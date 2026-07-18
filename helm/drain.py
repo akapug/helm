@@ -113,7 +113,8 @@ def _keywords_from(slug, statement):
 def _retype_text(src_path, act, ts):
     """The upgraded entry: typed frontmatter + the ORIGINAL body preserved
     verbatim (a drain that loses the why-and-how of an entry drained nothing)."""
-    raw = open(src_path, encoding="utf-8", errors="replace").read()
+    with open(src_path, encoding="utf-8", errors="replace") as f:
+        raw = f.read()
     body = raw.split("---", 2)[2].lstrip("\n") if raw.count("---") >= 2 else raw
     st = re.sub(r"\s+", " ", (act["statement"] or act["id"]).replace('"', "'"))[:300]
     to_prior = act["to_type"] == "prior"
@@ -155,7 +156,8 @@ def _repoint_index(mem, renames):
     """MEMORY.md is a projection — re-point lines whose link target moved."""
     idx = os.path.join(mem, "MEMORY.md")
     try:
-        raw = open(idx, encoding="utf-8").read()
+        with open(idx, encoding="utf-8") as f:
+            raw = f.read()
     except Exception:
         return 0
     hits = 0

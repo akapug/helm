@@ -76,11 +76,47 @@ def cmd_show(args):
     return 0
 
 
+def _lazy(module, fn):
+    """Import a leg only when its verb runs — `helm projects` never pays for
+    the web server's imports, and one broken leg never takes the CLI down."""
+    def run(args):
+        import importlib
+        return getattr(importlib.import_module("helm." + module), fn)(args)
+    return run
+
+
 VERBS = {
     "home": cmd_home,
     "sync": cmd_sync,
     "projects": cmd_projects,
     "show": cmd_show,
+    "store": _lazy("store", "cmd_store"),
+    "inject": _lazy("inject", "cmd_inject"),
+    "drain": _lazy("drain", "cmd_drain"),
+    "drift": _lazy("drift", "cmd_drift"),
+    "reflex": _lazy("reflex", "cmd_reflex"),
+    "lineage": _lazy("lineage", "cmd_lineage"),
+    "whoami": _lazy("whoami", "cmd_whoami"),
+    "interview": _lazy("whoami", "cmd_interview"),
+    "doctor": _lazy("doctor", "cmd_doctor"),
+    "skills": _lazy("skills", "cmd_skills"),
+    "evolve": _lazy("evolve", "cmd_evolve"),
+    "web": _lazy("web", "cmd_web"),
+}
+
+_VERB_HELP = {
+    "store": "store list|get|add|resolve|... — the one typed knowledge store",
+    "inject": "inject [--project P] — per-turn context for harness hooks (stdin: prompt)",
+    "drain": "drain [--apply] — route raw memory intake to typed homes (dry-run default)",
+    "drift": "drift — surface belief drift; silent when steady",
+    "reflex": "reflex list|add|retire — (signal -> steer) entries",
+    "lineage": "lineage [seed|add|external|archive-report] — the project family tree",
+    "whoami": "whoami [note ...] — the operator profile + dated notes",
+    "interview": "interview — the five-minute warmth-leg interview",
+    "doctor": "doctor — health check, read-only",
+    "skills": "skills [dupes] — skills census across every home, read-only",
+    "evolve": "evolve — one observe/propose cycle (proposes, never mutates)",
+    "web": "web [--port N] — the same, warm, in a browser",
 }
 
 
@@ -90,7 +126,7 @@ def main(argv=None):
         print("helm — the personal knowledge home for people who build with agents\n")
         print("usage: helm <verb> [args]\n")
         for name in VERBS:
-            doc = (VERBS[name].__doc__ or "").strip().split("\n")[0]
+            doc = _VERB_HELP.get(name) or (VERBS[name].__doc__ or "").strip().split("\n")[0]
             print("  " + doc)
         return 0
     verb = argv[0]
