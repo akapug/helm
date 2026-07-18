@@ -594,5 +594,44 @@ def cmd_configs(args):
         print(json.dumps(resolve(home_p, cwd, harness), indent=2, ensure_ascii=False))
         return 0
 
-    print("usage: helm configs [list|show <path>|cascade <cwd>]", file=sys.stderr)
+    if verb == "edit":
+        # edit <path>  (new content on stdin) — backup -> validate -> atomic
+        if not args:
+            print("usage: helm configs edit <path>   (new content on stdin)", file=sys.stderr)
+            return 2
+        if sys.stdin.isatty():
+            print("helm configs edit: pipe the new content on stdin "
+                  "(refusing an interactive empty write)", file=sys.stderr)
+            return 2
+        r = write_file(args[0], sys.stdin.read())
+        if r.get("error"):
+            print("helm configs edit: " + r["error"], file=sys.stderr)
+            return 1
+        print("helm configs: wrote %s (backup: %s)" % (r["path"], r.get("backup") or "none — new file"))
+        return 0
+
+    if verb == "backups":
+        bs = list_backups()
+        if not bs:
+            print("helm configs: no backups yet.")
+            return 0
+        print("helm configs backups (%d, newest first):" % len(bs))
+        for b in bs[:30]:
+            print("  %s  <- %s" % (b.get("backup", "?"), b.get("orig") or "?"))
+        return 0
+
+    if verb == "restore":
+        if not args:
+            print("usage: helm configs restore <backup-path>", file=sys.stderr)
+            return 2
+        r = restore(args[0])
+        if r.get("error"):
+            print("helm configs restore: " + r["error"], file=sys.stderr)
+            return 1
+        print("helm configs: restored %s (pre-restore backup: %s)"
+              % (r["path"], r.get("backup") or "none"))
+        return 0
+
+    print("usage: helm configs [list|show <path>|cascade <cwd>|edit <path>|"
+          "backups|restore <backup>]", file=sys.stderr)
     return 2
