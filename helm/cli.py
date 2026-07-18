@@ -102,6 +102,7 @@ VERBS = {
     "skills": _lazy("skills", "cmd_skills"),
     "evolve": _lazy("evolve", "cmd_evolve"),
     "sessions": _lazy("sessions", "cmd_sessions"),
+    "homes": _lazy("homes", "cmd_homes"),
     "web": _lazy("web", "cmd_web"),
 }
 
@@ -118,6 +119,7 @@ _VERB_HELP = {
     "skills": "skills [dupes] — skills census across every home, read-only",
     "evolve": "evolve — one observe/propose cycle (proposes, never mutates)",
     "sessions": "sessions [<project>] — every local session, all harnesses; resume in one paste",
+    "homes": "homes [prepare|verify|archive|restore|archives] — credential-home lifecycle",
     "web": "web [--port N] — the same, warm, in a browser",
 }
 
