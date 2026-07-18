@@ -64,11 +64,23 @@ Orthogonal to type. `load_class:` ∈
 The salience law governs all three: **empty on no match**. Salience is the
 scarce resource; spend it only when newly relevant.
 
-## Exploration: attested premises
+## Attested premises (converged design, awaiting ratification)
 
-Premises (confidence 1.0) are provable, standing truths — which makes them
-candidates to live as *attested records* in a verifiable substrate and be
-delivered just-in-time by contextual whisper rather than sitting in files.
-helm's store keeps `type`/`load_class` orthogonal to *placement* precisely so
-a premise's backing store can migrate (file → attested record) without any
-consumer changing. Design is open; the store schema already permits it.
+Premises (confidence 1.0) are provable, standing truths — so they can live as
+*attested records* on a verifiable ledger, not just files. The converged
+shape (2026-07-18, build + substrate poles):
+
+- **The operator's own cell signs** premise capture and supersession. This is
+  semantically exact, not just warm: confidence 1.0 is human-only by law, so
+  the attestable set is precisely the operator's stated truths.
+- **Thin claim, fat corroboration**: the ledger holds only a signed digest of
+  the canonical premise text; the text stays in the storehouse. A checker
+  recomputes the digest — match means attested.
+- **Supersession is a new signed turn** referencing the prior turn-hash
+  (append-only, never delete — the store's tombstone law, mirrored). Belief
+  history becomes a provable chain: *held X until T, then Y* — which the
+  drift report can read as attested belief evolution.
+- **Zero new substrate**: rides the existing self-write receipt shape;
+  delivery rides the existing whisper lane. `type`/`load_class` stay
+  orthogonal to placement, so no consumer changes when a premise's backing
+  migrates from file to attested record.
