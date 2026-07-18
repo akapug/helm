@@ -64,3 +64,17 @@ Status key: ✓ done+verified · ~ partial/present-verify-depth · ✗ missing �
 - LAST AX: A16 cmd (run-in-session) — confirm folded into capsule or add/N/A.
 - LAST UX: U9 config-editor-web + U12 team-tray (slice C building), depth-verify U10 homes/U11 hygiene web.
 - Recurring nit: `swap/capsule --help` treat --help as an arg (positional-first parsing) — small global fix.
+
+## DONE-GATE verdict (2026-07-18, view-by-view + VISUAL) — NOT YET DONE
+FULL RIGOR this time (feature-diff + rendered screenshots, not isolation). Results:
+- UX STRUCTURE: COMPLETE. Every sesh view present & renders: config-cascade EDITOR (works —
+  cwd-tree + layer badges + resolver), sessions (resume/filter), team-tray, homes, nav tabs.
+  Screenshots: helm-full-parity-dogfood.png, helm-configs-editor.png, helm-quota-view.png.
+- **U1 quota chart: DOWNGRADED ✓→~ — the CHART IS EMPTY.** Structure/toggles/controls/
+  burn-join/account-table all render, but NO data lines. Root cause: helm renders the CURRENT
+  snapshot (creds scorecard ✓) but the quota CHART needs HISTORY time-series. sesh feeds its
+  chart from providers.py → `<provider> history --json` / history.json; helm has the scaffold
+  ("quota provider — burn attribution needs burn history") but the history SOURCE isn't wired.
+- A16 cmd: still to confirm (capsule composes it? or add).
+BLOCKERS to done: (1) wire the quota-history source so the chart has data (parity with :7402's
+populated chart); (2) confirm A16 cmd. Everything else is parity-complete + rendered.

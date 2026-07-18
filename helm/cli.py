@@ -121,6 +121,7 @@ VERBS = {
     "creds": _lazy("creds", "cmd_creds"),
     "swap": _lazy("creds", "cmd_swap"),
     "capsule": _lazy("capsule", "cmd_capsule"),
+    "cmd": _lazy("transcripts", "cmd_cmd"),
     "web": _lazy("web", "cmd_web"),
 }
 
@@ -150,6 +151,7 @@ _VERB_HELP = {
     "creds": "creds — live account scorecard (headroom/state/reset), all providers",
     "swap": "swap <home|email> — seat ran dry: print resume-under-healthier-account blocks",
     "capsule": "capsule <sid> — the session's git era: worktree + resume commands",
+    "cmd": "cmd <sid> [--account A] [--model M] — account-aware pasteable resume command",
     "web": "web [--port N] — the same, warm, in a browser",
 }
 
@@ -168,7 +170,11 @@ def main(argv=None):
     if fn is None:
         print("helm: unknown verb '%s' (helm --help)" % verb, file=sys.stderr)
         return 2
-    return fn(argv[1:])
+    rest = argv[1:]
+    if rest and rest[0] in ("-h", "--help"):
+        print("helm " + (_VERB_HELP.get(verb) or (fn.__doc__ or verb).strip().split("\n")[0]))
+        return 0
+    return fn(rest)
 
 
 if __name__ == "__main__":

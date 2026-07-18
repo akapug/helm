@@ -824,3 +824,33 @@ def cmd_prune(args):
         print("  %s" % res["note"])
         print("  resume it: helm sessions resume %s" % res["newSid"][:8])
     return 0
+
+
+def cmd_cmd(args):
+    """cmd <sid> [--account A] [--model M] — the account-aware pasteable resume
+    command (the provider owns the cred/home half; '(default)' when none)."""
+    import sys
+    args = list(args)
+    account = model = None
+    for flag in ("--account", "--model"):
+        if flag in args:
+            i = args.index(flag)
+            if i + 1 < len(args):
+                val = args[i + 1]
+                del args[i:i + 2]
+                account, model = (val, model) if flag == "--account" else (account, val)
+    sid = next((a for a in args if not a.startswith("--")), None)
+    if not sid:
+        print("usage: helm cmd <sid> [--account A] [--model M]", file=sys.stderr)
+        return 2
+    r = make_cmd(account or "(default)", sid, model=model)
+    if r.get("error"):
+        print("helm cmd: " + r["error"], file=sys.stderr)
+        return 1
+    print(r.get("cmd") or r.get("command") or json.dumps(r))
+    for k in ("note", "fallback_note", "warn"):
+        v = r.get(k)
+        if v:
+            for line in (v if isinstance(v, list) else [v]):
+                print("  # " + str(line))
+    return 0
