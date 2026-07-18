@@ -31,6 +31,9 @@ keeps it alive:
 - **know-your-user** — a first-class profile of how you like to work: voice,
   autonomy, standing corrections, goals. The interview takes five minutes and
   every agent that reads the store gets warmer.
+- **`helm sessions`** — every local session across every harness, grouped by
+  project, with the exact resume command one paste away (it's just the
+  harness's own CLI — no wrapper).
 - **The lineage map** — projects fork, compose, supersede, and launch. helm's
   registry carries those edges and renders the family tree, including
   read-only external nodes, plus a ranked (read-only) "safe to archive and
@@ -58,6 +61,7 @@ keeps it alive:
 $ ./bin/helm sync        # discover your projects across all harnesses
 $ ./bin/helm projects    # the list, newest activity first
 $ ./bin/helm show meld   # one project's full record
+$ ./bin/helm sessions    # every session, all harnesses; resume in one paste
 $ ./bin/helm doctor      # health check (read-only)
 $ ./bin/helm web         # the same, warm, in a browser
 ```

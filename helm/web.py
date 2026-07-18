@@ -33,7 +33,15 @@ def _api_store():
     module lands in a parallel lane — absent/raising -> unavailable, never 500."""
     try:
         from . import store
-        out = {"counts": store.counts()}
+        per_root = store.counts()
+        by_type = {}
+        for row in per_root.values():
+            if isinstance(row, dict):
+                for t, n in row.items():
+                    if isinstance(n, int):
+                        by_type[t] = by_type.get(t, 0) + n
+        out = {"counts": {"by_type": by_type, "total": sum(by_type.values())},
+               "per_root": per_root}
         for name in ("entries", "list_entries", "all_entries", "scan"):
             fn = getattr(store, name, None)
             if not callable(fn):
@@ -70,10 +78,29 @@ def _api_whoami():
         return {"unavailable": True}
 
 
+SESSION_KEYS = ("h", "i", "t", "u", "mt", "project")
+SESSION_CAP = 200
+
+
+def _api_sessions():
+    """Newest sessions across every harness, project-lensed; same degrade law."""
+    try:
+        from . import sessions
+        rows = []
+        for r in sessions.rows_for(limit=SESSION_CAP):
+            row = {k: r.get(k) for k in SESSION_KEYS}
+            row["cmd"] = sessions.resume_command(r)
+            rows.append(row)
+        return {"sessions": rows}
+    except Exception:
+        return {"unavailable": True}
+
+
 API = {
     "/api/registry": _api_registry,
     "/api/store": _api_store,
     "/api/whoami": _api_whoami,
+    "/api/sessions": _api_sessions,
 }
 
 

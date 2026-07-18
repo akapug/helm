@@ -35,6 +35,16 @@ header{padding:26px 0 6px}
 .stype{white-space:nowrap;color:var(--mut)}
 .stype b{color:var(--fg);font-variant-numeric:tabular-nums;margin-right:4px}
 #store .stot{margin-left:auto;color:var(--sub);font-size:.78rem}
+#sessions{display:none;margin:10px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:.84rem}
+#sessions.show{display:block}
+#sessions .slabel{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+.srows{margin-top:6px;display:flex;flex-direction:column}
+.srow{display:flex;align-items:baseline;gap:10px;padding:3px 6px;border-radius:8px;cursor:copy;overflow:hidden}
+.srow:hover{background:var(--line)}
+.srow.copied{outline:1px solid var(--sub)}
+.srow .sage{color:var(--sub);font-size:.74rem;min-width:3.2em;font-variant-numeric:tabular-nums}
+.srow .sproj{color:var(--mut);min-width:9em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.srow .stitle{color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
 
 /* ---------- controls ---------- */
 #controls{display:flex;gap:8px;align-items:center;margin:16px 0 0;flex-wrap:wrap}
@@ -105,6 +115,7 @@ footer .fmark{color:color-mix(in srgb,var(--accent) 70%,var(--sub))}
   <div id="banner">helm isn’t answering — start it with <code>helm web</code>; retrying quietly…</div>
 
   <section id="store"></section>
+  <section id="sessions"></section>
 
   <div id="controls">
     <input id="q" type="search" placeholder="filter projects…  ( / )" autocomplete="off">
@@ -170,6 +181,26 @@ function storeStrip(s) {
     types.map(k => '<span class="stype"><b>' + c[k] + "</b>" + esc(k) + "</span>").join("") +
     '<span class="stot">' + total + " entries</span>";
   $("#store").classList.add("show");
+}
+
+/* ---------- sessions strip ---------- */
+function sessStrip(s) {
+  if (!s || s.unavailable || !Array.isArray(s.sessions) || !s.sessions.length) return;
+  const rows = s.sessions.slice(0, 12).map(r =>
+    '<div class="srow" data-cmd="' + esc(r.cmd || "") + '" title="click to copy the resume command">' +
+    '<span class="sage">' + esc(age(r.mt)) + '</span>' +
+    '<span class="chip h-' + esc(r.h) + '">' + esc(r.h) + '</span>' +
+    '<span class="sproj">' + esc(r.project || "–") + '</span>' +
+    '<span class="stitle">' + esc((r.t || "(untitled)").slice(0, 80)) + '</span></div>').join("");
+  $("#sessions").innerHTML = '<span class="slabel">sessions</span><div class="srows">' + rows + "</div>";
+  $("#sessions").classList.add("show");
+  $("#sessions").querySelectorAll(".srow").forEach(el => el.addEventListener("click", async () => {
+    const cmd = el.dataset.cmd;
+    if (!cmd) return;
+    try { await navigator.clipboard.writeText(cmd); } catch (e) {}
+    el.classList.add("copied");
+    setTimeout(() => el.classList.remove("copied"), 900);
+  }));
 }
 
 /* ---------- project cards ---------- */
@@ -288,6 +319,7 @@ async function load() {
   }
   j("/api/whoami").then(greet).catch(() => {});
   j("/api/store").then(storeStrip).catch(() => {});
+  j("/api/sessions").then(sessStrip).catch(() => {});
 }
 load();
 </script>
