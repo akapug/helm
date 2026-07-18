@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Session catalog — one row per local claude/codex session. ABSORBED from
-sesh (server/catalog.py, behavior-preserving) per the dissolve-into-helm law.
+"""Session catalog — one row per local claude/codex session.
 
 Incremental: rows are cached per file keyed by (mtime, size); a refresh only
 re-reads files that changed, so after the first full build a rescan is seconds.
@@ -15,7 +14,7 @@ _LEGACY_CACHE_DIR = os.path.join(HOME, ".cache", "sesh")
 if os.path.isdir(_LEGACY_CACHE_DIR) and not os.path.isdir(CACHE_DIR):
     try:
         import shutil
-        shutil.copytree(_LEGACY_CACHE_DIR, CACHE_DIR)  # seed from the sesh cache; sesh keeps its own
+        shutil.copytree(_LEGACY_CACHE_DIR, CACHE_DIR)  # one-time seed from the legacy cache
     except OSError:
         pass
 CACHE = os.path.join(CACHE_DIR, "catalog-cache.json")
@@ -279,7 +278,7 @@ def _backfill_syn(rows):
 
 def _build_from_cv():
     """Primary path: `cv ls --json` IS the catalog (cv 0.10+ carries sizeBytes +
-    synthesized titles + true messageCount — the fields that let sesh's transitional
+    synthesized titles + true messageCount — the fields that let the predecessor's transitional
     scanner retire). Returns (rows, stats) or None if cv can't answer (→ scanner
     fallback). The one remaining gap vs the scanner is git branch, which cv doesn't
     emit yet (emberian/cv#15) — non-load-bearing, blank until it lands."""
@@ -297,10 +296,10 @@ def _build_from_cv():
         objs = json.loads(p.stdout)
     except ValueError:
         return None
-    # sesh catalogs claude + codex (the harnesses it emits resume commands for and
+    # the catalog covers claude + codex (the harnesses helm mints resume commands for and
     # tracks quota for) — matching the scanner's scope, so retiring the scanner is a
     # behavior-preserving swap. cv also lists hermes/grok/gemini/… (and reports a
-    # shared state.db size for some, e.g. hermes) — out of sesh's catalog scope.
+    # shared state.db size for some, e.g. hermes) — out of the predecessor's catalog scope.
     rows = [_row_from_cv(o) for o in objs
             if isinstance(o, dict) and o.get("id") and o.get("harness") in ("claude", "codex")]
     _backfill_syn(rows)  # recover synthetic-session detection (cv leaves them untitled)

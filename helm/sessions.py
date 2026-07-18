@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """helm sessions — every local session, all harnesses, keyed to your projects.
 
-The catalog (absorbed from sesh) is the row source; the registry is the lens:
+The catalog is the row source; the registry is the lens:
 sessions group under the helm-known project whose tree their cwd lives in, so
-"what was I doing on meld?" is one verb. Resume stays one copy-paste away —
+"what was I doing on that project?" is one verb. Resume stays one copy-paste away —
 the exact command, not a wrapper (it's just the harness's own CLI).
 """
 import os

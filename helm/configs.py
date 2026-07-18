@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""configs.py — the config-management model (the sesh Configs-tab model).
-ABSORBED from sesh (server/configs.py, behavior-preserving) per the
-dissolve-into-helm law. Design record: the sesh repo's CONFIGS_DESIGN.md.
+"""configs.py — the config-management model.
+helm-native (see ATTRIBUTION.md for lineage)
+dissolve-into-helm law. Design record: the predecessor repo's CONFIGS_DESIGN.md.
 
 One place to SEE and safely EDIT every local claude/codex config — MCPs, hooks,
 skills, rules, memory (CLAUDE.md/AGENTS.md), settings — across all homes and cwds,

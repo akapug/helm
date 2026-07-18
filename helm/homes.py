@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """helm homes — credential-home lifecycle for claude AND codex (stdlib only).
-ABSORBED from sesh (server/homes.py, behavior-preserving) per the
+helm-native (see ATTRIBUTION.md for lineage)
 dissolve-into-helm law; rebrand only — new archives land in
 ~/.helm-home-archive/, legacy ~/.sesh-home-archive/ stays readable/restorable.
 
@@ -18,7 +18,7 @@ THE CANON (CRED_AUTH_CANON, distilled — violating these bricks accounts):
     session store) — a REAL projects dir silently strands sessions.
   * archive = MOVE into ~/.helm-home-archive/<name>-<date>/ (reversible),
     never delete; refused while a live agent sits on the home. Legacy sesh
-    archives (~/.sesh-home-archive/, marker .sesh-archive.json) are still
+    legacy archives (~/.sesh-home-archive/, marker .sesh-archive.json) are still
     listed and restorable — read both, write new.
 
 Every public function returns a JSON-able dict (or list); errors are
@@ -36,7 +36,7 @@ ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
 SHARED_PROJECTS = os.path.join(HOME, ".claude", "projects")
 ARCHIVE_ROOT = os.path.join(HOME, ".helm-home-archive")
 MARKER = ".helm-archive.json"  # metadata only: name/provider/from/aliases — no token contents
-# the sesh era's archive — recognized forever for list/restore, never written to
+# the legacy archive root — recognized forever for list/restore, never written to
 LEGACY_ARCHIVE_ROOT = os.path.join(HOME, ".sesh-home-archive")
 LEGACY_MARKER = ".sesh-archive.json"
 
@@ -46,7 +46,7 @@ LOGIN_CMDS = {"claude": lambda h: f"CLAUDE_CONFIG_DIR={shlex.quote(h)} claude /l
 
 
 def canonical_name(email):
-    """david@x.com -> david-x-com (same fold as sesh's _norm — keep them in step)."""
+    """david@x.com -> david-x-com (same fold as the predecessor's _norm — keep them in step)."""
     return "".join(ch if ch.isalnum() else "-" for ch in (email or "").lower()).strip("-")
 
 

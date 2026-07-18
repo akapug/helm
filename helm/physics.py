@@ -1,5 +1,5 @@
 """Physics inspector: what a seat launched with (credhome, cwd) WOULD load.
-ABSORBED from sesh (server/physics.py, behavior-preserving) per the
+helm-native (see ATTRIBUTION.md for lineage)
 dissolve-into-helm law.
 
 Read-only. Stdlib-only. Secret-free by construction:
@@ -8,7 +8,7 @@ Read-only. Stdlib-only. Secret-free by construction:
     URLs (paths/queries can embed tokens), never args beyond count
   - permissions -> counts + defaultMode, not rule bodies unless harmless names
 
-Ground truth for the resolution rules lives in the sesh repo's
+Ground truth for the resolution rules lives in the predecessor repo's
 portfolio/PRSH_HOME_INTERACTION.md (probed against Claude Code 2.1.207 and
 codex-cli 0.144.1 on 2026-07-12). Key facts encoded here:
 
@@ -200,7 +200,7 @@ def _claude_state_file(home):
 
 def _claude_settings_layers(home, cwd):
     """(name, path, data) for each present settings layer, low->high
-    precedence. Launch flags (--settings) are a runtime seam sesh injects;
+    precedence. Launch flags (--settings) are a runtime injection seam;
     they cannot be read from disk and are noted in the report instead."""
     layers = []
     for name, path in (
