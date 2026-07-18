@@ -38,3 +38,15 @@ Design converged + validated against live surfaces: the node's `/api/receipts` +
 (target/release/meld) exercises the self-write path. Empirical self-write premise dogfood:
 next (advisor). Build: Fable wires premise capture as a user-cell self-write; store fields
 already present.
+
+## Addendum — live-proof refinements (2026-07-18, dogfooded on the node)
+
+Advisor proved the mechanic live (self-write finalized at h43, read back
+independently). Two build-affecting constraints (relayed; advisor's canonical
+wording to follow — their direct edit did not land on this file):
+
+1. **The 32-byte digest rides the WHISPER PAYLOAD slots, never the 8-byte
+   heartbeat tag.** Premise self-write = the meld-send SetField path. Do not
+   wire premise → heartbeat-tag.
+2. **`premise-check` must quote the finality tier** it verified at:
+   ingress-immediate vs attested-after-next-height.
