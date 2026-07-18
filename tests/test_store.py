@@ -387,6 +387,19 @@ class EpisodicTest(StoreBase):
         self.assertEqual(store.load_all(include_dormant=False), [])
 
 
+class TypedFallbackTest(StoreBase):
+    def test_typed_prefix_without_typed_fields_reads_as_episodic(self):
+        # the live store carries prem-/lex- named files that are really bulk
+        # memory (name+description, type: project, no id/statement) — mc drops
+        # them; helm keeps them visible as episodic, never injected
+        pk.atomic_write(os.path.join(self.adopted, "prem-bulk-note.md"),
+                        '---\nname: prem-bulk-note\ndescription: "canon paragraph"\n'
+                        'metadata:\n  node_type: memory\n  type: project\n---\nbody\n')
+        e = self.one(store.load_all(), "prem-bulk-note")
+        self.assertEqual((e["type"], e["load_class"]), ("episodic", "dormant"))
+        self.assertEqual(store.resolve_prompt("prem-bulk-note canon paragraph"), [])
+
+
 class ScopeTest(StoreBase):
     def test_project_shadows_global_shadows_adopted(self):
         store.write_prior({"id": "foo", "statement": "adopted sense",

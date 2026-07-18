@@ -84,10 +84,16 @@ def classify(mem=None):
                          "origin": e.get("originsessionid") or ""})
             continue
         if etype == "project" or n.startswith(("proj-", "proj_", "project_")):
-            blob = (base + " " + (e.get("description") or "")).lower()
-            target = next((pn for pn in project_names
-                           if re.search(r"(?<![a-z0-9])" + re.escape(pn.lower())
-                                        + r"(?![a-z0-9])", blob)), None)
+            # filename-prefix match always counts; a description match needs a
+            # name specific enough not to wallpaper (short names like "dev"
+            # appear as ordinary words in half the corpus)
+            blob = (e.get("description") or "").lower()
+            target = next(
+                (pn for pn in project_names
+                 if base.lower().startswith(pn.lower() + "-") or base.lower() == pn.lower()
+                 or (len(pn) >= 6 and re.search(
+                     r"(?<![a-z0-9])" + re.escape(pn.lower()) + r"(?![a-z0-9])", blob))),
+                None)
             if target:
                 plan.append({"op": "route-project", "src": n, "project": target,
                              "dst": os.path.join(home.project_dir(target), "journal", n)})

@@ -23,9 +23,15 @@ from . import reflex
 
 PINNED_BUDGET = 1200  # bytes for the always lane — keep the constant tax tiny
 JIT_CAP = 4
+LINE_CAP = 400        # per-entry cap — the gloss fires, the full entry stays on disk
 
 
 def _entry_line(e):
+    line = _entry_line_full(e)
+    return line if len(line) <= LINE_CAP else line[:LINE_CAP - 1] + "…"
+
+
+def _entry_line_full(e):
     t = e.get("type")
     if t == "prior":
         tag = "PREMISE" if e.get("class") == "certain" else "PRIOR %.2f" % e["confidence"]

@@ -301,20 +301,30 @@ def _parse_episodic(path, name):
 
 def _parse_entry(path, name):
     """Filename-prefix dispatch (the drain/doctor classifier). reflex-*.md is
-    reflex.py's store and MEMORY.md is the index — neither is an entry here."""
+    reflex.py's store and MEMORY.md is the index — neither is an entry here.
+    A typed-prefix file that fails its typed parse (the live store carries
+    ~200 prem-/lex- named files that are really bulk memory: name+description
+    only, no id/statement) FALLS BACK to episodic — visible in the inventory,
+    never injected — where mc's resolvers silently dropped it."""
     if name == "MEMORY.md" or name.startswith("reflex-"):
         return None
     if name.startswith((PRIOR_PREFIX, LEGACY_PREFIX)):
         e = _parse_prior(path)
         if e:
             e["_legacy"] = name.startswith(LEGACY_PREFIX)
-        return e
-    if name.startswith("lex-"):
-        return _parse_lexicon(path)
-    if name.startswith("heuristic-"):
-        return _parse_heuristic(path)
-    if name.startswith("ref-"):
-        return _parse_reference(path, name)
+            return e
+    elif name.startswith("lex-"):
+        e = _parse_lexicon(path)
+        if e:
+            return e
+    elif name.startswith("heuristic-"):
+        e = _parse_heuristic(path)
+        if e:
+            return e
+    elif name.startswith("ref-"):
+        e = _parse_reference(path, name)
+        if e:
+            return e
     return _parse_episodic(path, name)
 
 

@@ -26,8 +26,9 @@ def _state_path():
 
 
 def _contradictions(e):
-    return [r for r in (e.get("evidence_log") or [])
-            if r.get("type") == "contradict" or (r.get("delta") or 0) < 0]
+    """Tolerate legacy string rows in old evidence logs — fail-open, dict-only."""
+    return [r for r in (e.get("evidence_log") or []) if isinstance(r, dict)
+            and (r.get("type") == "contradict" or (r.get("delta") or 0) < 0)]
 
 
 def report(project=None, snapshot=True):
