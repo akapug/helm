@@ -14,6 +14,8 @@ modules are built in parallel — their endpoints DEGRADE GRACEFULLY to
 import json
 import os
 import sys
+import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -202,6 +204,367 @@ def _api_skills_delete(payload):
     return {"ok": True, "path": ap, "trash": dest}, 200
 
 
+# ── quota surface: creds / history / burn / allocate / status / homes ──
+# ABSORBED from sesh (server/sesh.py route handlers, behavior-preserving):
+# same JSON shapes, so the ported quota UI works unmodified. providers.py owns
+# every fact about accounts/windows/history; these handlers only cache + join.
+
+_qlock = threading.Lock()
+_qstate = {}
+_qinflight = {}
+_PROVIDER = None  # lazy singleton; tests may inject a stub here
+
+
+def _provider():
+    global _PROVIDER
+    if _PROVIDER is None:
+        from . import providers
+        _PROVIDER = providers.default_provider()
+    return _PROVIDER
+
+
+def _cached(key, ttl, fn):
+    """Single-flight TTL cache (ported from sesh): concurrent misses on one key
+    share one build instead of racing."""
+    while True:
+        with _qlock:
+            ent = _qstate.get(key)
+            if ent and time.time() - ent[0] < ttl:
+                return ent[1]
+            ev = _qinflight.get(key)
+            if ev is None:
+                _qinflight[key] = threading.Event()
+                break
+        ev.wait(timeout=300)
+    try:
+        val = fn()  # computed outside the lock; other keys stay readable
+        with _qlock:
+            _qstate[key] = (time.time(), val)
+        return val
+    finally:
+        with _qlock:
+            _qinflight.pop(key).set()
+
+
+def _catalog_rows():
+    def build():
+        from . import catalog
+        rows, _stats = catalog.build()
+        return rows
+    return _cached("catalog", 600, build)
+
+
+def _claude_home_identity(home_p):
+    """oauthAccount email from a home's .claude.json — identity METADATA, never tokens."""
+    try:
+        with open(os.path.join(home_p, ".claude.json")) as f:
+            d = json.load(f)
+        return (d.get("oauthAccount") or {}).get("emailAddress")
+    except Exception:
+        return None
+
+
+def _norm(s):
+    return "".join(ch if ch.isalnum() else "-" for ch in (s or "").lower()).strip("-")
+
+
+def get_creds(refresh=False):
+    if refresh:
+        with _qlock:
+            _qstate.pop("creds", None)
+
+    def build():
+        import glob
+        from .providers import ProviderError
+        HOME = os.path.expanduser("~")
+        prov = _provider()
+        try:
+            accounts = prov.accounts()
+            states = {s.get("account"): s for s in prov.cred_state()}
+            windows = {w.get("account"): w for w in prov.windows()}
+        except ProviderError:
+            return []  # no quota provider on this machine — sessions/resume still work
+        merged = []
+        for a in accounts:
+            if a.get("provider") not in ("anthropic", "codex"):
+                continue
+            s = states.get(a["name"], {})
+            w = windows.get(a["name"], {})
+            home_p = a.get("home") or ""
+            real = os.path.realpath(home_p) if home_p else ""
+            home_name = os.path.basename(home_p) if home_p else None
+            identity = _claude_home_identity(real) if a["provider"] == "anthropic" and real else None
+            name_lies = bool(identity) and _norm(identity) not in (_norm(home_name), _norm(os.path.basename(real)))
+            merged.append({
+                "name": a["name"], "provider": a["provider"], "home": home_p,
+                "home_name": home_name, "identity": identity, "name_lies": name_lies,
+                "active": a.get("active", False), "tier": s.get("tier") or a.get("tier"),
+                "headroom": s.get("headroom_pct"), "state": s.get("cred_state", "unknown"),
+                "status": s.get("status"), "resets_at_ms": s.get("resets_at_ms"),
+                "windows_left": w.get("windows_left"), "windows_per_week": w.get("windows_per_week"),
+                "windows_verdict": w.get("verdict"),
+            })
+        seen = {}
+        for h in glob.glob(f"{HOME}/.claude-homes/*/"):
+            real = os.path.realpath(h)
+            ident = _claude_home_identity(real)
+            if ident and os.path.exists(os.path.join(real, ".credentials.json")):
+                seen.setdefault(ident, set()).add(real)
+        dups = {i: sorted(os.path.basename(p) for p in ps) for i, ps in seen.items() if len(ps) > 1}
+        for c in merged:
+            if c["provider"] == "anthropic" and c["name"] in dups:
+                c["duplicate_homes"] = dups[c["name"]]
+        return merged
+    return _cached("creds", 60, build)
+
+
+def get_history(hours=168):
+    def build():
+        from .providers import ProviderError
+        try:
+            rows = _provider().history(hours)
+        except ProviderError:
+            return []
+        # downsample to ~240 buckets per account — charts don't need minute-level points
+        bucket_s = max(60, (hours * 3600) // 240)
+        latest = {}
+        for r in rows:  # newest sample per (account, bucket), independent of provider order
+            try:
+                ts = time.mktime(time.strptime(r["probed_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+            except (ValueError, KeyError):
+                continue
+            k = (r.get("account"), int(ts // bucket_s))
+            if k not in latest or r["probed_at"] > latest[k]["probed_at"]:
+                latest[k] = r
+        return sorted(latest.values(), key=lambda r: r["probed_at"])  # oldest-first, guaranteed
+    return _cached(f"history:{hours}", 120, build)
+
+
+def _probe_epoch(s):
+    """True epoch seconds for a provider probed_at (RFC3339 UTC '...Z'; a naive
+    local string still parses). Burn buckets join against session mtimes (real
+    epochs), so a tz-shifted parse would attribute burn to the wrong hour."""
+    import calendar
+    try:
+        t = time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    return calendar.timegm(t) if "Z" in s[19:] or "+00:00" in s[19:] else time.mktime(t)
+
+
+def get_burn(hours=48):
+    """The join only this surface can make: this burn spike ↔ that session. v1 is
+    TEMPORAL — per account, the per-hour drop in remaining% of the binding '5h'
+    gauge (floor 0: resets are not burn), joined to the sessions last-active in
+    each hour. A session listed under a bucket was ACTIVE then, not proven to be
+    the burner."""
+    hours = max(1, min(168, hours))
+
+    def build():
+        hist = get_history(hours)
+        if not hist:
+            return {"buckets": [],
+                    "note": "no quota provider — burn attribution needs burn history"}
+        now = time.time()
+        t_lo = now - hours * 3600
+        # remaining% of the '5h' gauge per account, oldest-first (get_history guarantees order)
+        samples = {}
+        for r in hist:
+            g = next((g for g in r.get("gauges", [])
+                      if g.get("label") == "5h" and g.get("utilization") is not None), None)
+            if g is None:
+                continue
+            ts = _probe_epoch(r.get("probed_at") or "")
+            if ts is None:
+                continue
+            samples.setdefault(r.get("account"), []).append(
+                (ts, (1 - min(1, g["utilization"])) * 100))
+        burned = {}  # bucket epoch sec -> {account: pct burned}
+        for acct, pts in samples.items():
+            pts.sort()
+            for (_, r0), (t1, r1) in zip(pts, pts[1:]):
+                drop = r0 - r1
+                if drop <= 0 or t1 < t_lo:  # floor 0: a rising gauge is a reset, not burn
+                    continue
+                b = int(t1 // 3600) * 3600
+                acc = burned.setdefault(b, {})
+                acc[acct] = acc.get(acct, 0) + drop
+        by_bucket = {}
+        for r in _catalog_rows():
+            mt = r.get("mt") or 0
+            if mt < t_lo:
+                continue
+            by_bucket.setdefault(int(mt // 3600) * 3600, []).append(r)
+        buckets = []
+        for b in sorted(set(burned) | set(by_bucket)):
+            sess = sorted(by_bucket.get(b, []), key=lambda r: r["z"], reverse=True)[:8]
+            buckets.append({
+                "t": b * 1000,
+                "byAccount": {a: round(p, 1) for a, p in sorted(burned.get(b, {}).items())
+                              if p >= 0.05},
+                "sessions": [{"i": s["i"], "t": s["t"][:60], "c": s["c"], "h": s["h"]}
+                             for s in sess],
+            })
+        return {"buckets": buckets,
+                "note": "temporal join v1: burn = per-hour drop of each account's binding 5h "
+                        "gauge; sessions = last-active that hour, capped at the 8 largest "
+                        "per bucket — coincidence in time, not proven causation"}
+    return _cached(f"burn:{hours}", 120, build)
+
+
+def _alloc_models():
+    return (os.environ.get("HELM_ALLOC_MODELS")
+            or os.environ.get("SESH_ALLOC_MODELS") or "fable,opus,gpt-5.5").split(",")
+
+
+def get_allocations():
+    def build():
+        from .providers import ProviderError
+        out = {}
+        for m in _alloc_models():
+            m = m.strip()
+            if not m:
+                continue
+            try:
+                ranked = _provider().allocate(m)
+            except ProviderError:
+                ranked = []
+            pick = next((r for r in ranked if r.get("eligible")), None)
+            out[m] = {"pick": pick, "ranked": ranked[:5]}
+        return out
+    return _cached("alloc", 120, build)
+
+
+def _q1(qs, key, default=None):
+    """First value of a parse_qs list, else default."""
+    v = qs.get(key)
+    return v[0] if v else default
+
+
+def _api_creds(qs):
+    try:
+        return get_creds(refresh=_q1(qs, "refresh") == "1"), 200
+    except Exception:
+        return {"unavailable": True}, 200
+
+
+def _api_history(qs):
+    try:
+        return get_history(hours=int(_q1(qs, "hours", "168"))), 200
+    except ValueError:
+        return {"error": "hours wants an integer"}, 400
+    except Exception:
+        return {"unavailable": True}, 200
+
+
+def _api_burn(qs):
+    try:
+        return get_burn(hours=int(_q1(qs, "hours", "48"))), 200
+    except ValueError:
+        return {"error": "hours wants an integer"}, 400
+    except Exception:
+        return {"unavailable": True}, 200
+
+
+def _api_allocate():
+    try:
+        return get_allocations()
+    except Exception:
+        return {"unavailable": True}
+
+
+def _api_quota_status():
+    """Same shape as sesh /api/status: is a provider present, how many accounts,
+    does cv exist, how big is the cached catalog."""
+    import shutil
+    try:
+        qcli = type(_provider()).__name__.replace("QuotaProvider", "").lower()
+    except Exception:
+        qcli = "none"
+    creds_n = 0
+    try:
+        creds_n = len(get_creds())
+    except Exception:
+        pass
+    with _qlock:
+        cat = _qstate.get("catalog")
+    return {
+        "provider": {"configured": qcli,
+                     "present": qcli == "native" or bool(shutil.which(
+                         os.environ.get("HELM_QUOTA_CLI")
+                         or os.environ.get("SESH_QUOTA_CLI") or "tokaware")),
+                     "accounts": creds_n,
+                     "degraded": creds_n == 0,
+                     "fallback": "(default) account resume works without a provider"},
+        "cv": bool(shutil.which("cv")),
+        "catalogRows": len(cat[1]) if cat else None,
+        "mutations": "POST JSON (localhost-only surface)",
+    }
+
+
+# ── credential homes: the quota view's homes card (homes.py backend) ──
+
+def _api_homes():
+    """Every credential home (live, broken-alias, archived) — sesh /api/homes shape."""
+    try:
+        from . import homes
+        return homes.homes_list()
+    except Exception:
+        return {"unavailable": True}
+
+
+def _api_homes_post(payload):
+    """Home lifecycle: helm prepares/verifies/moves DIRECTORIES only — the human
+    runs every login; token contents are never touched (CRED_AUTH_CANON)."""
+    from . import homes
+    act = payload.get("action")
+    if act == "create":
+        out = homes.home_create(payload.get("provider"), payload.get("email"))
+    elif act == "verify":
+        out = homes.home_verify(payload.get("name"), payload.get("provider") or None)
+    elif act == "archive":
+        out = homes.home_archive(payload.get("name"), payload.get("provider") or None)
+    elif act == "unarchive":
+        out = homes.home_unarchive(payload.get("name"))
+    elif act == "migrate":
+        out = homes.home_migrate(payload.get("name"), payload.get("provider") or None)
+    else:
+        out = {"error": "unknown action %r "
+                        "(create | verify | archive | unarchive | migrate)" % (act,)}
+    return out, (400 if "error" in out else 200)
+
+
+def _resolve_home_path(name):
+    """Home NAME or path → absolute home path (claude-homes, codex-homes, defaults)."""
+    if not name:
+        return None
+    if name.startswith("/") or name.startswith("~"):
+        p = os.path.expanduser(name)
+        return p if os.path.isdir(p) else None
+    HOME = os.path.expanduser("~")
+    if name == "(default-claude)":
+        return os.path.join(HOME, ".claude")
+    if name == "(default-codex)":
+        return os.path.join(HOME, ".codex")
+    for root in (os.path.join(HOME, ".claude-homes"), os.path.join(HOME, ".codex-homes")):
+        p = os.path.join(root, name)
+        if os.path.isdir(p):
+            return p
+    return None
+
+
+def _api_physics(qs):
+    """What a seat on this home would load — the homes card's physics button."""
+    from . import physics
+    hp = _resolve_home_path(_q1(qs, "home") or "")
+    if not hp:
+        return {"error": "need home= (name or path)"}, 400
+    harness = _q1(qs, "harness") or (
+        "codex" if "/codex" in hp or "codex-homes" in hp else "claude")
+    return physics.physics_report(hp, _q1(qs, "cwd") or os.path.expanduser("~"),
+                                  harness), 200
+
+
 API = {
     "/api/registry": _api_registry,
     "/api/store": _api_store,
@@ -209,15 +572,23 @@ API = {
     "/api/sessions": _api_sessions,
     "/api/configs": _api_configs,
     "/api/skills": _api_skills,
+    "/api/status": _api_quota_status,
+    "/api/allocate": _api_allocate,
+    "/api/homes": _api_homes,
 }
 
 QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/configs/cascade": _api_configs_cascade,
+    "/api/creds": _api_creds,
+    "/api/history": _api_history,
+    "/api/burn": _api_burn,
+    "/api/physics": _api_physics,
 }
 
 POST_API = {  # fn(payload_dict) -> (obj, status)
     "/api/skills/toggle": _api_skills_toggle,
     "/api/skills/delete": _api_skills_delete,
+    "/api/homes": _api_homes_post,
 }
 
 

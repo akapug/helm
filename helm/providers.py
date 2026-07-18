@@ -751,12 +751,15 @@ class NativeQuotaProvider:
     @staticmethod
     def _allocation_rules():
         """Operator allocation rules, optional. Missing file -> {} (pure headroom
-        ranking, unchanged behavior); a present-but-broken file warns on stderr."""
-        path = os.environ.get("SESH_ALLOCATION_RULES") or os.path.expanduser(
-            "~/.config/sesh/allocation.json")
+        ranking, unchanged behavior); a present-but-broken file warns on stderr.
+        Path: env override, else ~/.config/helm/, else the legacy sesh file."""
+        helm_p = os.path.expanduser("~/.config/helm/allocation.json")
+        path = _env("ALLOCATION_RULES") or (
+            helm_p if os.path.exists(helm_p)
+            else os.path.expanduser("~/.config/sesh/allocation.json"))
         rules = _read_json(path)
         if rules is None and os.path.exists(path):
-            print(f"sesh: allocation rules unreadable, ignoring: {path}", file=sys.stderr)
+            print(f"helm: allocation rules unreadable, ignoring: {path}", file=sys.stderr)
         return rules if isinstance(rules, dict) else {}
 
     def _apply_rules(self, ranked, model, rules):
@@ -886,15 +889,16 @@ class NativeQuotaProvider:
 
 
 def default_provider():
-    """NATIVE is the default (deprecation flip 2026-07-12): sesh reads the
+    """NATIVE is the default (deprecation flip 2026-07-12): helm reads the
     providers' own usage endpoints directly. A legacy quota CLI is opt-in via
-    SESH_PROVIDER=cli (+ optional SESH_QUOTA_CLI naming the binary)."""
-    choice = (os.environ.get("SESH_PROVIDER") or "native").strip().lower()
+    HELM_PROVIDER=cli (+ optional HELM_QUOTA_CLI naming the binary); the
+    SESH_* spellings still work."""
+    choice = (_env("PROVIDER") or "native").strip().lower()
     if choice == "cli":
-        binary = os.environ.get("SESH_QUOTA_CLI", "tokaware")
+        binary = _env("QUOTA_CLI", "tokaware")
         if shutil.which(binary):
             return CliQuotaProvider(binary)
         # opted into a CLI that isn't installed: fail toward working, loudly
-        print(f"sesh: SESH_PROVIDER=cli but {binary!r} not found — using native provider",
+        print(f"helm: HELM_PROVIDER=cli but {binary!r} not found — using native provider",
               file=sys.stderr)
     return NativeQuotaProvider()
