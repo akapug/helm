@@ -1,0 +1,61 @@
+- generic [ref=e1]:
+  - navigation [ref=e2]:
+    - generic [ref=e3]:
+      - generic [ref=e4]: ⎈
+      - text: helm
+    - button "helm" [ref=e5] [cursor=pointer]
+    - button "quota" [ref=e6] [cursor=pointer]
+    - button "sessions" [ref=e7] [cursor=pointer]
+    - button "configs" [ref=e8] [cursor=pointer]
+    - generic [ref=e9]:
+      - generic [ref=e10]: 10 accounts
+      - generic [ref=e11]: 2,255 work sessions
+      - generic "daily-memory summarizers — kept as training data, hidden from resume search by default" [ref=e12]: +3,422 refs
+      - generic [ref=e13]: 4,820 cl · 857 cx
+      - generic [ref=e14]: 84.5 GB
+    - button "tray (0)" [ref=e15] [cursor=pointer]
+  - generic [ref=e16]:
+    - text: ▸ ▸
+    - generic [ref=e17]:
+      - generic [ref=e18]:
+        - generic [ref=e19]:
+          - searchbox "search sessions — Enter also searches inside every transcript" [active] [ref=e20]: catalog
+          - combobox "restrict the inside-transcript search to one project (greps its real sessions directly — instant, and skips the reference-transcript flood). Pick from your projects or type any path fragment." [ref=e21]: meld
+          - generic "reference transcripts (daily-memory summarizers) are hidden from content search by default — they flood every term. Kept in the corpus as training data. Click to include them." [ref=e22] [cursor=pointer]: "refs: off"
+          - generic [ref=e23] [cursor=pointer]: claude
+          - generic [ref=e24] [cursor=pointer]: codex
+          - combobox [ref=e25] [cursor=pointer]:
+            - 'option "view: recent" [selected]'
+            - 'option "view: by project"'
+            - 'option "view: biggest"'
+            - 'option "view: oldest first"'
+          - combobox [ref=e26] [cursor=pointer]:
+            - 'option "model: provider default" [selected]'
+            - option "fable"
+            - option "opus"
+            - option "sonnet"
+          - generic [ref=e27] [cursor=pointer]: last 45 days
+          - button "↻" [ref=e28] [cursor=pointer]
+          - generic [ref=e29]: 0 / 5,677
+        - generic [ref=e30]:
+          - text: "resume as:"
+          - generic "click to cycle the claude resume account" [ref=e31] [cursor=pointer]: claude → cto@exampleventures.c…
+          - generic "click to cycle the codex resume account" [ref=e32] [cursor=pointer]: codex → cto-exampleventures-c…
+          - generic [ref=e33]: · full picker on the quota tab
+      - generic [ref=e2076]:
+        - generic [ref=e2077]: 1 real session match in meld for “catalog” — click a snippet to read it
+        - generic [ref=e2078]:
+          - generic [ref=e2079]:
+            - generic [ref=e2080]: cl
+            - generic [ref=e2081]:
+              - text: canonical-agent-team-stack
+              - generic [ref=e2082]: 918c9ec7 · ~/dev/akapug/meld
+            - generic [ref=e2083]: 4,642 msg · 25.6M2026-07-18
+            - generic [ref=e2084]:
+              - button "⧉ resume" [ref=e2085] [cursor=pointer]
+              - button "+ team" [ref=e2086] [cursor=pointer]
+          - generic "read the transcript, centered on this match" [ref=e2087] [cursor=pointer]:
+            - text: …ht, artifact freshness, orphan cleanup, function-green verification, and the class-of-bug
+            - mark [ref=e2088]: catalog
+            - text: ".\\n- polyana:polyana-overnight-lang-driver: Use when driving an overnight or long autonomous polyana session to w…"
+  - button "◐ theme" [ref=e2038] [cursor=pointer]

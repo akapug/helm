@@ -1,0 +1,329 @@
+- generic [active] [ref=e1]:
+  - navigation [ref=e2]:
+    - generic [ref=e3]:
+      - generic [ref=e4]: ⎈
+      - text: helm
+    - button "helm" [ref=e5] [cursor=pointer]
+    - button "quota" [ref=e6] [cursor=pointer]
+    - button "sessions" [ref=e7] [cursor=pointer]
+    - button "configs" [ref=e8] [cursor=pointer]
+    - generic [ref=e9]:
+      - generic [ref=e6509]: 10 accounts
+      - generic [ref=e6510]: 2,255 work sessions
+      - generic "daily-memory summarizers — kept as training data, hidden from resume search by default" [ref=e6511]: +3,422 refs
+      - generic [ref=e6512]: 4,820 cl · 857 cx
+      - generic [ref=e6513]: 84.5 GB
+    - button "tray (0)" [ref=e15] [cursor=pointer]
+  - generic [ref=e6379]:
+    - generic [ref=e6380]:
+      - generic "team-example-com, (default-codex) — no auth or no usage endpoint; manage on the homes card, not a quota alert" [ref=e6514]: 2 homes not reporting
+      - generic "(default-claude) dir-name-lies" [ref=e6515]: ⚠ 1 home issue — hygiene plan has the marks
+      - generic "projected remaining at the weekly reset = capacity that expires unused" [ref=e6516]: 4 windows at waste-risk — hey@simbi.com strands ~63%, cto-minusculevent… strands ~100%, david-minusculeve… strands ~100%, owner-gmail-c… strands ~100%
+      - generic [ref=e6517]: "next → fable: cto@minusculeventur… · opus: cto@minusculeventur… · gpt-5.5: cto-minusculeventur…"
+    - generic [ref=e6384]:
+      - generic [ref=e6385]:
+        - generic [ref=e6386]: quota
+        - generic [ref=e6387]:
+          - generic [ref=e6518] [cursor=pointer]: session
+          - generic [ref=e6519] [cursor=pointer]: weekly
+          - generic [ref=e6520] [cursor=pointer]: 5h-gpt-5.3-codex-spark
+          - generic [ref=e6521] [cursor=pointer]: 7d-fable
+          - generic [ref=e6522] [cursor=pointer]: 7d-gpt-5.3-codex-spark
+        - generic [ref=e6390]: remaining % · history + projection to reset · server-truth just now
+      - img [ref=e6391]:
+        - generic [ref=e6523]: "100"
+        - generic [ref=e6524]: "50"
+        - generic [ref=e6525]: "0"
+        - generic [ref=e6526]: now
+        - generic [ref=e6528]: 7/11
+        - generic [ref=e6529]: 7/12
+        - generic [ref=e6530]: 7/13
+        - generic [ref=e6531]: 7/14
+        - generic [ref=e6532]: 7/15
+        - generic [ref=e6533]: 7/16
+        - generic [ref=e6534]: 7/17
+        - generic "1 session last-active here — click to list that day" [ref=e6535] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6536] [cursor=pointer]
+        - generic "4 sessions last-active here — click to list that day" [ref=e6537] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6538] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6539] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6540] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6541] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6542] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6543] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6544] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6545] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6546] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6547] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6548] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6549] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6550] [cursor=pointer]
+        - generic "4 sessions last-active here — click to list that day" [ref=e6551] [cursor=pointer]
+        - generic "5 sessions last-active here — click to list that day" [ref=e6552] [cursor=pointer]
+        - generic "6 sessions last-active here — click to list that day" [ref=e6553] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6554] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6555] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6556] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6557] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6558] [cursor=pointer]
+        - generic "3 sessions last-active here — click to list that day" [ref=e6559] [cursor=pointer]
+        - generic "3 sessions last-active here — click to list that day" [ref=e6560] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6561] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6562] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6563] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6564] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6565] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6566] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6567] [cursor=pointer]
+        - generic [ref=e6588] [cursor=pointer]: david-exampleventures… 100%
+        - generic [ref=e6589] [cursor=pointer]: owner-example-invalid 100%
+        - generic [ref=e6590] [cursor=pointer]: cto-exampleventures-c… 100%
+        - generic [ref=e6591] [cursor=pointer]: team-example-com 93%
+        - generic [ref=e6592] [cursor=pointer]: (default-claude) 90%
+        - generic [ref=e6593] [cursor=pointer]: david@exampleventures… 79%
+        - generic [ref=e6594] [cursor=pointer]: owner@example.invalid 78%
+        - generic [ref=e6595] [cursor=pointer]: hey@simbi.com 63%
+        - generic [ref=e6596] [cursor=pointer]: cto@exampleventures.c… 60%
+      - generic: scroll = zoom · drag = pan · double-click = reset
+    - group [ref=e6392]:
+      - generic "▸ burn ↔ sessions what was active when quota burned — last 48h, temporal join" [ref=e6393] [cursor=pointer]:
+        - text: ▸ burn ↔ sessions
+        - generic [ref=e6394]: what was active when quota burned — last 48h, temporal join
+      - generic [ref=e6992]:
+        - generic [ref=e6993]:
+          - generic [ref=e6994]: 7/18, 09:00 AM
+          - generic "owner@example.invalid burned 25% of its 5h window this hour" [ref=e6996]: david@minusculeve… −25%
+          - generic "~/dev/akapug/helm · claude — click to read the transcript" [ref=e6999] [cursor=pointer]: Review helm project brief and foundational decisions
+        - generic [ref=e7000]:
+          - generic [ref=e7001]: 7/17, 04:00 PM
+          - generic "cto@example.invalid burned 28% of its 5h window this hour" [ref=e7003]: cto@minusculevent… −28%
+          - generic [ref=e7005]: no sessions last-active this hour
+        - generic [ref=e7007]:
+          - generic [ref=e7008]: 7/17, 03:00 PM
+          - generic "cto@example.invalid burned 1% of its 5h window this hour" [ref=e7010]: cto@minusculevent… −1%
+          - generic [ref=e7012]: no sessions last-active this hour
+        - generic [ref=e7014]:
+          - generic [ref=e7015]: 7/17, 12:00 PM
+          - generic "cto@example.invalid burned 3% of its 5h window this hour" [ref=e7017]: cto@minusculevent… −3%
+          - generic [ref=e7019]: no sessions last-active this hour
+        - generic [ref=e7021]:
+          - generic [ref=e7022]: 7/17, 11:00 AM
+          - generic "cto@example.invalid burned 6% of its 5h window this hour" [ref=e7024]: cto@minusculevent… −6%
+          - generic "~/dev/akapug/goodtimes-platform · claude — click to read the transcript" [ref=e7027] [cursor=pointer]: Process buildr whisper message
+        - generic [ref=e7028]:
+          - generic [ref=e7029]: 7/17, 10:00 AM
+          - generic [ref=e7030]:
+            - generic "cto@example.invalid burned 9% of its 5h window this hour" [ref=e7031]: cto@minusculevent… −9%
+            - generic "owner@example.invalid burned 1% of its 5h window this hour" [ref=e7033]: owner@gmail.c… −1%
+          - generic "~/dev/akapug/mission-control · claude — click to read the transcript" [ref=e7036] [cursor=pointer]: (untitled)
+        - generic [ref=e7037]:
+          - generic [ref=e7038]: 7/17, 09:00 AM
+          - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7040]: owner@gmail.c… −3%
+          - generic [ref=e7042]: no sessions last-active this hour
+        - generic [ref=e7044]:
+          - generic [ref=e7045]: 7/17, 08:00 AM
+          - generic [ref=e7046]:
+            - generic "cto@example.invalid burned 8% of its 5h window this hour" [ref=e7047]: cto@minusculevent… −8%
+            - generic "owner@example.invalid burned 4% of its 5h window this hour" [ref=e7049]: owner@gmail.c… −4%
+            - generic "owner@example.invalid burned 1% of its 5h window this hour" [ref=e7051]: david@minusculeve… −1%
+          - generic "~/dev/akapug/sesh · claude — click to read the transcript" [ref=e7054] [cursor=pointer]: Onboard as new sesh maintainer
+        - generic [ref=e7055]:
+          - generic [ref=e7056]: 7/17, 07:00 AM
+          - generic [ref=e7057]:
+            - generic "cto@example.invalid burned 7% of its 5h window this hour" [ref=e7058]: cto@minusculevent… −7%
+            - generic "owner@example.invalid burned 4% of its 5h window this hour" [ref=e7060]: david@minusculeve… −4%
+          - generic [ref=e7062]: no sessions last-active this hour
+        - generic [ref=e7064]:
+          - generic [ref=e7065]: 7/17, 05:00 AM
+          - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7067]: owner@gmail.c… −3%
+          - generic [ref=e7069]: no sessions last-active this hour
+        - generic [ref=e7071]:
+          - generic [ref=e7072]: 7/17, 04:00 AM
+          - generic "owner@example.invalid burned 4% of its 5h window this hour" [ref=e7074]: owner@gmail.c… −4%
+          - generic [ref=e7076]: no sessions last-active this hour
+        - generic [ref=e7078]:
+          - generic [ref=e7079]: 7/17, 03:00 AM
+          - generic "owner@example.invalid burned 4% of its 5h window this hour" [ref=e7081]: owner@gmail.c… −4%
+          - generic [ref=e7083]:
+            - generic "~/dev/akapug/meld-worktrees/a2a-dogfood · claude — click to read the transcript" [ref=e7084] [cursor=pointer]: (untitled)
+            - generic "~/dev/akapug/meld-worktrees/a2a-dogfood · claude — click to read the transcript" [ref=e7085] [cursor=pointer]: (untitled)
+        - generic [ref=e7086]:
+          - generic [ref=e7087]: 7/17, 02:00 AM
+          - generic [ref=e7088]:
+            - generic "owner@example.invalid burned 8% of its 5h window this hour" [ref=e7089]: owner@gmail.c… −8%
+            - generic "cto@example.invalid burned 4% of its 5h window this hour" [ref=e7091]: cto@minusculevent… −4%
+            - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7093]: david@minusculeve… −3%
+          - generic [ref=e7095]: no sessions last-active this hour
+        - generic [ref=e7097]:
+          - generic [ref=e7098]: 7/17, 01:00 AM
+          - generic [ref=e7099]:
+            - generic "cto@example.invalid burned 4% of its 5h window this hour" [ref=e7100]: cto@minusculevent… −4%
+            - generic "owner@example.invalid burned 2% of its 5h window this hour" [ref=e7102]: david@minusculeve… −2%
+          - generic [ref=e7104]:
+            - generic "~/dev/akapug/meld-wt/autojoin · claude — click to read the transcript" [ref=e7105] [cursor=pointer]: (untitled)
+            - generic "~/dev/akapug/meld-wt/autojoin · claude — click to read the transcript" [ref=e7106] [cursor=pointer]: (untitled)
+            - generic "~/dev/akapug/meld · claude — click to read the transcript" [ref=e7107] [cursor=pointer]: Test bash command and detect injected context
+        - generic [ref=e7108]:
+          - generic [ref=e7109]: 7/17, 12:00 AM
+          - generic [ref=e7110]:
+            - generic "hey@simbi.com burned 21% of its 5h window this hour" [ref=e7111]: hey@simbi.com −21%
+            - generic "owner@example.invalid burned 6% of its 5h window this hour" [ref=e7113]: owner@gmail.c… −6%
+            - generic "cto@example.invalid burned 5% of its 5h window this hour" [ref=e7115]: cto@minusculevent… −5%
+            - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7117]: david@minusculeve… −3%
+          - generic [ref=e7119]:
+            - generic "~/dev/akapug/meld · claude — click to read the transcript" [ref=e7120] [cursor=pointer]: Verify meld coordination stack setup
+            - generic "/tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-postfix2 · claude — click to read the transcript" [ref=e7121] [cursor=pointer]: Execute sequential bash commands and report context
+            - generic "/tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-final · claude — click to read the transcript" [ref=e7122] [cursor=pointer]: Run two sequential bash echo commands
+            - generic "~/dev/akapug/meld · claude — click to read the transcript" [ref=e7123] [cursor=pointer]: Verify merged whisper hardening
+            - generic "/tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-postfix · claude — click to read the transcript" [ref=e7124] [cursor=pointer]: Execute sequential bash commands and report context
+        - generic [ref=e7125]:
+          - generic [ref=e7126]: 7/16, 11:00 PM
+          - generic [ref=e7127]:
+            - generic "hey@simbi.com burned 74% of its 5h window this hour" [ref=e7128]: hey@simbi.com −74%
+            - generic "cto@example.invalid burned 5% of its 5h window this hour" [ref=e7130]: cto@minusculevent… −5%
+            - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7132]: david@minusculeve… −3%
+            - generic "owner@example.invalid burned 1% of its 5h window this hour" [ref=e7134]: owner@gmail.c… −1%
+          - generic [ref=e7136]: no sessions last-active this hour
+        - generic [ref=e7138]:
+          - generic [ref=e7139]: 7/16, 10:00 PM
+          - generic [ref=e7140]:
+            - generic "owner@example.invalid burned 5% of its 5h window this hour" [ref=e7141]: david@minusculeve… −5%
+            - generic "cto@example.invalid burned 3% of its 5h window this hour" [ref=e7143]: cto@minusculevent… −3%
+          - generic [ref=e7145]:
+            - generic "/tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-cave-live · claude — click to read the transcript" [ref=e7146] [cursor=pointer]: Run sequential bash commands with sleep
+            - generic "/tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-live · claude — click to read the transcript" [ref=e7147] [cursor=pointer]: Run sequential bash commands
+        - generic [ref=e7148]:
+          - generic [ref=e7149]: 7/16, 05:00 PM
+          - generic "(default-claude) burned 71% of its 5h window this hour" [ref=e7151]: (default-claude) −71%
+          - generic [ref=e7153]: no sessions last-active this hour
+        - generic [ref=e7155]:
+          - generic [ref=e7156]: 7/16, 04:00 PM
+          - generic "(default-claude) burned 8% of its 5h window this hour" [ref=e7158]: (default-claude) −8%
+          - generic [ref=e7160]:
+            - generic "~/dev/akapug/builders-dev · claude — click to read the transcript" [ref=e7161] [cursor=pointer]: Review context management and pricing logic
+            - generic "~/dev/simbi-inc/clockdag-protocol · codex — click to read the transcript" [ref=e7162] [cursor=pointer]: "# AGENTS.md instructions <INSTRUCTIONS> # buildr Codex Rule"
+            - generic "~/dev/akapug/polyana · claude — click to read the transcript" [ref=e7163] [cursor=pointer]: (untitled)
+            - generic "~/dev/simbi-inc · claude — click to read the transcript" [ref=e7164] [cursor=pointer]: Review Simbi Fable cross-family changes
+            - generic "~/dev/akapug/polyana · claude — click to read the transcript" [ref=e7165] [cursor=pointer]: Check system status
+        - generic [ref=e7166]:
+          - generic [ref=e7167]: 7/16, 03:00 PM
+          - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7169]: david@minusculeve… −3%
+          - generic [ref=e7171]:
+            - generic "~/dev/akapug/goodtimes-platform · claude — click to read the transcript" [ref=e7172] [cursor=pointer]: (untitled)
+            - generic "~ · claude — click to read the transcript" [ref=e7173] [cursor=pointer]: (untitled)
+            - generic "~/dev/akapug/embark · claude — click to read the transcript" [ref=e7174] [cursor=pointer]: Resume Embark project in correct directory
+        - generic [ref=e7175]: "temporal join v1: burn = per-hour drop of each account's binding 5h gauge; sessions = last-active that hour, capped at the 8 largest per bucket — coincidence in time, not proven causation"
+    - generic [ref=e6395]:
+      - generic [ref=e6396]:
+        - generic [ref=e6397] [cursor=pointer]: all
+        - generic [ref=e6398] [cursor=pointer]: claude
+        - generic [ref=e6399] [cursor=pointer]: codex
+        - generic [ref=e6400]: click a row to select it for resumes · hover a row to spotlight its line · click a state to copy its fix
+      - table [ref=e6401]:
+        - rowgroup [ref=e6402]:
+          - row [ref=e6597]:
+            - columnheader [ref=e6598] [cursor=pointer]
+            - columnheader "account" [ref=e6599] [cursor=pointer]
+            - columnheader "session (5h)" [ref=e6600] [cursor=pointer]
+            - columnheader "weekly (7d)" [ref=e6601] [cursor=pointer]
+            - columnheader "5h-gpt-5.3-codex-spark" [ref=e6602] [cursor=pointer]
+            - columnheader "7d-fable" [ref=e6603] [cursor=pointer]
+            - columnheader "7d-gpt-5.3-codex-spark" [ref=e6604] [cursor=pointer]
+            - columnheader "win" [ref=e6605] [cursor=pointer]
+        - rowgroup [ref=e6409]:
+          - row [ref=e6606] [cursor=pointer]:
+            - 'cell "binding window: 32% left · SELECTED" [ref=e6607]'
+            - 'cell "cto@example.invalid ▶ Max 20× · ok · home: cto-example-invalid" [ref=e6612]':
+              - text: cto@example.invalid ▶
+              - generic [ref=e6614]: "Max 20× · ok · home: cto-example-invalid"
+            - cell "100%" [ref=e6615]
+            - cell "60% ↻4d" [ref=e6620]
+            - cell "—" [ref=e6625]
+            - cell "32% ↻4d" [ref=e6626]
+            - cell "—" [ref=e6631]
+            - cell "—" [ref=e6632]
+          - row [ref=e6633] [cursor=pointer]:
+            - 'cell "binding window: 68% left" [ref=e6634]'
+            - 'cell "owner@example.invalid ▶ Max 20× · ok · home: owner-example-invalid" [ref=e6639]':
+              - text: owner@example.invalid ▶
+              - generic [ref=e6641]: "Max 20× · ok · home: owner-example-invalid"
+            - cell "75%" [ref=e6642]
+            - cell "79% ↻13h45m" [ref=e6647]
+            - cell "—" [ref=e6652]
+            - cell "68% ↻13h45m" [ref=e6653]
+            - cell "—" [ref=e6658]
+            - cell "—" [ref=e6659]
+          - row [ref=e6660] [cursor=pointer]:
+            - 'cell "binding window: 73% left" [ref=e6661]'
+            - 'cell "owner@example.invalid ▶ Max 20× · ok · home: owner-example-invalid" [ref=e6666]':
+              - text: owner@example.invalid ▶
+              - generic [ref=e6668]: "Max 20× · ok · home: owner-example-invalid"
+            - cell "100% ↻1h55m" [ref=e6669]
+            - cell "78% ↻2d" [ref=e6674]
+            - cell "—" [ref=e6679]
+            - cell "73% ↻2d" [ref=e6680]
+            - cell "—" [ref=e6685]
+            - cell "—" [ref=e6686]
+          - row [ref=e6687] [cursor=pointer]:
+            - 'cell "binding window: 55% left" [ref=e6688]'
+            - 'cell "hey@simbi.com ▶ Max 20× · ok · home: team-example-com" [ref=e6693]':
+              - text: hey@simbi.com ▶
+              - generic [ref=e6695]: "Max 20× · ok · home: team-example-com"
+            - cell "100% ↻4h45m" [ref=e6696]
+            - cell "63% ↻3d" [ref=e6701]
+            - cell "—" [ref=e6706]
+            - cell "55% ↻3d" [ref=e6707]
+            - cell "—" [ref=e6712]
+            - cell "12.3/33.6 waste-danger" [ref=e6713]
+          - row [ref=e6714] [cursor=pointer]:
+            - 'cell "binding window: 99% left · SELECTED" [ref=e6715]'
+            - 'cell "cto-example-invalid ▶ Pro · ok · home: cto-example-invalid" [ref=e6720]':
+              - text: cto-example-invalid ▶
+              - generic [ref=e6722]: "Pro · ok · home: cto-example-invalid"
+            - cell "99%" [ref=e6723]
+            - cell "100% ↻7d" [ref=e6728]
+            - cell "100%" [ref=e6733]
+            - cell "—" [ref=e6738]
+            - cell "100% ↻7d" [ref=e6739]
+            - cell "33.6/33.6 waste-danger" [ref=e6744]
+          - row [ref=e6745] [cursor=pointer]:
+            - 'cell "binding window: 99% left" [ref=e6746]'
+            - 'cell "owner-example-invalid ▶ Pro · ok · home: owner-example-invalid" [ref=e6751]':
+              - text: owner-example-invalid ▶
+              - generic [ref=e6753]: "Pro · ok · home: owner-example-invalid"
+            - cell "99%" [ref=e6754]
+            - cell "100% ↻7d" [ref=e6759]
+            - cell "100%" [ref=e6764]
+            - cell "—" [ref=e6769]
+            - cell "100% ↻7d" [ref=e6770]
+            - cell "33.6/33.6 waste-danger" [ref=e6775]
+          - row [ref=e6776] [cursor=pointer]:
+            - 'cell "binding window: 33% left" [ref=e6777]'
+            - 'cell "owner-example-invalid Team · ok · home: owner-example-invalid" [ref=e6782]':
+              - text: owner-example-invalid
+              - generic [ref=e6784]: "Team · ok · home: owner-example-invalid"
+            - cell "33%" [ref=e6785]
+            - cell "100% ↻7d" [ref=e6790]
+            - cell "—" [ref=e6795]
+            - cell "—" [ref=e6796]
+            - cell "—" [ref=e6797]
+            - cell "33.6/33.6 waste-danger" [ref=e6798]
+          - row [ref=e6799] [cursor=pointer]:
+            - 'cell "binding window: 19% left" [ref=e6800]'
+            - 'cell "(default-claude) Max 20× · ok · home: .claude · ⚠name" [ref=e6805]':
+              - text: (default-claude)
+              - generic [ref=e6807]: "Max 20× · ok · home: .claude · ⚠name"
+            - cell "19%" [ref=e6808]
+            - cell "90% ↻2d" [ref=e6813]
+            - cell "—" [ref=e6818]
+            - cell "86% ↻2d" [ref=e6819]
+            - cell "—" [ref=e6824]
+            - cell "—" [ref=e6825]
+    - group [ref=e6506]:
+      - generic "▸ credential homes one home = one login — helm prepares, YOU run every login" [ref=e6507] [cursor=pointer]:
+        - text: ▸ credential homes
+        - generic [ref=e6508]: one home = one login — helm prepares, YOU run every login
+      - option "claude" [selected]
+      - option "codex"
+  - button "◐ theme" [ref=e2038] [cursor=pointer]
+  - generic: sessions last active 2026-07-17

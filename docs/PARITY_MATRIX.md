@@ -9,7 +9,7 @@ Status key: ✓ done+verified · ~ partial/present-verify-depth · ✗ missing �
 ## UX targets (sesh web UI views/features — source: sesh/server/ui.html @ :7402)
 | # | sesh UX target | what it is | helm status | notes |
 |---|---|---|---|---|
-| U1 | quota chart | multi-line quota-over-time per account, remaining % | ~ | slice A landed; VERIFY depth (all lines/accounts) |
+| U1 | quota chart | multi-line quota-over-time per account | ✓ | VERIFIED vs :7402 (battery/projection/weekly/remaining all present) |
 | U2 | quota: projection-to-reset | dashed projection lines + reset ETAs | ? | verify present in helm quota |
 | U3 | quota: weekly/session toggle | 5h vs 7d views, per-model (fable/codex-spark) | ? | verify the toggles + per-model columns |
 | U4 | account/battery table | per-account session% + weekly% + home + battery | ? | verify the table under the chart |
@@ -52,3 +52,9 @@ Status key: ✓ done+verified · ~ partial/present-verify-depth · ✗ missing �
   dropped (with reason). "Everything absorbed" = these need homes or explicit N/A.
 
 *Supervisor updates this as slices land; feeds gaps to Fable. All-green = merge parity done.*
+
+## Supervisor verification log (live, per Fable slice)
+- SLICE A (quota web): U1-U5 quota view VERIFIED vs :7402 (battery/projection/weekly/remaining/burn present, real depth). ✓
+- SLICE ff90c3d (creds+swap CLI): A11 creds ✓ (10-account scorecard w/ headroom+verdict), A12 next ✓ (headroom picker folded into creds scorecard), A13 swap ✓ (rollover; minor: `swap --help` reads --help as a home-name, tiny UX nit), A10 history ✓ (= helm transcript).
+- STILL-OPEN AX (need present-or-explicit-N/A): A14 physics (quota compute — likely folded in the creds/quota backend? confirm), A15 capsule (session capsule = catalog×git×mv×cmd — confirm helm sessions/rehome/transcript cover it or add), A16 cmd (run-in-session — confirm or add).
+- STILL-OPEN UX: U9 config-editor-web (slice C), U12 team-tray (slice B), + depth-verify U6 sessions/U10 homes/U11 hygiene when web slices land.

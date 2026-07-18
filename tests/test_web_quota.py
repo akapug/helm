@@ -282,8 +282,8 @@ class TestWebQuota(unittest.TestCase):
         for marker in ('id="grid"', 'id="store"', 'id="sessions"', 'id="skillsec"',
                        'id="hello"', 'id="foot"'):
             self.assertIn(marker, body, "helm view markup missing: %s" % marker)
-        # slice B / C placeholders are explicit, not blank
-        self.assertIn("slice B", body)
+        # slice B landed (real sessions view); the slice C placeholder is explicit
+        self.assertIn('id="sesscontrols"', body)
         self.assertIn("slice C", body)
 
     def test_existing_endpoints_still_work(self):

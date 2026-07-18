@@ -1,0 +1,205 @@
+- generic [active] [ref=e1]:
+  - navigation [ref=e2]:
+    - generic [ref=e3]:
+      - generic [ref=e4]: ⎈
+      - text: helm
+    - button "helm" [ref=e5] [cursor=pointer]
+    - button "quota" [ref=e6] [cursor=pointer]
+    - button "sessions" [ref=e7] [cursor=pointer]
+    - button "configs" [ref=e8] [cursor=pointer]
+    - generic [ref=e9]:
+      - generic [ref=e6509]: 10 accounts
+      - generic [ref=e6510]: 2,255 work sessions
+      - generic "daily-memory summarizers — kept as training data, hidden from resume search by default" [ref=e6511]: +3,422 refs
+      - generic [ref=e6512]: 4,820 cl · 857 cx
+      - generic [ref=e6513]: 84.5 GB
+    - button "tray (0)" [ref=e15] [cursor=pointer]
+  - generic [ref=e6379]:
+    - generic [ref=e6380]:
+      - generic "team-example-com, (default-codex) — no auth or no usage endpoint; manage on the homes card, not a quota alert" [ref=e6514]: 2 homes not reporting
+      - generic "(default-claude) dir-name-lies" [ref=e6515]: ⚠ 1 home issue — hygiene plan has the marks
+      - generic "projected remaining at the weekly reset = capacity that expires unused" [ref=e6516]: 4 windows at waste-risk — hey@simbi.com strands ~63%, cto-minusculevent… strands ~100%, david-minusculeve… strands ~100%, owner-gmail-c… strands ~100%
+      - generic [ref=e6517]: "next → fable: cto@minusculeventur… · opus: cto@minusculeventur… · gpt-5.5: cto-minusculeventur…"
+    - generic [ref=e6384]:
+      - generic [ref=e6385]:
+        - generic [ref=e6386]: quota
+        - generic [ref=e6387]:
+          - generic [ref=e6518] [cursor=pointer]: session
+          - generic [ref=e6519] [cursor=pointer]: weekly
+          - generic [ref=e6520] [cursor=pointer]: 5h-gpt-5.3-codex-spark
+          - generic [ref=e6521] [cursor=pointer]: 7d-fable
+          - generic [ref=e6522] [cursor=pointer]: 7d-gpt-5.3-codex-spark
+        - generic [ref=e6390]: remaining % · history + projection to reset · server-truth just now
+      - img [ref=e6391]:
+        - generic [ref=e6523]: "100"
+        - generic [ref=e6524]: "50"
+        - generic [ref=e6525]: "0"
+        - generic [ref=e6526]: now
+        - generic [ref=e6528]: 7/11
+        - generic [ref=e6529]: 7/12
+        - generic [ref=e6530]: 7/13
+        - generic [ref=e6531]: 7/14
+        - generic [ref=e6532]: 7/15
+        - generic [ref=e6533]: 7/16
+        - generic [ref=e6534]: 7/17
+        - generic "1 session last-active here — click to list that day" [ref=e6535] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6536] [cursor=pointer]
+        - generic "4 sessions last-active here — click to list that day" [ref=e6537] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6538] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6539] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6540] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6541] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6542] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6543] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6544] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6545] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6546] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6547] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6548] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6549] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6550] [cursor=pointer]
+        - generic "4 sessions last-active here — click to list that day" [ref=e6551] [cursor=pointer]
+        - generic "5 sessions last-active here — click to list that day" [ref=e6552] [cursor=pointer]
+        - generic "6 sessions last-active here — click to list that day" [ref=e6553] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6554] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6555] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6556] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6557] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6558] [cursor=pointer]
+        - generic "3 sessions last-active here — click to list that day" [ref=e6559] [cursor=pointer]
+        - generic "3 sessions last-active here — click to list that day" [ref=e6560] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6561] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6562] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6563] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6564] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6565] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6566] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6567] [cursor=pointer]
+        - generic [ref=e6588] [cursor=pointer]: david-exampleventures… 100%
+        - generic [ref=e6589] [cursor=pointer]: owner-example-invalid 100%
+        - generic [ref=e6590] [cursor=pointer]: cto-exampleventures-c… 100%
+        - generic [ref=e6591] [cursor=pointer]: team-example-com 93%
+        - generic [ref=e6592] [cursor=pointer]: (default-claude) 90%
+        - generic [ref=e6593] [cursor=pointer]: david@exampleventures… 79%
+        - generic [ref=e6594] [cursor=pointer]: owner@example.invalid 78%
+        - generic [ref=e6595] [cursor=pointer]: hey@simbi.com 63%
+        - generic [ref=e6596] [cursor=pointer]: cto@exampleventures.c… 60%
+      - generic: scroll = zoom · drag = pan · double-click = reset
+    - group [ref=e6392]:
+      - generic "▸ burn ↔ sessions what was active when quota burned — last 48h, temporal join" [ref=e6393] [cursor=pointer]:
+        - text: ▸ burn ↔ sessions
+        - generic [ref=e6394]: what was active when quota burned — last 48h, temporal join
+    - generic [ref=e6395]:
+      - generic [ref=e6396]:
+        - generic [ref=e6397] [cursor=pointer]: all
+        - generic [ref=e6398] [cursor=pointer]: claude
+        - generic [ref=e6399] [cursor=pointer]: codex
+        - generic [ref=e6400]: click a row to select it for resumes · hover a row to spotlight its line · click a state to copy its fix
+      - table [ref=e6401]:
+        - rowgroup [ref=e6402]:
+          - row [ref=e6597]:
+            - columnheader [ref=e6598] [cursor=pointer]
+            - columnheader "account" [ref=e6599] [cursor=pointer]
+            - columnheader "session (5h)" [ref=e6600] [cursor=pointer]
+            - columnheader "weekly (7d)" [ref=e6601] [cursor=pointer]
+            - columnheader "5h-gpt-5.3-codex-spark" [ref=e6602] [cursor=pointer]
+            - columnheader "7d-fable" [ref=e6603] [cursor=pointer]
+            - columnheader "7d-gpt-5.3-codex-spark" [ref=e6604] [cursor=pointer]
+            - columnheader "win" [ref=e6605] [cursor=pointer]
+        - rowgroup [ref=e6409]:
+          - row [ref=e6606] [cursor=pointer]:
+            - 'cell "binding window: 32% left · SELECTED" [ref=e6607]'
+            - 'cell "cto@example.invalid ▶ Max 20× · ok · home: cto-example-invalid" [ref=e6612]':
+              - text: cto@example.invalid ▶
+              - generic [ref=e6614]: "Max 20× · ok · home: cto-example-invalid"
+            - cell "100%" [ref=e6615]
+            - cell "60% ↻4d" [ref=e6620]
+            - cell "—" [ref=e6625]
+            - cell "32% ↻4d" [ref=e6626]
+            - cell "—" [ref=e6631]
+            - cell "—" [ref=e6632]
+          - row [ref=e6633] [cursor=pointer]:
+            - 'cell "binding window: 68% left" [ref=e6634]'
+            - 'cell "owner@example.invalid ▶ Max 20× · ok · home: owner-example-invalid" [ref=e6639]':
+              - text: owner@example.invalid ▶
+              - generic [ref=e6641]: "Max 20× · ok · home: owner-example-invalid"
+            - cell "75%" [ref=e6642]
+            - cell "79% ↻13h45m" [ref=e6647]
+            - cell "—" [ref=e6652]
+            - cell "68% ↻13h45m" [ref=e6653]
+            - cell "—" [ref=e6658]
+            - cell "—" [ref=e6659]
+          - row [ref=e6660] [cursor=pointer]:
+            - 'cell "binding window: 73% left" [ref=e6661]'
+            - 'cell "owner@example.invalid ▶ Max 20× · ok · home: owner-example-invalid" [ref=e6666]':
+              - text: owner@example.invalid ▶
+              - generic [ref=e6668]: "Max 20× · ok · home: owner-example-invalid"
+            - cell "100% ↻1h55m" [ref=e6669]
+            - cell "78% ↻2d" [ref=e6674]
+            - cell "—" [ref=e6679]
+            - cell "73% ↻2d" [ref=e6680]
+            - cell "—" [ref=e6685]
+            - cell "—" [ref=e6686]
+          - row [ref=e6687] [cursor=pointer]:
+            - 'cell "binding window: 55% left" [ref=e6688]'
+            - 'cell "hey@simbi.com ▶ Max 20× · ok · home: team-example-com" [ref=e6693]':
+              - text: hey@simbi.com ▶
+              - generic [ref=e6695]: "Max 20× · ok · home: team-example-com"
+            - cell "100% ↻4h45m" [ref=e6696]
+            - cell "63% ↻3d" [ref=e6701]
+            - cell "—" [ref=e6706]
+            - cell "55% ↻3d" [ref=e6707]
+            - cell "—" [ref=e6712]
+            - cell "12.3/33.6 waste-danger" [ref=e6713]
+          - row [ref=e6714] [cursor=pointer]:
+            - 'cell "binding window: 99% left · SELECTED" [ref=e6715]'
+            - 'cell "cto-example-invalid ▶ Pro · ok · home: cto-example-invalid" [ref=e6720]':
+              - text: cto-example-invalid ▶
+              - generic [ref=e6722]: "Pro · ok · home: cto-example-invalid"
+            - cell "99%" [ref=e6723]
+            - cell "100% ↻7d" [ref=e6728]
+            - cell "100%" [ref=e6733]
+            - cell "—" [ref=e6738]
+            - cell "100% ↻7d" [ref=e6739]
+            - cell "33.6/33.6 waste-danger" [ref=e6744]
+          - row [ref=e6745] [cursor=pointer]:
+            - 'cell "binding window: 99% left" [ref=e6746]'
+            - 'cell "owner-example-invalid ▶ Pro · ok · home: owner-example-invalid" [ref=e6751]':
+              - text: owner-example-invalid ▶
+              - generic [ref=e6753]: "Pro · ok · home: owner-example-invalid"
+            - cell "99%" [ref=e6754]
+            - cell "100% ↻7d" [ref=e6759]
+            - cell "100%" [ref=e6764]
+            - cell "—" [ref=e6769]
+            - cell "100% ↻7d" [ref=e6770]
+            - cell "33.6/33.6 waste-danger" [ref=e6775]
+          - row [ref=e6776] [cursor=pointer]:
+            - 'cell "binding window: 33% left" [ref=e6777]'
+            - 'cell "owner-example-invalid Team · ok · home: owner-example-invalid" [ref=e6782]':
+              - text: owner-example-invalid
+              - generic [ref=e6784]: "Team · ok · home: owner-example-invalid"
+            - cell "33%" [ref=e6785]
+            - cell "100% ↻7d" [ref=e6790]
+            - cell "—" [ref=e6795]
+            - cell "—" [ref=e6796]
+            - cell "—" [ref=e6797]
+            - cell "33.6/33.6 waste-danger" [ref=e6798]
+          - row [ref=e6799] [cursor=pointer]:
+            - 'cell "binding window: 19% left" [ref=e6800]'
+            - 'cell "(default-claude) Max 20× · ok · home: .claude · ⚠name" [ref=e6805]':
+              - text: (default-claude)
+              - generic [ref=e6807]: "Max 20× · ok · home: .claude · ⚠name"
+            - cell "19%" [ref=e6808]
+            - cell "90% ↻2d" [ref=e6813]
+            - cell "—" [ref=e6818]
+            - cell "86% ↻2d" [ref=e6819]
+            - cell "—" [ref=e6824]
+            - cell "—" [ref=e6825]
+    - group [ref=e6506]:
+      - generic "▸ credential homes one home = one login — helm prepares, YOU run every login" [ref=e6507] [cursor=pointer]:
+        - text: ▸ credential homes
+        - generic [ref=e6508]: one home = one login — helm prepares, YOU run every login
+      - option "claude" [selected]
+      - option "codex"
+  - button "◐ theme" [ref=e2038] [cursor=pointer]
+  - generic: copied ➜ cd /home/owner/dev/akapug/meld && CLAUDE_CONFIG_DIR=/home/owner/.claude-homes/cto-example-invalid claude --resume 918c9ec7-92ae-4c33-b718-486df982813c

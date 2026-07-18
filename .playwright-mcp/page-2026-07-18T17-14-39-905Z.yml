@@ -1,0 +1,483 @@
+- generic [active] [ref=e1]:
+  - navigation [ref=e2]:
+    - generic [ref=e3]:
+      - generic [ref=e4]: ⎈
+      - text: helm
+    - button "helm" [ref=e5] [cursor=pointer]
+    - button "quota" [ref=e6] [cursor=pointer]
+    - button "sessions" [ref=e7] [cursor=pointer]
+    - button "configs" [ref=e8] [cursor=pointer]
+    - generic [ref=e9]:
+      - generic [ref=e6509]: 10 accounts
+      - generic [ref=e6510]: 2,255 work sessions
+      - generic "daily-memory summarizers — kept as training data, hidden from resume search by default" [ref=e6511]: +3,422 refs
+      - generic [ref=e6512]: 4,820 cl · 857 cx
+      - generic [ref=e6513]: 84.5 GB
+    - button "tray (0)" [ref=e15] [cursor=pointer]
+  - generic [ref=e6379]:
+    - generic [ref=e6380]:
+      - generic "team-example-com, (default-codex) — no auth or no usage endpoint; manage on the homes card, not a quota alert" [ref=e6514]: 2 homes not reporting
+      - generic "(default-claude) dir-name-lies" [ref=e6515]: ⚠ 1 home issue — hygiene plan has the marks
+      - generic "projected remaining at the weekly reset = capacity that expires unused" [ref=e6516]: 4 windows at waste-risk — hey@simbi.com strands ~63%, cto-minusculevent… strands ~100%, david-minusculeve… strands ~100%, owner-gmail-c… strands ~100%
+      - generic [ref=e6517]: "next → fable: cto@minusculeventur… · opus: cto@minusculeventur… · gpt-5.5: cto-minusculeventur…"
+    - generic [ref=e6384]:
+      - generic [ref=e6385]:
+        - generic [ref=e6386]: quota
+        - generic [ref=e6387]:
+          - generic [ref=e6518] [cursor=pointer]: session
+          - generic [ref=e6519] [cursor=pointer]: weekly
+          - generic [ref=e6520] [cursor=pointer]: 5h-gpt-5.3-codex-spark
+          - generic [ref=e6521] [cursor=pointer]: 7d-fable
+          - generic [ref=e6522] [cursor=pointer]: 7d-gpt-5.3-codex-spark
+        - generic [ref=e6390]: remaining % · history + projection to reset · server-truth just now
+      - img [ref=e6391]:
+        - generic [ref=e6523]: "100"
+        - generic [ref=e6524]: "50"
+        - generic [ref=e6525]: "0"
+        - generic [ref=e6526]: now
+        - generic [ref=e6528]: 7/11
+        - generic [ref=e6529]: 7/12
+        - generic [ref=e6530]: 7/13
+        - generic [ref=e6531]: 7/14
+        - generic [ref=e6532]: 7/15
+        - generic [ref=e6533]: 7/16
+        - generic [ref=e6534]: 7/17
+        - generic "1 session last-active here — click to list that day" [ref=e6535] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6536] [cursor=pointer]
+        - generic "4 sessions last-active here — click to list that day" [ref=e6537] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6538] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6539] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6540] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6541] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6542] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6543] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6544] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6545] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6546] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6547] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6548] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6549] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6550] [cursor=pointer]
+        - generic "4 sessions last-active here — click to list that day" [ref=e6551] [cursor=pointer]
+        - generic "5 sessions last-active here — click to list that day" [ref=e6552] [cursor=pointer]
+        - generic "6 sessions last-active here — click to list that day" [ref=e6553] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6554] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6555] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6556] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6557] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6558] [cursor=pointer]
+        - generic "3 sessions last-active here — click to list that day" [ref=e6559] [cursor=pointer]
+        - generic "3 sessions last-active here — click to list that day" [ref=e6560] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6561] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6562] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6563] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6564] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6565] [cursor=pointer]
+        - generic "1 session last-active here — click to list that day" [ref=e6566] [cursor=pointer]
+        - generic "2 sessions last-active here — click to list that day" [ref=e6567] [cursor=pointer]
+        - generic [ref=e6588] [cursor=pointer]: david-exampleventures… 100%
+        - generic [ref=e6589] [cursor=pointer]: owner-example-invalid 100%
+        - generic [ref=e6590] [cursor=pointer]: cto-exampleventures-c… 100%
+        - generic [ref=e6591] [cursor=pointer]: team-example-com 93%
+        - generic [ref=e6592] [cursor=pointer]: (default-claude) 90%
+        - generic [ref=e6593] [cursor=pointer]: david@exampleventures… 79%
+        - generic [ref=e6594] [cursor=pointer]: owner@example.invalid 78%
+        - generic [ref=e6595] [cursor=pointer]: hey@simbi.com 63%
+        - generic [ref=e6596] [cursor=pointer]: cto@exampleventures.c… 60%
+      - generic: scroll = zoom · drag = pan · double-click = reset
+    - group [ref=e6392]:
+      - generic "▸ burn ↔ sessions what was active when quota burned — last 48h, temporal join" [ref=e6393] [cursor=pointer]:
+        - text: ▸ burn ↔ sessions
+        - generic [ref=e6394]: what was active when quota burned — last 48h, temporal join
+      - generic [ref=e6992]:
+        - generic [ref=e6993]:
+          - generic [ref=e6994]: 7/18, 09:00 AM
+          - generic "owner@example.invalid burned 25% of its 5h window this hour" [ref=e6996]: david@minusculeve… −25%
+          - generic "~/dev/akapug/helm · claude — click to read the transcript" [ref=e6999] [cursor=pointer]: Review helm project brief and foundational decisions
+        - generic [ref=e7000]:
+          - generic [ref=e7001]: 7/17, 04:00 PM
+          - generic "cto@example.invalid burned 28% of its 5h window this hour" [ref=e7003]: cto@minusculevent… −28%
+          - generic [ref=e7005]: no sessions last-active this hour
+        - generic [ref=e7007]:
+          - generic [ref=e7008]: 7/17, 03:00 PM
+          - generic "cto@example.invalid burned 1% of its 5h window this hour" [ref=e7010]: cto@minusculevent… −1%
+          - generic [ref=e7012]: no sessions last-active this hour
+        - generic [ref=e7014]:
+          - generic [ref=e7015]: 7/17, 12:00 PM
+          - generic "cto@example.invalid burned 3% of its 5h window this hour" [ref=e7017]: cto@minusculevent… −3%
+          - generic [ref=e7019]: no sessions last-active this hour
+        - generic [ref=e7021]:
+          - generic [ref=e7022]: 7/17, 11:00 AM
+          - generic "cto@example.invalid burned 6% of its 5h window this hour" [ref=e7024]: cto@minusculevent… −6%
+          - generic "~/dev/akapug/goodtimes-platform · claude — click to read the transcript" [ref=e7027] [cursor=pointer]: Process buildr whisper message
+        - generic [ref=e7028]:
+          - generic [ref=e7029]: 7/17, 10:00 AM
+          - generic [ref=e7030]:
+            - generic "cto@example.invalid burned 9% of its 5h window this hour" [ref=e7031]: cto@minusculevent… −9%
+            - generic "owner@example.invalid burned 1% of its 5h window this hour" [ref=e7033]: owner@gmail.c… −1%
+          - generic "~/dev/akapug/mission-control · claude — click to read the transcript" [ref=e7036] [cursor=pointer]: (untitled)
+        - generic [ref=e7037]:
+          - generic [ref=e7038]: 7/17, 09:00 AM
+          - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7040]: owner@gmail.c… −3%
+          - generic [ref=e7042]: no sessions last-active this hour
+        - generic [ref=e7044]:
+          - generic [ref=e7045]: 7/17, 08:00 AM
+          - generic [ref=e7046]:
+            - generic "cto@example.invalid burned 8% of its 5h window this hour" [ref=e7047]: cto@minusculevent… −8%
+            - generic "owner@example.invalid burned 4% of its 5h window this hour" [ref=e7049]: owner@gmail.c… −4%
+            - generic "owner@example.invalid burned 1% of its 5h window this hour" [ref=e7051]: david@minusculeve… −1%
+          - generic "~/dev/akapug/sesh · claude — click to read the transcript" [ref=e7054] [cursor=pointer]: Onboard as new sesh maintainer
+        - generic [ref=e7055]:
+          - generic [ref=e7056]: 7/17, 07:00 AM
+          - generic [ref=e7057]:
+            - generic "cto@example.invalid burned 7% of its 5h window this hour" [ref=e7058]: cto@minusculevent… −7%
+            - generic "owner@example.invalid burned 4% of its 5h window this hour" [ref=e7060]: david@minusculeve… −4%
+          - generic [ref=e7062]: no sessions last-active this hour
+        - generic [ref=e7064]:
+          - generic [ref=e7065]: 7/17, 05:00 AM
+          - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7067]: owner@gmail.c… −3%
+          - generic [ref=e7069]: no sessions last-active this hour
+        - generic [ref=e7071]:
+          - generic [ref=e7072]: 7/17, 04:00 AM
+          - generic "owner@example.invalid burned 4% of its 5h window this hour" [ref=e7074]: owner@gmail.c… −4%
+          - generic [ref=e7076]: no sessions last-active this hour
+        - generic [ref=e7078]:
+          - generic [ref=e7079]: 7/17, 03:00 AM
+          - generic "owner@example.invalid burned 4% of its 5h window this hour" [ref=e7081]: owner@gmail.c… −4%
+          - generic [ref=e7083]:
+            - generic "~/dev/akapug/meld-worktrees/a2a-dogfood · claude — click to read the transcript" [ref=e7084] [cursor=pointer]: (untitled)
+            - generic "~/dev/akapug/meld-worktrees/a2a-dogfood · claude — click to read the transcript" [ref=e7085] [cursor=pointer]: (untitled)
+        - generic [ref=e7086]:
+          - generic [ref=e7087]: 7/17, 02:00 AM
+          - generic [ref=e7088]:
+            - generic "owner@example.invalid burned 8% of its 5h window this hour" [ref=e7089]: owner@gmail.c… −8%
+            - generic "cto@example.invalid burned 4% of its 5h window this hour" [ref=e7091]: cto@minusculevent… −4%
+            - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7093]: david@minusculeve… −3%
+          - generic [ref=e7095]: no sessions last-active this hour
+        - generic [ref=e7097]:
+          - generic [ref=e7098]: 7/17, 01:00 AM
+          - generic [ref=e7099]:
+            - generic "cto@example.invalid burned 4% of its 5h window this hour" [ref=e7100]: cto@minusculevent… −4%
+            - generic "owner@example.invalid burned 2% of its 5h window this hour" [ref=e7102]: david@minusculeve… −2%
+          - generic [ref=e7104]:
+            - generic "~/dev/akapug/meld-wt/autojoin · claude — click to read the transcript" [ref=e7105] [cursor=pointer]: (untitled)
+            - generic "~/dev/akapug/meld-wt/autojoin · claude — click to read the transcript" [ref=e7106] [cursor=pointer]: (untitled)
+            - generic "~/dev/akapug/meld · claude — click to read the transcript" [ref=e7107] [cursor=pointer]: Test bash command and detect injected context
+        - generic [ref=e7108]:
+          - generic [ref=e7109]: 7/17, 12:00 AM
+          - generic [ref=e7110]:
+            - generic "hey@simbi.com burned 21% of its 5h window this hour" [ref=e7111]: hey@simbi.com −21%
+            - generic "owner@example.invalid burned 6% of its 5h window this hour" [ref=e7113]: owner@gmail.c… −6%
+            - generic "cto@example.invalid burned 5% of its 5h window this hour" [ref=e7115]: cto@minusculevent… −5%
+            - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7117]: david@minusculeve… −3%
+          - generic [ref=e7119]:
+            - generic "~/dev/akapug/meld · claude — click to read the transcript" [ref=e7120] [cursor=pointer]: Verify meld coordination stack setup
+            - generic "/tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-postfix2 · claude — click to read the transcript" [ref=e7121] [cursor=pointer]: Execute sequential bash commands and report context
+            - generic "/tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-final · claude — click to read the transcript" [ref=e7122] [cursor=pointer]: Run two sequential bash echo commands
+            - generic "~/dev/akapug/meld · claude — click to read the transcript" [ref=e7123] [cursor=pointer]: Verify merged whisper hardening
+            - generic "/tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-postfix · claude — click to read the transcript" [ref=e7124] [cursor=pointer]: Execute sequential bash commands and report context
+        - generic [ref=e7125]:
+          - generic [ref=e7126]: 7/16, 11:00 PM
+          - generic [ref=e7127]:
+            - generic "hey@simbi.com burned 74% of its 5h window this hour" [ref=e7128]: hey@simbi.com −74%
+            - generic "cto@example.invalid burned 5% of its 5h window this hour" [ref=e7130]: cto@minusculevent… −5%
+            - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7132]: david@minusculeve… −3%
+            - generic "owner@example.invalid burned 1% of its 5h window this hour" [ref=e7134]: owner@gmail.c… −1%
+          - generic [ref=e7136]: no sessions last-active this hour
+        - generic [ref=e7138]:
+          - generic [ref=e7139]: 7/16, 10:00 PM
+          - generic [ref=e7140]:
+            - generic "owner@example.invalid burned 5% of its 5h window this hour" [ref=e7141]: david@minusculeve… −5%
+            - generic "cto@example.invalid burned 3% of its 5h window this hour" [ref=e7143]: cto@minusculevent… −3%
+          - generic [ref=e7145]:
+            - generic "/tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-cave-live · claude — click to read the transcript" [ref=e7146] [cursor=pointer]: Run sequential bash commands with sleep
+            - generic "/tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-live · claude — click to read the transcript" [ref=e7147] [cursor=pointer]: Run sequential bash commands
+        - generic [ref=e7148]:
+          - generic [ref=e7149]: 7/16, 05:00 PM
+          - generic "(default-claude) burned 71% of its 5h window this hour" [ref=e7151]: (default-claude) −71%
+          - generic [ref=e7153]: no sessions last-active this hour
+        - generic [ref=e7155]:
+          - generic [ref=e7156]: 7/16, 04:00 PM
+          - generic "(default-claude) burned 8% of its 5h window this hour" [ref=e7158]: (default-claude) −8%
+          - generic [ref=e7160]:
+            - generic "~/dev/akapug/builders-dev · claude — click to read the transcript" [ref=e7161] [cursor=pointer]: Review context management and pricing logic
+            - generic "~/dev/simbi-inc/clockdag-protocol · codex — click to read the transcript" [ref=e7162] [cursor=pointer]: "# AGENTS.md instructions <INSTRUCTIONS> # buildr Codex Rule"
+            - generic "~/dev/akapug/polyana · claude — click to read the transcript" [ref=e7163] [cursor=pointer]: (untitled)
+            - generic "~/dev/simbi-inc · claude — click to read the transcript" [ref=e7164] [cursor=pointer]: Review Simbi Fable cross-family changes
+            - generic "~/dev/akapug/polyana · claude — click to read the transcript" [ref=e7165] [cursor=pointer]: Check system status
+        - generic [ref=e7166]:
+          - generic [ref=e7167]: 7/16, 03:00 PM
+          - generic "owner@example.invalid burned 3% of its 5h window this hour" [ref=e7169]: david@minusculeve… −3%
+          - generic [ref=e7171]:
+            - generic "~/dev/akapug/goodtimes-platform · claude — click to read the transcript" [ref=e7172] [cursor=pointer]: (untitled)
+            - generic "~ · claude — click to read the transcript" [ref=e7173] [cursor=pointer]: (untitled)
+            - generic "~/dev/akapug/embark · claude — click to read the transcript" [ref=e7174] [cursor=pointer]: Resume Embark project in correct directory
+        - generic [ref=e7175]: "temporal join v1: burn = per-hour drop of each account's binding 5h gauge; sessions = last-active that hour, capped at the 8 largest per bucket — coincidence in time, not proven causation"
+    - generic [ref=e6395]:
+      - generic [ref=e6396]:
+        - generic [ref=e6397] [cursor=pointer]: all
+        - generic [ref=e6398] [cursor=pointer]: claude
+        - generic [ref=e6399] [cursor=pointer]: codex
+        - generic [ref=e6400]: click a row to select it for resumes · hover a row to spotlight its line · click a state to copy its fix
+      - table [ref=e6401]:
+        - rowgroup [ref=e6402]:
+          - row [ref=e6597]:
+            - columnheader [ref=e6598] [cursor=pointer]
+            - columnheader "account" [ref=e6599] [cursor=pointer]
+            - columnheader "session (5h)" [ref=e6600] [cursor=pointer]
+            - columnheader "weekly (7d)" [ref=e6601] [cursor=pointer]
+            - columnheader "5h-gpt-5.3-codex-spark" [ref=e6602] [cursor=pointer]
+            - columnheader "7d-fable" [ref=e6603] [cursor=pointer]
+            - columnheader "7d-gpt-5.3-codex-spark" [ref=e6604] [cursor=pointer]
+            - columnheader "win" [ref=e6605] [cursor=pointer]
+        - rowgroup [ref=e6409]:
+          - row [ref=e6606] [cursor=pointer]:
+            - 'cell "binding window: 32% left · SELECTED" [ref=e6607]'
+            - 'cell "cto@example.invalid ▶ Max 20× · ok · home: cto-example-invalid" [ref=e6612]':
+              - text: cto@example.invalid ▶
+              - generic [ref=e6614]: "Max 20× · ok · home: cto-example-invalid"
+            - cell "100%" [ref=e6615]
+            - cell "60% ↻4d" [ref=e6620]
+            - cell "—" [ref=e6625]
+            - cell "32% ↻4d" [ref=e6626]
+            - cell "—" [ref=e6631]
+            - cell "—" [ref=e6632]
+          - row [ref=e6633] [cursor=pointer]:
+            - 'cell "binding window: 68% left" [ref=e6634]'
+            - 'cell "owner@example.invalid ▶ Max 20× · ok · home: owner-example-invalid" [ref=e6639]':
+              - text: owner@example.invalid ▶
+              - generic [ref=e6641]: "Max 20× · ok · home: owner-example-invalid"
+            - cell "75%" [ref=e6642]
+            - cell "79% ↻13h45m" [ref=e6647]
+            - cell "—" [ref=e6652]
+            - cell "68% ↻13h45m" [ref=e6653]
+            - cell "—" [ref=e6658]
+            - cell "—" [ref=e6659]
+          - row [ref=e6660] [cursor=pointer]:
+            - 'cell "binding window: 73% left" [ref=e6661]'
+            - 'cell "owner@example.invalid ▶ Max 20× · ok · home: owner-example-invalid" [ref=e6666]':
+              - text: owner@example.invalid ▶
+              - generic [ref=e6668]: "Max 20× · ok · home: owner-example-invalid"
+            - cell "100% ↻1h55m" [ref=e6669]
+            - cell "78% ↻2d" [ref=e6674]
+            - cell "—" [ref=e6679]
+            - cell "73% ↻2d" [ref=e6680]
+            - cell "—" [ref=e6685]
+            - cell "—" [ref=e6686]
+          - row [ref=e6687] [cursor=pointer]:
+            - 'cell "binding window: 55% left" [ref=e6688]'
+            - 'cell "hey@simbi.com ▶ Max 20× · ok · home: team-example-com" [ref=e6693]':
+              - text: hey@simbi.com ▶
+              - generic [ref=e6695]: "Max 20× · ok · home: team-example-com"
+            - cell "100% ↻4h45m" [ref=e6696]
+            - cell "63% ↻3d" [ref=e6701]
+            - cell "—" [ref=e6706]
+            - cell "55% ↻3d" [ref=e6707]
+            - cell "—" [ref=e6712]
+            - cell "12.3/33.6 waste-danger" [ref=e6713]
+          - row [ref=e6714] [cursor=pointer]:
+            - 'cell "binding window: 99% left · SELECTED" [ref=e6715]'
+            - 'cell "cto-example-invalid ▶ Pro · ok · home: cto-example-invalid" [ref=e6720]':
+              - text: cto-example-invalid ▶
+              - generic [ref=e6722]: "Pro · ok · home: cto-example-invalid"
+            - cell "99%" [ref=e6723]
+            - cell "100% ↻7d" [ref=e6728]
+            - cell "100%" [ref=e6733]
+            - cell "—" [ref=e6738]
+            - cell "100% ↻7d" [ref=e6739]
+            - cell "33.6/33.6 waste-danger" [ref=e6744]
+          - row [ref=e6745] [cursor=pointer]:
+            - 'cell "binding window: 99% left" [ref=e6746]'
+            - 'cell "owner-example-invalid ▶ Pro · ok · home: owner-example-invalid" [ref=e6751]':
+              - text: owner-example-invalid ▶
+              - generic [ref=e6753]: "Pro · ok · home: owner-example-invalid"
+            - cell "99%" [ref=e6754]
+            - cell "100% ↻7d" [ref=e6759]
+            - cell "100%" [ref=e6764]
+            - cell "—" [ref=e6769]
+            - cell "100% ↻7d" [ref=e6770]
+            - cell "33.6/33.6 waste-danger" [ref=e6775]
+          - row [ref=e6776] [cursor=pointer]:
+            - 'cell "binding window: 33% left" [ref=e6777]'
+            - 'cell "owner-example-invalid Team · ok · home: owner-example-invalid" [ref=e6782]':
+              - text: owner-example-invalid
+              - generic [ref=e6784]: "Team · ok · home: owner-example-invalid"
+            - cell "33%" [ref=e6785]
+            - cell "100% ↻7d" [ref=e6790]
+            - cell "—" [ref=e6795]
+            - cell "—" [ref=e6796]
+            - cell "—" [ref=e6797]
+            - cell "33.6/33.6 waste-danger" [ref=e6798]
+          - row [ref=e6799] [cursor=pointer]:
+            - 'cell "binding window: 19% left" [ref=e6800]'
+            - 'cell "(default-claude) Max 20× · ok · home: .claude · ⚠name" [ref=e6805]':
+              - text: (default-claude)
+              - generic [ref=e6807]: "Max 20× · ok · home: .claude · ⚠name"
+            - cell "19%" [ref=e6808]
+            - cell "90% ↻2d" [ref=e6813]
+            - cell "—" [ref=e6818]
+            - cell "86% ↻2d" [ref=e6819]
+            - cell "—" [ref=e6824]
+            - cell "—" [ref=e6825]
+    - group [ref=e6506]:
+      - generic "▸ credential homes one home = one login — helm prepares, YOU run every login" [ref=e6507] [cursor=pointer]:
+        - text: ▸ credential homes
+        - generic [ref=e6508]: one home = one login — helm prepares, YOU run every login
+      - option "claude" [selected]
+      - option "codex"
+  - generic [ref=e2089]:
+    - generic [ref=e2090]:
+      - generic [ref=e7176]:
+        - button "⧉ resume" [ref=e7177] [cursor=pointer]
+        - button "+ team" [ref=e7178] [cursor=pointer]
+        - button "⌂ cwd" [ref=e7179] [cursor=pointer]
+        - button "⚗ optimize" [ref=e7180] [cursor=pointer]
+        - button "✕" [ref=e7181] [cursor=pointer]
+      - generic [ref=e7182]: cl
+      - text: Review helm project brief and foundational decisions
+      - generic [ref=e7183]: c98d1877-acdf-4bf9-9d5e-b223261d4217 · /home/owner/dev/akapug/helm · ⑂ HEAD · claude-fable-5 · 908 messages · 3.5M
+    - generic [ref=e2099]:
+      - button "↑ load earlier (848 more)" [ref=e7184] [cursor=pointer]
+      - generic [ref=e7185]:
+        - generic [ref=e7186]: tool7/18, 09:40 AM
+        - generic [ref=e7187]: "attest seam fixed: e43f5195d5ee by helm-test helm search: 1 hit for 'lineage map' (scoped-grep (1 sessions in helm)) claude c98d1877 2026-07-18 Review helm project brief and foundational decisions HEET.\\n52\\t6. `lineage-map-decisions-2026-07-18.md` — the 5 answered questions gating the lineage map.\\n53\\t7. `KNOWLEDGE_CONCEPT_INVENTORY.html` + `helm-invent… helm cell: node LIVE at http://127.0.0.1:8899 — chain head 8 (finality tentative, consensus_final True, attested_height 46) helm cell: profile 'meld-agent' (exists) helm cell: roster /home/owner/.dregg/roster.toml: 2 cells (meld-maintainer, pr54-smoke-writer) OK"
+      - generic [ref=e7188]:
+        - generic [ref=e7189]: assistant7/18, 09:41 AM
+        - generic [ref=e7190]: "⚙ Bash {\"command\": \"git add -A && git commit -q -m \\\"substrate verbs + transcripts/keepalive absorption (160 tests green)\\n\\nhelm cell (join/send/recv/heartbeat/roster/status, HELM_* env mapped),\\nhelm premise / premise-check — attested capture live-proven on the node\\n(whisper payload path, algorithm-tagged digests, finality tier quoted;\\ntest-profile signed, user-cell activates at the owner's first cap…"
+      - generic [ref=e7191]:
+        - generic [ref=e7192]: tool7/18, 09:41 AM
+        - generic [ref=e7193]: Sent 123 bytes to term_1c5a870f-e338-4b92-824c-d7318732bdee.
+      - generic [ref=e7194]:
+        - generic [ref=e7195]: assistant7/18, 09:41 AM
+        - generic [ref=e7196]: "⚙ Bash {\"command\": \"grep -n \\\"def write_file\\\\|def entry_op\\\\|def list_backups\\\\|def restore\\\\|def read_file\\\\|def cmd_configs\\\" helm/configs.py; sed -n \\\"$(grep -n 'def cmd_configs' helm/configs.py | cut -d: -f1),+12p\\\" helm/configs.py\", \"description\": \"Check configs write API and cmd surface\"}"
+      - generic [ref=e7197]:
+        - generic [ref=e7198]: tool7/18, 09:41 AM
+        - generic [ref=e7199]: "335:def read_file(path): 396:def write_file(path, content): 438:def entry_op(action, path, kind, name, value=None): 485:def list_backups(): 503:def restore(backup): 532:def cmd_configs(args): def cmd_configs(args): \"\"\"configs [list|show <path>|cascade <cwd> [--harness claude|codex] [--home DIR]] — read-only surface over the config model. list = every discovered config file grouped by scope; show = one recognized file's content; cascade = what a seat at <cwd> loads (via physics).\"\"\" import sys args = list(args or []) verb = args.pop(0) if args else \"list\" if verb == \"list\": homes = homes_configs() print(\"helm configs — home/user scope:\") if not homes:"
+      - generic [ref=e7200]:
+        - generic [ref=e7201]: assistant7/18, 09:41 AM
+        - generic [ref=e7202]: "⚙ Bash {\"command\": \"sed -n \\\"$(grep -n 'def write_file' helm/configs.py | cut -d: -f1),+8p\\\" helm/configs.py; grep -n \\\"return\\\\|usage\\\" helm/configs.py | sed -n \\\"$(grep -c . /dev/null)p\\\"; tail -8 helm/configs.py\", \"description\": \"Read write_file signature and cmd_configs tail\"}"
+      - generic [ref=e7203]:
+        - generic [ref=e7204]: tool7/18, 09:41 AM
+        - generic [ref=e7205]: "def write_file(path, content): \"\"\"Backup → validate → atomic write. Refuses non-recognized / plugin / managed / out-of-root paths. Returns {ok, backup, note} or {error}.\"\"\" rp = _real(path) typ, editable, reason = classify_path(rp) if not editable: return {\"error\": f\"refused: {reason} ({rp})\"} ok, verr = _validate(typ, content) if not ok: 81: return os.path.realpath(os.path.expanduser(p)) 92: return False 95: return True 97: return True 102: return True 104: return True 105: return False 113: return \"json\" 115: return \"json\" 117: return \"toml\" 119: return \"md\" 120: return \"other\" 125: return any(rp == _real(r) or rp.startswith(_real(r).rstrip(\"/\") + \"/\") for r in roots) 131: return True 135: return any(rp.startswith(_real(os.path.join(h, \"plugins\")) + os.sep) for h in HOME_ROOTS) 146: return typ, False, \"credential/token store — never editable\" 148: return typ, False, \"not a recognized config file\" 150: return typ, False, \"outside the allowlisted config roots\" 152: return typ, False, \"plugin/managed-provided — read-only\" 155: …"
+      - generic [ref=e7206]:
+        - generic [ref=e7207]: assistant7/18, 09:41 AM
+        - generic [ref=e7208]: "⚙ Edit {\"replace_all\": false, \"file_path\": \"/home/owner/dev/akapug/helm/helm/configs.py\", \"old_string\": \" print(\\\"usage: helm configs [list|show <path>|cascade <cwd>]\\\", file=sys.stderr)\\n return 2\", \"new_string\": \" if verb == \\\"edit\\\":\\n # edit <path> (new content on stdin) — backup -> validate -> atomic\\n if not args:\\n print(\\\"usage: helm configs edit <path> (new con…"
+      - generic [ref=e7209]:
+        - generic [ref=e7210]: tool7/18, 09:41 AM
+        - generic [ref=e7211]: The file /home/owner/dev/akapug/helm/helm/configs.py has been updated successfully. (file state is current in your context — no need to Read it back)
+      - generic [ref=e7212]:
+        - generic [ref=e7213]: assistant7/18, 09:41 AM
+        - generic [ref=e7214]: "⚙ Bash {\"command\": \"grep -n '\\\"backup\\\"' helm/configs.py | head -3; sed -n \\\"$(grep -n 'def list_backups' helm/configs.py | cut -d: -f1),+14p\\\" helm/configs.py; ./bin/helm configs backups | head -4; echo '{\\\"mcpServers\\\":{}}' | ./bin/helm configs edit /etc/passwd; echo \\\"exit=$?\\\"; python3 -m unittest tests.test_configs 2>&1 | tail -1\", \"description\": \"Verify backups shape, edit refusal on bad path, test…"
+      - generic [ref=e7215]:
+        - generic [ref=e7216]: tool7/18, 09:41 AM
+        - generic [ref=e7217]: "432: return {\"ok\": True, \"path\": rp, \"backup\": backup, \"created_parent\": created_parent, 495: out.append({\"backup\": bp, \"orig\": _backup_orig(bp) or \"(unknown)\", 610: print(\"helm configs: wrote %s (backup: %s)\" % (r[\"path\"], r.get(\"backup\") or \"none — new file\")) def list_backups(): out = [] try: for b in sorted(os.listdir(BACKUP_DIR), reverse=True): if b.endswith(\".orig\"): continue bp = os.path.join(BACKUP_DIR, b) if not os.path.isfile(bp): continue st = os.stat(bp) out.append({\"backup\": bp, \"orig\": _backup_orig(bp) or \"(unknown)\", \"size\": st.st_size, \"at\": time.strftime(\"%Y-%m-%d %H:%M:%S\", time.localtime(st.st_mtime))}) except OSError: pass helm configs backups (1, newest first): /home/owner/.cache/helm/config-backups/20260717T094123-854787311__.mcp.json <- /home/owner/dev/.sesh-ui-test/.mcp.json helm configs edit: refused: not a recognized config file (/etc/passwd) exit=1 OK"
+      - generic [ref=e7218]:
+        - generic [ref=e7219]: assistant7/18, 09:41 AM
+        - generic [ref=e7220]: "⚙ Bash {\"command\": \"git add -A && git commit -q -m \\\"configs edit/backups/restore CLI verbs (safety law intact: backup->validate->atomic, allowlist-refused)\\n\\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\\nClaude-Session: https://claude.ai/code/session_014m7ktZi5na5zmJKFGtXkFs\\\" && git log --oneline | head -1\", \"description\": \"Commit configs edit verbs\"}"
+      - generic [ref=e7221]:
+        - generic [ref=e7222]: tool7/18, 09:41 AM
+        - generic [ref=e7223]: "4c58b2a configs edit/backups/restore CLI verbs (safety law intact: backup->validate->atomic, allowlist-refused)"
+      - generic [ref=e7224]:
+        - generic [ref=e7225]: assistant7/18, 09:41 AM
+        - generic [ref=e7226]: "**Progress**: substrate verbs (`cell`/`premise`/`premise-check`) and the full CLI absorption (`search`/`transcript`/`rehome`/`prune`/`keepalive`/`configs edit|backups|restore`) are landed, live-verified, and committed — 160 tests green, the attested-premise path proven end-to-end on the real node with the finality tier quoted, and the gap table now shows zero predecessor capabilities without helm substrate. The edit path correctly refuses non-config files and the legacy backup carried over through the seeded cache. Slice A (quota view + nav restructure — the owner-visible piece) is still building; per the liveness law I trust its completion notification, not file-mtime guessing. The moment it lands: integrate, verify in-browser, commit, fire slice B (sessions view — its backend functions are already waiting in transcripts.py with identical signatures), then C, then the maintainer's view-by-view diff. Heartbeats are current in the channel and PROGRESS.md."
+      - generic [ref=e7227]:
+        - generic [ref=e7228]: user7/18, 09:47 AM
+        - generic [ref=e7229]: "<task-notification> <task-id>a6b3baa3c462b10a1</task-id> <tool-use-id>toolu_01HJXS6K6Aa2f2JNkWgvAT9b</tool-use-id> <output-file>/tmp/claude-1000/-home-pug-dev-akapug-helm/c98d1877-acdf-4bf9-9d5e-b223261d4217/tasks/a6b3baa3c462b10a1.output</output-file> <status>completed</status> <summary>Agent \"Port quota view and providers\" finished</summary> <note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note> <result>All done — tree clean, suite green, live-verified. Final report: ## Slice A complete — sesh quota view ported into helm's web UI **Full suite: 171 tests green** (`python3 -m unittest discover -s tests`), including 11 new hermetic quota tests and the tests another lane landed mid-slice (their commit `b8b36a7` swept my in-progress files into git; final tree == my final versions, verified). Live-verified in a real browser against this machine: 10 accounts probed, chart + attention banner + accounts table + burn join + homes card all populated, zero console errors. ### 1. `/home/owner/dev/akapug/helm/helm/providers.py` (ABSORBED from sesh) sesh's `server/providers.py` imports **no other sesh modules** (stdlib only) — nothing else needed absorbing. Line-for-line port except rebrand: `_env()` helper (HELM_* preferred, SESH_* fallback) for PROVIDER / QUOTA_CLI / PROBE_LOOP / ALLOCATION_RULES; history at `~/.cache/helm/native-usage-history.jsonl` with a one-time seed copy from the sesh file (history continuity — 603 rows flowed on this machine); allocation rules read `~/.config/helm/allocation.json` first, else the legacy sesh path; stderr prefix `helm:`. ### 2. `/home/owner/dev/akapug/helm/helm/web.py` — endpoints, sesh shapes exactly - `GET /api/creds[?refresh=1]` — merged account rows (name/provider/home/home_name/identity/name_lies/active/tier/headroom/state/status/resets_at_ms/windows_left/windows_per_week/windows_verdict + duplicate_homes), ported with sesh's single-flight TTL cache. - `GET /api/history?hours=` — ~240-bucket downsample, oldest-first. `GET /api/burn?hours=` — `{buckets:[{t,byAccount,sessions}],note}` temporal join v1, verbatim. `GET /api/allocate` — `{model:{pick,ranked}}` (GET in sesh, so GET here; `HELM_ALLOC_MODELS`/`SESH_ALLOC_MODELS`). `GET /api/status` — sesh's shape (`provider{configured,present,accounts,degraded,fallback}, cv, catalogRows, mutations`). - `GET /api/homes` (homes.py list, sesh shape) + `POST /api/homes` (create/verify/archive/unarchive/migrate) + `GET /api/physics?home=` (helm's absorbed physics.py; the homes card's physics button). - Degrade: ProviderError → sesh's shapes (`[]` / empty buckets / `{}`); anything deeper → `{\"unavailable\": true}`, always 200. Every pre-existing endpoint untouched and tested. ### 3. `/home/owner/dev/akapug/helm/helm/web_ui.html` — tabbed restructure Sticky sesh-pattern nav (`helm | quota | sessions | configs`), hash + localStorage routing, `#homes` deep-link. **helm tab (default)**: all prior content moved intact. **quota tab**: the ENTIRE sesh quota view — attention banner; SVG chart with dynamic qtabs (live shows `7d-fable`, `5h-gpt-5.3-codex-spark`…), zoom/pan/double-click-reset, hover tip, projection-to-reset, activity histogram, label-click emphasis; accounts table (filter chips, sortable headers incl. dynamic gauge + win columns, batteries, row-select, state-fix click-to-copy, hover-spotlight); burn↔sessions collapsible; credential-homes card (create form printing the login command — never running it — hygiene rows, verify/physics/migrate/archive/unarchive, legacy sesh archives listed). Also ported sesh's data-theme override CSS + theme toggle and the 120s refresh. Single self-contained file, helm CSS variables (added `--hl`), no CDN, `node --check` clean. ### 4. `tests/test_web_quota.py` Hermetic: port-0 server, tmp HELM_HOME, **stub provider injected** (`web._PROVIDER`) so no vendor probes/cache writes, homes roots repointed at tmp (test_homes pattern), canned catalog seeded for the burn join. Covers creds shape + degrade, status, history ordering, burn bucket math (20% drop → one bucket) + session join, allocate, homes GET/POST (create prints login cmd, never runs it; bad action 400), UI markup for all four views + quota internals + slice B/C placeholders, and existing endpoints. ### Not ported faithfully (named, not hidden) 1. **No mutation bearer token**: sesh templates a per-process anti-CSRF token and gates POST /api/homes with it; helm's existing web.py has open localhost POSTs (skills), and I followed that convention — POST /api/homes is CSRF-reachable in principle (archive is reversible + live-agent-refused; confirms in UI). 2. **Row-select stores SEL** but the resume-as strip / team tray / cmd popover are sessions-view features → slice B. 3. **Chart day-bar click** toasts instead of jumping to the sessions view (slice B); **burn session chips** copy the resume command (helm rows carry it) instead of opening sesh's transcript drawer (slice B) — the title/toast say so. 4. Activity histogram joins `/api/sessions` (newest 200 work sessions), not the full catalog — thinner on very active weeks. 5. Quota data loads on first quota-tab activation (helm tab is default), not page boot; identical once on the tab. 6. sesh endpoints intentionally out of slice: /api/catalog, /api/search, /api/session, /api/cmd, /api/cwd, /api/prune (slice B); /api/configs/* family and /api/physics-diff (slice C — helm's own /api/configs + /api/configs/cascade already exist).</result> <usage><subagent_tokens>284604</subagent_tokens><tool_uses>79</tool_uses><duration_ms>1270974</duration_ms></usage> </task-notification>"
+      - generic [ref=e7230]:
+        - generic [ref=e7231]: assistant7/18, 09:47 AM
+        - generic [ref=e7232]: "Slice A landed — the full quota view, browser-verified with zero console errors, 171 tests. Verifying integration and firing slice B immediately:"
+      - generic [ref=e7233]:
+        - generic [ref=e7234]: assistant7/18, 09:47 AM
+        - generic [ref=e7235]: "⚙ Bash {\"command\": \"python3 -m unittest discover -s tests 2>&1 | tail -1 && git add -A && git commit -q -m \\\"slice A: tabbed web UI + full quota view + providers absorption (171 tests)\\n\\nSticky nav (helm|quota|sessions|configs), the entire predecessor quota\\nview — chart with zoom/projection, accounts table, burn join, attention\\nbanner, credential-homes card — live-verified in a browser, 10 accounts\\np…"
+      - generic [ref=e7236]:
+        - generic [ref=e7237]: tool7/18, 09:47 AM
+        - generic [ref=e7238]: Exit code 1 OK On branch main nothing to commit, working tree clean
+      - generic [ref=e7239]:
+        - generic [ref=e7240]: assistant7/18, 09:47 AM
+        - generic [ref=e7241]: "⚙ TaskUpdate {\"taskId\": \"10\", \"status\": \"completed\"}"
+      - generic [ref=e7242]:
+        - generic [ref=e7243]: tool7/18, 09:47 AM
+        - generic [ref=e7244]: "Updated task #10 status"
+      - generic [ref=e7245]:
+        - generic [ref=e7246]: assistant7/18, 09:47 AM
+        - generic [ref=e7247]: "⚙ TaskUpdate {\"taskId\": \"11\", \"status\": \"in_progress\"}"
+      - generic [ref=e7248]:
+        - generic [ref=e7249]: tool7/18, 09:47 AM
+        - generic [ref=e7250]: "Updated task #11 status"
+      - generic [ref=e7251]:
+        - generic [ref=e7252]: assistant7/18, 09:48 AM
+        - generic [ref=e7253]: "⚙ Agent {\"description\": \"Port full sessions view slice B\", \"prompt\": \"You are building slice B of the sesh→helm web-UI port at /home/owner/dev/akapug/helm (Python stdlib-only): the FULL sessions view. A supervisor diffs view-by-view against the live sesh UI at http://127.0.0.1:7402 — completeness is the bar. You own helm/web.py and helm/web_ui.html for this slice.\\n\\nREAD FIRST: helm/web.py (slice A just la…"
+      - generic [ref=e7254]:
+        - generic [ref=e7255]: tool7/18, 09:48 AM
+        - generic [ref=e7256]: "Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.) agentId: a2bd2aaefab9f56a1 (internal ID - do not mention to user. Use SendMessage with to: 'a2bd2aaefab9f56a1', summary: '<5-10 word recap>' to continue this agent.) The agent is working in the background. You will be notified automatically when it completes. You know nothing about its results until that notification arrives — do not report, assume, or predict them; continue other work or respond to the user in the meantime. Do not duplicate this agent's work — avoid working with the same files or topics it is using. output_file: /tmp/claude-1000/-home-pug-dev-akapug-helm/c98d1877-acdf-4bf9-9d5e-b223261d4217/tasks/a2bd2aaefab9f56a1.output Do NOT Read or tail this file via the shell tool — it is the full subagent JSONL transcript and reading it will overflow your context. If the user asks for progress, say the agent is still running; you'll get a completion notification."
+      - generic [ref=e7257]:
+        - generic [ref=e7258]: assistant7/18, 09:48 AM
+        - generic [ref=e7259]: "⚙ Bash {\"command\": \"python3 - << 'EOF'\\nimport pathlib\\np = pathlib.Path(\\\"PROGRESS.md\\\")\\ns = p.read_text()\\ns = s.replace(\\\"| A: nav tabs + quota view + providers | **building** (agent) | — |\\\",\\n \\\"| A: nav tabs + quota view + providers | landed | browser-verified, 10 accounts probed, 171 tests |\\\")\\ns = s.replace(\\\"| B: full sessions view (search/drawer/re-home/prune) | queued behind A |…"
+      - generic [ref=e7260]:
+        - generic [ref=e7261]: tool7/18, 09:48 AM
+        - generic [ref=e7262]: Sent 132 bytes to term_1c5a870f-e338-4b92-824c-d7318732bdee.
+      - generic [ref=e7263]:
+        - generic [ref=e7264]: assistant7/18, 09:48 AM
+        - generic [ref=e7265]: "While B builds, closing the last two deferred compositions — `helm creds` (quota scorecard in the terminal) and `helm swap` (the rollover rescue). Checking the provider API surface first:"
+      - generic [ref=e7266]:
+        - generic [ref=e7267]: assistant7/18, 09:48 AM
+        - generic [ref=e7268]: "⚙ Bash {\"command\": \"grep -n \\\"^def \\\\|^class \\\\|^ def \\\" helm/providers.py | head -25; grep -n \\\"def get_creds\\\\|def _creds\\\" helm/web.py | head -3\", \"description\": \"Map providers API and web creds helper\"}"
+      - generic [ref=e7269]:
+        - generic [ref=e7270]: tool7/18, 09:48 AM
+        - generic [ref=e7271]: "51:class ProviderError(RuntimeError): 55:def _env(name, default=None): 64:class CliQuotaProvider: 67: def __init__(self, binary=None): 70: def _run(self, *args, timeout=45): 80: def _json(self, *args, timeout=45, default=None): 91: def accounts(self): 94: def cred_state(self): 97: def windows(self): 100: def history(self, hours): 105: def allocate(self, model): 108: def launch_cmd(self, account, sid, model=None): 117: def preflight(self, account, sid, agent): 134:def _iso_z(ts=None): 138:def _epoch(iso): 146:def _read_json(path): 154:def _jwt_email(id_token): 166:def _find_cwd(obj, depth=0): 179:def _model_family(model): 185:class NativeQuotaProvider: 215: def __init__(self, history_path=None): 235: def _dedup_dirs(self, root, seen): 250: def _active_homes(self): 273: def _anthropic_identity(home): 295: def accounts(self): 273:def get_creds(refresh=False):"
+      - generic [ref=e7272]:
+        - generic [ref=e7273]: assistant7/18, 09:48 AM
+        - generic [ref=e7274]: "⚙ Bash {\"command\": \"sed -n '273,290p' helm/web.py; grep -n \\\"def default_provider\\\" helm/providers.py && sed -n \\\"$(grep -n 'def default_provider' helm/providers.py | cut -d: -f1),+10p\\\" helm/providers.py\", \"description\": \"Read get_creds and default_provider\"}"
+      - generic [ref=e7275]:
+        - generic [ref=e7276]: tool7/18, 09:48 AM
+        - generic [ref=e7277]: "def get_creds(refresh=False): if refresh: with _qlock: _qstate.pop(\"creds\", None) def build(): import glob from .providers import ProviderError HOME = os.path.expanduser(\"~\") prov = _provider() try: accounts = prov.accounts() states = {s.get(\"account\"): s for s in prov.cred_state()} windows = {w.get(\"account\"): w for w in prov.windows()} except ProviderError: return [] # no quota provider on this machine — sessions/resume still work merged = [] for a in accounts: 891:def default_provider(): def default_provider(): \"\"\"NATIVE is the default (deprecation flip 2026-07-12): helm reads the providers' own usage endpoints directly. A legacy quota CLI is opt-in via HELM_PROVIDER=cli (+ optional HELM_QUOTA_CLI naming the binary); the SESH_* spellings still work.\"\"\" choice = (_env(\"PROVIDER\") or \"native\").strip().lower() if choice == \"cli\": binary = _env(\"QUOTA_CLI\", \"tokaware\") if shutil.which(binary): return CliQuotaProvider(binary) # opted into a CLI that isn't installed: fail toward working…"
+      - generic [ref=e7278]:
+        - generic [ref=e7279]: assistant7/18, 09:49 AM
+        - generic [ref=e7280]: "⚙ Write {\"file_path\": \"/home/owner/dev/akapug/helm/helm/creds.py\", \"content\": \"#!/usr/bin/env python3\\n\\\"\\\"\\\"helm creds / swap — the account scorecard and the rollover rescue, in the\\nterminal. CLI parity for the quota view: same provider, same truth.\\n\\ncreds — every account with live headroom/state/reset, duplicate flags.\\nswap — a seat ran dry mid-work: find the sessions live on a home, pick the\\n …"
+      - generic [ref=e7281]:
+        - generic [ref=e7282]: tool7/18, 09:49 AM
+        - generic [ref=e7283]: "File created successfully at: /home/owner/dev/akapug/helm/helm/creds.py (file state is current in your context — no need to Read it back)"
+      - generic [ref=e7284]:
+        - generic [ref=e7285]: assistant7/18, 09:49 AM
+        - generic [ref=e7286]: "⚙ Bash {\"command\": \"grep -n \\\"def list_homes\\\\|def live_agents\\\\|def _agent_procs\\\\|def home_list\\\\|def list_all\\\" helm/homes.py | head -5\", \"description\": \"Check homes.py listing API names\"}"
+      - generic [ref=e7287]:
+        - generic [ref=e7288]: tool7/18, 09:49 AM
+        - generic [ref=e7289]: "85:def _agent_procs():"
+      - generic [ref=e7290]:
+        - generic [ref=e7291]: assistant7/18, 09:49 AM
+        - generic [ref=e7292]: "⚙ Bash {\"command\": \"grep -n \\\"^def \\\" helm/homes.py; sed -n '85,100p' helm/homes.py\", \"description\": \"Map homes.py public functions\"}"
+      - generic [ref=e7293]:
+        - generic [ref=e7294]: tool7/18, 09:49 AM
+        - generic [ref=e7295]: "48:def canonical_name(email): 53:def _read_json(path): 61:def _claude_identity(home): 68:def _codex_identity(home): 85:def _agent_procs(): 110:def _detect_provider(path): 121:def _home_row(provider, path, aliases, procs, default=False): 144:def _archive_marker(path): 153:def _archive_dirs(): 163:def _archived_rows(): 177:def homes_list(): 217:def _resolve(name, provider=None): 239:def home_create(provider, account_email): 295:def home_verify(name, provider=None): 336:def home_archive(name, provider=None): 370:def home_unarchive(name): 408:def home_migrate(name, provider=None): 441:def _hygiene_flags(r): 459:def _take_flag(args, name): 470:def _fail(res): 475:def _print_list(): 502:def _print_archives(): 514:def cmd_homes(args): def _agent_procs(): \"\"\"[(pid, provider, home_realpath|None)] for every live claude/codex AGENT process (comm must match — children like MCP servers inherit the env but carry other comms). home None = the process runs on the provider DEFAULT home.\"\"\" out = [] for envf in glob.glob(\"/proc/[0-9]*/environ\"): pid = envf.split(\"/\")[2] try: comm = open(f\"/proc/{pid}/comm\").read().strip() if comm not in (\"c…"
+      - generic [ref=e7296]:
+        - generic [ref=e7297]: assistant7/18, 09:49 AM
+        - generic [ref=e7298]: "⚙ Bash {\"command\": \"python3 -c \\\"\\nfrom helm import homes\\nrows = homes.homes_list()\\nprint(type(rows), len(rows) if hasattr(rows,'__len__') else '')\\nr = rows[0] if isinstance(rows, list) else list(rows.items())[:1]\\nprint(r)\\\" 2>&1 | head -6\", \"description\": \"Inspect homes_list row shape\"}"
+      - generic [ref=e7299]:
+        - generic [ref=e7300]: tool7/18, 09:49 AM
+        - generic [ref=e7301]: "<class 'list'> 19 {'name': 'cto-example-invalid', 'provider': 'claude', 'path': '/home/owner/.claude-homes/cto-example-invalid', 'default': False, 'aliases': ['cto-example'], 'authed': True, 'identity': 'cto@example.invalid', 'canonical': True, 'projects_link_ok': True, 'live_pids': [], 'archived': False}"
+      - generic [ref=e7302]:
+        - generic [ref=e7303]: assistant7/18, 09:49 AM
+        - generic [ref=e7304]: "⚙ Bash {\"command\": \"python3 - << 'EOF'\\nimport pathlib\\np = pathlib.Path(\\\"helm/creds.py\\\")\\ns = p.read_text()\\ns = s.replace('def _live_sessions_on(home_dir):\\\\n \\\"\\\"\\\"[(pid, sid)] of agent processes running under a cred home, best-effort:\\\\n the env carries the config-dir; the session id is recoverable from the\\\\n newest transcript touched by that home\\\\'s projects after attach — v1 keeps\\\\n …"
+      - generic [ref=e7305]:
+        - generic [ref=e7306]: tool7/18, 09:50 AM
+        - generic [ref=e7307]: "helm — the personal knowledge home for people who build with agents helm creds (10 accounts): provider account headroom state reset weekly windows anthropic cto@example.invalid - ? 10m - anthropic owner@example.invalid - ? 10m - anthropic owner@example.invalid - ? 2.3h - anthropic hey@simbi.com - ? 10m - anthropic (default-claude) - ? 10m - codex cto-example-invalid - ? 168.0h - --- helm swap: healthiest claude alternative: cto@example.invalid (headroom -, state ?) live pids on 'owner-example-invalid': 2410988,2422232 resume blocks (newest 3 — run in fresh terminals AFTER stopping the dry seat): cd '/home/owner/dev/akapug/helm' && env CLAUDE_CONFIG_DIR=/home/owner/.claude-homes/cto-example-invalid claude --resume c98d1877-acdf-4bf9-9d5e-b223261d4217 cd '/home/owner/dev/akapug/meld' && env CLAUDE_CONFIG_DIR=/home/owner/.claude-homes/cto-example-invalid claude --resume 918c9ec7-92ae-4c33-b718-486d…"
+      - generic [ref=e7308]:
+        - generic [ref=e7309]: assistant7/18, 09:50 AM
+        - generic [ref=e7310]: "⚙ Bash {\"command\": \"python3 -c \\\"\\nfrom helm.providers import default_provider\\np = default_provider()\\na = p.accounts()\\nprint('accounts[0]:', {k: v for k, v in a[0].items()} if a else None)\\ns = p.cred_state()\\nprint('cred_state[0]:', s[0] if s else None)\\nw = p.windows()\\nprint('windows[0]:', w[0] if w else None)\\\" 2>&1 | head -8\", \"description\": \"Inspect real provider row shapes\"}"
+      - generic [ref=e7311]:
+        - generic [ref=e7312]: tool7/18, 09:50 AM
+        - generic [ref=e7313]: "accounts[0]: {'name': 'cto@example.invalid', 'provider': 'anthropic', 'home': '/home/owner/.claude-homes/cto-example-invalid', 'active': True, 'tier': 'Max 20x', 'usable': True, 'email': 'cto@example.invalid'} cred_state[0]: {'account': 'cto@example.invalid', 'provider': 'anthropic', 'cred_state': 'ok', 'headroom_pct': 100.0, 'status': 'allowed', 'resets_at_ms': 1784394000000, 'tier': 'Max 20x', 'home': '/home/owner/.claude-homes/cto-example-invalid', 'source_at': None} windows[0]: {'account': 'cto-example-invalid', 'provider': 'codex', 'assumed': True, 'cost_per_window': 0.01, 'cycles': 159, 'windows_per_week': 33.6, 'windows_left': 33.6, 'windows_fit': 33.6, 'verdict': 'waste-danger'}"
+      - generic [ref=e7314]:
+        - generic [ref=e7315]: assistant7/18, 09:50 AM
+        - generic [ref=e7316]: "⚙ Bash {\"command\": \"python3 - << 'EOF'\\nimport pathlib\\np = pathlib.Path(\\\"helm/creds.py\\\")\\ns = p.read_text()\\ns = s.replace(''' name = a.get(\\\"account\\\") or a.get(\\\"name\\\") or \\\"?\\\"\\n st = states.get(name, {})\\n w = windows.get(name, {})\\n out.append({\\n \\\"account\\\": name,\\n \\\"provider\\\": a.get(\\\"provider\\\") or a.get(\\\"family\\\") or \\\"?\\\",\\n \\…"
+      - generic [ref=e7317]:
+        - generic [ref=e7318]: tool7/18, 09:50 AM
+        - generic [ref=e7319]: "helm creds (10 accounts): provider account tier headroom state reset weekly verdict anthropic cto@example.invalid Max 20x 100% ok 9m 18.4/33.6 waste-danger anthropic owner@example.invalid Max 20x 100% ok 2.3h 11.8/33.6 waste-danger anthropic hey@simbi.com Max 20x 100% ok 9m 12.4/33.6 waste-danger anthropic owner@example.invalid Max 20x 75% ok 9m 2.8/33.6 waste-danger anthropic (default-claude) Max 20x 75% ok 9m - codex cto-example-invalid - 100% ok 168.0h 33.6/33.6 waste-danger codex owner-example-invalid - 100% ok 168.0h 33.6/33.6 waste-danger codex owner-example-invalid - 100% ok 168.0h 33.6/33.6 waste-danger codex team-example-com - - unknown - - codex (default-codex) - - unknown - -"
+      - generic [ref=e7320]:
+        - generic [ref=e7321]: assistant7/18, 09:50 AM
+        - generic [ref=e7322]: "⚙ Bash {\"command\": \"./bin/helm swap owner-example-invalid 2>&1 | head -4; python3 -m unittest discover -s tests 2>&1 | tail -1; git add -A && git commit -q -m \\\"helm creds + swap: account scorecard and rollover rescue in the terminal\\n\\nReal provider shapes (headroom_pct/cred_state/windows verdicts); swap picks\\nthe healthiest same-family alternative and prints resume-under-new-home\\nblocks — never…"
+      - generic [ref=e7323]:
+        - generic [ref=e7324]: tool7/18, 09:50 AM
+        - generic [ref=e7325]: "helm swap: healthiest claude alternative: cto@example.invalid (headroom 100%, state ok) live pids on 'owner-example-invalid': 2410988,2422232 resume blocks (newest 3 — run in fresh terminals AFTER stopping the dry seat): cd '/home/owner/dev/akapug/helm' && env CLAUDE_CONFIG_DIR=/home/owner/.claude-homes/cto-example-invalid claude --resume c98d1877-acdf-4bf9-9d5e-b223261d4217 OK ff90c3d helm creds + swap: account scorecard and rollover rescue in the terminal"
+  - button "◐ theme" [ref=e2038] [cursor=pointer]
+  - generic: sessions last active 2026-07-17

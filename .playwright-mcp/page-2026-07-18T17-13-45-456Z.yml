@@ -1,0 +1,2298 @@
+- generic [ref=e1]:
+  - navigation [ref=e2]:
+    - generic [ref=e3]:
+      - generic [ref=e4]: ⎈
+      - text: helm
+    - button "helm" [ref=e5] [cursor=pointer]
+    - button "quota" [ref=e6] [cursor=pointer]
+    - button "sessions" [ref=e7] [cursor=pointer]
+    - button "configs" [ref=e8] [cursor=pointer]
+    - generic [ref=e9]:
+      - generic [ref=e10]: 10 accounts
+      - generic [ref=e11]: 2,255 work sessions
+      - generic "daily-memory summarizers — kept as training data, hidden from resume search by default" [ref=e12]: +3,422 refs
+      - generic [ref=e13]: 4,820 cl · 857 cx
+      - generic [ref=e14]: 84.5 GB
+    - button "tray (0)" [ref=e15] [cursor=pointer]
+  - generic [ref=e16]:
+    - text: ▸ ▸
+    - generic [ref=e17]:
+      - generic [ref=e18]:
+        - generic [ref=e19]:
+          - searchbox "search sessions — Enter also searches inside every transcript" [active] [ref=e20]
+          - combobox "restrict the inside-transcript search to one project (greps its real sessions directly — instant, and skips the reference-transcript flood). Pick from your projects or type any path fragment." [ref=e21]
+          - generic "reference transcripts (daily-memory summarizers) are hidden from content search by default — they flood every term. Kept in the corpus as training data. Click to include them." [ref=e22] [cursor=pointer]: "refs: off"
+          - generic [ref=e23] [cursor=pointer]: claude
+          - generic [ref=e24] [cursor=pointer]: codex
+          - combobox [ref=e25] [cursor=pointer]:
+            - 'option "view: recent" [selected]'
+            - 'option "view: by project"'
+            - 'option "view: biggest"'
+            - 'option "view: oldest first"'
+          - combobox [ref=e26] [cursor=pointer]:
+            - 'option "model: provider default" [selected]'
+            - option "fable"
+            - option "opus"
+            - option "sonnet"
+          - generic [ref=e27] [cursor=pointer]: last 45 days
+          - button "↻" [ref=e28] [cursor=pointer]
+          - generic [ref=e29]: 5,468 / 5,677
+        - generic [ref=e30]:
+          - text: "resume as:"
+          - generic "click to cycle the claude resume account" [ref=e31] [cursor=pointer]: claude → cto@exampleventures.c…
+          - generic "click to cycle the codex resume account" [ref=e32] [cursor=pointer]: codex → cto-exampleventures-c…
+          - generic [ref=e33]: · full picker on the quota tab
+      - generic [ref=e4375]:
+        - generic [ref=e4376]:
+          - generic [ref=e4377]: cl
+          - generic [ref=e4378]:
+            - text: canonical-agent-team-stack
+            - generic [ref=e4379]: 918c9ec7 · ~/dev/akapug/meld
+          - generic [ref=e4380]: 4,642 msg · 25.6M2026-07-18
+          - generic [ref=e4381]:
+            - button "⧉ resume" [ref=e4382] [cursor=pointer]
+            - button "+ team" [ref=e4383] [cursor=pointer]
+        - generic [ref=e4384]:
+          - generic [ref=e4385]: cl
+          - generic [ref=e4386]:
+            - text: Review helm project brief and foundational decisions
+            - generic [ref=e4387]: c98d1877 · ~/dev/akapug/helm
+          - generic [ref=e4388]: 908 msg · 3.5M2026-07-18
+          - generic [ref=e4389]:
+            - button "⧉ resume" [ref=e4390] [cursor=pointer]
+            - button "+ team" [ref=e4391] [cursor=pointer]
+        - generic [ref=e4392]:
+          - generic [ref=e4393]: cl
+          - generic [ref=e4394]:
+            - text: Process buildr whisper message
+            - generic [ref=e4395]: 3bed7f6e · ~/dev/akapug/goodtimes-platform
+          - generic [ref=e4396]: 21,341 msg · 119.8M2026-07-17
+          - generic [ref=e4397]:
+            - button "⧉ resume" [ref=e4398] [cursor=pointer]
+            - button "+ team" [ref=e4399] [cursor=pointer]
+        - generic [ref=e4400]:
+          - generic [ref=e4401]: cl
+          - generic [ref=e4402]:
+            - text: (untitled)
+            - generic [ref=e4403]: f55cac7c · ~/dev/akapug/mission-control
+          - generic [ref=e4404]: 39,454 msg · 198.5M2026-07-17
+          - generic [ref=e4405]:
+            - button "⧉ resume" [ref=e4406] [cursor=pointer]
+            - button "+ team" [ref=e4407] [cursor=pointer]
+        - generic [ref=e4408]:
+          - generic [ref=e4409]: cl
+          - generic [ref=e4410]:
+            - text: Onboard as new sesh maintainer
+            - generic [ref=e4411]: 74b69bce · ~/dev/akapug/sesh
+          - generic [ref=e4412]: 1,485 msg · 8.3M2026-07-17
+          - generic [ref=e4413]:
+            - button "⧉ resume" [ref=e4414] [cursor=pointer]
+            - button "+ team" [ref=e4415] [cursor=pointer]
+        - generic [ref=e4416]:
+          - generic [ref=e4417]: cl
+          - generic [ref=e4418]:
+            - text: (untitled)
+            - generic [ref=e4419]: 81cd67e5 · ~/dev/akapug/meld-worktrees/a2a-dogfood
+          - generic [ref=e4420]: 12 msg · 77K2026-07-17
+          - generic [ref=e4421]:
+            - button "⧉ resume" [ref=e4422] [cursor=pointer]
+            - button "+ team" [ref=e4423] [cursor=pointer]
+        - generic [ref=e4424]:
+          - generic [ref=e4425]: cl
+          - generic [ref=e4426]:
+            - text: (untitled)
+            - generic [ref=e4427]: e9269cdc · ~/dev/akapug/meld-worktrees/a2a-dogfood
+          - generic [ref=e4428]: 12 msg · 76K2026-07-17
+          - generic [ref=e4429]:
+            - button "⧉ resume" [ref=e4430] [cursor=pointer]
+            - button "+ team" [ref=e4431] [cursor=pointer]
+        - generic [ref=e4432]:
+          - generic [ref=e4433]: cl
+          - generic [ref=e4434]:
+            - text: (untitled)
+            - generic [ref=e4435]: 13c8d794 · ~/dev/akapug/meld-wt/autojoin
+          - generic [ref=e4436]: 6 msg · 38K2026-07-17
+          - generic [ref=e4437]:
+            - button "⧉ resume" [ref=e4438] [cursor=pointer]
+            - button "+ team" [ref=e4439] [cursor=pointer]
+        - generic [ref=e4440]:
+          - generic [ref=e4441]: cl
+          - generic [ref=e4442]:
+            - text: (untitled)
+            - generic [ref=e4443]: 20221232 · ~/dev/akapug/meld-wt/autojoin
+          - generic [ref=e4444]: 6 msg · 38K2026-07-17
+          - generic [ref=e4445]:
+            - button "⧉ resume" [ref=e4446] [cursor=pointer]
+            - button "+ team" [ref=e4447] [cursor=pointer]
+        - generic [ref=e4448]:
+          - generic [ref=e4449]: cl
+          - generic [ref=e4450]:
+            - text: Test bash command and detect injected context
+            - generic [ref=e4451]: 4c40aa4a · ~/dev/akapug/meld
+          - generic [ref=e4452]: 6 msg · 28K2026-07-17
+          - generic [ref=e4453]:
+            - button "⧉ resume" [ref=e4454] [cursor=pointer]
+            - button "+ team" [ref=e4455] [cursor=pointer]
+        - generic [ref=e4456]:
+          - generic [ref=e4457]: cl
+          - generic [ref=e4458]:
+            - text: Verify merged whisper hardening
+            - generic [ref=e4459]: 1f929e89 · ~/dev/akapug/meld
+          - generic [ref=e4460]: 12 msg · 46K2026-07-17
+          - generic [ref=e4461]:
+            - button "⧉ resume" [ref=e4462] [cursor=pointer]
+            - button "+ team" [ref=e4463] [cursor=pointer]
+        - generic [ref=e4464]:
+          - generic [ref=e4465]: cl
+          - generic [ref=e4466]:
+            - text: Run two sequential bash echo commands
+            - generic [ref=e4467]: d43a705f · /tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-final
+          - generic [ref=e4468]: 9 msg · 46K2026-07-17
+          - generic [ref=e4469]:
+            - button "⧉ resume" [ref=e4470] [cursor=pointer]
+            - button "+ team" [ref=e4471] [cursor=pointer]
+        - generic [ref=e4472]:
+          - generic [ref=e4473]: cl
+          - generic [ref=e4474]:
+            - text: Verify meld coordination stack setup
+            - generic [ref=e4475]: ece1a0d2 · ~/dev/akapug/meld
+          - generic [ref=e4476]: 18 msg · 56K2026-07-17
+          - generic [ref=e4477]:
+            - button "⧉ resume" [ref=e4478] [cursor=pointer]
+            - button "+ team" [ref=e4479] [cursor=pointer]
+        - generic [ref=e4480]:
+          - generic [ref=e4481]: cl
+          - generic [ref=e4482]:
+            - text: Execute sequential bash commands and report context
+            - generic [ref=e4483]: 560305f7 · /tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-postfix2
+          - generic [ref=e4484]: 9 msg · 46K2026-07-17
+          - generic [ref=e4485]:
+            - button "⧉ resume" [ref=e4486] [cursor=pointer]
+            - button "+ team" [ref=e4487] [cursor=pointer]
+        - generic [ref=e4488]:
+          - generic [ref=e4489]: cl
+          - generic [ref=e4490]:
+            - text: Execute sequential bash commands and report context
+            - generic [ref=e4491]: 16c36720 · /tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-postfix
+          - generic [ref=e4492]: 8 msg · 29K2026-07-17
+          - generic [ref=e4493]:
+            - button "⧉ resume" [ref=e4494] [cursor=pointer]
+            - button "+ team" [ref=e4495] [cursor=pointer]
+        - generic [ref=e4496]:
+          - generic [ref=e4497]: cl
+          - generic [ref=e4498]:
+            - text: Run sequential bash commands with sleep
+            - generic [ref=e4499]: f1b497c2 · /tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-cave-live
+          - generic [ref=e4500]: 13 msg · 52K2026-07-17
+          - generic [ref=e4501]:
+            - button "⧉ resume" [ref=e4502] [cursor=pointer]
+            - button "+ team" [ref=e4503] [cursor=pointer]
+        - generic [ref=e4504]:
+          - generic [ref=e4505]: cl
+          - generic [ref=e4506]:
+            - text: Run sequential bash commands
+            - generic [ref=e4507]: d75a9a20 · /tmp/claude-1000/-home-pug-dev-akapug-sesh/74b69bce-fc34-48c2-945e-dc9729931e9c/scratchpad/whisper-live
+          - generic [ref=e4508]: 9 msg · 36K2026-07-17
+          - generic [ref=e4509]:
+            - button "⧉ resume" [ref=e4510] [cursor=pointer]
+            - button "+ team" [ref=e4511] [cursor=pointer]
+        - generic [ref=e4512]:
+          - generic [ref=e4513]: cl
+          - generic [ref=e4514]:
+            - text: Submit verified turn to Dreggons Cave swarm
+            - generic [ref=e4515]: ccfe10a4 · ~/dev/akapug/mission-control
+          - generic [ref=e4516]: 18 msg · 119K2026-07-17
+          - generic [ref=e4517]:
+            - button "⧉ resume" [ref=e4518] [cursor=pointer]
+            - button "+ team" [ref=e4519] [cursor=pointer]
+        - generic [ref=e4520]:
+          - generic [ref=e4521]: cl
+          - generic [ref=e4522]:
+            - text: Submit verified turn to Dreggs Cave node
+            - generic [ref=e4523]: b47f8c9c · ~/dev/akapug/mission-control
+          - generic [ref=e4524]: 36 msg · 162K2026-07-17
+          - generic [ref=e4525]:
+            - button "⧉ resume" [ref=e4526] [cursor=pointer]
+            - button "+ team" [ref=e4527] [cursor=pointer]
+        - generic [ref=e4528]:
+          - generic [ref=e4529]: cl
+          - generic [ref=e4530]:
+            - text: Execute blocking orchestration ask command
+            - generic [ref=e4531]: 9c46f2a3 · ~/dev/akapug/mission-control
+          - generic [ref=e4532]: 10 msg · 98K2026-07-17
+          - generic [ref=e4533]:
+            - button "⧉ resume" [ref=e4534] [cursor=pointer]
+            - button "+ team" [ref=e4535] [cursor=pointer]
+        - generic [ref=e4536]:
+          - generic [ref=e4537]: cl
+          - generic [ref=e4538]:
+            - text: Dead worker test silence acknowledgment
+            - generic [ref=e4539]: 35504558 · ~/dev/akapug/mission-control
+          - generic [ref=e4540]: 1 msg · 77K2026-07-17
+          - generic [ref=e4541]:
+            - button "⧉ resume" [ref=e4542] [cursor=pointer]
+            - button "+ team" [ref=e4543] [cursor=pointer]
+        - generic [ref=e4544]:
+          - generic [ref=e4545]: cl
+          - generic [ref=e4546]:
+            - text: Get git HEAD SHA and identify repository
+            - generic [ref=e4547]: e0440daa · ~/dev/akapug/mission-control
+          - generic [ref=e4548]: 38 msg · 177K2026-07-17
+          - generic [ref=e4549]:
+            - button "⧉ resume" [ref=e4550] [cursor=pointer]
+            - button "+ team" [ref=e4551] [cursor=pointer]
+        - generic [ref=e4552]:
+          - generic [ref=e4553]: cl
+          - generic [ref=e4554]:
+            - text: Review context management and pricing logic
+            - generic [ref=e4555]: b8477e64 · ~/dev/akapug/builders-dev
+          - generic [ref=e4556]: 50,015 msg · 311.5M2026-07-16
+          - generic [ref=e4557]:
+            - button "⧉ resume" [ref=e4558] [cursor=pointer]
+            - button "+ team" [ref=e4559] [cursor=pointer]
+        - generic [ref=e4560]:
+          - generic [ref=e4561]: cl
+          - generic [ref=e4562]:
+            - text: (untitled)
+            - generic [ref=e4563]: cf2de8f4 · ~/dev/akapug/polyana
+          - generic [ref=e4564]: 8,567 msg · 64.9M2026-07-16
+          - generic [ref=e4565]:
+            - button "⧉ resume" [ref=e4566] [cursor=pointer]
+            - button "+ team" [ref=e4567] [cursor=pointer]
+        - generic [ref=e4568]:
+          - generic [ref=e4569]: cl
+          - generic [ref=e4570]:
+            - text: Check system status
+            - generic [ref=e4571]: d5aae6cd · ~/dev/akapug/polyana
+          - generic [ref=e4572]: 780 msg · 4.0M2026-07-16
+          - generic [ref=e4573]:
+            - button "⧉ resume" [ref=e4574] [cursor=pointer]
+            - button "+ team" [ref=e4575] [cursor=pointer]
+        - generic [ref=e4576]:
+          - generic [ref=e4577]: cx
+          - generic [ref=e4578]:
+            - text: "# AGENTS.md instructions <INSTRUCTIONS> # buildr Codex Rules Install target: …"
+            - generic [ref=e4579]: 019ee115 · ~/dev/simbi-inc/clockdag-protocol
+          - generic [ref=e4580]: 6,560 msg · 286.5M2026-07-16
+          - generic [ref=e4581]:
+            - button "⧉ resume" [ref=e4582] [cursor=pointer]
+            - button "+ team" [ref=e4583] [cursor=pointer]
+        - generic [ref=e4584]:
+          - generic [ref=e4585]: cl
+          - generic [ref=e4586]:
+            - text: Review Simbi Fable cross-family changes
+            - generic [ref=e4587]: f5fbea5c · ~/dev/simbi-inc
+          - generic [ref=e4588]: 2,321 msg · 11.3M2026-07-16
+          - generic [ref=e4589]:
+            - button "⧉ resume" [ref=e4590] [cursor=pointer]
+            - button "+ team" [ref=e4591] [cursor=pointer]
+        - generic [ref=e4592]:
+          - generic [ref=e4593]: cl
+          - generic [ref=e4594]:
+            - text: (untitled)
+            - generic [ref=e4595]: dd62390d · ~/dev/akapug/goodtimes-platform
+          - generic [ref=e4596]: 15,321 msg · 106.1M2026-07-16
+          - generic [ref=e4597]:
+            - button "⧉ resume" [ref=e4598] [cursor=pointer]
+            - button "+ team" [ref=e4599] [cursor=pointer]
+        - generic [ref=e4600]:
+          - generic [ref=e4601]: cl
+          - generic [ref=e4602]:
+            - text: Resume Embark project in correct directory
+            - generic [ref=e4603]: 1cb81e16 · ~/dev/akapug/embark
+          - generic [ref=e4604]: 1,472 msg · 8.3M2026-07-16
+          - generic [ref=e4605]:
+            - button "⧉ resume" [ref=e4606] [cursor=pointer]
+            - button "+ team" [ref=e4607] [cursor=pointer]
+        - generic [ref=e4608]:
+          - generic [ref=e4609]: cl
+          - generic [ref=e4610]:
+            - text: (untitled)
+            - generic [ref=e4611]: 85935aed · ~
+          - generic [ref=e4612]: 8,219 msg · 76.4M2026-07-16
+          - generic [ref=e4613]:
+            - button "⧉ resume" [ref=e4614] [cursor=pointer]
+            - button "+ team" [ref=e4615] [cursor=pointer]
+        - generic [ref=e4616]:
+          - generic [ref=e4617]: cl
+          - generic [ref=e4618]:
+            - text: Burn Mission Control backlog to zero
+            - generic [ref=e4619]: a5342b9b · ~/dev/akapug/mission-control
+          - generic [ref=e4620]: 4,039 msg · 14.3M2026-07-16
+          - generic [ref=e4621]:
+            - button "⧉ resume" [ref=e4622] [cursor=pointer]
+            - button "+ team" [ref=e4623] [cursor=pointer]
+        - generic [ref=e4624]:
+          - generic [ref=e4625]: cl
+          - generic [ref=e4626]:
+            - text: Review inbox and execute captain dispatch
+            - generic [ref=e4627]: 0a9f50da · ~/dev/akapug/mission-control
+          - generic [ref=e4628]: 17,724 msg · 80.5M2026-07-16
+          - generic [ref=e4629]:
+            - button "⧉ resume" [ref=e4630] [cursor=pointer]
+            - button "+ team" [ref=e4631] [cursor=pointer]
+        - generic [ref=e4632]:
+          - generic [ref=e4633]: cl
+          - generic [ref=e4634]:
+            - text: Process Mission Control backlog to zero
+            - generic [ref=e4635]: 7f34a25e · ~/dev/akapug/mission-control
+          - generic [ref=e4636]: 3,546 msg · 12.6M2026-07-16
+          - generic [ref=e4637]:
+            - button "⧉ resume" [ref=e4638] [cursor=pointer]
+            - button "+ team" [ref=e4639] [cursor=pointer]
+        - generic [ref=e4640]:
+          - generic [ref=e4641]: cl
+          - generic [ref=e4642]:
+            - text: Execute captain dispatch on mc-night conversation
+            - generic [ref=e4643]: 76cfc08e · ~/dev/akapug/mission-control
+          - generic [ref=e4644]: 24,910 msg · 111.1M2026-07-16
+          - generic [ref=e4645]:
+            - button "⧉ resume" [ref=e4646] [cursor=pointer]
+            - button "+ team" [ref=e4647] [cursor=pointer]
+        - generic [ref=e4648]:
+          - generic [ref=e4649]: cl
+          - generic [ref=e4650]:
+            - text: Review code submissions for MC fleet
+            - generic [ref=e4651]: 39b2edd2 · ~/dev/akapug/mission-control
+          - generic [ref=e4652]: 3,522 msg · 13.1M2026-07-16
+          - generic [ref=e4653]:
+            - button "⧉ resume" [ref=e4654] [cursor=pointer]
+            - button "+ team" [ref=e4655] [cursor=pointer]
+        - generic [ref=e4656]:
+          - generic [ref=e4657]: cx
+          - generic [ref=e4658]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4659]: 019f5903 · ~/dev/akapug/mission-control
+          - generic [ref=e4660]: 659 msg · 17.7M2026-07-16
+          - generic [ref=e4661]:
+            - button "⧉ resume" [ref=e4662] [cursor=pointer]
+            - button "+ team" [ref=e4663] [cursor=pointer]
+        - generic [ref=e4664]:
+          - generic [ref=e4665]: cx
+          - generic [ref=e4666]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4667]: 019f2973 · ~/dev/akapug/mission-control
+          - generic [ref=e4668]: 35,326 msg · 219.2M2026-07-16
+          - generic [ref=e4669]:
+            - button "⧉ resume" [ref=e4670] [cursor=pointer]
+            - button "+ team" [ref=e4671] [cursor=pointer]
+        - generic [ref=e4672]:
+          - generic [ref=e4673]: cl
+          - generic [ref=e4674]:
+            - text: (untitled)
+            - generic [ref=e4675]: 3c2bba7c · ~/dev/akapug/polyana
+          - generic [ref=e4676]: 36,015 msg · 233.2M2026-07-15
+          - generic [ref=e4677]:
+            - button "⧉ resume" [ref=e4678] [cursor=pointer]
+            - button "+ team" [ref=e4679] [cursor=pointer]
+        - generic [ref=e4680]:
+          - generic [ref=e4681]: cx
+          - generic [ref=e4682]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4683]: 019f5c8f · ~/dev/akapug/mission-control
+          - generic [ref=e4684]: 882 msg · 18.3M2026-07-15
+          - generic [ref=e4685]:
+            - button "⧉ resume" [ref=e4686] [cursor=pointer]
+            - button "+ team" [ref=e4687] [cursor=pointer]
+        - generic [ref=e4688]:
+          - generic [ref=e4689]: cl
+          - generic [ref=e4690]:
+            - text: (untitled)
+            - generic [ref=e4691]: 98abdea2 · ~/dev/akapug/mission-control
+          - generic [ref=e4692]: 3,117 msg · 41.1M2026-07-15
+          - generic [ref=e4693]:
+            - button "⧉ resume" [ref=e4694] [cursor=pointer]
+            - button "+ team" [ref=e4695] [cursor=pointer]
+        - generic [ref=e4696]:
+          - generic [ref=e4697]: cl
+          - generic [ref=e4698]:
+            - text: (untitled)
+            - generic [ref=e4699]: 28fc772f · /tmp xl syn
+          - generic [ref=e4700]: 7 msg · 10.0M2026-07-13
+          - generic [ref=e4701]:
+            - button "⧉ resume" [ref=e4702] [cursor=pointer]
+            - button "+ team" [ref=e4703] [cursor=pointer]
+        - generic [ref=e4704]:
+          - generic [ref=e4705]: cl
+          - generic [ref=e4706]:
+            - text: (untitled)
+            - generic [ref=e4707]: fddcf82f · ~/dev/akapug/mission-control
+          - generic [ref=e4708]: 9,112 msg · 75.4M2026-07-13
+          - generic [ref=e4709]:
+            - button "⧉ resume" [ref=e4710] [cursor=pointer]
+            - button "+ team" [ref=e4711] [cursor=pointer]
+        - generic [ref=e4712]:
+          - generic [ref=e4713]: cx
+          - generic [ref=e4714]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4715]: 019f26cd · ~/dev/akapug/mission-control
+          - generic [ref=e4716]: 9,583 msg · 56.9M2026-07-13
+          - generic [ref=e4717]:
+            - button "⧉ resume" [ref=e4718] [cursor=pointer]
+            - button "+ team" [ref=e4719] [cursor=pointer]
+        - generic [ref=e4720]:
+          - generic [ref=e4721]: cx
+          - generic [ref=e4722]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4723]: 019f5a7c · ~/dev/akapug/mission-control
+          - generic [ref=e4724]: 138 msg · 2.3M2026-07-13
+          - generic [ref=e4725]:
+            - button "⧉ resume" [ref=e4726] [cursor=pointer]
+            - button "+ team" [ref=e4727] [cursor=pointer]
+        - generic [ref=e4728]:
+          - generic [ref=e4729]: cx
+          - generic [ref=e4730]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4731]: 019f539b · ~/dev/akapug/mission-control
+          - generic [ref=e4732]: 633 msg · 10.4M2026-07-13
+          - generic [ref=e4733]:
+            - button "⧉ resume" [ref=e4734] [cursor=pointer]
+            - button "+ team" [ref=e4735] [cursor=pointer]
+        - generic [ref=e4736]:
+          - generic [ref=e4737]: cx
+          - generic [ref=e4738]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4739]: 019f40d9 · ~/dev/akapug/mission-control
+          - generic [ref=e4740]: 4,164 msg · 30.0M2026-07-13
+          - generic [ref=e4741]:
+            - button "⧉ resume" [ref=e4742] [cursor=pointer]
+            - button "+ team" [ref=e4743] [cursor=pointer]
+        - generic [ref=e4744]:
+          - generic [ref=e4745]: cl
+          - generic [ref=e4746]:
+            - text: (untitled)
+            - generic [ref=e4747]: d6257141 · ~/dev/akapug/mission-control
+          - generic [ref=e4748]: 24,176 msg · 110.5M2026-07-13
+          - generic [ref=e4749]:
+            - button "⧉ resume" [ref=e4750] [cursor=pointer]
+            - button "+ team" [ref=e4751] [cursor=pointer]
+        - generic [ref=e4752]:
+          - generic [ref=e4753]: cx
+          - generic [ref=e4754]:
+            - text: "# AGENTS.md instructions <INSTRUCTIONS> # buildr Codex Rules Install target: …"
+            - generic [ref=e4755]: 019f2993 · ~/dev
+          - generic [ref=e4756]: 1,717 msg · 20.3M2026-07-13
+          - generic [ref=e4757]:
+            - button "⧉ resume" [ref=e4758] [cursor=pointer]
+            - button "+ team" [ref=e4759] [cursor=pointer]
+        - generic [ref=e4760]:
+          - generic [ref=e4761]: cx
+          - generic [ref=e4762]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4763]: 019f5370 · ~/dev/akapug/mission-control
+          - generic [ref=e4764]: 460 msg · 5.9M2026-07-12
+          - generic [ref=e4765]:
+            - button "⧉ resume" [ref=e4766] [cursor=pointer]
+            - button "+ team" [ref=e4767] [cursor=pointer]
+        - generic [ref=e4768]:
+          - generic [ref=e4769]: cx
+          - generic [ref=e4770]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/dregg <INSTRUCTIONS> # build…"
+            - generic [ref=e4771]: 019f2b9d · ~/dev/akapug/dregg
+          - generic [ref=e4772]: 3,405 msg · 53.3M2026-07-12
+          - generic [ref=e4773]:
+            - button "⧉ resume" [ref=e4774] [cursor=pointer]
+            - button "+ team" [ref=e4775] [cursor=pointer]
+        - generic [ref=e4776]:
+          - generic [ref=e4777]: cx
+          - generic [ref=e4778]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/polyana <INSTRUCTIONS> # bui…"
+            - generic [ref=e4779]: 019ed02a · ~/dev/akapug/polyana
+          - generic [ref=e4780]: 2,157 msg · 107.7M2026-07-12
+          - generic [ref=e4781]:
+            - button "⧉ resume" [ref=e4782] [cursor=pointer]
+            - button "+ team" [ref=e4783] [cursor=pointer]
+        - generic [ref=e4784]:
+          - generic [ref=e4785]: cx
+          - generic [ref=e4786]:
+            - text: "# AGENTS.md instructions <INSTRUCTIONS> <!-- MC Codex global instructions. Dep…"
+            - generic [ref=e4787]: 019f483f · ~/dev/akapug/homelab
+          - generic [ref=e4788]: 266 msg · 1.8M2026-07-12
+          - generic [ref=e4789]:
+            - button "⧉ resume" [ref=e4790] [cursor=pointer]
+            - button "+ team" [ref=e4791] [cursor=pointer]
+        - generic [ref=e4792]:
+          - generic [ref=e4793]: cx
+          - generic [ref=e4794]:
+            - text: "# AGENTS.md instructions <INSTRUCTIONS> <!-- MC Codex global instructions. Dep…"
+            - generic [ref=e4795]: 019f4c9c · ~
+          - generic [ref=e4796]: 245 msg · 8.3M2026-07-12
+          - generic [ref=e4797]:
+            - button "⧉ resume" [ref=e4798] [cursor=pointer]
+            - button "+ team" [ref=e4799] [cursor=pointer]
+        - generic [ref=e4800]:
+          - generic [ref=e4801]: cl
+          - generic [ref=e4802]:
+            - text: Respond with model name and FABLE-READY
+            - generic [ref=e4803]: e1533ef5 · ~/dev/akapug/mission-control
+          - generic [ref=e4804]: 2,037 msg · 7.8M2026-07-12
+          - generic [ref=e4805]:
+            - button "⧉ resume" [ref=e4806] [cursor=pointer]
+            - button "+ team" [ref=e4807] [cursor=pointer]
+        - generic [ref=e4808]:
+          - generic [ref=e4809]: cx
+          - generic [ref=e4810]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/cod…"
+            - generic [ref=e4811]: 019f54e5 · ~/dev/akapug/mission-control-worktrees/codex-self-wake
+          - generic [ref=e4812]: 13 msg · 88K2026-07-12
+          - generic [ref=e4813]:
+            - button "⧉ resume" [ref=e4814] [cursor=pointer]
+            - button "+ team" [ref=e4815] [cursor=pointer]
+        - generic [ref=e4816]:
+          - generic [ref=e4817]: cx
+          - generic [ref=e4818]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/cod…"
+            - generic [ref=e4819]: 019f54e3 · ~/dev/akapug/mission-control-worktrees/codex-self-wake
+          - generic [ref=e4820]: 4 msg · 79K2026-07-12
+          - generic [ref=e4821]:
+            - button "⧉ resume" [ref=e4822] [cursor=pointer]
+            - button "+ team" [ref=e4823] [cursor=pointer]
+        - generic [ref=e4824]:
+          - generic [ref=e4825]: cl
+          - generic [ref=e4826]:
+            - text: (untitled)
+            - generic [ref=e4827]: 85112ed2 · ~/dev/akapug/buildr-private-beta
+          - generic [ref=e4828]: 48 msg · 344K2026-07-12
+          - generic [ref=e4829]:
+            - button "⧉ resume" [ref=e4830] [cursor=pointer]
+            - button "+ team" [ref=e4831] [cursor=pointer]
+        - generic [ref=e4832]:
+          - generic [ref=e4833]: cl
+          - generic [ref=e4834]:
+            - text: Test building Starbridge-v2 on Linux
+            - generic [ref=e4835]: ce0ffcf2 · ~
+          - generic [ref=e4836]: 1,030 msg · 4.4M2026-07-12
+          - generic [ref=e4837]:
+            - button "⧉ resume" [ref=e4838] [cursor=pointer]
+            - button "+ team" [ref=e4839] [cursor=pointer]
+        - generic [ref=e4840]:
+          - generic [ref=e4841]: cl
+          - generic [ref=e4842]:
+            - text: Test guard deck CANARY probe arming
+            - generic [ref=e4843]: e44caf48 · ~/dev/akapug/mission-control
+          - generic [ref=e4844]: 344 msg · 1.6M2026-07-11
+          - generic [ref=e4845]:
+            - button "⧉ resume" [ref=e4846] [cursor=pointer]
+            - button "+ team" [ref=e4847] [cursor=pointer]
+        - generic [ref=e4848]:
+          - generic [ref=e4849]: cl
+          - generic [ref=e4850]:
+            - text: Triage steward intake and task orchestration
+            - generic [ref=e4851]: 54e914e5 · ~/dev/akapug/mission-control
+          - generic [ref=e4852]: 21,457 msg · 88.3M2026-07-11
+          - generic [ref=e4853]:
+            - button "⧉ resume" [ref=e4854] [cursor=pointer]
+            - button "+ team" [ref=e4855] [cursor=pointer]
+        - generic [ref=e4856]:
+          - generic [ref=e4857]: cl
+          - generic [ref=e4858]:
+            - text: (untitled)
+            - generic [ref=e4859]: fc71f0e8 · ~/dev/akapug/tokaware
+          - generic [ref=e4860]: 6,528 msg · 28.9M2026-07-11
+          - generic [ref=e4861]:
+            - button "⧉ resume" [ref=e4862] [cursor=pointer]
+            - button "+ team" [ref=e4863] [cursor=pointer]
+        - generic [ref=e4864]:
+          - generic [ref=e4865]: cl
+          - generic [ref=e4866]:
+            - text: (untitled)
+            - generic [ref=e4867]: f12e5dd3 · ~/dev/akapug/mission-control
+          - generic [ref=e4868]: 16,718 msg · 70.1M2026-07-11
+          - generic [ref=e4869]:
+            - button "⧉ resume" [ref=e4870] [cursor=pointer]
+            - button "+ team" [ref=e4871] [cursor=pointer]
+        - generic [ref=e4872]:
+          - generic [ref=e4873]: cl
+          - generic [ref=e4874]:
+            - text: (untitled)
+            - generic [ref=e4875]: 53a5c9f3 · ~/dev/akapug/mission-control
+          - generic [ref=e4876]: 1,467 msg · 7.0M2026-07-11
+          - generic [ref=e4877]:
+            - button "⧉ resume" [ref=e4878] [cursor=pointer]
+            - button "+ team" [ref=e4879] [cursor=pointer]
+        - generic [ref=e4880]:
+          - generic [ref=e4881]: cl
+          - generic [ref=e4882]:
+            - text: (untitled)
+            - generic [ref=e4883]: f1701ec8 · ~
+          - generic [ref=e4884]: 4,760 msg · 33.5M2026-07-11
+          - generic [ref=e4885]:
+            - button "⧉ resume" [ref=e4886] [cursor=pointer]
+            - button "+ team" [ref=e4887] [cursor=pointer]
+        - generic [ref=e4888]:
+          - generic [ref=e4889]: cx
+          - generic [ref=e4890]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4891]: 019f2abb · ~/dev/akapug/mission-control
+          - generic [ref=e4892]: 904 msg · 27.8M2026-07-10
+          - generic [ref=e4893]:
+            - button "⧉ resume" [ref=e4894] [cursor=pointer]
+            - button "+ team" [ref=e4895] [cursor=pointer]
+        - generic [ref=e4896]:
+          - generic [ref=e4897]: cl
+          - generic [ref=e4898]:
+            - text: Run onboarding communication command
+            - generic [ref=e4899]: 459a32b7 · ~/dev/akapug/mission-control
+          - generic [ref=e4900]: 12,659 msg · 63.5M2026-07-10
+          - generic [ref=e4901]:
+            - button "⧉ resume" [ref=e4902] [cursor=pointer]
+            - button "+ team" [ref=e4903] [cursor=pointer]
+        - generic [ref=e4904]:
+          - generic [ref=e4905]: cx
+          - generic [ref=e4906]:
+            - text: <recommended_plugins> Here is a list of plugins that are available but not inst…
+            - generic [ref=e4907]: 019f487e · ~/dev/akapug/mission-control
+          - generic [ref=e4908]: 6 msg · 47K2026-07-09
+          - generic [ref=e4909]:
+            - button "⧉ resume" [ref=e4910] [cursor=pointer]
+            - button "+ team" [ref=e4911] [cursor=pointer]
+        - generic [ref=e4912]:
+          - generic [ref=e4913]: cx
+          - generic [ref=e4914]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4915]: 019f487e · ~/dev/akapug/mission-control
+          - generic [ref=e4916]: 4 msg · 72K2026-07-09
+          - generic [ref=e4917]:
+            - button "⧉ resume" [ref=e4918] [cursor=pointer]
+            - button "+ team" [ref=e4919] [cursor=pointer]
+        - generic [ref=e4920]:
+          - generic [ref=e4921]: cx
+          - generic [ref=e4922]:
+            - text: <recommended_plugins> Here is a list of plugins that are available but not inst…
+            - generic [ref=e4923]: 019f487e · ~/dev/akapug/mission-control
+          - generic [ref=e4924]: 8 msg · 70K2026-07-09
+          - generic [ref=e4925]:
+            - button "⧉ resume" [ref=e4926] [cursor=pointer]
+            - button "+ team" [ref=e4927] [cursor=pointer]
+        - generic [ref=e4928]:
+          - generic [ref=e4929]: cx
+          - generic [ref=e4930]:
+            - text: <recommended_plugins> Here is a list of plugins that are available but not inst…
+            - generic [ref=e4931]: 019f487e · ~/dev/akapug/mission-control
+          - generic [ref=e4932]: 9 msg · 72K2026-07-09
+          - generic [ref=e4933]:
+            - button "⧉ resume" [ref=e4934] [cursor=pointer]
+            - button "+ team" [ref=e4935] [cursor=pointer]
+        - generic [ref=e4936]:
+          - generic [ref=e4937]: cx
+          - generic [ref=e4938]:
+            - text: <recommended_plugins> Here is a list of plugins that are available but not inst…
+            - generic [ref=e4939]: 019f487d · ~/dev/akapug/mission-control
+          - generic [ref=e4940]: 9 msg · 73K2026-07-09
+          - generic [ref=e4941]:
+            - button "⧉ resume" [ref=e4942] [cursor=pointer]
+            - button "+ team" [ref=e4943] [cursor=pointer]
+        - generic [ref=e4944]:
+          - generic [ref=e4945]: cl
+          - generic [ref=e4946]:
+            - text: (untitled)
+            - generic [ref=e4947]: 3c2bba7c · ~/dev/akapug/polyana
+          - generic [ref=e4948]: 31,058 msg · 199.4M2026-07-09
+          - generic [ref=e4949]:
+            - button "⧉ resume" [ref=e4950] [cursor=pointer]
+            - button "+ team" [ref=e4951] [cursor=pointer]
+        - generic [ref=e4952]:
+          - generic [ref=e4953]: cx
+          - generic [ref=e4954]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4955]: 019f4261 · ~/dev/akapug/mission-control
+          - generic [ref=e4956]: 228 msg · 1.2M2026-07-09
+          - generic [ref=e4957]:
+            - button "⧉ resume" [ref=e4958] [cursor=pointer]
+            - button "+ team" [ref=e4959] [cursor=pointer]
+        - generic [ref=e4960]:
+          - generic [ref=e4961]: cl
+          - generic [ref=e4962]:
+            - text: Process buildr whisper message
+            - generic [ref=e4963]: 419cc9b7 · ~/dev/akapug/goodtimes-platform
+          - generic [ref=e4964]: 17,021 msg · 69.9M2026-07-09
+          - generic [ref=e4965]:
+            - button "⧉ resume" [ref=e4966] [cursor=pointer]
+            - button "+ team" [ref=e4967] [cursor=pointer]
+        - generic [ref=e4968]:
+          - generic [ref=e4969]: cx
+          - generic [ref=e4970]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4971]: 019f3f51 · ~/dev/akapug/mission-control
+          - generic [ref=e4972]: 247 msg · 2.5M2026-07-08
+          - generic [ref=e4973]:
+            - button "⧉ resume" [ref=e4974] [cursor=pointer]
+            - button "+ team" [ref=e4975] [cursor=pointer]
+        - generic [ref=e4976]:
+          - generic [ref=e4977]: cx
+          - generic [ref=e4978]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e4979]: 019f3f54 · ~/dev/akapug/mission-control
+          - generic [ref=e4980]: 401 msg · 3.2M2026-07-08
+          - generic [ref=e4981]:
+            - button "⧉ resume" [ref=e4982] [cursor=pointer]
+            - button "+ team" [ref=e4983] [cursor=pointer]
+        - generic [ref=e4984]:
+          - generic [ref=e4985]: cl
+          - generic [ref=e4986]:
+            - text: Execute captain dispatch on mc-night conversation
+            - generic [ref=e4987]: 9447321b · ~/dev/akapug/mission-control
+          - generic [ref=e4988]: 760 msg · 4.0M2026-07-08
+          - generic [ref=e4989]:
+            - button "⧉ resume" [ref=e4990] [cursor=pointer]
+            - button "+ team" [ref=e4991] [cursor=pointer]
+        - generic [ref=e4992]:
+          - generic [ref=e4993]: cl
+          - generic [ref=e4994]:
+            - text: (untitled)
+            - generic [ref=e4995]: e1d025fd · ~/dev/akapug/tokaware
+          - generic [ref=e4996]: 1,490 msg · 6.7M2026-07-08
+          - generic [ref=e4997]:
+            - button "⧉ resume" [ref=e4998] [cursor=pointer]
+            - button "+ team" [ref=e4999] [cursor=pointer]
+        - generic [ref=e5000]:
+          - generic [ref=e5001]: cx
+          - generic [ref=e5002]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e5003]: 019f3f4f · ~/dev/akapug/mission-control
+          - generic [ref=e5004]: 4 msg · 95K2026-07-08
+          - generic [ref=e5005]:
+            - button "⧉ resume" [ref=e5006] [cursor=pointer]
+            - button "+ team" [ref=e5007] [cursor=pointer]
+        - generic [ref=e5008]:
+          - generic [ref=e5009]: cl
+          - generic [ref=e5010]:
+            - text: (untitled)
+            - generic [ref=e5011]: 0a6755d2 · ~/dev/akapug/tokaware
+          - generic [ref=e5012]: 1,483 msg · 6.6M2026-07-08
+          - generic [ref=e5013]:
+            - button "⧉ resume" [ref=e5014] [cursor=pointer]
+            - button "+ team" [ref=e5015] [cursor=pointer]
+        - generic [ref=e5016]:
+          - generic [ref=e5017]: cl
+          - generic [ref=e5018]:
+            - text: (untitled)
+            - generic [ref=e5019]: 0c465500 · ~/dev/akapug/tokaware
+          - generic [ref=e5020]: 1,481 msg · 6.6M2026-07-08
+          - generic [ref=e5021]:
+            - button "⧉ resume" [ref=e5022] [cursor=pointer]
+            - button "+ team" [ref=e5023] [cursor=pointer]
+        - generic [ref=e5024]:
+          - generic [ref=e5025]: cl
+          - generic [ref=e5026]:
+            - text: (untitled)
+            - generic [ref=e5027]: 07ca3bf1 · ~/dev
+          - generic [ref=e5028]: 72,094 msg · 653.9M2026-07-07
+          - generic [ref=e5029]:
+            - button "⧉ resume" [ref=e5030] [cursor=pointer]
+            - button "+ team" [ref=e5031] [cursor=pointer]
+        - generic [ref=e5032]:
+          - generic [ref=e5033]: cx
+          - generic [ref=e5034]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/polyana <INSTRUCTIONS> # bui…"
+            - generic [ref=e5035]: 019ee4a3 · ~/dev/akapug/polyana
+          - generic [ref=e5036]: 9,207 msg · 161.0M2026-07-07
+          - generic [ref=e5037]:
+            - button "⧉ resume" [ref=e5038] [cursor=pointer]
+            - button "+ team" [ref=e5039] [cursor=pointer]
+        - generic [ref=e5040]:
+          - generic [ref=e5041]: cl
+          - generic [ref=e5042]:
+            - text: (untitled)
+            - generic [ref=e5043]: 289812a8 · ~/dev/akapug/buildr-private-beta
+          - generic [ref=e5044]: 1,822 msg · 17.5M2026-07-07
+          - generic [ref=e5045]:
+            - button "⧉ resume" [ref=e5046] [cursor=pointer]
+            - button "+ team" [ref=e5047] [cursor=pointer]
+        - generic [ref=e5048]:
+          - generic [ref=e5049]: cl
+          - generic [ref=e5050]:
+            - text: (untitled)
+            - generic [ref=e5051]: 26427de1 · ~/dev/emberian/cv
+          - generic [ref=e5052]: 3,319 msg · 29.9M2026-07-07
+          - generic [ref=e5053]:
+            - button "⧉ resume" [ref=e5054] [cursor=pointer]
+            - button "+ team" [ref=e5055] [cursor=pointer]
+        - generic [ref=e5056]:
+          - generic [ref=e5057]: cx
+          - generic [ref=e5058]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/builders-dev <INSTRUCTIONS> …"
+            - generic [ref=e5059]: 019ee58e · ~/dev/akapug/builders-dev
+          - generic [ref=e5060]: 2,209 msg · 13.2M2026-07-07
+          - generic [ref=e5061]:
+            - button "⧉ resume" [ref=e5062] [cursor=pointer]
+            - button "+ team" [ref=e5063] [cursor=pointer]
+        - generic [ref=e5064]:
+          - generic [ref=e5065]: cl
+          - generic [ref=e5066]:
+            - text: (untitled)
+            - generic [ref=e5067]: bd2b264f · ~/dev/akapug/buildr-private-beta
+          - generic [ref=e5068]: 9,335 msg · 77.4M2026-07-07
+          - generic [ref=e5069]:
+            - button "⧉ resume" [ref=e5070] [cursor=pointer]
+            - button "+ team" [ref=e5071] [cursor=pointer]
+        - generic [ref=e5072]:
+          - generic [ref=e5073]: cl
+          - generic [ref=e5074]:
+            - text: Triage steward intake and task orchestration
+            - generic [ref=e5075]: c3fd117e · ~/dev/akapug/buildr-private-beta
+          - generic [ref=e5076]: 8,967 msg · 51.8M2026-07-07
+          - generic [ref=e5077]:
+            - button "⧉ resume" [ref=e5078] [cursor=pointer]
+            - button "+ team" [ref=e5079] [cursor=pointer]
+        - generic [ref=e5080]:
+          - generic [ref=e5081]: cl
+          - generic [ref=e5082]:
+            - text: (untitled)
+            - generic [ref=e5083]: 3c2bba7c · ~/dev/akapug/polyana
+          - generic [ref=e5084]: 30,531 msg · 196.8M2026-07-07
+          - generic [ref=e5085]:
+            - button "⧉ resume" [ref=e5086] [cursor=pointer]
+            - button "+ team" [ref=e5087] [cursor=pointer]
+        - generic [ref=e5088]:
+          - generic [ref=e5089]: cx
+          - generic [ref=e5090]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e5091]: 019f34ed · ~/dev/akapug/mission-control
+          - generic [ref=e5092]: 545 msg · 5.3M2026-07-07
+          - generic [ref=e5093]:
+            - button "⧉ resume" [ref=e5094] [cursor=pointer]
+            - button "+ team" [ref=e5095] [cursor=pointer]
+        - generic [ref=e5096]:
+          - generic [ref=e5097]: cl
+          - generic [ref=e5098]:
+            - text: Review inbox and execute captain dispatch
+            - generic [ref=e5099]: b553bc9a · ~/dev/akapug/mission-control
+          - generic [ref=e5100]: 1,332 msg · 5.3M2026-07-07
+          - generic [ref=e5101]:
+            - button "⧉ resume" [ref=e5102] [cursor=pointer]
+            - button "+ team" [ref=e5103] [cursor=pointer]
+        - generic [ref=e5104]:
+          - generic [ref=e5105]: cl
+          - generic [ref=e5106]:
+            - text: (untitled)
+            - generic [ref=e5107]: 17abd58b · ~/dev/akapug/mission-control
+          - generic [ref=e5108]: 13,681 msg · 68.5M2026-07-07
+          - generic [ref=e5109]:
+            - button "⧉ resume" [ref=e5110] [cursor=pointer]
+            - button "+ team" [ref=e5111] [cursor=pointer]
+        - generic [ref=e5112]:
+          - generic [ref=e5113]: cl
+          - generic [ref=e5114]:
+            - text: Triage steward intake and task orchestration
+            - generic [ref=e5115]: 03ddfd42 · ~/dev/akapug/mission-control
+          - generic [ref=e5116]: 16,346 msg · 40.6M2026-07-07
+          - generic [ref=e5117]:
+            - button "⧉ resume" [ref=e5118] [cursor=pointer]
+            - button "+ team" [ref=e5119] [cursor=pointer]
+        - generic [ref=e5120]:
+          - generic [ref=e5121]: cl
+          - generic [ref=e5122]:
+            - text: Run onboarding communication command
+            - generic [ref=e5123]: d1a70aae · ~/dev/akapug/mission-control
+          - generic [ref=e5124]: 7,239 msg · 26.9M2026-07-07
+          - generic [ref=e5125]:
+            - button "⧉ resume" [ref=e5126] [cursor=pointer]
+            - button "+ team" [ref=e5127] [cursor=pointer]
+        - generic [ref=e5128]:
+          - generic [ref=e5129]: cl
+          - generic [ref=e5130]:
+            - text: (untitled)
+            - generic [ref=e5131]: 645caef2 · ~/dev/akapug/mission-control
+          - generic [ref=e5132]: 3,477 msg · 16.4M2026-07-06
+          - generic [ref=e5133]:
+            - button "⧉ resume" [ref=e5134] [cursor=pointer]
+            - button "+ team" [ref=e5135] [cursor=pointer]
+        - generic [ref=e5136]:
+          - generic [ref=e5137]: cl
+          - generic [ref=e5138]:
+            - text: Execute captain dispatch on mc-night conversation
+            - generic [ref=e5139]: 90dd1eec · ~/dev/akapug/mission-control
+          - generic [ref=e5140]: 1,682 msg · 9.4M2026-07-06
+          - generic [ref=e5141]:
+            - button "⧉ resume" [ref=e5142] [cursor=pointer]
+            - button "+ team" [ref=e5143] [cursor=pointer]
+        - generic [ref=e5144]:
+          - generic [ref=e5145]: cl
+          - generic [ref=e5146]:
+            - text: (untitled)
+            - generic [ref=e5147]: 07e78f05 · ~/dev/akapug/mission-control
+          - generic [ref=e5148]: 7,829 msg · 31.0M2026-07-06
+          - generic [ref=e5149]:
+            - button "⧉ resume" [ref=e5150] [cursor=pointer]
+            - button "+ team" [ref=e5151] [cursor=pointer]
+        - generic [ref=e5152]:
+          - generic [ref=e5153]: cl
+          - generic [ref=e5154]:
+            - text: Run onboarding communication command
+            - generic [ref=e5155]: 1feb13e1 · ~/dev/akapug/mission-control
+          - generic [ref=e5156]: 6,097 msg · 21.7M2026-07-06
+          - generic [ref=e5157]:
+            - button "⧉ resume" [ref=e5158] [cursor=pointer]
+            - button "+ team" [ref=e5159] [cursor=pointer]
+        - generic [ref=e5160]:
+          - generic [ref=e5161]: cl
+          - generic [ref=e5162]:
+            - text: Execute captain dispatch on mc-night conversation
+            - generic [ref=e5163]: 706d040a · ~/dev/akapug/mission-control
+          - generic [ref=e5164]: 787 msg · 3.8M2026-07-06
+          - generic [ref=e5165]:
+            - button "⧉ resume" [ref=e5166] [cursor=pointer]
+            - button "+ team" [ref=e5167] [cursor=pointer]
+        - generic [ref=e5168]:
+          - generic [ref=e5169]: cl
+          - generic [ref=e5170]:
+            - text: (untitled)
+            - generic [ref=e5171]: cf6b31b9 · ~/dev/akapug/mission-control
+          - generic [ref=e5172]: 10,137 msg · 25.3M2026-07-06
+          - generic [ref=e5173]:
+            - button "⧉ resume" [ref=e5174] [cursor=pointer]
+            - button "+ team" [ref=e5175] [cursor=pointer]
+        - generic [ref=e5176]:
+          - generic [ref=e5177]: cl
+          - generic [ref=e5178]:
+            - text: Triage steward intake and task orchestration
+            - generic [ref=e5179]: cb6a61e8 · ~/dev/akapug/mission-control
+          - generic [ref=e5180]: 14,864 msg · 32.8M2026-07-06
+          - generic [ref=e5181]:
+            - button "⧉ resume" [ref=e5182] [cursor=pointer]
+            - button "+ team" [ref=e5183] [cursor=pointer]
+        - generic [ref=e5184]:
+          - generic [ref=e5185]: cl
+          - generic [ref=e5186]:
+            - text: (untitled)
+            - generic [ref=e5187]: 54060c93 · ~/dev/akapug/tokaware
+          - generic [ref=e5188]: 15,827 msg · 54.2M2026-07-06
+          - generic [ref=e5189]:
+            - button "⧉ resume" [ref=e5190] [cursor=pointer]
+            - button "+ team" [ref=e5191] [cursor=pointer]
+        - generic [ref=e5192]:
+          - generic [ref=e5193]: cl
+          - generic [ref=e5194]:
+            - text: Set up cred-steward credential health monitoring agent
+            - generic [ref=e5195]: 4c2d542a · ~/dev/akapug/mission-control
+          - generic [ref=e5196]: 14,327 msg · 34.0M2026-07-06
+          - generic [ref=e5197]:
+            - button "⧉ resume" [ref=e5198] [cursor=pointer]
+            - button "+ team" [ref=e5199] [cursor=pointer]
+        - generic [ref=e5200]:
+          - generic [ref=e5201]: cl
+          - generic [ref=e5202]:
+            - text: Review pending onboarding message
+            - generic [ref=e5203]: d72edbf5 · ~/dev/akapug/mission-control
+          - generic [ref=e5204]: 5,295 msg · 26.3M2026-07-06
+          - generic [ref=e5205]:
+            - button "⧉ resume" [ref=e5206] [cursor=pointer]
+            - button "+ team" [ref=e5207] [cursor=pointer]
+        - generic [ref=e5208]:
+          - generic [ref=e5209]: cl
+          - generic [ref=e5210]:
+            - text: Review pending onboarding message
+            - generic [ref=e5211]: c96ad74d · ~/dev/akapug/mission-control
+          - generic [ref=e5212]: 5,291 msg · 18.2M2026-07-06
+          - generic [ref=e5213]:
+            - button "⧉ resume" [ref=e5214] [cursor=pointer]
+            - button "+ team" [ref=e5215] [cursor=pointer]
+        - generic [ref=e5216]:
+          - generic [ref=e5217]: cl
+          - generic [ref=e5218]:
+            - text: (untitled)
+            - generic [ref=e5219]: cb8b58da · ~/dev/akapug/mission-control
+          - generic [ref=e5220]: 12,104 msg · 57.3M2026-07-06
+          - generic [ref=e5221]:
+            - button "⧉ resume" [ref=e5222] [cursor=pointer]
+            - button "+ team" [ref=e5223] [cursor=pointer]
+        - generic [ref=e5224]:
+          - generic [ref=e5225]: cx
+          - generic [ref=e5226]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e5227]: 019f2bbc · ~/dev/akapug/mission-control
+          - generic [ref=e5228]: 3,024 msg · 22.5M2026-07-06
+          - generic [ref=e5229]:
+            - button "⧉ resume" [ref=e5230] [cursor=pointer]
+            - button "+ team" [ref=e5231] [cursor=pointer]
+        - generic [ref=e5232]:
+          - generic [ref=e5233]: cx
+          - generic [ref=e5234]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control <INSTRUCTION…"
+            - generic [ref=e5235]: 019f34e8 · ~/dev/akapug/mission-control
+          - generic [ref=e5236]: 138 msg · 3.7M2026-07-06
+          - generic [ref=e5237]:
+            - button "⧉ resume" [ref=e5238] [cursor=pointer]
+            - button "+ team" [ref=e5239] [cursor=pointer]
+        - generic [ref=e5240]:
+          - generic [ref=e5241]: cl
+          - generic [ref=e5242]:
+            - text: Run pending onboarding communication command
+            - generic [ref=e5243]: 25a5c39f · ~/dev/akapug/mission-control
+          - generic [ref=e5244]: 5,494 msg · 24.5M2026-07-06
+          - generic [ref=e5245]:
+            - button "⧉ resume" [ref=e5246] [cursor=pointer]
+            - button "+ team" [ref=e5247] [cursor=pointer]
+        - generic [ref=e5248]:
+          - generic [ref=e5249]: cl
+          - generic [ref=e5250]:
+            - text: (untitled)
+            - generic [ref=e5251]: 6728d7da · ~/dev/akapug/polyana
+          - generic [ref=e5252]: 84,352 msg · 737.0M2026-07-06
+          - generic [ref=e5253]:
+            - button "⧉ resume" [ref=e5254] [cursor=pointer]
+            - button "+ team" [ref=e5255] [cursor=pointer]
+        - generic [ref=e5256]:
+          - generic [ref=e5257]: cl
+          - generic [ref=e5258]:
+            - text: (untitled)
+            - generic [ref=e5259]: f078610c · ~/dev/akapug/mission-control
+          - generic [ref=e5260]: 4,703 msg · 49.5M2026-07-06
+          - generic [ref=e5261]:
+            - button "⧉ resume" [ref=e5262] [cursor=pointer]
+            - button "+ team" [ref=e5263] [cursor=pointer]
+        - generic [ref=e5264]:
+          - generic [ref=e5265]: cl
+          - generic [ref=e5266]:
+            - text: (untitled)
+            - generic [ref=e5267]: 3aca89a5 · ~/dev/akapug/goodtimes-platform
+          - generic [ref=e5268]: 14,561 msg · 81.6M2026-07-05
+          - generic [ref=e5269]:
+            - button "⧉ resume" [ref=e5270] [cursor=pointer]
+            - button "+ team" [ref=e5271] [cursor=pointer]
+        - generic [ref=e5272]:
+          - generic [ref=e5273]: cl
+          - generic [ref=e5274]:
+            - text: (untitled)
+            - generic [ref=e5275]: 287836ff · ~/dev/akapug/mission-control
+          - generic [ref=e5276]: 10,520 msg · 46.0M2026-07-05
+          - generic [ref=e5277]:
+            - button "⧉ resume" [ref=e5278] [cursor=pointer]
+            - button "+ team" [ref=e5279] [cursor=pointer]
+        - generic [ref=e5280]:
+          - generic [ref=e5281]: cl
+          - generic [ref=e5282]:
+            - text: (untitled)
+            - generic [ref=e5283]: aab118d2 · ~/dev/akapug/mission-control
+          - generic [ref=e5284]: 5,634 msg · 19.3M2026-07-05
+          - generic [ref=e5285]:
+            - button "⧉ resume" [ref=e5286] [cursor=pointer]
+            - button "+ team" [ref=e5287] [cursor=pointer]
+        - generic [ref=e5288]:
+          - generic [ref=e5289]: cl
+          - generic [ref=e5290]:
+            - text: Set up cred-steward credential health monitoring agent
+            - generic [ref=e5291]: 6ff37910 · ~/dev/akapug/mission-control
+          - generic [ref=e5292]: 12,424 msg · 25.6M2026-07-05
+          - generic [ref=e5293]:
+            - button "⧉ resume" [ref=e5294] [cursor=pointer]
+            - button "+ team" [ref=e5295] [cursor=pointer]
+        - generic [ref=e5296]:
+          - generic [ref=e5297]: cl
+          - generic [ref=e5298]:
+            - text: (untitled)
+            - generic [ref=e5299]: c191e42a · ~/dev/akapug/mission-control
+          - generic [ref=e5300]: 12,367 msg · 46.5M2026-07-05
+          - generic [ref=e5301]:
+            - button "⧉ resume" [ref=e5302] [cursor=pointer]
+            - button "+ team" [ref=e5303] [cursor=pointer]
+        - generic [ref=e5304]:
+          - generic [ref=e5305]: cl
+          - generic [ref=e5306]:
+            - text: (untitled)
+            - generic [ref=e5307]: 3b450706 · ~/dev/akapug/mission-control
+          - generic [ref=e5308]: 9,168 msg · 37.6M2026-07-05
+          - generic [ref=e5309]:
+            - button "⧉ resume" [ref=e5310] [cursor=pointer]
+            - button "+ team" [ref=e5311] [cursor=pointer]
+        - generic [ref=e5312]:
+          - generic [ref=e5313]: cl
+          - generic [ref=e5314]:
+            - text: Triage steward intake and task orchestration
+            - generic [ref=e5315]: ad0d51b0 · ~/dev/akapug/mission-control
+          - generic [ref=e5316]: 12,170 msg · 22.4M2026-07-05
+          - generic [ref=e5317]:
+            - button "⧉ resume" [ref=e5318] [cursor=pointer]
+            - button "+ team" [ref=e5319] [cursor=pointer]
+        - generic [ref=e5320]:
+          - generic [ref=e5321]: cl
+          - generic [ref=e5322]:
+            - text: (untitled)
+            - generic [ref=e5323]: 8d5f6a91 · ~/dev/akapug/tokaware
+          - generic [ref=e5324]: 13,576 msg · 26.4M2026-07-05
+          - generic [ref=e5325]:
+            - button "⧉ resume" [ref=e5326] [cursor=pointer]
+            - button "+ team" [ref=e5327] [cursor=pointer]
+        - generic [ref=e5328]:
+          - generic [ref=e5329]: cl
+          - generic [ref=e5330]:
+            - text: (untitled)
+            - generic [ref=e5331]: ba207311 · ~/dev/akapug/mission-control
+          - generic [ref=e5332]: 7,732 msg · 15.3M2026-07-05
+          - generic [ref=e5333]:
+            - button "⧉ resume" [ref=e5334] [cursor=pointer]
+            - button "+ team" [ref=e5335] [cursor=pointer]
+        - generic [ref=e5336]:
+          - generic [ref=e5337]: cl
+          - generic [ref=e5338]:
+            - text: (untitled)
+            - generic [ref=e5339]: e40fce32 · /tmp
+          - generic [ref=e5340]: 13 msg · 112K2026-07-05
+          - generic [ref=e5341]:
+            - button "⧉ resume" [ref=e5342] [cursor=pointer]
+            - button "+ team" [ref=e5343] [cursor=pointer]
+        - generic [ref=e5344]:
+          - generic [ref=e5345]: cl
+          - generic [ref=e5346]:
+            - text: (untitled)
+            - generic [ref=e5347]: 6e2c644e · /tmp
+          - generic [ref=e5348]: 3 msg · 69K2026-07-05
+          - generic [ref=e5349]:
+            - button "⧉ resume" [ref=e5350] [cursor=pointer]
+            - button "+ team" [ref=e5351] [cursor=pointer]
+        - generic [ref=e5352]:
+          - generic [ref=e5353]: cx
+          - generic [ref=e5354]:
+            - text: Q79CODEX alpha line one probe Q79CODEX bravo line two Q79CODEX charlie line thr…
+            - generic [ref=e5355]: 019f3011 · /tmp/claude-1000/-home-pug-dev-akapug-mission-control/d72edbf5-a76f-4845-a6f5-4baebce21f64/scratchpad/q79-scratch
+          - generic [ref=e5356]: 4 msg · 61K2026-07-05
+          - generic [ref=e5357]:
+            - button "⧉ resume" [ref=e5358] [cursor=pointer]
+            - button "+ team" [ref=e5359] [cursor=pointer]
+        - generic [ref=e5360]:
+          - generic [ref=e5361]: cl
+          - generic [ref=e5362]:
+            - text: Debug Q79 multiline probe output
+            - generic [ref=e5363]: d8b08d1d · /tmp/claude-1000/-home-pug-dev-akapug-mission-control/d72edbf5-a76f-4845-a6f5-4baebce21f64/scratchpad/q79-scratch
+          - generic [ref=e5364]: 2 msg · 92K2026-07-05
+          - generic [ref=e5365]:
+            - button "⧉ resume" [ref=e5366] [cursor=pointer]
+            - button "+ team" [ref=e5367] [cursor=pointer]
+        - generic [ref=e5368]:
+          - generic [ref=e5369]: cl
+          - generic [ref=e5370]:
+            - text: (untitled)
+            - generic [ref=e5371]: e355b629 · ~/dev/akapug/tokaware
+          - generic [ref=e5372]: 12,008 msg · 22.0M2026-07-05
+          - generic [ref=e5373]:
+            - button "⧉ resume" [ref=e5374] [cursor=pointer]
+            - button "+ team" [ref=e5375] [cursor=pointer]
+        - generic [ref=e5376]:
+          - generic [ref=e5377]: cl
+          - generic [ref=e5378]:
+            - text: Run onboarding communication command
+            - generic [ref=e5379]: 8eb550da · ~/dev/akapug/mission-control
+          - generic [ref=e5380]: 3,491 msg · 10.6M2026-07-05
+          - generic [ref=e5381]:
+            - button "⧉ resume" [ref=e5382] [cursor=pointer]
+            - button "+ team" [ref=e5383] [cursor=pointer]
+        - generic [ref=e5384]:
+          - generic [ref=e5385]: cl
+          - generic [ref=e5386]:
+            - text: (untitled)
+            - generic [ref=e5387]: 0981935d · ~/dev/akapug/mission-control
+          - generic [ref=e5388]: 4 msg · 104K2026-07-05
+          - generic [ref=e5389]:
+            - button "⧉ resume" [ref=e5390] [cursor=pointer]
+            - button "+ team" [ref=e5391] [cursor=pointer]
+        - generic [ref=e5392]:
+          - generic [ref=e5393]: cl
+          - generic [ref=e5394]:
+            - text: (untitled)
+            - generic [ref=e5395]: b5dda048 · ~/dev/akapug/mission-control
+          - generic [ref=e5396]: 11,281 msg · 20.9M2026-07-04
+          - generic [ref=e5397]:
+            - button "⧉ resume" [ref=e5398] [cursor=pointer]
+            - button "+ team" [ref=e5399] [cursor=pointer]
+        - generic [ref=e5400]:
+          - generic [ref=e5401]: cl
+          - generic [ref=e5402]:
+            - text: Review pending onboarding message
+            - generic [ref=e5403]: 118dd228 · ~/dev/akapug/mission-control
+          - generic [ref=e5404]: 2,984 msg · 9.7M2026-07-04
+          - generic [ref=e5405]:
+            - button "⧉ resume" [ref=e5406] [cursor=pointer]
+            - button "+ team" [ref=e5407] [cursor=pointer]
+        - generic [ref=e5408]:
+          - generic [ref=e5409]: cl
+          - generic [ref=e5410]:
+            - text: (untitled)
+            - generic [ref=e5411]: e12480e2 · ~/dev/akapug/mission-control
+          - generic [ref=e5412]: 11,264 msg · 20.7M2026-07-04
+          - generic [ref=e5413]:
+            - button "⧉ resume" [ref=e5414] [cursor=pointer]
+            - button "+ team" [ref=e5415] [cursor=pointer]
+        - generic [ref=e5416]:
+          - generic [ref=e5417]: cl
+          - generic [ref=e5418]:
+            - text: Run pending onboarding communication command
+            - generic [ref=e5419]: 2426d4c2 · ~/dev/akapug/mission-control
+          - generic [ref=e5420]: 3,560 msg · 10.3M2026-07-04
+          - generic [ref=e5421]:
+            - button "⧉ resume" [ref=e5422] [cursor=pointer]
+            - button "+ team" [ref=e5423] [cursor=pointer]
+        - generic [ref=e5424]:
+          - generic [ref=e5425]: cl
+          - generic [ref=e5426]:
+            - text: (untitled)
+            - generic [ref=e5427]: 90bb639d · ~/dev/akapug/mission-control
+          - generic [ref=e5428]: 7,088 msg · 29.3M2026-07-04
+          - generic [ref=e5429]:
+            - button "⧉ resume" [ref=e5430] [cursor=pointer]
+            - button "+ team" [ref=e5431] [cursor=pointer]
+        - generic [ref=e5432]:
+          - generic [ref=e5433]: cl
+          - generic [ref=e5434]:
+            - text: (untitled)
+            - generic [ref=e5435]: f600f77f · ~/dev/akapug/mission-control
+          - generic [ref=e5436]: 3,759 msg · 11.5M2026-07-04
+          - generic [ref=e5437]:
+            - button "⧉ resume" [ref=e5438] [cursor=pointer]
+            - button "+ team" [ref=e5439] [cursor=pointer]
+        - generic [ref=e5440]:
+          - generic [ref=e5441]: cl
+          - generic [ref=e5442]:
+            - text: (untitled)
+            - generic [ref=e5443]: 79e7c42f · ~/dev/akapug/tokaware
+          - generic [ref=e5444]: 10,688 msg · 18.3M2026-07-04
+          - generic [ref=e5445]:
+            - button "⧉ resume" [ref=e5446] [cursor=pointer]
+            - button "+ team" [ref=e5447] [cursor=pointer]
+        - generic [ref=e5448]:
+          - generic [ref=e5449]: cl
+          - generic [ref=e5450]:
+            - text: Triage steward intake and task orchestration
+            - generic [ref=e5451]: 5e5359cd · ~/dev/akapug/mission-control
+          - generic [ref=e5452]: 10,547 msg · 17.5M2026-07-04
+          - generic [ref=e5453]:
+            - button "⧉ resume" [ref=e5454] [cursor=pointer]
+            - button "+ team" [ref=e5455] [cursor=pointer]
+        - generic [ref=e5456]:
+          - generic [ref=e5457]: cl
+          - generic [ref=e5458]:
+            - text: Triage steward intake and task orchestration
+            - generic [ref=e5459]: 116c9fd3 · ~/dev/akapug/mission-control
+          - generic [ref=e5460]: 10,226 msg · 16.5M2026-07-04
+          - generic [ref=e5461]:
+            - button "⧉ resume" [ref=e5462] [cursor=pointer]
+            - button "+ team" [ref=e5463] [cursor=pointer]
+        - generic [ref=e5464]:
+          - generic [ref=e5465]: cl
+          - generic [ref=e5466]:
+            - text: Run pending onboarding communication command
+            - generic [ref=e5467]: 2729023d · ~/dev/akapug/mission-control
+          - generic [ref=e5468]: 2,314 msg · 6.5M2026-07-04
+          - generic [ref=e5469]:
+            - button "⧉ resume" [ref=e5470] [cursor=pointer]
+            - button "+ team" [ref=e5471] [cursor=pointer]
+        - generic [ref=e5472]:
+          - generic [ref=e5473]: cl
+          - generic [ref=e5474]:
+            - text: Set up cred-steward credential health monitoring agent
+            - generic [ref=e5475]: e0d71997 · ~/dev/akapug/mission-control
+          - generic [ref=e5476]: 10,779 msg · 18.2M2026-07-04
+          - generic [ref=e5477]:
+            - button "⧉ resume" [ref=e5478] [cursor=pointer]
+            - button "+ team" [ref=e5479] [cursor=pointer]
+        - generic [ref=e5480]:
+          - generic [ref=e5481]: cl
+          - generic [ref=e5482]:
+            - text: (untitled)
+            - generic [ref=e5483]: 735fe90d · ~/dev/akapug/mission-control
+          - generic [ref=e5484]: 9,784 msg · 16.4M2026-07-04
+          - generic [ref=e5485]:
+            - button "⧉ resume" [ref=e5486] [cursor=pointer]
+            - button "+ team" [ref=e5487] [cursor=pointer]
+        - generic [ref=e5488]:
+          - generic [ref=e5489]: cl
+          - generic [ref=e5490]:
+            - text: (untitled)
+            - generic [ref=e5491]: 90da08df · ~/dev/akapug/tokaware
+          - generic [ref=e5492]: 9,480 msg · 14.7M2026-07-04
+          - generic [ref=e5493]:
+            - button "⧉ resume" [ref=e5494] [cursor=pointer]
+            - button "+ team" [ref=e5495] [cursor=pointer]
+        - generic [ref=e5496]:
+          - generic [ref=e5497]: cl
+          - generic [ref=e5498]:
+            - text: (untitled)
+            - generic [ref=e5499]: 3f18dfa0 · ~/dev/akapug/mission-control
+          - generic [ref=e5500]: 6,244 msg · 12.4M2026-07-04
+          - generic [ref=e5501]:
+            - button "⧉ resume" [ref=e5502] [cursor=pointer]
+            - button "+ team" [ref=e5503] [cursor=pointer]
+        - generic [ref=e5504]:
+          - generic [ref=e5505]: cl
+          - generic [ref=e5506]:
+            - text: Run onboarding communication command
+            - generic [ref=e5507]: f2c0ec87 · ~/dev/akapug/mission-control
+          - generic [ref=e5508]: 1,854 msg · 5.3M2026-07-04
+          - generic [ref=e5509]:
+            - button "⧉ resume" [ref=e5510] [cursor=pointer]
+            - button "+ team" [ref=e5511] [cursor=pointer]
+        - generic [ref=e5512]:
+          - generic [ref=e5513]: cl
+          - generic [ref=e5514]:
+            - text: Review pending onboarding message
+            - generic [ref=e5515]: 0add8b8a · ~/dev/akapug/mission-control
+          - generic [ref=e5516]: 1,399 msg · 4.2M2026-07-04
+          - generic [ref=e5517]:
+            - button "⧉ resume" [ref=e5518] [cursor=pointer]
+            - button "+ team" [ref=e5519] [cursor=pointer]
+        - generic [ref=e5520]:
+          - generic [ref=e5521]: cl
+          - generic [ref=e5522]:
+            - text: Review Simbi Fable cross-family changes
+            - generic [ref=e5523]: 1c5e3d10 · ~/dev/simbi-inc
+          - generic [ref=e5524]: 2,209 msg · 8.4M2026-07-04
+          - generic [ref=e5525]:
+            - button "⧉ resume" [ref=e5526] [cursor=pointer]
+            - button "+ team" [ref=e5527] [cursor=pointer]
+        - generic [ref=e5528]:
+          - generic [ref=e5529]: cl
+          - generic [ref=e5530]:
+            - text: Run pending onboarding communication command
+            - generic [ref=e5531]: d0c55ad6 · ~/dev/akapug/mission-control
+          - generic [ref=e5532]: 1,064 msg · 3.0M2026-07-04
+          - generic [ref=e5533]:
+            - button "⧉ resume" [ref=e5534] [cursor=pointer]
+            - button "+ team" [ref=e5535] [cursor=pointer]
+        - generic [ref=e5536]:
+          - generic [ref=e5537]: cl
+          - generic [ref=e5538]:
+            - text: (untitled)
+            - generic [ref=e5539]: f381259d · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5540]: 3 msg · 73K2026-07-04
+          - generic [ref=e5541]:
+            - button "⧉ resume" [ref=e5542] [cursor=pointer]
+            - button "+ team" [ref=e5543] [cursor=pointer]
+        - generic [ref=e5544]:
+          - generic [ref=e5545]: cl
+          - generic [ref=e5546]:
+            - text: (untitled)
+            - generic [ref=e5547]: 395379d4 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5548]: 3 msg · 67K2026-07-04
+          - generic [ref=e5549]:
+            - button "⧉ resume" [ref=e5550] [cursor=pointer]
+            - button "+ team" [ref=e5551] [cursor=pointer]
+        - generic [ref=e5552]:
+          - generic [ref=e5553]: cx
+          - generic [ref=e5554]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5555]: 019f2c00 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5556]: 6 msg · 94K2026-07-04
+          - generic [ref=e5557]:
+            - button "⧉ resume" [ref=e5558] [cursor=pointer]
+            - button "+ team" [ref=e5559] [cursor=pointer]
+        - generic [ref=e5560]:
+          - generic [ref=e5561]: cx
+          - generic [ref=e5562]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5563]: 019f2c00 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5564]: 6 msg · 93K2026-07-04
+          - generic [ref=e5565]:
+            - button "⧉ resume" [ref=e5566] [cursor=pointer]
+            - button "+ team" [ref=e5567] [cursor=pointer]
+        - generic [ref=e5568]:
+          - generic [ref=e5569]: cx
+          - generic [ref=e5570]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5571]: 019f2c00 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5572]: 6 msg · 93K2026-07-04
+          - generic [ref=e5573]:
+            - button "⧉ resume" [ref=e5574] [cursor=pointer]
+            - button "+ team" [ref=e5575] [cursor=pointer]
+        - generic [ref=e5576]:
+          - generic [ref=e5577]: cx
+          - generic [ref=e5578]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5579]: 019f2bff · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5580]: 6 msg · 93K2026-07-04
+          - generic [ref=e5581]:
+            - button "⧉ resume" [ref=e5582] [cursor=pointer]
+            - button "+ team" [ref=e5583] [cursor=pointer]
+        - generic [ref=e5584]:
+          - generic [ref=e5585]: cl
+          - generic [ref=e5586]:
+            - text: (untitled)
+            - generic [ref=e5587]: 23574821 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5588]: 3 msg · 68K2026-07-04
+          - generic [ref=e5589]:
+            - button "⧉ resume" [ref=e5590] [cursor=pointer]
+            - button "+ team" [ref=e5591] [cursor=pointer]
+        - generic [ref=e5592]:
+          - generic [ref=e5593]: cl
+          - generic [ref=e5594]:
+            - text: (untitled)
+            - generic [ref=e5595]: 5c0df061 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5596]: 3 msg · 69K2026-07-04
+          - generic [ref=e5597]:
+            - button "⧉ resume" [ref=e5598] [cursor=pointer]
+            - button "+ team" [ref=e5599] [cursor=pointer]
+        - generic [ref=e5600]:
+          - generic [ref=e5601]: cl
+          - generic [ref=e5602]:
+            - text: (untitled)
+            - generic [ref=e5603]: b66d5be5 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5604]: 3 msg · 67K2026-07-04
+          - generic [ref=e5605]:
+            - button "⧉ resume" [ref=e5606] [cursor=pointer]
+            - button "+ team" [ref=e5607] [cursor=pointer]
+        - generic [ref=e5608]:
+          - generic [ref=e5609]: cl
+          - generic [ref=e5610]:
+            - text: (untitled)
+            - generic [ref=e5611]: 3e43cc5b · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5612]: 3 msg · 67K2026-07-04
+          - generic [ref=e5613]:
+            - button "⧉ resume" [ref=e5614] [cursor=pointer]
+            - button "+ team" [ref=e5615] [cursor=pointer]
+        - generic [ref=e5616]:
+          - generic [ref=e5617]: cx
+          - generic [ref=e5618]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5619]: 019f2bfe · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5620]: 6 msg · 101K2026-07-04
+          - generic [ref=e5621]:
+            - button "⧉ resume" [ref=e5622] [cursor=pointer]
+            - button "+ team" [ref=e5623] [cursor=pointer]
+        - generic [ref=e5624]:
+          - generic [ref=e5625]: cx
+          - generic [ref=e5626]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5627]: 019f2bfe · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5628]: 6 msg · 94K2026-07-04
+          - generic [ref=e5629]:
+            - button "⧉ resume" [ref=e5630] [cursor=pointer]
+            - button "+ team" [ref=e5631] [cursor=pointer]
+        - generic [ref=e5632]:
+          - generic [ref=e5633]: cx
+          - generic [ref=e5634]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5635]: 019f2bfe · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5636]: 6 msg · 92K2026-07-04
+          - generic [ref=e5637]:
+            - button "⧉ resume" [ref=e5638] [cursor=pointer]
+            - button "+ team" [ref=e5639] [cursor=pointer]
+        - generic [ref=e5640]:
+          - generic [ref=e5641]: cx
+          - generic [ref=e5642]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5643]: 019f2bfd · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5644]: 6 msg · 94K2026-07-04
+          - generic [ref=e5645]:
+            - button "⧉ resume" [ref=e5646] [cursor=pointer]
+            - button "+ team" [ref=e5647] [cursor=pointer]
+        - generic [ref=e5648]:
+          - generic [ref=e5649]: cx
+          - generic [ref=e5650]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5651]: 019f2bfd · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5652]: 6 msg · 93K2026-07-04
+          - generic [ref=e5653]:
+            - button "⧉ resume" [ref=e5654] [cursor=pointer]
+            - button "+ team" [ref=e5655] [cursor=pointer]
+        - generic [ref=e5656]:
+          - generic [ref=e5657]: cl
+          - generic [ref=e5658]:
+            - text: (untitled)
+            - generic [ref=e5659]: e449eae0 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5660]: 3 msg · 76K2026-07-04
+          - generic [ref=e5661]:
+            - button "⧉ resume" [ref=e5662] [cursor=pointer]
+            - button "+ team" [ref=e5663] [cursor=pointer]
+        - generic [ref=e5664]:
+          - generic [ref=e5665]: cl
+          - generic [ref=e5666]:
+            - text: (untitled)
+            - generic [ref=e5667]: 81663bb4 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5668]: 3 msg · 69K2026-07-04
+          - generic [ref=e5669]:
+            - button "⧉ resume" [ref=e5670] [cursor=pointer]
+            - button "+ team" [ref=e5671] [cursor=pointer]
+        - generic [ref=e5672]:
+          - generic [ref=e5673]: cl
+          - generic [ref=e5674]:
+            - text: (untitled)
+            - generic [ref=e5675]: b9475d73 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5676]: 3 msg · 67K2026-07-04
+          - generic [ref=e5677]:
+            - button "⧉ resume" [ref=e5678] [cursor=pointer]
+            - button "+ team" [ref=e5679] [cursor=pointer]
+        - generic [ref=e5680]:
+          - generic [ref=e5681]: cx
+          - generic [ref=e5682]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5683]: 019f2bfc · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5684]: 6 msg · 83K2026-07-04
+          - generic [ref=e5685]:
+            - button "⧉ resume" [ref=e5686] [cursor=pointer]
+            - button "+ team" [ref=e5687] [cursor=pointer]
+        - generic [ref=e5688]:
+          - generic [ref=e5689]: cx
+          - generic [ref=e5690]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5691]: 019f2bfc · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5692]: 6 msg · 93K2026-07-04
+          - generic [ref=e5693]:
+            - button "⧉ resume" [ref=e5694] [cursor=pointer]
+            - button "+ team" [ref=e5695] [cursor=pointer]
+        - generic [ref=e5696]:
+          - generic [ref=e5697]: cx
+          - generic [ref=e5698]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5699]: 019f2bfc · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5700]: 6 msg · 92K2026-07-04
+          - generic [ref=e5701]:
+            - button "⧉ resume" [ref=e5702] [cursor=pointer]
+            - button "+ team" [ref=e5703] [cursor=pointer]
+        - generic [ref=e5704]:
+          - generic [ref=e5705]: cl
+          - generic [ref=e5706]:
+            - text: (untitled)
+            - generic [ref=e5707]: 99970ae8 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5708]: 3 msg · 79K2026-07-04
+          - generic [ref=e5709]:
+            - button "⧉ resume" [ref=e5710] [cursor=pointer]
+            - button "+ team" [ref=e5711] [cursor=pointer]
+        - generic [ref=e5712]:
+          - generic [ref=e5713]: cl
+          - generic [ref=e5714]:
+            - text: (untitled)
+            - generic [ref=e5715]: 28d99c0e · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5716]: 3 msg · 68K2026-07-04
+          - generic [ref=e5717]:
+            - button "⧉ resume" [ref=e5718] [cursor=pointer]
+            - button "+ team" [ref=e5719] [cursor=pointer]
+        - generic [ref=e5720]:
+          - generic [ref=e5721]: cl
+          - generic [ref=e5722]:
+            - text: (untitled)
+            - generic [ref=e5723]: 775124ed · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5724]: 3 msg · 67K2026-07-04
+          - generic [ref=e5725]:
+            - button "⧉ resume" [ref=e5726] [cursor=pointer]
+            - button "+ team" [ref=e5727] [cursor=pointer]
+        - generic [ref=e5728]:
+          - generic [ref=e5729]: cl
+          - generic [ref=e5730]:
+            - text: (untitled)
+            - generic [ref=e5731]: 3677e205 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5732]: 3 msg · 70K2026-07-04
+          - generic [ref=e5733]:
+            - button "⧉ resume" [ref=e5734] [cursor=pointer]
+            - button "+ team" [ref=e5735] [cursor=pointer]
+        - generic [ref=e5736]:
+          - generic [ref=e5737]: cl
+          - generic [ref=e5738]:
+            - text: (untitled)
+            - generic [ref=e5739]: 481151e7 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5740]: 3 msg · 69K2026-07-04
+          - generic [ref=e5741]:
+            - button "⧉ resume" [ref=e5742] [cursor=pointer]
+            - button "+ team" [ref=e5743] [cursor=pointer]
+        - generic [ref=e5744]:
+          - generic [ref=e5745]: cx
+          - generic [ref=e5746]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5747]: 019f2bfa · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5748]: 6 msg · 93K2026-07-04
+          - generic [ref=e5749]:
+            - button "⧉ resume" [ref=e5750] [cursor=pointer]
+            - button "+ team" [ref=e5751] [cursor=pointer]
+        - generic [ref=e5752]:
+          - generic [ref=e5753]: cx
+          - generic [ref=e5754]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5755]: 019f2bfa · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5756]: 6 msg · 94K2026-07-04
+          - generic [ref=e5757]:
+            - button "⧉ resume" [ref=e5758] [cursor=pointer]
+            - button "+ team" [ref=e5759] [cursor=pointer]
+        - generic [ref=e5760]:
+          - generic [ref=e5761]: cx
+          - generic [ref=e5762]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5763]: 019f2bfa · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5764]: 6 msg · 92K2026-07-04
+          - generic [ref=e5765]:
+            - button "⧉ resume" [ref=e5766] [cursor=pointer]
+            - button "+ team" [ref=e5767] [cursor=pointer]
+        - generic [ref=e5768]:
+          - generic [ref=e5769]: cl
+          - generic [ref=e5770]:
+            - text: (untitled)
+            - generic [ref=e5771]: bb00e420 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5772]: 3 msg · 68K2026-07-04
+          - generic [ref=e5773]:
+            - button "⧉ resume" [ref=e5774] [cursor=pointer]
+            - button "+ team" [ref=e5775] [cursor=pointer]
+        - generic [ref=e5776]:
+          - generic [ref=e5777]: cl
+          - generic [ref=e5778]:
+            - text: (untitled)
+            - generic [ref=e5779]: 69ebda4c · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5780]: 3 msg · 68K2026-07-04
+          - generic [ref=e5781]:
+            - button "⧉ resume" [ref=e5782] [cursor=pointer]
+            - button "+ team" [ref=e5783] [cursor=pointer]
+        - generic [ref=e5784]:
+          - generic [ref=e5785]: cl
+          - generic [ref=e5786]:
+            - text: (untitled)
+            - generic [ref=e5787]: df042f9e · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5788]: 13 msg · 87K2026-07-04
+          - generic [ref=e5789]:
+            - button "⧉ resume" [ref=e5790] [cursor=pointer]
+            - button "+ team" [ref=e5791] [cursor=pointer]
+        - generic [ref=e5792]:
+          - generic [ref=e5793]: cl
+          - generic [ref=e5794]:
+            - text: (untitled)
+            - generic [ref=e5795]: 03dd3443 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5796]: 10 msg · 80K2026-07-04
+          - generic [ref=e5797]:
+            - button "⧉ resume" [ref=e5798] [cursor=pointer]
+            - button "+ team" [ref=e5799] [cursor=pointer]
+        - generic [ref=e5800]:
+          - generic [ref=e5801]: cl
+          - generic [ref=e5802]:
+            - text: (untitled)
+            - generic [ref=e5803]: 0fe2c000 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5804]: 10 msg · 79K2026-07-04
+          - generic [ref=e5805]:
+            - button "⧉ resume" [ref=e5806] [cursor=pointer]
+            - button "+ team" [ref=e5807] [cursor=pointer]
+        - generic [ref=e5808]:
+          - generic [ref=e5809]: cl
+          - generic [ref=e5810]:
+            - text: (untitled)
+            - generic [ref=e5811]: 91570bb5 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5812]: 21 msg · 106K2026-07-04
+          - generic [ref=e5813]:
+            - button "⧉ resume" [ref=e5814] [cursor=pointer]
+            - button "+ team" [ref=e5815] [cursor=pointer]
+        - generic [ref=e5816]:
+          - generic [ref=e5817]: cl
+          - generic [ref=e5818]:
+            - text: (untitled)
+            - generic [ref=e5819]: 2855c31e · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5820]: 19 msg · 102K2026-07-04
+          - generic [ref=e5821]:
+            - button "⧉ resume" [ref=e5822] [cursor=pointer]
+            - button "+ team" [ref=e5823] [cursor=pointer]
+        - generic [ref=e5824]:
+          - generic [ref=e5825]: cx
+          - generic [ref=e5826]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5827]: 019f2bf6 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5828]: 6 msg · 93K2026-07-04
+          - generic [ref=e5829]:
+            - button "⧉ resume" [ref=e5830] [cursor=pointer]
+            - button "+ team" [ref=e5831] [cursor=pointer]
+        - generic [ref=e5832]:
+          - generic [ref=e5833]: cl
+          - generic [ref=e5834]:
+            - text: (untitled)
+            - generic [ref=e5835]: 9c89ea18 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5836]: 21 msg · 104K2026-07-04
+          - generic [ref=e5837]:
+            - button "⧉ resume" [ref=e5838] [cursor=pointer]
+            - button "+ team" [ref=e5839] [cursor=pointer]
+        - generic [ref=e5840]:
+          - generic [ref=e5841]: cl
+          - generic [ref=e5842]:
+            - text: (untitled)
+            - generic [ref=e5843]: c68b40a2 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5844]: 24 msg · 111K2026-07-04
+          - generic [ref=e5845]:
+            - button "⧉ resume" [ref=e5846] [cursor=pointer]
+            - button "+ team" [ref=e5847] [cursor=pointer]
+        - generic [ref=e5848]:
+          - generic [ref=e5849]: cl
+          - generic [ref=e5850]:
+            - text: (untitled)
+            - generic [ref=e5851]: d51d4274 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5852]: 24 msg · 115K2026-07-04
+          - generic [ref=e5853]:
+            - button "⧉ resume" [ref=e5854] [cursor=pointer]
+            - button "+ team" [ref=e5855] [cursor=pointer]
+        - generic [ref=e5856]:
+          - generic [ref=e5857]: cl
+          - generic [ref=e5858]:
+            - text: (untitled)
+            - generic [ref=e5859]: 49e01509 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5860]: 20 msg · 106K2026-07-04
+          - generic [ref=e5861]:
+            - button "⧉ resume" [ref=e5862] [cursor=pointer]
+            - button "+ team" [ref=e5863] [cursor=pointer]
+        - generic [ref=e5864]:
+          - generic [ref=e5865]: cl
+          - generic [ref=e5866]:
+            - text: (untitled)
+            - generic [ref=e5867]: 668a5918 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5868]: 25 msg · 118K2026-07-04
+          - generic [ref=e5869]:
+            - button "⧉ resume" [ref=e5870] [cursor=pointer]
+            - button "+ team" [ref=e5871] [cursor=pointer]
+        - generic [ref=e5872]:
+          - generic [ref=e5873]: cx
+          - generic [ref=e5874]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5875]: 019f2bf2 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5876]: 6 msg · 101K2026-07-04
+          - generic [ref=e5877]:
+            - button "⧉ resume" [ref=e5878] [cursor=pointer]
+            - button "+ team" [ref=e5879] [cursor=pointer]
+        - generic [ref=e5880]:
+          - generic [ref=e5881]: cx
+          - generic [ref=e5882]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5883]: 019f2bf2 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5884]: 6 msg · 93K2026-07-04
+          - generic [ref=e5885]:
+            - button "⧉ resume" [ref=e5886] [cursor=pointer]
+            - button "+ team" [ref=e5887] [cursor=pointer]
+        - generic [ref=e5888]:
+          - generic [ref=e5889]: cx
+          - generic [ref=e5890]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5891]: 019f2bf2 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5892]: 6 msg · 93K2026-07-04
+          - generic [ref=e5893]:
+            - button "⧉ resume" [ref=e5894] [cursor=pointer]
+            - button "+ team" [ref=e5895] [cursor=pointer]
+        - generic [ref=e5896]:
+          - generic [ref=e5897]: cx
+          - generic [ref=e5898]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5899]: 019f2bf2 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5900]: 6 msg · 92K2026-07-04
+          - generic [ref=e5901]:
+            - button "⧉ resume" [ref=e5902] [cursor=pointer]
+            - button "+ team" [ref=e5903] [cursor=pointer]
+        - generic [ref=e5904]:
+          - generic [ref=e5905]: cl
+          - generic [ref=e5906]:
+            - text: (untitled)
+            - generic [ref=e5907]: 1515154f · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5908]: 3 msg · 84K2026-07-04
+          - generic [ref=e5909]:
+            - button "⧉ resume" [ref=e5910] [cursor=pointer]
+            - button "+ team" [ref=e5911] [cursor=pointer]
+        - generic [ref=e5912]:
+          - generic [ref=e5913]: cl
+          - generic [ref=e5914]:
+            - text: (untitled)
+            - generic [ref=e5915]: 53c798a3 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5916]: 3 msg · 73K2026-07-04
+          - generic [ref=e5917]:
+            - button "⧉ resume" [ref=e5918] [cursor=pointer]
+            - button "+ team" [ref=e5919] [cursor=pointer]
+        - generic [ref=e5920]:
+          - generic [ref=e5921]: cx
+          - generic [ref=e5922]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5923]: 019f2bf1 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5924]: 6 msg · 100K2026-07-04
+          - generic [ref=e5925]:
+            - button "⧉ resume" [ref=e5926] [cursor=pointer]
+            - button "+ team" [ref=e5927] [cursor=pointer]
+        - generic [ref=e5928]:
+          - generic [ref=e5929]: cx
+          - generic [ref=e5930]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5931]: 019f2bf1 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5932]: 6 msg · 94K2026-07-04
+          - generic [ref=e5933]:
+            - button "⧉ resume" [ref=e5934] [cursor=pointer]
+            - button "+ team" [ref=e5935] [cursor=pointer]
+        - generic [ref=e5936]:
+          - generic [ref=e5937]: cl
+          - generic [ref=e5938]:
+            - text: (untitled)
+            - generic [ref=e5939]: 5fdbc394 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5940]: 3 msg · 81K2026-07-04
+          - generic [ref=e5941]:
+            - button "⧉ resume" [ref=e5942] [cursor=pointer]
+            - button "+ team" [ref=e5943] [cursor=pointer]
+        - generic [ref=e5944]:
+          - generic [ref=e5945]: cl
+          - generic [ref=e5946]:
+            - text: (untitled)
+            - generic [ref=e5947]: 14f4146d · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5948]: 3 msg · 83K2026-07-04
+          - generic [ref=e5949]:
+            - button "⧉ resume" [ref=e5950] [cursor=pointer]
+            - button "+ team" [ref=e5951] [cursor=pointer]
+        - generic [ref=e5952]:
+          - generic [ref=e5953]: cx
+          - generic [ref=e5954]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5955]: 019f2bf0 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5956]: 6 msg · 93K2026-07-04
+          - generic [ref=e5957]:
+            - button "⧉ resume" [ref=e5958] [cursor=pointer]
+            - button "+ team" [ref=e5959] [cursor=pointer]
+        - generic [ref=e5960]:
+          - generic [ref=e5961]: cx
+          - generic [ref=e5962]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e5963]: 019f2bef · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5964]: 6 msg · 96K2026-07-04
+          - generic [ref=e5965]:
+            - button "⧉ resume" [ref=e5966] [cursor=pointer]
+            - button "+ team" [ref=e5967] [cursor=pointer]
+        - generic [ref=e5968]:
+          - generic [ref=e5969]: cl
+          - generic [ref=e5970]:
+            - text: (untitled)
+            - generic [ref=e5971]: 60557d7d · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5972]: 3 msg · 73K2026-07-04
+          - generic [ref=e5973]:
+            - button "⧉ resume" [ref=e5974] [cursor=pointer]
+            - button "+ team" [ref=e5975] [cursor=pointer]
+        - generic [ref=e5976]:
+          - generic [ref=e5977]: cl
+          - generic [ref=e5978]:
+            - text: (untitled)
+            - generic [ref=e5979]: 5f327389 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5980]: 3 msg · 75K2026-07-04
+          - generic [ref=e5981]:
+            - button "⧉ resume" [ref=e5982] [cursor=pointer]
+            - button "+ team" [ref=e5983] [cursor=pointer]
+        - generic [ref=e5984]:
+          - generic [ref=e5985]: cl
+          - generic [ref=e5986]:
+            - text: (untitled)
+            - generic [ref=e5987]: f76b6b57 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5988]: 3 msg · 70K2026-07-04
+          - generic [ref=e5989]:
+            - button "⧉ resume" [ref=e5990] [cursor=pointer]
+            - button "+ team" [ref=e5991] [cursor=pointer]
+        - generic [ref=e5992]:
+          - generic [ref=e5993]: cl
+          - generic [ref=e5994]:
+            - text: (untitled)
+            - generic [ref=e5995]: d83c4ff3 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e5996]: 3 msg · 73K2026-07-04
+          - generic [ref=e5997]:
+            - button "⧉ resume" [ref=e5998] [cursor=pointer]
+            - button "+ team" [ref=e5999] [cursor=pointer]
+        - generic [ref=e6000]:
+          - generic [ref=e6001]: cx
+          - generic [ref=e6002]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6003]: 019f2bee · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6004]: 6 msg · 95K2026-07-04
+          - generic [ref=e6005]:
+            - button "⧉ resume" [ref=e6006] [cursor=pointer]
+            - button "+ team" [ref=e6007] [cursor=pointer]
+        - generic [ref=e6008]:
+          - generic [ref=e6009]: cx
+          - generic [ref=e6010]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6011]: 019f2bee · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6012]: 6 msg · 94K2026-07-04
+          - generic [ref=e6013]:
+            - button "⧉ resume" [ref=e6014] [cursor=pointer]
+            - button "+ team" [ref=e6015] [cursor=pointer]
+        - generic [ref=e6016]:
+          - generic [ref=e6017]: cx
+          - generic [ref=e6018]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6019]: 019f2bee · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6020]: 6 msg · 93K2026-07-04
+          - generic [ref=e6021]:
+            - button "⧉ resume" [ref=e6022] [cursor=pointer]
+            - button "+ team" [ref=e6023] [cursor=pointer]
+        - generic [ref=e6024]:
+          - generic [ref=e6025]: cl
+          - generic [ref=e6026]:
+            - text: (untitled)
+            - generic [ref=e6027]: 11c066de · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6028]: 3 msg · 73K2026-07-04
+          - generic [ref=e6029]:
+            - button "⧉ resume" [ref=e6030] [cursor=pointer]
+            - button "+ team" [ref=e6031] [cursor=pointer]
+        - generic [ref=e6032]:
+          - generic [ref=e6033]: cl
+          - generic [ref=e6034]:
+            - text: (untitled)
+            - generic [ref=e6035]: a28a1897 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6036]: 3 msg · 89K2026-07-04
+          - generic [ref=e6037]:
+            - button "⧉ resume" [ref=e6038] [cursor=pointer]
+            - button "+ team" [ref=e6039] [cursor=pointer]
+        - generic [ref=e6040]:
+          - generic [ref=e6041]: cx
+          - generic [ref=e6042]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6043]: 019f2bed · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6044]: 6 msg · 100K2026-07-04
+          - generic [ref=e6045]:
+            - button "⧉ resume" [ref=e6046] [cursor=pointer]
+            - button "+ team" [ref=e6047] [cursor=pointer]
+        - generic [ref=e6048]:
+          - generic [ref=e6049]: cx
+          - generic [ref=e6050]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6051]: 019f2bed · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6052]: 6 msg · 93K2026-07-04
+          - generic [ref=e6053]:
+            - button "⧉ resume" [ref=e6054] [cursor=pointer]
+            - button "+ team" [ref=e6055] [cursor=pointer]
+        - generic [ref=e6056]:
+          - generic [ref=e6057]: cl
+          - generic [ref=e6058]:
+            - text: (untitled)
+            - generic [ref=e6059]: f429ac1c · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6060]: 3 msg · 81K2026-07-04
+          - generic [ref=e6061]:
+            - button "⧉ resume" [ref=e6062] [cursor=pointer]
+            - button "+ team" [ref=e6063] [cursor=pointer]
+        - generic [ref=e6064]:
+          - generic [ref=e6065]: cl
+          - generic [ref=e6066]:
+            - text: (untitled)
+            - generic [ref=e6067]: 9560db97 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6068]: 3 msg · 78K2026-07-04
+          - generic [ref=e6069]:
+            - button "⧉ resume" [ref=e6070] [cursor=pointer]
+            - button "+ team" [ref=e6071] [cursor=pointer]
+        - generic [ref=e6072]:
+          - generic [ref=e6073]: cl
+          - generic [ref=e6074]:
+            - text: (untitled)
+            - generic [ref=e6075]: fc3d8d76 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6076]: 3 msg · 74K2026-07-04
+          - generic [ref=e6077]:
+            - button "⧉ resume" [ref=e6078] [cursor=pointer]
+            - button "+ team" [ref=e6079] [cursor=pointer]
+        - generic [ref=e6080]:
+          - generic [ref=e6081]: cx
+          - generic [ref=e6082]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6083]: 019f2bec · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6084]: 6 msg · 101K2026-07-04
+          - generic [ref=e6085]:
+            - button "⧉ resume" [ref=e6086] [cursor=pointer]
+            - button "+ team" [ref=e6087] [cursor=pointer]
+        - generic [ref=e6088]:
+          - generic [ref=e6089]: cx
+          - generic [ref=e6090]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6091]: 019f2beb · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6092]: 6 msg · 94K2026-07-04
+          - generic [ref=e6093]:
+            - button "⧉ resume" [ref=e6094] [cursor=pointer]
+            - button "+ team" [ref=e6095] [cursor=pointer]
+        - generic [ref=e6096]:
+          - generic [ref=e6097]: cx
+          - generic [ref=e6098]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6099]: 019f2beb · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6100]: 6 msg · 92K2026-07-04
+          - generic [ref=e6101]:
+            - button "⧉ resume" [ref=e6102] [cursor=pointer]
+            - button "+ team" [ref=e6103] [cursor=pointer]
+        - generic [ref=e6104]:
+          - generic [ref=e6105]: cl
+          - generic [ref=e6106]:
+            - text: (untitled)
+            - generic [ref=e6107]: 070a2480 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6108]: 3 msg · 81K2026-07-04
+          - generic [ref=e6109]:
+            - button "⧉ resume" [ref=e6110] [cursor=pointer]
+            - button "+ team" [ref=e6111] [cursor=pointer]
+        - generic [ref=e6112]:
+          - generic [ref=e6113]: cl
+          - generic [ref=e6114]:
+            - text: (untitled)
+            - generic [ref=e6115]: af85792d · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6116]: 3 msg · 75K2026-07-04
+          - generic [ref=e6117]:
+            - button "⧉ resume" [ref=e6118] [cursor=pointer]
+            - button "+ team" [ref=e6119] [cursor=pointer]
+        - generic [ref=e6120]:
+          - generic [ref=e6121]: cl
+          - generic [ref=e6122]:
+            - text: (untitled)
+            - generic [ref=e6123]: b747bc5d · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6124]: 3 msg · 70K2026-07-04
+          - generic [ref=e6125]:
+            - button "⧉ resume" [ref=e6126] [cursor=pointer]
+            - button "+ team" [ref=e6127] [cursor=pointer]
+        - generic [ref=e6128]:
+          - generic [ref=e6129]: cl
+          - generic [ref=e6130]:
+            - text: (untitled)
+            - generic [ref=e6131]: 8401c181 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6132]: 3 msg · 74K2026-07-04
+          - generic [ref=e6133]:
+            - button "⧉ resume" [ref=e6134] [cursor=pointer]
+            - button "+ team" [ref=e6135] [cursor=pointer]
+        - generic [ref=e6136]:
+          - generic [ref=e6137]: cl
+          - generic [ref=e6138]:
+            - text: (untitled)
+            - generic [ref=e6139]: 9f9237aa · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6140]: 3 msg · 71K2026-07-04
+          - generic [ref=e6141]:
+            - button "⧉ resume" [ref=e6142] [cursor=pointer]
+            - button "+ team" [ref=e6143] [cursor=pointer]
+        - generic [ref=e6144]:
+          - generic [ref=e6145]: cl
+          - generic [ref=e6146]:
+            - text: (untitled)
+            - generic [ref=e6147]: 39e1e687 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6148]: 3 msg · 74K2026-07-04
+          - generic [ref=e6149]:
+            - button "⧉ resume" [ref=e6150] [cursor=pointer]
+            - button "+ team" [ref=e6151] [cursor=pointer]
+        - generic [ref=e6152]:
+          - generic [ref=e6153]: cx
+          - generic [ref=e6154]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6155]: 019f2bea · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6156]: 6 msg · 94K2026-07-04
+          - generic [ref=e6157]:
+            - button "⧉ resume" [ref=e6158] [cursor=pointer]
+            - button "+ team" [ref=e6159] [cursor=pointer]
+        - generic [ref=e6160]:
+          - generic [ref=e6161]: cx
+          - generic [ref=e6162]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6163]: 019f2bea · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6164]: 6 msg · 94K2026-07-04
+          - generic [ref=e6165]:
+            - button "⧉ resume" [ref=e6166] [cursor=pointer]
+            - button "+ team" [ref=e6167] [cursor=pointer]
+        - generic [ref=e6168]:
+          - generic [ref=e6169]: cx
+          - generic [ref=e6170]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6171]: 019f2be9 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6172]: 6 msg · 95K2026-07-04
+          - generic [ref=e6173]:
+            - button "⧉ resume" [ref=e6174] [cursor=pointer]
+            - button "+ team" [ref=e6175] [cursor=pointer]
+        - generic [ref=e6176]:
+          - generic [ref=e6177]: cl
+          - generic [ref=e6178]:
+            - text: (untitled)
+            - generic [ref=e6179]: 9b56e140 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6180]: 3 msg · 73K2026-07-04
+          - generic [ref=e6181]:
+            - button "⧉ resume" [ref=e6182] [cursor=pointer]
+            - button "+ team" [ref=e6183] [cursor=pointer]
+        - generic [ref=e6184]:
+          - generic [ref=e6185]: cl
+          - generic [ref=e6186]:
+            - text: (untitled)
+            - generic [ref=e6187]: acdedfa4 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6188]: 3 msg · 72K2026-07-04
+          - generic [ref=e6189]:
+            - button "⧉ resume" [ref=e6190] [cursor=pointer]
+            - button "+ team" [ref=e6191] [cursor=pointer]
+        - generic [ref=e6192]:
+          - generic [ref=e6193]: cl
+          - generic [ref=e6194]:
+            - text: (untitled)
+            - generic [ref=e6195]: 4418c944 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6196]: 3 msg · 73K2026-07-04
+          - generic [ref=e6197]:
+            - button "⧉ resume" [ref=e6198] [cursor=pointer]
+            - button "+ team" [ref=e6199] [cursor=pointer]
+        - generic [ref=e6200]:
+          - generic [ref=e6201]: cx
+          - generic [ref=e6202]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6203]: 019f2be8 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6204]: 6 msg · 93K2026-07-04
+          - generic [ref=e6205]:
+            - button "⧉ resume" [ref=e6206] [cursor=pointer]
+            - button "+ team" [ref=e6207] [cursor=pointer]
+        - generic [ref=e6208]:
+          - generic [ref=e6209]: cx
+          - generic [ref=e6210]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6211]: 019f2be8 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6212]: 6 msg · 94K2026-07-04
+          - generic [ref=e6213]:
+            - button "⧉ resume" [ref=e6214] [cursor=pointer]
+            - button "+ team" [ref=e6215] [cursor=pointer]
+        - generic [ref=e6216]:
+          - generic [ref=e6217]: cl
+          - generic [ref=e6218]:
+            - text: (untitled)
+            - generic [ref=e6219]: 9ee0fe8b · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6220]: 3 msg · 74K2026-07-04
+          - generic [ref=e6221]:
+            - button "⧉ resume" [ref=e6222] [cursor=pointer]
+            - button "+ team" [ref=e6223] [cursor=pointer]
+        - generic [ref=e6224]:
+          - generic [ref=e6225]: cl
+          - generic [ref=e6226]:
+            - text: (untitled)
+            - generic [ref=e6227]: 421c1d20 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6228]: 3 msg · 72K2026-07-04
+          - generic [ref=e6229]:
+            - button "⧉ resume" [ref=e6230] [cursor=pointer]
+            - button "+ team" [ref=e6231] [cursor=pointer]
+        - generic [ref=e6232]:
+          - generic [ref=e6233]: cl
+          - generic [ref=e6234]:
+            - text: (untitled)
+            - generic [ref=e6235]: 0c7ba5e8 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6236]: 3 msg · 74K2026-07-04
+          - generic [ref=e6237]:
+            - button "⧉ resume" [ref=e6238] [cursor=pointer]
+            - button "+ team" [ref=e6239] [cursor=pointer]
+        - generic [ref=e6240]:
+          - generic [ref=e6241]: cx
+          - generic [ref=e6242]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6243]: 019f2be7 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6244]: 6 msg · 111K2026-07-04
+          - generic [ref=e6245]:
+            - button "⧉ resume" [ref=e6246] [cursor=pointer]
+            - button "+ team" [ref=e6247] [cursor=pointer]
+        - generic [ref=e6248]:
+          - generic [ref=e6249]: cx
+          - generic [ref=e6250]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6251]: 019f2be7 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6252]: 6 msg · 95K2026-07-04
+          - generic [ref=e6253]:
+            - button "⧉ resume" [ref=e6254] [cursor=pointer]
+            - button "+ team" [ref=e6255] [cursor=pointer]
+        - generic [ref=e6256]:
+          - generic [ref=e6257]: cx
+          - generic [ref=e6258]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6259]: 019f2be7 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6260]: 6 msg · 93K2026-07-04
+          - generic [ref=e6261]:
+            - button "⧉ resume" [ref=e6262] [cursor=pointer]
+            - button "+ team" [ref=e6263] [cursor=pointer]
+        - generic [ref=e6264]:
+          - generic [ref=e6265]: cl
+          - generic [ref=e6266]:
+            - text: (untitled)
+            - generic [ref=e6267]: 823a3587 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6268]: 3 msg · 94K2026-07-04
+          - generic [ref=e6269]:
+            - button "⧉ resume" [ref=e6270] [cursor=pointer]
+            - button "+ team" [ref=e6271] [cursor=pointer]
+        - generic [ref=e6272]:
+          - generic [ref=e6273]: cl
+          - generic [ref=e6274]:
+            - text: (untitled)
+            - generic [ref=e6275]: 8f63e82b · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6276]: 3 msg · 83K2026-07-04
+          - generic [ref=e6277]:
+            - button "⧉ resume" [ref=e6278] [cursor=pointer]
+            - button "+ team" [ref=e6279] [cursor=pointer]
+        - generic [ref=e6280]:
+          - generic [ref=e6281]: cx
+          - generic [ref=e6282]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6283]: 019f2be5 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6284]: 6 msg · 101K2026-07-04
+          - generic [ref=e6285]:
+            - button "⧉ resume" [ref=e6286] [cursor=pointer]
+            - button "+ team" [ref=e6287] [cursor=pointer]
+        - generic [ref=e6288]:
+          - generic [ref=e6289]: cx
+          - generic [ref=e6290]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6291]: 019f2be5 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6292]: 6 msg · 94K2026-07-04
+          - generic [ref=e6293]:
+            - button "⧉ resume" [ref=e6294] [cursor=pointer]
+            - button "+ team" [ref=e6295] [cursor=pointer]
+        - generic [ref=e6296]:
+          - generic [ref=e6297]: cx
+          - generic [ref=e6298]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6299]: 019f2be5 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6300]: 6 msg · 92K2026-07-04
+          - generic [ref=e6301]:
+            - button "⧉ resume" [ref=e6302] [cursor=pointer]
+            - button "+ team" [ref=e6303] [cursor=pointer]
+        - generic [ref=e6304]:
+          - generic [ref=e6305]: cx
+          - generic [ref=e6306]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6307]: 019f2be5 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6308]: 6 msg · 92K2026-07-04
+          - generic [ref=e6309]:
+            - button "⧉ resume" [ref=e6310] [cursor=pointer]
+            - button "+ team" [ref=e6311] [cursor=pointer]
+        - generic [ref=e6312]:
+          - generic [ref=e6313]: cl
+          - generic [ref=e6314]:
+            - text: (untitled)
+            - generic [ref=e6315]: 6cded9b2 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6316]: 3 msg · 91K2026-07-04
+          - generic [ref=e6317]:
+            - button "⧉ resume" [ref=e6318] [cursor=pointer]
+            - button "+ team" [ref=e6319] [cursor=pointer]
+        - generic [ref=e6320]:
+          - generic [ref=e6321]: cl
+          - generic [ref=e6322]:
+            - text: (untitled)
+            - generic [ref=e6323]: 0decb432 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6324]: 3 msg · 85K2026-07-04
+          - generic [ref=e6325]:
+            - button "⧉ resume" [ref=e6326] [cursor=pointer]
+            - button "+ team" [ref=e6327] [cursor=pointer]
+        - generic [ref=e6328]:
+          - generic [ref=e6329]: cl
+          - generic [ref=e6330]:
+            - text: (untitled)
+            - generic [ref=e6331]: 600af9cf · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6332]: 3 msg · 74K2026-07-04
+          - generic [ref=e6333]:
+            - button "⧉ resume" [ref=e6334] [cursor=pointer]
+            - button "+ team" [ref=e6335] [cursor=pointer]
+        - generic [ref=e6336]:
+          - generic [ref=e6337]: cl
+          - generic [ref=e6338]:
+            - text: (untitled)
+            - generic [ref=e6339]: f5d00dd2 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6340]: 3 msg · 74K2026-07-04
+          - generic [ref=e6341]:
+            - button "⧉ resume" [ref=e6342] [cursor=pointer]
+            - button "+ team" [ref=e6343] [cursor=pointer]
+        - generic [ref=e6344]:
+          - generic [ref=e6345]: cx
+          - generic [ref=e6346]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6347]: 019f2be3 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6348]: 6 msg · 93K2026-07-04
+          - generic [ref=e6349]:
+            - button "⧉ resume" [ref=e6350] [cursor=pointer]
+            - button "+ team" [ref=e6351] [cursor=pointer]
+        - generic [ref=e6352]:
+          - generic [ref=e6353]: cx
+          - generic [ref=e6354]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6355]: 019f2be3 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6356]: 6 msg · 93K2026-07-04
+          - generic [ref=e6357]:
+            - button "⧉ resume" [ref=e6358] [cursor=pointer]
+            - button "+ team" [ref=e6359] [cursor=pointer]
+        - generic [ref=e6360]:
+          - generic [ref=e6361]: cx
+          - generic [ref=e6362]:
+            - text: "# AGENTS.md instructions for /home/owner/dev/akapug/mission-control-worktrees/q34…"
+            - generic [ref=e6363]: 019f2be3 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6364]: 6 msg · 92K2026-07-04
+          - generic [ref=e6365]:
+            - button "⧉ resume" [ref=e6366] [cursor=pointer]
+            - button "+ team" [ref=e6367] [cursor=pointer]
+        - generic [ref=e6368]:
+          - generic [ref=e6369]: cl
+          - generic [ref=e6370]:
+            - text: (untitled)
+            - generic [ref=e6371]: ec314549 · ~/dev/akapug/mission-control-worktrees/q34-g2b-judge
+          - generic [ref=e6372]: 3 msg · 74K2026-07-04
+          - generic [ref=e6373]:
+            - button "⧉ resume" [ref=e6374] [cursor=pointer]
+            - button "+ team" [ref=e6375] [cursor=pointer]
+        - generic [ref=e6376]: first 250 of 5,468 — search to narrow
+  - button "◐ theme" [ref=e2038] [cursor=pointer]
+  - generic: copied ➜ cd /home/owner/dev/akapug/meld && CLAUDE_CONFIG_DIR=/home/owner/.claude-homes/cto-example-invalid claude --resume 918c9ec7-92ae-4c33-b718-486df982813c
