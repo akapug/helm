@@ -38,6 +38,30 @@ header{padding:26px 0 6px}
 #sessions{display:none;margin:10px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:.84rem}
 #sessions.show{display:block}
 #sessions .slabel{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+
+/* ---------- skills strip (collapsible; enable/disable/delete) ---------- */
+#skillsec{display:none;margin:10px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:.84rem}
+#skillsec.show{display:block}
+#skillsec .slabel{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+#skillsec .shead{display:flex;align-items:baseline;gap:10px;cursor:pointer;user-select:none}
+#skillsec .scount{color:var(--sub);font-size:.78rem}
+#skillsec .chev{margin-left:auto;color:var(--sub);font-size:.68rem;transition:transform .15s}
+#skillsec.open .chev{transform:rotate(90deg)}
+.skrows{display:none;margin-top:6px;flex-direction:column}
+#skillsec.open .skrows{display:flex}
+.skrow{display:flex;align-items:center;gap:9px;padding:3px 6px;border-radius:8px;overflow:hidden}
+.skrow:hover{background:var(--hover)}
+.skrow .skname{font-weight:600;min-width:11em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.skrow.off .skname{color:var(--mut);font-weight:500}
+.skrow .skhome{color:var(--sub);font:.74rem ui-monospace,Menlo,Consolas,monospace;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+.skflag{flex:none;font-size:.64rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 7px;border-radius:5px;white-space:nowrap}
+.skflag.off{background:color-mix(in srgb,var(--mut) 16%,transparent);color:var(--mut)}
+.skflag.shadowed{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)}
+.skflag.diverged{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
+.skbtn{flex:none;border:1px solid var(--line);border-radius:8px;padding:2px 10px;background:transparent;color:var(--mut);font:.74rem inherit;cursor:pointer;transition:border-color .12s,color .12s}
+.skbtn:hover{border-color:var(--line2);color:var(--fg)}
+.skbtn.armed{border-color:var(--bad);color:var(--bad);background:color-mix(in srgb,var(--bad) 12%,transparent)}
+.skbtn.failed{border-color:var(--bad);color:var(--bad)}
 .srows{margin-top:6px;display:flex;flex-direction:column}
 .srow{display:flex;align-items:baseline;gap:10px;padding:3px 6px;border-radius:8px;cursor:copy;overflow:hidden}
 .srow:hover{background:var(--line)}
@@ -116,6 +140,7 @@ footer .fmark{color:color-mix(in srgb,var(--accent) 70%,var(--sub))}
 
   <section id="store"></section>
   <section id="sessions"></section>
+  <section id="skillsec"></section>
 
   <div id="controls">
     <input id="q" type="search" placeholder="filter projects…  ( / )" autocomplete="off">
@@ -200,6 +225,70 @@ function sessStrip(s) {
     try { await navigator.clipboard.writeText(cmd); } catch (e) {}
     el.classList.add("copied");
     setTimeout(() => el.classList.remove("copied"), 900);
+  }));
+}
+
+/* ---------- skills strip ---------- */
+async function post(url, body) {
+  const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || url + " -> " + r.status);
+  return d;
+}
+
+let skillsOpen = false;
+
+function skillFlags(s) {
+  let out = "";
+  if (s.disabled) out += '<span class="skflag off">disabled</span>';
+  if (s.diverged) out += '<span class="skflag diverged" title="same name, different content across homes">diverged</span>';
+  else if (s.shadowed) out += '<span class="skflag shadowed" title="same name in multiple homes">shadowed</span>';
+  if (!s.has_manifest) out += '<span class="skflag off">no SKILL.md</span>';
+  return out;
+}
+
+function skillsSec(d) {
+  if (!d || d.unavailable || !Array.isArray(d.skills) || !d.skills.length) return;
+  const el = $("#skillsec");
+  const home = h => h.replace(/^\/home\/[^/]+|^\/Users\/[^/]+/, "~");
+  const rows = d.skills.map(s =>
+    '<div class="skrow' + (s.disabled ? " off" : "") + '">' +
+    '<span class="skname" title="' + esc(s.real) + '">' + esc(s.name) + '</span>' +
+    skillFlags(s) +
+    '<span class="skhome">' + esc(home(s.home)) + '</span>' +
+    '<button class="skbtn" data-act="toggle" data-path="' + esc(s.path) + '">' + (s.disabled ? "enable" : "disable") + '</button>' +
+    '<button class="skbtn" data-act="delete" data-path="' + esc(s.path) + '" title="moved to ~/.cache/helm/skills-trash — nothing is destroyed">delete</button></div>').join("");
+  const nbad = (d.bad || []).length;
+  el.innerHTML = '<div class="shead"><span class="slabel">skills</span>' +
+    '<span class="scount">' + d.skills.length + (nbad ? " · " + nbad + " hygiene flag" + (nbad === 1 ? "" : "s") : "") + '</span>' +
+    '<span class="chev">▶</span></div><div class="skrows">' + rows + "</div>";
+  el.classList.add("show");
+  el.classList.toggle("open", skillsOpen);
+  el.querySelector(".shead").addEventListener("click", () => {
+    skillsOpen = !skillsOpen;
+    el.classList.toggle("open", skillsOpen);
+  });
+  // two-click arm: first click arms ("sure?"), second executes; a pause disarms.
+  el.querySelectorAll(".skbtn").forEach(b => b.addEventListener("click", async ev => {
+    ev.stopPropagation();
+    if (!b.classList.contains("armed")) {
+      b.dataset.label = b.textContent;
+      b.classList.add("armed");
+      b.textContent = b.dataset.act === "delete" ? "sure? → trash" : "sure?";
+      b._disarm = setTimeout(() => { b.classList.remove("armed"); b.textContent = b.dataset.label; }, 3500);
+      return;
+    }
+    clearTimeout(b._disarm);
+    try {
+      await post("/api/skills/" + b.dataset.act, {path: b.dataset.path});
+    } catch (e) {
+      b.classList.remove("armed");
+      b.classList.add("failed");
+      b.textContent = "failed";
+      setTimeout(() => { b.classList.remove("failed"); b.textContent = b.dataset.label; }, 2000);
+      return;
+    }
+    j("/api/skills").then(skillsSec).catch(() => {});
   }));
 }
 
@@ -301,7 +390,7 @@ function foot(reg) {
   const when = ts && !isNaN(ts) ? age(ts.getTime() / 1000) : null;
   $("#foot").innerHTML = '<span class="fmark">⎈</span> ~/.helm' +
     (when ? " · synced " + (when === "today" ? "today" : when + " ago") : " · never synced — run <code>helm sync</code>") +
-    " · read-only surface — the CLI is the helm";
+    " · localhost surface — the CLI is the helm";
 }
 
 async function load() {
@@ -320,6 +409,7 @@ async function load() {
   j("/api/whoami").then(greet).catch(() => {});
   j("/api/store").then(storeStrip).catch(() => {});
   j("/api/sessions").then(sessStrip).catch(() => {});
+  j("/api/skills").then(skillsSec).catch(() => {});
 }
 load();
 </script>

@@ -103,6 +103,7 @@ VERBS = {
     "evolve": _lazy("evolve", "cmd_evolve"),
     "sessions": _lazy("sessions", "cmd_sessions"),
     "homes": _lazy("homes", "cmd_homes"),
+    "configs": _lazy("configs", "cmd_configs"),
     "web": _lazy("web", "cmd_web"),
 }
 
@@ -120,6 +121,7 @@ _VERB_HELP = {
     "evolve": "evolve — one observe/propose cycle (proposes, never mutates)",
     "sessions": "sessions [<project>] — every local session, all harnesses; resume in one paste",
     "homes": "homes [prepare|verify|archive|restore|archives] — credential-home lifecycle",
+    "configs": "configs [list|show|cascade <cwd>] — every config across every home, read-only",
     "web": "web [--port N] — the same, warm, in a browser",
 }
 

@@ -514,3 +514,85 @@ def restore(backup):
     except OSError as e:
         return {"error": f"cannot read backup: {e}"}
     return write_file(orig, content)
+
+
+# ── CLI (read-only surface over the same model) ───────────────────────────────
+
+def _print_files(files, indent="    "):
+    import sys
+    for f in files:
+        extra = ""
+        if f.get("entries") is not None:
+            extra = "  (%d entries)" % len(f["entries"])
+        elif not f["editable"]:
+            extra = "  [read-only: %s]" % f["reason"]
+        print("%s%-32s %s%s" % (indent, f["rel"], f["kind"], extra))
+
+
+def cmd_configs(args):
+    """configs [list|show <path>|cascade <cwd> [--harness claude|codex] [--home DIR]]
+    — read-only surface over the config model. list = every discovered config file
+    grouped by scope; show = one recognized file's content; cascade = what a seat
+    at <cwd> loads (via physics)."""
+    import sys
+    args = list(args or [])
+    verb = args.pop(0) if args else "list"
+
+    if verb == "list":
+        homes = homes_configs()
+        print("helm configs — home/user scope:")
+        if not homes:
+            print("  (none)")
+        for h in homes:
+            print("  %s  [%s]" % (h["path"], h["provider"]))
+            _print_files(h["files"])
+        t = tree()
+        print("project scope (roots: %s):" % ", ".join(t["config_roots"]))
+        def _walk(node):
+            if node["files"]:
+                print("  " + node["path"])
+                _print_files(node["files"])
+            for c in node["children"]:
+                _walk(c)
+        for r in t["roots"]:
+            _walk(r)
+        return 0
+
+    if verb == "show":
+        if not args:
+            print("usage: helm configs show <path>", file=sys.stderr)
+            return 2
+        r = read_file(args[0])
+        if r.get("error"):
+            print("helm configs: %s" % r["error"], file=sys.stderr)
+            return 1
+        print("# %s  [%s%s]" % (r["path"], r["type"],
+                                "" if r["editable"] else "; read-only: " + r["reason"]),
+              file=sys.stderr)
+        sys.stdout.write(r["content"])
+        return 0
+
+    if verb == "cascade":
+        cwd, harness, home_p = None, "claude", None
+        while args:
+            a = args.pop(0)
+            if a == "--harness" and args:
+                harness = args.pop(0)
+            elif a == "--home" and args:
+                home_p = args.pop(0)
+            elif not a.startswith("-") and cwd is None:
+                cwd = a
+            else:
+                print("usage: helm configs cascade <cwd> [--harness claude|codex] "
+                      "[--home DIR]", file=sys.stderr)
+                return 2
+        if not cwd or harness not in ("claude", "codex"):
+            print("usage: helm configs cascade <cwd> [--harness claude|codex] "
+                  "[--home DIR]", file=sys.stderr)
+            return 2
+        home_p = home_p or os.path.join(HOME, ".codex" if harness == "codex" else ".claude")
+        print(json.dumps(resolve(home_p, cwd, harness), indent=2, ensure_ascii=False))
+        return 0
+
+    print("usage: helm configs [list|show <path>|cascade <cwd>]", file=sys.stderr)
+    return 2

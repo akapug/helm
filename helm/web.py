@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""helm web — the read-only web surface. CLI-first + web parity: every view
-here is a projection of what the CLI already answers (registry / store /
-whoami); no mutation lands from the browser yet.
+"""helm web — the web surface. CLI-first + web parity: every view here is a
+projection of what the CLI already answers (registry / store / whoami /
+configs / skills). The ONLY mutations that land from the browser are the
+owner-requested skills verbs (toggle = reversible rename, delete = move to
+trash — archive-not-delete, nothing is ever destroyed), census-validated and
+localhost-only.
 
 Laws: localhost-only bind (127.0.0.1, default port 7433), Python stdlib only,
 one self-contained UI file (web_ui.html) served at /. The store and whoami
@@ -11,6 +14,7 @@ modules are built in parallel — their endpoints DEGRADE GRACEFULLY to
 import json
 import os
 import sys
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import registry
@@ -96,21 +100,141 @@ def _api_sessions():
         return {"unavailable": True}
 
 
+def _api_configs():
+    """The config-file list model: home/user scope + the project-scope cwd tree.
+    Same graceful degrade as the store."""
+    try:
+        from . import configs
+        out = {"homes": configs.homes_configs(), "tree": configs.tree()}
+        json.dumps(out)
+        return out
+    except Exception:
+        return {"unavailable": True}
+
+
+def _api_configs_cascade(qs):
+    """What a seat at ?cwd= loads — physics' resolved cascade. Optional
+    ?harness=claude|codex (default claude) and ?home=DIR (default the
+    harness's default home). Returns (obj, status)."""
+    from . import configs
+    harness = (qs.get("harness") or ["claude"])[0]
+    if harness not in ("claude", "codex"):
+        return {"error": "harness wants claude|codex, got %r" % harness}, 400
+    cwd = (qs.get("cwd") or [None])[0]
+    home_p = (qs.get("home") or [None])[0] or os.path.join(
+        os.path.expanduser("~"), ".codex" if harness == "codex" else ".claude")
+    return configs.resolve(home_p, cwd, harness), 200
+
+
+# ── skills: census read + the owner-requested enable/disable/delete surface ──
+# disable = rename <skill> -> <skill>.disabled (reversible); delete = MOVE to
+# the trash dir (archive-not-delete law: nothing is ever destroyed).
+
+TRASH_DIR = os.path.join(os.path.expanduser("~"), ".cache", "helm", "skills-trash")
+DISABLED_SUFFIX = ".disabled"
+
+
+def _api_skills():
+    """The census, dupes-flagged, with the real dir path each mutation needs."""
+    try:
+        from . import skills
+        found, bad = skills.census()
+        name_dupes, _content_dupes = skills.dupes(found)
+        rows = []
+        for s in found:
+            disabled = s["name"].endswith(DISABLED_SUFFIX)
+            group = name_dupes.get(s["name"]) or []
+            rows.append({
+                "name": s["name"][:-len(DISABLED_SUFFIX)] if disabled else s["name"],
+                "disabled": disabled, "home": s["home"], "real": s["real"],
+                "path": os.path.join(s["home"], s["name"]),
+                "has_manifest": s["has_manifest"],
+                "shadowed": len(group) > 1,
+                "diverged": len({x["hash"] for x in group}) > 1,
+            })
+        rows.sort(key=lambda r: (r["name"], r["home"]))
+        return {"skills": rows, "bad": [{"path": p, "why": w} for p, w in bad]}
+    except Exception:
+        return {"unavailable": True}
+
+
+def _valid_skill_dir(payload):
+    """(abspath, None) iff payload['path'] is a REAL skill dir the census knows
+    (inside a known skill home) — the gate for every mutation. Else (None, err)."""
+    from . import skills
+    p = payload.get("path")
+    if not isinstance(p, str) or not p.strip():
+        return None, ({"error": 'payload wants {"path": "<real skill dir>"}'}, 400)
+    ap = os.path.abspath(os.path.expanduser(p))
+    found, _bad = skills.census()
+    known = {os.path.abspath(os.path.join(s["home"], s["name"])) for s in found}
+    if ap not in known or not os.path.isdir(ap):
+        return None, ({"error": "refused: not a known skill dir "
+                                "(census-validated): %s" % ap}, 400)
+    return ap, None
+
+
+def _api_skills_toggle(payload):
+    ap, err = _valid_skill_dir(payload)
+    if err:
+        return err
+    if ap.endswith(DISABLED_SUFFIX):
+        new, state = ap[:-len(DISABLED_SUFFIX)], "enabled"
+    else:
+        new, state = ap + DISABLED_SUFFIX, "disabled"
+    if os.path.exists(new):
+        return {"error": "refused: %s already exists" % new}, 409
+    os.rename(ap, new)
+    return {"ok": True, "path": ap, "new_path": new, "state": state}, 200
+
+
+def _api_skills_delete(payload):
+    ap, err = _valid_skill_dir(payload)
+    if err:
+        return err
+    import shutil
+    import time
+    stamp = (time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+             + "-%09d" % (time.time_ns() % 1_000_000_000))
+    dest = os.path.join(TRASH_DIR, "%s-%s" % (stamp, os.path.basename(ap)))
+    os.makedirs(TRASH_DIR, exist_ok=True)
+    shutil.move(ap, dest)
+    return {"ok": True, "path": ap, "trash": dest}, 200
+
+
 API = {
     "/api/registry": _api_registry,
     "/api/store": _api_store,
     "/api/whoami": _api_whoami,
     "/api/sessions": _api_sessions,
+    "/api/configs": _api_configs,
+    "/api/skills": _api_skills,
+}
+
+QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
+    "/api/configs/cascade": _api_configs_cascade,
+}
+
+POST_API = {  # fn(payload_dict) -> (obj, status)
+    "/api/skills/toggle": _api_skills_toggle,
+    "/api/skills/delete": _api_skills_delete,
 }
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        path, _, query = self.path.partition("?")
         if path != "/":
             path = path.rstrip("/")
         if path == "/":
             return self._ui()
+        qfn = QUERY_API.get(path)
+        if qfn is not None:
+            try:
+                obj, status = qfn(urllib.parse.parse_qs(query))
+            except Exception as e:
+                return self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
+            return self._json(obj, status)
         fn = API.get(path)
         if fn is None:
             return self._json({"error": "not found: %s" % path}, 404)
@@ -118,6 +242,29 @@ class Handler(BaseHTTPRequestHandler):
             self._json(fn())
         except Exception as e:
             self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0].rstrip("/")
+        fn = POST_API.get(path)
+        if fn is None:
+            return self._json({"error": "not found: %s" % path}, 404)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n > 65536:
+            return self._json({"error": "body too large"}, 400)
+        try:
+            payload = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            return self._json({"error": "body is not valid JSON"}, 400)
+        if not isinstance(payload, dict):
+            return self._json({"error": "body wants a JSON object"}, 400)
+        try:
+            obj, status = fn(payload)
+        except Exception as e:
+            return self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
+        self._json(obj, status)
 
     def _ui(self):
         try:
