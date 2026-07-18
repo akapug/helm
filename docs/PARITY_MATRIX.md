@@ -60,3 +60,7 @@ Status key: ✓ done+verified · ~ partial/present-verify-depth · ✗ missing �
 - STILL-OPEN UX: U9 config-editor-web (slice C), U12 team-tray (slice B), + depth-verify U6 sessions/U10 homes/U11 hygiene when web slices land.
 - SLICE B c7192eb (sessions web): U6 sessions view ✓ (harness badges + filter + harness-filter all parity vs :7402), U7 resume-one-paste ✓ (api/sessions carries `cmd` = resume command). Quota+sessions web now both VERIFIED.
 - AWAITING slice C (configs-editor-web U9 + team-tray U12) — the last big UX block. Then: depth-verify homes(U10)/hygiene(U11) web, confirm AX physics/capsule/cmd.
+- SLICE ff8157a (capsule + premise-retry): A15 capsule ✓ (verb works; --help nit: reads --help as session-id), A14 physics ✓ (absorbed as helm/physics.py backend — sesh physics = internal quota-compute, not a user verb, correct home).
+- LAST AX: A16 cmd (run-in-session) — confirm folded into capsule or add/N/A.
+- LAST UX: U9 config-editor-web + U12 team-tray (slice C building), depth-verify U10 homes/U11 hygiene web.
+- Recurring nit: `swap/capsule --help` treat --help as an arg (positional-first parsing) — small global fix.

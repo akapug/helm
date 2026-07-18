@@ -80,7 +80,8 @@ def _cached(key, ttl, fn):
 
 def _load_cwd_overrides():
     try:
-        d = json.load(open(OVERRIDES_PATH))
+        with open(OVERRIDES_PATH) as f:
+            d = json.load(f)
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}

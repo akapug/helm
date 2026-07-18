@@ -133,7 +133,8 @@ class TestWebQuota(unittest.TestCase):
         url = "http://127.0.0.1:%d%s" % (self.port, path)
         data = json.dumps(payload).encode() if payload is not None else None
         r = urllib.request.Request(url, data=data, headers=(
-            {"Content-Type": "application/json"} if data else {}))
+            {"Content-Type": "application/json",
+             "Authorization": "Bearer " + web.MUTATION_TOKEN} if data else {}))
         try:
             with urllib.request.urlopen(r, timeout=10) as resp:
                 return resp.status, json.loads(resp.read() or b"null")
@@ -282,9 +283,12 @@ class TestWebQuota(unittest.TestCase):
         for marker in ('id="grid"', 'id="store"', 'id="sessions"', 'id="skillsec"',
                        'id="hello"', 'id="foot"'):
             self.assertIn(marker, body, "helm view markup missing: %s" % marker)
-        # slice B landed (real sessions view); the slice C placeholder is explicit
+        # slice B landed (real sessions view); slice C replaced the placeholder
         self.assertIn('id="sesscontrols"', body)
-        self.assertIn("slice C", body)
+        self.assertNotIn("slice C", body)
+        for marker in ('id="cfgbar"', 'id="cfgsplit"', 'id="cfgtree"',
+                       'id="cfgdetail"'):
+            self.assertIn(marker, body, "configs view markup missing: %s" % marker)
 
     def test_existing_endpoints_still_work(self):
         status, d = self.req("/api/registry")

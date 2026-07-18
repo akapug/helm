@@ -4,9 +4,12 @@ projection of what the CLI already answers (registry / store / whoami /
 configs / skills / homes / quota). The ONLY mutations that land from the
 browser are the owner-requested skills verbs (toggle = reversible rename,
 delete = move to trash — archive-not-delete, nothing is ever destroyed;
-census-validated) and the homes lifecycle verbs (prepare/verify/archive/
+census-validated), the homes lifecycle verbs (prepare/verify/archive/
 unarchive/migrate — directory moves only, archive-not-delete, live-agent
-refusals; logins stay human-only). All of it localhost-only.
+refusals; logins stay human-only), the session verbs (cwd re-home / prune —
+metadata + new-copy only) and the configs editor (backup→validate→atomic,
+recognized files only). All of it localhost-only, and every mutation demands
+the per-process bearer token (MUTATION_TOKEN) — 403 without.
 
 Laws: localhost-only bind (127.0.0.1, default port 7433), Python stdlib only,
 one self-contained UI file (web_ui.html) served at /. The store and whoami
@@ -15,6 +18,7 @@ modules are built in parallel — their endpoints DEGRADE GRACEFULLY to
 """
 import json
 import os
+import secrets
 import sys
 import threading
 import time
@@ -26,6 +30,14 @@ from . import registry
 BIND = "127.0.0.1"
 DEFAULT_PORT = 7433
 UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_ui.html")
+
+# Per-process anti-CSRF bearer (sesh's MUTATION_TOKEN, ported): a hostile page
+# can fire cross-origin POSTs at 127.0.0.1 but can never READ our UI to learn
+# the token, so EVERY POST demands it (403 without). It reaches the browser by
+# template substitution — _ui() replaces __HELM_TOKEN__ when serving the page.
+# HELM_API_TOKEN (legacy SESH_API_TOKEN) pins it; else fresh each process.
+MUTATION_TOKEN = (os.environ.get("HELM_API_TOKEN")
+                  or os.environ.get("SESH_API_TOKEN") or secrets.token_hex(16))
 
 # One store entry projects to these keys on the wire — the strip never needs bodies.
 ENTRY_KEYS = ("id", "type", "confidence", "load_class", "scope")
@@ -128,6 +140,76 @@ def _api_configs_cascade(qs):
     home_p = (qs.get("home") or [None])[0] or os.path.join(
         os.path.expanduser("~"), ".codex" if harness == "codex" else ".claude")
     return configs.resolve(home_p, cwd, harness), 200
+
+
+# ── configs editor surface (sesh /api/configs/* contracts, ported exactly) ──
+# configs.py owns all behavior (recognition gate, backup→validate→atomic write,
+# entry ops, restore); these handlers only adapt query/payload shapes.
+
+def _api_configs_tree(qs):
+    """The cwd tree of dirs holding project configs. ?root= narrows the scan;
+    live session cwds are folded in (sesh: catalog rows' cwd)."""
+    from . import configs
+    cwds = []
+    try:
+        cwds = [r["cwd"] for r in _transcripts().get_catalog()["rows"] if r.get("cwd")]
+    except Exception:
+        pass  # no catalog on this machine — the scanned roots still answer
+    return configs.tree(_q1(qs, "root") or None, extra_cwds=cwds), 200
+
+
+def _api_configs_homes():
+    from . import configs
+    return configs.homes_configs()
+
+
+def _api_configs_resolve(qs):
+    """What a seat (home, cwd, harness) loads — the cascade with MCP
+    winner/shadowed annotation. home= is a name or a path (sesh contract)."""
+    from . import configs
+    hp = _resolve_home_path(_q1(qs, "home") or "")
+    if not hp:
+        return {"error": "need home= (name or path, see /api/configs/homes)"}, 400
+    harness = _q1(qs, "harness") or ("codex" if "codex" in hp else "claude")
+    return configs.resolve(hp, _q1(qs, "cwd") or None, harness), 200
+
+
+def _api_configs_file(qs):
+    """One recognized config file's content (+editability). Refusals answer 200
+    with an error field + empty content — the sesh contract the UI renders."""
+    from . import configs
+    p = _q1(qs, "path")
+    if not p:
+        return {"error": "need path="}, 400
+    return configs.read_file(p), 200
+
+
+def _api_configs_backups():
+    from . import configs
+    return configs.list_backups()
+
+
+def _api_configs_file_post(payload):
+    """Save one config file: backup → validate → atomic write (configs.py)."""
+    from . import configs
+    out = configs.write_file(payload.get("path") or "", payload.get("content") or "")
+    return out, (400 if "error" in out else 200)
+
+
+def _api_configs_entry_post(payload):
+    """Structured entry op (add/remove an MCP server) — never hand-edits JSON."""
+    from . import configs
+    out = configs.entry_op(payload.get("action") or "", payload.get("path") or "",
+                           payload.get("kind") or "", payload.get("name") or "",
+                           payload.get("value"))
+    return out, (400 if "error" in out else 200)
+
+
+def _api_configs_restore_post(payload):
+    """Restore a backup over its origin (validated + re-backed-up first)."""
+    from . import configs
+    out = configs.restore(payload.get("backup") or "")
+    return out, (400 if "error" in out else 200)
 
 
 # ── skills: census read + the owner-requested enable/disable/delete surface ──
@@ -500,7 +582,8 @@ def _api_quota_status():
                      "fallback": "(default) account resume works without a provider"},
         "cv": bool(shutil.which("cv")),
         "catalogRows": len(cat[1]) if cat else None,
-        "mutations": "POST JSON (localhost-only surface)",
+        "mutations": "POST JSON + Authorization: Bearer (per-process token, "
+                     "templated into the UI)",
     }
 
 
@@ -565,6 +648,17 @@ def _api_physics(qs):
         "codex" if "/codex" in hp or "codex-homes" in hp else "claude")
     return physics.physics_report(hp, _q1(qs, "cwd") or os.path.expanduser("~"),
                                   harness), 200
+
+
+def _api_physics_diff(qs):
+    """What differs between two homes' physics (cred axis when cwd is omitted)."""
+    from . import physics
+    a = _resolve_home_path(_q1(qs, "a") or "")
+    b = _resolve_home_path(_q1(qs, "b") or "")
+    if not a or not b:
+        return {"error": "need a= and b= (home names or paths)"}, 400
+    return physics.physics_diff(a, b, _q1(qs, "harness") or "claude",
+                                cwd=_q1(qs, "cwd") or None), 200
 
 
 # ── sessions surface: catalog / search / session / cmd / cwd / prune ──
@@ -682,26 +776,35 @@ API = {
     "/api/status": _api_quota_status,
     "/api/allocate": _api_allocate,
     "/api/homes": _api_homes,
+    "/api/configs/homes": _api_configs_homes,
+    "/api/configs/backups": _api_configs_backups,
 }
 
 QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/configs/cascade": _api_configs_cascade,
+    "/api/configs/tree": _api_configs_tree,
+    "/api/configs/resolve": _api_configs_resolve,
+    "/api/configs/file": _api_configs_file,
     "/api/creds": _api_creds,
     "/api/history": _api_history,
     "/api/burn": _api_burn,
     "/api/physics": _api_physics,
+    "/api/physics-diff": _api_physics_diff,
     "/api/catalog": _api_catalog,
     "/api/search": _api_search,
     "/api/session": _api_session,
     "/api/cmd": _api_cmd,
 }
 
-POST_API = {  # fn(payload_dict) -> (obj, status)
+POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
     "/api/skills/toggle": _api_skills_toggle,
     "/api/skills/delete": _api_skills_delete,
     "/api/homes": _api_homes_post,
     "/api/cwd": _api_cwd_post,
     "/api/prune": _api_prune_post,
+    "/api/configs/file": _api_configs_file_post,
+    "/api/configs/entry": _api_configs_entry_post,
+    "/api/configs/restore": _api_configs_restore_post,
 }
 
 
@@ -732,6 +835,12 @@ class Handler(BaseHTTPRequestHandler):
         fn = POST_API.get(path)
         if fn is None:
             return self._json({"error": "not found: %s" % path}, 404)
+        # mutations are NEVER open: browser CSRF can fire cross-origin POSTs at
+        # 127.0.0.1, so every mutation demands the per-process bearer the UI
+        # carries (sesh's _mut_authed, ported; helm answers 403).
+        if self.headers.get("Authorization", "") != "Bearer " + MUTATION_TOKEN:
+            return self._json({"error": "forbidden (mutations always require "
+                                        "the bearer token the UI carries)"}, 403)
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -756,6 +865,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = f.read()
         except OSError:
             return self._json({"error": "web_ui.html missing beside web.py"}, 500)
+        # the sesh token hand-off, ported: the UI file stays raw on disk; the
+        # per-process mutation bearer is templated in at serve time.
+        body = body.replace(b"__HELM_TOKEN__", MUTATION_TOKEN.encode())
         self._send(body, "text/html; charset=utf-8")
 
     def _json(self, obj, status=200):

@@ -1,0 +1,250 @@
+- generic [active] [ref=f1e1]:
+  - navigation [ref=f1e2]:
+    - generic [ref=f1e3]:
+      - generic [ref=f1e4]: ⎈
+      - text: helm
+    - button "helm" [ref=f1e5] [cursor=pointer]
+    - button "quota" [ref=f1e6] [cursor=pointer]
+    - button "sessions" [ref=f1e7] [cursor=pointer]
+    - button "configs" [ref=f1e8] [cursor=pointer]
+    - button "tray (0)" [ref=f1e9] [cursor=pointer]
+  - generic [ref=f1e10]:
+    - text: ▸ ▸
+    - generic [ref=f1e11]:
+      - generic [ref=f1e12]:
+        - textbox "filter cwd / config…" [ref=f1e13]
+        - generic [ref=f1e14] [cursor=pointer]: all
+        - generic [ref=f1e15] [cursor=pointer]: claude
+        - generic [ref=f1e16] [cursor=pointer]: codex
+        - generic [ref=f1e24]: 255 cwds · 16 homes
+        - button "↻ rescan" [ref=f1e17] [cursor=pointer]
+      - generic [ref=f1e18]:
+        - generic [ref=f1e19]:
+          - generic [ref=f1e85]:
+            - heading "cwd tree · project-scope" [level=4] [ref=f1e86]
+            - generic [ref=f1e87]:
+              - generic [ref=f1e88] [cursor=pointer]:
+                - generic [ref=f1e89]: ▾
+                - generic [ref=f1e90]: dev
+                - generic [ref=f1e91]: memory
+                - generic [ref=f1e92]: settings 2
+              - generic [ref=f1e93]:
+                - generic [ref=f1e95] [cursor=pointer]:
+                  - generic [ref=f1e96]: ·
+                  - generic [ref=f1e97]: .claude
+                  - generic [ref=f1e98]: memory
+                - generic [ref=f1e100] [cursor=pointer]:
+                  - generic [ref=f1e101]: ▸
+                  - generic [ref=f1e102]: .phaseD-probes
+                - generic [ref=f1e104] [cursor=pointer]:
+                  - generic [ref=f1e105]: ·
+                  - generic [ref=f1e106]: .sesh-ui-test
+                  - generic [ref=f1e107]: mcp
+                  - generic [ref=f1e108]: memory
+                - generic [ref=f1e110] [cursor=pointer]:
+                  - generic [ref=f1e111]: ▸
+                  - generic [ref=f1e112]: akapug
+                - generic [ref=f1e114] [cursor=pointer]:
+                  - generic [ref=f1e115]: ▸
+                  - generic [ref=f1e116]: archive
+                - generic [ref=f1e118] [cursor=pointer]:
+                  - generic [ref=f1e119]: ▸
+                  - generic [ref=f1e120]: dregg
+                - generic [ref=f1e122] [cursor=pointer]:
+                  - generic [ref=f1e123]: ▸
+                  - generic [ref=f1e124]: emberian
+                - generic [ref=f1e126] [cursor=pointer]:
+                  - generic [ref=f1e127]: ▸
+                  - generic [ref=f1e128]: kapfworktrees
+                - generic [ref=f1e130] [cursor=pointer]:
+                  - generic [ref=f1e131]: ▸
+                  - generic [ref=f1e132]: references
+                - generic [ref=f1e134] [cursor=pointer]:
+                  - generic [ref=f1e135]: ▸
+                  - generic [ref=f1e136]: refs
+                - generic [ref=f1e138] [cursor=pointer]:
+                  - generic [ref=f1e139]: ▸
+                  - generic [ref=f1e140]: simbi-inc
+                  - generic [ref=f1e141]: memory 2
+                  - generic [ref=f1e142]: settings
+          - group [ref=f1e143]:
+            - generic "homes · user-scope 16 · top of the cascade" [ref=f1e144] [cursor=pointer]
+        - generic [ref=f1e21]:
+          - generic [ref=f1e145]:
+            - generic [ref=f1e146]: /home/owner/dev/.sesh-ui-test
+            - generic [ref=f1e147]: "seat:"
+            - combobox [ref=f1e148]:
+              - option "claude" [selected]
+              - option "codex"
+            - combobox [ref=f1e149]:
+              - option "(default-claude)" [selected]
+              - option ".claude"
+              - option "cto-example-invalid"
+              - option "cto-example"
+              - option "owner-example-invalid"
+              - option "david-mv"
+              - option "owner"
+              - option "owner-example-invalid"
+              - option "team-example"
+              - option "team-example-com"
+          - generic [ref=f1e150]:
+            - heading "files at this cwd" [level=4] [ref=f1e151]
+            - generic [ref=f1e152]:
+              - generic [ref=f1e153]: mcp
+              - generic [ref=f1e154]: .mcp.json
+              - generic [ref=f1e155]: claude · json
+              - generic [ref=f1e156] [cursor=pointer]: ✎ edit
+            - generic [ref=f1e157]:
+              - generic [ref=f1e158]: memory
+              - generic [ref=f1e159]: CLAUDE.md
+              - generic [ref=f1e160]: claude · md
+              - generic [ref=f1e161] [cursor=pointer]: ✎ edit
+          - generic [ref=f1e162]:
+            - generic [ref=f1e163]:
+              - heading "memory cascade (root → cwd)" [level=4] [ref=f1e164]
+              - list [ref=f1e165]:
+                - listitem [ref=f1e166]: ⌂ home CLAUDE.md home-scope
+                - listitem [ref=f1e167]: ↳ CLAUDE.md
+            - generic [ref=f1e168]:
+              - heading "MCP servers (7)" [level=4] [ref=f1e169]
+              - generic [ref=f1e170]:
+                - generic [ref=f1e171]: mcp
+                - generic [ref=f1e172]: jetbrains
+                - generic [ref=f1e173]: sse · http://localhost:64342
+                - generic [ref=f1e174]: home-global
+              - generic [ref=f1e175]:
+                - generic [ref=f1e176]: mcp
+                - generic [ref=f1e177]: cv
+                - generic [ref=f1e178]: stdio · cv-mcp
+                - generic [ref=f1e179]: home-global
+              - generic [ref=f1e180]:
+                - generic [ref=f1e181]: mcp
+                - generic [ref=f1e182]: builders-dev
+                - generic [ref=f1e183]: http · https://mcp.builders.dev
+                - generic [ref=f1e184]: home-global
+              - generic [ref=f1e185]:
+                - generic [ref=f1e186]: mcp
+                - generic [ref=f1e187]: polyana
+                - generic [ref=f1e188]: stdio · polyana-mcp-server
+                - generic [ref=f1e189]: home-global
+              - generic [ref=f1e190]:
+                - generic [ref=f1e191]: mcp
+                - generic [ref=f1e192]: exa
+                - generic [ref=f1e193]: http · https://mcp.exa.ai
+                - generic [ref=f1e194]: home-global
+              - generic [ref=f1e195]:
+                - generic [ref=f1e196]: mcp
+                - generic [ref=f1e197]: fetch
+                - generic [ref=f1e198]: stdio · uvx
+                - generic [ref=f1e199]: home-global
+              - generic [ref=f1e200]:
+                - generic [ref=f1e201]: mcp
+                - generic [ref=f1e202]: playwright
+                - generic [ref=f1e203]: stdio · npx
+                - generic [ref=f1e204]: plugin:playwright@claude-plugins-official
+            - generic [ref=f1e205]:
+              - heading "hooks (17)" [level=4] [ref=f1e206]
+              - generic [ref=f1e207]:
+                - generic [ref=f1e208]: hook
+                - generic [ref=f1e209]: PermissionRequest
+                - generic [ref=f1e210]: ×1
+                - generic [ref=f1e211]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e212]:
+                - generic [ref=f1e213]: hook
+                - generic [ref=f1e214]: PostToolUse
+                - generic [ref=f1e215]: ×1
+                - generic [ref=f1e216]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e217]:
+                - generic [ref=f1e218]: hook
+                - generic [ref=f1e219]: PostToolUseFailure
+                - generic [ref=f1e220]: ×1
+                - generic [ref=f1e221]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e222]:
+                - generic [ref=f1e223]: hook
+                - generic [ref=f1e224]: PreToolUse
+                - generic [ref=f1e225]: ×1
+                - generic [ref=f1e226]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e227]:
+                - generic [ref=f1e228]: hook
+                - generic [ref=f1e229]: SessionStart
+                - generic [ref=f1e230]: ×1
+                - generic [ref=f1e231]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e232]:
+                - generic [ref=f1e233]: hook
+                - generic [ref=f1e234]: Stop
+                - generic [ref=f1e235]: ×1
+                - generic [ref=f1e236]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e237]:
+                - generic [ref=f1e238]: hook
+                - generic [ref=f1e239]: StopFailure
+                - generic [ref=f1e240]: ×1
+                - generic [ref=f1e241]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e242]:
+                - generic [ref=f1e243]: hook
+                - generic [ref=f1e244]: SubagentStart
+                - generic [ref=f1e245]: ×1
+                - generic [ref=f1e246]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e247]:
+                - generic [ref=f1e248]: hook
+                - generic [ref=f1e249]: SubagentStop
+                - generic [ref=f1e250]: ×1
+                - generic [ref=f1e251]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e252]:
+                - generic [ref=f1e253]: hook
+                - generic [ref=f1e254]: TeammateIdle
+                - generic [ref=f1e255]: ×1
+                - generic [ref=f1e256]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e257]:
+                - generic [ref=f1e258]: hook
+                - generic [ref=f1e259]: UserPromptSubmit
+                - generic [ref=f1e260]: ×2
+                - generic [ref=f1e261]: user (/home/owner/.claude/settings.json)
+              - generic [ref=f1e262]:
+                - generic [ref=f1e263]: hook
+                - generic [ref=f1e264]: PostToolUse
+                - generic [ref=f1e265]: ×1
+                - generic [ref=f1e266]: plugin:hookify@claude-plugins-official
+              - generic [ref=f1e267]:
+                - generic [ref=f1e268]: hook
+                - generic [ref=f1e269]: PreToolUse
+                - generic [ref=f1e270]: ×1
+                - generic [ref=f1e271]: plugin:hookify@claude-plugins-official
+              - generic [ref=f1e272]:
+                - generic [ref=f1e273]: hook
+                - generic [ref=f1e274]: Stop
+                - generic [ref=f1e275]: ×1
+                - generic [ref=f1e276]: plugin:hookify@claude-plugins-official
+              - generic [ref=f1e277]:
+                - generic [ref=f1e278]: hook
+                - generic [ref=f1e279]: UserPromptSubmit
+                - generic [ref=f1e280]: ×1
+                - generic [ref=f1e281]: plugin:hookify@claude-plugins-official
+              - generic [ref=f1e282]:
+                - generic [ref=f1e283]: hook
+                - generic [ref=f1e284]: PostToolUse
+                - generic [ref=f1e285]: ×1
+                - generic [ref=f1e286]: plugin:remember@claude-plugins-official
+              - generic [ref=f1e287]:
+                - generic [ref=f1e288]: hook
+                - generic [ref=f1e289]: SessionStart
+                - generic [ref=f1e290]: ×1
+                - generic [ref=f1e291]: plugin:remember@claude-plugins-official
+            - generic [ref=f1e292]:
+              - heading "skills / commands / agents" [level=4] [ref=f1e293]
+              - generic [ref=f1e294]:
+                - text: skills
+                - generic [ref=f1e295]: "20"
+                - text: · commands
+                - generic [ref=f1e296]: "10"
+                - text: · agents
+                - generic [ref=f1e297]: "5"
+                - text: · plugins
+                - generic [ref=f1e298]: "10"
+            - generic [ref=f1e299]:
+              - heading "settings" [level=4] [ref=f1e300]
+              - generic [ref=f1e301]: "model: fable"
+            - generic [ref=f1e302]:
+              - heading "warnings" [level=4] [ref=f1e303]
+              - generic [ref=f1e304]: ⚠ two state files exist (/home/owner/.claude.json vs /home/owner/.claude/.claude.json); using the richer one — set CLAUDE_CONFIG_DIR explicitly at launch to pin identity
+              - generic [ref=f1e305]: ⚠ cwd never opened under this home — first-launch trust dialog (and .mcp.json approvals) will fire
+  - button "◐ theme" [ref=f1e23] [cursor=pointer]

@@ -149,7 +149,8 @@ class ConfigsWebTest(unittest.TestCase):
         url = "http://127.0.0.1:%d%s" % (self.port, path)
         req = urllib.request.Request(
             url, data=json.dumps(obj).encode(), method="POST",
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + web.MUTATION_TOKEN})
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 return r.status, json.loads(r.read())

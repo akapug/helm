@@ -310,6 +310,54 @@ mark{background:var(--accent);color:var(--bg);border-radius:2px;padding:0 1px}
 #cwdedit.show{display:flex}
 #cwdedit input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font:.8rem ui-monospace,Menlo,monospace}
 
+/* ================= configs view (CSS ported from sesh, on helm's variables) ================= */
+#view-configs .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:.86rem;cursor:pointer;transition:border-color .12s,background .12s}
+#view-configs .chip:hover{background:var(--hover);border-color:var(--line2)}
+#view-configs .chip.on{border-color:var(--accent);color:var(--accent);font-weight:600;background:var(--accent-soft)}
+#cfgbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0 12px}
+#cfgFilter{flex:1;min-width:200px;padding:7px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:.9rem}
+#cfgFilter:focus{border-color:var(--accent);outline:none}
+.cfgmut{font-size:.78rem;color:var(--mut)}
+#cfgsplit{display:grid;grid-template-columns:minmax(280px,38%) 1fr;gap:16px;align-items:start}
+@media(max-width:820px){#cfgsplit{grid-template-columns:1fr}}
+#cfgtree,#cfgdetail{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;max-height:76vh;overflow:auto;box-shadow:var(--shadow)}
+.cfgnode{user-select:none}
+.cfgrow{display:flex;align-items:center;gap:6px;padding:3px 5px;border-radius:6px;cursor:pointer;font-size:.9rem;white-space:nowrap}
+.cfgrow:hover{background:var(--hl)}
+.cfgrow.sel{background:var(--accent);color:var(--bg)}
+.cfgrow.sel .cfgbadge{border-color:var(--bg);color:var(--bg)}
+.cfgtw{display:inline-block;width:12px;color:var(--mut);text-align:center}
+.cfgname{font-weight:600}
+.cfgkids{margin-left:14px;border-left:1px solid var(--line);padding-left:4px}
+.cfgbadge{font-size:.64rem;border:1px solid var(--line);border-radius:5px;padding:0 4px;color:var(--mut);font-weight:700;letter-spacing:.03em}
+.cfgbadge.mcp{color:#5470c6;border-color:#5470c6}.cfgbadge.hooks{color:#b4442e;border-color:#b4442e}
+.cfgbadge.memory{color:#3f7d54;border-color:#3f7d54}.cfgbadge.settings{color:#b58a2e;border-color:#b58a2e}
+.cfgbadge.rule{color:#8a5fc0;border-color:#8a5fc0}
+.cfgsec{margin:0 0 16px}
+.cfgsec h4{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 6px;border-bottom:1px solid var(--line);padding-bottom:4px}
+details.cfgsec>summary{cursor:pointer;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:6px;list-style:revert}
+details.cfgsec>summary:hover{color:var(--fg)}
+.cfgitem{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:7px;font-size:.88rem}
+.cfgitem:hover{background:var(--hl)}
+.cfgitem .src{font-size:.7rem;color:var(--mut);margin-left:auto;white-space:nowrap}
+.cfgitem.cfgshadow{opacity:.5}
+.cfgitem.cfgshadow b{text-decoration:line-through}
+.cfgitem.cfgshadow .src{color:var(--bad)}
+.cfgfile{cursor:pointer;color:var(--accent);text-decoration:underline;text-decoration-style:dotted}
+.cfgcascade{list-style:none;margin:0;padding:0}
+.cfgcascade li{position:relative;padding:4px 0 4px 20px;font-size:.86rem}
+.cfgcascade li:before{content:"↳";position:absolute;left:4px;color:var(--mut)}
+.cfgcascade li:first-child:before{content:"⌂"}
+.cfgwarn{background:color-mix(in srgb,var(--bad) 12%,transparent);border:1px solid var(--bad);border-radius:8px;padding:8px 10px;font-size:.82rem;margin:4px 0;color:var(--fg)}
+.cfged{margin-top:10px}
+.cfged textarea{width:100%;min-height:280px;font:.82rem ui-monospace,Menlo,monospace;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);padding:10px;resize:vertical;box-sizing:border-box}
+.cfgedbar{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
+.cfgpath{font:.76rem ui-monospace,monospace;color:var(--mut);word-break:break-all}
+.cfgro{color:var(--bad);font-size:.76rem;font-weight:700}
+.cfgpick{padding:5px 10px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:.85rem}
+.cfgdiff{font:.78rem ui-monospace,Menlo,monospace;word-break:break-all;padding:2px 6px;border-radius:6px}
+.cfgdiff.add{color:var(--ok)}.cfgdiff.del{color:var(--bad)}.cfgdiff.chg{color:var(--warn)}
+
 /* ---------- toast + theme toggle ---------- */
 .hint{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:9px;font:.82rem ui-monospace,Menlo,monospace;opacity:0;transition:.2s;pointer-events:none;z-index:70;max-width:92vw;word-break:break-all}
 .hint.show{opacity:.96}
@@ -412,7 +460,18 @@ mark{background:var(--accent);color:var(--bg);border-radius:2px;padding:0 1px}
 </div>
 
 <div class="view" id="view-configs">
-  <div class="placeholder"><div class="glyph">⎈</div>the configs view (cwd tree · cascade · editors) lands in slice C —<br>meanwhile <code>/api/configs</code> and <code>helm configs</code> answer from the CLI side.</div>
+  <div id="cfgbar">
+    <input id="cfgFilter" placeholder="filter cwd / config…" autocomplete="off">
+    <span class="chip on" data-ch="all">all</span>
+    <span class="chip" data-ch="claude">claude</span>
+    <span class="chip" data-ch="codex">codex</span>
+    <span id="cfgStatus" class="cfgmut"></span>
+    <button class="chip" id="cfgReload" style="margin-left:auto">↻ rescan</button>
+  </div>
+  <div id="cfgsplit">
+    <div id="cfgtree"><div class="empty">open the configs tab to scan…</div></div>
+    <div id="cfgdetail"><div class="empty">pick a cwd or a home to see what its agents load →</div></div>
+  </div>
 </div>
 
 </div>
@@ -434,6 +493,7 @@ mark{background:var(--accent);color:var(--bg);border-radius:2px;padding:0 1px}
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const TOKEN = "__HELM_TOKEN__"; // per-process anti-CSRF bearer, templated in by the server — every POST carries it
 const KNOWN_H = ["claude", "codex", "opencode"];
 const STORE_ORDER = ["premise", "prior", "lexicon", "heuristic", "reference", "episodic"];
 
@@ -472,6 +532,7 @@ function showView(v) {
   if (location.hash !== "#" + v) history.replaceState(null, "", "#" + v);
   if (v === "quota") initQuota();
   if (v === "sessions") initSessions();
+  if (v === "configs") cfgInit();
 }
 $$(".navtab").forEach(t => t.onclick = () => showView(t.dataset.v));
 window.addEventListener("hashchange", () => {
@@ -535,7 +596,7 @@ function sessStrip(s) {
 
 /* ---------- skills strip ---------- */
 async function post(url, body) {
-  const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json", "Authorization": "Bearer " + TOKEN}, body: JSON.stringify(body)});
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || url + " -> " + r.status);
   return d;
@@ -1126,7 +1187,7 @@ $("#burncard").addEventListener("toggle", () => { if ($("#burncard").open) loadB
    helm prepares/verifies/moves home DIRECTORIES; every login is human-run and
    credentials are never read, written, copied, or moved (one home = one login). */
 let HOMES = [];
-const homePost = async body => await (await fetch("/api/homes", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})).json();
+const homePost = async body => await (await fetch("/api/homes", {method: "POST", headers: {"Content-Type": "application/json", "Authorization": "Bearer " + TOKEN}, body: JSON.stringify(body)})).json();
 async function loadHomes() {
   const host = $("#homerows");
   host.innerHTML = '<div class="empty">scanning homes…</div>';
@@ -1227,8 +1288,8 @@ $("#homescard").addEventListener("toggle", () => { if ($("#homescard").open) loa
 
 /* ================= sessions view (ported from sesh ui.html, behavior-preserving) =================
    Renames vs sesh (collision-avoidance with the helm view, behavior identical):
-   #q -> #sq, #count -> #sesscount, render() -> renderSessions(); no bearer token
-   (helm's surface is localhost-only, mutations are plain POSTs like the rest). */
+   #q -> #sq, #count -> #sesscount, render() -> renderSessions(); mutations carry
+   the per-process bearer TOKEN via post() (sesh's apiFetch, slice-C hardening). */
 let DATA = [], CONTENT = null, SYN_ON = false, TEAM = [];
 const state = {q: "", h: new Set(["claude", "codex"]), view: "recent", recent: true};
 const cut = new Date(Date.now() - 45 * 864e5).toISOString().slice(0, 10);
@@ -1706,6 +1767,249 @@ $$("#view-sessions .chip.h").forEach(ch => ch.onclick = () => {
 });
 { const vm = localStorage.getItem("helm.viewmode"); if (vm) { state.view = vm; $("#viewmode").value = vm; } }
 renderPresets(); trayCount();
+
+/* ================= configs view (ported from sesh ui.html, behavior-preserving) =================
+   The cwd tree + homes (top of the cascade) on the left; the detail pane on the
+   right: files at the selection, the resolved cascade (what a seat here loads),
+   the safety-first editor (backup → validate → atomic via POST /api/configs/file),
+   MCP entry quick-ops, backups + one-click restore. Mutations ride post() (bearer
+   TOKEN). helm addition beyond sesh: a physics-diff panel on home selection. */
+const CFG = {tree: null, homes: null, harness: "claude", home: null, ch: "all", loaded: false, openDirs: new Set(), sel: null};
+const cfgPost = (url, body) => post(url, body).catch(e => ({error: String(e.message || e)}));
+async function cfgInit(force) {
+  if (CFG.loaded && !force) return;
+  $("#cfgtree").innerHTML = '<div class="empty">scanning config tree…</div>';
+  try {
+    const [tree, homes2] = await Promise.all([j("/api/configs/tree"), j("/api/configs/homes")]);
+    CFG.tree = tree; CFG.homes = Array.isArray(homes2) ? homes2 : []; CFG.loaded = true;
+    CFG.home = CFG.home || "(default-claude)";
+    cfgRenderTree();
+    $("#cfgStatus").textContent = `${tree.count} cwds · ${CFG.homes.length} homes`;
+  } catch (e) { $("#cfgtree").innerHTML = '<div class="empty">✗ config scan failed: ' + esc(e.message) + '</div>'; }
+}
+function cfgFileBadges(files) {
+  const seen = {};
+  for (const f of files) seen[f.kind] = (seen[f.kind] || 0) + 1;
+  return Object.keys(seen).map(k => `<span class="cfgbadge ${esc(k)}">${esc(k)}${seen[k] > 1 ? " " + seen[k] : ""}</span>`).join("");
+}
+function cfgMatch(node) {
+  const q = ($("#cfgFilter").value || "").toLowerCase();
+  const chOk = f => CFG.ch === "all" || f.harness === CFG.ch;
+  const selfFiles = node.files.filter(chOk);
+  const selfHit = (!q || node.path.toLowerCase().includes(q)) && selfFiles.length > 0;
+  const kids = node.children.map(cfgMatch).filter(Boolean);
+  if (selfHit || kids.length) return {...node, files: selfFiles, children: kids, _hit: selfHit};
+  return null;
+}
+function cfgTreeNode(node, depth) {
+  const id = node.path;
+  const filtering = !!(($("#cfgFilter").value || "").trim()) || CFG.ch !== "all";
+  const open = filtering || CFG.openDirs.has(id) || depth < 1;
+  const hasKids = node.children.length > 0;
+  const tw = hasKids ? (open ? "▾" : "▸") : "·";
+  const sel = CFG.sel && CFG.sel.type === "cwd" && CFG.sel.path === id ? " sel" : "";
+  let h = `<div class="cfgnode"><div class="cfgrow${sel}" data-cwd="${esc(id)}">`
+    + `<span class="cfgtw" data-tw="${esc(id)}">${tw}</span>`
+    + `<span class="cfgname">${esc(node.name)}</span> ${cfgFileBadges(node.files)}</div>`;
+  if (hasKids && open) h += `<div class="cfgkids">` + node.children.map(c => cfgTreeNode(c, depth + 1)).join("") + `</div>`;
+  return h + `</div>`;
+}
+function cfgRenderTree() {
+  const host = $("#cfgtree");
+  // cwd tree first (the primary axis), homes collapsible below
+  let h = `<div class="cfgsec"><h4>cwd tree · project-scope</h4>`;
+  const roots = (CFG.tree ? CFG.tree.roots : []).map(cfgMatch).filter(Boolean);
+  h += roots.length ? roots.map(r => cfgTreeNode(r, 0)).join("") : '<div class="empty">no configs match</div>';
+  h += `</div>`;
+  const homes2 = (CFG.homes || []).filter(hm => CFG.ch === "all" || hm.provider === CFG.ch);
+  h += `<details class="cfgsec" id="cfgHomesDet"${CFG.homesOpen ? " open" : ""}><summary><b>homes · user-scope</b> <span class="cfgmut">${homes2.length} · top of the cascade</span></summary>`;
+  for (const hm of homes2) {
+    const sel = CFG.sel && CFG.sel.type === "home" && CFG.sel.path === hm.path ? " sel" : "";
+    h += `<div class="cfgrow${sel}" data-home="${esc(hm.path)}"><span class="cfgtw">⌂</span>`
+      + `<span class="cfgname">${esc(hm.home)}</span> <span class="cfgbadge">${esc(hm.provider)}</span> ${cfgFileBadges(hm.files)}</div>`;
+  }
+  h += `</details>`;
+  host.innerHTML = h;
+  const det = $("#cfgHomesDet");
+  if (det) det.addEventListener("toggle", () => { CFG.homesOpen = det.open; });
+  host.querySelectorAll(".cfgtw[data-tw]").forEach(el => el.onclick = ev => {
+    ev.stopPropagation();
+    const p = el.dataset.tw;
+    CFG.openDirs.has(p) ? CFG.openDirs.delete(p) : CFG.openDirs.add(p);
+    cfgRenderTree();
+  });
+  host.querySelectorAll(".cfgrow[data-cwd]").forEach(el => el.onclick = () => cfgSelectCwd(el.dataset.cwd));
+  host.querySelectorAll(".cfgrow[data-home]").forEach(el => el.onclick = () => cfgSelectHome(el.dataset.home));
+}
+function cfgNodeByPath(node, path) {
+  if (node.path === path) return node;
+  for (const c of node.children) { const r = cfgNodeByPath(c, path); if (r) return r; }
+  return null;
+}
+async function cfgSelectCwd(path) {
+  CFG.sel = {type: "cwd", path};
+  cfgRenderTree();
+  const detail = $("#cfgdetail");
+  let node = null;
+  for (const r of (CFG.tree.roots || [])) { node = cfgNodeByPath(r, path); if (node) break; }
+  const homeOpts = (CFG.homes || []).filter(h => h.provider === CFG.harness).map(h => h.home);
+  const defHome = CFG.harness === "codex" ? "(default-codex)" : "(default-claude)";
+  detail.innerHTML = `<div class="cfgedbar">
+    <b>${esc(path)}</b>
+    <span class="cfgpick" style="margin-left:auto">seat:</span>
+    <select class="cfgpick" id="cfgHarness"><option${CFG.harness === "claude" ? " selected" : ""}>claude</option><option${CFG.harness === "codex" ? " selected" : ""}>codex</option></select>
+    <select class="cfgpick" id="cfgHome"><option value="${defHome}">${defHome}</option>${homeOpts.map(h => `<option value="${esc(h)}">${esc(h)}</option>`).join("")}</select>
+  </div>
+  <div class="cfgsec"><h4>files at this cwd</h4>${(node ? node.files : []).map(f => cfgFileRow(f)).join("") || '<div class="cfgmut">none directly here</div>'}</div>
+  <div id="cfgResolved"><div class="empty">resolving what this seat loads…</div></div>`;
+  $("#cfgHarness").onchange = e => { CFG.harness = e.target.value; cfgSelectCwd(path); };
+  $("#cfgHome").onchange = e => { CFG.home = e.target.value; cfgResolve(path); };
+  CFG.home = $("#cfgHome").value;
+  detail.querySelectorAll(".cfgfile").forEach(el => el.onclick = () => cfgEdit(el.dataset.path));
+  cfgResolve(path);
+}
+function cfgFileRow(f) {
+  const ed = f.editable ? '<span class="cfgfile" data-path="' + esc(f.path) + '">✎ edit</span>'
+    : f.entries ? '<span class="cfgmut">' + f.entries.length + ' entries</span>'
+    : '<span class="cfgro" title="' + esc(f.reason) + '">🔒</span>';
+  return `<div class="cfgitem"><span class="cfgbadge ${esc(f.kind)}">${esc(f.kind)}</span> <span>${esc(f.rel)}</span> <span class="src">${esc(f.harness)} · ${esc(f.type)}</span> ${ed}</div>`;
+}
+async function cfgResolve(cwd) {
+  const host = $("#cfgResolved");
+  if (!host) return;
+  try {
+    const r = await j(`/api/configs/resolve?home=${encodeURIComponent(CFG.home)}&cwd=${encodeURIComponent(cwd)}&harness=${CFG.harness}`);
+    if (r.error) { host.innerHTML = '<div class="cfgwarn">' + esc(r.error) + '</div>'; return; }
+    host.innerHTML = cfgRenderResolved(r);
+    host.querySelectorAll(".cfgfile").forEach(el => el.onclick = () => cfgEdit(el.dataset.path));
+  } catch (e) { host.innerHTML = '<div class="cfgwarn">resolve failed: ' + esc(e.message) + '</div>'; }
+}
+function cfgFileLink(p) { return p ? `<span class="cfgfile" data-path="${esc(p)}">${esc(p.replace(/^.*\//, ""))}</span>` : ""; }
+function cfgRenderResolved(r) {
+  let h = "";
+  // the cascade — memory chain root→cwd (the "passes down through cwds" view)
+  const chain = (r.memory && r.memory.projectClaudeMdChain) || (r.agents && r.agents.projectAgentsMdChain) || [];
+  const homeMd = r.memory ? r.memory.homeClaudeMd : (r.agents && r.agents.homeAgentsMd);
+  h += `<div class="cfgsec"><h4>memory cascade (root → cwd)</h4><ul class="cfgcascade">`;
+  if (homeMd) h += `<li>home ${r.harness === "codex" ? "AGENTS.md" : "CLAUDE.md"} <span class="src">home-scope</span></li>`;
+  h += chain.length ? chain.slice().reverse().map(p => `<li>${cfgFileLink(p)}</li>`).join("") : (homeMd ? "" : `<li class="cfgmut">no project memory files in the chain</li>`);
+  h += `</ul></div>`;
+  // MCP servers — winners first, shadowed (overridden) ones grayed below
+  const servers = r.mcpServers || [];
+  const live = servers.filter(m => !m.shadowed), shadowed = servers.filter(m => m.shadowed);
+  h += `<div class="cfgsec"><h4>MCP servers (${live.length}${shadowed.length ? ` · ${shadowed.length} shadowed` : ""})</h4>`;
+  const mcpRow = m => `<div class="cfgitem${m.shadowed ? " cfgshadow" : ""}"><span class="cfgbadge mcp">mcp</span> <b>${esc(m.name)}</b> <span class="cfgmut">${esc(m.transport || "")}${m.detail ? " · " + esc(m.detail) : ""}</span> <span class="src">${esc(m.source)}${m.file ? " · " + cfgFileLink(m.file) : ""}${m.approval ? " · " + esc(m.approval) : ""}${m.shadowed ? ` · ⤺ shadowed by ${esc(m.shadowed_by || "?")}` : ""}</span></div>`;
+  h += live.map(mcpRow).join("") || '<div class="cfgmut">none</div>';
+  h += shadowed.map(mcpRow).join("");
+  h += `</div>`;
+  // hooks
+  h += `<div class="cfgsec"><h4>hooks (${(r.hooks || []).length})</h4>`;
+  h += (r.hooks || []).map(x => `<div class="cfgitem"><span class="cfgbadge hooks">hook</span> <b>${esc(x.event)}</b> <span class="cfgmut">×${x.count}</span> <span class="src">${esc(x.source || "")}</span></div>`).join("") || '<div class="cfgmut">none</div>';
+  h += `</div>`;
+  // skills / commands / agents
+  const cnt = o => o && typeof o.count === "number" ? o.count : 0;
+  h += `<div class="cfgsec"><h4>skills / commands / agents</h4><div class="cfgitem">skills <b>${cnt(r.skills)}</b> · commands <b>${cnt(r.commands)}</b> · agents <b>${cnt(r.agents)}</b> · plugins <b>${(r.plugins && r.plugins.enabled && r.plugins.enabled.length) || 0}</b></div></div>`;
+  // settings highlights
+  const s = r.settingsHighlights || {};
+  h += `<div class="cfgsec"><h4>settings</h4><div class="cfgitem cfgmut">model: ${esc(s.model || "—")}${s.modelReasoningEffort ? " · effort " + esc(s.modelReasoningEffort) : ""}${s.approvalPolicy ? " · approval " + esc(s.approvalPolicy) : ""}${s.sandboxMode ? " · sandbox " + esc(s.sandboxMode) : ""}</div></div>`;
+  // warnings
+  if ((r.warnings || []).length) h += `<div class="cfgsec"><h4>warnings</h4>` + r.warnings.map(w => `<div class="cfgwarn">⚠ ${esc(w)}</div>`).join("") + `</div>`;
+  return h;
+}
+async function cfgSelectHome(path) {
+  CFG.sel = {type: "home", path};
+  cfgRenderTree();
+  const hm = (CFG.homes || []).find(h => h.path === path);
+  if (!hm) return;
+  const others = (CFG.homes || []).filter(h => h.provider === hm.provider && h.path !== path);
+  $("#cfgdetail").innerHTML = `<div class="cfgedbar"><b>⌂ ${esc(hm.home)}</b> <span class="cfgmut">${esc(hm.provider)} home · user-scope configs</span></div>`
+    + `<div class="cfgsec"><h4>files</h4>${hm.files.map(cfgFileRow).join("")}</div>`
+    + `<div class="cfgmut">these sit at the TOP of the cascade — every cwd under this home inherits them unless a deeper layer overrides.</div>`
+    + (others.length ? `<div class="cfgsec" style="margin-top:16px"><h4>physics diff · cred axis</h4>
+      <div class="cfgedbar"><span class="cfgmut">what a seat here loads vs</span>
+      <select class="cfgpick" id="cfgDiffB">${others.map(o => `<option value="${esc(o.path)}">${esc(o.home)}</option>`).join("")}</select>
+      <button class="chip" id="cfgDiffGo">diff</button></div>
+      <div id="cfgDiffOut"></div></div>` : "");
+  $("#cfgdetail").querySelectorAll(".cfgfile").forEach(el => el.onclick = () => cfgEdit(el.dataset.path));
+  if ($("#cfgDiffGo")) $("#cfgDiffGo").onclick = () => cfgPhysDiff(hm, $("#cfgDiffB").value);
+}
+async function cfgPhysDiff(hm, bPath) {
+  const out = $("#cfgDiffOut");
+  out.innerHTML = '<div class="empty">diffing physics…</div>';
+  let d;
+  try { d = await j(`/api/physics-diff?a=${encodeURIComponent(hm.path)}&b=${encodeURIComponent(bPath)}&harness=${encodeURIComponent(hm.provider)}`); }
+  catch (e) { out.innerHTML = '<div class="cfgwarn">✗ ' + esc(e.message) + '</div>'; return; }
+  if (d.error) { out.innerHTML = '<div class="cfgwarn">✗ ' + esc(d.error) + '</div>'; return; }
+  if (d.identical) { out.innerHTML = '<div class="cfgitem cfgmut">identical physics — a seat loads the same on either home</div>'; return; }
+  const fmt = v => typeof v === "string" ? v : JSON.stringify(v);
+  out.innerHTML =
+    Object.entries(d.added_in_b || {}).map(([k, v]) => `<div class="cfgdiff add">+ ${esc(k)} = ${esc(fmt(v))}</div>`).join("")
+    + Object.entries(d.removed_in_b || {}).map(([k, v]) => `<div class="cfgdiff del">− ${esc(k)} = ${esc(fmt(v))}</div>`).join("")
+    + Object.entries(d.changed || {}).map(([k, v]) => `<div class="cfgdiff chg">± ${esc(k)}: ${esc(fmt(v.a))} → ${esc(fmt(v.b))}</div>`).join("");
+}
+async function cfgEdit(path) {
+  let r;
+  try { r = await j(`/api/configs/file?path=${encodeURIComponent(path)}`); }
+  catch (e) { toast("✗ " + e.message); return; }
+  const host = $("#cfgdetail");
+  const ro = !r.editable;
+  const isMcp = /\.mcp\.json$|\.claude\.json$/.test(path);
+  host.innerHTML = `<div class="cfgedbar"><button class="chip" id="cfgBack">← back</button>
+    <span class="cfgpath">${esc(r.path)}</span> <span class="cfgbadge">${esc(r.type)}</span>
+    ${ro ? '<span class="cfgro">🔒 ' + esc(r.reason || r.error || "") + '</span>' : ''}</div>
+    <div class="cfged"><textarea id="cfgTA" ${ro ? "readonly" : ""} spellcheck="false">${esc(r.content || "")}</textarea>
+      <div class="cfgedbar">
+        ${ro ? "" : '<button class="chip" id="cfgSave">save (backup + validate)</button>'}
+        ${isMcp && !ro ? '<button class="chip" id="cfgAddMcp">+ MCP server</button>' : ''}
+        <span id="cfgSaveMsg" class="cfgmut"></span>
+      </div></div>
+    <div id="cfgBackups"></div>`;
+  $("#cfgBack").onclick = () => { CFG.sel && CFG.sel.type === "home" ? cfgSelectHome(CFG.sel.path) : cfgSelectCwd((CFG.sel && CFG.sel.path) || path.replace(/\/[^/]*$/, "")); };
+  if (!ro) {
+    $("#cfgSave").onclick = async () => {
+      const res = await cfgPost("/api/configs/file", {path: r.path, content: $("#cfgTA").value});
+      const m = $("#cfgSaveMsg");
+      if (res.error) { m.innerHTML = '<span class="cfgro">' + esc(res.error) + '</span>'; }
+      else { m.textContent = `✓ ${res.note}${res.backup ? " · backup: " + res.backup : ""}`; toast("saved " + r.path); cfgLoadBackups(r.path); }
+    };
+    if (isMcp) $("#cfgAddMcp").onclick = () => cfgAddMcp(r.path);
+  }
+  cfgLoadBackups(r.path);
+}
+async function cfgAddMcp(path) {
+  const name = prompt("MCP server name?");
+  if (!name) return;
+  const cmd = prompt("command (stdio) — leave blank for a URL server:", "");
+  let value;
+  if (cmd) { const args = prompt("args (space-separated, optional):", ""); value = {command: cmd, ...(args ? {args: args.split(/\s+/).filter(Boolean)} : {})}; }
+  else { const url = prompt("server url:"); if (!url) return; value = {url}; }
+  const res = await cfgPost("/api/configs/entry", {action: "add", path, kind: "mcp", name, value});
+  if (res.error) toast("✗ " + res.error);
+  else { toast("added MCP " + name); cfgEdit(path); }
+}
+async function cfgLoadBackups(path) {
+  const host = $("#cfgBackups");
+  if (!host) return;
+  let all;
+  try { all = await j("/api/configs/backups"); } catch (e) { return; }
+  const mine = (Array.isArray(all) ? all : []).filter(b => b.orig === path).slice(0, 6);
+  if (!mine.length) { host.innerHTML = ""; return; }
+  host.innerHTML = `<div class="cfgsec"><h4>backups · undo</h4>` + mine.map(b =>
+    `<div class="cfgitem"><span class="cfgmut">${esc(b.at)}</span> <span class="src">${b.size}B</span> <button class="chip" data-bk="${esc(b.backup)}">restore</button></div>`).join("") + `</div>`;
+  host.querySelectorAll("button[data-bk]").forEach(el => el.onclick = async () => {
+    if (!confirm("restore this backup over the current file?")) return;
+    const res = await cfgPost("/api/configs/restore", {backup: el.dataset.bk});
+    if (res.error) toast("✗ " + res.error);
+    else { toast("restored"); cfgEdit(path); }
+  });
+}
+$("#cfgFilter").addEventListener("input", () => { if (CFG.loaded) cfgRenderTree(); });
+$$("#cfgbar .chip[data-ch]").forEach(ch => ch.onclick = () => {
+  CFG.ch = ch.dataset.ch;
+  $$("#cfgbar .chip[data-ch]").forEach(x => x.classList.toggle("on", x === ch));
+  if (CFG.loaded) cfgRenderTree();
+});
+$("#cfgReload").onclick = () => cfgInit(true);
 
 /* ================= boot ================= */
 {

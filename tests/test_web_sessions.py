@@ -156,7 +156,8 @@ class TestWebSessions(unittest.TestCase):
         url = "http://127.0.0.1:%d%s" % (self.port, path)
         data = json.dumps(payload).encode() if payload is not None else None
         r = urllib.request.Request(url, data=data, headers=(
-            {"Content-Type": "application/json"} if data else {}))
+            {"Content-Type": "application/json",
+             "Authorization": "Bearer " + web.MUTATION_TOKEN} if data else {}))
         try:
             with urllib.request.urlopen(r, timeout=10) as resp:
                 return resp.status, json.loads(resp.read() or b"null")
