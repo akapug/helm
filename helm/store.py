@@ -202,6 +202,9 @@ _PRIOR_DEFAULTS = {
     "evidence_log": "", "confidence_history": "",
     "supersedes": "", "replaced_by": "", "source_prior": "",
     "retired_ts": "", "retired_why": "",
+    # attestation receipt (premise.py annotates; parse + rewrite carry through)
+    "attest_payload": "", "attest_ts": "", "attest_by": "", "attest_turn": "",
+    "attest_receipt": "", "attest_chain_index": "",
 }
 
 _LEX_DEFAULTS = {"term": "", "scope": "global", "definition": "", "kind": "",
@@ -512,6 +515,12 @@ def write_prior(e, root_dir=None, path=None):
     ]
     if pin:
         body.append("  pin: true")
+    # attestation annotations survive rewrites — the ledger is the truth, but a
+    # store rewrite (evidence/retire) must never orphan the entry's receipt keys
+    for opt in ("attest_payload", "attest_ts", "attest_by", "attest_turn",
+                "attest_receipt", "attest_chain_index"):
+        if e.get(opt) not in (None, ""):
+            body.append("  " + opt + ": " + str(e[opt]))
     for opt in ("supersedes", "replaced_by", "source_prior"):
         if e.get(opt):
             body.append("  " + opt + ": " + str(e[opt]))

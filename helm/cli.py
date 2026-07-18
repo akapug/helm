@@ -110,6 +110,14 @@ VERBS = {
     "sessions": _lazy("sessions", "cmd_sessions"),
     "homes": _lazy("homes", "cmd_homes"),
     "configs": _lazy("configs", "cmd_configs"),
+    "cell": _lazy("cell", "cmd_cell"),
+    "premise": _lazy("premise", "cmd_premise"),
+    "premise-check": _lazy("premise", "cmd_premise_check"),
+    "search": _lazy("transcripts", "cmd_search"),
+    "transcript": _lazy("transcripts", "cmd_transcript"),
+    "rehome": _lazy("transcripts", "cmd_rehome"),
+    "prune": _lazy("transcripts", "cmd_prune"),
+    "keepalive": _lazy("keepalive", "cmd_keepalive"),
     "web": _lazy("web", "cmd_web"),
 }
 
@@ -128,6 +136,14 @@ _VERB_HELP = {
     "sessions": "sessions [<project>] — every local session, all harnesses; resume in one paste",
     "homes": "homes [prepare|verify|archive|restore|archives] — credential-home lifecycle",
     "configs": "configs [list|show|cascade <cwd>] — every config across every home, read-only",
+    "cell": "cell join|send|recv|heartbeat|roster|status — the a2a substrate, helm-named",
+    "premise": "premise <id> | <statement> — capture a certain truth, attested on the ledger",
+    "premise-check": "premise-check <id> — verify digest + quote the finality tier",
+    "search": "search <text> [--scope P] [--refs] — content search inside transcripts",
+    "transcript": "transcript <sid> [--find T] [--limit N] — windowed role-tagged transcript read",
+    "rehome": "rehome <sid> <new-cwd>|--reset — re-home a session (claude slug symlink)",
+    "prune": "prune <sid> [--preset lean|window20k] [--dry] — resume-optimized copy, original untouched",
+    "keepalive": "keepalive [--home H] [--early N] — roll idle claude homes' tokens (codex read-only)",
     "web": "web [--port N] — the same, warm, in a browser",
 }
 

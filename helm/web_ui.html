@@ -4,23 +4,43 @@
 <title>helm</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='25' x='16' text-anchor='middle' font-size='26' fill='%237eb8a2'%3E⎈%3C/text%3E%3C/svg%3E">
 <style>
-/* palette: the sesh/builders.dev warm token family — helm is dark-first, light derived in-family */
-:root{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--ok:#7eb8a2;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
-@media (prefers-color-scheme:light){:root{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--ok:#3e8a6e;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}}
+/* palette: the sesh/builders.dev warm token family — helm is dark-first, light derived in-family.
+   data-theme overrides (after the media query, so the toggle wins both ways) ported from sesh. */
+:root{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--hl:#2a231a;--ok:#7eb8a2;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
+@media (prefers-color-scheme:light){:root{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--hl:#efe7d8;--ok:#3e8a6e;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}}
+:root[data-theme=dark]{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--hl:#2a231a;--ok:#7eb8a2;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
+:root[data-theme=light]{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--hl:#efe7d8;--ok:#3e8a6e;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 body::before{content:"";position:fixed;inset:0 0 auto;height:340px;background:radial-gradient(60% 100% at 50% 0,var(--accent-soft),transparent 70%);pointer-events:none}
 .wrap{max-width:1180px;margin:0 auto;padding:0 clamp(14px,3vw,36px);position:relative}
 code,.mono{font:.86em ui-monospace,Menlo,Consolas,monospace}
 code{background:var(--code);color:var(--codefg);padding:1px 5px;border-radius:4px}
+button{font:inherit}
 
-/* ---------- header ---------- */
-header{padding:26px 0 6px}
-.brand{display:flex;align-items:center;gap:11px}
-.brand .mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 50%,var(--claude)));display:grid;place-items:center;font-size:21px;color:var(--bg);box-shadow:0 1px 5px rgba(0,0,0,.25)}
-.brand h1{margin:0;font-size:1.45rem;font-weight:800;letter-spacing:-.03em}
-.brand .stats{margin-left:auto;font-size:.82rem;color:var(--mut);text-align:right;font-variant-numeric:tabular-nums}
-.brand .stats b{color:var(--fg)}
+/* ---------- nav (the sesh navtab pattern) ---------- */
+#nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;padding:10px clamp(14px,3vw,36px);background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+#nav .brand{display:flex;align-items:center;gap:9px;font-size:1.15rem;font-weight:800;letter-spacing:-.03em;margin-right:6px}
+#nav .brand .mark{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 50%,var(--claude)));display:grid;place-items:center;font-size:16px;color:var(--bg);box-shadow:0 1px 4px rgba(0,0,0,.18)}
+.navtab{padding:6px 16px;border-radius:20px;border:1px solid transparent;cursor:pointer;font-weight:600;font-size:.92rem;color:var(--mut);background:none}
+.navtab.on{color:var(--accent);border-color:var(--accent);background:var(--card)}
+.navtab:hover{color:var(--fg)}
+#nav .stats{margin-left:auto;display:flex;gap:14px;font-size:.8rem;color:var(--mut);flex-wrap:wrap;font-variant-numeric:tabular-nums}
+#nav .stats b{color:var(--fg)}
+
+/* ---------- views ---------- */
+.view{display:none}.view.on{display:block}
+.placeholder{padding:72px 20px;text-align:center;color:var(--mut)}
+.placeholder .glyph{font-size:2rem;opacity:.4}
+.empty{padding:24px;text-align:center;color:var(--mut)}
+
+/* ---------- header (helm view) ---------- */
+header{padding:22px 0 6px}
+.brandrow{display:flex;align-items:center;gap:11px}
+.brandrow .mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 50%,var(--claude)));display:grid;place-items:center;font-size:21px;color:var(--bg);box-shadow:0 1px 5px rgba(0,0,0,.25)}
+.brandrow h1{margin:0;font-size:1.45rem;font-weight:800;letter-spacing:-.03em}
+.brandrow .stats{margin-left:auto;font-size:.82rem;color:var(--mut);text-align:right;font-variant-numeric:tabular-nums}
+.brandrow .stats b{color:var(--fg)}
 #hello{margin:10px 0 0;font-size:1.02rem;color:var(--mut)}
 #hello b{color:var(--fg);font-weight:650}
 
@@ -125,11 +145,108 @@ header{padding:26px 0 6px}
 #empty .glyph{font-size:2rem;opacity:.4}
 footer{margin:26px 0 46px;font-size:.76rem;color:var(--sub);display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 footer .fmark{color:color-mix(in srgb,var(--accent) 70%,var(--sub))}
+
+/* ================= quota view (CSS ported from sesh, on helm's variables) ================= */
+/* ---------- attention ---------- */
+#attn{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0 0;font-size:.85rem;min-height:1.5em}
+.attn{padding:4px 12px;border-radius:16px;border:1px solid var(--line);background:var(--card)}
+.attn.warn{border-color:color-mix(in srgb,var(--warn) 60%,transparent);color:var(--warn)}
+.attn.bad{border-color:color-mix(in srgb,var(--bad) 60%,transparent);color:var(--bad)}
+.attn.next{color:var(--mut)}.attn.next b{color:var(--fg)}
+
+/* ---------- chart card ---------- */
+#chartcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px 6px;position:relative;box-shadow:var(--shadow)}
+#zoomhint{position:absolute;right:16px;bottom:10px;font-size:.72rem;color:var(--sub);pointer-events:none}
+#chartcard .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px}
+#chartcard .chead b{font-size:1.05rem}
+.qtab{padding:5px 16px;border-radius:16px;border:1px solid var(--line);font-size:.88rem;cursor:pointer;color:var(--mut);background:none;display:inline-block}
+.qtab.on{border-color:var(--accent);color:var(--accent);font-weight:700}
+#qsub{margin-left:auto;font-size:.8rem;color:var(--mut)}
+#chart{width:100%;height:auto;display:block;cursor:crosshair}
+#tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:.78rem ui-monospace,Menlo,monospace;display:none;z-index:5;box-shadow:0 3px 14px rgba(0,0,0,.18);white-space:nowrap}
+#tip .tt{color:var(--mut)}
+
+/* ---------- account table ---------- */
+#acctcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 14px;box-shadow:var(--shadow)}
+.afilter{display:flex;gap:6px;margin:2px 0 8px;align-items:center}
+#view-quota .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:.86rem;cursor:pointer;transition:border-color .12s,background .12s}
+#view-quota .chip:hover{background:var(--hover);border-color:var(--line2)}
+#view-quota .chip.on{border-color:var(--accent);color:var(--accent);font-weight:600;background:var(--accent-soft)}
+table.accts{width:100%;border-collapse:collapse;font-size:.92rem;table-layout:auto}
+table.accts th{text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);padding:6px 8px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none;white-space:nowrap}
+table.accts th:hover{color:var(--fg)}
+table.accts td{padding:8px;border-bottom:1px solid var(--line);vertical-align:middle}
+table.accts tr:last-child td{border-bottom:none}
+table.accts tr.sel td{background:var(--hl)}
+table.accts tbody tr{cursor:pointer}
+table.accts tbody tr:hover td{background:color-mix(in srgb,var(--hl) 55%,transparent)}
+.adot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px}
+.acct-line2{font-size:.76rem;color:var(--mut);margin-top:1px}
+.qbig{white-space:nowrap;font-variant-numeric:tabular-nums}
+.rst{color:var(--mut);font-size:.78rem}
+.st-ok{color:var(--ok)}.st-approaching{color:var(--warn)}.st-exhausted,.st-api-error,.st-unknown{color:var(--bad)}
+.stfix{cursor:pointer;text-decoration:underline dotted}
+.batt{display:inline-block;vertical-align:-2px}
+.flagchip{font-size:.72rem;color:var(--warn)}
+
+/* ---------- collapsible group cards (burn / homes) ---------- */
+.grp{margin:14px 0 0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--card)}
+.grp>summary{cursor:pointer;padding:11px 16px;display:flex;align-items:center;gap:10px;font-weight:600;list-style:none}
+.grp>summary::-webkit-details-marker{display:none}
+.grp>summary::before{content:"▸";color:var(--mut);font-size:.8rem;transition:.15s}
+.grp[open]>summary::before{transform:rotate(90deg)}
+.gmeta{color:var(--mut);font-size:.8rem;font-weight:400;white-space:nowrap}
+#burncard>summary .gmeta{margin-left:auto}
+#homescard>summary .gmeta{margin-left:auto}
+.burnrow{display:flex;gap:14px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:baseline;flex-wrap:wrap;font-size:.86rem}
+.burnrow:last-of-type{border-bottom:none}
+.burnt{color:var(--mut);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:92px}
+.burnchips{display:flex;gap:10px;flex-wrap:wrap}
+.burnchip{white-space:nowrap;font-variant-numeric:tabular-nums;font-weight:600}
+.burnsesss{flex:1;min-width:240px;display:flex;gap:4px 14px;flex-wrap:wrap}
+.burnsess{cursor:pointer;color:var(--accent);text-decoration:underline dotted;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.burnsess:hover{text-decoration:underline solid}
+.burnnote{padding:9px 16px;font-size:.78rem;color:var(--mut);border-top:1px solid var(--line)}
+
+/* ---------- credential homes ---------- */
+.hbadge{font-size:.66rem;font-weight:700;text-transform:uppercase;padding:3px 7px;border-radius:5px;text-align:center}
+.homerow{display:flex;gap:12px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap;font-size:.86rem}
+.homerow:last-of-type{border-bottom:none}
+.homerow .hn{font:600 .86rem ui-monospace,Menlo,monospace;white-space:nowrap}
+.homerow .hn .rst{font-weight:400}
+.homerow .hchips{display:flex;gap:10px;flex-wrap:wrap;flex:1;min-width:220px;align-items:baseline}
+.homerow .hacts{display:flex;gap:6px}
+.homerow .hacts button{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:4px 10px;font-size:.78rem;cursor:pointer}
+.homerow .hacts button:hover{border-color:var(--accent);color:var(--accent)}
+.homefix{flex-basis:100%;font-size:.78rem;color:var(--mut);white-space:pre-wrap;word-break:break-word}
+#homeform{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap;align-items:center}
+#homeform input{flex:1;min-width:220px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font-size:.82rem}
+#homeform select{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 10px;font-size:.82rem;cursor:pointer}
+#homeform .cmdbox{flex-basis:100%;background:var(--fg);color:var(--bg);border-radius:8px;padding:9px 12px;font:.76rem ui-monospace,Menlo,monospace;word-break:break-all;cursor:pointer}
+#homeform .cmdbox .hintline{font:italic .7rem -apple-system,sans-serif;opacity:.7;margin-top:4px}
+.homehdr{padding:8px 16px;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line)}
+.dupwarn{color:var(--bad);font-size:.8rem;margin:6px 0}
+
+/* ---------- toast + theme toggle ---------- */
+.hint{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:9px;font:.82rem ui-monospace,Menlo,monospace;opacity:0;transition:.2s;pointer-events:none;z-index:70;max-width:92vw;word-break:break-all}
+.hint.show{opacity:.96}
+#themetog{position:fixed;bottom:16px;right:16px;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:20px;padding:8px 14px;font-size:.82rem;cursor:pointer;z-index:20}
 </style>
 
+<nav id="nav">
+  <span class="brand"><span class="mark">⎈</span>helm</span>
+  <button class="navtab on" data-v="helm">helm</button>
+  <button class="navtab" data-v="quota">quota</button>
+  <button class="navtab" data-v="sessions">sessions</button>
+  <button class="navtab" data-v="configs">configs</button>
+  <div class="stats" id="navstats"></div>
+</nav>
+
 <div class="wrap">
+
+<div class="view on" id="view-helm">
   <header>
-    <div class="brand">
+    <div class="brandrow">
       <span class="mark">⎈</span><h1>helm</h1>
       <div class="stats" id="stats"></div>
     </div>
@@ -154,10 +271,60 @@ footer .fmark{color:color-mix(in srgb,var(--accent) 70%,var(--sub))}
   <footer id="foot"></footer>
 </div>
 
+<div class="view" id="view-quota">
+  <div id="attn"></div>
+  <div id="chartcard">
+    <div class="chead"><b>quota</b>
+      <span id="qtabs"><span class="qtab on" data-w="7d">weekly</span><span class="qtab" data-w="5h">session</span></span>
+      <span id="qsub">remaining % · history + projection to reset</span>
+    </div>
+    <svg id="chart" viewBox="0 0 1400 430" preserveAspectRatio="none"></svg>
+    <div id="tip"></div>
+    <div id="zoomhint">scroll = zoom · drag = pan · double-click = reset</div>
+  </div>
+  <details class="grp" id="burncard">
+    <summary>burn ↔ sessions<span class="gmeta">what was active when quota burned — last 48h, temporal join</span></summary>
+    <div class="rows" id="burnrows"></div>
+  </details>
+  <div id="acctcard">
+    <div class="afilter">
+      <span class="chip on" data-f="all">all</span>
+      <span class="chip" data-f="anthropic">claude</span>
+      <span class="chip" data-f="codex">codex</span>
+      <span style="margin-left:auto;font-size:.78rem;color:var(--mut)">click a row to select it for resumes · hover a row to spotlight its line · click a state to copy its fix</span>
+    </div>
+    <table class="accts"><thead><tr id="athead"></tr></thead><tbody id="atbody"></tbody></table>
+  </div>
+  <details class="grp" id="homescard">
+    <summary>credential homes<span class="gmeta">one home = one login — helm prepares, YOU run every login</span></summary>
+    <div id="homeform">
+      <input id="hEmail" placeholder="new home: account email (david@x.com → home david-x-com)" autocomplete="off">
+      <select id="hProv"><option value="claude">claude</option><option value="codex">codex</option></select>
+      <button class="chip" id="hCreate">new home</button>
+      <div id="hCmd" style="flex-basis:100%"></div>
+    </div>
+    <div id="homerows"></div>
+  </details>
+</div>
+
+<div class="view" id="view-sessions">
+  <div class="placeholder"><div class="glyph">⎈</div>the sessions view (search · resume · transcripts) lands in slice B —<br>meanwhile the helm tab’s sessions strip has your newest sessions.</div>
+</div>
+
+<div class="view" id="view-configs">
+  <div class="placeholder"><div class="glyph">⎈</div>the configs view (cwd tree · cascade · editors) lands in slice C —<br>meanwhile <code>/api/configs</code> and <code>helm configs</code> answer from the CLI side.</div>
+</div>
+
+</div>
+
+<button id="themetog">◐ theme</button>
+<div class="hint" id="hint"></div>
+
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
-const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const KNOWN_H = ["claude", "codex", "opencode"];
 const STORE_ORDER = ["premise", "prior", "lexicon", "heuristic", "reference", "episodic"];
 
@@ -178,6 +345,34 @@ async function j(url) {
   if (!r.ok) throw new Error(url + " -> " + r.status);
   return r.json();
 }
+
+function toast(m, ms) {
+  const h = $("#hint");
+  h.textContent = m;
+  h.classList.add("show");
+  clearTimeout(h._t);
+  h._t = setTimeout(() => h.classList.remove("show"), ms || 2600);
+}
+
+/* ---------- nav (sesh navtab pattern; helm is the default view) ---------- */
+const VIEWS = ["helm", "quota", "sessions", "configs"];
+function showView(v) {
+  $$(".navtab").forEach(t => t.classList.toggle("on", t.dataset.v === v));
+  $$(".view").forEach(p => p.classList.toggle("on", p.id === "view-" + v));
+  localStorage.setItem("helm.view", v);
+  if (location.hash !== "#" + v) history.replaceState(null, "", "#" + v);
+  if (v === "quota") initQuota();
+}
+$$(".navtab").forEach(t => t.onclick = () => showView(t.dataset.v));
+window.addEventListener("hashchange", () => {
+  const v = location.hash.slice(1);
+  if (VIEWS.includes(v)) showView(v);
+});
+$("#themetog").onclick = () => {
+  const r = document.documentElement;
+  const cur = r.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme:dark)").matches ? "dark" : "light");
+  r.setAttribute("data-theme", cur === "dark" ? "light" : "dark");
+};
 
 /* ---------- greeting ---------- */
 function greet(w) {
@@ -375,7 +570,10 @@ document.addEventListener("click", ev => {
   if (c) c.classList.toggle("open");
 });
 document.addEventListener("keydown", ev => {
-  if (ev.key === "/" && document.activeElement !== $("#q")) { ev.preventDefault(); $("#q").focus(); }
+  if (ev.key === "/" && document.activeElement !== $("#q") && $("#view-helm").classList.contains("on")) {
+    ev.preventDefault();
+    $("#q").focus();
+  }
   if (ev.key === "Escape") document.querySelectorAll(".card.open").forEach(c => c.classList.remove("open"));
 });
 $("#q").addEventListener("input", render);
@@ -412,4 +610,529 @@ async function load() {
   j("/api/skills").then(skillsSec).catch(() => {});
 }
 load();
+
+/* ================= quota view (ported from sesh ui.html, behavior-preserving) =================
+   Adaptations for helm slice A (named, not hidden):
+   - no sessions tab yet: chart activity-bars and burn session chips can't open a
+     transcript drawer; burn chips copy the resume command instead, day-bars toast.
+   - account row-select keeps SEL state (feeds the slice-B resume picker); there is
+     no resume-as strip or team tray until slice B lands.
+   - the activity histogram joins against /api/sessions (newest 200 work sessions),
+     not the full catalog. */
+let CREDS = [], HIST = [], ALLOC = {}, SDATA = [], SEL = {anthropic: null, codex: null};
+let QWIN = "7d", AFILTER = "all", EMPH = null, QINIT = false;
+const short = (n, l = 26) => n.length > l ? n.slice(0, l - 1) + "…" : n;
+function fmtIn(ms) {
+  const s = (ms - Date.now()) / 1e3;
+  if (s <= 0) return "now";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h > 48 ? Math.round(h / 24) + "d" : h > 0 ? h + "h" + String(m).padStart(2, "0") + "m" : m + "m";
+}
+const PALETTE = ["#c9772e", "#3f7d54", "#5470c6", "#b4442e", "#8a5fc0", "#2f8f8f", "#b58a2e", "#c05f8c", "#6b8e23", "#7a5c3e"];
+const ROSTER = () => new Set(CREDS.map(c => c.name));
+const acol = a => { const i = CREDS.findIndex(c => c.name === a); return i >= 0 ? PALETTE[i % PALETTE.length] : "#999"; };
+
+function initQuota() {
+  if (QINIT) return;
+  QINIT = true;
+  loadCreds().then(() => { loadHist(); loadAlloc(); });
+  loadSData();
+  loadStatus();
+  setInterval(() => { loadCreds(true).then(() => { loadHist(); loadAlloc(); }); }, 120e3);
+}
+
+/* ================= data ================= */
+async function loadCreds(refresh) {
+  let d;
+  try { d = await j("/api/creds" + (refresh ? "?refresh=1" : "")); } catch (e) { d = []; }
+  CREDS = Array.isArray(d) ? d : [];
+  for (const p of ["anthropic", "codex"]) {
+    if (!SEL[p] || !CREDS.find(c => c.name === SEL[p])) {
+      const best = CREDS.filter(c => c.provider === p && c.state === "ok").sort((a, b) => (b.headroom ?? 0) - (a.headroom ?? 0))[0];
+      SEL[p] = best ? best.name : null;
+    }
+  }
+  $("#navstats").innerHTML = CREDS.length ? "<span><b>" + CREDS.length + "</b> accounts</span>" : "";
+  renderAttn(); renderAccts();
+}
+async function loadHist() {
+  let d;
+  try { d = await j("/api/history?hours=168"); } catch (e) { d = []; }
+  HIST = Array.isArray(d) ? d : [];
+  const labels = gaugeLabels();
+  if (labels.length) {
+    if (!labels.includes(QWIN)) QWIN = labels[0];
+    $("#qtabs").innerHTML = labels.map(l => `<span class="qtab ${l === QWIN ? "on" : ""}" data-w="${esc(l)}">${esc(LBL_NICE[l] || l)}</span>`).join("");
+    $$(".qtab").forEach(tb => tb.onclick = () => { QWIN = tb.dataset.w; $$(".qtab").forEach(x => x.classList.toggle("on", x === tb)); renderChart(); });
+  }
+  let newest = 0;
+  for (const r of HIST) { const t = Date.parse(r.probed_at); if (t > newest) newest = t; }
+  if (newest) {
+    const m = Math.round((Date.now() - newest) / 60e3);
+    $("#qsub").textContent = `remaining % · history + projection to reset · server-truth ${m < 1 ? "just now" : m + "m ago"}`;
+  }
+  renderChart(); renderAccts(); renderAttn();
+}
+async function loadAlloc() {
+  try {
+    const d = await j("/api/allocate");
+    ALLOC = (d && typeof d === "object" && !d.unavailable) ? d : {};
+  } catch (e) { ALLOC = {}; }
+  renderAttn();
+}
+async function loadSData() {
+  try {
+    const d = await j("/api/sessions");
+    SDATA = (d && Array.isArray(d.sessions)) ? d.sessions : [];
+  } catch (e) { SDATA = []; }
+  if (HIST.length) renderChart();
+}
+async function loadStatus() {
+  try {
+    const s = await j("/api/status");
+    if (s && s.provider && s.provider.degraded)
+      $("#qsub").textContent = "no quota provider reporting on this machine — resume still works under the default account";
+  } catch (e) {}
+}
+
+/* ================= attention ================= */
+function strandAtReset(acct) {
+  const S = seriesFor("7d")[acct];
+  if (!S || !S.reset || S.reset < Date.now()) return null;
+  const now = Date.now(), pts = S.pts, fit = pts.filter(p => p[0] > now - 6 * 3600e3);
+  if (fit.length < 3) return pts.length ? Math.round(pts[pts.length - 1][1]) : null;
+  const mx = fit.reduce((a, p) => a + p[0], 0) / fit.length, my = fit.reduce((a, p) => a + p[1], 0) / fit.length;
+  const den = fit.reduce((a, p) => a + (p[0] - mx) ** 2, 0);
+  let slope = den ? fit.reduce((a, p) => a + (p[0] - mx) * (p[1] - my), 0) / den : 0;
+  if (slope > 0) slope = 0;
+  return Math.max(0, Math.round(pts[pts.length - 1][1] + slope * (S.reset - now)));
+}
+function renderAttn() {
+  const bits = [];
+  // REAL quota problems only: an account with auth that is exhausted or erroring.
+  const bad = CREDS.filter(c => c.state === "exhausted" || c.state === "api-error" || c.state === "approaching");
+  if (bad.length) bits.push(`<span class="attn bad" title="${esc(bad.map(c => c.name + ": " + c.state).join(" · "))}">⚠ ${bad.length} need attention: ${esc(bad.map(c => short(c.name, 18)).join(", "))}</span>`);
+  // structural (no auth / no usage endpoint) — a homes concern, kept quiet + muted
+  const nore = CREDS.filter(c => c.state === "unknown");
+  if (nore.length) bits.push(`<span class="attn" style="color:var(--sub);border-style:dashed" title="${esc(nore.map(c => c.name).join(", "))} — no auth or no usage endpoint; manage on the homes card, not a quota alert">${nore.length} home${nore.length > 1 ? "s" : ""} not reporting</span>`);
+  const hyg = CREDS.filter(c => c.name_lies || c.duplicate_homes);
+  if (hyg.length) bits.push(`<span class="attn warn" title="${esc(hyg.map(c => c.name + (c.name_lies ? " dir-name-lies" : "") + (c.duplicate_homes ? " " + c.duplicate_homes.length + "-homes" : "")).join(" · "))}">⚠ ${hyg.length} home issue${hyg.length > 1 ? "s" : ""} — hygiene plan has the marks</span>`);
+  const waste = CREDS.filter(c => c.windows_verdict && c.windows_verdict !== "ok" && c.windows_verdict !== "no-weekly");
+  if (waste.length) {
+    const det = waste.map(c => {
+      const st = HIST.length ? strandAtReset(c.name) : null;
+      return short(c.name, 18) + (st != null ? ` strands ~${st}%` : "");
+    }).join(", ");
+    bits.push(`<span class="attn warn" title="projected remaining at the weekly reset = capacity that expires unused">${waste.length} window${waste.length > 1 ? "s" : ""} at waste-risk — ${esc(det)}</span>`);
+  }
+  const next = Object.entries(ALLOC).filter(([m, v]) => v && v.pick).map(([m, v]) => `${esc(m)}: <b title="headroom ${v.pick.headroom_pct}%">${esc(short(v.pick.account, 20))}</b>`);
+  if (next.length) bits.push(`<span class="attn next">next → ${next.join(" · ")}</span>`);
+  $("#attn").innerHTML = bits.join("");
+}
+
+/* ================= chart ================= */
+const LBL_NICE = {"5h": "session", "7d": "weekly"};
+function gaugeLabels() {
+  const seen = new Set(), roster = ROSTER();
+  for (const r of HIST) { if (!roster.has(r.account)) continue; for (const g of r.gauges || []) if (g.utilization != null) seen.add(g.label); }
+  const pref = ["5h", "7d"], rest = [...seen].filter(l => !pref.includes(l)).sort();
+  return pref.filter(l => seen.has(l)).concat(rest);
+}
+function seriesFor(win) {
+  const by = {}, roster = ROSTER();
+  for (const r of HIST) {
+    if (!roster.has(r.account)) continue;
+    const g = (r.gauges || []).find(g => g.label === win);
+    if (!g || g.utilization == null) continue;
+    const t = Date.parse(r.probed_at);
+    if (!t) continue;
+    (by[r.account] = by[r.account] || {provider: r.provider, pts: [], reset: null}).pts.push([t, (1 - Math.min(1, g.utilization)) * 100]);
+    if (g.reset) by[r.account].reset = g.reset * 1000;
+  }
+  for (const k in by) by[k].pts.sort((a, b) => a[0] - b[0]);
+  return by;
+}
+let ZOOMW = null; // {t0,t1} when the user zoomed/panned; null = auto window
+function updateZoomHint() {
+  const z = $("#zoomhint");
+  if (!z) return;
+  z.textContent = ZOOMW ? "zoomed — double-click to reset · scroll = zoom · drag = pan" : "scroll = zoom · drag = pan · double-click = reset";
+  z.style.color = ZOOMW ? "var(--accent)" : "var(--sub)";
+}
+function renderChart() {
+  const svgEl = $("#chart");
+  if (!HIST.length) { svgEl.innerHTML = ""; return; }
+  const win = QWIN, S = seriesFor(win), now = Date.now();
+  const histSpan = win === "5h" ? 24 * 3600e3 : 7 * 24 * 3600e3, projSpan = win === "5h" ? 6 * 3600e3 : 20 * 3600e3;
+  let t0 = now - histSpan, t1 = now + projSpan;
+  if (ZOOMW) { t0 = ZOOMW.t0; t1 = ZOOMW.t1; }
+  const W = 1400, H = 430, PL = 34, PR = 210, PT = 14, PB = 26, IW = W - PL - PR, IH = H - PT - PB;
+  const x = t => PL + ((t - t0) / (t1 - t0)) * IW, y = p => PT + (1 - p / 100) * IH;
+  let s = `<line x1="${PL}" y1="${y(0)}" x2="${PL + IW}" y2="${y(0)}" stroke="var(--line)"/>`
+    + `<line x1="${PL}" y1="${y(50)}" x2="${PL + IW}" y2="${y(50)}" stroke="var(--line)" stroke-dasharray="2,5"/>`
+    + `<line x1="${PL}" y1="${y(100)}" x2="${PL + IW}" y2="${y(100)}" stroke="var(--line)"/>`
+    + `<text x="2" y="${y(100) + 4}" font-size="12" fill="var(--mut)">100</text>`
+    + `<text x="2" y="${y(50) + 4}" font-size="12" fill="var(--mut)">50</text>`
+    + `<text x="2" y="${y(0) + 4}" font-size="12" fill="var(--mut)">0</text>`
+    + (now >= t0 && now <= t1 ? `<line x1="${x(now)}" y1="${PT}" x2="${x(now)}" y2="${PT + IH}" stroke="var(--mut)" stroke-width="1"/>`
+    + `<text x="${x(now)}" y="${H - 8}" font-size="11" fill="var(--mut)" text-anchor="middle">now</text>`
+    + `<rect x="${x(now)}" y="${PT}" width="${Math.max(0, PL + IW - x(now))}" height="${IH}" fill="var(--mut)" opacity="0.05"/>` : "");
+  const span = t1 - t0;
+  const tickStep = span <= 10 * 3600e3 ? 3600e3 : span <= 36 * 3600e3 ? 3 * 3600e3 : span <= 5 * 24 * 3600e3 ? 12 * 3600e3 : 24 * 3600e3;
+  for (let t = Math.ceil(t0 / tickStep) * tickStep; t < Math.min(now, t1); t += tickStep) {
+    if (now >= t0 && now <= t1 && Math.abs(x(now) - x(t)) < 30) continue;
+    const d = new Date(t), lbl = tickStep < 24 * 3600e3 ? (d.getHours() === 0 ? (d.getMonth() + 1) + "/" + d.getDate() : d.getHours() + ":00") : (d.getMonth() + 1) + "/" + d.getDate();
+    s += `<line x1="${x(t)}" y1="${PT}" x2="${x(t)}" y2="${PT + IH}" stroke="var(--line)" stroke-dasharray="1,6"/>`
+      + `<text x="${x(t)}" y="${H - 8}" font-size="11" fill="var(--mut)" text-anchor="middle">${lbl}</text>`;
+  }
+  if (SDATA.length) {
+    const bh = 3600e3, nb = Math.ceil((now - t0) / bh), buckets = new Array(nb).fill(0);
+    for (const r of SDATA) { const mt = (r.mt || 0) * 1000; if (mt >= t0 && mt < now) buckets[Math.floor((mt - t0) / bh)]++; }
+    const bmax = Math.max(1, ...buckets);
+    for (let i = 0; i < nb; i++) {
+      if (!buckets[i]) continue;
+      const bx = x(t0 + i * bh), bw = Math.max(1, IW / nb - 0.5), h2 = 2 + (buckets[i] / bmax) * 15;
+      const dd = new Date(t0 + i * bh); // LOCAL date — must match the catalog's local "updated" day
+      const day = dd.getFullYear() + "-" + String(dd.getMonth() + 1).padStart(2, "0") + "-" + String(dd.getDate()).padStart(2, "0");
+      s += `<rect class="actb" data-day="${day}" x="${bx.toFixed(1)}" y="${(PT + IH - h2).toFixed(1)}" width="${bw.toFixed(1)}" height="${h2.toFixed(1)}" fill="var(--accent)" opacity="0.35" style="cursor:pointer"><title>${buckets[i]} session${buckets[i] > 1 ? "s" : ""} last-active here</title></rect>`;
+    }
+  }
+  const labels = [];
+  for (const [acct, S1] of Object.entries(S)) {
+    if (AFILTER !== "all" && S1.provider !== AFILTER) continue;
+    const col = acol(acct), pts = S1.pts.filter(p => p[0] >= t0 && p[0] <= t1);
+    if (pts.length < 2) continue;
+    const dim = EMPH && EMPH !== acct, wgt = EMPH === acct ? 3.4 : 2, op = dim ? 0.18 : 1;
+    s += `<polyline data-a="${esc(acct)}" fill="none" stroke="${col}" stroke-width="${wgt}" opacity="${op}" points="${pts.map(p => x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1)).join(" ")}"/>`;
+    const [lt, lv] = pts[pts.length - 1];
+    s += `<circle cx="${x(lt)}" cy="${y(lv)}" r="3.5" fill="${col}" opacity="${op}"/>`;
+    const fitSpan = win === "5h" ? 90 * 60e3 : 6 * 3600e3, fit = pts.filter(p => p[0] > now - fitSpan);
+    let slope = 0;
+    if (fit.length >= 3) {
+      const mx = fit.reduce((a, p) => a + p[0], 0) / fit.length, my = fit.reduce((a, p) => a + p[1], 0) / fit.length;
+      const den = fit.reduce((a, p) => a + (p[0] - mx) ** 2, 0);
+      slope = den ? fit.reduce((a, p) => a + (p[0] - mx) * (p[1] - my), 0) / den : 0;
+      if (slope > 0) slope = 0;
+    }
+    if (now >= t0 && now < t1) {
+      const rt = S1.reset && S1.reset > now && S1.reset < t1 ? S1.reset : t1;
+      const pv = Math.max(0, lv + slope * (rt - now));
+      s += `<line x1="${x(now)}" y1="${y(lv)}" x2="${x(rt)}" y2="${y(pv)}" stroke="${col}" stroke-width="1.4" stroke-dasharray="5,5" opacity="${dim ? 0.12 : 0.7}"/>`;
+      if (S1.reset && S1.reset > now && S1.reset < t1) {
+        s += `<line x1="${x(S1.reset)}" y1="${y(pv)}" x2="${x(S1.reset)}" y2="${y(100)}" stroke="${col}" stroke-width="1" stroke-dasharray="1,3" opacity="${dim ? 0.12 : 0.55}"/>`
+          + `<circle cx="${x(S1.reset)}" cy="${y(100)}" r="2.8" fill="none" stroke="${col}" opacity="${op}"/>`;
+      }
+    }
+    labels.push({acct, col, v: lv, yy: y(lv), op});
+  }
+  labels.sort((a, b) => a.yy - b.yy);
+  for (let i = 1; i < labels.length; i++) if (labels[i].yy - labels[i - 1].yy < 16) labels[i].yy = labels[i - 1].yy + 16;
+  for (const l of labels)
+    s += `<text data-a="${esc(l.acct)}" x="${PL + IW + 8}" y="${l.yy + 4}" font-size="13" fill="${l.col}" opacity="${l.op}" style="cursor:pointer">${esc(short(l.acct, 24))} ${l.v.toFixed(0)}%</text>`;
+  svgEl.innerHTML = s;
+  svgEl._geo = {t0, t1, x, y, S, PL, IW, PT, IH, now};
+}
+$("#chart").addEventListener("mousemove", e => {
+  const svgEl = $("#chart"), g = svgEl._geo;
+  if (!g) return;
+  const r = svgEl.getBoundingClientRect();
+  const t = g.t0 + ((e.clientX - r.left) / r.width) * (g.t1 - g.t0);
+  const rows = [];
+  for (const [acct, S1] of Object.entries(g.S)) {
+    if (AFILTER !== "all" && S1.provider !== AFILTER) continue;
+    let best = null;
+    for (const p of S1.pts) if (!best || Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
+    if (best && Math.abs(best[0] - t) < 3 * 3600e3) rows.push([acct, best[1]]);
+  }
+  rows.sort((a, b) => b[1] - a[1]);
+  const tip = $("#tip");
+  if (!rows.length) { tip.style.display = "none"; return; }
+  tip.innerHTML = `<div class="tt">${new Date(t).toLocaleString([], {month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"})}</div>`
+    + rows.slice(0, 10).map(([a, v]) => `<div><span class="adot" style="background:${acol(a)}"></span>${esc(short(a, 22))} ${v.toFixed(0)}%</div>`).join("");
+  tip.style.display = "block";
+  const bx = $("#chartcard").getBoundingClientRect();
+  tip.style.left = Math.min(e.clientX - bx.left + 16, bx.width - 200) + "px";
+  tip.style.top = (e.clientY - bx.top + 10) + "px";
+});
+$("#chart").addEventListener("mouseleave", () => { $("#tip").style.display = "none"; });
+/* interactive time axis: scroll = zoom, drag = pan, double-click = reset */
+let PANST = null, PANMOVED = false;
+$("#chart").addEventListener("wheel", e => {
+  const g = $("#chart")._geo;
+  if (!g) return;
+  e.preventDefault();
+  const r = $("#chart").getBoundingClientRect();
+  const t = g.t0 + ((e.clientX - r.left) / r.width) * (g.t1 - g.t0);
+  const f = e.deltaY > 0 ? 1.2 : 1 / 1.2;
+  const nt0 = t - (t - g.t0) * f, nt1 = t + (g.t1 - t) * f, span = nt1 - nt0;
+  if (span < 20 * 60e3) return;
+  ZOOMW = span > 45 * 24 * 3600e3 ? null : {t0: nt0, t1: nt1};
+  renderChart(); updateZoomHint();
+}, {passive: false});
+$("#chart").addEventListener("pointerdown", e => { const g = $("#chart")._geo; if (!g) return; PANST = {x: e.clientX, t0: g.t0, t1: g.t1}; PANMOVED = false; });
+window.addEventListener("pointermove", e => {
+  if (!PANST) return;
+  const dx = e.clientX - PANST.x;
+  if (Math.abs(dx) > 5) PANMOVED = true;
+  if (!PANMOVED) return;
+  const r = $("#chart").getBoundingClientRect();
+  const dt = -(dx / r.width) * (PANST.t1 - PANST.t0);
+  ZOOMW = {t0: PANST.t0 + dt, t1: PANST.t1 + dt};
+  renderChart(); updateZoomHint();
+});
+window.addEventListener("pointerup", () => { PANST = null; setTimeout(() => PANMOVED = false, 60); });
+$("#chart").addEventListener("dblclick", () => { ZOOMW = null; renderChart(); updateZoomHint(); });
+$("#chart").addEventListener("click", e => {
+  if (PANMOVED) return; // a pan is not a click
+  const d = e.target.dataset || {};
+  if (d.day) { toast("sessions last active " + d.day + " — the sessions tab lands in slice B"); return; }
+  if (d.a) { EMPH = EMPH === d.a ? null : d.a; renderChart(); renderAccts(); }
+});
+updateZoomHint();
+
+/* ================= account table ================= */
+function battery(pct, sel, scale = 1) {
+  const col = pct == null ? "var(--mut)" : pct >= 50 ? "var(--ok)" : pct >= 20 ? "var(--warn)" : "var(--bad)";
+  const w = pct == null ? 0 : Math.max(1, (Math.min(100, pct) / 100) * 16);
+  const sw = 28 * scale, sh = 15 * scale;
+  return `<svg class="batt" width="${sw}" height="${sh}" viewBox="0 0 24 13">
+    <rect x="1" y="1.5" width="20" height="10" rx="2.5" fill="none" stroke="${sel ? "var(--accent)" : "var(--mut)"}" stroke-width="${sel ? 2 : 1.1}"/>
+    <rect x="21.6" y="4.5" width="2" height="4" rx="1" fill="${sel ? "var(--accent)" : "var(--mut)"}"/>
+    <rect x="3" y="3.5" width="${w}" height="6" rx="1.2" fill="${col}"/></svg>`;
+}
+const LOGIN_CMDS = {anthropic: h => `CLAUDE_CONFIG_DIR=${h} claude /login`, codex: h => `CODEX_HOME=${h} codex login --device-auth`};
+function latestGauges(acct) {
+  const out = {}, when = {};
+  for (const r of HIST) {
+    if (r.account !== acct) continue;
+    for (const g of r.gauges || []) {
+      if (g.utilization == null) continue;
+      if (!(g.label in when) || r.probed_at > when[g.label]) {
+        when[g.label] = r.probed_at;
+        out[g.label] = {rem: (1 - Math.min(1, g.utilization)) * 100, reset: g.reset ? g.reset * 1000 : null};
+      }
+    }
+  }
+  return out;
+}
+function qcell(g, fallbackReset) {
+  if (!g) return `<td class="rst">—</td>`;
+  const pct = g.rem;
+  let reset = g.reset && g.reset > Date.now() ? g.reset : (fallbackReset && fallbackReset > Date.now() ? fallbackReset : null);
+  const rl = reset ? ` <span class="rst" title="resets ${new Date(reset).toLocaleString([], {weekday: "short", hour: "numeric", minute: "2-digit"})}">↻${fmtIn(reset)}</span>` : "";
+  return `<td class="qbig">${battery(pct, false)} <b>${pct.toFixed(0)}%</b>${rl}</td>`;
+}
+let SORTA = {key: null, dir: 1};
+function _sortVal(c, key) {
+  const G = latestGauges(c.name);
+  switch (key) {
+    case "account": return c.name.toLowerCase();
+    case "win": return c.windows_left ?? -1;
+    default: return G[key] ? G[key].rem : -1;
+  }
+}
+function renderAccts() {
+  const tb = $("#atbody");
+  if (!CREDS.length) { tb.innerHTML = ""; return; }
+  const labels = gaugeLabels(), extras = labels.filter(l => l !== "5h" && l !== "7d");
+  const arrow = k => SORTA.key === k ? (SORTA.dir > 0 ? " ▲" : " ▼") : "";
+  $("#athead").innerHTML = `<th></th><th data-s="account">account${arrow("account")}</th>`
+    + `<th data-s="5h">session (5h)${arrow("5h")}</th><th data-s="7d">weekly (7d)${arrow("7d")}</th>`
+    + extras.map(l => `<th data-s="${esc(l)}">${esc(LBL_NICE[l] || l)}${arrow(l)}</th>`).join("")
+    + `<th data-s="win">win${arrow("win")}</th>`;
+  $$("#athead th[data-s]").forEach(th => th.onclick = () => {
+    const k = th.dataset.s;
+    SORTA = SORTA.key === k ? {key: k, dir: -SORTA.dir} : {key: k, dir: 1};
+    renderAccts();
+  });
+  // quota table = accounts with quota data; structural no-auth homes (unknown + no
+  // tier/headroom) live on the homes card, summarized as "N not reporting" in the strip.
+  const hasData = c => c.state !== "unknown" || c.tier || c.headroom != null || c.windows_left != null;
+  let show = CREDS.filter(c => (AFILTER === "all" || c.provider === AFILTER) && hasData(c));
+  if (SORTA.key) show = [...show].sort((a, b) => {
+    const va = _sortVal(a, SORTA.key), vb = _sortVal(b, SORTA.key);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * SORTA.dir;
+  });
+  tb.innerHTML = show.map(c => {
+    const G = latestGauges(c.name), sel = SEL[c.provider] === c.name;
+    const rems = labels.map(k => G[k] && G[k].rem).filter(v => v != null);
+    const binding = rems.length ? Math.min(...rems) : (c.headroom ?? null);
+    const flags = [c.name_lies ? "⚠name" : "", c.duplicate_homes ? `⚠${c.duplicate_homes.length}homes` : ""].filter(Boolean).join(" ");
+    const win = c.windows_left != null ? `${c.windows_left.toFixed(1)}/${c.windows_per_week.toFixed(1)}` : "—";
+    const wv = c.windows_verdict && c.windows_verdict !== "ok" ? ` <span class="flagchip">${esc(c.windows_verdict)}</span>` : "";
+    const fix = (LOGIN_CMDS[c.provider] || (x => ""))(c.home);
+    const st = c.state === "ok" ? `<span class="st-ok">ok</span>`
+      : `<span class="st-${c.state} stfix" data-fix="${esc(fix)}" title="click to copy the fix (you run the login yourself): ${esc(fix)}">${esc(c.state)} ⧉</span>`;
+    return `<tr data-a="${esc(c.name)}" data-p="${c.provider}" class="${sel ? "sel" : ""}" title="click to select for ${c.provider === "anthropic" ? "claude" : "codex"} resumes">
+      <td title="binding window: ${binding == null ? "?" : binding.toFixed(0) + "% left"}${sel ? " · SELECTED" : ""}">${battery(binding, sel, 1.15)}</td>
+      <td><span class="adot" style="background:${acol(c.name)}"></span><b>${esc(c.name)}</b>${c.active ? ' <span title="a live agent is on this account right now" style="color:var(--ok)">▶</span>' : ""}
+        <div class="acct-line2">${esc((c.tier || c.provider).replace("Max 20x", "Max 20×"))} · ${st} · home: ${esc(c.home_name || "?")}${flags ? ` · <span class="flagchip">${flags}</span>` : ""}</div></td>
+      ${qcell(G["5h"])}${qcell(G["7d"], c.resets_at_ms)}
+      ${extras.map(l => qcell(G[l])).join("")}
+      <td class="qbig">${win}${wv}</td></tr>`;
+  }).join("");
+  tb.querySelectorAll("tr").forEach(tr => {
+    tr.onclick = e => {
+      const fx = e.target.closest(".stfix");
+      if (fx) { navigator.clipboard.writeText(fx.dataset.fix); toast("copied login fix (run it yourself — logins are human-only): " + fx.dataset.fix, 5000); return; }
+      SEL[tr.dataset.p] = tr.dataset.a;
+      renderAccts();
+    };
+    tr.onmouseenter = () => { EMPH = tr.dataset.a; renderChart(); };
+    tr.onmouseleave = () => { if (EMPH === tr.dataset.a) { EMPH = null; renderChart(); } };
+  });
+}
+$$(".afilter .chip[data-f]").forEach(ch => ch.onclick = () => {
+  AFILTER = ch.dataset.f;
+  $$(".afilter .chip[data-f]").forEach(x => x.classList.toggle("on", x === ch));
+  renderAccts(); renderChart();
+});
+
+/* ================= burn ↔ sessions ================= */
+async function loadBurn() {
+  const host = $("#burnrows");
+  host.innerHTML = '<div class="empty">joining burn history to sessions…</div>';
+  let d;
+  try { d = await j("/api/burn?hours=48"); } catch (e) { host.innerHTML = '<div class="empty">✗ burn fetch failed</div>'; return; }
+  if (d.error || d.unavailable) { host.innerHTML = `<div class="empty">✗ ${esc(d.error || "burn unavailable on this machine")}</div>`; return; }
+  const roster = ROSTER(); // same convention as the chart: history accounts outside the roster don't render
+  const burnsOf = b => Object.entries(b.byAccount || {}).filter(([a]) => !CREDS.length || roster.has(a));
+  const rows = (d.buckets || []).filter(b => burnsOf(b).length).sort((a, b) => b.t - a.t).slice(0, 40);
+  if (!rows.length) { host.innerHTML = `<div class="empty">${esc(d.note || "no burn in the last 48h")}</div>`; return; }
+  host.innerHTML = rows.map(b => {
+    const when = new Date(b.t).toLocaleString([], {month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"});
+    const chips = burnsOf(b).sort((x, y) => y[1] - x[1]).map(([a, p]) =>
+      `<span class="burnchip" title="${esc(a)} burned ${p}% of its 5h window this hour"><span class="adot" style="background:${acol(a)}"></span>${esc(short(a, 18))} −${p}%</span>`).join("");
+    const sess = (b.sessions || []).map(s =>
+      `<span class="burnsess" data-open="${esc(s.i)}" title="${esc(s.c)} · ${s.h} — click to copy its resume command (transcript reader lands in slice B)">${esc(s.t || "(untitled)")}</span>`).join("");
+    return `<div class="burnrow"><span class="burnt">${when}</span><span class="burnchips">${chips}</span><span class="burnsesss">${sess || '<span class="rst">no sessions last-active this hour</span>'}</span></div>`;
+  }).join("") + (d.note ? `<div class="burnnote">${esc(d.note)}</div>` : "");
+  host.querySelectorAll(".burnsess").forEach(el => el.onclick = () => {
+    const r = SDATA.find(x => x.i === el.dataset.open);
+    if (r && r.cmd) {
+      navigator.clipboard && navigator.clipboard.writeText(r.cmd);
+      toast("resume command copied — the transcript reader lands with the sessions tab (slice B)");
+    } else {
+      toast("the transcript reader lands with the sessions tab (slice B)");
+    }
+  });
+}
+$("#burncard").addEventListener("toggle", () => { if ($("#burncard").open) loadBurn(); });
+
+/* ================= credential homes =================
+   helm prepares/verifies/moves home DIRECTORIES; every login is human-run and
+   credentials are never read, written, copied, or moved (one home = one login). */
+let HOMES = [];
+const homePost = async body => await (await fetch("/api/homes", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})).json();
+async function loadHomes() {
+  const host = $("#homerows");
+  host.innerHTML = '<div class="empty">scanning homes…</div>';
+  try { HOMES = await j("/api/homes"); } catch (e) { host.innerHTML = '<div class="empty">✗ homes fetch failed</div>'; return; }
+  if (!Array.isArray(HOMES)) { host.innerHTML = `<div class="empty">✗ ${esc(HOMES.error || "homes unavailable on this machine")}</div>`; HOMES = []; return; }
+  renderHomes();
+}
+function homeRowHTML(h) {
+  const chips = [];
+  chips.push(h.authed ? `<span class="st-ok" title="credential file present (contents never read)">authed</span>`
+    : `<span class="st-unknown" title="no credential file — this home does not appear in quota providers">no-auth</span>`);
+  chips.push(h.identity ? `<span title="identity metadata (claude: oauthAccount · codex: id_token email claim)">${esc(h.identity)}</span>`
+    : `<span class="rst">identity —</span>`);
+  if (h.canonical === false) chips.push(`<span class="flagchip" title="dir name should be the identity email folded to dashes — migrate fixes this">⚠ name-lies</span>`);
+  if (h.provider === "claude" && !h.archived) chips.push(h.projects_link_ok
+    ? `<span class="st-ok" title="projects → ~/.claude/projects (one shared session store)">link ✓</span>`
+    : `<span class="st-exhausted" title="projects must SYMLINK to ~/.claude/projects — a real dir silently strands sessions (verify shows the fix)">link ✗</span>`);
+  if (h.duplicate_identity && h.duplicate_identity.length)
+    chips.push(`<span class="flagchip" title="same identity also holds: ${esc(h.duplicate_identity.join(", "))} — one identity, one home; archive the loser (never copy creds)">⚠ dup-identity</span>`);
+  if (h.default) chips.push(`<span class="rst" title="the harness's fallback home — not archivable">default</span>`);
+  if (h.aliases && h.aliases.length) chips.push(`<span class="rst" title="alias symlinks pointing here">⤷ ${esc(h.aliases.join(", "))}</span>`);
+  const live = h.live_pids && h.live_pids.length ? ` <span title="live agent pid(s): ${h.live_pids.join(", ")}" style="color:var(--ok)">▶ ${h.live_pids.length}</span>` : "";
+  const nk = esc(h.name), pk = esc(h.provider || "?");
+  const acts = h.archived
+    ? `<button data-ha="unarchive" data-hn="${nk}">unarchive</button>`
+    : [`<button data-ha="verify" data-hn="${nk}" data-hp="${pk}" title="post-login check: identity, canonical name, projects link, duplicates">verify</button>`,
+       h.authed ? `<button data-ha="physics" data-hn="${nk}" data-hp="${pk}" title="what a seat on this home would load: MCPs, hooks, plugins, model">physics</button>` : "",
+       h.canonical === false ? `<button data-ha="migrate" data-hn="${nk}" data-hp="${pk}" title="rename to the canonical name; alias symlink left behind">migrate</button>` : "",
+       h.default ? "" : `<button data-ha="archive" data-hn="${nk}" data-hp="${pk}" title="${h.live_pids && h.live_pids.length ? "will REFUSE: live agents on this home" : "move into ~/.helm-home-archive (reversible)"}">archive</button>`
+      ].join("");
+  return `<div class="homerow"><span class="hbadge h-${pk === "claude" || pk === "codex" ? pk : "other"}">${pk.slice(0, 2)}</span>
+    <span class="hn">${nk}${live}${h.archived ? ` <span class="rst">→ ${esc(h.path)}</span>` : ""}</span>
+    <span class="hchips">${chips.join("")}</span>
+    <span class="hacts">${acts}</span><div class="homefix"></div></div>`;
+}
+function renderHomes() {
+  const active = HOMES.filter(h => !h.archived && !h.broken_alias), arch = HOMES.filter(h => h.archived), broken = HOMES.filter(h => h.broken_alias);
+  $("#homerows").innerHTML = active.map(homeRowHTML).join("")
+    + broken.map(h => `<div class="homerow"><span class="hn">${esc(h.name)}</span><span class="hchips"><span class="st-exhausted">broken alias → ${esc(h.target)}</span></span></div>`).join("")
+    + (arch.length ? `<div class="homehdr">archived (reversible — ~/.helm-home-archive)</div>` + arch.map(homeRowHTML).join("") : "")
+    || '<div class="empty">no credential homes found</div>';
+  $("#homerows").querySelectorAll("button[data-ha]").forEach(b => b.onclick = () => homeAction(b));
+}
+async function homeAction(btn) {
+  const act = btn.dataset.ha, name = btn.dataset.hn, provider = btn.dataset.hp;
+  const fixEl = btn.closest(".homerow").querySelector(".homefix");
+  if (act === "physics") {
+    if (fixEl.dataset.phys) { fixEl.innerHTML = ""; delete fixEl.dataset.phys; return; }
+    btn.disabled = true;
+    const r = await (await fetch(`/api/physics?home=${encodeURIComponent(name)}`)).json();
+    btn.disabled = false;
+    if (r.error) { fixEl.textContent = "✗ " + r.error; return; }
+    fixEl.dataset.phys = "1";
+    // shape-tolerant: mcpServers/hooks are lists; plugins may be {enabled:[...]}
+    const names = v => Array.isArray(v) ? v.map(x => (x && x.name) || x) : (v && Array.isArray(v.enabled)) ? v.enabled.map(x => String(x).split("@")[0]) : [];
+    const m = names(r.mcpServers), pl = names(r.plugins);
+    const hk = Array.isArray(r.hooks) ? r.hooks.reduce((n, h) => n + (h.count || 1), 0) : 0;
+    const hi = r.settingsHighlights || {};
+    fixEl.innerHTML = `<span class="rst">physics (home-scope): </span>`
+      + `MCPs: <b>${m.length ? esc(m.join(", ")) : "none"}</b> · hooks: <b>${hk}</b> · plugins: <b>${pl.length ? esc(pl.join(", ")) : "none"}</b>`
+      + (hi.model ? ` · model: <b>${esc(String(hi.model))}</b>` : "")
+      + (r.warnings && r.warnings.length ? `<br><span class="flagchip">⚠ ${esc(r.warnings.slice(0, 3).join(" · "))}</span>` : "");
+    return;
+  }
+  if (act === "verify") {
+    btn.disabled = true;
+    const r = await homePost({action: "verify", name, provider});
+    btn.disabled = false;
+    if (r.error) { fixEl.textContent = "✗ " + r.error; return; }
+    fixEl.innerHTML = `verdict: <b class="${r.verdict === "ok" ? "st-ok" : "st-approaching"}">${esc(r.verdict)}</b>`
+      + (r.fixes.length ? "<br>" + r.fixes.map(f => "fix: " + esc(f)).join("<br>") : " — all checks pass");
+    return;
+  }
+  if (act === "archive" && !confirm(`Archive home ${name} (${provider})?\n\nMoves the whole directory into ~/.helm-home-archive — reversible via unarchive. Refuses if a live agent is on it.`)) return;
+  if (act === "migrate" && !confirm(`Migrate home ${name} (${provider}) to its canonical name?\n\nRenames the directory and leaves an alias symlink at the old path. Refuses if a live agent is on it.`)) return;
+  btn.disabled = true;
+  const r = await homePost(act === "unarchive" ? {action: act, name} : {action: act, name, provider});
+  btn.disabled = false;
+  if (r.error) { fixEl ? fixEl.textContent = "✗ " + r.error : 0; toast("✗ " + r.error, 6000); return; }
+  toast("✓ " + (r.archived_to ? ("archived → " + r.archived_to) : r.restored_to ? ("restored → " + r.restored_to) : r.note || "done"), 6000);
+  loadHomes(); loadCreds(true);
+}
+$("#hCreate").onclick = async () => {
+  const email = $("#hEmail").value.trim(), provider = $("#hProv").value;
+  if (!email) { toast("enter the account email — the home name derives from it"); return; }
+  const r = await homePost({action: "create", provider, email});
+  const slot = $("#hCmd");
+  if (r.error) { slot.innerHTML = `<div class="dupwarn">✗ ${esc(r.error)}</div>`; return; }
+  slot.innerHTML = `<div class="cmdbox">${esc(r.login_cmd)}<div class="hintline">click to copy — run it in YOUR terminal, approve in the browser, then hit verify on the new row (logins are human-only)</div></div>`;
+  slot.querySelector(".cmdbox").onclick = async () => {
+    await navigator.clipboard.writeText(r.login_cmd);
+    toast("login command copied ✓ — run it yourself, then verify");
+  };
+  toast(`home ${r.existing ? "already prepared" : "created"}: ${r.home}`, 5000);
+  loadHomes();
+};
+$("#homescard").addEventListener("toggle", () => { if ($("#homescard").open) loadHomes(); });
+
+/* ================= boot ================= */
+{
+  const v = location.hash.slice(1);
+  if (VIEWS.includes(v)) showView(v);
+  else if (v === "homes") {
+    showView("quota");
+    $("#homescard").open = true;
+    setTimeout(() => $("#homescard").scrollIntoView({block: "start"}), 400);
+  } else {
+    const sv = localStorage.getItem("helm.view");
+    if (sv && VIEWS.includes(sv)) showView(sv);
+  }
+}
 </script>

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """helm web — the web surface. CLI-first + web parity: every view here is a
 projection of what the CLI already answers (registry / store / whoami /
-configs / skills). The ONLY mutations that land from the browser are the
-owner-requested skills verbs (toggle = reversible rename, delete = move to
-trash — archive-not-delete, nothing is ever destroyed), census-validated and
-localhost-only.
+configs / skills / homes / quota). The ONLY mutations that land from the
+browser are the owner-requested skills verbs (toggle = reversible rename,
+delete = move to trash — archive-not-delete, nothing is ever destroyed;
+census-validated) and the homes lifecycle verbs (prepare/verify/archive/
+unarchive/migrate — directory moves only, archive-not-delete, live-agent
+refusals; logins stay human-only). All of it localhost-only.
 
 Laws: localhost-only bind (127.0.0.1, default port 7433), Python stdlib only,
 one self-contained UI file (web_ui.html) served at /. The store and whoami
