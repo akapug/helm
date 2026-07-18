@@ -126,8 +126,12 @@ def attest_profile():
 
 
 def cmd_premise(args):
-    """premise <id> | <statement> [| keywords [| domain]] — store + attest."""
+    """premise <id> | <statement> [| keywords [| domain]] — store + attest.
+    premise --retry-queue — replay attestations queued while the substrate
+    was down (success annotates the entry + leaves the queue; failures stay)."""
     args = list(args)
+    if "--retry-queue" in args:
+        return _retry_queue()
     project = _pop_flag(args, "--project", True)
     no_attest = _pop_flag(args, "--no-attest", False)
     parts = [p.strip() for p in " ".join(args).split("|")]
@@ -174,6 +178,46 @@ def cmd_premise(args):
           % (info.get("turn_hash"), info.get("chain_index"), profile))
     print("  payload: " + payload)
     return 0
+
+
+def _retry_queue():
+    """Replay pending attestations. Each success annotates the stored entry
+    and drops the row; failures (and rows whose entry vanished) are kept."""
+    qp = _queue_path()
+    try:
+        with open(qp, encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+    except OSError:
+        rows = []
+    if not rows:
+        print("helm premise: attest queue empty.")
+        return 0
+    kept = []
+    done = 0
+    for rec in rows:
+        e = store._find(rec.get("id", ""), types=("prior",),
+                        project=rec.get("project"))
+        if not e:
+            rec["reason"] = "entry no longer in the store"
+            kept.append(rec)
+            continue
+        info, err = cell.send_self(rec["payload"], rec.get("profile") or attest_profile())
+        if err:
+            rec["reason"] = err
+            kept.append(rec)
+            continue
+        _annotate(e["path"], [("attest_payload", rec["payload"]),
+                              ("attest_ts", pk.now_ts()),
+                              ("attest_by", rec.get("profile") or attest_profile()),
+                              ("attest_turn", info.get("turn_hash", "")),
+                              ("attest_receipt", info.get("receipt_hash", "")),
+                              ("attest_chain_index", info.get("chain_index", ""))])
+        print("helm premise: attested '%s' from queue — turn %s"
+              % (rec["id"], (info.get("turn_hash") or "")[:16]))
+        done += 1
+    pk.atomic_write(qp, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept))
+    print("helm premise: queue replay — %d attested, %d still pending." % (done, len(kept)))
+    return 0 if not kept else 1
 
 
 # ---------------------------------------------------------------------------

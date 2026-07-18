@@ -120,6 +120,7 @@ VERBS = {
     "keepalive": _lazy("keepalive", "cmd_keepalive"),
     "creds": _lazy("creds", "cmd_creds"),
     "swap": _lazy("creds", "cmd_swap"),
+    "capsule": _lazy("capsule", "cmd_capsule"),
     "web": _lazy("web", "cmd_web"),
 }
 
@@ -148,6 +149,7 @@ _VERB_HELP = {
     "keepalive": "keepalive [--home H] [--early N] — roll idle claude homes' tokens (codex read-only)",
     "creds": "creds — live account scorecard (headroom/state/reset), all providers",
     "swap": "swap <home|email> — seat ran dry: print resume-under-healthier-account blocks",
+    "capsule": "capsule <sid> — the session's git era: worktree + resume commands",
     "web": "web [--port N] — the same, warm, in a browser",
 }
 

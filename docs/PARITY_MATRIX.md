@@ -58,3 +58,5 @@ Status key: ✓ done+verified · ~ partial/present-verify-depth · ✗ missing �
 - SLICE ff90c3d (creds+swap CLI): A11 creds ✓ (10-account scorecard w/ headroom+verdict), A12 next ✓ (headroom picker folded into creds scorecard), A13 swap ✓ (rollover; minor: `swap --help` reads --help as a home-name, tiny UX nit), A10 history ✓ (= helm transcript).
 - STILL-OPEN AX (need present-or-explicit-N/A): A14 physics (quota compute — likely folded in the creds/quota backend? confirm), A15 capsule (session capsule = catalog×git×mv×cmd — confirm helm sessions/rehome/transcript cover it or add), A16 cmd (run-in-session — confirm or add).
 - STILL-OPEN UX: U9 config-editor-web (slice C), U12 team-tray (slice B), + depth-verify U6 sessions/U10 homes/U11 hygiene when web slices land.
+- SLICE B c7192eb (sessions web): U6 sessions view ✓ (harness badges + filter + harness-filter all parity vs :7402), U7 resume-one-paste ✓ (api/sessions carries `cmd` = resume command). Quota+sessions web now both VERIFIED.
+- AWAITING slice C (configs-editor-web U9 + team-tray U12) — the last big UX block. Then: depth-verify homes(U10)/hygiene(U11) web, confirm AX physics/capsule/cmd.
