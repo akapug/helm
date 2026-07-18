@@ -33,7 +33,22 @@ keeps it alive:
   every agent that reads the store gets warmer.
 - **`helm sessions`** — every local session across every harness, grouped by
   project, with the exact resume command one paste away (it's just the
-  harness's own CLI — no wrapper).
+  harness's own CLI — no wrapper). Content search inside transcripts
+  (`helm search`), windowed reads (`helm transcript`), re-homing, and
+  resume-optimized copies (`helm prune`) included.
+- **Accounts and quota** — `helm creds` is the live scorecard (headroom,
+  reset windows, use-it-or-lose-it verdicts); `helm swap` rescues a seat that
+  ran dry with exact resume-under-a-healthier-account commands; `helm homes`
+  manages credential homes safely (helm prepares, you run every login).
+- **Attested truths** — `helm premise` captures a certainty into the store
+  *and* commits a signed digest to a verifiable ledger; `helm premise-check`
+  re-verifies it and quotes the finality tier. Belief history supersedes as a
+  provable chain, never deleted.
+- **The web app** — `helm web` serves four views from one self-contained
+  page: your knowledge home, the quota chart + accounts table + credential
+  homes, the full sessions browser (search inside transcripts, role-colored
+  drawer, one-click resume, team tray), and the config-cascade editor
+  (backup → validate → atomic write, one-click restore).
 - **The lineage map** — projects fork, compose, supersede, and launch. helm's
   registry carries those edges and renders the family tree, including
   read-only external nodes, plus a ranked (read-only) "safe to archive and
