@@ -13,10 +13,16 @@ from . import catalog, registry
 
 
 def _project_lens():
-    """[(name, path)] longest-path-first, so nested repos match before parents."""
+    """[(name, prefix)] longest-prefix-first, so nested repos match before
+    parents. Uses the registry's full cv_scope prefix set — sibling-dir
+    worktree cwds don't share the canonical root's prefix."""
     reg = registry.load()
-    pairs = [(p["name"], p["path"]) for p in reg["projects"].values()
-             if p.get("path") and not p.get("external")]
+    pairs = []
+    for p in reg["projects"].values():
+        if not p.get("path") or p.get("external"):
+            continue
+        prefixes = (p.get("cv_scope") or {}).get("cwd_prefixes") or [p["path"]]
+        pairs += [(p["name"], pre) for pre in prefixes]
     return sorted(pairs, key=lambda t: -len(t[1]))
 
 
