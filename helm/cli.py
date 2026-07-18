@@ -118,6 +118,8 @@ VERBS = {
     "rehome": _lazy("transcripts", "cmd_rehome"),
     "prune": _lazy("transcripts", "cmd_prune"),
     "keepalive": _lazy("keepalive", "cmd_keepalive"),
+    "creds": _lazy("creds", "cmd_creds"),
+    "swap": _lazy("creds", "cmd_swap"),
     "web": _lazy("web", "cmd_web"),
 }
 
@@ -144,6 +146,8 @@ _VERB_HELP = {
     "rehome": "rehome <sid> <new-cwd>|--reset — re-home a session (claude slug symlink)",
     "prune": "prune <sid> [--preset lean|window20k] [--dry] — resume-optimized copy, original untouched",
     "keepalive": "keepalive [--home H] [--early N] — roll idle claude homes' tokens (codex read-only)",
+    "creds": "creds — live account scorecard (headroom/state/reset), all providers",
+    "swap": "swap <home|email> — seat ran dry: print resume-under-healthier-account blocks",
     "web": "web [--port N] — the same, warm, in a browser",
 }
 
