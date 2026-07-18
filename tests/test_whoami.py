@@ -54,11 +54,13 @@ class TestMergeScaffold(WhoamiBase):
         path = self.write_mc({"technical_level": "technical",
                               "guidance": ["no emojis"], "interview_status": "offered"})
         first = whoami.merge_scaffold(mc_path=path)
-        raw = open(whoami.profile_path()).read()
+        with open(whoami.profile_path()) as f:
+            raw = f.read()
         second = whoami.merge_scaffold(mc_path=path)
         self.assertEqual(first, second)
         self.assertEqual(second["guidance"], ["no emojis"])  # no duplicate append
-        self.assertEqual(open(whoami.profile_path()).read(), raw)  # untouched on no-change
+        with open(whoami.profile_path()) as f:
+            self.assertEqual(f.read(), raw)  # untouched on no-change
 
     def test_empty_mc_fields_never_clobber_helm_content(self):
         whoami.save_profile({"schema_version": 2, "technical_level": "technical",

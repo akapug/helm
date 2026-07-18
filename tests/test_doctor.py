@@ -146,7 +146,11 @@ class TestCmdDoctor(DoctorBase):
         for dirpath, dirnames, filenames in os.walk(root):
             for f in filenames:
                 p = os.path.join(dirpath, f)
-                state[p] = open(p, "rb").read()
+                if os.path.islink(p):
+                    state[p] = os.readlink(p)
+                    continue
+                with open(p, "rb") as fh:
+                    state[p] = fh.read()
         return state
 
     def test_full_report_exit_1_on_fail_and_read_only(self):

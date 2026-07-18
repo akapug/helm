@@ -178,8 +178,9 @@ def _du_mb(path):
 
 def _git_dirty(path):
     """None = not a git repo; -1 = status failed (cannot verify); else the count
-    of uncommitted paths in `git status --porcelain`."""
-    if not os.path.isdir(os.path.join(path, ".git")):
+    of uncommitted paths in `git status --porcelain`. A linked worktree's .git
+    is a FILE — exists, not isdir, or a dirty checkout dup would slip through."""
+    if not os.path.exists(os.path.join(path, ".git")):
         return None
     try:
         out = subprocess.run(["git", "-C", path, "status", "--porcelain"],

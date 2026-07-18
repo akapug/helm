@@ -45,13 +45,11 @@ def proposals():
         out.append(("drift", "%d belief%s drifting" % (len(lines), "s"[:len(lines) != 1]),
                     "helm drift"))
 
-    try:
-        from . import whoami
-        if not whoami.profile_has_content():
-            out.append(("who", "the warmth leg is empty — the five-minute interview "
-                        "makes every agent warmer", "helm interview"))
-    except Exception:
-        pass
+    from . import whoami
+    p = whoami.load_profile()
+    if not (p["technical_level"] or p["guidance"] or whoami.load_notes()):
+        out.append(("who", "the warmth leg is empty — the five-minute interview "
+                    "makes every agent warmer", "helm interview"))
     return out
 
 
