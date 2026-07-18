@@ -754,6 +754,8 @@ def retire(eid, ts, why="", project=None):
 _USAGE = """usage: helm store <verb> [args] [--project P]
   list [--type T] [--all]                     entries (live; --all incl. retired)
   get <id>                                    one entry, full record
+  resolve <text>                              JIT lookup — what would fire for this prompt
+  pinned                                      the always-on lane
   add <type> <id> | <statement> [| ...]       type: prior|premise|lexicon|heuristic|reference
       prior:     <id> | <statement> [| conf [| keywords [| domain]]]  (belief, default 0.6)
       premise:   <id> | <statement> [| keywords [| domain]]           (certain, conf 1.0)
@@ -950,9 +952,24 @@ def cmd_store(args):
         return 0
 
     if cmd == "resolve":
-        text = "" if sys.stdin.isatty() else sys.stdin.read()
-        for e in resolve_prompt(text, project=project):
+        # explicit args win; stdin is the hook path (may be an empty pipe —
+        # ignoring args silently made an advertised verb a no-op)
+        text = " ".join(a for a in rest if not a.startswith("--") and a != project)
+        from_args = bool(text)
+        if not text and not sys.stdin.isatty():
+            text = sys.stdin.read()
+        if not text.strip():
+            print("usage: helm store resolve <text>   (or pipe prompt text on stdin)",
+                  file=sys.stderr)
+            return 2
+        hits = resolve_prompt(text, project=project)
+        for e in hits:
             print(_fmt(e))
+        if not hits and from_args:
+            # a human asked directly — explain the silence; the stdin/hook path
+            # stays empty-on-no-match (salience law)
+            print("helm store resolve: no JIT match (salience law — generic-only "
+                  "matches never fire); try `helm store get <id>` for direct lookup")
         return 0
 
     if cmd == "pinned":
