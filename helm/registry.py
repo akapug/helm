@@ -44,7 +44,10 @@ def _overlay_pointers(rec):
             mem = d
             break
     rec["memory_dir"] = mem
-    rec["cv_scope"] = {"cwd_prefix": rec["path"]}
+    # cv prefix-matches on recorded cwds; sibling-dir worktrees don't share the
+    # canonical root's prefix, so the scope carries every observed cwd too.
+    rec["cv_scope"] = {"cwd_prefix": rec["path"],
+                       "cwd_prefixes": sorted({rec["path"], *rec.get("cwds", [])})}
     rec["home"] = home.project_dir(rec["name"])
     return rec
 
