@@ -1,0 +1,9 @@
+# internal planning — never pushed, never committed (as-public repo law)
+BUILD_BRIEF.md
+ADVISOR_QUESTIONS.md
+docs/helm-inventory-owner-decisions-*.md
+docs/lineage-map-decisions-*.md
+.remember/
+__pycache__/
+*.pyc
+.pytest_cache/
