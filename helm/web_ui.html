@@ -1,0 +1,292 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>helm</title>
+<style>
+/* palette: the sesh/builders.dev warm token family — helm is dark-first, light derived in-family */
+:root{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--ok:#7eb8a2;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
+@media (prefers-color-scheme:light){:root{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--ok:#3e8a6e;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body::before{content:"";position:fixed;inset:0 0 auto;height:340px;background:radial-gradient(60% 100% at 50% 0,var(--accent-soft),transparent 70%);pointer-events:none}
+.wrap{max-width:1180px;margin:0 auto;padding:0 clamp(14px,3vw,36px);position:relative}
+code,.mono{font:.86em ui-monospace,Menlo,Consolas,monospace}
+code{background:var(--code);color:var(--codefg);padding:1px 5px;border-radius:4px}
+
+/* ---------- header ---------- */
+header{padding:26px 0 6px}
+.brand{display:flex;align-items:center;gap:11px}
+.brand .mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 50%,var(--claude)));display:grid;place-items:center;font-size:21px;color:var(--bg);box-shadow:0 1px 5px rgba(0,0,0,.25)}
+.brand h1{margin:0;font-size:1.45rem;font-weight:800;letter-spacing:-.03em}
+.brand .stats{margin-left:auto;font-size:.82rem;color:var(--mut);text-align:right;font-variant-numeric:tabular-nums}
+.brand .stats b{color:var(--fg)}
+#hello{margin:10px 0 0;font-size:1.02rem;color:var(--mut)}
+#hello b{color:var(--fg);font-weight:650}
+
+/* ---------- banner ---------- */
+#banner{display:none;margin:14px 0 0;padding:9px 14px;border:1px solid color-mix(in srgb,var(--warn) 55%,transparent);border-radius:10px;background:var(--card);color:var(--warn);font-size:.86rem}
+#banner.show{display:block}
+
+/* ---------- store strip ---------- */
+#store{display:none;margin:16px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);align-items:baseline;gap:4px 16px;flex-wrap:wrap;font-size:.84rem}
+#store.show{display:flex}
+#store .slabel{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+.stype{white-space:nowrap;color:var(--mut)}
+.stype b{color:var(--fg);font-variant-numeric:tabular-nums;margin-right:4px}
+#store .stot{margin-left:auto;color:var(--sub);font-size:.78rem}
+
+/* ---------- controls ---------- */
+#controls{display:flex;gap:8px;align-items:center;margin:16px 0 0;flex-wrap:wrap}
+#q{flex:1 1 240px;min-width:180px;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:9px 13px;font-size:.95rem;outline:none}
+#q:focus{border-color:var(--accent)}
+#q::placeholder{color:var(--sub)}
+.tog{border:1px solid var(--line);border-radius:16px;padding:5px 13px;background:var(--card);color:var(--mut);font:.8rem inherit;cursor:pointer;display:none}
+.tog.avail{display:inline-block}
+.tog.on{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+#count{color:var(--sub);font-size:.8rem;margin-left:auto;white-space:nowrap}
+
+/* ---------- project cards ---------- */
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin:14px 0 0;padding:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:13px 15px 12px;cursor:pointer;box-shadow:var(--shadow);transition:border-color .12s,background .12s;animation:rise .35s ease both;min-width:0}
+.card:hover{border-color:var(--line2);background:var(--hover)}
+.card.open{grid-column:1/-1;border-color:color-mix(in srgb,var(--accent) 55%,var(--line));cursor:default}
+@keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+.trow{display:flex;align-items:baseline;gap:9px;min-width:0}
+.dot{width:9px;height:9px;border-radius:50%;flex:none;align-self:center;background:var(--sub)}
+.dot.active{background:var(--ok);box-shadow:0 0 6px color-mix(in srgb,var(--ok) 60%,transparent)}
+.dot.dormant{background:var(--sub);opacity:.55}
+.dot.external{background:var(--ext)}
+.pname{font-weight:700;font-size:1.02rem;letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card.dormant .pname{color:var(--mut);font-weight:600}
+.age{margin-left:auto;flex:none;font-size:.78rem;color:var(--mut);font-variant-numeric:tabular-nums}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 0;min-height:1.2em}
+.hchip{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:2.5px 8px;border-radius:5px;white-space:nowrap}
+.h-claude{background:color-mix(in srgb,var(--claude) 18%,transparent);color:var(--claude)}
+.h-codex{background:color-mix(in srgb,var(--codex) 18%,transparent);color:var(--codex)}
+.h-opencode{background:color-mix(in srgb,var(--opencode) 20%,transparent);color:var(--opencode)}
+.h-other{background:color-mix(in srgb,var(--mut) 18%,transparent);color:var(--mut)}
+.lchip{font-size:.68rem;padding:2.5px 8px;border-radius:5px;color:var(--accent);background:var(--accent-soft);white-space:nowrap}
+.ppath{margin:8px 0 0;font:.76rem ui-monospace,Menlo,Consolas,monospace;color:var(--sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card:hover .ppath{color:var(--mut)}
+
+/* ---------- detail expansion ---------- */
+.detail{display:none;margin:12px -15px 0;border-top:1px solid var(--line);padding:11px 15px 2px;column-width:340px;column-gap:28px}
+.card.open .detail{display:block}
+.dsec{break-inside:avoid;margin:0 0 12px}
+.dsec h4{margin:0 0 4px;font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+.dline{font-size:.82rem;color:var(--mut);margin:2px 0;word-break:break-all}
+.dline.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.78rem}
+.dline b{color:var(--fg);font-weight:600}
+.edge .rel{color:var(--accent);font-weight:600}
+.edge .enote{color:var(--sub);font-style:italic}
+.unconf{color:var(--warn);font-size:.7rem;font-style:normal}
+.copy{cursor:copy;border-radius:5px;padding:0 3px;margin:0 -3px}
+.copy:hover{background:var(--hover);color:var(--fg)}
+.copy.did{color:var(--ok)}
+
+/* ---------- empty / footer ---------- */
+#empty{display:none;padding:52px 20px;text-align:center;color:var(--mut)}
+#empty.show{display:block}
+#empty .glyph{font-size:2rem;opacity:.4}
+footer{margin:26px 0 46px;font-size:.76rem;color:var(--sub);display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+footer .fmark{color:color-mix(in srgb,var(--accent) 70%,var(--sub))}
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <span class="mark">⎈</span><h1>helm</h1>
+      <div class="stats" id="stats"></div>
+    </div>
+    <p id="hello">your projects, remembered</p>
+  </header>
+
+  <div id="banner">helm isn’t answering — start it with <code>helm web</code>; retrying quietly…</div>
+
+  <section id="store"></section>
+
+  <div id="controls">
+    <input id="q" type="search" placeholder="filter projects…  ( / )" autocomplete="off">
+    <button class="tog" id="togRetired">retired</button>
+    <span id="count"></span>
+  </div>
+
+  <main id="grid"></main>
+  <div id="empty"><div class="glyph">⎈</div>no projects yet — run <code>helm sync</code>, then refresh.</div>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const KNOWN_H = ["claude", "codex", "opencode"];
+const STORE_ORDER = ["premise", "prior", "lexicon", "heuristic", "reference", "episodic"];
+
+let projects = [], showRetired = false;
+
+function age(epoch) {
+  if (!epoch) return "never";
+  const d = (Date.now() / 1000 - epoch) / 86400;
+  if (d < 1) return "today";
+  if (d < 2) return "1d";
+  if (d < 14) return Math.floor(d) + "d";
+  if (d < 70) return Math.floor(d / 7) + "w";
+  return Math.floor(d / 30) + "mo";
+}
+
+async function j(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(url + " -> " + r.status);
+  return r.json();
+}
+
+/* ---------- greeting ---------- */
+function greet(w) {
+  if (!w || w.unavailable) return;
+  const p = (w.profile && typeof w.profile === "object") ? w.profile : w;
+  const name = ["name", "display_name", "operator", "user", "owner"]
+    .map(k => p[k]).find(v => typeof v === "string" && v.trim());
+  if (!name) return;
+  const h = new Date().getHours();
+  const tod = h < 5 ? "up late" : h < 12 ? "good morning" : h < 18 ? "good afternoon" : "good evening";
+  const notes = Array.isArray(w.notes) ? w.notes.length : 0;
+  $("#hello").innerHTML = esc(tod) + ", <b>" + esc(name.trim().split(/\s+/)[0]) +
+    "</b> — your projects, remembered." + (notes ? " <span style='color:var(--sub)'>" + notes + " note" + (notes === 1 ? "" : "s") + " on file.</span>" : "");
+}
+
+/* ---------- store strip ---------- */
+function storeStrip(s) {
+  if (!s || s.unavailable || !s.counts) return;
+  const c = (s.counts.by_type && typeof s.counts.by_type === "object") ? s.counts.by_type : s.counts;
+  const types = Object.keys(c).filter(k => typeof c[k] === "number" && k !== "total");
+  types.sort((a, b) => (STORE_ORDER.indexOf(a) + 99 || 999) - (STORE_ORDER.indexOf(b) + 99 || 999) || a.localeCompare(b));
+  if (!types.length) return;
+  const total = typeof c.total === "number" ? c.total :
+    (typeof s.counts.total === "number" ? s.counts.total : types.reduce((n, k) => n + c[k], 0));
+  $("#store").innerHTML = '<span class="slabel">store</span>' +
+    types.map(k => '<span class="stype"><b>' + c[k] + "</b>" + esc(k) + "</span>").join("") +
+    '<span class="stot">' + total + " entries</span>";
+  $("#store").classList.add("show");
+}
+
+/* ---------- project cards ---------- */
+function chips(p) {
+  const sess = p.sessions || {};
+  const hs = Object.keys(sess).sort((a, b) =>
+    (KNOWN_H.indexOf(a) + 99 || 999) - (KNOWN_H.indexOf(b) + 99 || 999) || a.localeCompare(b));
+  let out = hs.map(h =>
+    '<span class="hchip h-' + (KNOWN_H.includes(h) ? esc(h) : "other") + '">' + esc(h) +
+    (sess[h] > 1 ? "·" + sess[h] : "") + "</span>").join("");
+  if ((p.edges || []).length) out += '<span class="lchip">⑂ lineage</span>';
+  return out;
+}
+
+function detail(p) {
+  const secs = [];
+  if ((p.edges || []).length)
+    secs.push("<div class='dsec'><h4>lineage</h4>" + p.edges.map(e =>
+      "<div class='dline edge'><span class='rel'>" + esc(e.rel || "?") + "</span> <b>" + esc(e.to || "?") + "</b>" +
+      (e.note ? " <span class='enote'>— " + esc(e.note) + "</span>" : "") +
+      (e.confirmed === false ? " <span class='unconf'>unconfirmed</span>" : "") + "</div>").join("") + "</div>");
+  if (p.notes)
+    secs.push("<div class='dsec'><h4>notes</h4><div class='dline'>" + esc(p.notes) + "</div></div>");
+  const sess = p.sessions || {}, refs = p.harness_refs || {};
+  const hlines = Object.keys(sess).map(h => {
+    const r = refs[h] || [];
+    const shown = r.slice(0, 3).map(esc).join(", ");
+    return "<div class='dline'><b>" + esc(h) + "</b> · " + sess[h] + " session" + (sess[h] === 1 ? "" : "s") +
+      (shown ? " <span class='mono'>" + shown + (r.length > 3 ? " +" + (r.length - 3) : "") + "</span>" : "") + "</div>";
+  });
+  if (hlines.length) secs.push("<div class='dsec'><h4>harnesses</h4>" + hlines.join("") + "</div>");
+  const cwds = (p.cwds || []).filter(c => c !== p.path);
+  if (cwds.length)
+    secs.push("<div class='dsec'><h4>working dirs</h4>" + cwds.map(c =>
+      "<div class='dline mono copy' data-copy='" + esc(c) + "'>" + esc(c) + "</div>").join("") + "</div>");
+  const ptr = [["home", p.home], ["memory", p.memory_dir], ["cv scope", p.cv_scope && p.cv_scope.cwd_prefix]]
+    .filter(x => x[1]).map(x =>
+      "<div class='dline'><b>" + x[0] + "</b> <span class='mono copy' data-copy='" + esc(x[1]) + "'>" + esc(x[1]) + "</span></div>");
+  if (ptr.length) secs.push("<div class='dsec'><h4>pointers</h4>" + ptr.join("") + "</div>");
+  const days = p.active_days ? "<div class='dline'>" + p.active_days + " active day" + (p.active_days === 1 ? "" : "s") +
+    (p.first_seen ? " · first seen " + age(p.first_seen) + " ago" : "") + "</div>" : "";
+  if (days) secs.push("<div class='dsec'><h4>activity</h4>" + days + "</div>");
+  return secs.join("");
+}
+
+function card(p, i) {
+  const status = p.status || "dormant";
+  return '<article class="card ' + esc(status) + '" data-name="' + esc(p.name) + '" style="animation-delay:' + Math.min(i * 22, 380) + 'ms">' +
+    '<div class="trow"><span class="dot ' + esc(status) + '" title="' + esc(status) + '"></span>' +
+    '<span class="pname">' + esc(p.name) + '</span>' +
+    '<span class="age">' + age(p.last_seen) + "</span></div>" +
+    '<div class="chips">' + chips(p) + "</div>" +
+    '<div class="ppath copy" data-copy="' + esc(p.path || "") + '" title="click to copy">' + esc(p.path || "") + "</div>" +
+    '<div class="detail">' + detail(p) + "</div></article>";
+}
+
+function render() {
+  const q = $("#q").value.trim().toLowerCase();
+  const hit = p => !q || [p.name, p.path, ...Object.keys(p.sessions || {})].join(" ").toLowerCase().includes(q);
+  const vis = projects.filter(p => (showRetired || !p.retired) && hit(p));
+  $("#grid").innerHTML = vis.map(card).join("");
+  const retired = projects.filter(p => p.retired).length;
+  $("#togRetired").textContent = "retired · " + retired;
+  $("#togRetired").classList.toggle("avail", retired > 0);
+  $("#count").textContent = vis.length === projects.length ? vis.length + " projects" : vis.length + " of " + projects.length;
+  $("#empty").classList.toggle("show", !projects.length);
+  const active = projects.filter(p => p.status === "active").length;
+  const sess = projects.reduce((n, p) => n + Object.values(p.sessions || {}).reduce((a, b) => a + b, 0), 0);
+  $("#stats").innerHTML = "<b>" + projects.length + "</b> projects · <b>" + active + "</b> active<br><b>" + sess + "</b> sessions remembered";
+}
+
+/* ---------- wiring ---------- */
+document.addEventListener("click", ev => {
+  const cp = ev.target.closest(".copy");
+  if (cp) {
+    ev.stopPropagation();
+    navigator.clipboard && navigator.clipboard.writeText(cp.dataset.copy || cp.textContent);
+    cp.classList.add("did");
+    setTimeout(() => cp.classList.remove("did"), 600);
+    return;
+  }
+  const c = ev.target.closest(".card");
+  if (c) c.classList.toggle("open");
+});
+document.addEventListener("keydown", ev => {
+  if (ev.key === "/" && document.activeElement !== $("#q")) { ev.preventDefault(); $("#q").focus(); }
+  if (ev.key === "Escape") document.querySelectorAll(".card.open").forEach(c => c.classList.remove("open"));
+});
+$("#q").addEventListener("input", render);
+$("#togRetired").addEventListener("click", () => {
+  showRetired = !showRetired;
+  $("#togRetired").classList.toggle("on", showRetired);
+  render();
+});
+
+function foot(reg) {
+  const ts = reg.generated_ts ? new Date(reg.generated_ts) : null;
+  const when = ts && !isNaN(ts) ? age(ts.getTime() / 1000) : null;
+  $("#foot").innerHTML = '<span class="fmark">⎈</span> ~/.helm' +
+    (when ? " · synced " + (when === "today" ? "today" : when + " ago") : " · never synced — run <code>helm sync</code>") +
+    " · read-only surface — the CLI is the helm";
+}
+
+async function load() {
+  try {
+    const reg = await j("/api/registry");
+    $("#banner").classList.remove("show");
+    projects = Object.values(reg.projects || {});
+    projects.sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0));
+    render();
+    foot(reg);
+  } catch (e) {
+    $("#banner").classList.add("show");
+    setTimeout(load, 8000);
+    return;
+  }
+  j("/api/whoami").then(greet).catch(() => {});
+  j("/api/store").then(storeStrip).catch(() => {});
+}
+load();
+</script>

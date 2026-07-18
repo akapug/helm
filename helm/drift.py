@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""The drift report — confidence-weighted beliefs, surfaced to the operator
+ONLY on drift. No drift, no output; no news is silence.
+
+Drift =
+  1. CONTRADICTED certainty: a confidence-1.0 premise whose evidence log
+     carries agent contradictions (the log records what confidence refuses to
+     move for — that logged tension IS the alignment-break signal).
+  2. TIER CROSSING since the last report: a belief crossed the auto-act line
+     (0.85) in either direction, or fell dormant (< 0.4).
+  3. DECAY: beliefs sitting dormant — held so weakly they no longer inject.
+
+State: one snapshot of {id: confidence} under _global/.state/ — the diff
+between runs is what makes crossings reportable exactly once.
+"""
+import os
+
+from . import home, pk
+
+ACT_AT = 0.85
+DORMANT_BELOW = 0.4
+
+
+def _state_path():
+    return os.path.join(home.global_dir(), ".state", "drift-snapshot.json")
+
+
+def _contradictions(e):
+    return [r for r in (e.get("evidence_log") or [])
+            if r.get("type") == "contradict" or (r.get("delta") or 0) < 0]
+
+
+def report(project=None, snapshot=True):
+    """-> (lines, counts). Empty lines list == no drift."""
+    from . import store
+    entries = store.load_all(project=project, include_dormant=True, types=("prior",))
+    prev = pk.read_json(_state_path(), {})
+    lines = []
+    for e in sorted(entries, key=lambda x: x["id"]):
+        eid, conf = e["id"], e["confidence"]
+        if e.get("class") == "certain":
+            rows = [r for r in _contradictions(e) if r.get("by") != "human"]
+            if rows:
+                last = rows[-1]
+                lines.append("CONTRADICTED  %s — %d agent contradiction%s logged; latest: %s"
+                             % (eid, len(rows), "s"[:len(rows) != 1],
+                                (last.get("reason") or "")[:120]))
+            continue
+        was = prev.get(eid)
+        if was is not None:
+            for tier, name in ((ACT_AT, "auto-act"), (DORMANT_BELOW, "dormant")):
+                if (was >= tier) != (conf >= tier):
+                    arrow = "rose past" if conf >= tier else "fell below"
+                    lines.append("TIER          %s — %s %s (%.2f -> %.2f)"
+                                 % (eid, arrow, name, was, conf))
+        if e.get("load_class") == "dormant":
+            lines.append("DECAYED       %s — confidence %.2f, no longer injecting "
+                         "(re-confirm or retire)" % (eid, conf))
+    if snapshot:
+        pk.write_json(_state_path(), {e["id"]: e["confidence"] for e in entries
+                                      if e.get("class") != "certain"})
+    return lines, len(entries)
+
+
+def cmd_drift(args):
+    """drift [--project P] [--peek] — surface belief drift; silent when none."""
+    project = None
+    if "--project" in args:
+        project = args[args.index("--project") + 1]
+    lines, n = report(project=project, snapshot="--peek" not in args)
+    if not lines:
+        print("helm drift: no drift (%d priors steady)." % n)
+        return 0
+    print("helm drift (%d of %d priors):" % (len(lines), n))
+    for line in lines:
+        print("  " + line)
+    return 0
