@@ -853,10 +853,18 @@ async function loadAlloc() {
   renderAttn();
 }
 async function loadSData() {
+  // the activity histogram feeds the FULL catalog (parity ruling): every
+  // session's last-activity lands in the buckets, not a newest-N slice.
   try {
-    const d = await j("/api/sessions");
-    SDATA = (d && Array.isArray(d.sessions)) ? d.sessions : [];
+    await ensureCatalog();
+    SDATA = DATA.filter(r => !r.syn);
   } catch (e) { SDATA = []; }
+  if (!SDATA.length) {
+    try {
+      const d = await j("/api/sessions");
+      SDATA = (d && Array.isArray(d.sessions)) ? d.sessions : [];
+    } catch (e) { SDATA = []; }
+  }
   if (HIST.length) renderChart();
 }
 async function loadStatus() {

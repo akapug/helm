@@ -78,3 +78,24 @@ FULL RIGOR this time (feature-diff + rendered screenshots, not isolation). Resul
 - A16 cmd: still to confirm (capsule composes it? or add).
 BLOCKERS to done: (1) wire the quota-history source so the chart has data (parity with :7402's
 populated chart); (2) confirm A16 cmd. Everything else is parity-complete + rendered.
+
+## CORRECTION (2026-07-18): quota chart is ✓ NOT empty — my earlier finding was a screenshot-timing false-negative
+Re-verified: /api/history = 1358 timeseries points; the chart RENDERS full parity vs :7402 (9 account lines, projection, weekly/session toggle, per-model tabs, histogram, hygiene banners, account table — all real data). Screenshot: helm-quota-recheck.png.
+- U1 quota chart ✓ · U2 projection ✓ · U3 weekly/session+per-model ✓ · U4 account table ✓ · U5 burn↔sessions ✓ · U11 hygiene ✓ (all rendered with real data).
+- LESSON: wait for async load before screenshotting; cross-check the data endpoint. "tested" requires correct test timing.
+- Remaining: visually confirm U12 team-tray render (data wired), triage Fable's named deviations, confirm A16 cmd/A14 physics UI params.
+
+## Final gate sweep (2026-07-18)
+- U12 team-tray ✓ — drawer opens + renders ("team tray — one seat per terminal", team/seat mgmt, save-team). Screenshot helm-tray-drawer.png.
+- ALL UX views now present + visually verified rendering with real data (U1-U14 ✓).
+- A16 cmd ✓ (verb landed 506f906), --help fixed dispatcher-level (nit closed).
+- REMAINING: triage Fable's disclosed deviations (renamed DOM ids / 403-vs-401 / navstats-slot / no-?theme=) — cosmetic-class, rule each; sweep ~ AX (keepalive/ls/show/mv/prune equivalents).
+
+## Deviation triage (Fable's 5 named) — supervisor rulings
+(a) renamed DOM ids (#sq/#sesscount/renderSessions) → PARITY-OK — required to avoid collision with helm's own DOM; behavior identical, no user-facing diff.
+(b) 403 vs sesh's 401 on missing bearer → PARITY-OK — both refuse; trivial HTTP semantics (401 is stricter-correct; optional align, not a gap).
+(c) session totals in shared #navstats not a dedicated #stats slot → PARITY-OK — same info, helm's own nav layout.
+(e) no ?theme= URL param → PARITY-OK — theme TOGGLE is present (functionality parity); URL-param is a minor access method.
+(d) activity histogram joins /api/sessions (newest 200) not full catalog → **MINOR GAP — fix for spec-perfect.** helm's histogram under-samples older activity vs sesh's full-catalog. Use the full catalog (or the quota window) so the histogram matches :7402 exactly.
+- A4-A8 (keepalive/ls→sessions/show/mv→rehome/prune): helm verbs all present ✓.
+## GATE: UX ✓ (all views render w/ real data), AX ✓ (all verbs wired). ONE item to spec-perfect: (d) histogram full-catalog.
