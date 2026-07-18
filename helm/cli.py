@@ -48,17 +48,23 @@ def cmd_projects(args):
     show_all = "--all" in args
     projects.sort(key=lambda p: -(p.get("last_seen") or 0))
     rows = []
+    shelf = sum(1 for p in projects if p.get("status") == "shelf")
     for p in projects:
-        if p.get("retired") and not show_all:
+        if (p.get("retired") or p.get("status") == "shelf") and not show_all:
             continue
         sess = p.get("sessions") or {}
         stotal = sum(sess.values())
         hlist = "+".join(sorted(sess)) if sess else "-"
         rows.append((p["name"], p.get("status", "?"), _age(p.get("last_seen")),
                      str(stotal), hlist, p.get("path", "")))
+    if not rows:
+        print("helm: %d shelf repos only — `helm projects --all`" % shelf)
+        return 0
     w = [max(len(r[i]) for r in rows) for i in range(5)]
     for r in rows:
         print("  ".join(r[i].ljust(w[i]) for i in range(5)) + "  " + r[5])
+    if shelf and not show_all:
+        print("  (+%d shelf repos on disk with no agent activity — `helm projects --all`)" % shelf)
     return 0
 
 

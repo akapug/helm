@@ -113,6 +113,36 @@ def _name_for(root, taken, home):
     return re.sub(r"[^A-Za-z0-9_.-]", "-", rel)
 
 
+# Repo-scan (the second discovery tier): every git repo under these roots is
+# helm-known as a SHELF project — on disk, no observed agent activity. Shelf
+# nodes serve lineage + the archive report; they never scaffold a home and the
+# default project list hides them (signal first).
+def _scan_roots():
+    raw = os.environ.get("HELM_SCAN_ROOTS")
+    home = os.path.expanduser("~")
+    roots = raw.split(":") if raw else [os.path.join(home, "dev", "akapug"),
+                                       os.path.join(home, "dev")]
+    return [os.path.expanduser(r) for r in roots if r]
+
+
+_SHELF_SKIP = re.compile(r"(worktrees?$|-wt$|RETIRED|^references$|^archive$|^\.)")
+
+
+def scan_repos(roots=None):
+    """{path: name} of git repos (depth 1) under the scan roots."""
+    out = {}
+    for root in roots if roots is not None else _scan_roots():
+        if not os.path.isdir(root):
+            continue
+        for n in sorted(os.listdir(root)):
+            if _SHELF_SKIP.search(n):
+                continue
+            p = os.path.join(root, n)
+            if os.path.isdir(os.path.join(p, ".git")):
+                out[p] = n
+    return out
+
+
 def build_map(observations=None, home=None, now=None):
     """observations -> {name: project-record}. Pure derivation, no writes."""
     home = home or os.path.expanduser("~")

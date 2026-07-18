@@ -54,3 +54,33 @@ THE ONE FORK (let's meld it — see /tmp/helm-meld/channel.md): **who signs?** A
 root) vs **the user's own cell** (premises are David's truths, signed by his identity —
 warmer, matches know-your-user, but couples premise-issuance to his cell's key management).
 That's a real both-poles call — you know the storehouse wiring, I know the substrate. Meld it.
+
+## Lineage-edge corrections (historian pole, from dogfooding `helm lineage`)
+The RENDERER is great; three edges are wrong/missing (git-proven facts):
+1. **Root at herdr, not buildr.** herdr (`ogulcancelik/herdr`) → buildr-private-beta
+   (forked_from) → mission-control (forked_from). ALL THREE share root commit `a57b9728`
+   (git-proven, per _lineage/DESIGN.md; mc's object DB even contains buildr's HEAD). The map
+   currently roots at buildr-private-beta — add herdr as its parent (descends-from).
+2. **cv is MISSING from the registry entirely** (not just unmapped — the auto-map didn't
+   discover it). It's a real git repo at `/home/owner/dev/akapug/cv` (also `/home/owner/dev/cv`),
+   `forked_from emberian/cv` (shared root `17bb708`), and it's a TRUTH ENGINE (composes,
+   alongside dregg). Two findings: (a) auto-map gap — why did sync miss akapug/cv? (b) once
+   mapped, edge it as a truth engine that meld+sesh→helm depend on (mirror dregg's edge).
+3. **tokaware is unmapped** — add edge: tokaware = the cred/token-quota layer (the mc+tokaware
+   lineage stage); sesh's account-selection-by-headroom inherited it → helm. Edge label:
+   "contributes cred/quota layer".
+Also: dregg's edge should note `forked_from emberian/dregg` (Ember owns the lane; we consume) —
+same shape as cv←emberian/cv. Both are Ember truth engines.
+
+## ROOT CAUSE of the cv auto-map gap (dogfooded, not just reported)
+cv has ZERO agent sessions (0 claude, 0 codex/opencode with cwd inside cv) — verified. It's a
+git repo but nobody CODES in it with an agent; it's USED as a binary from other dirs. The
+auto-map's discovery signal is session-cwd → it structurally cannot see a consumed-as-tool dep.
+DESIGN INSIGHT: **session-cwd discovery finds projects you BUILD; it misses deps you USE.**
+Truth engines (cv — and dregg barely made it, 1 session) are used, not built-in-place.
+FIX (two options): (a) a SECOND discovery signal — git repos under ~/dev/akapug referenced as
+path-deps or in a known-engines seed list, unioned with session-discovery; or (b) seed cv+dregg
+as explicit truth-engine nodes in the lineage (David's Q4 answer allows external/known nodes).
+Recommend BOTH: seed the known engines now (cv, dregg, emberian upstreams), add dep-scan later.
+This is the same class as the 689→11 filter but inverted: filter OUT tmp noise, but ADD IN
+used-not-built deps.

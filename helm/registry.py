@@ -78,9 +78,25 @@ def sync(observations=None):
             cur.update(preserved)
             report["updated"].append(cur_name)
 
+    # second discovery tier: on-disk git repos with no observed agent activity
+    # register as SHELF nodes — lineage/archive-report substrate, no home
+    # scaffold, hidden from the default project list. An observed project is
+    # never demoted to shelf (observation outranks presence).
+    by_path = {p["path"]: n for n, p in known.items()}
+    for path, name in automap.scan_repos().items():
+        if path in by_path:
+            continue
+        shelf_name = name if name not in known else automap._name_for(path, {n: p["path"] for n, p in known.items()}, os.path.expanduser("~"))
+        known[shelf_name] = {
+            "name": shelf_name, "path": path, "kind": "git", "status": "shelf",
+            "sessions": {}, "first_seen": time.time(), "last_seen": None,
+        }
+        by_path[path] = shelf_name
+        report.setdefault("shelved", []).append(shelf_name)
+
     home.scaffold_global()
     for name, rec in known.items():
-        if rec.get("external") or rec.get("retired"):
+        if rec.get("external") or rec.get("retired") or rec.get("status") == "shelf":
             continue
         _adopt_or_scaffold(name)
     save(reg)

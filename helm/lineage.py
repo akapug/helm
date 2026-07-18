@@ -157,9 +157,17 @@ def render(fmt="tree"):
     if unmapped:
         if out:
             out.append("")
-        out.append("unmapped (no lineage edges):")
-        for r in unmapped:
-            out.append("  " + r + _tags(g[r]["rec"] if r in g else None))
+        # shelf nodes (on disk, no observed activity) compress to one line —
+        # 100+ of them would bury the observed unmapped set that matters.
+        shelf = [r for r in unmapped
+                 if r in g and (g[r]["rec"] or {}).get("status") == "shelf"]
+        rest = [r for r in unmapped if r not in shelf]
+        if rest:
+            out.append("unmapped (no lineage edges):")
+            for r in rest:
+                out.append("  " + r + _tags(g[r]["rec"] if r in g else None))
+        if shelf:
+            out.append("(+%d shelf repos unmapped — `helm projects --all`)" % len(shelf))
     return "\n".join(out)
 
 

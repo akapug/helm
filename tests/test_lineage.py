@@ -100,7 +100,7 @@ class TestApplySeed(LineageBase):
         self.assertIn(("polyanna", "checkout-of", "polyana"), triples)
         self.assertNotIn("tokaware", {e["src"] for e in seed["edges"]})  # deliberately unlinked
         # cv/dregg are real repos, never seed externals
-        self.assertEqual([x["name"] for x in seed["external"]], ["references"])
+        self.assertEqual([x["name"] for x in seed["external"]], ["references", "herdr"])
 
 
 class TestRender(LineageBase):
