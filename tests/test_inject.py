@@ -334,7 +334,9 @@ class LedgerTest(InjectBase):
         self.assertIn("pinned (1 candidate, budget %dB):" % inject.PINNED_BUDGET, out)
         self.assertIn("+ PREMISE pin-a: always truth", out)
         self.assertIn("jit (1 hit, cap %d):" % inject.JIT_CAP, out)
-        self.assertIn("+ jit-a [matched: fluxcap]", out)
+        # per-hit DF contributions: fluxcap is unique among candidates (df=1,
+        # weight 1.000); score = confidence 0.8 * 1.0
+        self.assertIn("+ jit-a [matched: fluxcap=1.000] score 0.800", out)
         self.assertFalse(os.path.exists(inject._ledger_path()),
                          "--explain must never write the ledger")
         # over-cap hits are shown, marked, and still not fired

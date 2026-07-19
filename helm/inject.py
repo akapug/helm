@@ -35,8 +35,8 @@ bytes per lane, pre-cap candidate count, elapsed_ms; a no-fire turn logs
 {"silent": true} instead of per-entry fields.
 O(1) append, 5MB one-generation rotation (-> .1), and fail-open: ledger
 trouble never blocks or slows the hook. `helm inject --explain` is the read
-side — what WOULD fire for stdin text and why (the pinned budget walk, which
-keyword matched per JIT hit) — and writes NO ledger row.
+side — what WOULD fire for stdin text and why (the pinned budget walk, each
+JIT hit's per-probe DF score contributions) — and writes NO ledger row.
 
 FAIL OPEN (docs/HOOKS.md law): a hook that cannot run helm must inject nothing,
 never block — a store or reflex failure yields an empty lane and rc 0.
@@ -247,10 +247,15 @@ def render(sections):
 
 def _explain(text, project=None):
     """--explain: what WOULD fire for this text and WHY — the pinned budget
-    walk, each JIT hit's matching keyword(s), live reflex signals. A dry look:
-    NO ledger row (an explain must never count as a turn)."""
+    walk, each JIT hit's per-probe DF score contributions (probe=1/df, summed
+    then confidence-weighted — resolve_prompt's exact arithmetic), live reflex
+    signals. A dry look: NO ledger row (an explain must never count as a turn)."""
     from . import store
-    pinned_entries, jit_all = _lanes(text, project=project)
+    entries = load_entries(project)
+    pinned_entries = store.pinned(project=project, entries=entries)
+    jit_all = store.resolve_prompt(text, project=project, cap=len(entries),
+                                   entries=entries)
+    df = store._df_map(store._jit_candidates(entries))
     low = (text or "").lower()
     used = 0
     cut = False
@@ -269,8 +274,10 @@ def _explain(text, project=None):
         print("jit (%d hit%s, cap %d):" % (len(jit_all), "s"[:len(jit_all) != 1], JIT_CAP))
     for i, e in enumerate(jit_all):
         matched = store._probe_hits(e, low)[2]
+        why = " ".join("%s=%.3f" % (p, 1.0 / df[p]) for p in matched)
+        score = e["confidence"] * sum(1.0 / df[p] for p in matched)
         mark, over = ("  + ", "") if i < JIT_CAP else ("  - ", " (over cap)")
-        print(mark + str(e["id"]) + " [matched: " + " ".join(matched) + "]" + over)
+        print(mark + str(e["id"]) + " [matched: " + why + "] score %.3f" % score + over)
     fired_reflex = reflex.fire(text, project=project)
     if fired_reflex:
         print("reflex:")

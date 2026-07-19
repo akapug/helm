@@ -58,7 +58,12 @@ Orthogonal to type. `load_class:` ∈
 - **always** — injected every turn. Budget-capped, pin-earned, kept tiny.
 - **jit** — injected only when the prompt matches the entry's id or a
   *specific* keyword (generic-word matches are rejected — the anti-wallpaper
-  guard). The default.
+  guard). The default. Ranking is **DF-weighted**: each matched keyword
+  contributes 1/df — df being how many entries carry it, computed over the
+  in-memory store per call — summed, then confidence-weighted. A keyword
+  shared by many entries is a weak signal; a rare one is strong, so one
+  distinctive match outranks a pile of shared ones. Ties break
+  most-recently-updated first, never alphabetically.
 - **dormant** — never injected until re-confirmed; where decayed beliefs go.
 
 The salience law governs all three: **empty on no match**. Salience is the

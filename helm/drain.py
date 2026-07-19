@@ -26,6 +26,7 @@ Dry-run by default; --apply executes; --limit N drains incrementally.
 The index file (MEMORY.md) is a projection: lines referencing moved files are
 re-pointed, never invented.
 """
+import json
 import os
 import re
 import shutil
@@ -122,14 +123,18 @@ def classify(mem=None):
 
 
 def _keywords_from(slug, statement):
+    """Keywords for a drained entry: the DISTINCTIVE words of slug + the FULL
+    statement — length >= 5, non-generic (store.GENERIC_KEYWORDS), ranked by
+    in-statement frequency then length (a repeated long word IS the topic),
+    first-seen breaking ties; cap 8. The old derivation (first 80 chars,
+    len > 3, first-seen only) minted weak generic keywords for the drained
+    cohort — --rekey below migrates those in place."""
     from .store import GENERIC_KEYWORDS
-    words = [w for w in re.split(r"[^a-z0-9]+", (slug + " " + statement[:80]).lower())
-             if len(w) > 3 and w not in GENERIC_KEYWORDS]
-    seen = []
-    for w in words:
-        if w not in seen:
-            seen.append(w)
-    return ",".join(seen[:6])
+    rank = {}
+    for w in re.split(r"[^a-z0-9]+", (slug + " " + statement).lower()):
+        if len(w) >= 5 and w not in GENERIC_KEYWORDS:
+            rank.setdefault(w, [0, len(w), -len(rank)])[0] += 1
+    return ",".join(sorted(rank, key=lambda w: rank[w], reverse=True)[:8])
 
 
 def _retype_text(src_path, act, ts):
@@ -172,6 +177,91 @@ def _retype_text(src_path, act, ts):
         fm.append("  origin_session: " + act["origin"])
     fm += ["---", ""]
     return "\n".join(fm) + body
+
+
+DRAINED_MARK = "drained from feedback memory"  # the evidence reason drain seeds
+
+
+def _rekey_edit(raw, new_kw, ts):
+    """The in-place two-line edit: the frontmatter `keywords:` line replaced
+    and a rekeyed receipt appended to its `evidence_log:` line. Every other
+    byte survives identical (never a full rewrite); None when either line is
+    missing/garbled — a malformed entry is skipped, never guessed at."""
+    end = raw.find("\n---", 1)
+    if end < 0:
+        return None
+    fm, rest = raw[:end], raw[end:]
+    ev = re.search(r"^(\s*evidence_log:\s*)(\[.*\])\s*$", fm, re.M)
+    if not (ev and re.search(r"^\s*keywords:", fm, re.M)):
+        return None
+    try:
+        log = json.loads(ev.group(2))
+    except ValueError:
+        return None
+    kw = re.search(r"^\s*keywords:\s*([^\n]*)$", fm, re.M)
+    old = (kw.group(1).strip() if kw else "")[:160]
+    log.append({"ts": ts, "type": "rekeyed", "delta": 0,
+                "reason": "rekeyed: distinctive keywords from full statement"
+                          + (" (was: %s)" % old if old else ""),
+                "by": "drain"})
+    fm = re.sub(r"^(\s*keywords:)[^\n]*$",
+                lambda m: m.group(1) + " " + new_kw, fm, count=1, flags=re.M)
+    fm = re.sub(r"^(\s*evidence_log:\s*)\[.*\]\s*$",
+                lambda m: m.group(1) + json.dumps(log, separators=(",", ":"),
+                                                  ensure_ascii=False),
+                fm, count=1, flags=re.M)
+    return fm + rest
+
+
+def rekey(apply=False):
+    """The ONE-TIME drained-cohort migration: every store prior whose
+    evidence_log carries DRAINED_MARK gets its keywords recomputed with the
+    fixed derivation, edited IN PLACE (atomic; untouched bytes preserved) plus
+    a rekeyed evidence receipt — which is also the idempotence marker (already-
+    rekeyed entries skip). Dry-run unless apply. -> receipt dict."""
+    from . import store
+    ts = pk.now_ts()
+    drained = already = malformed = 0
+    changes = []
+    for e in store.load_all(include_retired=True):
+        log = [i for i in (e.get("evidence_log") or []) if isinstance(i, dict)]
+        if e["type"] != "prior" or \
+                not any(DRAINED_MARK in str(i.get("reason") or "") for i in log):
+            continue
+        drained += 1
+        if any(i.get("type") == "rekeyed" for i in log):
+            already += 1
+            continue
+        with open(e["path"], encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+        new_kw = _keywords_from(pk.slug(str(e["id"])), e.get("statement") or "")
+        edited = _rekey_edit(raw, new_kw, ts)
+        if edited is None:
+            malformed += 1
+            continue
+        changes.append((str(e["id"]), e.get("keywords") or "", new_kw))
+        if apply:
+            pk.atomic_write(e["path"], edited)
+    return {"ts": ts, "drained": drained, "already": already,
+            "malformed": malformed, "changes": changes,
+            "rekeyed": len(changes) if apply else 0}
+
+
+def _cmd_rekey(args):
+    r = rekey(apply="--apply" in args)
+    print("helm drain --rekey: %d drained prior%s — %d to rekey, %d already rekeyed%s"
+          % (r["drained"], "s"[:r["drained"] != 1], len(r["changes"]), r["already"],
+             (", %d malformed skipped" % r["malformed"]) if r["malformed"] else ""))
+    for pid, old, new in r["changes"][:5]:
+        print("  %s: %s -> %s" % (pid, old or "-", new or "-"))
+    if len(r["changes"]) > 5:
+        print("  ... %d more" % (len(r["changes"]) - 5))
+    if "--apply" not in args:
+        print("helm drain --rekey: DRY-RUN (nothing written). Re-run with --apply.")
+    elif r["rekeyed"]:
+        print("helm drain --rekey: REKEYED %d entr%s in place (receipt appended to "
+              "each evidence_log)" % (r["rekeyed"], "y" if r["rekeyed"] == 1 else "ies"))
+    return 0
 
 
 def _repoint_index(mem, renames):
@@ -251,8 +341,11 @@ def apply(plan, mem=None, sweep_dups=False, limit=None):
 
 
 def cmd_drain(args):
-    """drain [--apply] [--sweep-dups] [--limit N] — classify raw memory
-    entries and route them to typed homes. Dry-run by default."""
+    """drain [--apply] [--sweep-dups] [--limit N] | drain --rekey [--apply] —
+    classify raw memory entries and route them to typed homes; --rekey is the
+    one-time drained-cohort keyword migration. Dry-run by default."""
+    if "--rekey" in args:
+        return _cmd_rekey(args)
     mem = _mem_dir()
     if not os.path.isdir(mem):
         print("helm drain: no adopted memory dir at " + mem)

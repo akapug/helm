@@ -302,6 +302,52 @@ class ResolveTest(StoreBase):
         self.assertEqual(store.resolve_prompt("glorp time"), [])
 
 
+class DFRankTest(StoreBase):
+    """DF-weighted JIT scoring: a matched probe contributes 1/df (df = entries
+    carrying it), confidence-weighted — rare keywords are strong signals, and
+    the old (hits, id-desc) ranking noise is gone."""
+
+    def test_rare_keyword_outranks_generic_with_more_hits(self):
+        # six entries share alpha/beta/gamma (df=6 each); one entry alone
+        # carries glorpx (df=1). Old ranking: 3 hits beat 1 -> a shared-keyword
+        # entry won. DF: 3/6 = 0.5 < 1/1 = 1.0 -> the rare match wins the cap.
+        for i in range(5):
+            self.seed_prior("filler-%d" % i, "s", conf=0.8, keywords="alpha,beta,gamma")
+        self.seed_prior("many-hits", "s", conf=0.8, keywords="alpha,beta,gamma")
+        self.seed_prior("rare-one", "s", conf=0.8, keywords="glorpx")
+        got = [e["id"] for e in store.resolve_prompt("alpha beta gamma glorpx report")]
+        self.assertEqual(got[0], "rare-one")
+
+    def test_alphabetical_order_no_longer_decides(self):
+        # same confidence, same ts: the old tiebreak ranked ids DESCENDING, so
+        # zzz-* won the cap arbitrarily. DF puts the rare match first instead.
+        self.seed_prior("zzz-shared", "s", conf=0.8, keywords="commonkw")
+        self.seed_prior("yyy-shared", "s", conf=0.8, keywords="commonkw")
+        self.seed_prior("aaa-rare", "s", conf=0.8, keywords="rarekw")
+        got = [e["id"] for e in store.resolve_prompt("commonkw rarekw both")]
+        self.assertEqual(got[0], "aaa-rare")
+        # and a FULL tie (score AND ts) falls to stable load order, never the
+        # old id-descending rank (which would put zzz-shared first)
+        self.assertEqual(got[1:], ["yyy-shared", "zzz-shared"])
+
+    def test_tie_breaks_most_recently_updated(self):
+        self.seed_prior("aaa-stale", "s", conf=0.8, keywords="glorp",
+                        last_updated="2026-01-01T00:00:00Z")
+        self.seed_prior("zzz-fresh", "s", conf=0.8, keywords="glorp",
+                        last_updated="2026-06-01T00:00:00Z")
+        self.assertEqual([e["id"] for e in store.resolve_prompt("glorp time")],
+                         ["zzz-fresh", "aaa-stale"])
+
+    def test_df_computed_over_candidates_only(self):
+        # dormant/pinned entries are outside the JIT candidate set, so they
+        # must not dilute df either
+        self.seed_prior("live-one", "s", conf=0.8, keywords="sharedkw")
+        self.seed_prior("dorm-one", "s", conf=0.3, keywords="sharedkw")
+        self.seed_prior("pin-one", "s", conf=1.0, keywords="sharedkw", pin="true")
+        df = store._df_map(store._jit_candidates(store.load_all()))
+        self.assertEqual(df["sharedkw"], 1)
+
+
 class LexiconTest(StoreBase):
     def test_write_and_term_match(self):
         p = store.write_lexicon({"term": "youable", "definition": "able to be you",
@@ -517,6 +563,17 @@ class EntriesSeamTest(StoreBase):
         # dormant/episodic/always filtered exactly as the load_all path would
         self.assertEqual([e["id"] for e in got_jit], ["jit-a"])
 
+    def test_df_scoring_stable_through_seam(self):
+        # the seam path scores identically to the disk path: DF over the
+        # supplied candidate list, rare probe outranks the shared one
+        entries = [self.synth("shared-a", keywords="commonkw"),
+                   self.synth("shared-b", keywords="commonkw"),
+                   self.synth("rare-c", keywords="rarekw")]
+        with mock.patch.object(store, "load_all",
+                               side_effect=AssertionError("entries= must skip load_all")):
+            got = store.resolve_prompt("commonkw rarekw mix", entries=entries)
+        self.assertEqual([e["id"] for e in got], ["rare-c", "shared-a", "shared-b"])
+
 
 class CountsTest(StoreBase):
     def test_per_root_type_counts(self):
@@ -650,6 +707,91 @@ class CliTest(StoreBase):
         self.assertEqual(rc, 2)
         rc, _ = self.run_cli(["frobnicate"])
         self.assertEqual(rc, 2)
+
+
+class AddGuardTest(StoreBase):
+    """supersede-not-duplicate at add time: a live same-id is a hard refuse
+    with the exact follow-up commands (never a silent overwrite — the drain
+    conflict law); a near-identical statement under another id warns loudly
+    and proceeds (never blocked on similarity alone)."""
+
+    def add(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(["add", *args])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_same_id_live_refuses_with_commands(self):
+        rc, _, _ = self.add("prior", "x-law | the original | 0.7 | xkw")
+        self.assertEqual(rc, 0)
+        rc, out, err = self.add("prior", "x-law | a different statement")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("'x-law' is already LIVE [prior helm-global]", err)
+        self.assertIn("helm store evidence", err)
+        self.assertIn("helm store supersede", err)
+        # never a silent overwrite: the original statement survives
+        self.assertEqual(self.one(store.load_all(), "x-law")["statement"],
+                         "the original")
+        # cross-type same slug stays legal (no cross-type shadowing)
+        rc, _, _ = self.add("heuristic", "x-law | do the move | movekw")
+        self.assertEqual(rc, 0)
+        # premise re-add of a live prior hits the same rail (premise IS prior)
+        rc, _, err = self.add("premise", "x-law | now certain")
+        self.assertEqual(rc, 1)
+        self.assertIn("helm store evidence", err)
+
+    def test_retired_or_superseded_id_may_be_re_minted(self):
+        self.add("prior", "gone | old sense | 0.7")
+        store.retire("gone", TS, "over")
+        rc, out, _ = self.add("prior", "gone | new sense | 0.7")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.one(store.load_all(), "gone")["statement"], "new sense")
+
+    def test_near_duplicate_warns_and_proceeds(self):
+        self.add("premise", "small-prs | small reviewable prs land faster and cleaner | prkw")
+        rc, out, err = self.add(
+            "prior", "tiny-prs | small reviewable prs land faster and cleaner today | 0.7")
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertIn("possible duplicate of 'small-prs'", out)
+        self.assertIn("88% statement overlap", out)  # 7/8 tokens shared
+        self.assertIn("helm store supersede", out)
+        self.assertIn("LIVE 'tiny-prs'", out)  # the add went through
+        self.assertEqual(len(store.load_all(types=("prior",))), 2)
+
+    def test_distinct_adds_stay_silent(self):
+        self.add("prior", "one-law | ship small slices deliberately | 0.7")
+        rc, out, _ = self.add(
+            "prior", "other-law | measure quota before dispatching agents | 0.7")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("WARNING", out)
+
+    def test_refuse_sees_live_entry_across_roots(self):
+        # live in ADOPTED; the add targets helm-global — the lens still
+        # refuses (a global add would silently shadow the adopted truth)
+        store.write_prior({"id": "adopted-law", "statement": "adopted sense",
+                           "confidence": 0.9}, root_dir=self.adopted)
+        rc, _, err = self.add("prior", "adopted-law | shadowing attempt")
+        self.assertEqual(rc, 1)
+        self.assertIn("[prior adopted]", err)
+        # a PROJECT-scoped entry is outside the global lens: global add proceeds
+        self.add("prior", "proj-law | project sense | 0.6", "--project", "p1")
+        rc, _, err = self.add("prior", "proj-law | global sense | 0.6")
+        self.assertEqual(rc, 0)
+        # but through the project lens the (narrower) live entry refuses it
+        rc, _, err = self.add("prior", "proj-law | another try | 0.6",
+                              "--project", "p1")
+        self.assertEqual(rc, 1)
+        self.assertIn("[prior project]", err)
+
+    def test_lexicon_redefine_stays_legal(self):
+        self.add("lexicon", "youable | able to be you")
+        rc, out, err = self.add("lexicon", "youable | able to be you, sharpened")
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(self.one(store.load_all(types=("lexicon",)), "youable")
+                         ["definition"], "able to be you, sharpened")
 
 
 if __name__ == "__main__":

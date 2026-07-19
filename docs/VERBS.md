@@ -101,6 +101,18 @@ that rail is what makes premises human-only. A certain prior contradicted by
 agent evidence keeps its confidence: the contradiction is logged and the drift
 report surfaces it.
 
+`add` enforces **supersede-not-duplicate**: a same-id entry that is already
+LIVE in scope is a hard refuse — never a silent overwrite — and the refusal
+prints the exact `evidence`/`supersede` commands to run instead. A *different*
+id whose statement is near-identical (token-set overlap ≥ 0.8) warns loudly,
+names the other id and the supersede command, and proceeds — similarity alone
+never blocks. Lexicon is exempt: redefining a term is its update lane.
+
+`resolve` ranks JIT hits DF-weighted: each matched probe scores 1/df (df = how
+many entries carry that keyword), summed and confidence-weighted — one rare
+keyword outranks a pile of shared ones. Ties break most-recently-updated,
+never alphabetical. `helm inject --explain` shows the per-probe contributions.
+
 ```console
 $ helm store add prior "prefer-small-prs | small reviewable PRs land faster | 0.7 | pr,review"
 $ helm store evidence 2026-07-18T09:00:00Z prefer-small-prs +0.1 "three clean merges this week"
@@ -123,16 +135,28 @@ $ echo "how should we drain the memory backlog?" | helm inject --project myproje
 TERM drain: routing raw memory intake to typed homes ...
 ```
 
-### `helm drain [--apply] [--sweep-dups] [--limit N]`
+### `helm drain [--apply] [--sweep-dups] [--limit N] | --rekey [--apply]`
 Classify raw memory intake and route entries to their typed homes, archiving
 sources with a reference back. **Dry-run by default** — nothing moves without
 `--apply`, and the rollback net is verified non-empty first. Conflicts are
-never auto-resolved.
+never auto-resolved. Drained feedback becomes a prior with keywords derived
+from the full statement's distinctive words (≥ 5 chars, non-generic,
+frequency-then-length ranked, cap 8).
+
+`--rekey` is the one-time migration for the already-drained cohort: every
+store prior whose evidence log says "drained from feedback memory" gets its
+keywords recomputed with that derivation, edited **in place** (atomic; every
+untouched byte preserved) plus a `rekeyed` evidence receipt — which is also
+the idempotence marker, so re-runs skip. Dry-run by default, counts reported.
 
 ```console
 $ helm drain
 helm drain plan (12 raw entries): ...
 helm drain: DRY-RUN (nothing moved). Re-run with --apply.
+$ helm drain --rekey
+helm drain --rekey: 413 drained priors — 413 to rekey, 0 already rekeyed
+...
+helm drain --rekey: DRY-RUN (nothing written). Re-run with --apply.
 ```
 
 ### `helm drift [--project P] [--peek]`

@@ -1,5 +1,7 @@
-import json
+import contextlib
+import io
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -101,6 +103,132 @@ class DrainTest(unittest.TestCase):
     def test_limit(self):
         receipt = drain.apply(drain.classify(self.mem), self.mem, limit=1)
         self.assertEqual(receipt["applied"], 1)
+
+
+class KeywordsFromTest(unittest.TestCase):
+    """The fixed derivation: FULL statement, distinctive words (>= 5 chars,
+    non-generic), frequency-then-length ranked, cap 8 — the old slug+80-chars
+    version minted weak generic keywords for the drained cohort."""
+
+    def test_distinctive_words_chosen_generics_excluded(self):
+        kw = drain._keywords_from(
+            "short-dms", "agent DMs must build toward short direct messages").split(",")
+        self.assertIn("short", kw)
+        self.assertIn("direct", kw)
+        self.assertIn("messages", kw)
+        for g in ("build", "agent", "must"):  # generic or < 5 chars
+            self.assertNotIn(g, kw)
+
+    def test_full_statement_not_first_80_chars(self):
+        stmt = "x " * 50 + "quorumward is the load bearing word"
+        self.assertIn("quorumward", drain._keywords_from("slugword", stmt).split(","))
+
+    def test_repeated_topic_word_ranks_first_cap_8(self):
+        stmt = ("checkpoint early checkpoint often checkpoint always; "
+                "alpha1 beta22 gamma333 delta4444 epsilon5 zetas66 etaxx77 thetas888")
+        kw = drain._keywords_from("", stmt).split(",")
+        self.assertEqual(kw[0], "checkpoint")  # freq 3 beats every singleton
+        self.assertEqual(len(kw), 8)           # capped
+
+    def test_empty_statement_falls_back_to_slug(self):
+        self.assertEqual(drain._keywords_from("atomic-write", ""), "atomic,write")
+        self.assertEqual(drain._keywords_from("a-b", ""), "")
+
+
+class RekeyTest(unittest.TestCase):
+    """drain --rekey: the one-time drained-cohort keyword migration — in-place
+    two-line edit, evidence receipt as the idempotence marker, dry-run default."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-rekey-")
+        self.env_prior = {k: os.environ.get(k)
+                          for k in ("HELM_HOME", "HELM_ADOPTED_DIR")}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        self.mem = os.path.join(self.tmp, "adopted")
+        os.makedirs(self.mem)
+        os.environ["HELM_ADOPTED_DIR"] = self.mem
+        # a real drained prior, minted by drain.apply itself
+        pk.atomic_write(os.path.join(self.mem, "feedback-atomic-writes.md"), _mem_entry(
+            "feedback-atomic-writes.md", "feedback",
+            "always use atomic writes so a torn checkpoint never lands"))
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {}})
+        drain.apply(drain.classify(self.mem), self.mem)
+        self.path = os.path.join(self.mem, "prior-atomic-writes.md")
+        # simulate the drained cohort: overwrite with the OLD derivation's
+        # weak keywords (drain now writes the fixed set at drain time)
+        raw = re.sub(r"^(  keywords:).*$", r"\1 use,atomic,writes,torn",
+                     self.read(self.path), count=1, flags=re.M)
+        pk.atomic_write(self.path, raw)
+        # a NON-drained store prior: rekey must never touch it
+        from helm import store
+        self.other = store.write_prior({"id": "hand-authored", "statement":
+                                        "authored by hand", "confidence": 0.8,
+                                        "keywords": "handkw"})
+
+    def tearDown(self):
+        for k, v in self.env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def read(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_dry_run_writes_nothing(self):
+        before = self.read(self.path)
+        r = drain.rekey()
+        self.assertEqual((r["drained"], r["already"], r["rekeyed"]), (1, 0, 0))
+        self.assertEqual(len(r["changes"]), 1)
+        self.assertEqual(self.read(self.path), before)
+
+    def test_apply_rekeys_in_place_preserving_untouched_bytes(self):
+        before = self.read(self.path)
+        r = drain.rekey(apply=True)
+        self.assertEqual(r["rekeyed"], 1)
+        after = self.read(self.path)
+        # exactly two lines changed: evidence_log + keywords; every other
+        # line survives byte-identical, in order
+        diff = [(b, a) for b, a in zip(before.splitlines(), after.splitlines())
+                if b != a]
+        self.assertEqual([b.split(":")[0] for b, _ in diff],
+                         ["  evidence_log", "  keywords"])
+        kws = next(a for _, a in diff if a.startswith("  keywords:")) \
+            .split(":", 1)[1].strip().split(",")
+        self.assertEqual(kws[0], "atomic")  # slug + statement, freq 2
+        self.assertIn("checkpoint", kws)
+        self.assertNotIn("torn", kws)       # < 5 chars — no longer minted
+        self.assertNotIn("use", kws)        # generic stays out
+        self.assertIn('"type":"rekeyed"', after)  # the receipt landed
+        # body + provenance untouched
+        self.assertIn("the full body", after)
+        self.assertIn("drained_from: feedback-atomic-writes.md", after)
+        # the non-drained prior is untouched
+        self.assertNotIn("rekeyed", self.read(self.other))
+
+    def test_idempotent_second_run_skips_via_marker(self):
+        drain.rekey(apply=True)
+        first = self.read(self.path)
+        r = drain.rekey(apply=True)
+        self.assertEqual((r["drained"], r["already"], r["rekeyed"]), (1, 1, 0))
+        self.assertEqual(self.read(self.path), first)
+
+    def test_cmd_flag_dry_run_default(self):
+        before = self.read(self.path)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = drain.cmd_drain(["--rekey"])
+        self.assertEqual(rc, 0)
+        self.assertIn("DRY-RUN", out.getvalue())
+        self.assertIn("1 to rekey", out.getvalue())
+        self.assertEqual(self.read(self.path), before)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = drain.cmd_drain(["--rekey", "--apply"])
+        self.assertEqual(rc, 0)
+        self.assertIn("REKEYED 1", out.getvalue())
 
 
 if __name__ == "__main__":

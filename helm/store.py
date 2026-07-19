@@ -435,21 +435,46 @@ def _find(eid, project=None, types=None):
 # resolve — the ONE JIT lane (priors + heuristics + lexicon + references)
 # ---------------------------------------------------------------------------
 
+def _probes(e):
+    """The entry's probe set — id + csv keywords, lowercased, deduped — as
+    {(probe, is_generic)}. The ONE probe vocabulary, shared by matching
+    (_probe_hits) and DF weighting (_df_map)."""
+    generic = _HEURISTIC_GENERIC if e["type"] == "heuristic" else GENERIC_KEYWORDS
+    return {(str(e["id"]).lower(), False)} | {
+        (k.strip().lower(), k.strip().lower() in generic)
+        for k in (e.get("keywords") or "").split(",") if k.strip()}
+
+
+def _jit_candidates(entries):
+    """The JIT-resolvable slice of a load_all() list — the uniform post-filter
+    (always/dormant/episodic out) so a raw caller-supplied list needs no
+    pre-shaping. Shared by resolve_prompt and inject --explain."""
+    return [e for e in entries if e["type"] in _JIT_TYPES
+            and e.get("load_class") not in ("always", "dormant")]
+
+
+def _df_map(entries):
+    """probe -> document frequency over the candidate set: one pass over the
+    in-memory list, computed fresh per resolve call, never persisted. A probe
+    carried by MANY entries' keywords is a weak signal; a rare one is strong —
+    a matched probe scores 1/df."""
+    df = {}
+    for e in entries:
+        for p in {p for p, _g in _probes(e)}:
+            df[p] = df.get(p, 0) + 1
+    return df
+
+
 def _probe_hits(e, low):
     """The ONE keyword-match law: (hits, specific, matched) for entry `e`
     against lowercased turn text — id + csv keywords, word-boundary, the
     specificity guard. Shared by resolve_prompt (scoring) and inject --explain
     (the why); `matched` is the sorted probe list that actually hit."""
-    heur = e["type"] == "heuristic"
-    generic = _HEURISTIC_GENERIC if heur else GENERIC_KEYWORDS
-    min_len = _MIN_HEURISTIC_TOKEN if heur else 1
-    probes = [(str(e["id"]).lower(), False)] + [
-        (k.strip().lower(), k.strip().lower() in generic)
-        for k in (e.get("keywords") or "").split(",") if k.strip()]
+    min_len = _MIN_HEURISTIC_TOKEN if e["type"] == "heuristic" else 1
     hits = 0
     specific = False
     matched = []
-    for p, is_generic in {(p, g) for p, g in probes}:
+    for p, is_generic in _probes(e):
         # substring prefilter before the (expensive) word-boundary regex —
         # ~all probes miss on any given prompt, so only true hits pay the
         # regex. Measured 88ms -> 1.3ms per call on the live store, and this
@@ -466,33 +491,38 @@ def _probe_hits(e, low):
 
 def resolve_prompt(text, project=None, cap=4, entries=None):
     """JIT: live, non-dormant entries whose id/keywords (lexicon: term)
-    word-boundary-match the turn text, ranked confidence-weighted
-    (score = specific-guarded hits * confidence; ties -> last_updated desc then
-    id). Pinned (load_class always) entries are NOT returned here — they are
-    emitted unconditionally via pinned(). Salience law: EMPTY on no match.
-    entries= feeds the lane from a caller-supplied load_all() list (the inject
-    parsed-entry cache) instead of a fresh parse; None = load_all() as ever."""
+    word-boundary-match the turn text, DF-WEIGHTED: each matched probe
+    contributes 1/df (df = how many candidate entries carry that probe, one
+    in-memory pass per call), summed then confidence-weighted — one rare
+    keyword outranks a pile of shared ones, so the cap-4 winners are earned,
+    not (hits, id-desc) noise. The specificity guard is unchanged: at least
+    one non-generic probe must hit. Ties break most-recently-updated first,
+    then stable load order — NEVER the id (with ~400 same-day priors the old
+    id tiebreak made the winners reverse-alphabetical). Pinned (load_class
+    always) entries are NOT returned here — they are emitted unconditionally
+    via pinned(). Salience law: EMPTY on no match. entries= feeds the lane
+    from a caller-supplied load_all() list (the inject parsed-entry cache)
+    instead of a fresh parse; None = load_all() as ever."""
     low = (text or "").lower()
     if not low.strip():
         return []
     if entries is None:
         entries = load_all(project=project, include_dormant=False, types=_JIT_TYPES)
+    cand = _jit_candidates(entries)
+    df = _df_map(cand)
     scored = []
-    for e in entries:
-        # uniform post-filter so a raw load_all() list needs no pre-shaping
-        if e["type"] not in _JIT_TYPES or e.get("load_class") in ("always", "dormant"):
-            continue
-        hits, specific, _ = _probe_hits(e, low)
+    for e in cand:
+        hits, specific, matched = _probe_hits(e, low)
         if hits and specific:
-            scored.append((hits * e["confidence"],
+            scored.append((e["confidence"] * sum(1.0 / df[p] for p in matched),
                            str(e.get("last_updated") or e.get("updated_ts") or ""),
-                           str(e["id"]), e))
-    scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+                           e))
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)  # stable: never id order
     try:
         n = int(cap)
     except (TypeError, ValueError):
         n = 4
-    return [t[3] for t in scored[:max(n, 0)]]
+    return [t[2] for t in scored[:max(n, 0)]]
 
 
 def pinned(project=None, entries=None):
@@ -795,6 +825,40 @@ def retire(eid, ts, why="", project=None):
 
 
 # ---------------------------------------------------------------------------
+# add guard — supersede-not-duplicate (the drain conflict law at add time)
+# ---------------------------------------------------------------------------
+
+DUP_OVERLAP = 0.8  # near-identical statement threshold (token-set Jaccard)
+
+# add's <type> arg -> the store type the guard checks (premise IS a prior).
+# Lexicon is exempt by design: redefinition is its only update lane (no
+# supersede/evidence leg), so a re-define stays a legal in-place update.
+_GUARD_TYPE = {"prior": "prior", "premise": "prior",
+               "heuristic": "heuristic", "reference": "reference"}
+
+
+def _tokens(s):
+    return set(re.split(r"[^a-z0-9]+", (s or "").lower())) - {""}
+
+
+def _near_dup(etype, eid, statement, project=None):
+    """The nearest LIVE same-type entry (excluding eid) whose statement's
+    normalized token-set overlap (Jaccard) >= DUP_OVERLAP -> (entry, overlap),
+    else (None, 0). Similarity WARNS, never blocks — the operator may
+    genuinely want both."""
+    want, tok = _slug(str(eid)), _tokens(statement)
+    best, best_ov = None, 0.0
+    for e in load_all(project=project, types=(etype,)):
+        if _slug(str(e["id"])) == want:
+            continue
+        other = _tokens(e.get("statement"))
+        ov = len(tok & other) / len(tok | other) if tok and other else 0.0
+        if ov >= DUP_OVERLAP and ov > best_ov:
+            best, best_ov = e, ov
+    return best, best_ov
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -810,6 +874,8 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
       heuristic: <id> | <move> [| trigger-csv [| domain]]
       reference: <id> | <summary> [| url [| keywords [| domain]]]
       flags: [--source S] [--rationale <text...>]   (rationale seeds evidence_log)
+      a LIVE same-id add is REFUSED (supersede/evidence instead, printed);
+      a near-identical statement warns and proceeds (lexicon redefines freely)
   resolve                                     prompt on stdin -> JIT hits
   pinned                                      the always-on lane
   evidence <ts> <id> <delta> <reason...>      move a belief (logged + clamped)
@@ -917,6 +983,32 @@ def cmd_store(args):
             print(_USAGE, file=sys.stderr)
             return 2
         ts = pk.now_ts()
+
+        # supersede-not-duplicate guard: a live same-id NEVER silently
+        # overwrites (hard refuse, exact follow-up commands); a near-identical
+        # statement under another id warns loudly and proceeds.
+        gt = _GUARD_TYPE.get(etype)
+        if gt:
+            cur = _find(parts[0], project=project, types=(gt,))
+            if cur and cur.get("status") == STATUS_LIVE:
+                print("helm store add: '%s' is already LIVE [%s %s] — refusing to "
+                      "overwrite (supersede-not-duplicate law)"
+                      % (parts[0], gt, cur["root"]), file=sys.stderr)
+                if gt == "prior":
+                    print("  update its confidence:  helm store evidence %s %s "
+                          "<delta> <reason...>" % (ts, parts[0]), file=sys.stderr)
+                print("  or replace it:          helm store add %s <new-id> | <statement...>"
+                      % etype, file=sys.stderr)
+                print("                          helm store supersede %s %s <new-id> "
+                      "[reason...]" % (ts, parts[0]), file=sys.stderr)
+                return 1
+            dup, ov = _near_dup(gt, parts[0], parts[1], project=project)
+            if dup:
+                print("helm store add: WARNING possible duplicate of '%s' (%d%% "
+                      "statement overlap) — if it IS the same knowledge, supersede "
+                      "instead of accumulating:" % (dup["id"], round(ov * 100)))
+                print("  helm store supersede %s %s %s <reason...>"
+                      % (ts, dup["id"], parts[0]))
 
         if etype in ("prior", "premise"):
             path = os.path.join(_default_dir("prior", project),
