@@ -162,5 +162,40 @@ class TestSyncSurvival(RegistryBase):
         self.assertEqual(sorted(pk.read_json(home.authored_path())["projects"]), ["proj"])
 
 
+class TestReviewHardening(RegistryBase):
+    """Cross-family (codex-seat) review findings, 2026-07-19 — pinned."""
+
+    def test_save_never_clobbers_path_mismatched_authored_entry(self):
+        # incumbent authored at path A; a merged view carrying same-NAME
+        # authored fields at path B must not delete A's entry on save
+        pk.write_json(home.authored_path(), {"version": 1, "projects": {
+            "proj": {"path": "/elsewhere/proj", "notes": "the unrebuildable note"}}})
+        reg = {"version": 1, "projects": {
+            "proj": {"name": "proj", "path": "/here/proj", "kind": "git",
+                     "status": "active", "sessions": {},
+                     "edges": [{"rel": "forked-from", "to": "elder"}]}}}
+        registry.save(reg)
+        auth = pk.read_json(home.authored_path())["projects"]
+        self.assertEqual(auth["proj"]["notes"], "the unrebuildable note")  # survived
+        q = registry._qualified("proj", "/here/proj")
+        self.assertEqual(auth[q]["edges"][0]["to"], "elder")  # newcomer parked
+        # and load() resolves the newcomer via the qualified key
+        merged = registry.load()["projects"]["proj"]
+        self.assertEqual(merged["edges"][0]["to"], "elder")
+
+    def test_corrupt_authored_file_backed_up_before_any_save(self):
+        os.makedirs(os.path.dirname(home.authored_path()), exist_ok=True)
+        with open(home.authored_path(), "w") as f:
+            f.write("{ this is not json")
+        registry.save({"version": 1, "projects": {}})
+        siblings = [n for n in os.listdir(os.path.dirname(home.authored_path()))
+                    if n.startswith(os.path.basename(home.authored_path()) + ".corrupt-")]
+        self.assertEqual(len(siblings), 1)  # the garbled bytes survive for repair
+        bak = os.path.join(os.path.dirname(home.authored_path()), siblings[0])
+        with open(bak) as f:
+            self.assertIn("this is not json", f.read())
+        self.assertIsInstance(pk.read_json(home.authored_path()), dict)  # rewritten clean
+
+
 if __name__ == "__main__":
     unittest.main()

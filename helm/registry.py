@@ -19,6 +19,7 @@ Adoption law: where a project already has a knowledge home (mission-control's
 never a second copy.
 """
 import os
+import shutil
 import time
 
 from . import automap, home, pk
@@ -33,7 +34,35 @@ ADOPTED_HOMES = {
 
 
 def _authored_load():
-    return pk.read_json(home.authored_path(), {"version": 1, "projects": {}})
+    """The authored layer, with a corruption net: an unparseable file is backed
+    up beside itself BEFORE any caller can save over it — authored content is
+    unrebuildable, so a garbled byte must never cascade into an empty rewrite
+    (cross-family review finding, 2026-07-19)."""
+    path = home.authored_path()
+    val = pk.read_json(path)
+    if isinstance(val, dict):
+        return val
+    if os.path.exists(path):
+        bak = path + ".corrupt-" + pk.now_ts().replace(":", "")
+        if not os.path.exists(bak):
+            shutil.copy2(path, bak)
+    return {"version": 1, "projects": {}}
+
+
+def _qualified(name, path):
+    """The collision key for a same-name entry authored against a different
+    path — both survive; the path stamp decides which one a project reads."""
+    import hashlib
+    return "%s@%s" % (name, hashlib.sha1((path or "").encode()).hexdigest()[:8])
+
+
+def _authored_for(entries, name, path):
+    """The authored entry for (name, path): the name key when its stamp
+    matches, else the path-qualified key. None when neither matches."""
+    entry = entries.get(name)
+    if entry is not None and entry.get("path", path) == path:
+        return entry
+    return entries.get(_qualified(name, path))
 
 
 def load():
@@ -61,8 +90,8 @@ def load():
         pk.write_json(home.authored_path(), auth)
         pk.write_json(home.registry_path(), reg)
     for name, rec in projects.items():
-        entry = entries.get(name)
-        if entry and entry.get("path", rec.get("path")) == rec.get("path"):
+        entry = _authored_for(entries, name, rec.get("path"))
+        if entry:
             rec.update({k: entry[k] for k in AUTHORED_FIELDS if k in entry})
     for name, entry in entries.items():  # external anchors outlive a projection wipe
         if name in projects or not entry.get("external"):
@@ -88,7 +117,15 @@ def save(reg):
         keep = {k: rec[k] for k in AUTHORED_FIELDS if k in rec}
         if keep:
             keep["path"] = rec.get("path", "")
-            entries[name] = keep
+            cur = entries.get(name)
+            if cur is not None and cur.get("path", keep["path"]) != keep["path"]:
+                # a same-name entry authored against a DIFFERENT path: never
+                # clobber it (unrebuildable) — the newcomer's authored fields
+                # land under the path-qualified key; both survive, load()
+                # resolves by path stamp (cross-family review finding)
+                entries[_qualified(name, keep["path"])] = keep
+            else:
+                entries[name] = keep
         proj["projects"][name] = {k: v for k, v in rec.items() if k not in AUTHORED_FIELDS}
     pk.write_json(home.authored_path(), auth)
     pk.write_json(home.registry_path(), proj)
