@@ -206,9 +206,12 @@ helm drain --rekey: DRY-RUN (nothing written). Re-run with --apply.
 ```
 
 ### `helm drift [--project P] [--peek]`
-Surface belief drift — contradictions, tier-crossings, decays — and only
-that. Steady beliefs print one summary line. `--peek` reads without updating
-the snapshot.
+Surface belief drift — contradictions, tier-crossings, decays, and evolutions
+— and only that. A superseded premise reports `EVOLVED`, exactly once:
+*attested chain* when its signed supersession link verifies (offline; the
+biography is one `helm premise-check --chain` away), *unbacked* when the
+supersession is store-only. Steady beliefs print one summary line. `--peek`
+reads without updating the snapshot.
 
 ```console
 $ helm drift
@@ -346,15 +349,42 @@ $ helm premise "naming-extremes | metaphors live at the extremes only"
 helm premise: LIVE 'naming-extremes' [certain 1.00] - metaphors live at the extremes only
 ```
 
-### `helm premise-check <id> [--project P]`
-Re-verify an attested premise: recompute the digest from the stored statement,
-compare to the attested payload, and quote the finality tier the ledger node
-proves. Exit 0 on a digest match.
+### `helm premise --supersede <old-id> <new-id> | <statement> [| keywords [| domain]]`
+Evolve the chain instead of editing in place: captures the NEW premise,
+tombstones the old one through the store's own lifecycle (`replaced_by` /
+`supersedes`, file kept), and commits ONE signed turn linking the chain —
+`sup:b2b:<new digest>:<prior turn prefix>`. The store legs land even with
+the node down; only the turn queues, and replay binds the prior turn hash in
+queue order. Re-stating a LIVE attested premise with a different statement
+is refused toward this verb — an in-place edit would orphan the attestation.
 
 ```console
-$ helm premise-check naming-extremes
-  digest: MATCH prem:b2b:9f2c...
+$ helm premise --supersede naming-extremes "naming-poles | metaphors live at the poles"
+helm premise: LIVE 'naming-poles' [certain 1.00] - metaphors live at the poles
+  supersedes 'naming-extremes' — tombstoned (delete_eligible, file kept)
+  attested: turn 41c2... (chain_index 7) signed by profile 'david'
+```
+
+### `helm premise-check <id> [--chain] [--project P]`
+Re-verify an attested premise: recompute the digest from the stored statement,
+compare to the attested payload (`prem:` or `sup:` form), and quote the
+finality tier the ledger node proves. Exit 0 on a digest match. `--chain`
+walks the whole supersession chain through any link — every digest and hop
+linkage re-verified, every turn's tier quoted — and prints the attested
+biography ("held X until T, then Y"). The on-ledger link is a 16-hex
+**pointer**; the full prior-turn hash rides frontmatter
+(`attest_supersedes_turn`) — a pointer, not a proof, and the output says so.
+
+```console
+$ helm premise-check naming-poles
+  digest: MATCH sup:b2b:9f2c...
   finality tier: attested-after-next-height (consensus_final at attested_height 43)
+$ helm premise-check --chain naming-poles
+  1. naming-extremes [delete_eligible] - metaphors live at the extremes only
+  2. naming-poles [live] - metaphors live at the poles
+       link 1->2 ATTESTED — full linkage in frontmatter
+  biography:
+    held 'metaphors live at the extremes only' until 2026-07-19T..., then 'metaphors live at the poles' — LIVE now
 ```
 
 ## sessions — every harness, one catalog

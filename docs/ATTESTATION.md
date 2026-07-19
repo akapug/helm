@@ -132,15 +132,57 @@ included) are attested **in place**:
 
 ## Supersession is a chain, not an edit
 
-Retiring or superseding an attested premise is a **new signed turn**
-referencing the prior one — append-only, mirroring the store's record law
-(files are kept; status flips). Belief history thereby becomes a provable
-chain — *held X until T, then Y* — which the drift report can read as
-attested belief evolution rather than lost history.
+Superseding an attested premise is a **new signed turn** referencing the
+prior one — append-only, mirroring the store's record law (files are kept;
+status flips). Belief history thereby becomes a provable chain — *held X
+until T, then Y* — which the drift report reads as attested belief evolution
+rather than lost history.
+
+`helm premise --supersede <old-id> <new-id> | <statement> [| keywords [|
+domain]]` does all three legs in one verb:
+
+1. **Store** — the new premise is captured (same shape as a plain capture)
+   and the old one is tombstoned through the store's own lifecycle
+   (`status: delete_eligible`, the existing `replaced_by`/`supersedes`
+   backpointers — zero schema change, the file stays). This leg is local and
+   lands even with the node down.
+2. **Ledger** — ONE signed turn commits the link:
+   `sup:b2b:<64-hex new digest>:<16-hex prior attest_turn prefix>` — 89
+   bytes, inside the 104-byte whisper budget. The truncated prefix is a
+   **pointer, not a proof**; the full prior turn hash rides the new entry's
+   frontmatter as `attest_supersedes_turn`, and every surface that quotes the
+   chain states that distinction.
+3. **Queue** — with the substrate down, the turn queues with the link
+   *unbound*: replay binds the prior turn hash at send time, so a pending
+   `prem:` turn earlier in the queue lands before the `sup:` turn that
+   references it (replayed in order). A never-attested predecessor is stated
+   honestly — the chain starts at the new premise with a plain `prem:` turn.
+
+An edit that would orphan an attestation is refused at capture: re-stating a
+LIVE attested premise with a *different* statement points you at
+`--supersede` (an identical re-statement is recognized as already attested
+and sends nothing).
+
+**Reading the chain.** `helm premise-check --chain <id>` walks the chain
+through any link (back via `supersedes`, forward via `replaced_by`),
+re-verifies every digest and every hop's linkage, quotes each turn's
+finality tier from the node, and prints the attested biography — *held X
+until T, then Y*. Exit 0 means every digest matches and no link is broken; a
+store-only (unbacked) hop prints loudly but is a stated design state, not
+corruption.
+
+**Drift reads it too.** A superseded premise whose chain verifies (offline —
+the drift path never calls the node) reports as `EVOLVED … attested chain`,
+exactly once per hop; a store-only supersession reports as unbacked. Belief
+evolution surfaces as provable history instead of disappearing silently.
 
 The store's lifecycle writers carry the `attest_*` keys through rewrites
 (evidence, retire) — a lifecycle update never orphans the entry's receipt
-annotations. The attestation **truth still lives on the ledger**; the file
+annotations. (`attest_supersedes_turn` is the one exception — store rewrites
+shed it — so chain verification hinges on the surviving
+`attest_payload`/`attest_turn` fields and treats the frontmatter full hash
+as corroboration; `--supersede` itself restores it when extending a chain.)
+The attestation **truth still lives on the ledger**; the file
 keys are the convenient pointer back to it (turn hash, receipt, chain index),
 recoverable from the queue/receipts if a file is ever hand-edited without
 them. The design record behind all of this is an
