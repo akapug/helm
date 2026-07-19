@@ -17,7 +17,14 @@ observations, never deletes a known project, never touches authored fields.
 Adoption law: where a project already has a knowledge home (mission-control's
 ~/.mc/mission-control), ~/.helm/<name> becomes a SYMLINK to it — one chain,
 never a second copy.
+
+Also home of the PROJECTION REGISTRY (projections() + projection_survey()):
+constitution laws 2+3 as an executable manifest — every on-disk store helm
+reads or writes declares its class, and every projection its source + rebuild.
+`helm projections` is the read surface; doctor.check_projection_registry
+enforces it.
 """
+import fnmatch
 import os
 import shutil
 import time
@@ -274,3 +281,176 @@ def add_edge(src, rel, dst, note="", confirmed=True):
     edges.append(e)
     save(reg)
     return e, None
+
+
+# ---------------------------------------------------------------------------
+# projection registry — constitution laws 2+3 as an executable manifest
+# ---------------------------------------------------------------------------
+
+# Every on-disk store helm reads or writes, classified:
+#   authored     source of truth — unrebuildable, never regenerated, ships
+#   projection   regenerable view — source + rebuild REQUIRED; a projection
+#                that cannot name its rebuild cannot be safely wiped or
+#                gitignored (the ship-pull derived/authored split rests here)
+#   events       append-only receipts — lossy-by-design, never truth
+#   state        host-local runtime — safe to lose, readers fail open
+#   backup       recovery copies of authored/config content
+# doctor walks the manifest READ-ONLY (it reports; rebuilds stay with their
+# legs: sync/sessions/inject/drift); rebuild-and-converge is pinned by the
+# test suite, not run in doctor.
+KINDS = ("authored", "projection", "events", "state", "backup")
+
+
+def cache_root():
+    """~/.cache/helm — the second classified root. HELM_CACHE_DIR overrides
+    (inject._cache_file's law), which is how tests point it at a tmp dir."""
+    return home.env("CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "helm")
+
+
+def projections():
+    """The executable manifest: one row per declared on-disk store —
+    {name, kind, root, globs, source, sources, rebuild, fresh_days,
+    mutable: False}. globs are root-relative, fnmatch semantics (* crosses
+    /); `sources` are the authoritative paths a projection re-derives from
+    (at least one must exist while the projection does); `fresh_days` is the
+    declared staleness horizon (None = self-invalidating: sig-keyed or TTL).
+    Any file under either root that NO row names is an unclassified
+    squatter — the ~/.remember rot class, flagged by doctor."""
+    from . import store
+    u = os.path.expanduser("~")
+    scans = tuple(r for r in (home.env("SCAN_ROOTS") or "").split(":") if r)
+    harness_roots = (os.path.join(u, ".claude", "projects"),
+                     os.path.join(u, ".codex", "sessions"),
+                     os.path.join(u, ".local", "share", "opencode")) + scans
+    store_roots = (store.adopted_dir(), home.global_dir())
+    master = home.registry_path()
+    g_cats = sorted(set(home.GLOBAL_CATEGORIES) | set(store.TYPE_SUBDIR.values()))
+    # + reflexes: mentor-taught project reflexes are authored (provenanced)
+    p_cats = sorted(set(home.PROJECT_CATEGORIES) | set(store.TYPE_SUBDIR.values())
+                    | {"reflexes"})
+
+    def row(name, kind, root, globs, source="", sources=(), rebuild=None, fresh_days=None):
+        return {"name": name, "kind": kind, "root": root, "globs": tuple(globs),
+                "source": source, "sources": tuple(sources), "rebuild": rebuild,
+                "fresh_days": fresh_days, "mutable": False}
+
+    return (
+        row("registry", "projection", "home", ("_global/registry.json",),
+            source="harness session stores + disk repo scan",
+            sources=harness_roots, rebuild="helm sync", fresh_days=30),
+        row("project-registry", "projection", "home", ("*/registry.json",),
+            source="_global/registry.json (+ authored layer), re-mirrored per project",
+            sources=(master,), rebuild="helm sync", fresh_days=30),
+        row("registry-authored", "authored", "home", ("_global/registry-authored.json",)),
+        row("store-global", "authored", "home",
+            tuple("_global/%s/*" % c for c in g_cats)),
+        row("store-project", "authored", "home",
+            tuple("*/%s/*" % c for c in p_cats)),
+        row("host-blocks", "projection", "home", ("_global/hosts/*",),
+            source="this host's registry.json observations",
+            sources=(master,), rebuild="helm ship --apply"),
+        row("gitignore", "authored", "home", (".gitignore",)),
+        row("events-journal", "events", "home", ("_global/.state/events.jsonl*",)),
+        row("inject-ledger", "events", "home", ("_global/.state/inject-ledger.jsonl*",)),
+        row("attest-queue", "state", "home", ("_global/.state/attest-queue.jsonl",)),
+        row("inject-seen", "state", "home", ("_global/.state/inject-seen/*",)),
+        row("coinages", "state", "home", ("_global/.state/coinages.json",)),
+        row("drift-snapshot", "projection", "home",
+            ("_global/.state/drift-snapshot*.json",),
+            source="the typed store's prior confidences",
+            sources=store_roots, rebuild="helm drift"),
+        row("now", "state", "home", ("_global/now.md",)),
+        row("chat-node", "state", "home", ("_global/.state/chat-node.json",)),
+        row("cells", "state", "home", ("_global/.state/cells.json",)),
+        row("reflex-state", "state", "home", ("_global/.state/reflex-state/*",)),
+        row("seats", "state", "home", ("_global/seats/*",)),
+        row("catalog-cache", "projection", "cache", ("catalog-cache.json",),
+            source="local claude/codex transcripts (cv ls, or the scanner)",
+            sources=harness_roots, rebuild="helm sessions"),
+        row("syn-cache", "projection", "cache", ("syn-cache.json",),
+            source="transcript first-bytes (synthetic-session peek)",
+            sources=harness_roots, rebuild="helm sessions"),
+        row("store-cache", "projection", "cache", ("store-cache-*.json",),
+            source="the typed store roots (stat-signature keyed)",
+            sources=store_roots, rebuild="helm inject"),
+        row("cwd-overrides", "authored", "cache", ("cwd-overrides.json",)),
+        row("mints", "events", "cache", ("mints.jsonl",)),
+        row("keepalive-log", "events", "cache", ("keepalive-log.jsonl",)),
+        row("usage-history", "events", "cache", ("native-usage-history.jsonl",)),
+        row("backups", "backup", "cache",
+            ("config-backups/*", "settings-backups/*", "skills-backups/*",
+             "skills-trash/*")),
+        row("scratch", "state", "cache", ("*.lock", "*.tmp")),
+    )
+
+
+def _walk_root(root_dir):
+    """Every regular file under root_dir as /-relative paths. .git pruned and
+    symlinks never crossed or listed — a symlink is a pointer into someone
+    else's estate (the adoption law), not a store to classify."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        dirnames[:] = [d for d in dirnames if d != ".git"
+                       and not os.path.islink(os.path.join(dirpath, d))]
+        for n in filenames:
+            p = os.path.join(dirpath, n)
+            if not os.path.islink(p):
+                out.append(os.path.relpath(p, root_dir))
+    return sorted(out)
+
+
+def projection_survey():
+    """The manifest joined to disk: (rows, squatters) where each row copies
+    its manifest row + `files` (matched, root-relative) and squatters is
+    {"home": [...], "cache": [...]} — every file no row names. Overlapping
+    rows both collect a file (classification, not ownership). Read-only;
+    an absent root reads as empty."""
+    rows = [dict(r, files=[]) for r in projections()]
+    squat = {}
+    for root_key, root_dir in (("home", home.helm_home()), ("cache", cache_root())):
+        files = _walk_root(root_dir) if os.path.isdir(root_dir) else []
+        mine = [r for r in rows if r["root"] == root_key]
+        squat[root_key] = []
+        for f in files:
+            hit = False
+            for r in mine:
+                if any(fnmatch.fnmatchcase(f, g) for g in r["globs"]):
+                    r["files"].append(f)
+                    hit = True
+            if not hit:
+                squat[root_key].append(f)
+    return rows, squat
+
+
+def cmd_projections(args):
+    """projections [--json] — the projection registry: every on-disk store
+    helm writes, classified (authored/projection/events/state/backup), each
+    projection naming its source + rebuild. Laws 2+3's read surface;
+    `helm doctor` enforces it (source present, rebuild declared, staleness,
+    squatters)."""
+    rows, squat = projection_survey()
+    if "--json" in args:
+        import json
+        print(json.dumps({"rows": rows, "squatters": squat}, ensure_ascii=False, indent=2))
+        return 0
+    print("helm projections (%d rows over %s + %s):"
+          % (len(rows), home.helm_home(), cache_root()))
+    w = max(len(r["name"]) for r in rows)
+    for r in rows:
+        extra = "" if r["kind"] != "projection" else \
+            "  <- %s | rebuild: %s" % (r["source"], r["rebuild"])
+        n = len(r["files"])
+        print("  %-*s %-10s %4d file%s%s" % (w, r["name"], r["kind"], n,
+                                             "s"[:n != 1] or " ", extra))
+    n = sum(len(v) for v in squat.values())
+    if not n:
+        print("  no unclassified squatters")
+        return 0
+    print("  %d UNCLASSIFIED squatter file%s (no row names them — classify or evict):"
+          % (n, "s"[:n != 1]))
+    for root_key, root_dir in (("home", home.helm_home()), ("cache", cache_root())):
+        for f in squat[root_key][:8]:
+            print("    ? " + os.path.join(root_dir, f))
+        if len(squat[root_key]) > 8:
+            print("    … +%d more under %s" % (len(squat[root_key]) - 8, root_dir))
+    return 0

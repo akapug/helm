@@ -197,5 +197,101 @@ class TestReviewHardening(RegistryBase):
         self.assertIsInstance(pk.read_json(home.authored_path()), dict)  # rewritten clean
 
 
+class TestProjections(RegistryBase):
+    """The projection registry (laws 2+3 as a manifest): well-formed rows,
+    disk survey + squatter detection, the CLI surface, and the converge
+    proof — a wiped projection rebuilds to the same estate from source."""
+
+    def setUp(self):
+        super().setUp()
+        cache = self._dir("cache")
+        envp = mock.patch.dict(os.environ, {"HELM_CACHE_DIR": cache})
+        envp.start()
+        self.addCleanup(envp.stop)
+        self.cache = cache
+
+    def test_manifest_well_formed(self):
+        rows = registry.projections()
+        names = [r["name"] for r in rows]
+        self.assertEqual(len(names), len(set(names)))  # names are keys
+        for r in rows:
+            self.assertIn(r["kind"], registry.KINDS)
+            self.assertIn(r["root"], ("home", "cache"))
+            self.assertTrue(r["globs"])
+            self.assertIs(r["mutable"], False)
+            if r["kind"] == "projection":
+                # the card's law: an undeclared rebuild/source cannot ship
+                self.assertTrue(r["rebuild"], r["name"])
+                self.assertTrue(r["sources"], r["name"])
+                self.assertTrue(r["source"], r["name"])
+
+    def test_survey_classifies_synced_estate_with_zero_squatters(self):
+        repo = self._repo("src", "alpha")
+        registry.sync(observations=[_obs(repo)])
+        rows, squat = registry.projection_survey()
+        by = {r["name"]: r for r in rows}
+        self.assertIn("_global/registry.json", by["registry"]["files"])
+        self.assertTrue(any(f.startswith("alpha/") for f in
+                            by["project-registry"]["files"]))
+        self.assertIn("_global/registry-authored.json",
+                      by["registry-authored"]["files"])
+        self.assertTrue(by["store-global"]["files"])  # the seeded reflex pack
+        self.assertEqual(squat, {"home": [], "cache": []})
+
+    def test_squatter_detected_in_both_roots(self):
+        home.scaffold_global()
+        state = os.path.join(home.global_dir(), ".state")
+        os.makedirs(state, exist_ok=True)
+        pk.atomic_write(os.path.join(state, "mystery.bin"), "?")
+        pk.atomic_write(os.path.join(self.cache, "stray.json"), "{}")
+        _rows, squat = registry.projection_survey()
+        self.assertEqual(squat["home"], ["_global/.state/mystery.bin"])
+        self.assertEqual(squat["cache"], ["stray.json"])
+
+    def test_symlinks_never_crossed_or_flagged(self):
+        # an adopted (symlinked) home is someone else's estate — its contents
+        # are never classified, and the link itself is never a squatter
+        home.scaffold_global()
+        alien = self._dir("alien-estate")
+        pk.atomic_write(os.path.join(alien, "junk.bin"), "?")
+        os.symlink(alien, os.path.join(home.helm_home(), "adopted-proj"))
+        _rows, squat = registry.projection_survey()
+        self.assertEqual(squat["home"], [])
+
+    def test_wipe_and_resync_converges(self):
+        # THE overlay-not-store proof: the projection is regenerable from its
+        # authoritative source — wipe registry.json + the mirror, re-sync,
+        # same estate (doctor stays read-only; this test IS the converge check)
+        repo = self._repo("src", "alpha")
+        reg1, _ = registry.sync(observations=[_obs(repo)])
+        want = {n: p["path"] for n, p in reg1["projects"].items()}
+        mirror = os.path.join(home.project_dir("alpha"), "registry.json")
+        self.assertTrue(os.path.exists(mirror))
+        os.remove(home.registry_path())
+        os.remove(mirror)
+        reg2, _ = registry.sync(observations=[_obs(repo)])
+        self.assertEqual({n: p["path"] for n, p in reg2["projects"].items()}, want)
+        self.assertTrue(os.path.exists(mirror))
+
+    def test_cmd_projections_table_and_json(self):
+        import contextlib
+        import io
+        import json
+        home.scaffold_global()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(registry.cmd_projections([]), 0)
+        out = buf.getvalue()
+        self.assertIn("helm projections", out)
+        self.assertIn("rebuild: helm sync", out)
+        self.assertIn("no unclassified squatters", out)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(registry.cmd_projections(["--json"]), 0)
+        d = json.loads(buf.getvalue())
+        self.assertEqual(len(d["rows"]), len(registry.projections()))
+        self.assertEqual(d["squatters"], {"home": [], "cache": []})
+
+
 if __name__ == "__main__":
     unittest.main()

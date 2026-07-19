@@ -108,6 +108,65 @@ def check_adoption():
     return out
 
 
+def check_projection_registry():
+    """Constitution laws 2+3 as a standing guard, over registry.projections():
+    a projection with no declared rebuild/source FAILs (it cannot be safely
+    wiped or gitignored), a projection ON DISK whose every declared source is
+    gone FAILs (the copy just became the only truth), staleness beyond a
+    row's declared freshness horizon WARNs, and any file under the helm home
+    or cache root named by NO manifest row is an unclassified SQUATTER (the
+    ~/.remember rot class) — the ancestor's one-time squatter eviction, made
+    permanent. Read-only: rebuilds stay with their legs (sync / sessions /
+    inject / drift); the test suite pins rebuild-and-converge."""
+    import time
+    try:
+        rows, squat = registry.projection_survey()
+    except Exception as e:
+        return [(WARN, "projection registry unreadable (%s: %s)"
+                 % (e.__class__.__name__, e))]
+    out = []
+    roots = {"home": home.helm_home(), "cache": registry.cache_root()}
+    for r in rows:
+        if r.get("mutable") is not False:
+            out.append((FAIL, "%s: manifest row not mutable:false — every "
+                              "projection is read-only-as-truth" % r["name"]))
+        if r["kind"] != "projection":
+            continue
+        missing = [w for w in ("rebuild", "sources") if not r.get(w)]
+        if missing:
+            out.append((FAIL, "%s: projection with undeclared %s — cannot be "
+                              "safely wiped or gitignored"
+                        % (r["name"], "/".join(missing))))
+            continue
+        if r["files"] and not any(os.path.exists(s) for s in r["sources"]):
+            out.append((FAIL, "%s: ORPHANED — projection on disk but every "
+                              "declared source is gone (%s); the copy just "
+                              "became the only truth" % (r["name"], r["source"])))
+            continue
+        if r["fresh_days"] and r["files"]:
+            try:
+                newest = max(os.path.getmtime(os.path.join(roots[r["root"]], f))
+                             for f in r["files"])
+            except OSError:
+                continue
+            if time.time() - newest > r["fresh_days"] * 86400:
+                out.append((WARN, "%s: stale beyond its %dd freshness horizon "
+                                  "— rebuild: %s"
+                            % (r["name"], r["fresh_days"], r["rebuild"])))
+    n_sq = sum(len(v) for v in squat.values())
+    if n_sq:
+        first = [os.path.join(roots[k], f) for k in ("home", "cache")
+                 for f in squat[k]][:3]
+        out.append((WARN, "%d unclassified SQUATTER file%s under the helm "
+                          "home/cache (e.g. %s) — `helm projections` lists "
+                          "them; classify (manifest row) or evict"
+                    % (n_sq, "s"[:n_sq != 1], ", ".join(first))))
+    n_proj = sum(1 for r in rows if r["kind"] == "projection")
+    out.append((OK, "projection registry: %d rows, %d projection%s, %d squatter%s"
+                % (len(rows), n_proj, "s"[:n_proj != 1], n_sq, "s"[:n_sq != 1])))
+    return out
+
+
 def check_adopted_store(adopted_dir=None):
     """Adopted-store shape: entry counts by prefix + the prem-/prior- same-slug
     duplicate count (the incomplete-migration leftovers)."""
@@ -244,6 +303,7 @@ def check_record():
 
 
 CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
+          "check_projection_registry",
           "check_adopted_store", "check_know_your_user", "check_cv",
           "check_inject_coverage", "check_env", "check_physics_currency", "check_record",
           "check_chat_node")

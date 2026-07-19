@@ -14,6 +14,14 @@ helm inherits a hard-won information architecture. Its laws:
 3. **Name your source.** Every store must say what it derives from — source,
    projection, replica, or trash. A store that cannot name its source is
    pretending to be canonical: migrate it or archive it.
+
+   Laws 2+3 are *executable*: `registry.projections()` is the manifest — one
+   row per on-disk store, classified (`authored | projection | events | state
+   | backup`), every projection declaring its source and rebuild command.
+   `helm projections` renders it; `helm doctor` enforces it (undeclared
+   rebuild, orphaned projection, staleness, and unclassified-squatter files
+   under `~/.helm` or `~/.cache/helm` — the standing guard against the
+   store-rot that killed the ancestor's `~/.remember`).
 4. **One recall index.** Transcript search/recall lives in one place; helm
    records *how to query it* per project and never builds a second index.
 5. **Placement is policy.** Local-vs-shared, private-vs-published are

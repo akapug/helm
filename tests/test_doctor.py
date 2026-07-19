@@ -20,9 +20,13 @@ class DoctorBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.helm_home = os.path.join(self.tmp.name, "helm-home")
+        scan = os.path.join(self.tmp.name, "scan-root")
+        os.makedirs(scan)  # a live source for the registry projection row
         self.envp = mock.patch.dict(os.environ, {
             "HELM_HOME": self.helm_home,
             "MC_HOME": os.path.join(self.tmp.name, "mc-home"),
+            "HELM_CACHE_DIR": os.path.join(self.tmp.name, "cache"),
+            "HELM_SCAN_ROOTS": scan,
         })
         self.envp.start()
         os.environ.pop("MELD_HOME", None)
@@ -155,6 +159,88 @@ class TestChecks(DoctorBase):
     def test_env_overrides_reported(self):
         msgs = levels(doctor.check_env(), doctor.OK)
         self.assertTrue(any("HELM_HOME=" + self.helm_home in m for m in msgs))
+
+
+class TestProjectionRegistry(DoctorBase):
+    """check_projection_registry: laws 2+3 enforced read-only — undeclared
+    rebuild/source FAILs, an orphaned projection FAILs, declared staleness
+    WARNs, squatters WARN; a clean scaffolded estate is one OK row."""
+
+    def _row(self, **kw):
+        base = {"name": "probe", "kind": "projection", "root": "home",
+                "globs": ("probe.json",), "source": "the probe source",
+                "sources": (os.path.join(self.tmp.name, "scan-root"),),
+                "rebuild": "helm probe", "fresh_days": None, "mutable": False}
+        base.update(kw)
+        return base
+
+    def _check(self, row):
+        from helm import registry
+        with mock.patch.object(registry, "projections", lambda: (row,)):
+            return doctor.check_projection_registry()
+
+    def test_green_scaffold_is_single_ok(self):
+        home.scaffold_global()
+        res = doctor.check_projection_registry()
+        self.assertEqual([lvl for lvl, _ in res], [doctor.OK])
+        self.assertIn("0 squatters", res[0][1])
+
+    def test_undeclared_rebuild_and_source_fail(self):
+        for kw in ({"rebuild": None}, {"sources": ()}):
+            res = self._check(self._row(**kw))
+            fails = levels(res, doctor.FAIL)
+            self.assertTrue(any("undeclared" in m and "gitignored" in m
+                                for m in fails), kw)
+
+    def test_orphaned_projection_fails(self):
+        home.scaffold_global()
+        pk.atomic_write(os.path.join(self.helm_home, "probe.json"), "{}")
+        res = self._check(self._row(
+            sources=(os.path.join(self.tmp.name, "no-such-source"),)))
+        self.assertTrue(any("ORPHANED" in m and "only truth" in m
+                            for m in levels(res, doctor.FAIL)))
+
+    def test_present_source_is_ok_and_absent_projection_skips_orphan_check(self):
+        home.scaffold_global()
+        # no probe.json on disk: a gone source is NOT an orphan (nothing to lose)
+        res = self._check(self._row(
+            sources=(os.path.join(self.tmp.name, "no-such-source"),)))
+        self.assertEqual(levels(res, doctor.FAIL), [])
+        pk.atomic_write(os.path.join(self.helm_home, "probe.json"), "{}")
+        res = self._check(self._row())  # source exists -> healthy
+        self.assertEqual(levels(res, doctor.FAIL), [])
+
+    def test_stale_projection_warns(self):
+        home.scaffold_global()
+        p = os.path.join(self.helm_home, "probe.json")
+        pk.atomic_write(p, "{}")
+        os.utime(p, (0, 0))  # epoch: decades past any horizon
+        res = self._check(self._row(fresh_days=30))
+        self.assertTrue(any("stale" in m and "helm probe" in m
+                            for m in levels(res, doctor.WARN)))
+
+    def test_mutable_row_fails(self):
+        res = self._check(self._row(mutable=True))
+        self.assertTrue(any("read-only-as-truth" in m
+                            for m in levels(res, doctor.FAIL)))
+
+    def test_squatters_warn_with_paths(self):
+        home.scaffold_global()
+        state = os.path.join(home.global_dir(), ".state")
+        pk.atomic_write(os.path.join(state, "mystery.bin"), "?")
+        res = doctor.check_projection_registry()
+        warns = levels(res, doctor.WARN)
+        self.assertTrue(any("SQUATTER" in m and "mystery.bin" in m
+                            and "helm projections" in m for m in warns))
+        self.assertIn("1 squatter", levels(res, doctor.OK)[0])
+
+    def test_survey_trouble_is_warn_not_crash(self):
+        from helm import registry
+        with mock.patch.object(registry, "projection_survey",
+                               side_effect=OSError("boom")):
+            res = doctor.check_projection_registry()
+        self.assertEqual(res[0][0], doctor.WARN)
+        self.assertIn("unreadable", res[0][1])
 
 
 class TestCmdDoctor(DoctorBase):

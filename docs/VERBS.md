@@ -559,6 +559,48 @@ One observe/propose cycle over the stores: what to drain, which beliefs need
 evidence, what's missing. **Proposes, never mutates** — the anti-rulesurf
 gate is constitutional (see [EVOLUTION.md](EVOLUTION.md)).
 
+### `helm gc [--dry | --apply]`
+The retention policy plane over the derived exhaust — the ancestor hit 32MB
+of guard-ledger before learning this, so helm declares budgets on day one.
+Every derived stream (ledgers, rotated generations, per-session state,
+caches, config backups) carries one row in `gc.POLICIES`: a class, ONE budget
+axis (size / age-days / count), and an action. **Dry-run is the default** —
+report what WOULD be reaped, reap nothing; `--apply` enforces. Laws:
+
+- **Authored content is out of reach by class.** Only class `exhaust` is ever
+  reaped. `source` (attest-queue — pending attestations), `archive` (drain
+  archives, skills-trash — the only copy of authored bytes), and `state`
+  (drift baselines) get loud report-only rows whatever their budget says;
+  the queue row points at `helm premise --retry-queue`, the archives at the
+  owner. The typed store itself never appears in the table at all.
+- **Reaping is rotate or prune, never a partial rewrite.** Over-size jsonl
+  ledgers rotate by ONE atomic rename to a dated sibling (the rename is the
+  write-archive-first step; the writer recreates the live file on its next
+  append). Stale derived files/dirs (inject-seen past its own `SEEN_TTL`,
+  dead reflex-state session dirs, aged `.1` generations, store caches,
+  config backups) are pruned. Self-rotating ledgers (inject-ledger, events)
+  budget at their module cap + slack, so gc firing means the module's own
+  rotation broke; `keepalive-log`, `mints`, and `native-usage-history` have
+  no rotation of their own — gc is their only cap.
+- **Fail-open, per stream.** One unreadable stream reports an error row and
+  the sweep continues; rc 0 always — gc is a janitor, not a gate. Age reads
+  the basename stamp before mtime (backup/trash moves preserve the origin's
+  mtime — the wrong axis), and a session dir stays fresh while any file in
+  it moves. An `--apply` that reaped writes one `gc` receipt on the events
+  journal.
+
+`helm projections` is the read surface for what these stores ARE; gc is the
+budget surface for how long their exhaust may live.
+
+```console
+$ helm gc
+helm gc — declared retention over the derived exhaust (dry-run; `helm gc --apply` enforces)
+  OVER  inject-seen  exhaust  age>7d      3 stale of 11 (12.4KB)  would prune 3 items
+  in budget: inject-ledger, events, ... (14/15 streams)
+helm gc: 3 items would be reaped; 0 report-only over budget — nothing touched
+```
+
+
 ### `helm web [--port N] [--open]`
 The same truth, warm, in a browser: five views (knowledge home, quota,
 sessions, configs, chat) served self-contained on `127.0.0.1:7433`. `--open`
