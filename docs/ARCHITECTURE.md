@@ -32,7 +32,23 @@ helm inherits a hard-won information architecture. Its laws:
 | the authored chain (premises/heuristics/lexicon/prd/journal/evals) | **helm** (`~/.helm/<project>/`) | the durable per-project home |
 | know-your-user | **helm** (`~/.helm/_global/know-your-user/`) | the one operator profile |
 
-## Layout
+## Operating scale (why the machinery is sized the way it is)
+
+Numbers from the founding deployment, so a reader can judge each subsystem
+against its *actual* consumer rather than guessing (every one below shipped
+with a live consumer on day one):
+
+- the adopted store is **~880 entry files** — the parsed-entry cache and the
+  substring prefilter exist because the per-prompt hook pays for that corpus
+  on every turn (88ms → ~1ms measured);
+- the session catalog spans **~15,000 sessions** across harnesses — the
+  single-flight cache and stat-keyed rescans exist because `/api/sessions`
+  and `deep_search` join against it;
+- the quota **probe loop feeds the web burn view** (per-account per-hour
+  drop of the binding window) — it is read, not speculative;
+- `helm seat` shipped with a **codex seat live-proven the same day**
+  (prompt, tool round-trip, subagent); other families are config rows on the
+  proven path, not waiting machinery.
 
 ```
 ~/.helm/

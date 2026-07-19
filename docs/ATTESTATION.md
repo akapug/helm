@@ -124,3 +124,21 @@ hash back from the queue/receipts. The design record behind all of this is an
 internal decision document; its ratified shape is summarized in
 [CONCEPTS.md](CONCEPTS.md) and implemented in `helm/premise.py` (whose
 docstring is the normative spec for the digest contract).
+
+## Sequencing: git history vs the ledger
+
+Two tamper-evidence layers serve two different moments, deliberately:
+
+- **Solo-operator history** wants git: the planned authored/derived split
+  (`helm ship`/`pull`) git-backs the authored chain, and the supersession
+  history — *who believed what, when* — rides content-addressed commits with
+  zero daemons. For one operator on their own machines, that is the right
+  weight.
+- **Second-party proof** is what the ledger adds: the day a belief must be
+  proven *to someone else* (multi-operator helm, cross-machine finality), a
+  self-writable git history is no longer evidence — signed turns on the
+  substrate are. That is why the substrate ships optional and propose-only:
+  helm runs fully without it, and it is sequenced to the moment it pays.
+
+The digest check in `helm doctor` stays regardless — it catches accidental
+drift cheaply, whichever history layer is carrying the record.
