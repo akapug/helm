@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from helm import homes
 
@@ -26,8 +27,14 @@ class HomesTest(unittest.TestCase):
         homes._agent_procs = lambda: []
         for r in homes.ROOTS.values():
             os.makedirs(r)
+        # hermetic: a real HELM_SKILL_DECK on the host must not leak into tests
+        self._envpatch = mock.patch.dict(os.environ)
+        self._envpatch.start()
+        os.environ.pop("HELM_SKILL_DECK", None)
+        os.environ.pop("MELD_SKILL_DECK", None)
 
     def tearDown(self):
+        self._envpatch.stop()
         for k, v in self._orig.items():
             setattr(homes, k, v)
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -65,6 +72,40 @@ class HomesTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(res["home"], ".credentials.json")))
         # idempotent re-prepare
         self.assertTrue(homes.home_create("claude", "new@user.dev")["existing"])
+
+    def test_prepare_links_skill_deck_additively(self):
+        deck = os.path.join(self.tmp, "deck")
+        os.makedirs(os.path.join(deck, "learn"))
+        with open(os.path.join(deck, "learn", "SKILL.md"), "w") as f:
+            f.write("# learn")
+        os.makedirs(os.path.join(deck, "not-a-skill"))  # no SKILL.md — never linked
+        os.environ["HELM_SKILL_DECK"] = deck
+        res = homes.home_create("claude", "deck@user.dev")
+        self.assertNotIn("error", res)
+        sd = os.path.join(res["home"], "skills")
+        link = os.path.join(sd, "learn")
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.path.realpath(link),
+                         os.path.realpath(os.path.join(deck, "learn")))
+        self.assertFalse(os.path.lexists(os.path.join(sd, "not-a-skill")))
+        self.assertIn("skill deck: linked 1", res["note"])
+        # additive idempotence: re-create leaves the link, reports it existing
+        res2 = homes.home_create("claude", "deck@user.dev")
+        self.assertIn("left 1 existing", res2["note"])
+        self.assertTrue(os.path.islink(link))
+        # a home-local entry is never touched: plant one, add a deck twin
+        local = os.path.join(sd, "local-skill")
+        os.makedirs(local)
+        os.makedirs(os.path.join(deck, "local-skill"))
+        with open(os.path.join(deck, "local-skill", "SKILL.md"), "w") as f:
+            f.write("# deck twin")
+        homes.home_create("claude", "deck@user.dev")
+        self.assertFalse(os.path.islink(local))  # real dir survives, link not forced
+
+    def test_prepare_without_deck_env_provisions_nothing(self):
+        res = homes.home_create("claude", "nodeck@user.dev")
+        self.assertNotIn("error", res)
+        self.assertFalse(os.path.lexists(os.path.join(res["home"], "skills")))
 
     def test_prepare_codex_home_no_symlink(self):
         res = homes.home_create("codex", "cx@user.dev")

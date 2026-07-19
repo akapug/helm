@@ -17,7 +17,9 @@ from helm import keepalive
 
 
 def _http_error(code):
-    return urllib.error.HTTPError("https://x", code, "err", {}, None)
+    # a real fp: HTTPError(fp=None) mints an internal tempfile that only closes
+    # at GC — a flaky ResourceWarning under the warning-clean gate
+    return urllib.error.HTTPError("https://x", code, "err", {}, io.BytesIO(b""))
 
 
 class _FakeResp:

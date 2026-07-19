@@ -150,6 +150,7 @@ def refresh_home(home_path, early_horizon_s=60, force=False):
         with urllib.request.urlopen(req, timeout=30) as resp:
             j = json.loads(resp.read())
     except urllib.error.HTTPError as e:
+        e.close()  # an HTTPError IS a response object — close its fp deterministically
         return _log({"home": name, "action": "needs_reauth",
                      "reason": f"refresh HTTP {e.code} — refresh token dead, one-time re-login needed"})
     except Exception as e:

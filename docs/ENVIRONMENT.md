@@ -37,6 +37,7 @@ overrides are in effect.
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
 | `HELM_CONFIG_ROOTS` | `~/dev` | `helm configs` — colon-separated roots for the project-scope config tree walk | `SESH_CONFIG_ROOTS` |
+| `HELM_SKILL_DECK` | — (no deck; nothing provisioned) | `helm homes create` — a directory of skill dirs (each carrying a `SKILL.md`), symlinked into every new claude home's `skills/` so any credential loads the same setup; existing entries are never touched | — |
 
 ## accounts and quota
 
@@ -62,7 +63,7 @@ time.)
 
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
-| `HELM_CELL_BIN` | a known dev build path, else `meld` on `PATH` | `helm cell` / `helm premise` — the ledger-node client binary | `MELD_CELL_BIN` |
+| `HELM_CELL_BIN` | `meld` on `PATH`, else a sibling-checkout build (`../meld/target/release/meld`) | `helm cell` / `helm premise` — the ledger-node client binary | `MELD_CELL_BIN` |
 | `HELM_NODE_URL` | `http://127.0.0.1:8899` | the ledger node's HTTP API | `MELD_NODE_URL` |
 | `HELM_NODE_TOKEN` | — | bearer for the node's submit endpoint | `MELD_NODE_TOKEN` |
 | `HELM_NODE_PASSPHRASE` | — | unlock alternative to the token | `MELD_NODE_PASSPHRASE` |

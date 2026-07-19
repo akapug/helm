@@ -431,6 +431,7 @@ class NativeQuotaProvider:
             try:
                 data = self._get_json(ANTHROPIC_USAGE_URL, {"Authorization": "Bearer " + token})
             except urllib.error.HTTPError as e:
+                e.close()  # an HTTPError IS a response object — close its fp deterministically
                 return rows("api-error", "needs_reauth" if e.code in (401, 403) else f"http_{e.code}")
             except Exception:
                 return rows("api-error", "network-error")
@@ -452,6 +453,7 @@ class NativeQuotaProvider:
         try:
             data = self._get_json(CODEX_USAGE_URL, headers)
         except urllib.error.HTTPError as e:
+            e.close()  # an HTTPError IS a response object — close its fp deterministically
             return rows("unknown", "needs_reauth" if e.code in (401, 403) else f"http_{e.code}",
                         note="stored access token rejected — codex refreshes it on next launch")
         except Exception:

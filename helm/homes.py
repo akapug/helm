@@ -26,6 +26,8 @@ Every public function returns a JSON-able dict (or list); errors are
 """
 import base64, glob, json, os, shlex, shutil, sys, time
 
+from .home import env as _env
+
 HOME = os.path.expanduser("~")
 ROOTS = {"claude": os.path.join(HOME, ".claude-homes"),
          "codex": os.path.join(HOME, ".codex-homes")}
@@ -238,9 +240,30 @@ def _resolve(name, provider=None):
     return None, {"error": f"unknown home {name!r} (see `helm homes`)"}
 
 
+def _link_deck(deck, skills_dir):
+    """Symlink each SKILL.md-bearing dir of the deck into skills_dir. Additive
+    only: an existing entry (link or real dir) is never touched — replacing a
+    diverged copy is the deck's own deploy tool's job, not home creation's.
+    -> (linked, skipped_existing)."""
+    os.makedirs(skills_dir, exist_ok=True)
+    linked = skipped = 0
+    for name in sorted(os.listdir(deck)):
+        src = os.path.join(deck, name)
+        if not os.path.isfile(os.path.join(src, "SKILL.md")):
+            continue
+        dst = os.path.join(skills_dir, name)
+        if os.path.lexists(dst):
+            skipped += 1
+            continue
+        os.symlink(src, dst)
+        linked += 1
+    return linked, skipped
+
+
 def home_create(provider, account_email):
-    """Prepare a home for a fresh device login. mkdir + (claude) the projects symlink,
-    then hand the human the exact login command. NEVER seats credentials itself."""
+    """Prepare a home for a fresh device login. mkdir + (claude) the projects symlink
+    + (claude) the HELM_SKILL_DECK symlink farm, then hand the human the exact
+    login command. NEVER seats credentials itself."""
     provider = (provider or "").strip().lower()
     if provider not in ROOTS:
         return {"error": f"provider must be claude or codex (got {provider!r})"}
@@ -285,6 +308,17 @@ def home_create(provider, account_email):
             return {"error": f"{pl} exists and is neither a directory nor a symlink"}
         else:
             os.symlink(SHARED_PROJECTS, pl)
+        # every home loads the same best setup, whatever cred it carries:
+        # symlink the canonical skill deck (HELM_SKILL_DECK, a dir of skill
+        # dirs) so a new home is never born with a stale subset. No deck
+        # configured = nothing to provision; helm never guesses a local path.
+        deck = _env("SKILL_DECK")
+        deck = os.path.realpath(os.path.expanduser(deck)) if deck else None
+        if deck and os.path.isdir(deck):
+            linked, skipped = _link_deck(deck, os.path.join(home, "skills"))
+            if linked or skipped:
+                notes.append(f"skill deck: linked {linked}"
+                             + (f", left {skipped} existing" if skipped else ""))
     if existing:
         notes.append("home already existed (idempotent — nothing was overwritten)")
     return {"home": home, "name": name, "provider": provider, "existing": existing,
