@@ -2,7 +2,12 @@
 """helm inject — the ONE active-fire surface. A harness hook calls this once
 per turn with the prompt text; helm returns the context worth injecting:
 
-  1. the pinned lane   (load_class=always priors, byte-budget-capped)
+  1. the pinned lane   (load_class=always priors, byte-budget-capped) — led by
+     the WHO leg: the operator digest (whoami.load_profile(): technical level
+     + top guidance, <=2 terse lines jointly capped at WHO_CAP) rides the
+     pinned budget as the lane's FIRST entry (id who:operator) whenever a
+     profile exists, so every agent warms from the profile on every turn.
+     Cooldown-exempt (pinned-class); fail-open (no profile/garbled = absent).
   2. the JIT lane      (typed-store entries whose specific keywords match)
   3. reflex steers     (signals live this turn)
 
@@ -63,6 +68,15 @@ FOREVER: one line per term, ever, max one nudge per turn. O(1) small-JSON
 write, skipped entirely on candidate-free prompts. Both features fully
 fail-open: any state trouble means no cooldown / no nudge, never a crash.
 
+LANE-REPORT (the lane-split eval's instrument): `helm inject --lane-report` is
+a READ-ONLY analyzer over the whole fire-ledger — every fired id classified
+against the current store into the facts cohort (lexicon / certain
+decisions-of-record / references / the operator profile) vs the judgment
+cohort (heuristic moves / sub-certain belief priors), with per-cohort fires,
+byte estimate, session spread, cooldown suppression, and the silent-rate
+trend. Delivery only: fires are not heeds — the outcome-marker protocol lives
+in evals/2026-07-19-lane-split-eval.md. No ledger row, no state mutation.
+
 FAIL OPEN (docs/HOOKS.md law): a hook that cannot run helm must inject nothing,
 never block — a store or reflex failure yields an empty lane and rc 0.
 """
@@ -78,6 +92,8 @@ from . import home, pk, reflex
 PINNED_BUDGET = 1200  # bytes for the always lane — keep the constant tax tiny
 JIT_CAP = 4
 LINE_CAP = 400        # per-entry cap — the gloss fires, the full entry stays on disk
+WHO_CAP = 350         # WHO digest's joint byte cap inside PINNED_BUDGET — warmth stays terse
+WHO_ID = "who:operator"  # the digest's ledger id (the profile cohort in --lane-report)
 LEDGER_MAX = 5 * 1024 * 1024  # ledger rotates here (one .1 generation)
 
 COOLDOWN_TURNS = 15   # a fired JIT entry cools for this many turns per session
@@ -93,6 +109,34 @@ _CACHE_VERSION = 1    # bump when store parsing/derivation changes entry shape
 def _entry_line(e):
     line = _entry_line_full(e)
     return line if len(line) <= LINE_CAP else line[:LINE_CAP - 1] + "…"
+
+
+def _who_lines():
+    """The WHO leg (know-your-user): operator digest off whoami.load_profile()
+    — technical level + top guidance rendered as <=2 terse lines, jointly
+    capped at WHO_CAP so warmth never crowds the safety premises out of the
+    pinned budget. guidance joins "; "-terse, so truncation keeps the TOP
+    items (the list is owner-ordered). Fail-open: no profile / garbled /
+    raising whoami -> [] (absent, never a blocked turn)."""
+    try:
+        from . import whoami
+        p = whoami.load_profile()
+        raw = []
+        if p["technical_level"]:
+            raw.append("WHO operator: " + p["technical_level"])
+        if p["guidance"]:
+            raw.append("WHO guidance: " + "; ".join(p["guidance"]))
+    except Exception:
+        return []
+    lines, left = [], WHO_CAP
+    for line in raw:
+        if left < 40:  # no room left for a meaningful line
+            break
+        if len(line) > left:
+            line = line[:left - 1] + "…"
+        lines.append(line)
+        left -= len(line)
+    return lines
 
 
 def _entry_line_full(e):
@@ -421,6 +465,9 @@ def _coinage(text, entries):
 
 def gather(text, project=None, session=None):
     """-> dict {pinned: [line], jit: [line], reflex: [line]} (each may be empty).
+    The pinned lane leads with the WHO digest (_who_lines) as its FIRST entry
+    — atomic (fires whole or not at all against PINNED_BUDGET), ledgered as
+    who:operator with its bytes in the pinned lane, cooldown-exempt.
     Fail-open per lane: a raising store/reflex yields that lane empty. Every
     call appends one fire-ledger row (silent turns log {"silent": true});
     session (the hook's session_id) rides the row when supplied and switches
@@ -430,8 +477,14 @@ def gather(text, project=None, session=None):
         pinned_entries, jit_all, entries = _lanes(text, project=project)
     except Exception:
         pinned_entries, jit_all, entries = [], [], []
+    who = _who_lines()
     pinned_lines, pinned_ids = [], []
-    used = 0
+    used = sum(len(l) for l in who)
+    if who and used <= PINNED_BUDGET:  # the digest fires whole (FIRST entry) or not at all
+        pinned_lines += who
+        pinned_ids.append(WHO_ID)
+    else:
+        used = 0
     for e in pinned_entries:
         line = _entry_line(e)
         if used + len(line) > PINNED_BUDGET:
@@ -490,7 +543,7 @@ def gather(text, project=None, session=None):
     if any(fired.values()):
         row.update({"fired": fired,
                     "bytes": {k: sum(len(l) for l in sections[k]) for k in sections},
-                    "candidates": len(pinned_entries) + n_jit + len(steers)})
+                    "candidates": bool(who) + len(pinned_entries) + n_jit + len(steers)})
     else:
         row["silent"] = True
     _ledger_append(row)
@@ -520,9 +573,19 @@ def _explain(text, project=None, session=None):
     turn = seen["turn"] + 1 if seen else 0  # the would-be turn
     used = 0
     cut = False
-    if pinned_entries:
+    who = _who_lines()
+    n_pin = bool(who) + len(pinned_entries)
+    if n_pin:
         print("pinned (%d candidate%s, budget %dB):" % (
-            len(pinned_entries), "s"[:len(pinned_entries) != 1], PINNED_BUDGET))
+            n_pin, "s"[:n_pin != 1], PINNED_BUDGET))
+    if who:  # gather's exact atomic walk: the digest leads or drops whole
+        w = sum(len(l) for l in who)
+        if w > PINNED_BUDGET:
+            print("  - %s (over budget)" % WHO_ID)
+        else:
+            used = w
+            for l in who:
+                print("  + " + l)
     for e in pinned_entries:
         line = _entry_line(e)
         cut = cut or used + len(line) > PINNED_BUDGET  # greedy walk: first overflow ends the lane
@@ -550,20 +613,155 @@ def _explain(text, project=None, session=None):
         print("reflex:")
     for e in fired_reflex:
         print("  + %s [%s]: %s" % (e["id"], e.get("signal") or "prompt", e["steer"]))
-    if not (pinned_entries or jit_all or fired_reflex):
+    if not (who or pinned_entries or jit_all or fired_reflex):
         print("silent turn — nothing fires (salience law)")
     return 0
 
 
+# ---------------------------------------------------------------------------
+# lane-split eval — the read-only cohort analyzer (--lane-report)
+# ---------------------------------------------------------------------------
+
+def _cohort(e):
+    """The lane-split-eval razor (ember's-claude vision review, 2026-07-19):
+    'facts' = knowledge that makes a capable model fluent — lexicon terms,
+    certain priors (premises / decisions-of-record), references; 'judgment' =
+    steering that could anchor it — heuristic moves, sub-certain belief
+    priors. None = not cohortable (reflex machinery, unknown ids)."""
+    t = e.get("type")
+    if t in ("lexicon", "reference"):
+        return "facts"
+    if t == "prior":
+        return "facts" if e.get("class") == "certain" else "judgment"
+    if t == "heuristic":
+        return "judgment"
+    return None
+
+
+def _ledger_rows():
+    """Every fire-ledger row oldest-first, rotated generation (.1) included.
+    Read-only; torn lines skipped."""
+    rows = []
+    path = _ledger_path()
+    for p in (path + ".1", path):
+        try:
+            with open(p, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(r, dict):
+                        rows.append(r)
+        except OSError:
+            continue
+    return rows
+
+
+def lane_report(project=None):
+    """The lane-split eval's accumulating instrument, READ-ONLY: every fired
+    id in the ledger classified via _cohort against the CURRENT store (the
+    operator digest who:operator = facts/profile), with per-cohort fires,
+    distinct ids, byte estimate (today's rendering x fires — per-entry bytes
+    are not ledgered), session spread, cooldown suppression, and the
+    silent-rate first-half vs second-half trend. DELIVERY ONLY: the ledger
+    logs fires, not heeds — anchoring is NOT measurable here; the
+    outcome-marker protocol lives in evals/2026-07-19-lane-split-eval.md."""
+    rows = _ledger_rows()
+    try:
+        by_id = {str(e["id"]): e for e in load_entries(project)}
+    except Exception:
+        by_id = {}
+    who_bytes = sum(len(l) for l in _who_lines())
+
+    def cohort(i):
+        if i == WHO_ID:
+            return "facts"  # the operator profile
+        e = by_id.get(i)
+        return (e and _cohort(e)) or "other"
+
+    c = {k: {"fires": 0, "ids": set(), "bytes": 0, "sessions": set(),
+             "suppressed": 0} for k in ("facts", "judgment", "other")}
+    fired_rows = silent = 0
+    sessions = set()
+    halves = [[0, 0], [0, 0]]  # [silent, rows] per ledger half
+    for n, r in enumerate(rows):
+        half = halves[n * 2 // len(rows)]
+        half[1] += 1
+        s = r.get("session")
+        if s:
+            sessions.add(s)
+        if r.get("silent"):
+            silent += 1
+            half[0] += 1
+        else:
+            fired_rows += 1
+        for ids in (r.get("fired") or {}).values():
+            for i in map(str, ids):
+                d = c[cohort(i)]
+                d["fires"] += 1
+                d["ids"].add(i)
+                e = by_id.get(i)
+                d["bytes"] += len(_entry_line(e)) if e else \
+                    (who_bytes if i == WHO_ID else 0)
+                if s:
+                    d["sessions"].add(s)
+        for i in map(str, r.get("suppressed") or ()):
+            c[cohort(i)]["suppressed"] += 1
+    return {"rows": len(rows), "fired_rows": fired_rows, "silent": silent,
+            "sessions": len(sessions), "halves": halves,
+            "cohorts": {k: {"fires": d["fires"], "ids": len(d["ids"]),
+                            "bytes": d["bytes"],
+                            "sessions": len(d["sessions"]),
+                            "suppressed": d["suppressed"]}
+                        for k, d in c.items()}}
+
+
+def _pct(num, den):
+    return 100.0 * num / den if den else 0.0
+
+
+def _lane_report(project=None):
+    """--lane-report: lane_report() rendered as the cohort table. No ledger
+    row, no state mutation — an analyzer must never count as a turn."""
+    r = lane_report(project)
+    if not r["rows"]:
+        print("lane-report: no ledger rows yet — the instrument is unfired.")
+        return 0
+    print("lane-split cohorts — %d rows (%d fired, %d silent), %d sessions" % (
+        r["rows"], r["fired_rows"], r["silent"], r["sessions"]))
+    total_f = sum(d["fires"] for d in r["cohorts"].values())
+    total_b = sum(d["bytes"] for d in r["cohorts"].values())
+    fmt = "%-9s %6s %6s %5s %8s %6s %5s %5s %6s"
+    print(fmt % ("cohort", "fires", "share", "ids", "bytes~", "share",
+                 "sess", "supp", "supp%"))
+    for k in ("facts", "judgment", "other"):
+        d = r["cohorts"][k]
+        print("%-9s %6d %5.1f%% %5d %8d %5.1f%% %5d %5d %5.1f%%" % (
+            k, d["fires"], _pct(d["fires"], total_f), d["ids"], d["bytes"],
+            _pct(d["bytes"], total_b), d["sessions"], d["suppressed"],
+            _pct(d["suppressed"], d["fires"] + d["suppressed"])))
+    h1, h2 = r["halves"]
+    print("silent rate: %.1f%% overall | first half %.1f%% -> second half %.1f%%" % (
+        _pct(r["silent"], r["rows"]), _pct(h1[0], h1[1]), _pct(h2[0], h2[1])))
+    print("bytes~ = today's rendering x fires (per-entry bytes are not ledgered).")
+    print("DELIVERY ONLY: fires are not heeds — the anchoring verdict needs the")
+    print("outcome markers in evals/2026-07-19-lane-split-eval.md.")
+    return 0
+
+
 def cmd_inject(args):
-    """inject [--project P] [--json] [--explain] [--hook-json] — prompt text on
-    stdin -> context lines. --hook-json reads the harness hook's FULL JSON on
-    stdin instead (prompt/cwd/session_id) and derives --project from the cwd
-    via the registry; malformed hook JSON injects nothing, rc 0 (fail-open).
-    --explain prints what WOULD fire and why, sans ledger row."""
+    """inject [--project P] [--json] [--explain] [--hook-json] [--lane-report]
+    — prompt text on stdin -> context lines. --hook-json reads the harness
+    hook's FULL JSON on stdin instead (prompt/cwd/session_id) and derives
+    --project from the cwd via the registry; malformed hook JSON injects
+    nothing, rc 0 (fail-open). --explain prints what WOULD fire and why, sans
+    ledger row. --lane-report renders the lane-split cohort table (read-only)."""
     project = None
     if "--project" in args:
         project = args[args.index("--project") + 1]
+    if "--lane-report" in args:
+        return _lane_report(project=project)
     session = scope_via = None
     if "--hook-json" in args:
         text, cwd, session = parse_hook_json(

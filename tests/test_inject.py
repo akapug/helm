@@ -757,5 +757,195 @@ class CoinageTest(InjectBase):
                              "counts that cannot persist must never nudge")
 
 
+class WhoLaneTest(InjectBase):
+    """The WHO leg: the operator digest (whoami profile) rides the pinned
+    budget as the lane's FIRST entry — <=2 lines jointly WHO_CAP-terse, atomic
+    against PINNED_BUDGET, ledgered as who:operator, cooldown-exempt,
+    fail-open on any profile trouble."""
+
+    def plant_profile(self, level="expert operator",
+                      guidance=("keep it short", "batch deploys")):
+        pk.write_json(
+            os.path.join(home.global_dir(), "know-your-user", "profile.json"),
+            {"schema_version": 2, "technical_level": level,
+             "guidance": list(guidance), "interview_status": "done",
+             "updated_at": "2026-07-19T00:00:00Z", "source": "test"})
+
+    def rows(self):
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            return [json.loads(l) for l in f.read().splitlines()]
+
+    def test_digest_leads_the_pinned_lane(self):
+        self.plant_profile()
+        self.plant_pinned("pin-a", "always truth")
+        got = inject.gather("anything")["pinned"]
+        self.assertEqual(got, ["WHO operator: expert operator",
+                               "WHO guidance: keep it short; batch deploys",
+                               "PREMISE pin-a: always truth"])
+        r = self.rows()[-1]
+        self.assertEqual(r["fired"]["pinned"], ["who:operator", "pin-a"])
+        self.assertEqual(r["bytes"]["pinned"], sum(len(l) for l in got))
+        self.assertEqual(r["candidates"], 2)  # the digest + one pin
+
+    def test_no_profile_absent(self):
+        self.plant_pinned("pin-a", "always truth")
+        got = inject.gather("anything")["pinned"]
+        self.assertEqual(got, ["PREMISE pin-a: always truth"])
+        self.assertEqual(self.rows()[-1]["fired"]["pinned"], ["pin-a"])
+        self.assertEqual(self.rows()[-1]["candidates"], 1)
+
+    def test_who_cap_two_terse_lines(self):
+        self.plant_profile(level="x" * 500, guidance=("y" * 500,))
+        got = inject.gather("anything")["pinned"]
+        self.assertEqual(len(got), 1)  # level ate WHO_CAP; no room for guidance
+        self.assertEqual(len(got[0]), inject.WHO_CAP)
+        self.assertTrue(got[0].endswith("…"))
+        self.plant_profile(level="expert", guidance=("g" * 500,))
+        got = inject.gather("anything")["pinned"]
+        self.assertEqual(len(got), 2)
+        self.assertLessEqual(sum(len(l) for l in got), inject.WHO_CAP)
+        self.assertTrue(got[1].endswith("…"))  # top guidance survives, terse
+
+    def test_budget_drop_is_atomic_lane_survives(self):
+        self.plant_profile()  # digest ~70B
+        self.plant_pinned("pin-a", "tiny")
+        with mock.patch.object(inject, "PINNED_BUDGET", 40):
+            got = inject.gather("anything")["pinned"]
+        self.assertEqual(got, ["PREMISE pin-a: tiny"],
+                         "an over-budget digest drops WHOLE; the lane lives on")
+        r = self.rows()[-1]
+        self.assertEqual(r["fired"]["pinned"], ["pin-a"])
+        self.assertEqual(r["candidates"], 2)  # the dropped digest still counted
+
+    def test_fail_open_garbled_and_raising(self):
+        from helm import whoami
+        self.plant_pinned("pin-a", "always truth")
+        pk.atomic_write(whoami.profile_path(), "{not json")
+        rc, out, err = self.run_inject([], stdin_text="anything")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertNotIn("WHO", out)
+        self.assertIn("pin-a", out)
+        with mock.patch.object(whoami, "load_profile",
+                               side_effect=RuntimeError("profile exploded")):
+            rc, out, err = self.run_inject([], stdin_text="anything")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertNotIn("WHO", out)
+        self.assertIn("pin-a", out)
+
+    def test_explain_renders_who_counts_candidate_no_ledger(self):
+        self.plant_profile()
+        self.plant_pinned("pin-a", "always truth")
+        rc, out, _ = self.run_inject(["--explain"], stdin_text="anything")
+        self.assertEqual(rc, 0)
+        self.assertIn("pinned (2 candidates, budget %dB):" % inject.PINNED_BUDGET, out)
+        self.assertIn("+ WHO operator: expert operator", out)
+        self.assertIn("+ WHO guidance: keep it short; batch deploys", out)
+        self.assertFalse(os.path.exists(inject._ledger_path()),
+                         "--explain must never write the ledger")
+        with mock.patch.object(inject, "PINNED_BUDGET", 40):
+            rc, out, _ = self.run_inject(["--explain"], stdin_text="anything")
+        self.assertIn("- who:operator (over budget)", out)
+        self.assertNotIn("+ WHO", out)
+
+    def test_cooldown_exempt_fires_every_turn(self):
+        self.plant_profile()
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        first = inject.gather("tune the fluxcap", session="s1")
+        second = inject.gather("tune the fluxcap", session="s1")
+        self.assertEqual(second["pinned"], first["pinned"])  # WHO exempt
+        self.assertIn("WHO operator: expert operator", second["pinned"])
+        self.assertEqual((first["jit"], second["jit"]),
+                         (["PRIOR 0.80 jit-a: a flux fact"], []))  # jit cools
+
+
+class LaneReportTest(InjectBase):
+    """--lane-report: the lane-split eval's read-only instrument — cohort
+    classification (facts = lexicon/certain-prior/reference/profile; judgment
+    = heuristic/belief-prior), the table off planted ledger fixtures, rotated
+    generation included, zero mutation."""
+
+    def plant_store(self):
+        store.write_lexicon({"term": "term-a", "definition": "a fact of naming"})
+        store.write_prior({"id": "cert-a", "statement": "a settled decision",
+                           "confidence": "1.0", "keywords": "certkw"})
+        store.write_prior({"id": "bel-a", "statement": "a held belief",
+                           "confidence": "0.8", "keywords": "belkw"})
+        store.write_heuristic({"id": "heur-a", "move": "a judgment move",
+                               "keywords": "heurkw"})
+        store.write_reference({"id": "ref-a", "statement": "a pointer",
+                               "url": "https://x", "keywords": "refkw"})
+
+    def plant_ledger(self, rotated, rows):
+        path = inject._ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".1", "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(r) + "\n" for r in rotated)
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(r) + "\n" for r in rows)
+
+    FIXTURE_OLD = [{"v": 1, "ts": "t1", "session": "s1", "fired": {
+        "pinned": ["cert-a", "who:operator"], "jit": ["term-a", "bel-a"],
+        "reflex": ["punt-tell"]}}]
+    FIXTURE = [
+        {"v": 1, "ts": "t2", "session": "s2",
+         "fired": {"pinned": ["cert-a"], "jit": ["heur-a", "ref-a"], "reflex": []},
+         "suppressed": ["bel-a"]},
+        {"v": 1, "ts": "t3", "silent": True},
+        {"v": 1, "ts": "t4", "silent": True, "session": "s2"},
+    ]
+
+    def test_cohort_classification(self):
+        self.plant_store()
+        by_id = {e["id"]: e for e in store.load_all()}
+        self.assertEqual(inject._cohort(by_id["term-a"]), "facts")
+        self.assertEqual(inject._cohort(by_id["cert-a"]), "facts")
+        self.assertEqual(inject._cohort(by_id["ref-a"]), "facts")
+        self.assertEqual(inject._cohort(by_id["bel-a"]), "judgment")
+        self.assertEqual(inject._cohort(by_id["heur-a"]), "judgment")
+        self.assertIsNone(inject._cohort({"type": "episodic"}))
+
+    def test_report_numbers_from_planted_fixtures(self):
+        self.plant_store()
+        self.plant_ledger(self.FIXTURE_OLD, self.FIXTURE)
+        r = inject.lane_report()
+        self.assertEqual((r["rows"], r["fired_rows"], r["silent"],
+                          r["sessions"]), (4, 2, 2, 2))
+        f, j, o = (r["cohorts"][k] for k in ("facts", "judgment", "other"))
+        # facts: cert-a x2 + who:operator + term-a + ref-a = 5 fires, 4 ids
+        self.assertEqual((f["fires"], f["ids"], f["sessions"], f["suppressed"]),
+                         (5, 4, 2, 0))
+        self.assertGreater(f["bytes"], 0)
+        # judgment: bel-a + heur-a fired once each; bel-a suppressed once
+        self.assertEqual((j["fires"], j["ids"], j["suppressed"]), (2, 2, 1))
+        # other: the reflex id — machinery, outside the A/B question
+        self.assertEqual((o["fires"], o["ids"]), (1, 1))
+        self.assertEqual(r["halves"], [[0, 2], [2, 2]])  # silent-rate trend
+
+    def test_table_renders_and_is_read_only(self):
+        self.plant_store()
+        self.plant_ledger(self.FIXTURE_OLD, self.FIXTURE)
+        with open(inject._ledger_path(), encoding="utf-8") as fh:
+            before = fh.read()
+        rc, out, err = self.run_inject(["--lane-report"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("lane-split cohorts — 4 rows (2 fired, 2 silent), 2 sessions", out)
+        facts = next(l for l in out.splitlines() if l.startswith("facts"))
+        judgment = next(l for l in out.splitlines() if l.startswith("judgment"))
+        self.assertIn(" 5 ", facts.replace("%", " "))
+        self.assertIn("33.3%", judgment)  # 1 suppressed of 2+1 seen
+        self.assertIn("first half 0.0% -> second half 100.0%", out)
+        self.assertIn("fires are not heeds", out)
+        with open(inject._ledger_path(), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before,
+                             "--lane-report must never write the ledger")
+        self.assertFalse(os.path.exists(inject._seen_dir()))
+        self.assertFalse(os.path.exists(inject._coinage_path()))
+
+    def test_empty_ledger_reports_unfired(self):
+        rc, out, _ = self.run_inject(["--lane-report"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no ledger rows yet", out)
+
+
 if __name__ == "__main__":
     unittest.main()
