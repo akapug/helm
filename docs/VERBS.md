@@ -285,14 +285,37 @@ $ helm drift
 helm drift: no drift (48 priors steady).
 ```
 
-### `helm reflex [list [--all] | add <id> | <steer> [--signal S] [--pattern RE] [--marker PATH] [--project P] | retire <id>]`
+### `helm reflex [list [--all] | add <id> | <steer> [--signal S] [--pattern RE] [--marker PATH] [--counter NAME --threshold N [--latch] [--escalate N] [--window S]] [--project P] | retire <id> | smoke [--session S] [--project P]]`
 The (signal → steer) entries a harness delivers every matching turn. Signals:
 `prompt` (regex on the turn text — the default; the pattern defaults to the
 id as a word), `every-turn`, `marker-file --marker <path>` (fires while the
 file exists). Retire is a one-line status flip; the file stays.
 
+**Counter/latch signals (v2)** turn `helm record`'s per-session counters into
+dynamic reflexes — every threshold and steer is an editable store entry, not
+hardcoded Python. The named signals map a counter to a field-tested default:
+`stalled` (passive-streak ≥ 6), `thrash` (loop-streak ≥ 3), `drift`
+(dirty-streak ≥ 8), `stuck` (stuck-streak ≥ 3, escalating); generic `counter`
+reads any counter via `--counter NAME --threshold N`. `--latch` fires ONCE per
+episode (the latch persists in the session's `reflex-state/<sid>/latch.json`
+and clears on the inverse event — a forward op, a commit, a recovery);
+`--escalate N` re-fires as the streak worsens. An optional `--pattern` gates on
+the **prompt text only** (fixed-text law), `--window S` on the counter's
+freshness. Fail-open: no threaded `session_id` (or missing counters) → every
+counter signal is silently absent (v1 degrade), never a crash. Specificity law:
+a counter reflex with no counter or threshold ≤ 0 is skipped, never wallpaper.
+A fresh session re-arms every latch — correct, and by design.
+
+`smoke` is the LIVE read-only check: the real `helm record` counters, which
+counter reflexes fire against them, and each one's idle/armed/FIRE state —
+mutating no latch. The seeded pack ships `stalled-driver`, `loop-thrash`,
+`uncommitted-drift`, and `stuck-commonsense`, all latched, editable like any
+reflex.
+
 ```console
 $ helm reflex add "checkpoint-green | checkpoint the green slice before refactoring" --pattern "refactor"
+$ helm reflex add "spin-guard | stop retrying; read the error" --signal stuck --threshold 3 --latch
+$ helm reflex smoke
 ```
 
 ### `helm record [--hook-json] | status [--session S] | install [--dry] [--home NAME]`
