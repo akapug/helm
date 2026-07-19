@@ -139,6 +139,26 @@ PRIOR: Always do X.
         self.assertEqual(store._coerce_conf(-2), 0.0)
         self.assertAlmostEqual(store._coerce_conf("0.35"), 0.35)
 
+    def test_belief_never_rounds_up_to_certainty(self):
+        # audit MEDIUM: %.2f serialized 0.995..0.999 as "confidence: 1.00"
+        # beside "class: prior" — the next read minted a certain premise from
+        # an agent-suppliable belief. A belief clamps to 0.99 BEFORE writing.
+        p = self.seed_prior("almostsure", "strong belief", conf=0.999)
+        with open(p) as f:
+            raw = f.read()
+        self.assertIn("  confidence: 0.99", raw)
+        self.assertIn("  class: prior", raw)
+        self.assertNotIn("1.00", raw)
+        e = self.one(store.load_all(), "almostsure")
+        self.assertEqual(e["class"], "prior")
+        self.assertAlmostEqual(e["confidence"], 0.99)
+        # an explicit human certainty (exactly 1.0) still writes as a premise
+        p = self.seed_prior("truth", "human truth", conf=1.0)
+        with open(p) as f:
+            raw = f.read()
+        self.assertIn("  confidence: 1.00", raw)
+        self.assertIn("  class: certain", raw)
+
     def test_dormant_derivation(self):
         self.seed_prior("weak-belief", "barely held", conf=0.3)
         e = self.one(store.load_all(), "weak-belief")
@@ -525,6 +545,18 @@ class CliTest(StoreBase):
         self.assertIn("the statement", out)
         rc, _ = self.run_cli(["get", "ghost"])
         self.assertEqual(rc, 1)
+
+    def test_add_prior_clamps_to_belief_rail(self):
+        # the prior verb mints beliefs — 0.999 (or an outright 1.0) must never
+        # become a certain premise through the agent-facing lane
+        for i, raw_conf in enumerate(("0.999", "1.0")):
+            rc, out = self.run_cli(["add", "prior",
+                                    "clamp-%d | nearly sure | %s" % (i, raw_conf)])
+            self.assertEqual(rc, 0)
+            self.assertIn("[prior 0.99]", out)
+            e = self.one(store.load_all(), "clamp-%d" % i)
+            self.assertEqual(e["class"], "prior")
+            self.assertAlmostEqual(e["confidence"], 0.99)
 
     def test_add_premise_and_typed_adds(self):
         rc, out = self.run_cli(["add", "premise", "cli-truth | always true | truthkw"])

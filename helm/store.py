@@ -495,6 +495,12 @@ def write_prior(e, root_dir=None, path=None):
         path = os.path.join(root_dir or _default_dir("prior"),
                             PRIOR_PREFIX + _slug(str(e["id"])) + ".md")
     conf = _coerce_conf(e.get("confidence"))
+    if conf < CERTAIN:
+        # a BELIEF clamps to 0.99 BEFORE the %.2f serialization: 0.995..0.999
+        # would round to "confidence: 1.00" beside "class: prior" and the next
+        # read would coerce it into a certain premise — an agent-suppliable
+        # value crossing the human-only certainty rail.
+        conf = min(conf, BELIEF_CLAMP[1])
     klass = derive_class(conf)
     pin = _is_pinned(e)
     lc = derive_load_class(e, conf, pin)
@@ -908,6 +914,10 @@ def cmd_store(args):
                 dom = parts[3] if len(parts) > 3 else e.get("domain", "")
                 src = source or "human"
             conf = _coerce_conf(conf)
+            if etype == "prior":
+                # the prior verb mints BELIEFS; certainty (1.0) is the premise
+                # verb's human-only lane — an add-prior 0.999/1.0 clamps to 0.99
+                conf = min(conf, BELIEF_CLAMP[1])
             e.update({"id": parts[0], "statement": parts[1], "status": STATUS_LIVE,
                       "stated_ts": ts, "last_updated": ts, "confidence": conf,
                       "keywords": kw, "domain": dom, "source": src})
