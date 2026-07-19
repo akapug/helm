@@ -137,7 +137,7 @@ class ShapeTest(InjectBase):
         rc, out, _ = self.run_inject(["--json"], stdin_text="tune the fluxcap")
         self.assertEqual(rc, 0)
         d = json.loads(out)
-        self.assertEqual(sorted(d), ["jit", "pinned", "reflex"])
+        self.assertEqual(sorted(d), ["jit", "pinned", "reflex", "whisper"])
         for k in ("pinned", "jit", "reflex"):
             self.assertIsInstance(d[k], list)
         self.assertEqual(d["pinned"], ["PREMISE pin-a: always truth"])
@@ -147,7 +147,8 @@ class ShapeTest(InjectBase):
     def test_json_no_match_is_empty_lists_not_silence(self):
         rc, out, _ = self.run_inject(["--json"], stdin_text="nothing")
         self.assertEqual(rc, 0)
-        self.assertEqual(json.loads(out), {"pinned": [], "jit": [], "reflex": []})
+        self.assertEqual(json.loads(out),
+                         {"whisper": [], "pinned": [], "jit": [], "reflex": []})
 
     def test_inline_arg_beats_stdin(self):
         self.plant_jit("jit-a", "a flux fact", "fluxcap")
@@ -354,6 +355,14 @@ class HookJsonTest(InjectBase):
     """--hook-json: the harness hook payload on stdin + cwd->project scope
     derivation (longest-prefix over registry paths, global fallback)."""
 
+    def setUp(self):
+        super().setUp()
+        # these session turns are not the day's first — hold the whisper latched
+        # so no real brief compose rides them (WhisperTest owns that lane)
+        p = mock.patch.object(inject, "_greeted_today", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def seed_registry(self, **paths):
         pk.write_json(home.registry_path(), {"version": 1, "projects": {
             n: {"name": n, "path": p, "kind": "git", "status": "active",
@@ -463,6 +472,12 @@ class SessionCooldownTest(InjectBase):
     score escape, pinned/reflex exempt, freed cap slots, fail-open."""
 
     PROMPT = "tune the fluxcap"
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(inject, "_greeted_today", return_value=True)
+        p.start()  # keep the cooldown turns off the first-turn-whisper path
+        self.addCleanup(p.stop)
 
     def hook_stdin(self, prompt, session="sid-1"):
         return json.dumps({"prompt": prompt, "session_id": session,
@@ -945,6 +960,105 @@ class LaneReportTest(InjectBase):
         rc, out, _ = self.run_inject(["--lane-report"])
         self.assertEqual(rc, 0)
         self.assertIn("no ledger rows yet", out)
+
+
+class WhisperTest(InjectBase):
+    """The first-turn whisper: once per calendar day the day's first
+    session-bearing, non-empty turn LEADS with a one-line brief digest, latched
+    in _global/.state/greeted.json; later turns stay silent (and pay no brief
+    read), day-rollover re-fires, brief trouble fails open, --explain renders it
+    read-only, and the empty-output rc-0 hook contract is preserved. brief is
+    mocked at helm.brief.compose so the lane is exercised hermetically."""
+
+    BRIEF = {"sessions": {"total": 4},
+             "knowledge": {"added": ["a", "b"], "updated": [], "retired": [],
+                           "drained": 0},
+             "waiting": ["interview", "2 queued"]}
+    QUIET = {"sessions": {"total": 0},
+             "knowledge": {"added": [], "updated": [], "retired": [], "drained": 0},
+             "waiting": []}
+
+    def hook(self, prompt="what's the plan today?", session="sid-1"):
+        return json.dumps({"prompt": prompt, "session_id": session,
+                           "hook_event_name": "UserPromptSubmit"})
+
+    def rows(self):
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            return [json.loads(l) for l in f.read().splitlines()]
+
+    def test_fires_once_per_day_then_silent(self):
+        with mock.patch("helm.brief.compose", return_value=self.BRIEF) as m:
+            line, = inject.gather("hello", session="s1")["whisper"]
+            self.assertTrue(line.startswith("BRIEF: "))
+            self.assertIn("4 sessions since you left", line)
+            self.assertIn("+2 knowledge", line)
+            self.assertIn("2 need you", line)
+            self.assertLessEqual(len(line), inject.WHISPER_CAP)
+            self.assertEqual(m.call_count, 1)
+            for _ in range(3):  # every later turn that day: silent, no brief read
+                self.assertEqual(inject.gather("hello", session="s1")["whisper"], [])
+            self.assertEqual(m.call_count, 1, "only the first turn reads the brief")
+        self.assertEqual(pk.read_json(inject._greeted_path())["day"], inject._today())
+
+    def test_leads_the_rendered_output(self):
+        self.plant_pinned("pin-a", "always truth")
+        with mock.patch("helm.brief.compose", return_value=self.BRIEF):
+            rc, out, _ = self.run_inject(["--hook-json"], stdin_text=self.hook())
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.splitlines()[0].startswith("BRIEF: "),
+                        "the whisper must lead the injected output")
+        self.assertIn("PREMISE pin-a: always truth", out)  # the lanes still ride
+
+    def test_day_rollover_refires(self):
+        with mock.patch("helm.brief.compose", return_value=self.BRIEF):
+            with mock.patch.object(inject, "_today", return_value="2026-07-19"):
+                self.assertTrue(inject.gather("hi", session="s1")["whisper"])
+                self.assertFalse(inject.gather("hi", session="s1")["whisper"])
+            with mock.patch.object(inject, "_today", return_value="2026-07-20"):
+                self.assertTrue(inject.gather("hi", session="s1")["whisper"],
+                                "a new calendar day re-greets")
+
+    def test_quiet_day_whispers_nothing_but_still_latches(self):
+        with mock.patch("helm.brief.compose", return_value=self.QUIET) as m:
+            self.assertEqual(inject.gather("hi", session="s1")["whisper"], [])
+            self.assertEqual(inject.gather("hi", session="s1")["whisper"], [])
+            self.assertEqual(m.call_count, 1, "the quiet first turn still latches")
+        self.assertTrue(inject._greeted_today())
+
+    def test_fail_open_when_brief_unavailable(self):
+        with mock.patch("helm.brief.compose",
+                        side_effect=RuntimeError("brief exploded")):
+            rc, out, err = self.run_inject(["--hook-json"], stdin_text=self.hook())
+        self.assertEqual((rc, out, err), (0, "", ""),
+                         "brief trouble -> no whisper, never a blocked hook")
+
+    def test_no_session_or_empty_prompt_never_whispers(self):
+        with mock.patch("helm.brief.compose", return_value=self.BRIEF) as m:
+            self.assertEqual(inject.gather("hello")["whisper"], [])       # no session
+            self.assertEqual(inject.gather("   ", session="s1")["whisper"], [])  # blank
+            self.assertEqual(m.call_count, 0, "the gate pays no brief compose")
+        self.assertFalse(os.path.exists(inject._greeted_path()))
+
+    def test_whisper_rides_the_ledger_ids_never_text(self):
+        with mock.patch("helm.brief.compose", return_value=self.BRIEF):
+            inject.gather("hello", session="s1")
+        r = self.rows()[-1]
+        self.assertEqual(r["fired"]["whisper"], [inject.WHISPER_ID])
+        self.assertGreater(r["bytes"]["whisper"], 0)
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            self.assertNotIn("since you left", f.read())  # the id rides, not the line
+
+    def test_explain_renders_it_read_only(self):
+        with mock.patch("helm.brief.compose", return_value=self.BRIEF):
+            rc, out, _ = self.run_inject(["--hook-json", "--explain"],
+                                         stdin_text=self.hook())
+        self.assertEqual(rc, 0)
+        self.assertIn("whisper (first turn today):", out)
+        self.assertIn("BRIEF: helm morning", out)
+        self.assertFalse(inject._greeted_today(),
+                         "--explain must never stamp the greeted latch")
+        self.assertFalse(os.path.exists(inject._ledger_path()),
+                         "--explain must never write the ledger")
 
 
 if __name__ == "__main__":

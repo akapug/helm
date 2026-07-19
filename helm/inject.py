@@ -68,6 +68,19 @@ FOREVER: one line per term, ever, max one nudge per turn. O(1) small-JSON
 write, skipped entirely on candidate-free prompts. Both features fully
 fail-open: any state trouble means no cooldown / no nudge, never a crash.
 
+FIRST-TURN WHISPER (the warmth leg): on the FIRST inject turn of a calendar day
+that carries a session and a non-empty prompt, the output LEADS with a one-line
+brief digest (brief.compose in its tightest form, distinct BRIEF: prefix) so the
+day's first agent turn surfaces "since you left" and relays it warmly in its own
+voice; every later turn that day is silent. Latched once per day in
+_global/.state/greeted.json ({day}, the drift-snapshot single-file pattern): the
+HOT-PATH check is one small-JSON day-compare — O(1), and only the first turn pays
+a brief compose, never every turn. The latch is stamped on the first attempt
+BEFORE composing, so a slow/failed brief costs the day's greeting, not a per-turn
+read. Budget-capped (WHISPER_CAP) and fully FAIL-OPEN: brief unavailable -> no
+whisper, never a blocked hook. `--explain` renders it read-only (stamps nothing);
+a quiet window (no sessions/knowledge/gates) whispers nothing but still latches.
+
 LANE-REPORT (the lane-split eval's instrument): `helm inject --lane-report` is
 a READ-ONLY analyzer over the whole fire-ledger — every fired id classified
 against the current store into the facts cohort (lexicon / certain
@@ -102,6 +115,9 @@ SEEN_TTL = 7 * 86400  # inject-seen session files older than this pruned on writ
 
 COINAGE_STRIKES = 3   # distinct turns before the one-shot define nudge
 COINAGE_CAP = 400     # tracked unoffered terms — oldest evicted past this
+
+WHISPER_ID = "whisper:brief"  # the first-turn digest's ledger id
+WHISPER_CAP = 240     # the one-line brief digest's byte cap (attention budget)
 
 _CACHE_VERSION = 1    # bump when store parsing/derivation changes entry shape
 
@@ -463,8 +479,85 @@ def _coinage(text, entries):
     return None
 
 
+# ---------------------------------------------------------------------------
+# first-turn whisper — the brief's TL;DR greets the day's first session
+# ---------------------------------------------------------------------------
+
+def _today():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _greeted_path():
+    return os.path.join(home.global_dir(), ".state", "greeted.json")
+
+
+def _greeted_today():
+    """The O(1) hot-path latch READ: True if the first-turn whisper already
+    fired today. One small-JSON day-compare, no scan. Fail-open: an absent /
+    torn / alien-shaped file reads as NOT greeted (the whisper may fire) — the
+    fire re-stamps the latch, so the brief compose stays once-a-day."""
+    d = pk.read_json(_greeted_path())
+    return isinstance(d, dict) and d.get("day") == _today()
+
+
+def _mark_greeted():
+    """Stamp today's latch (single-file overwrite, the drift-snapshot shape)."""
+    pk.write_json(_greeted_path(), {"v": 1, "day": _today(), "ts": pk.now_ts()})
+
+
+def _brief_digest():
+    """The morning brief in its TIGHTEST form: ONE line off brief.compose()'s
+    read-only dict — sessions since you left, the knowledge delta, the count of
+    owner gates — under a distinct BRIEF: prefix so the receiving agent relays
+    it warmly in its own voice. Seats are omitted (standing state, not news);
+    the line points at `helm brief` for the full detail on demand (attention
+    budget: relevance + availability). -> the WHISPER_CAP-capped line, or None
+    when the window holds nothing worth a whisper (a quiet day)."""
+    from . import brief
+    b = brief.compose()
+    parts = []
+    n = (b.get("sessions") or {}).get("total") or 0
+    if n:
+        parts.append("%d session%s since you left" % (n, "s"[:n != 1]))
+    k = b.get("knowledge") or {}
+    kd = [fmt % len(k.get(key) or ()) for fmt, key in
+          (("+%d", "added"), ("~%d", "updated"), ("-%d", "retired")) if k.get(key)]
+    if k.get("drained"):
+        kd.append("%d drained" % k["drained"])
+    if kd:
+        parts.append(" ".join(kd) + " knowledge")
+    w = b.get("waiting") or ()
+    if w:  # verb agrees with the count: "1 needs you" / "2 need you"
+        parts.append("%d need%s you" % (len(w), "s"[:len(w) == 1]))
+    if not parts:
+        return None
+    line = "BRIEF: helm morning — " + " · ".join(parts) + " (helm brief)"
+    return line if len(line) <= WHISPER_CAP else line[:WHISPER_CAP - 1] + "…"
+
+
+def _whisper(text, session):
+    """The first-turn whisper: on the day's FIRST session-bearing, non-empty
+    turn, lead with the one-line brief digest. Latched once per day — the
+    O(1) _greeted_today read means only the first turn pays a brief compose.
+    The latch is stamped on the FIRST attempt BEFORE composing, so a slow or
+    failed brief costs the day's greeting, never a per-turn read. Plain stdin
+    (no session) never whispers, mirroring the cooldown gate. Fully fail-open:
+    any brief/state trouble -> [] (no whisper, never a blocked turn)."""
+    if not (session and (text or "").strip()):
+        return []
+    try:
+        if _greeted_today():
+            return []
+        _mark_greeted()          # latch the attempt: at most one brief read/day
+        d = _brief_digest()
+        return [d] if d else []
+    except Exception:
+        return []
+
+
 def gather(text, project=None, session=None):
-    """-> dict {pinned: [line], jit: [line], reflex: [line]} (each may be empty).
+    """-> dict {whisper: [line], pinned: [line], jit: [line], reflex: [line]}
+    (each may be empty).
     The pinned lane leads with the WHO digest (_who_lines) as its FIRST entry
     — atomic (fires whole or not at all against PINNED_BUDGET), ledgered as
     who:operator with its bytes in the pinned lane, cooldown-exempt.
@@ -531,7 +624,8 @@ def gather(text, project=None, session=None):
     if nudge:
         steers.append(nudge[0])
         reflex_ids.append(nudge[1])
-    sections = {"pinned": pinned_lines, "jit": jit, "reflex": steers}
+    whisper = _whisper(text, session)  # the day's first turn leads with the brief
+    sections = {"whisper": whisper, "pinned": pinned_lines, "jit": jit, "reflex": steers}
     row = {"v": 1, "ts": pk.now_ts(), "project": project,
            "elapsed_ms": round((time.time() - t0) * 1000, 1)}
     if session:
@@ -540,6 +634,8 @@ def gather(text, project=None, session=None):
         row["suppressed"] = suppressed  # the cooldown's own measurability
     fired = {"pinned": pinned_ids, "jit": [str(e["id"]) for e in jit_entries],
              "reflex": reflex_ids}
+    if whisper:
+        fired["whisper"] = [WHISPER_ID]  # the once-a-day greeting, self-measurable
     if any(fired.values()):
         row.update({"fired": fired,
                     "bytes": {k: sum(len(l) for l in sections[k]) for k in sections},
@@ -551,7 +647,8 @@ def gather(text, project=None, session=None):
 
 
 def render(sections):
-    lines = sections["pinned"] + sections["jit"] + sections["reflex"]
+    lines = (sections.get("whisper") or []) + sections["pinned"] \
+        + sections["jit"] + sections["reflex"]
     return "\n".join(lines)
 
 
@@ -571,6 +668,15 @@ def _explain(text, project=None, session=None):
     low = (text or "").lower()
     seen = _seen_load(session) if session else None
     turn = seen["turn"] + 1 if seen else 0  # the would-be turn
+    wd = None  # first-turn whisper: what WOULD lead, read-only (stamps no latch)
+    if session and (text or "").strip() and not _greeted_today():
+        try:
+            wd = _brief_digest()
+        except Exception:
+            wd = None
+        if wd:
+            print("whisper (first turn today):")
+            print("  + " + wd)
     used = 0
     cut = False
     who = _who_lines()
@@ -613,7 +719,7 @@ def _explain(text, project=None, session=None):
         print("reflex:")
     for e in fired_reflex:
         print("  + %s [%s]: %s" % (e["id"], e.get("signal") or "prompt", e["steer"]))
-    if not (who or pinned_entries or jit_all or fired_reflex):
+    if not (wd or who or pinned_entries or jit_all or fired_reflex):
         print("silent turn — nothing fires (salience law)")
     return 0
 

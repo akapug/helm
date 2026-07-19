@@ -196,6 +196,18 @@ the owner is present, write a lexicon candidate if away — then latches
 forever: one line per term, ever. Both are fully fail-open: any state trouble
 means no cooldown and no nudge, never a blocked turn.
 
+On the **first turn of a calendar day** (session-bearing, non-empty prompt), the
+output leads with a one-line **brief digest** under a distinct `BRIEF:` prefix —
+sessions since you left, the knowledge delta, the count of owner gates — so the
+day's first agent turn surfaces "since you left" and relays it warmly in its own
+voice. It is latched once per day in `_global/.state/greeted.json`: the hot-path
+check is one small-JSON day-compare (O(1)), so only that first turn pays a brief
+compose — every later turn is silent. Seats are omitted (standing state, not
+news); the line points at `helm brief` for the full detail on demand. Day
+rollover re-greets. Fully fail-open: brief unavailable → no whisper, never a
+blocked hook; the latch is stamped on the first attempt, so a bad brief costs
+the day's greeting, not a per-turn read. `--explain` renders it read-only.
+
 ```console
 $ echo "how should we drain the memory backlog?" | helm inject --project myproject
 TERM drain: routing raw memory intake to typed homes ...
