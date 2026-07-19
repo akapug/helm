@@ -6,7 +6,9 @@ dirs; the real ~/.helm, ~/.claude and ~/.cache are never touched.
 Pins the load-bearing constants (PINNED_BUDGET / JIT_CAP / LINE_CAP), the
 salience law (no match -> empty stdout, rc 0), the --json shape, inline-arg vs
 stdin precedence, the fail-open law (a raising store must never block a turn),
-and the parsed-entry cache added for the twice-per-prompt parse fix."""
+the parsed-entry cache added for the twice-per-prompt parse fix (including the
+entries= seam short-circuiting ALL store parsing), and the fire-ledger (row
+shape, ids-never-text, rotation, fail-open, --explain writes no row)."""
 import contextlib
 import io
 import json
@@ -225,6 +227,20 @@ class CacheTest(InjectBase):
                          "gather must parse the store ONCE (was twice pre-fix)")
         self.assertTrue(sections["pinned"] and sections["jit"])
 
+    def test_warm_cache_short_circuits_store_parse(self):
+        self.plant_pinned("pin-a", "always truth")
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        first = inject.gather("tune the fluxcap")
+        self.assertTrue(first["pinned"] and first["jit"])
+        # sentinel: ANY real parse now explodes. The warm cache + the entries=
+        # seam must carry the whole call; a regression (a lane reaching for
+        # load_all/disk again) trips fail-open -> EMPTY lanes -> loud inequality.
+        with mock.patch.object(store, "_load_root",
+                               side_effect=AssertionError("store parsed twice")), \
+                mock.patch.object(store, "load_all",
+                                  side_effect=AssertionError("load_all called twice")):
+            self.assertEqual(inject.gather("tune the fluxcap"), first)
+
     def test_unwritable_cache_dir_still_serves(self):
         blocker = os.path.join(self.tmp, "not-a-dir")
         with open(blocker, "w") as f:
@@ -232,6 +248,100 @@ class CacheTest(InjectBase):
         os.environ["HELM_CACHE_DIR"] = os.path.join(blocker, "cache")  # mkdir fails
         self.plant_pinned("pin-a", "always truth")
         self.assertEqual(inject.gather("x")["pinned"], ["PREMISE pin-a: always truth"])
+
+
+class LedgerTest(InjectBase):
+    def rows(self):
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            return [json.loads(l) for l in f.read().splitlines()]
+
+    def test_fired_row_shape_ids_never_prompt_text(self):
+        self.plant_pinned("pin-a", "always truth")
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        rc, _, _ = self.run_inject([], stdin_text="tune the fluxcap now")
+        self.assertEqual(rc, 0)
+        self.assertEqual(inject._ledger_path(), os.path.join(
+            os.environ["HELM_HOME"], "_global", ".state", "inject-ledger.jsonl"))
+        r, = self.rows()
+        self.assertEqual(r["v"], 1)
+        self.assertTrue(r["ts"])
+        self.assertIsNone(r["project"])
+        self.assertEqual(r["fired"], {"pinned": ["pin-a"], "jit": ["jit-a"], "reflex": []})
+        self.assertGreater(r["bytes"]["pinned"], 0)
+        self.assertGreater(r["bytes"]["jit"], 0)
+        self.assertEqual(r["bytes"]["reflex"], 0)
+        self.assertEqual(r["candidates"], 2)
+        self.assertGreaterEqual(r["elapsed_ms"], 0)
+        self.assertNotIn("silent", r)
+        # entry IDS only — the raw line must never carry the prompt
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            self.assertNotIn("tune the fluxcap", f.read())
+        # jsonl append: a second call adds exactly one more row
+        self.run_inject([], stdin_text="tune the fluxcap now")
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_silent_turn_logs_silent_row(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        rc, out, _ = self.run_inject([], stdin_text="completely unrelated words")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "")
+        r, = self.rows()
+        self.assertIs(r["silent"], True)
+        self.assertEqual(r["v"], 1)
+        self.assertNotIn("fired", r)
+        self.assertNotIn("bytes", r)
+
+    def test_rotation_at_5mb_one_generation(self):
+        self.assertEqual(inject.LEDGER_MAX, 5 * 1024 * 1024)
+        path = inject._ledger_path()
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            f.write("x" * (inject.LEDGER_MAX + 1))
+        self.plant_pinned("pin-a", "always truth")
+        self.run_inject([], stdin_text="anything")
+        self.assertEqual(len(self.rows()), 1)  # fresh file: this turn's row only
+        with open(path + ".1", encoding="utf-8") as f:
+            self.assertEqual(len(f.read()), inject.LEDGER_MAX + 1)
+        # ONE generation: the next rotation replaces .1, never mints .2
+        with open(path, "a") as f:
+            f.write("y" * (inject.LEDGER_MAX + 1))
+        self.run_inject([], stdin_text="anything")
+        self.assertEqual(len(self.rows()), 1)
+        self.assertFalse(os.path.exists(path + ".2"))
+        with open(path + ".1", encoding="utf-8") as f:
+            self.assertTrue(f.read().endswith("y"))
+
+    def test_unwritable_ledger_fails_open(self):
+        # a FILE where the .state dir belongs -> every ledger write raises
+        g = os.path.join(os.environ["HELM_HOME"], "_global")
+        os.makedirs(g)
+        with open(os.path.join(g, ".state"), "w") as f:
+            f.write("x")
+        self.plant_pinned("pin-a", "always truth")
+        rc, out, err = self.run_inject([], stdin_text="anything")
+        self.assertEqual(rc, 0)
+        self.assertIn("PREMISE pin-a: always truth", out)
+        self.assertEqual(err, "")
+
+    def test_explain_prints_why_and_writes_no_ledger(self):
+        rc, out, _ = self.run_inject(["--explain"], stdin_text="nothing here")
+        self.assertEqual(rc, 0)
+        self.assertIn("silent turn", out)
+        self.plant_pinned("pin-a", "always truth")
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        rc, out, _ = self.run_inject(["--explain"], stdin_text="tune the fluxcap")
+        self.assertEqual(rc, 0)
+        self.assertIn("pinned (1 candidate, budget %dB):" % inject.PINNED_BUDGET, out)
+        self.assertIn("+ PREMISE pin-a: always truth", out)
+        self.assertIn("jit (1 hit, cap %d):" % inject.JIT_CAP, out)
+        self.assertIn("+ jit-a [matched: fluxcap]", out)
+        self.assertFalse(os.path.exists(inject._ledger_path()),
+                         "--explain must never write the ledger")
+        # over-cap hits are shown, marked, and still not fired
+        for i in range(6):
+            self.plant_jit("jit-%d" % i, "flux fact %d" % i, "fluxcap")
+        rc, out, _ = self.run_inject(["--explain"], stdin_text="tune the fluxcap")
+        self.assertEqual(out.count("(over cap)"), 3)  # 7 hits, cap 4
 
 
 if __name__ == "__main__":

@@ -21,9 +21,18 @@ stat signature of every store file (the catalog-cache.json pattern), so the
 steady state is ~N stat() calls + one JSON read instead of two full
 frontmatter parses of the ~880-file adopted store. Cache lives under
 $HELM_CACHE_DIR (default ~/.cache/helm); any cache trouble falls back to a
-direct parse. The DURABLE fix — an entries= parameter threading one load
-through store.pinned/resolve_prompt — is a store.py change deferred to that
-lane; until it lands the shared list is installed here (see _lanes).
+direct parse. The cached list feeds both lanes EXPLICITLY through
+store.pinned/resolve_prompt's entries= parameter (the durable seam — no
+monkeypatch, so a dropped cache regresses loudly in tests, not silently here).
+
+FIRE-LEDGER (the measurement spine): every gather() appends ONE JSON line to
+<helm home>/_global/.state/inject-ledger.jsonl — v:1, ts, project, fired entry
+IDS per lane (never prompt text), bytes per lane, pre-cap candidate count,
+elapsed_ms; a no-fire turn logs {"silent": true} instead of per-entry fields.
+O(1) append, 5MB one-generation rotation (-> .1), and fail-open: ledger
+trouble never blocks or slows the hook. `helm inject --explain` is the read
+side — what WOULD fire for stdin text and why (the pinned budget walk, which
+keyword matched per JIT hit) — and writes NO ledger row.
 
 FAIL OPEN (docs/HOOKS.md law): a hook that cannot run helm must inject nothing,
 never block — a store or reflex failure yields an empty lane and rc 0.
@@ -32,16 +41,16 @@ import hashlib
 import json
 import os
 import sys
-import threading
+import time
 
-from . import home, reflex
+from . import home, pk, reflex
 
 PINNED_BUDGET = 1200  # bytes for the always lane — keep the constant tax tiny
 JIT_CAP = 4
 LINE_CAP = 400        # per-entry cap — the gloss fires, the full entry stays on disk
+LEDGER_MAX = 5 * 1024 * 1024  # ledger rotates here (one .1 generation)
 
 _CACHE_VERSION = 1    # bump when store parsing/derivation changes entry shape
-_lanes_lock = threading.Lock()
 
 
 def _entry_line(e):
@@ -105,7 +114,6 @@ def load_entries(project=None):
         pass
     entries = store.load_all(project=project)
     try:
-        from . import pk
         pk.atomic_write(path, json.dumps(
             {"v": _CACHE_VERSION, "sig": sig, "entries": entries}, ensure_ascii=False))
     except Exception:
@@ -114,56 +122,78 @@ def load_entries(project=None):
 
 
 def _lanes(text, project=None):
-    """(pinned_entries, jit_entries) off ONE store parse. store.pinned and
-    store.resolve_prompt each call load_all() internally (that seam is owned by
-    the store lane — the durable fix is an entries= parameter there); until it
-    lands, the shared list is served by swapping store.load_all around the two
-    calls, applying load_all's exact post-filters. Lock-guarded + restored in
-    finally, so the swap can never leak out of this call."""
+    """(pinned_entries, ALL ranked jit matches) off ONE store parse — the
+    cached list feeds both lanes explicitly through the entries= seam. JIT
+    comes back UNCAPPED so gather can both cap the lane and ledger the pre-cap
+    candidate count."""
     from . import store
     entries = load_entries(project)
-    real = store.load_all
+    return (store.pinned(project=project, entries=entries),
+            store.resolve_prompt(text, project=project, cap=len(entries),
+                                 entries=entries))
 
-    def shared(project=None, include_retired=False, include_dormant=True, types=None):
-        if include_retired:  # not an inject shape — stay truthful, hit disk
-            return real(project=project, include_retired=True,
-                        include_dormant=include_dormant, types=types)
-        if isinstance(types, str):
-            types = (types,)
-        return [e for e in entries
-                if (include_dormant or e.get("load_class") != "dormant")
-                and (not types or e["type"] in types)]
 
-    with _lanes_lock:
-        store.load_all = shared
+def _ledger_path():
+    return os.path.join(home.global_dir(), ".state", "inject-ledger.jsonl")
+
+
+def _ledger_append(row):
+    """ONE appended JSON line per inject call — the measurement spine. HARD
+    LAWS: O(1) (one stat + one append, never a read), entry IDS never prompt
+    text, 5MB one-generation rotation, and FAIL-OPEN — a ledger that cannot be
+    written must never block or slow the hook."""
+    try:
+        path = _ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
-            return (store.pinned(project=project),
-                    store.resolve_prompt(text, project=project, cap=JIT_CAP))
-        finally:
-            store.load_all = real
+            if os.path.getsize(path) > LEDGER_MAX:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass  # no ledger yet
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def gather(text, project=None):
     """-> dict {pinned: [line], jit: [line], reflex: [line]} (each may be empty).
-    Fail-open per lane: a raising store/reflex yields that lane empty."""
+    Fail-open per lane: a raising store/reflex yields that lane empty. Every
+    call appends one fire-ledger row (silent turns log {"silent": true})."""
+    t0 = time.time()
     try:
-        pinned_entries, jit_entries = _lanes(text, project=project)
+        pinned_entries, jit_all = _lanes(text, project=project)
     except Exception:
-        pinned_entries, jit_entries = [], []
-    pinned_lines = []
+        pinned_entries, jit_all = [], []
+    pinned_lines, pinned_ids = [], []
     used = 0
     for e in pinned_entries:
         line = _entry_line(e)
         if used + len(line) > PINNED_BUDGET:
             break
         pinned_lines.append(line)
+        pinned_ids.append(str(e["id"]))
         used += len(line)
+    jit_entries = jit_all[:JIT_CAP]
     jit = [_entry_line(e) for e in jit_entries]
     try:
-        steers = ["REFLEX: " + e["steer"] for e in reflex.fire(text, project=project)]
+        fired_reflex = reflex.fire(text, project=project)
     except Exception:
-        steers = []
-    return {"pinned": pinned_lines, "jit": jit, "reflex": steers}
+        fired_reflex = []
+    steers = ["REFLEX: " + e["steer"] for e in fired_reflex]
+    sections = {"pinned": pinned_lines, "jit": jit, "reflex": steers}
+    row = {"v": 1, "ts": pk.now_ts(), "project": project,
+           "elapsed_ms": round((time.time() - t0) * 1000, 1)}
+    fired = {"pinned": pinned_ids, "jit": [str(e["id"]) for e in jit_entries],
+             "reflex": [str(e["id"]) for e in fired_reflex]}
+    if any(fired.values()):
+        row.update({"fired": fired,
+                    "bytes": {k: sum(len(l) for l in sections[k]) for k in sections},
+                    "candidates": len(pinned_entries) + len(jit_all) + len(fired_reflex)})
+    else:
+        row["silent"] = True
+    _ledger_append(row)
+    return sections
 
 
 def render(sections):
@@ -171,8 +201,45 @@ def render(sections):
     return "\n".join(lines)
 
 
+def _explain(text, project=None):
+    """--explain: what WOULD fire for this text and WHY — the pinned budget
+    walk, each JIT hit's matching keyword(s), live reflex signals. A dry look:
+    NO ledger row (an explain must never count as a turn)."""
+    from . import store
+    pinned_entries, jit_all = _lanes(text, project=project)
+    low = (text or "").lower()
+    used = 0
+    cut = False
+    if pinned_entries:
+        print("pinned (%d candidate%s, budget %dB):" % (
+            len(pinned_entries), "s"[:len(pinned_entries) != 1], PINNED_BUDGET))
+    for e in pinned_entries:
+        line = _entry_line(e)
+        cut = cut or used + len(line) > PINNED_BUDGET  # greedy walk: first overflow ends the lane
+        if cut:
+            print("  - %s (over budget)" % e["id"])
+        else:
+            used += len(line)
+            print("  + " + line)
+    if jit_all:
+        print("jit (%d hit%s, cap %d):" % (len(jit_all), "s"[:len(jit_all) != 1], JIT_CAP))
+    for i, e in enumerate(jit_all):
+        matched = store._probe_hits(e, low)[2]
+        mark, over = ("  + ", "") if i < JIT_CAP else ("  - ", " (over cap)")
+        print(mark + str(e["id"]) + " [matched: " + " ".join(matched) + "]" + over)
+    fired_reflex = reflex.fire(text, project=project)
+    if fired_reflex:
+        print("reflex:")
+    for e in fired_reflex:
+        print("  + %s [%s]: %s" % (e["id"], e.get("signal") or "prompt", e["steer"]))
+    if not (pinned_entries or jit_all or fired_reflex):
+        print("silent turn — nothing fires (salience law)")
+    return 0
+
+
 def cmd_inject(args):
-    """inject [--project P] [--json] — prompt text on stdin -> context lines."""
+    """inject [--project P] [--json] [--explain] — prompt text on stdin ->
+    context lines. --explain prints what WOULD fire and why, sans ledger row."""
     project = None
     if "--project" in args:
         project = args[args.index("--project") + 1]
@@ -180,6 +247,8 @@ def cmd_inject(args):
     for a in args:
         if not a.startswith("--") and a != project:
             text = a  # allow inline text for quick tests
+    if "--explain" in args:
+        return _explain(text, project=project)
     sections = gather(text, project=project)
     if "--json" in args:
         print(json.dumps(sections, ensure_ascii=False))

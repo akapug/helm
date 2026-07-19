@@ -22,7 +22,7 @@ Entry TYPES (filename prefix is the classifier, matching drain/doctor):
              confidence coercion, DORMANT_BELOW, BELIEF_CLAMP, pin handling,
              the live/retired/delete_eligible lifecycle, one-line-JSON
              evidence_log/confidence_history, the certain-prior
-             contradiction-logged-not-applied rule, the tombstone law.
+             contradiction-logged-not-applied rule, the record law (retire keeps the file).
   lexicon    lex-*.md — term/definition; matches when the TERM appears in the
              turn text (word-boundary).
   heuristic  heuristic-*.md — a MOVE you apply; confidence 1.0 by construction
@@ -90,6 +90,9 @@ TYPE_SUBDIR = {"prior": "premises", "lexicon": "lexicon",
 _SCAN_SUBDIRS = ("premises", "heuristics", "lexicon", "references", "priors")
 
 _TYPE_ORDER = ("prior", "heuristic", "reference", "lexicon", "episodic")
+
+# The JIT-resolvable types (episodic never fires — load_class dormant).
+_JIT_TYPES = ("prior", "heuristic", "lexicon", "reference")
 
 
 # ---------------------------------------------------------------------------
@@ -384,9 +387,9 @@ def load_all(project=None, include_retired=False, include_dormant=True, types=No
         merged.update(_load_root(root, scope, d))
     out = []
     for e in merged.values():
-        # status filter AFTER the merge: a retired/tombstoned shadow-WINNER
+        # status filter AFTER the merge: a retired shadow-WINNER
         # drops out entirely — it must not un-bury the wider-scope entry it
-        # shadowed (the tombstone law survives scope precedence).
+        # shadowed (the record law survives scope precedence).
         if not include_retired and e.get("status") != STATUS_LIVE:
             continue
         if not include_dormant and e.get("load_class") == "dormant":
@@ -432,38 +435,54 @@ def _find(eid, project=None, types=None):
 # resolve — the ONE JIT lane (priors + heuristics + lexicon + references)
 # ---------------------------------------------------------------------------
 
-def resolve_prompt(text, project=None, cap=4):
+def _probe_hits(e, low):
+    """The ONE keyword-match law: (hits, specific, matched) for entry `e`
+    against lowercased turn text — id + csv keywords, word-boundary, the
+    specificity guard. Shared by resolve_prompt (scoring) and inject --explain
+    (the why); `matched` is the sorted probe list that actually hit."""
+    heur = e["type"] == "heuristic"
+    generic = _HEURISTIC_GENERIC if heur else GENERIC_KEYWORDS
+    min_len = _MIN_HEURISTIC_TOKEN if heur else 1
+    probes = [(str(e["id"]).lower(), False)] + [
+        (k.strip().lower(), k.strip().lower() in generic)
+        for k in (e.get("keywords") or "").split(",") if k.strip()]
+    hits = 0
+    specific = False
+    matched = []
+    for p, is_generic in {(p, g) for p, g in probes}:
+        # substring prefilter before the (expensive) word-boundary regex —
+        # ~all probes miss on any given prompt, so only true hits pay the
+        # regex. Measured 88ms -> 1.3ms per call on the live store, and this
+        # runs on EVERY prompt in EVERY session fleet-wide.
+        if p and len(p) >= min_len and p in low and \
+                re.search(r"(?<![a-z0-9])" + re.escape(p) + r"(?![a-z0-9])", low):
+            hits += 1
+            matched.append(p)
+            if not is_generic:
+                specific = True
+    matched.sort()
+    return hits, specific, matched
+
+
+def resolve_prompt(text, project=None, cap=4, entries=None):
     """JIT: live, non-dormant entries whose id/keywords (lexicon: term)
     word-boundary-match the turn text, ranked confidence-weighted
     (score = specific-guarded hits * confidence; ties -> last_updated desc then
     id). Pinned (load_class always) entries are NOT returned here — they are
-    emitted unconditionally via pinned(). Salience law: EMPTY on no match."""
+    emitted unconditionally via pinned(). Salience law: EMPTY on no match.
+    entries= feeds the lane from a caller-supplied load_all() list (the inject
+    parsed-entry cache) instead of a fresh parse; None = load_all() as ever."""
     low = (text or "").lower()
     if not low.strip():
         return []
+    if entries is None:
+        entries = load_all(project=project, include_dormant=False, types=_JIT_TYPES)
     scored = []
-    for e in load_all(project=project, include_dormant=False,
-                      types=("prior", "heuristic", "lexicon", "reference")):
-        if e.get("load_class") == "always":
+    for e in entries:
+        # uniform post-filter so a raw load_all() list needs no pre-shaping
+        if e["type"] not in _JIT_TYPES or e.get("load_class") in ("always", "dormant"):
             continue
-        heur = e["type"] == "heuristic"
-        generic = _HEURISTIC_GENERIC if heur else GENERIC_KEYWORDS
-        min_len = _MIN_HEURISTIC_TOKEN if heur else 1
-        probes = [(str(e["id"]).lower(), False)] + [
-            (k.strip().lower(), k.strip().lower() in generic)
-            for k in (e.get("keywords") or "").split(",") if k.strip()]
-        hits = 0
-        specific = False
-        for p, is_generic in {(p, g) for p, g in probes}:
-            # substring prefilter before the (expensive) word-boundary regex —
-            # ~all probes miss on any given prompt, so only true hits pay the
-            # regex. Measured 88ms -> 1.3ms per call on the live store, and this
-            # runs on EVERY prompt in EVERY session fleet-wide.
-            if p and len(p) >= min_len and p in low and \
-                    re.search(r"(?<![a-z0-9])" + re.escape(p) + r"(?![a-z0-9])", low):
-                hits += 1
-                if not is_generic:
-                    specific = True
+        hits, specific, _ = _probe_hits(e, low)
         if hits and specific:
             scored.append((hits * e["confidence"],
                            str(e.get("last_updated") or e.get("updated_ts") or ""),
@@ -476,10 +495,13 @@ def resolve_prompt(text, project=None, cap=4):
     return [t[3] for t in scored[:max(n, 0)]]
 
 
-def pinned(project=None):
+def pinned(project=None, entries=None):
     """load_class=always entries — returned ALWAYS (no relevance gate), ranked
-    confidence-desc then id so the always-on consumer can budget the top-N."""
-    out = [e for e in load_all(project=project) if e.get("load_class") == "always"]
+    confidence-desc then id so the always-on consumer can budget the top-N.
+    entries= as in resolve_prompt: a supplied load_all() list skips the parse."""
+    if entries is None:
+        entries = load_all(project=project)
+    out = [e for e in entries if e.get("load_class") == "always"]
     out.sort(key=lambda e: (-e["confidence"], str(e["id"])))
     return out
 
@@ -688,7 +710,7 @@ _WRITERS = {"prior": write_prior, "heuristic": write_heuristic,
 
 
 # ---------------------------------------------------------------------------
-# lifecycle — evidence, tombstone, retire (the mc laws, root-aware)
+# lifecycle — evidence, supersede, retire (the mc laws, root-aware)
 # ---------------------------------------------------------------------------
 
 def apply_evidence(pid, ts, delta, reason, by="agent", kind=None, project=None):
@@ -731,7 +753,7 @@ def apply_evidence(pid, ts, delta, reason, by="agent", kind=None, project=None):
 
 def mark_superseded(old_id, new_id, ts, reason="", project=None):
     """Tombstone OLD as superseded BY NEW: old.status=delete_eligible +
-    old.replaced_by=new, backpointer new.supersedes=old. A tombstoned entry
+    old.replaced_by=new, backpointer new.supersedes=old. A superseded entry
     STOPS injecting (load skips non-live) but the FILE STAYS — this function
     NEVER deletes (the presence-gated sweep is the physical delete). Idempotent;
     refuses self-supersede and a missing replacement."""

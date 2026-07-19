@@ -128,7 +128,7 @@ VERBS = {
 
 _VERB_HELP = {
     "store": "store list|get|add|resolve|... — the one typed knowledge store",
-    "inject": "inject [--project P] — per-turn context for harness hooks (stdin: prompt)",
+    "inject": "inject [--project P] [--json|--explain] — per-turn context for harness hooks (stdin: prompt)",
     "drain": "drain [--apply] — route raw memory intake to typed homes (dry-run default)",
     "drift": "drift — surface belief drift; silent when steady",
     "reflex": "reflex list|add|retire — (signal -> steer) entries",

@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 
@@ -492,6 +493,29 @@ class PinnedTest(StoreBase):
         # the flag survives the file round-trip
         with open(got[1]["path"]) as f:
             self.assertIn("  pin: true", f.read())
+
+
+class EntriesSeamTest(StoreBase):
+    """pinned/resolve_prompt entries= — inject's parsed-entry cache feeds both
+    lanes through this seam with ZERO load_all() calls (the durable one-parse
+    fix), and the supplied list gets exactly the load_all-path post-filters."""
+
+    def synth(self, eid, load_class="jit", etype="prior", keywords="", conf=0.8):
+        return {"id": eid, "type": etype, "statement": "s", "confidence": conf,
+                "load_class": load_class, "keywords": keywords, "last_updated": ""}
+
+    def test_supplied_entries_never_touch_disk(self):
+        entries = [self.synth("pin-a", load_class="always", conf=1.0),
+                   self.synth("jit-a", keywords="fluxcap"),
+                   self.synth("dorm-a", load_class="dormant", keywords="fluxcap"),
+                   self.synth("epi-a", etype="episodic", keywords="fluxcap")]
+        with mock.patch.object(store, "load_all",
+                               side_effect=AssertionError("entries= must skip load_all")):
+            got_pinned = store.pinned(entries=entries)
+            got_jit = store.resolve_prompt("tune the fluxcap", entries=entries)
+        self.assertEqual([e["id"] for e in got_pinned], ["pin-a"])
+        # dormant/episodic/always filtered exactly as the load_all path would
+        self.assertEqual([e["id"] for e in got_jit], ["jit-a"])
 
 
 class CountsTest(StoreBase):
