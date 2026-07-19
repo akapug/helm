@@ -225,6 +225,41 @@ helm drain --rekey: 413 drained priors — 413 to rekey, 0 already rekeyed
 helm drain --rekey: DRY-RUN (nothing written). Re-run with --apply.
 ```
 
+### `helm sweep [--apply] [--project P]`
+A lineage-driven supersession sweep of the adopted store. The store feeds
+inject, and a corpus whose majority carries superseded premises fires stale
+knowledge into live turns — so sweep walks the family tree's succession edges
+(`supersedes`, `descends-from`, `forked-from`; a `checkout-of` worktree
+duplicate is not a succession and is excluded) and proposes superseding the
+ancestor-era entries the store still holds by their successor-era twins (the
+sesh-era premise superseded by its helm successor).
+
+**Never on weak signal.** A proposal needs BOTH a directed lineage edge AND a
+match between an ancestor-era entry and a successor-era one: *same-slug* (equal
+base after stripping the era token — `sesh-rollover` / `helm-rollover` →
+`rollover`) or *high-overlap* (keyword/statement Jaccard ≥ 0.6). Term-mention
+alone never qualifies — an entry that merely *mentions* a dead harness while
+stating a live lesson is not superseded, which is why the dry-run quotes both
+statements as evidence and emits a per-entry command to veto.
+
+**Dry-run by default** — nothing is superseded without `--apply`. Each line
+prints the signal, the old → new pair, the edge that justifies it, the quoted
+before/after evidence, and the exact `helm store supersede` command. `--apply`
+runs each through `store.mark_superseded` (the public API): old is tombstoned
+`delete_eligible` with a backpointer, the **file stays** (never deleted,
+re-promotable), and a receipt lands on the events journal. Fail-open: a missing
+registry or unreadable store yields a clean line, never a crash.
+
+```console
+$ helm sweep
+helm sweep — 1 lineage supersession proposed across 1 edge (PROPOSE-ONLY; nothing superseded):
+  [same-slug] sesh-rollover-policy -> helm-rollover-policy   (helm supersedes sesh)
+      old: "on rollover, re-home the sesh session under the freshest account"
+      new: "on rollover, helm re-homes the session under the freshest account"
+      ->  helm store supersede <ts> sesh-rollover-policy helm-rollover-policy lineage: helm supersedes sesh + same base slug 'rollover-policy'
+helm sweep: DRY-RUN (nothing superseded). Re-run with --apply to tombstone via store.supersede (files KEPT — re-promotable).
+```
+
 ### `helm drift [--project P] [--peek]`
 Surface belief drift — contradictions, tier-crossings, decays, and evolutions
 — and only that. A superseded premise reports `EVOLVED`, exactly once:
