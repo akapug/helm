@@ -202,7 +202,22 @@ def get_json(url, timeout=4):
 # ---------------------------------------------------------------------------
 
 def _roster_summary():
+    """The substrate's own view first (dregg-frontline law: consume the mature
+    client surface, retire local re-parsing) — `meld roster --json` when the
+    binary answers; the regex fallback only covers a missing/failing binary."""
     path = roster_path()
+    rc, out, _err = run_bin(["roster", "--json"], timeout=15)
+    if rc == 0 and out.strip().startswith(("[", "{")):
+        try:
+            data = json.loads(out)
+            cells = data if isinstance(data, list) else data.get("cells") or []
+            labels = [str(c.get("label") or "") for c in cells if isinstance(c, dict)]
+            n = len(cells)
+            return "roster %s: %d cell%s%s" % (
+                path, n, "s"[:n != 1],
+                (" (" + ", ".join(l for l in labels if l) + ")") if any(labels) else "")
+        except (ValueError, AttributeError):
+            pass
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             raw = f.read()

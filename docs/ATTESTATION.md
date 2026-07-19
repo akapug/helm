@@ -116,11 +116,12 @@ referencing the prior one — append-only, mirroring the store's record law
 chain — *held X until T, then Y* — which the drift report can read as
 attested belief evolution rather than lost history.
 
-One sharp edge, by design: the store's lifecycle writers own the entry's byte
-shape and do not carry the `attest_*` keys, so a later lifecycle rewrite
-(evidence, retire) drops the annotation from the *file*. The attestation
-**truth lives on the ledger** — re-capture to re-annotate, or read the turn
-hash back from the queue/receipts. The design record behind all of this is an
+The store's lifecycle writers carry the `attest_*` keys through rewrites
+(evidence, retire) — a lifecycle update never orphans the entry's receipt
+annotations. The attestation **truth still lives on the ledger**; the file
+keys are the convenient pointer back to it (turn hash, receipt, chain index),
+recoverable from the queue/receipts if a file is ever hand-edited without
+them. The design record behind all of this is an
 internal decision document; its ratified shape is summarized in
 [CONCEPTS.md](CONCEPTS.md) and implemented in `helm/premise.py` (whose
 docstring is the normative spec for the digest contract).
