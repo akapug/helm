@@ -133,7 +133,7 @@ def cmd_swap(args):
             # "claude " must not be corrupted (test-pinned)
             head, sep, tail = base.rpartition(" && ")
             if sep and tail.startswith(provider + " "):
-                base = "%s%s env %s=%s %s" % (head, sep, env_var,
-                                              target_home.get("path", "?"), tail)
+                base = "%s && env %s=%s %s" % (head, env_var,
+                                               target_home.get("path", "?"), tail)
         print("    " + base)
     return 0
