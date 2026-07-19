@@ -64,11 +64,14 @@ Orthogonal to type. `load_class:` ∈
 The salience law governs all three: **empty on no match**. Salience is the
 scarce resource; spend it only when newly relevant.
 
-## Attested premises (converged design, awaiting ratification)
+## Attested premises (shipped)
 
-Premises (confidence 1.0) are provable, standing truths — so they can live as
-*attested records* on a verifiable ledger, not just files. The converged
-shape (2026-07-18, build + substrate poles):
+Premises (confidence 1.0) are provable, standing truths — so they live as
+*attested records* on a verifiable ledger, not just files. The design
+converged 2026-07-18 between the build and substrate poles, was ratified in
+that convergence, and was live-proven on the node the same day; it ships as
+`helm premise` / `helm premise-check` (operational detail:
+[ATTESTATION.md](ATTESTATION.md)). The shape:
 
 - **The operator's own cell signs** premise capture and supersession. This is
   semantically exact, not just warm: confidence 1.0 is human-only by law, so
@@ -84,3 +87,9 @@ shape (2026-07-18, build + substrate poles):
   delivery rides the existing whisper lane. `type`/`load_class` stay
   orthogonal to placement, so no consumer changes when a premise's backing
   migrates from file to attested record.
+
+One activation note: captures sign as a visibly-test profile until the
+operator sets their own — the operator's first personal capture with their
+profile configured is what activates user-cell signing, by design. And the
+substrate is an upgrade, never a dependency: without it, premises store
+normally and attestations queue for retry.

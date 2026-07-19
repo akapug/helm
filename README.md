@@ -80,19 +80,57 @@ The pillars:
 ## Quickstart
 
 ```console
-$ ./bin/helm sync        # discover your projects across all harnesses
-$ ./bin/helm projects    # the list, newest activity first
-$ ./bin/helm show meld   # one project's full record
-$ ./bin/helm sessions    # every session, all harnesses; resume in one paste
-$ ./bin/helm doctor      # health check (read-only)
-$ ./bin/helm web         # the same, warm, in a browser
+$ ./bin/helm sync              # discover your projects across all harnesses
+$ ./bin/helm projects          # the list, newest activity first
+$ ./bin/helm show <project>    # one project's full record (any name from the list)
+$ ./bin/helm sessions          # every session, all harnesses; resume in one paste
+$ ./bin/helm doctor            # health check (read-only)
+$ ./bin/helm web               # the same, warm, in a browser
 ```
 
-`HELM_HOME` overrides the default `~/.helm` (legacy `MELD_*` variables are
-accepted as a fallback).
+Optional PATH install — the entry script resolves through symlinks, so one
+line makes it `helm` everywhere:
+
+```console
+$ ln -s "$PWD/bin/helm" ~/.local/bin/helm
+```
+
+**What first run does.** `helm sync` scaffolds `~/.helm` (the global chain +
+one dir per discovered project) and, if you already use Claude Code, **adopts
+your live memory dir in place** — the resolver reads
+`~/.claude/projects/<slug-of-home>/memory` as one more root, same files, no
+copy, byte-shape-compatible writes (your existing hooks keep working
+untouched; new helm entries land in `~/.helm`, never there unless you point
+them there). On a fresh machine with no harness stores at all, everything
+still works: sync scaffolds an empty home, the project list is empty until an
+agent runs somewhere, and `helm doctor` tells you exactly what it is (and
+isn't) seeing. Quota, recall, and the attestation substrate are all
+optional — each degrades to one informative line.
+
+- **Command reference** — every verb with syntax and examples:
+  [docs/VERBS.md](docs/VERBS.md)
+- **Environment** — every `HELM_*` variable (all optional):
+  [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md). `HELM_HOME` overrides the
+  default `~/.helm`; legacy `MELD_*`/`SESH_*` spellings are accepted as
+  fallbacks forever.
+
+## Docs
+
+[VERBS](docs/VERBS.md) — the command reference ·
+[ENVIRONMENT](docs/ENVIRONMENT.md) — every knob ·
+[ARCHITECTURE](docs/ARCHITECTURE.md) — the two-source model ·
+[CONCEPTS](docs/CONCEPTS.md) — the axes and laws ·
+[HOOKS](docs/HOOKS.md) — wiring `helm inject` into your harness ·
+[WEB](docs/WEB.md) — the browser surface, API, service unit ·
+[ATTESTATION](docs/ATTESTATION.md) — the ledger leg ·
+[EVOLUTION](docs/EVOLUTION.md) — the self-evolution loop ·
+[CONTRIBUTING](CONTRIBUTING.md) — setup, tests, the laws new code obeys
 
 ## Status
 
 Young and moving fast. The registry/auto-map, typed store, drain, drift,
 lineage, and web views are live; reflexes and the self-evolution loop are in
-active development. Issues and harness-format reports welcome.
+active development. Issues and harness-format reports welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the on-ramp.
+
+License: TBD (see [docs/LICENSE-TODO.md](docs/LICENSE-TODO.md)).
