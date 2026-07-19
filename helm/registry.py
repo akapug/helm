@@ -60,15 +60,27 @@ def sync(observations=None):
     mapped = automap.build_map(observations=observations)
     report = {"new": [], "updated": []}
 
-    # match on path (a rename of the display name must not duplicate a project)
+    # PATH is identity. Match on path first (a display-name rename must not
+    # duplicate a project). Only merge into an existing record when its path
+    # matches; a same-BASENAME newcomer at a different path must get a fresh
+    # non-colliding name, never inherit the incumbent's authored edges/notes.
     by_path = {p["path"]: n for n, p in known.items()}
     for name, rec in sorted(mapped.items()):
-        cur_name = by_path.get(rec["path"], name)
-        cur = known.get(cur_name)
         _overlay_pointers(rec)
+        cur_name = by_path.get(rec["path"])
+        if cur_name is None and name in known and known[name].get("path") != rec["path"]:
+            # basename collision with a DIFFERENT project — mint a distinct name
+            taken = {n: p.get("path", "") for n, p in known.items()}
+            cur_name = automap._name_for(rec["path"], taken, os.path.expanduser("~"))
+            if cur_name in known:  # last-resort disambiguation
+                cur_name = cur_name + "-" + rec["path"].strip("/").replace("/", "-")[-24:]
+        cur = known.get(cur_name) if cur_name else None
         if cur is None:
+            cur_name = cur_name or name
+            rec["name"] = cur_name
             rec["first_seen"] = rec["last_seen"] or time.time()
             known[cur_name] = rec
+            by_path[rec["path"]] = cur_name
             report["new"].append(cur_name)
         else:
             preserved = {k: cur[k] for k in AUTHORED_FIELDS if k in cur}

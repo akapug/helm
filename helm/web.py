@@ -809,7 +809,29 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _same_origin(self):
+        """DNS-rebinding defense: a bound-to-127.0.0.1 server still answers
+        requests a hostile page re-resolves to us, and our GETs leak data +
+        the templated token. Pin Host to the loopback literals we bind, and
+        reject any cross-origin request outright. This holds regardless of the
+        bearer token (which a rebound same-origin page could otherwise read
+        off the served page)."""
+        port = self.server.server_address[1]
+        ok_hosts = {"127.0.0.1:%d" % port, "localhost:%d" % port,
+                    "[::1]:%d" % port}
+        host = self.headers.get("Host", "")
+        if host not in ok_hosts:
+            return False
+        origin = self.headers.get("Origin") or self.headers.get("Referer")
+        if origin:
+            from urllib.parse import urlparse
+            if urlparse(origin).netloc not in ok_hosts:
+                return False
+        return True
+
     def do_GET(self):
+        if not self._same_origin():
+            return self._json({"error": "forbidden (host/origin not loopback)"}, 403)
         path, _, query = self.path.partition("?")
         if path != "/":
             path = path.rstrip("/")
@@ -831,6 +853,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
 
     def do_POST(self):
+        if not self._same_origin():
+            return self._json({"error": "forbidden (host/origin not loopback)"}, 403)
         path = self.path.split("?", 1)[0].rstrip("/")
         fn = POST_API.get(path)
         if fn is None:
