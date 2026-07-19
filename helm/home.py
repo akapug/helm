@@ -83,10 +83,14 @@ def claude_memory_dir_for(path):
 
 
 def scaffold_global():
-    """Ensure the _global chain exists. Idempotent, additive."""
+    """Ensure the _global chain exists. Idempotent, additive. Also seeds the
+    shipped default reflex pack — a no-op for every id already present, so an
+    operator edit or retire is never overwritten (reflex.seed_defaults law)."""
     g = global_dir()
     for c in GLOBAL_CATEGORIES:
         os.makedirs(os.path.join(g, c), exist_ok=True)
+    from . import reflex
+    reflex.seed_defaults()
     return g
 
 

@@ -25,10 +25,48 @@ from . import home, pk
 
 _DEFAULTS = {
     "id": "", "steer": "", "signal": "prompt", "pattern": "", "marker": "",
-    "status": "live", "stated_ts": "", "notes": "",
+    "status": "live", "stated_ts": "", "notes": "", "source": "",
 }
 
 EVERY_TURN_BUDGET = 3  # max constant steers per injection — habituation guard
+
+# The shipped starter pack — installed by seed_defaults() at scaffold time so
+# the lane is live out of the box. Each lands as a normal store entry marked
+# source: helm-default (shipped vs authored stays legible); operators edit or
+# retire them like any authored reflex and seeding never touches an existing id
+# again. All prompt-signal: none fires on a generic turn (specificity law).
+DEFAULT_PACK = (
+    {"id": "correction-language",
+     "pattern": r"\b(no,? actually|that'?s (wrong|not what)|i (said|told you)|stop doing)\b",
+     "steer": "Correction detected: capture it durably (/premise or helm store add) — "
+              "a correction only complied-with is lost by the next compaction."},
+    {"id": "punt-tell",
+     # punt-SHAPED phrasing only — bare "later"/"todo" ride ordinary narration
+     # ("3 days later...", "the todo list") and would fire wallpaper
+     "pattern": r"\b(?:(?:wire|do|fix|handle|finish|add|ship|test|clean|deal)\b"
+                r"[^.!?\n]{0,24}\blater\b|maybe later\b|for now\b|next session\b|"
+                r"punt(?:s|ed|ing)?\b|park (?:it|this|that)\b|"
+                r"(?:leave|add) (?:a |the )?todo\b|todo:)",
+     "steer": "Deferral language detected: identified fixes land in-pass; anything "
+              "truly deferred is loudly flagged to the owner, never silently parked."},
+    {"id": "compaction-continuity",
+     "pattern": r"\b(summarized|compacted|continu(ed|ing) from)\b",
+     "steer": "Compaction marker detected: re-read .remember/now and the live task "
+              "state before acting — settled decisions are not re-derived."},
+)
+
+
+def seed_defaults():
+    """Install DEFAULT_PACK into _global/reflexes, marked source: helm-default.
+    Idempotent by id: an existing file — operator-edited, re-worded, or retired
+    — is never overwritten; a re-seed of a present id is a no-op. Returns the
+    paths actually written (empty on re-seed)."""
+    out = []
+    for d in DEFAULT_PACK:
+        if os.path.exists(reflex_path(d["id"])):
+            continue
+        out.append(write(dict(d, signal="prompt", source="helm-default")))
+    return out
 
 
 def _dirs(project=None):
@@ -77,7 +115,7 @@ def write(e, project=None):
         "  steer: " + re.sub(r"\s+", " ", e["steer"]),
         "  signal: " + (e.get("signal") or "prompt"),
     ]
-    for opt in ("pattern", "marker", "notes"):
+    for opt in ("pattern", "marker", "notes", "source"):
         if e.get(opt):
             body.append("  " + opt + ": " + str(e[opt]))
     body += ["  status: " + (e.get("status") or "live"),
@@ -124,6 +162,8 @@ def cmd_reflex(args):
             sig = e["signal"] + (":" + e["pattern"] if e.get("pattern") else "") \
                 + (":" + e["marker"] if e.get("marker") else "")
             mark = "" if e["status"] == "live" else " [" + e["status"] + "]"
+            if e.get("source") == "helm-default":
+                mark += " [default]"
             print("  - %s%s (%s): %s" % (e["id"], mark, sig, e["steer"][:90]))
         return 0
     if args[0] == "add":

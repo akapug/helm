@@ -1,10 +1,16 @@
+import contextlib
+import io
 import os
+import shutil
 import tempfile
 import unittest
 
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 
 from helm import home, reflex  # noqa: E402
+
+ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
+            "HELM_CACHE_DIR", "MELD_CACHE_DIR")
 
 
 class ReflexTest(unittest.TestCase):
@@ -47,6 +53,142 @@ class ReflexTest(unittest.TestCase):
     def test_retired_silent(self):
         reflex.write({"id": "r2", "steer": "s2", "signal": "every-turn", "status": "retired"})
         self.assertEqual(reflex.fire("x"), [])
+
+
+class SeedBase(unittest.TestCase):
+    """Fresh HELM_HOME per test — the default pack must never land in (or read
+    from) the module-level home the ReflexTest wipes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-seed-")
+        self.env_prior = {k: os.environ.get(k) for k in ENV_KEYS}
+        for k in ENV_KEYS:
+            os.environ.pop(k, None)
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
+        os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
+        os.makedirs(os.environ["HELM_ADOPTED_DIR"])
+
+    def tearDown(self):
+        for k, v in self.env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def by_id(self, **kw):
+        return {e["id"]: e for e in reflex.load_all(**kw)}
+
+
+class SeedDefaultsTest(SeedBase):
+    def test_seed_installs_three_marked_defaults(self):
+        wrote = reflex.seed_defaults()
+        self.assertEqual(len(wrote), 3)
+        es = self.by_id()
+        self.assertEqual(sorted(es), ["compaction-continuity",
+                                      "correction-language", "punt-tell"])
+        for e in es.values():
+            self.assertEqual(e["source"], "helm-default")  # shipped, legibly
+            self.assertEqual(e["signal"], "prompt")
+            self.assertTrue(e["pattern"])
+
+    def test_reseed_is_a_byte_identical_noop(self):
+        reflex.seed_defaults()
+        def snap():
+            out = {}
+            for e in reflex.load_all():
+                with open(e["path"]) as f:
+                    out[e["id"]] = f.read()
+            return out
+        before = snap()
+        self.assertEqual(reflex.seed_defaults(), [])
+        self.assertEqual(snap(), before)
+
+    def test_operator_edit_survives_reseed(self):
+        reflex.seed_defaults()
+        reflex.write({"id": "punt-tell", "steer": "my own wording",
+                      "signal": "prompt", "pattern": r"\blater\b"})
+        self.assertEqual(reflex.seed_defaults(), [])
+        e = self.by_id()["punt-tell"]
+        self.assertEqual(e["steer"], "my own wording")
+        self.assertNotEqual(e["source"], "helm-default")  # authored now
+
+    def test_retired_default_stays_retired(self):
+        reflex.seed_defaults()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(reflex.cmd_reflex(["retire", "punt-tell"]), 0)
+        self.assertEqual(reflex.seed_defaults(), [])
+        self.assertNotIn("punt-tell", self.by_id())
+        e = self.by_id(include_retired=True)["punt-tell"]
+        self.assertEqual(e["status"], "retired")
+        self.assertEqual(reflex.fire("do it later"), [])
+
+    def test_scaffold_global_seeds_and_stays_idempotent(self):
+        home.scaffold_global()
+        self.assertEqual(len(reflex.load_all()), 3)
+        home.scaffold_global()
+        self.assertEqual(len(reflex.load_all()), 3)
+
+
+class DefaultPackFiringTest(SeedBase):
+    def setUp(self):
+        super().setUp()
+        reflex.seed_defaults()
+
+    def fired(self, text):
+        return sorted(e["id"] for e in reflex.fire(text))
+
+    def test_correction_language_fires(self):
+        for t in ("no, actually the store is HOME-anchored",
+                  "that's wrong, re-read the spec",
+                  "i said use the typed store",
+                  "stop doing per-commit pushes"):
+            self.assertEqual(self.fired(t), ["correction-language"], t)
+
+    def test_punt_tell_fires(self):
+        for t in ("let's wire the guard later",
+                  "leave a TODO by the cache path",
+                  "good enough for now",
+                  "park it until next session"):
+            self.assertEqual(self.fired(t), ["punt-tell"], t)
+
+    def test_compaction_continuity_fires(self):
+        for t in ("This session is being continued from a previous conversation.",
+                  "the conversation was summarized to fit the window",
+                  "context was compacted; resuming the build"):
+            self.assertEqual(self.fired(t), ["compaction-continuity"], t)
+
+    def test_generic_prompts_fire_none(self):
+        for t in ("please refactor the auth module and add coverage",
+                  "what does the registry sync actually write?",
+                  "run the suite and show the failures",
+                  # narrative "later"/"todo" is not a punt — the tightened
+                  # pattern demands punt-SHAPED phrasing
+                  "3 days later the bug reappeared in the todo list view",
+                  "the changelog was updated two hours later",
+                  ""):
+            self.assertEqual(reflex.fire(t), [], t)  # specificity guard
+
+    def test_nudge_lines_short_and_single(self):
+        for e in reflex.load_all():
+            line = "REFLEX: " + e["steer"]  # exactly what the lane emits
+            self.assertNotIn("\n", line)
+            self.assertLessEqual(len(line), 160, e["id"])
+
+
+class LiveLaneTest(SeedBase):
+    """The seeded pack must reach the per-turn surface through the same public
+    read path inject uses (reflex.fire -> the reflex lane) — no inject edits."""
+
+    def test_lane_carries_the_nudge_through_gather(self):
+        home.scaffold_global()  # first-use scaffolding seeds the pack
+        from helm import inject
+        steer = next(d["steer"] for d in reflex.DEFAULT_PACK
+                     if d["id"] == "correction-language")
+        sections = inject.gather("no, actually keep the store HOME-anchored")
+        self.assertEqual(sections["reflex"], ["REFLEX: " + steer])
+        self.assertEqual(inject.gather("refactor the parser")["reflex"], [])
 
 
 if __name__ == "__main__":
