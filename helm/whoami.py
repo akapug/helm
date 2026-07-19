@@ -130,6 +130,7 @@ def load_profile():
 def save_profile(p):
     p["updated_at"] = pk.now_ts()
     pk.write_json(profile_path(), p)
+    pk.event("whoami.save", profile_path(), "operator profile saved")
     return p
 
 
