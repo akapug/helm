@@ -179,6 +179,42 @@ file exists). Retire is a one-line status flip; the file stays.
 $ helm reflex add "checkpoint-green | checkpoint the green slice before refactoring" --pattern "refactor"
 ```
 
+### `helm record [--hook-json] | status [--session S] | install [--dry] [--home NAME]`
+The session-keyed tool-outcome recorder — the sensing half of the behavior
+leg. A `PostToolUse` hook pipes each tool event's full JSON in (claude first;
+codex when its hook surface lands); helm keeps tiny per-session counters under
+`_global/.state/reflex-state/<session_id>/` that dynamic reflexes, the
+stuck-hook, mentor observe triggers, and evolve's behavior observers read:
+`counters.json` (passive-streak; dirty-streak with cached last-dirty — `git
+status` probed only on dirtying tools, in the tool's own workdir; a
+conservative stuck-signal gated to action tools — reads carry error text as
+*data*; a loop-thrash hash chain over recent commands) plus the two
+verify-grounding artifacts: `command-log.jsonl` (test-runner invocations with
+their **real** exit codes — token + digest, never the raw command line) and
+`edit-targets.log` (basenames actually edited). Keyed by the payload's
+`session_id`, never a pane — sessions are helm's key. A pure-Python argv verb
+(no shell string ever interpolates tool content — the ancestor's
+apostrophe-breaks-`python -c` silent-noop class is structurally dead).
+Fail-open and silent by law: any payload, any trouble — record nothing, rc 0,
+never block a turn; the passive hot path is one JSON read + one atomic write,
+no subprocess. `install` merges the `PostToolUse` → `helm record --hook-json`
+hook into every claude home on the same rails as `helm hooks install`
+(merge-preserving, idempotent, backup → validate → atomic write, fail-open
+`timeout` + `|| true`); `status` is the read-only wiring + per-session counter
+table; doctor mirrors it (`record coverage: N of M claude homes`, state
+freshness).
+
+```console
+$ helm record install
+helm record: command: timeout 10 /path/to/helm/bin/helm record --hook-json || true
+  you-example-com    add    backup: none — new file
+helm record: 2 of 2 claude homes covered
+$ helm record status
+  wiring: 2 of 2 claude homes (PostToolUse)
+  session        age   passive dirty stuck loop  cmds edits
+  a1b2c3d4       3m    4       0     0     1     2    5
+```
+
 ### `helm whoami [note <text...> [--topic T] [--supersedes <note-name>]]`
 The warmth leg: what your agents know about you — profile plus dated,
 superseding notes. Bare `helm whoami` prints it; `note` grows it.

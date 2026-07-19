@@ -209,9 +209,44 @@ def check_physics_currency():
     return out
 
 
+def check_chat_node():
+    """The chat room node (chat v2's signed transport): liveness, chain head,
+    joined-cell balances (the never-die-on-computrons watch). Read-only —
+    repairs live with `helm chat node up`."""
+    from . import chat, pk as _pk
+    url = chat.node_url()
+    if not url:
+        return [(OK, "chat: signed transport disabled (HELM_CHAT_NODE_URL empty) "
+                     "— v1 RAM room only")]
+    head = chat.node_head(url)
+    if head is None:
+        return [(WARN, "chat room node UNREACHABLE at %s — posts fall back to "
+                       "[unsigned]; `helm chat node up`" % url)]
+    out = [(OK, "chat room node LIVE at %s — chain head %s" % (
+        url, head.get("chain_index") if head else "(no receipts yet)"))]
+    from . import cell as _cell
+    cells = _pk.read_json(chat.cells_path(), {}) or {}
+    for profile in sorted(cells):
+        info = _cell.get_json(url + "/api/cell/" + cells[profile], timeout=3) or {}
+        bal = info.get("balance")
+        level = WARN if isinstance(bal, int) and bal < 200 else OK
+        out.append((level, "chat cell '%s': balance %s%s" % (
+            profile, bal if bal is not None else "?",
+            " — low (the auto-faucet refunds on next post)" if level == WARN else "")))
+    return out
+
+
+def check_record():
+    """The tool-outcome recorder: wired per claude home + state fresh
+    (record.py owns the logic)."""
+    from . import record
+    return record.doctor_rows()
+
+
 CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
           "check_adopted_store", "check_know_your_user", "check_cv",
-          "check_inject_coverage", "check_env", "check_physics_currency")
+          "check_inject_coverage", "check_env", "check_physics_currency", "check_record",
+          "check_chat_node")
 
 
 def cmd_doctor(args):
