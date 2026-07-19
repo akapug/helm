@@ -217,7 +217,8 @@ class TranscriptsTest(unittest.TestCase):
         target = os.path.join(transcripts.CLAUDE_PROJECTS, slug, SID_A + ".jsonl")
         self.assertTrue(os.path.islink(target))
         self.assertEqual(os.path.realpath(target), os.path.realpath(real))
-        self.assertEqual(json.load(open(transcripts.OVERRIDES_PATH)), {SID_A: new_cwd})
+        with open(transcripts.OVERRIDES_PATH) as fh:
+            self.assertEqual(json.load(fh), {SID_A: new_cwd})
         # applied at read time
         row = next(r for r in transcripts.get_catalog()["rows"] if r["i"] == SID_A)
         self.assertEqual(row["cwd"], new_cwd)
@@ -227,7 +228,8 @@ class TranscriptsTest(unittest.TestCase):
         # reset removes the override, leaves the symlink (harmless)
         res = transcripts.cwd_override({"sid": SID_A, "cwd": None})
         self.assertTrue(res["ok"])
-        self.assertEqual(json.load(open(transcripts.OVERRIDES_PATH)), {})
+        with open(transcripts.OVERRIDES_PATH) as fh:
+            self.assertEqual(json.load(fh), {})
         self.assertTrue(os.path.islink(target))
 
     def test_rehome_refuses_clobber_and_bad_cwd(self):

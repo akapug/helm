@@ -90,10 +90,12 @@ def _agent_procs():
     for envf in glob.glob("/proc/[0-9]*/environ"):
         pid = envf.split("/")[2]
         try:
-            comm = open(f"/proc/{pid}/comm").read().strip()
+            with open(f"/proc/{pid}/comm") as fh:
+                comm = fh.read().strip()
             if comm not in ("claude", "codex"):
                 continue
-            env = open(envf, "rb").read()
+            with open(envf, "rb") as fh:
+                env = fh.read()
         except OSError:
             continue
         key = (ENV_VAR[comm] + "=").encode()

@@ -112,7 +112,8 @@ def _save_cwd_overrides():
     with open(lockp, "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)  # CLI and server are both writers
         tmp = f"{OVERRIDES_PATH}.{os.getpid()}.{threading.get_ident()}.tmp"
-        json.dump(_cwd_overrides, open(tmp, "w"))
+        with open(tmp, "w") as fh:
+            json.dump(_cwd_overrides, fh)
         os.replace(tmp, OVERRIDES_PATH)
 
 

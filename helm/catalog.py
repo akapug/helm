@@ -68,28 +68,29 @@ def _scan_claude(f):
     cwd = branch = title = created = ""
     n = 0
     try:
-        for line in open(f, errors="ignore"):
-            n += 1
-            if n > 80:
-                break
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            cwd = cwd or r.get("cwd", "")
-            branch = branch or r.get("gitBranch", "")
-            created = created or r.get("timestamp", "")
-            if not title:
-                m = r.get("message", {})
-                if isinstance(m, dict) and m.get("role") == "user":
-                    t = _first_user_text(m)
-                    if t and not t.startswith(("<", "Caveat:", "[", "{")) \
-                       and "tool_result" not in t[:40] and "task-notification" not in t[:40] \
-                       and "Stop hook" not in t[:20] and "command-name" not in t[:40] \
-                       and "system-reminder" not in t[:40]:
-                        title = t[:120]
-            if title and cwd:
-                break
+        with open(f, errors="ignore") as fh:
+            for line in fh:
+                n += 1
+                if n > 80:
+                    break
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                cwd = cwd or r.get("cwd", "")
+                branch = branch or r.get("gitBranch", "")
+                created = created or r.get("timestamp", "")
+                if not title:
+                    m = r.get("message", {})
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        t = _first_user_text(m)
+                        if t and not t.startswith(("<", "Caveat:", "[", "{")) \
+                           and "tool_result" not in t[:40] and "task-notification" not in t[:40] \
+                           and "Stop hook" not in t[:20] and "command-name" not in t[:40] \
+                           and "system-reminder" not in t[:40]:
+                            title = t[:120]
+                if title and cwd:
+                    break
     except OSError:
         pass
     return cwd, branch, title, created
@@ -99,28 +100,29 @@ def _scan_codex(f):
     cwd = title = created = ""
     n = 0
     try:
-        for line in open(f, errors="ignore"):
-            n += 1
-            if n > 60:
-                break
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            if not cwd:
-                m = re.search(r'"cwd"\s*:\s*"([^"]+)"', line)
-                if m:
-                    cwd = m.group(1)
-            created = created or r.get("timestamp", "") or r.get("ts", "")
-            if not title:
-                for key in ("text", "content", "instructions"):
-                    v = r.get(key)
-                    if isinstance(v, str) and 8 < len(v.strip()) < 400 \
-                       and not v.startswith(("<", "{")):
-                        title = v.strip()[:120]
-                        break
-            if title and cwd:
-                break
+        with open(f, errors="ignore") as fh:
+            for line in fh:
+                n += 1
+                if n > 60:
+                    break
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if not cwd:
+                    m = re.search(r'"cwd"\s*:\s*"([^"]+)"', line)
+                    if m:
+                        cwd = m.group(1)
+                created = created or r.get("timestamp", "") or r.get("ts", "")
+                if not title:
+                    for key in ("text", "content", "instructions"):
+                        v = r.get(key)
+                        if isinstance(v, str) and 8 < len(v.strip()) < 400 \
+                           and not v.startswith(("<", "{")):
+                            title = v.strip()[:120]
+                            break
+                if title and cwd:
+                    break
     except OSError:
         pass
     return cwd, "", title, created
@@ -189,7 +191,8 @@ def _row(path, harness, st):
 
 def _load_cache():
     try:
-        return json.load(open(CACHE))
+        with open(CACHE) as fh:
+            return json.load(fh)
     except Exception:
         return {}
 
@@ -248,7 +251,8 @@ def _backfill_syn(rows):
     keyed by (path, mtime), so the corpus is peeked once, not every build."""
     import concurrent.futures
     try:
-        cache = json.load(open(SYN_CACHE))
+        with open(SYN_CACHE) as fh:
+            cache = json.load(fh)
     except Exception:
         cache = {}
     todo, fresh = [], {}
@@ -271,7 +275,8 @@ def _backfill_syn(rows):
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         tmp = f"{SYN_CACHE}.{os.getpid()}.tmp"
-        json.dump(fresh, open(tmp, "w"))
+        with open(tmp, "w") as fh:
+            json.dump(fresh, fh)
         os.replace(tmp, SYN_CACHE)
     except OSError:
         pass
@@ -346,7 +351,8 @@ def build(progress=None):
     rows.sort(key=lambda r: r["u"], reverse=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
     tmp = f"{CACHE}.{os.getpid()}.tmp"  # unique per writer; atomic replace
-    json.dump(fresh, open(tmp, "w"))
+    with open(tmp, "w") as fh:
+        json.dump(fresh, fh)
     os.replace(tmp, CACHE)
     return rows, {"files": len(files), "rescanned": changed, "rows": len(rows)}
 
@@ -354,7 +360,8 @@ def build(progress=None):
 def seed_from(catalog_json):
     """One-time cache seed from a prior full-scan catalog (old row schema ok).
     Derives FULL session ids from paths; only stats files, no content reads."""
-    old = json.load(open(catalog_json))
+    with open(catalog_json) as fh:
+        old = json.load(fh)
     cache = {}
     for r in old:
         path = os.path.expanduser(r["path"]) if r["path"].startswith("~") else r["path"]
@@ -370,7 +377,8 @@ def seed_from(catalog_json):
             "p": path, "cwd": os.path.expanduser(r["cwd"]) if r["cwd"].startswith("~") else r["cwd"],
         }}
     os.makedirs(CACHE_DIR, exist_ok=True)
-    json.dump(cache, open(CACHE, "w"))
+    with open(CACHE, "w") as fh:
+        json.dump(cache, fh)
     return len(cache)
 
 

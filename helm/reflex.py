@@ -162,7 +162,9 @@ def cmd_reflex(args):
             print("helm reflex: '%s' not found" % args[1], file=sys.stderr)
             return 1
         e["status"] = "retired"
-        pk.atomic_write(e["path"], open(e["path"]).read().replace(
+        with open(e["path"]) as fh:
+            raw = fh.read()
+        pk.atomic_write(e["path"], raw.replace(
             "  status: live", "  status: retired"))
         print("helm reflex: RETIRED '%s' (file kept as the record)" % args[1])
         return 0

@@ -300,7 +300,8 @@ class TestWebSessions(unittest.TestCase):
         self.assertEqual(status, 200, d)
         self.assertTrue(d["ok"])
         self.assertIsNone(d["cwd"])
-        self.assertEqual(json.load(open(transcripts.OVERRIDES_PATH)), {})
+        with open(transcripts.OVERRIDES_PATH) as fh:
+            self.assertEqual(json.load(fh), {})
         self.assertTrue(os.path.islink(target))
         status, cat = self.req("/api/catalog")
         row = next(r for r in cat["rows"] if r["i"] == SID_A)

@@ -62,7 +62,8 @@ class DrainTest(unittest.TestCase):
         self.assertGreaterEqual(receipt["applied"], 3)
         newp = os.path.join(self.mem, "prior-short-dms.md")
         self.assertTrue(os.path.isfile(newp))
-        raw = open(newp).read()
+        with open(newp) as fh:
+            raw = fh.read()
         self.assertIn("the full body", raw)             # body preserved verbatim
         self.assertIn("type: prior", raw)
         self.assertIn("confidence: 0.90", raw)
@@ -74,7 +75,8 @@ class DrainTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(net, "feedback-short-dms.md")))
         self.assertTrue(os.path.isfile(os.path.join(net, "RECEIPT.json")))
         # the index re-pointed
-        idx = open(os.path.join(self.mem, "MEMORY.md")).read()
+        with open(os.path.join(self.mem, "MEMORY.md")) as fh:
+            idx = fh.read()
         self.assertIn("(prior-short-dms.md)", idx)
 
     def test_route_project_lands_in_journal(self):

@@ -213,7 +213,10 @@ def apply(plan, mem=None, sweep_dups=False, limit=None):
         to_net[a["src"]] = os.path.join(mem, a["src"])
         dst = a.get("dst")
         if a["op"] == "retype" and dst and os.path.isfile(os.path.join(mem, dst)):
-            to_net["overwritten-" + dst] = os.path.join(mem, dst)
+            # a subdir, not a name prefix: a src literally named
+            # overwritten-<dst> must never collide with the netted dst
+            os.makedirs(os.path.join(net, "overwritten"), exist_ok=True)
+            to_net[os.path.join("overwritten", dst)] = os.path.join(mem, dst)
     for label, srcpath in to_net.items():
         shutil.copy2(srcpath, os.path.join(net, label))
     # the rollback net must hold every file, byte-identical, before ANY mutation

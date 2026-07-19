@@ -76,7 +76,8 @@ class KeepaliveTest(unittest.TestCase):
 
     def test_skip_when_live_holder_never_writes(self):
         d = self._plant_home("busy-home", {"refreshToken": "SECRET-R", "expiresAt": 0})
-        before = open(os.path.join(d, ".credentials.json")).read()
+        with open(os.path.join(d, ".credentials.json")) as fh:
+            before = fh.read()
         keepalive._live_holder_pid = lambda p: "4242"
         res = keepalive.refresh_home(d)
         self.assertEqual(res["action"], "skip")
@@ -108,20 +109,23 @@ class KeepaliveTest(unittest.TestCase):
         sent = json.loads(uo.call_args[0][0].data)
         self.assertEqual(sent["grant_type"], "refresh_token")
         cred_path = os.path.join(d, ".credentials.json")
-        val = json.load(open(cred_path))
+        with open(cred_path) as fh:
+            val = json.load(fh)
         oauth = val["claudeAiOauth"]
         self.assertEqual(oauth["accessToken"], "NEW-A")
         self.assertEqual(oauth["refreshToken"], "NEW-R")      # rotation persisted
         self.assertGreater(oauth["expiresAt"], time.time() * 1000)
         self.assertEqual(oauth["scopes"], ["keepme"])          # untouched fields survive
         self.assertEqual(stat.S_IMODE(os.stat(cred_path).st_mode), 0o600)  # owner-only
-        log_text = open(keepalive.LOG_PATH).read()             # token VALUES never logged
+        with open(keepalive.LOG_PATH) as fh:
+            log_text = fh.read()                               # token VALUES never logged
         for secret in ("NEW-A", "NEW-R", "OLD-R"):
             self.assertNotIn(secret, log_text)
 
     def test_refresh_http_error_means_reauth_and_no_write(self):
         d = self._plant_home("expired-home", {"refreshToken": "OLD-R", "expiresAt": 0})
-        before = open(os.path.join(d, ".credentials.json")).read()
+        with open(os.path.join(d, ".credentials.json")) as fh:
+            before = fh.read()
         with mock.patch("urllib.request.urlopen", side_effect=_http_error(403)):
             res = keepalive.refresh_home(d)
         self.assertEqual(res["action"], "needs_reauth")

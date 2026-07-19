@@ -64,9 +64,11 @@ def _live_holder_pid(home_path):
     for envf in glob.glob("/proc/[0-9]*/environ"):
         pid = envf.split("/")[2]
         try:
-            if open(f"/proc/{pid}/comm").read().strip() != "claude":
-                continue
-            env = open(envf, "rb").read()
+            with open(f"/proc/{pid}/comm") as fh:
+                if fh.read().strip() != "claude":
+                    continue
+            with open(envf, "rb") as fh:
+                env = fh.read()
         except OSError:
             continue
         homes = [v.split(b"=", 1)[1].decode() for v in env.split(b"\0")
@@ -90,7 +92,8 @@ def _predecessor_pids():
         if pid == me:
             continue
         try:
-            cmdline = open(f, "rb").read().decode(errors="ignore")
+            with open(f, "rb") as fh:
+                cmdline = fh.read().decode(errors="ignore")
         except OSError:
             continue
         argv0 = cmdline.split("\0", 1)[0]
@@ -102,7 +105,8 @@ def _predecessor_pids():
 
 
 def _read_oauth(cred_path):
-    val = json.load(open(cred_path))
+    with open(cred_path) as fh:
+        val = json.load(fh)
     return val, val.get("claudeAiOauth") or {}
 
 
