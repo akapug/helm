@@ -128,7 +128,12 @@ def cmd_swap(args):
     for r in from_home[:3]:
         base = sess_mod.resume_command(r)
         if target_home:
-            base = base.replace(provider + " ", "env %s=%s %s " % (env_var, target_home.get("path", "?"), provider), 1) \
-                if provider + " " in base else base
+            # inject the env prefix onto the HARNESS clause (the last " && "
+            # clause), never a raw substring replace — a cwd containing
+            # "claude " must not be corrupted (test-pinned)
+            head, sep, tail = base.rpartition(" && ")
+            if sep and tail.startswith(provider + " "):
+                base = "%s%s env %s=%s %s" % (head, sep, env_var,
+                                              target_home.get("path", "?"), tail)
         print("    " + base)
     return 0

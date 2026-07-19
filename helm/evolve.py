@@ -3,9 +3,15 @@
 
 The loop that keeps helm improving itself: observe the stores, notice what
 drifted or accumulated, and PROPOSE the next actions. The anti-rulesurf gate
-is constitutional: evolve NEVER mutates — every proposal is an explicit verb
-the operator (or a supervising agent) runs deliberately. A system that edits
-its own beliefs unprompted isn't learning, it's drifting.
+is constitutional: evolve NEVER edits knowledge — every proposal is an
+explicit verb the operator (or a supervising agent) runs deliberately. A
+system that edits its own beliefs unprompted isn't learning, it's drifting.
+
+Boundary, stated honestly: the sync observer (registry.sync) DOES write the
+registry file and scaffold missing project home dirs — additive bookkeeping,
+idempotent, never touching entries/beliefs. The drift observer runs with
+snapshot=False so a pending drift report is never consumed. Everything else
+is read-only.
 
 `helm evolve` composes the observers:
   sync     is the registry current?
@@ -54,12 +60,14 @@ def proposals():
 
 
 def cmd_evolve(args):
-    """evolve — one observe/propose cycle. Proposes, never mutates."""
+    """evolve — one observe/propose cycle. Proposes; edits no knowledge
+    (the sync observer's registry write + scaffold is the one documented
+    bookkeeping side effect — see the module docstring)."""
     props = proposals()
     if not props:
         print("helm evolve: steady — nothing to propose.")
         return 0
-    print("helm evolve — %d proposal%s (nothing mutated):" % (len(props), "s"[:len(props) != 1]))
+    print("helm evolve — %d proposal%s (no knowledge edited):" % (len(props), "s"[:len(props) != 1]))
     for area, what, verb in props:
         print("  [%s] %s%s" % (area, what, ("  ->  " + verb) if verb else ""))
     return 0

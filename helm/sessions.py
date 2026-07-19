@@ -9,7 +9,7 @@ the exact command, not a wrapper (it's just the harness's own CLI).
 import os
 import time
 
-from . import catalog, registry
+from . import registry
 
 
 def _project_lens():
@@ -35,16 +35,22 @@ def _project_for(cwd, lens):
 
 
 def rows_for(project=None, include_synthetic=False, limit=None):
-    rows, _ = catalog.build()
+    """Catalog rows via transcripts.get_catalog() — the single-flight cached
+    path every other consumer (/api/catalog, /api/burn, the CLI) shares, so
+    /api/sessions never re-spawns a full catalog build per GET. Same rows,
+    plus cwd overrides applied. Rows are COPIED before the project annotation —
+    the cache's row objects are shared and must never be mutated here."""
+    from . import transcripts
+    rows = transcripts.get_catalog()["rows"]
     lens = _project_lens()
     out = []
     for r in rows:
-        r["project"] = _project_for(r.get("cwd") or r.get("c"), lens)
-        if project and r["project"] != project:
+        proj = _project_for(r.get("cwd") or r.get("c"), lens)
+        if project and proj != project:
             continue
         if not include_synthetic and r.get("syn"):
             continue
-        out.append(r)
+        out.append(dict(r, project=proj))
         if limit and len(out) >= limit:
             break
     return out
