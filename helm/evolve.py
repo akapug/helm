@@ -24,7 +24,7 @@ the ledger, or the reflexes.
              dead-weight  live jit entries that NEVER fired (batched)
              silence      ~100% silent turns over a populated store
   reflex   which steers re-fire right after firing (steer not landing)?
-  whoami   is the warmth leg still empty?
+  whoami   is the know-your-user leg still empty?
 
 Behavior observers read the fire-ledger (inject's measurement spine, plus its
 .1 rotation) tolerating absence and garbage — no ledger, no claims. The
@@ -232,7 +232,7 @@ def cycle(project=None):
     from . import whoami
     p = whoami.load_profile()
     if not (p["technical_level"] or p["guidance"] or whoami.load_notes()):
-        out.append(("who", "the warmth leg is empty — the five-minute interview "
+        out.append(("who", "the know-your-user leg is empty — the five-minute interview "
                     "makes every agent warmer", "helm interview"))
 
     window = {"turns": len(rows),

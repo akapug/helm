@@ -131,11 +131,11 @@ def check_adopted_store(adopted_dir=None):
 
 
 def check_know_your_user():
-    """The warmth leg: WARN while empty and un-interviewed."""
+    """The know-your-user leg: WARN while empty and un-interviewed."""
     p = whoami.load_profile()
     notes = whoami.load_notes()
     if not (p["technical_level"] or p["guidance"] or notes) and p["interview_status"] != "done":
-        return [(WARN, "know-your-user: the warmth leg is empty — run `helm interview`")]
+        return [(WARN, "know-your-user: the know-your-user leg is empty — run `helm interview`")]
     return [(OK, "know-your-user: level=%s, %d guidance, %d active note%s (interview %s)" % (
         p["technical_level"] or "-", len(p["guidance"]), len(notes),
         "s"[:len(notes) != 1], p["interview_status"] or "not offered"))]

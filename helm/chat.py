@@ -10,7 +10,7 @@ the room; past SIZE_CAP the oldest half rotates out (RAM etiquette).
 
 v2 — THE SIGNED TRANSPORT (PRD CHAT_V2, premises a2a-ram-only-disk-log-after
 + comms-presets-optimize-their-novel-purity): when the chat ROOM NODE (a
-dregg cave whose data-dir lives on tmpfs — chatnode.py supervises it)
+dregg node whose data-dir lives on tmpfs — chatnode.py supervises it)
 answers, every post also rides a signed self-write turn on the poster's cell
 there: the turn payload carries the message digest ("chat:b2b:<blake2b-256>",
 73 B inside the whisper frame budget), the RAM room carries the text — thin
@@ -20,7 +20,7 @@ and tag everything else "[unsigned]". Node down -> the v1 path automatically
 (fallback law: drop the signature, never the RAM property). NO transport
 path writes disk, ever; RAM-side caches (join cells, node token) live in the
 room dir itself. Transport is NODE-AGNOSTIC (HELM_CHAT_NODE_URL, else the
-node-state url, else :8898) — the ONE-CAVE unification just repoints it.
+node-state url, else :8898) — the node migration just repoints it.
 
 The log-after leg — the ONLY disk writer here (the canon's durable-record
 layer): `helm chat log-flush` appends delivered history OUT-OF-BAND to
@@ -96,7 +96,7 @@ def whoname():
 def node_url():
     """The room node. HELM_CHAT_NODE_URL wins (SET-BUT-EMPTY disables the
     signed transport entirely — the hermetic-test/ops kill switch), else the
-    node-state file's url (how unification repoints ONE CAVE), else :8898."""
+    node-state file's url (how the node migration repoints chat), else :8898."""
     v = home.env("CHAT_NODE_URL")
     if v is not None:
         return v.rstrip("/") or None
@@ -166,7 +166,7 @@ def _revive():
     """The node lost its provisioned state (reboot wiped tmpfs; token stale;
     chain empty): re-unlock with the STORED passphrase, re-bootstrap health,
     cache the fresh token RAM-side. Returns the token or None. Chat turns
-    never die on provisioning state — the ceremony's exhaustion lesson,
+    never die on provisioning state — the provisioning exhaustion lesson,
     generalized."""
     from . import chatnode
     u = node_url()

@@ -92,7 +92,7 @@ from . import home, pk, reflex
 PINNED_BUDGET = 1200  # bytes for the always lane — keep the constant tax tiny
 JIT_CAP = 4
 LINE_CAP = 400        # per-entry cap — the gloss fires, the full entry stays on disk
-WHO_CAP = 350         # WHO digest's joint byte cap inside PINNED_BUDGET — warmth stays terse
+WHO_CAP = 350         # WHO digest's joint byte cap inside PINNED_BUDGET — the digest stays terse
 WHO_ID = "who:operator"  # the digest's ledger id (the profile cohort in --lane-report)
 LEDGER_MAX = 5 * 1024 * 1024  # ledger rotates here (one .1 generation)
 
@@ -114,7 +114,7 @@ def _entry_line(e):
 def _who_lines():
     """The WHO leg (know-your-user): operator digest off whoami.load_profile()
     — technical level + top guidance rendered as <=2 terse lines, jointly
-    capped at WHO_CAP so warmth never crowds the safety premises out of the
+    capped at WHO_CAP so the WHO digest never crowds the safety premises out of the
     pinned budget. guidance joins "; "-terse, so truncation keeps the TOP
     items (the list is owner-ordered). Fail-open: no profile / garbled /
     raising whoami -> [] (absent, never a blocked turn)."""

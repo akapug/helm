@@ -172,8 +172,8 @@ def own_cell(profile):
     return info["cell"], None
 
 
-# After the cave-unification ceremony the team cave runs RAM-hot; this hook
-# (installed by scripts/cave-unification.sh) flushes the tmpfs data-dir to its
+# After the node migration the team node runs RAM-hot; this hook
+# (installed by scripts/node-migration.sh) flushes the tmpfs data-dir to its
 # disk snapshot. Fired after every successful ATTESTATION turn — the log-after
 # ordering: the turn commits in RAM first, the durable record follows. Absent
 # hook (pre-unification, fresh clone) = silent no-op; HELM_SNAPSHOT_HOOK
@@ -210,7 +210,7 @@ def send_self(payload, profile):
     info = _last_json(out)
     if not (info and info.get("sent")):
         return None, "meld send printed no receipt JSON: %s" % (out or "").strip()[-200:]
-    fire_snapshot_hook()   # attestation landed -> flush the RAM cave to disk
+    fire_snapshot_hook()   # attestation landed -> flush the RAM node to disk
     return info, None
 
 

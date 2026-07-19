@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""helm chat node — supervision of the chat room node (the dregg RAM cave).
+"""helm chat node — supervision of the chat room node (a dregg tmpfs node).
 
-INTERIM SCAFFOLDING by design (ONE CAVE law, PRD 2026-07-19): the target
-topology is one team cave; tonight chat gets its OWN tmpfs node so a signed
+INTERIM SCAFFOLDING by design (one-node-per-team law, PRD 2026-07-19): the
+target topology is one team node; interim, chat gets its OWN tmpfs node so a signed
 chat turn can never land on a disk-persisted chain. Everything here is
-node-agnostic — the cave-unification ceremony (scripts/cave-unification.sh)
+node-agnostic — the node migration (scripts/node-migration.sh)
 repoints the url in the state file and this module keeps working unchanged.
 
 The daemon is the SUBSTRATE's (`dregg-cave-node`), helm only supervises it
-via a user systemd unit `helm-chat-cave.service` (precedent: the team cave's
+via a user systemd unit `helm-chat-node.service` (precedent: the team node's
 dregg-cave.service) — the no-daemons law stays intact. Data-dir lives on
-tmpfs (/dev/shm/helm-chat-cave): messages exist only in RAM.
+tmpfs (/dev/shm/helm-chat-node): messages exist only in RAM.
 
 Provisioning contract (probed live against the binary, 2026-07-19):
   - a fresh node boots LOCKED and UNHEALTHY (no blocks yet);
@@ -38,8 +38,8 @@ import time
 
 from . import cell, home, pk
 
-UNIT = "helm-chat-cave.service"
-DATA_DIR = "/dev/shm/helm-chat-cave"
+UNIT = "helm-chat-node.service"
+DATA_DIR = "/dev/shm/helm-chat-node"
 PORT = 8898
 GOSSIP_PORT = 18898
 HEALTH_WAIT_S = 30
@@ -69,11 +69,11 @@ def unit_path():
 
 
 def unit_text(binary, data_dir=DATA_DIR, port=PORT, gossip=GOSSIP_PORT):
-    """The unit body — mirrors the team cave's dregg-cave.service, tmpfs
+    """The unit body — mirrors the team node's dregg-cave.service, tmpfs
     data-dir + its own ports. Faucet ON: chat turns must never die on
-    computrons (the ceremony's exhaustion lesson)."""
+    computrons (the provisioning exhaustion lesson)."""
     return """[Unit]
-Description=helm chat RAM cave (dregg tmpfs node :%d)
+Description=helm chat node (dregg tmpfs node :%d)
 After=network.target
 
 [Service]
@@ -140,7 +140,7 @@ def unlock(url, passphrase):
 def bootstrap_cell_hex():
     """A deterministic throwaway recipient for the first-block faucet turn —
     NEVER a real profile's cell (a stub-materialized cell cannot sign)."""
-    return hashlib.blake2b(b"helm-chat-cave-bootstrap", digest_size=32).hexdigest()
+    return hashlib.blake2b(b"helm-chat-node-bootstrap", digest_size=32).hexdigest()
 
 
 def ensure_healthy(url):
@@ -255,7 +255,7 @@ def _status(args):
 
 
 def cmd_node(args):
-    """node up|down|status — supervise the chat RAM cave."""
+    """node up|down|status — supervise the chat tmpfs node."""
     verb = args[0] if args else "status"
     fn = {"up": _up, "down": _down, "status": _status}.get(verb)
     if fn is None:

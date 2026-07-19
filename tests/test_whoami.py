@@ -122,7 +122,7 @@ class TestWhoamiCmd(WhoamiBase):
     def test_empty_points_at_interview(self):
         rc, out = self.run_cmd(whoami.cmd_whoami, [])
         self.assertEqual(rc, 0)
-        self.assertIn("warmth leg is empty", out)
+        self.assertIn("know-your-user leg is empty", out)
         self.assertIn("helm interview", out)
 
     def test_note_cli_and_render(self):

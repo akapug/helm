@@ -177,20 +177,22 @@ fat corroboration, twice over: the ledger holds digests, the store holds
 premise text, the RAM room holds chat text. See the chat section of
 [VERBS.md](VERBS.md).
 
-## The cave-unification ceremony (ONE CAVE)
+## The node migration (one node per team)
 
-The target topology is ONE cave per local team — RAM-hot (tmpfs data-dir)
+The target topology is ONE node per local team — RAM-hot (tmpfs data-dir)
 with disk as **log-after**: restore-on-boot, a snapshot after every
 attestation turn (`helm/cell.py` fires `~/.local/bin/dregg-cave-snapshot`
 after each successful `send_self`), an interval snapshot timer, and a
 snapshot on unit stop. The interim second chat node dissolves into it.
 
-The prepared ceremony is `scripts/cave-unification.sh` — run `--dry-run`
-first (it exercises every read-only gate for real). Its hard gates: a full
+The migration is `scripts/node-migration.sh` — run `--dry-run`
+first (it exercises every gate for real; the probe mints append-only turns).
+Its hard gates: a full
 tarball backup before anything; the restore-on-boot path **proven before the
-flip**; `premise-check` MATCH on every attested premise plus a
-chain-head/receipt comparison before *and* after; a paste-ready rollback
+flip**; `premise-check` MATCH on every attested premise before *and* after;
+a post-flip durability cycle (a fresh turn must survive snapshot -> stop ->
+tmpfs wipe -> cold boot); a paste-ready rollback
 (`--rollback`); the whisper daemon stopped around the flip and verified
-back. A digest MISMATCH on any attested premise aborts the ceremony — edit
+back. A digest MISMATCH on any attested premise aborts the migration — edit
 drift must be re-attested (supersession is a chain, not an edit) before the
 chain moves homes.

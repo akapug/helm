@@ -16,7 +16,7 @@ What a knowledge layer must know about its *operator* to feel personal:
 
 **The fourth leg is WHO.** Personalization without a live `who` leg is what
 makes a coordination layer feel like an admin panel. In helm, `who` is
-load-bearing: the interview fills it, agents read it, warmth follows.
+load-bearing: the interview fills it, agents read it, rapport follows.
 
 ## Axis 2 — CONTENT CLASS (what a stored entry *is*)
 

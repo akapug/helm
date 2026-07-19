@@ -142,7 +142,7 @@ _VERB_HELP = {
     "record": "record [--hook-json]|status|install — session-keyed tool-outcome recorder (PostToolUse leg)",
     "lineage": "lineage [seed|add|external|archive-report] — the project family tree",
     "whoami": "whoami [note ...] — the operator profile + dated notes",
-    "interview": "interview — the five-minute warmth-leg interview",
+    "interview": "interview — the five-minute know-your-user interview",
     "doctor": "doctor — health check, read-only",
     "skills": "skills [dupes] — skills census across every home, read-only",
     "evolve": "evolve — one observe/propose cycle (proposes, never mutates)",

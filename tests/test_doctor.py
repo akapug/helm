@@ -138,7 +138,7 @@ class TestChecks(DoctorBase):
 
     def test_know_your_user_empty_warns_then_ok(self):
         results = doctor.check_know_your_user()
-        self.assertTrue(any("warmth leg is empty" in m and "helm interview" in m
+        self.assertTrue(any("know-your-user leg is empty" in m and "helm interview" in m
                             for m in levels(results, doctor.WARN)))
         whoami.add_note("short replies", topic="voice")
         results = doctor.check_know_your_user()
@@ -190,7 +190,7 @@ class TestCmdDoctor(DoctorBase):
         self.assertIn("repo moved or deleted", out)
         self.assertIn("adoption conflict", out)
         self.assertIn("drain --sweep-dups", out)
-        self.assertIn("warmth leg is empty", out)
+        self.assertIn("know-your-user leg is empty", out)
         self.assertIn("helm doctor:", out)
         self.assertIn("1 fail", out)
         self.assertEqual(self.snapshot(self.tmp.name), before)  # READ-ONLY always

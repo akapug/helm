@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """helm know-your-user — the WHO leg (memory=did, rules=believes, lexicon=means,
-THIS=who). The warmth leg: what makes helm feel like a teammate instead of a
+THIS=who). The know-your-user leg: what makes helm feel like a teammate instead of a
 tool, and the reason it exists at all.
 
 Store: ~/.helm/_global/know-your-user/
@@ -54,7 +54,7 @@ QUESTIONS = (
      "why": "Goals let an agent weigh what is worth your attention."},
     {"key": "warmth",
      "question": "What makes an agent feel like a great teammate rather than a tool?",
-     "why": "The warmth leg IS the product — this answer defines it in your words."},
+     "why": "The know-your-user leg IS the product — this answer defines it in your words."},
     {"key": "pet_peeves",
      "question": "What are your pet peeves in agent behavior or output?",
      "why": "Peeves are cheap to avoid and expensive to repeat."},
@@ -284,7 +284,7 @@ def cmd_whoami(args):
     p = merge_scaffold()
     notes = load_notes()
     if not (p["technical_level"] or p["guidance"] or notes):
-        print("helm whoami: the warmth leg is empty — your agents don't know you yet.")
+        print("helm whoami: the know-your-user leg is empty — your agents don't know you yet.")
         print("  Run `helm interview` (a few minutes) and every future session starts warmer.")
         return 0
     print("helm whoami — what your agents know about you\n")
@@ -320,7 +320,7 @@ def _print_questions(p):
 
 def _run_interview(p):
     print("helm interview — %d quick questions. Blank answer skips; ctrl-d stops early." % len(QUESTIONS))
-    print("This is the warmth leg: what you say here rides into every future session.\n")
+    print("This is the know-your-user leg: what you say here rides into every future session.\n")
     captured = 0
     for q in QUESTIONS:
         print(q["question"])
@@ -424,7 +424,7 @@ def _confirm_interview(p):
 
 def cmd_interview(args):
     """interview [--questions] [--redo] — the first-run step that fills the
-    warmth leg. A populated profile is confirmed line-by-line (drafts to
+    know-your-user leg. A populated profile is confirmed line-by-line (drafts to
     keep/correct/drop); an empty one gets the blank questions. Interactive on a
     tty; otherwise prints the sheet, or the drafts unwritten. Never nags: done
     latches it off."""

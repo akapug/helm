@@ -131,7 +131,7 @@ class ProposalShapeTest(EvolveBase):
         self.assertIn("[who]", out)
         self.assertIn("helm interview", out)
 
-    def test_notes_alone_satisfy_the_warmth_leg(self):
+    def test_notes_alone_satisfy_the_know_your_user_leg(self):
         props, _ = self.with_observers(evolve.proposals, notes="knows the user")
         self.assertEqual(props, [])
 

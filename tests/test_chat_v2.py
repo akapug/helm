@@ -271,7 +271,7 @@ class LogFlushTest(V2Base):
 class NodeSupervisorTest(V2Base):
     def test_unit_text_contract(self):
         t = chatnode.unit_text("/x/dregg-cave-node")
-        self.assertIn("--data-dir /dev/shm/helm-chat-cave", t)   # tmpfs — RAM law
+        self.assertIn("--data-dir /dev/shm/helm-chat-node", t)   # tmpfs — RAM law
         self.assertIn("--port 8898", t)
         self.assertIn("--enable-faucet", t)                      # never die on balance
         self.assertIn("/x/dregg-cave-node run", t)

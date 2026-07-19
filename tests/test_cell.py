@@ -51,7 +51,7 @@ class CellBase(unittest.TestCase):
         for k in ENV_KEYS:
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
-        os.environ["HELM_SNAPSHOT_HOOK"] = ""  # never a real cave snapshot
+        os.environ["HELM_SNAPSHOT_HOOK"] = ""  # never a real node snapshot
         self.log = os.path.join(self.tmp, "stub.log")
         os.environ["STUB_LOG"] = self.log
         os.environ["STUB_CELL"] = CELL_HEX
@@ -202,7 +202,7 @@ class SendSelfTest(CellBase):
         self.assertIn("meld send failed", err)
 
     def test_snapshot_hook_fires_after_attestation_only(self):
-        # the log-after leg of the unified cave: a SUCCESSFUL send_self fires
+        # the log-after leg of the unified node: a SUCCESSFUL send_self fires
         # the snapshot hook; a failed one (no turn landed) must not
         mark = os.path.join(self.tmp, "snapped")
         hook = os.path.join(self.tmp, "snapshot-hook")

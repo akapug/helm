@@ -262,7 +262,7 @@ $ helm record status
 ```
 
 ### `helm whoami [note <text...> [--topic T] [--supersedes <note-name>]]`
-The warmth leg: what your agents know about you — profile plus dated,
+The know-your-user leg: what your agents know about you — profile plus dated,
 superseding notes. Bare `helm whoami` prints it; `note` grows it.
 
 ```console
@@ -455,7 +455,7 @@ identity guess: session, then user). `read` prints the room (`--since N` skips
 the first N messages); `read --follow` polls and prints new lines until Ctrl-C.
 
 **The signed transport (v2).** When the chat **room node** answers — a dregg
-cave whose data-dir lives on tmpfs, so a chat turn never lands on a
+node whose data-dir lives on tmpfs, so a chat turn never lands on a
 disk-persisted chain — every post also rides a **signed self-write turn** on
 the poster's cell there: the turn payload carries the message digest
 (`chat:b2b:<blake2b-256>`), the RAM room carries the text (thin claim, fat
@@ -465,11 +465,11 @@ shows a subtle ✓ tick, chain index on hover); node down → the v1 path
 automatically, tagged `[unsigned]` — the message never dies, the signature is
 what degrades. Agents sign as `HELM_CELL_PROFILE` (else `meld-agent`); the
 owner's web posts sign server-side as `david`. `helm chat node up` provisions
-the room node (`helm-chat-cave.service`, `dregg-cave-node` on
-`/dev/shm/helm-chat-cave`, port 8898, faucet ON — the node auto-funds joining
+the room node (`helm-chat-node.service`, `dregg-cave-node` on
+`/dev/shm/helm-chat-node`, port 8898, faucet ON — the node auto-funds joining
 cells and helm tops up before each turn: **chat turns never die on
 computrons**). The transport is node-agnostic (`HELM_CHAT_NODE_URL`; empty
-disables) — the ONE-CAVE unification (`scripts/cave-unification.sh`) just
+disables) — the node migration (`scripts/node-migration.sh`) just
 repoints it.
 
 **The log-after leg.** RAM stays pure in the hot path (premise
