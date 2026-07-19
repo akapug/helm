@@ -111,7 +111,7 @@ entry has since left the store) stay queued. Nothing expires.
 ## Supersession is a chain, not an edit
 
 Retiring or superseding an attested premise is a **new signed turn**
-referencing the prior one — append-only, mirroring the store's tombstone law
+referencing the prior one — append-only, mirroring the store's record law
 (files are kept; status flips). Belief history thereby becomes a provable
 chain — *held X until T, then Y* — which the drift report can read as
 attested belief evolution rather than lost history.

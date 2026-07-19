@@ -16,7 +16,7 @@ Classification (frontmatter `type:` first, filename prefix second):
   project entries     -> the project's journal in ~/.helm/<project>/journal/
                          (target resolved against the registry; unresolved
                          entries STAY and are reported)
-  prem-*/prior-* twins-> the prem tombstone archives (--sweep-dups only;
+  prem-*/prior-* twins-> the prem duplicate archives (--sweep-dups only;
                          operator-gated: it removes canon-store files, safe
                          per read-time dedup but surfaced first by design)
   already-typed files -> skipped (governed by the store)
@@ -278,7 +278,7 @@ def cmd_drain(args):
               "entry or collide) — resolve by hand" % (
                   len(by_op["conflict"]), "s"[:len(by_op["conflict"]) != 1]))
     if by_op.get("sweep-dup") and "--sweep-dups" not in args:
-        print("  note: %d prem/prior twin tombstones need --sweep-dups "
+        print("  note: %d prem/prior twin duplicates need --sweep-dups "
               "(removes canon-store files; safe per read-time dedup — "
               "operator-gated by design)" % len(by_op["sweep-dup"]))
     if "--apply" not in args:

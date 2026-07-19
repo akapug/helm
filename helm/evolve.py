@@ -43,7 +43,7 @@ def proposals():
                     % (len(routable), "ies" if len(routable) != 1 else "y"),
                     "helm drain --apply"))
     if dups:
-        out.append(("drain", "%d prem/prior twin tombstones sweepable (operator-gated)"
+        out.append(("drain", "%d prem/prior twin duplicates sweepable (operator-gated)"
                     % len(dups), "helm drain --apply --sweep-dups"))
 
     lines, _ = drift.report(snapshot=False)

@@ -275,6 +275,11 @@ def home_create(provider, account_email):
     for r in homes_list():
         if r["archived"] or r.get("broken_alias") or r["provider"] != provider:
             continue
+        if r["default"]:
+            # an identity seated in the provider DEFAULT may also get a named
+            # home — that IS the orchestrator compromise (default = managed
+            # cred for env-less launches; named home = pinned processes)
+            continue
         if r["authed"] and r["identity"] == email:
             hint = "" if r["canonical"] in (True, None) else \
                 f" (its name is non-canonical — `helm homes migrate {r['name']}` fixes that)"
@@ -356,9 +361,13 @@ def home_verify(name, provider=None):
         else:
             fixes.append(f"projects link missing — create: ln -s {SHARED_PROJECTS} {pl}")
     dups = row.get("duplicate_identity") or []
-    if dups:
-        fixes.append(f"identity {row['identity']} also lives in: {', '.join(dups)} — one "
-                     "identity should hold ONE home; the human picks a survivor and archives "
+    # default-home sharing is the orchestrator pattern (see _hygiene_flags) —
+    # only named-home <-> named-home duplication demands a survivor
+    named_dups = [d for d in dups if not d.startswith("(default-")] \
+        if not row["default"] else []
+    if named_dups:
+        fixes.append(f"identity {row['identity']} also lives in: {', '.join(named_dups)} — one "
+                     "identity should hold ONE named home; the human picks a survivor and archives "
                      "the rest (`helm homes archive`) — NEVER copy credentials between homes")
     verdict = "pending-login" if not row["authed"] else ("issues" if fixes else "ok")
     return {"home": row["name"], "provider": prov, "path": row["path"],
@@ -485,8 +494,20 @@ def _hygiene_flags(r):
         flags.append(f"name-lies(want {canonical_name(r['identity'])})")
     if r["projects_link_ok"] is False:
         flags.append("projects!")
-    if r.get("duplicate_identity"):
-        flags.append("dup:" + ",".join(r["duplicate_identity"]))
+    dups = r.get("duplicate_identity") or []
+    # named-home + provider DEFAULT sharing an identity is the recognized
+    # orchestrator pattern (the default carries orchestrator-managed cred for
+    # processes launched without a home env; the named home pins the rest) —
+    # describe it, don't alarm. Named-home <-> named-home stays a violation.
+    named = [d for d in dups if not d.startswith("(default-")]
+    if r["default"]:
+        named = []  # the default's mirror flag is informational by the same rule
+        if dups:
+            flags.append("shares:" + ",".join(dups) + " (by design)")
+    elif len(named) < len(dups):
+        flags.append("shared-with-default (by design)")
+    if named:
+        flags.append("dup:" + ",".join(named))
     if r["live_pids"]:
         flags.append("live:" + ",".join(map(str, r["live_pids"])))
     return flags

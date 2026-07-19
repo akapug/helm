@@ -102,7 +102,8 @@ typed store **adopts your live memory dir in place** — the resolver reads
 copy, byte-shape-compatible writes, so your existing hooks keep working
 untouched. New helm entries land in `~/.helm`, never there; only the
 lifecycle verbs (evidence / supersede / retire) write back wherever an entry
-lives, adopted included — and those tombstone, never delete. On a fresh
+lives, adopted included — and those retire in place, never delete (the file
+stays as the record). On a fresh
 machine with no harness stores at all, everything
 still works: sync scaffolds an empty home, the project list is empty until an
 agent runs somewhere, and `helm doctor` tells you exactly what it is (and

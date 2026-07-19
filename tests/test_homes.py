@@ -102,6 +102,28 @@ class HomesTest(unittest.TestCase):
         homes.home_create("claude", "deck@user.dev")
         self.assertFalse(os.path.islink(local))  # real dir survives, link not forced
 
+    def test_default_home_identity_sharing_is_by_design(self):
+        # the orchestrator compromise: the provider DEFAULT carries managed
+        # cred for env-less launches; the SAME identity may hold a named home
+        # for pinned processes. Described, never flagged as a violation.
+        d = homes.DEFAULTS["claude"]
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {"emailAddress": "shared@user.dev"}}, f)
+        open(os.path.join(d, ".credentials.json"), "w").close()
+        # create: a default-seated identity may still get a named home
+        res = homes.home_create("claude", "shared@user.dev")
+        self.assertNotIn("error", res)
+        # seat it (fresh login simulated), then: described, not flagged
+        self._plant_claude_home("shared-user-dev", "shared@user.dev")
+        rows = {r["name"]: r for r in homes.homes_list()}
+        named = homes._hygiene_flags(rows["shared-user-dev"])
+        self.assertTrue(any("by design" in f for f in named), named)
+        self.assertFalse(any(f.startswith("dup:") for f in named), named)
+        # verify: no survivor demand for the default pattern
+        res = homes.home_verify("shared-user-dev")
+        self.assertFalse(any("picks a survivor" in f for f in res["fixes"]), res["fixes"])
+
     def test_prepare_without_deck_env_provisions_nothing(self):
         res = homes.home_create("claude", "nodeck@user.dev")
         self.assertNotIn("error", res)

@@ -195,5 +195,37 @@ class TestCmdDoctor(DoctorBase):
         self.assertNotIn("FAIL", out)
 
 
+class PhysicsCurrencyTest(unittest.TestCase):
+    def _run(self, version_out):
+        import shutil as sh
+        import subprocess as sp
+        done = mock.Mock(returncode=0, stdout=version_out, stderr="")
+        with mock.patch.object(sh, "which", lambda t: "/usr/bin/" + t), \
+                mock.patch.object(sp, "run", return_value=done), \
+                mock.patch.object(doctor, "PHYSICS_PROBED", {"claude": "2.1.207"}):
+            return doctor.check_physics_currency()
+
+    def test_matching_version_is_ok(self):
+        res = self._run("2.1.207 (Claude Code)")
+        self.assertEqual([lvl for lvl, _ in res], [doctor.OK])
+
+    def test_drifted_version_warns_with_both_versions(self):
+        res = self._run("2.1.215 (Claude Code)")
+        self.assertEqual(res[0][0], doctor.WARN)
+        self.assertIn("2.1.215", res[0][1])
+        self.assertIn("2.1.207", res[0][1])
+
+    def test_unparseable_version_warns(self):
+        res = self._run("not a version at all")
+        self.assertEqual(res[0][0], doctor.WARN)
+        self.assertIn("unparseable", res[0][1])
+
+    def test_missing_binary_is_silent(self):
+        import shutil as sh
+        with mock.patch.object(sh, "which", lambda t: None), \
+                mock.patch.object(doctor, "PHYSICS_PROBED", {"claude": "2.1.207"}):
+            self.assertEqual(doctor.check_physics_currency(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

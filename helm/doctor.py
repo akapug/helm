@@ -7,6 +7,7 @@ loop is data-driven over CHECKS (names resolved late, so any check is a test
 seam), no if-forest. Exit 0 unless a FAIL.
 """
 import os
+import re
 
 from . import home, pk, registry, whoami
 
@@ -83,7 +84,7 @@ def check_adoption():
 
 def check_adopted_store(adopted_dir=None):
     """Adopted-store shape: entry counts by prefix + the prem-/prior- same-slug
-    duplicate count (the incomplete-migration tombstones)."""
+    duplicate count (the incomplete-migration leftovers)."""
     d = adopted_dir or home.adopted_memory_dir()
     if not os.path.isdir(d):
         return [(WARN, "adopted store missing (%s) — no live memory dir to adopt" % d)]
@@ -98,7 +99,7 @@ def check_adopted_store(adopted_dir=None):
     if dups:
         n = len(dups)
         out.append((WARN, "%d prem-/prior- same-slug duplicate%s (incomplete-migration "
-                    "tombstones) — `helm drain --sweep-dups` will archive these, owner-gated"
+                    "leftovers) — `helm drain --sweep-dups` will archive these, owner-gated"
                     % (n, "s"[:n != 1])))
     return out
 
@@ -129,8 +130,41 @@ def check_env():
     return out or [(OK, "no env overrides — home resolves to ~/.helm")]
 
 
+# The harness versions the physics facts were probed against (physics.py
+# header). A harness upgrade makes those facts quietly wrong, never loudly
+# broken — this sentinel is the loud part.
+PHYSICS_PROBED = {"claude": "2.1.207", "codex": "0.144.1"}
+
+
+def check_physics_currency():
+    """Installed harness version vs the version physics.py was probed against."""
+    import shutil as _sh
+    import subprocess as _sp
+    out = []
+    for tool, probed in sorted(PHYSICS_PROBED.items()):
+        if not _sh.which(tool):
+            continue
+        try:
+            v = _sp.run([tool, "--version"], capture_output=True, text=True,
+                        timeout=15).stdout.strip()
+        except (_sp.TimeoutExpired, OSError):
+            continue
+        m = re.search(r"\d+\.\d+\.\d+", v)
+        if not m:
+            out.append((WARN, "%s --version unparseable (%r) — physics facts "
+                              "probed at %s, currency unknown" % (tool, v[:40], probed)))
+        elif m.group(0) != probed:
+            out.append((WARN, "%s is %s but physics.py facts were probed at %s — "
+                              "re-verify config-resolution behavior (settings "
+                              "precedence, MCP sources) and update PHYSICS_PROBED"
+                              % (tool, m.group(0), probed)))
+        else:
+            out.append((OK, "%s %s matches the physics probe baseline" % (tool, probed)))
+    return out
+
+
 CHECKS = ("check_home", "check_projects", "check_adoption", "check_adopted_store",
-          "check_know_your_user", "check_cv", "check_env")
+          "check_know_your_user", "check_cv", "check_env", "check_physics_currency")
 
 
 def cmd_doctor(args):

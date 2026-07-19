@@ -80,7 +80,7 @@ that convergence, and was live-proven on the node the same day; it ships as
   the canonical premise text; the text stays in the storehouse. A checker
   recomputes the digest — match means attested.
 - **Supersession is a new signed turn** referencing the prior turn-hash
-  (append-only, never delete — the store's tombstone law, mirrored). Belief
+  (append-only, never delete — the store's record law, mirrored — retire keeps the file). Belief
   history becomes a provable chain: *held X until T, then Y* — which the
   drift report can read as attested belief evolution.
 - **Zero new substrate**: rides the existing self-write receipt shape;
