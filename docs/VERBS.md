@@ -106,12 +106,17 @@ $ helm store add prior "prefer-small-prs | small reviewable PRs land faster | 0.
 $ helm store evidence 2026-07-18T09:00:00Z prefer-small-prs +0.1 "three clean merges this week"
 ```
 
-### `helm inject [--project P] [--json]`
+### `helm inject [--project P] [--json] [--explain] [--hook-json]`
 The active-fire surface: prompt text on stdin, injection-worthy context on
 stdout — the pinned lane (budget-capped), just-in-time store matches, live
 reflex steers. Empty on no match; salience is the scarce resource. This is the
-one call a harness hook makes per turn — wiring per harness is in
-[HOOKS.md](HOOKS.md).
+one call a harness hook makes per turn — `helm hooks install` wires it;
+per-harness recipes are in [HOOKS.md](HOOKS.md). `--hook-json` reads the
+harness hook's full JSON on stdin instead (`prompt`/`cwd`/`session_id`),
+derives `--project` from the cwd (longest registry-path prefix, global-only
+fallback) and stamps the session onto the fire-ledger row; malformed JSON
+injects nothing, rc 0 (fail-open). `--explain` shows what would fire and why
+(plus the derived `[scope: …]`), writing no ledger row.
 
 ```console
 $ echo "how should we drain the memory backlog?" | helm inject --project myproject
@@ -292,6 +297,26 @@ $ helm configs cascade ~/dev/myproject --harness claude
 $ helm configs edit ~/.claude/settings.json < settings.json
 ```
 
+### `helm hooks [install [--harness claude|codex] [--home NAME] [--dry] | status]`
+The self-closing installer for the per-turn inject wiring. `install` merges
+the `UserPromptSubmit` → `helm inject --hook-json` hook into every claude
+home's `settings.json` (the default `~/.claude` included) — MERGE-preserving,
+idempotent (an up-to-date entry reports `ok`), on the configs safety rails
+(backup → validate → atomic write, backup restored on any failure). The
+generated command is fail-open by construction (`timeout` + `|| true` — a
+broken helm never blocks a turn). `--dry` prints the would-be diff per home;
+`--home NAME` narrows to one. `status` is the read-only per-home coverage
+table (hook present / helm resolvable / fail-open intact), mirrored by
+doctor's `inject coverage: N of M claude homes` line. Codex is reported as
+recipe-pending until [HOOKS.md](HOOKS.md) carries a mechanical shape.
+
+```console
+$ helm hooks install
+helm hooks: command: timeout 10 /path/to/helm/bin/helm inject --hook-json || true
+  you-example-com    add    backup: none — new file
+helm hooks: 2 of 2 claude homes covered
+```
+
 ### `helm skills [dupes]`
 Census of every skill across every home, read-only. `dupes` flags multi-homed
 names (identical-everywhere = safe to consolidate vs diverged), same-content-
@@ -314,6 +339,26 @@ helm cell: node LIVE at http://127.0.0.1:8899 — chain head 43 ...
 
 ## ops — health, evolution, the browser
 
+### `helm brief [--hours N] [--json]`
+
+The operator's morning brief, composed from what the estate already knows —
+read-only everywhere, never probes the network. Four sections, each omitted
+when empty: **SINCE YOU LEFT** (session activity in the window, bucketed by
+project; `--hours`, default 12), **KNOWLEDGE DELTA** (store entries
+added/updated/retired + drain receipts + inject-ledger turn stats),
+**SEATS** (the freshest cached quota observation per account — no cache says
+`quota: run helm creds`), **WAITING ON YOU** (owner-gated items the estate
+already records: the interview, queued attestations, stale project pointers,
+prem/prior duplicates). `--json` prints the raw dict.
+
+```console
+$ helm brief
+helm brief — 2026-07-19T07:27:15Z (last 12h)
+
+SINCE YOU LEFT — 7 sessions, 4 projects
+  helm                   3  Review Helm 0.1-alpha release verification
+```
+
 ### `helm doctor`
 Read-only health report over the whole estate: home layout, registry,
 adoption, the adopted store, know-your-user, the recall index, env overrides
@@ -332,9 +377,8 @@ launches your browser. Full surface, API table, and a systemd unit:
 
 ---
 
-**A note on `helm seat`:** the multimodel-seat module (giving a non-Claude
-model family the full claude-code harness through a local wire proxy) ships in
-the codebase (`helm/seat.py`, with its `seat add|up|down|launch|smoke|list|
-status|doctor` sub-grammar and tests) but is not yet wired into the
-dispatcher — running `helm seat` today reports an unknown verb. It lands as a
-top-level verb once its live proving rounds finish.
+**A note on `helm seat`:** the multimodel-seat verb (giving a non-Claude
+model family the full claude-code harness through a local wire proxy —
+`seat add|up|down|launch|smoke|list|status|doctor`) is wired into the
+dispatcher; see [MULTIMODEL_SEATS_ADDENDUM.md](MULTIMODEL_SEATS_ADDENDUM.md)
+while its live proving rounds finish.

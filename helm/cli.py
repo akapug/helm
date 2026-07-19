@@ -96,6 +96,7 @@ VERBS = {
     "sync": cmd_sync,
     "projects": cmd_projects,
     "show": cmd_show,
+    "brief": _lazy("brief", "cmd_brief"),
     "store": _lazy("store", "cmd_store"),
     "inject": _lazy("inject", "cmd_inject"),
     "drain": _lazy("drain", "cmd_drain"),
@@ -110,6 +111,7 @@ VERBS = {
     "sessions": _lazy("sessions", "cmd_sessions"),
     "homes": _lazy("homes", "cmd_homes"),
     "configs": _lazy("configs", "cmd_configs"),
+    "hooks": _lazy("hooks", "cmd_hooks"),
     "cell": _lazy("cell", "cmd_cell"),
     "premise": _lazy("premise", "cmd_premise"),
     "premise-check": _lazy("premise", "cmd_premise_check"),
@@ -127,8 +129,9 @@ VERBS = {
 }
 
 _VERB_HELP = {
+    "brief": "brief [--hours N] [--json] — the operator's morning brief: sessions, knowledge delta, seats, owner gates (read-only, never probes)",
     "store": "store list|get|add|resolve|... — the one typed knowledge store",
-    "inject": "inject [--project P] [--json|--explain] — per-turn context for harness hooks (stdin: prompt)",
+    "inject": "inject [--project P] [--json|--explain|--hook-json] — per-turn context for harness hooks (stdin: prompt or hook JSON)",
     "drain": "drain [--apply] — route raw memory intake to typed homes (dry-run default)",
     "drift": "drift — surface belief drift; silent when steady",
     "reflex": "reflex list|add|retire — (signal -> steer) entries",
@@ -141,6 +144,7 @@ _VERB_HELP = {
     "sessions": "sessions [<project>] — every local session, all harnesses; resume in one paste",
     "homes": "homes [prepare|verify|archive|restore|archives] — credential-home lifecycle",
     "configs": "configs [list|show|cascade <cwd>] — every config across every home, read-only",
+    "hooks": "hooks [install [--dry]|status] — self-wire the per-turn inject hook into every claude home",
     "cell": "cell join|send|recv|heartbeat|roster|status — the a2a substrate, helm-named",
     "premise": "premise <id> | <statement> — capture a certain truth, attested on the ledger",
     "premise-check": "premise-check <id> — verify digest + quote the finality tier",
