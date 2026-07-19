@@ -723,6 +723,53 @@ store-state roots per host, `--attest` self-written receipts, and pull's
 CONTRADICTED-ACROSS-HOSTS drift entry when the same id diverges with no
 supersede link.
 
+### `helm handoff [check [--hook-json] | write [--project P] | recover <sid>]`
+
+Compaction continuity, leg 1 — the AUTHORED handoff contract. `write` reads
+DONE/REMAINING/NEXT prose on stdin and lands it as a typed journal entry on
+the project shelf (`~/.helm/<project>/journal/<date>-handoff-<sid8>.md`);
+the frontmatter carries the one-line DONE/REMAINING/NEXT summaries plus the
+session id, so the entry is greppable, cv-searchable, and ships with the
+authored chain. A same-day same-session re-write lands on the same path —
+the newest handoff wins. `check` asks one question: does a handoff artifact
+for THIS session exist (a journal entry carrying the session id, or a repo
+`HANDOFF_NEXT_SESSION.md`) newer than session start? With `--hook-json` on
+PreCompact (and SessionEnd, for sessions that die uncompacted) it first
+takes the automatic now-snapshot (leg 2, below — two legs, one trigger),
+then NAGS in a few lines when the contract is unmet: a nag, never a capture
+— the agent authors audited prose; helm never invents a summary. Hook mode
+is fail-open total: rc 0 always, silent when satisfied, a garbled payload
+nags nobody, and capture can never block the compaction. `recover <sid>`
+re-reads the span a compaction discarded by wrapping the ONE recall index
+(`cv show <sid> --pre-compaction`, architecture law 4 — helm records how to
+query it, never a second index); a missing `cv` prints that exact command.
+
+### `helm now [capture [--hook-json] [--session S] | show]`
+
+Leg 2 — the AUTOMATIC safety net (the write side of the compaction-
+continuity reflex; the ancestor's now.md was advisory-without-actuator and
+sat at 0 bytes). `capture` snapshots the session id + registry project +
+git branch/status/changed paths + this session's recorded edits and reflex
+counters (record.py's session state — session-keyed, never pane) into
+`_global/now.md`: newest-first, 40-line cap, fail-open total. `show` prints
+the snapshot ONLY while under 48h fresh — a stale now.md actively misleads,
+so staleness is silence (the gate is load-bearing, not polish) — shaped for
+SessionStart additionalContext; the legacy `~/.remember/now.md` is honored
+as a read fallback until retired. now.md is DERIVED telemetry: rebuildable,
+never ships, no mutation receipt.
+
+Hook recipes (the HOOKS.md fail-open law — `timeout` + `|| true`, absolute
+helm path):
+
+```json
+"PreCompact":   [{"hooks": [{"type": "command",
+  "command": "timeout 10 <helm>/bin/helm handoff check --hook-json || true"}]}],
+"SessionEnd":   [{"hooks": [{"type": "command",
+  "command": "timeout 10 <helm>/bin/helm handoff check --hook-json || true"}]}],
+"SessionStart": [{"hooks": [{"type": "command",
+  "command": "timeout 10 <helm>/bin/helm now show || true"}]}]
+```
+
 ---
 
 **A note on `helm seat`:** the multimodel-seat verb (giving a non-Claude

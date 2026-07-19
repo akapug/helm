@@ -130,6 +130,7 @@ VERBS = {
     "swap": _lazy("creds", "cmd_swap"),
     "capsule": _lazy("capsule", "cmd_capsule"),
     "ship": _lazy("ship", "cmd_ship"),
+    "handoff": _lazy("handoff", "cmd_handoff"), "now": _lazy("handoff", "cmd_now"),
     "cmd": _lazy("transcripts", "cmd_cmd"),
     "web": _lazy("web", "cmd_web"),
 }
@@ -169,6 +170,7 @@ _VERB_HELP = {
     "swap": "swap <home|email> — seat ran dry: print resume-under-healthier-account blocks",
     "capsule": "capsule <sid> — the session's git era: worktree + resume commands",
     "ship": "ship [--apply] [--remote URL] | ship pull | ship hosts — the authored chain over git (dry-run default; pull merges + re-derives)",
+    "handoff": "handoff check [--hook-json]|write|recover <sid> — the compaction-continuity contract (PreCompact/SessionEnd nag; typed journal handoff; cv pre-compaction recovery)", "now": "now capture [--hook-json]|show — automatic session-continuity snapshot (_global/now.md, 40 lines newest-first, 48h freshness gate; SessionStart context)",
     "cmd": "cmd <sid> [--account A] [--model M] — account-aware pasteable resume command",
     "web": "web [--port N] — the same, warm, in a browser",
 }
