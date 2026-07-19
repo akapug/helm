@@ -477,6 +477,60 @@ $ helm premise-check --chain naming-poles
     held 'metaphors live at the extremes only' until 2026-07-19T..., then 'metaphors live at the poles' — LIVE now
 ```
 
+### `helm coach <lesson...> [--apply] [--as L] [--id ID] [--project P] [--supersede OLD] [--json]`
+The capture front door — the chat-path partner to `helm premise`. The owner (or
+an agent) says a lesson in plain words and coach PLACES it right instead of
+letting the store accrete duplicates. It is `/premise` for the whole store:
+speak, and coach routes to the correct layer. The intake discipline that was
+trapped in a claude-only command file, now a CLI every harness shares.
+
+A mechanical **4-step GATE** (deterministic shape rules, no model call — the
+routing is identical on every host and family):
+
+1. **reframe** — echo the lesson's intent back.
+2. **place** — shape rules pick the layer (same spirit as `drain.classify`):
+   `X = Y` / `define X` → **lexicon**; a certain standing truth (always/never/
+   must, no hedge) → **premise**; a hedged claim (probably/usually/might) →
+   **prior** with confidence scaled to the hedge; a fires-unbidden `when X, do
+   Y` → **reflex** (a concrete marker path picks a marker-file signal, else a
+   prompt regex over the trigger's distinctive words); a procedure/how-to/
+   numbered steps → a **skill/hook pointer** (not the typed store).
+3. **no-cruft** — `resolve` + fuzzy token search across the store **including
+   retired/tombstoned** entries; near matches ranked, each live near-dup
+   carrying a ready-to-run `helm store supersede` command. Upgrade-in-place
+   beats a new near-duplicate.
+4. **simplify** — flag what the new entry could retire.
+
+Propose-only by default: it prints the routing, the related entries, and the
+**exact one-paste landing verb**. `--apply` lands it through that layer's own
+verb (`helm premise` / `helm store add` / `helm reflex add`), so every store
+guard runs — coach composes resolve + add, it never re-implements them. A
+low-confidence route (no clear shape) is never guessed at on `--apply`: it
+drops into the drain intake dir as a `feedback-*.md` entry, lossless, for `helm
+drain` to route later. `--as` forces the layer, `--id` the id, `--supersede
+OLD` lands-then-tombstones in one step (the upgrade path), `--json` emits the
+plan. The lesson may also pipe on stdin (the voice/chat path). Fail-open
+throughout; framing is neutral proof-engineering.
+
+```console
+$ helm coach "always scrub internal planning docs before any push"
+helm coach: reframed -> "always scrub internal planning docs before any push"
+  place:    premise   [id: scrub-planning-before-push]  - certain standing truth (signal 'always', no hedge)
+  no-cruft: 1 related entry (resolve + fuzzy, incl. retired/tombstoned; 1 near-dup):
+      - push-scrub-first [prior 0.80] 62% overlap
+        upgrade in place:  helm store supersede 2026-07-19T.. push-scrub-first scrub-planning-before-push <reason>
+  land it:  helm premise "scrub-planning-before-push | always scrub internal planning docs before any push"
+  (propose-only - re-run with --apply to land, or paste the verb above)
+
+$ helm coach --apply "the prefilter might be faster than the regex scan"
+helm store: LIVE 'prefilter-faster-regex-scan' [prior 0.50] - the prefilter might be faster than the regex scan
+coached -> prior (prefilter-faster-regex-scan) | new
+```
+
+A thin `~/.claude/commands/coach.md` wrapper (one line: `helm coach "$ARGUMENTS"`)
+gives claude a `/coach` slash-verb; codex/opencode/bare terminal use the CLI
+directly — same front door, no per-harness lane.
+
 ## sessions — every harness, one catalog
 
 ### `helm sessions [<project>] [--limit N] [--all] | helm sessions resume <sid>`
