@@ -43,6 +43,10 @@ with open(os.path.join(_HOMEDIR, "settings.json"), "w") as f:
 
 from helm import configs, skills, web  # noqa: E402
 
+# the synthetic cred home must be on the resolve allowlist (resolve refuses
+# homes outside HOME_ROOTS — the audit's arbitrary-directory read gate)
+configs.HOME_ROOTS.append(_HOMEDIR)
+
 
 def _mk_skill(name, content="skill body"):
     d = os.path.join(_SKILLS, name)
@@ -87,6 +91,22 @@ class ConfigsModelTest(unittest.TestCase):
         r = configs.read_file("/etc/passwd")
         self.assertIn("error", r)
         self.assertEqual(r["content"], "")
+
+    def test_resolve_refuses_unlisted_home(self):
+        # audit: resolve fed an arbitrary ?home= dir into physics_report,
+        # returning that directory's settings/hooks/mcpServers on an
+        # unauthenticated GET. Only recognized cred homes resolve.
+        outside = os.path.join(_TMP, "not-a-home")
+        os.makedirs(outside, exist_ok=True)
+        with open(os.path.join(outside, "settings.json"), "w") as f:
+            json.dump({"env": {"SECRET_NAME": "x"}}, f)
+        r = configs.resolve(outside, _PROJ, "claude")
+        self.assertEqual(sorted(r), ["error"])
+        self.assertIn("not a recognized cred home", r["error"])
+        # the CLI surfaces the refusal as an error exit
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                configs.cmd_configs(["cascade", _PROJ, "--home", outside]), 1)
 
     def test_cmd_configs(self):
         out = io.StringIO()
@@ -178,6 +198,15 @@ class ConfigsWebTest(unittest.TestCase):
         status, d = self.get("/api/configs/cascade?harness=bogus")
         self.assertEqual(status, 400)
         self.assertIn("error", d)
+
+    def test_api_cascade_refuses_unlisted_home(self):
+        outside = os.path.join(_TMP, "not-a-home-web")
+        os.makedirs(outside, exist_ok=True)
+        q = urllib.parse.urlencode({"cwd": _PROJ, "home": outside})
+        status, d = self.get("/api/configs/cascade?" + q)
+        self.assertIn("error", d)
+        self.assertIn("not a recognized cred home", d["error"])
+        self.assertNotIn("mcpServers", d)
 
     def test_api_skills_census(self):
         status, d = self.get("/api/skills")

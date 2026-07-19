@@ -323,10 +323,30 @@ def _annotate_mcp_shadows(report):
     return report
 
 
+def _allowed_home(path):
+    """True iff path is a recognized cred home: an entry of HOME_ROOTS (tests
+    patch this list), or a direct child of ~/.claude-homes / ~/.codex-homes
+    (homes created after import — HOME_ROOTS globs once). The resolve read
+    path must never walk an arbitrary directory's config-shaped files: the
+    web layer exposes it on unauthenticated GET (?home=), and physics_report
+    returns hook commands, mcpServers and settings layers for whatever home
+    it is pointed at."""
+    rp = _real(path)
+    if any(rp == _real(h) for h in HOME_ROOTS):
+        return True
+    return os.path.dirname(rp) in (_real(f"{HOME}/.claude-homes"),
+                                   _real(f"{HOME}/.codex-homes"))
+
+
 def resolve(home_path, cwd, harness):
     """physics.py's resolved seat — what (home, cwd) WOULD load, with source +
     precedence, plus MCP winner/shadowed annotation. This IS the cascade view
-    (root→…→cwd + the home/user layer)."""
+    (root→…→cwd + the home/user layer). The home must be a recognized cred
+    home (allowlist, same posture as read_file) — never an arbitrary dir."""
+    if not _allowed_home(home_path):
+        return {"error": "home %r is not a recognized cred home "
+                         "(~/.claude, ~/.codex, ~/.claude-homes/*, ~/.codex-homes/*)"
+                         % home_path}
     return _annotate_mcp_shadows(physics.physics_report(home_path, cwd or None, harness))
 
 
@@ -591,7 +611,11 @@ def cmd_configs(args):
                   "[--home DIR]", file=sys.stderr)
             return 2
         home_p = home_p or os.path.join(HOME, ".codex" if harness == "codex" else ".claude")
-        print(json.dumps(resolve(home_p, cwd, harness), indent=2, ensure_ascii=False))
+        res = resolve(home_p, cwd, harness)
+        if res.get("error"):
+            print("helm configs cascade: %s" % res["error"], file=sys.stderr)
+            return 1
+        print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
 
     if verb == "edit":
