@@ -43,6 +43,26 @@ $ helm projects
 myproject  active  today  61  claude+codex  ~/dev/myproject
 ```
 
+### `helm projections [--json]`
+The projection registry — constitution laws 2+3 as an executable manifest.
+Every on-disk store helm reads or writes (both roots: the helm home and
+`~/.cache/helm`), classified `authored | projection | events | state |
+backup`, with each **projection** naming its authoritative source and its
+rebuild command — a projection that cannot name its rebuild cannot be safely
+wiped or gitignored. Any file no row names is an unclassified **squatter**.
+Read surface only; `helm doctor` enforces (undeclared rebuild/source = FAIL,
+orphaned projection = FAIL, declared staleness = WARN, squatters = WARN).
+
+```console
+$ helm projections
+helm projections (27 rows over /home/you/.helm + /home/you/.cache/helm):
+  registry          projection    1 file   <- harness session stores + disk repo scan | rebuild: helm sync
+  catalog-cache     projection    1 file   <- local claude/codex transcripts (cv ls, or the scanner) | rebuild: helm sessions
+  cwd-overrides     authored      1 file
+  ...
+  no unclassified squatters
+```
+
 ### `helm show <project>`
 One project's full JSON record — path, pointers (memory dir, recall scope),
 per-harness session counts, lineage edges.
@@ -688,7 +708,6 @@ helm gc — declared retention over the derived exhaust (dry-run; `helm gc --app
   in budget: inject-ledger, events, ... (14/15 streams)
 helm gc: 3 items would be reaped; 0 report-only over budget — nothing touched
 ```
-
 
 ### `helm web [--port N] [--open]`
 The same truth, warm, in a browser: five views (knowledge home, quota,
