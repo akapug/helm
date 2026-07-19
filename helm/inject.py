@@ -10,10 +10,13 @@ One resolver, every harness — claude/codex/opencode/hermes hooks all call the
 same verb, which is what makes helm's knowledge fire wherever the operator
 works. Salience law: no match -> EMPTY output (a silent turn costs nothing).
 
-Wiring (examples):
-  claude   UserPromptSubmit hook: helm inject --project <p> < prompt.txt
-           -> stdout becomes additionalContext
-  codex    notify/turn hook: same call, same stdout
+Wiring (`helm hooks install` writes this; docs/HOOKS.md has the manual recipe):
+  claude   UserPromptSubmit hook: helm inject --hook-json  <- the FULL hook
+           JSON on stdin (prompt/cwd/session_id, unknown keys tolerated);
+           stdout becomes additionalContext. The project scope is DERIVED from
+           the hook's cwd via the registry (longest-prefix over project paths,
+           drain's longest-first law) — global-only when no project claims it.
+  codex    notify/turn hook: same verb, plain prompt text on stdin
 
 PERF (the per-prompt hot path): the store is parsed ONCE per call, not once per
 lane — both lanes are fed from a persistent parsed-entry cache keyed by the
@@ -26,9 +29,10 @@ store.pinned/resolve_prompt's entries= parameter (the durable seam — no
 monkeypatch, so a dropped cache regresses loudly in tests, not silently here).
 
 FIRE-LEDGER (the measurement spine): every gather() appends ONE JSON line to
-<helm home>/_global/.state/inject-ledger.jsonl — v:1, ts, project, fired entry
-IDS per lane (never prompt text), bytes per lane, pre-cap candidate count,
-elapsed_ms; a no-fire turn logs {"silent": true} instead of per-entry fields.
+<helm home>/_global/.state/inject-ledger.jsonl — v:1, ts, project, session
+(when the hook supplied one), fired entry IDS per lane (never prompt text),
+bytes per lane, pre-cap candidate count, elapsed_ms; a no-fire turn logs
+{"silent": true} instead of per-entry fields.
 O(1) append, 5MB one-generation rotation (-> .1), and fail-open: ledger
 trouble never blocks or slows the hook. `helm inject --explain` is the read
 side — what WOULD fire for stdin text and why (the pinned budget walk, which
@@ -133,6 +137,43 @@ def _lanes(text, project=None):
                                  entries=entries))
 
 
+def parse_hook_json(raw):
+    """Claude Code UserPromptSubmit hook JSON -> (prompt, cwd, session). Unknown
+    keys are tolerated (the hook payload grows); missing keys read as empty.
+    Malformed/non-object input -> (None, None, None): the caller must FAIL OPEN
+    (inject nothing, rc 0) — a garbled payload never blocks a turn."""
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None, None, None
+    if not isinstance(d, dict):
+        return None, None, None
+    return (str(d.get("prompt") or ""),
+            str(d.get("cwd") or "") or None,
+            str(d.get("session_id") or "") or None)
+
+
+def project_for_cwd(cwd):
+    """cwd -> registry project name by LONGEST-prefix match over project paths
+    (drain's longest-first law: the deepest registered path that contains cwd
+    wins). None = no project claims it — the caller stays global-only.
+    Read-only registry access; fail-open (any trouble -> None)."""
+    if not cwd:
+        return None
+    from . import registry
+    try:
+        want = os.path.abspath(os.path.expanduser(str(cwd)))
+        best = None
+        for key, rec in (registry.load().get("projects") or {}).items():
+            path = str(rec.get("path") or "").rstrip("/")
+            if path and (want == path or want.startswith(path + "/")) \
+                    and len(path) > len(best[0] if best else ""):
+                best = (path, str(rec.get("name") or key))
+        return best[1] if best else None
+    except Exception:
+        return None
+
+
 def _ledger_path():
     return os.path.join(home.global_dir(), ".state", "inject-ledger.jsonl")
 
@@ -156,10 +197,11 @@ def _ledger_append(row):
         pass
 
 
-def gather(text, project=None):
+def gather(text, project=None, session=None):
     """-> dict {pinned: [line], jit: [line], reflex: [line]} (each may be empty).
     Fail-open per lane: a raising store/reflex yields that lane empty. Every
-    call appends one fire-ledger row (silent turns log {"silent": true})."""
+    call appends one fire-ledger row (silent turns log {"silent": true});
+    session (the hook's session_id) rides the row when supplied."""
     t0 = time.time()
     try:
         pinned_entries, jit_all = _lanes(text, project=project)
@@ -184,6 +226,8 @@ def gather(text, project=None):
     sections = {"pinned": pinned_lines, "jit": jit, "reflex": steers}
     row = {"v": 1, "ts": pk.now_ts(), "project": project,
            "elapsed_ms": round((time.time() - t0) * 1000, 1)}
+    if session:
+        row["session"] = session
     fired = {"pinned": pinned_ids, "jit": [str(e["id"]) for e in jit_entries],
              "reflex": [str(e["id"]) for e in fired_reflex]}
     if any(fired.values()):
@@ -238,18 +282,33 @@ def _explain(text, project=None):
 
 
 def cmd_inject(args):
-    """inject [--project P] [--json] [--explain] — prompt text on stdin ->
-    context lines. --explain prints what WOULD fire and why, sans ledger row."""
+    """inject [--project P] [--json] [--explain] [--hook-json] — prompt text on
+    stdin -> context lines. --hook-json reads the harness hook's FULL JSON on
+    stdin instead (prompt/cwd/session_id) and derives --project from the cwd
+    via the registry; malformed hook JSON injects nothing, rc 0 (fail-open).
+    --explain prints what WOULD fire and why, sans ledger row."""
     project = None
     if "--project" in args:
         project = args[args.index("--project") + 1]
-    text = "" if sys.stdin.isatty() else sys.stdin.read()
-    for a in args:
-        if not a.startswith("--") and a != project:
-            text = a  # allow inline text for quick tests
+    session = scope_via = None
+    if "--hook-json" in args:
+        text, cwd, session = parse_hook_json(
+            "" if sys.stdin.isatty() else sys.stdin.read())
+        if text is None:
+            return 0  # garbled hook payload: inject nothing, never block
+        if project is None:
+            project = project_for_cwd(cwd)
+            scope_via = cwd if project else None
+    else:
+        text = "" if sys.stdin.isatty() else sys.stdin.read()
+        for a in args:
+            if not a.startswith("--") and a != project:
+                text = a  # allow inline text for quick tests
     if "--explain" in args:
+        if scope_via:
+            print("[scope: %s via %s]" % (project, scope_via))
         return _explain(text, project=project)
-    sections = gather(text, project=project)
+    sections = gather(text, project=project, session=session)
     if "--json" in args:
         print(json.dumps(sections, ensure_ascii=False))
         return 0

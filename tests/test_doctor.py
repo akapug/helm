@@ -249,6 +249,30 @@ class PhysicsCurrencyTest(unittest.TestCase):
                 mock.patch.object(doctor, "PHYSICS_PROBED", {"claude": "2.1.207"}):
             self.assertEqual(doctor.check_physics_currency(), [])
 
+    def test_version_probe_failure_warns_not_silent(self):
+        # the sentinel must not fail QUIET exactly when currency is unknowable
+        import shutil as sh
+        import subprocess as sp
+        with mock.patch.object(sh, "which", lambda t: "/usr/bin/" + t), \
+                mock.patch.object(sp, "run", side_effect=OSError("boom")), \
+                mock.patch.object(doctor, "PHYSICS_PROBED", {"claude": "2.1.207"}):
+            res = doctor.check_physics_currency()
+        self.assertEqual(res[0][0], doctor.WARN)
+        self.assertIn("UNKNOWN", res[0][1])
+
+    def test_authored_non_object_entry_fails_not_crashes(self):
+        # a parseable file with a null entry must FAIL, never raise —
+        # hermetic: never touch the live helm home
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="helm-doctor-auth-") as tmp, \
+                mock.patch.dict(os.environ, {"HELM_HOME": tmp}):
+            os.makedirs(os.path.dirname(doctor.home.authored_path()), exist_ok=True)
+            pk.write_json(doctor.home.authored_path(),
+                          {"version": 1, "projects": {"proj": None}})
+            res = doctor.check_authored()
+        self.assertEqual(res[0][0], doctor.FAIL)
+        self.assertIn("proj", res[0][1])
+
 
 if __name__ == "__main__":
     unittest.main()

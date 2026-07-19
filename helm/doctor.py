@@ -47,6 +47,11 @@ def check_authored():
     entries = auth.get("projects") if isinstance(auth, dict) else None
     if not isinstance(entries, dict):
         return [(FAIL, "registry-authored.json does not parse (%s)" % path)]
+    bad = sorted(n for n, e in entries.items() if not isinstance(e, dict))
+    if bad:
+        # a null/garbled ENTRY inside a parseable file must report, not crash
+        return [(FAIL, "registry-authored.json has non-object entr%s: %s"
+                 % ("y" if len(bad) == 1 else "ies", ", ".join(bad)))]
     reg = pk.read_json(home.registry_path())
     projects = (reg.get("projects") if isinstance(reg, dict) else None) or {}
     live = sum(1 for n, e in entries.items()
@@ -144,6 +149,23 @@ def check_cv(cv_dir=None):
     return [(WARN, "cv missing (%s) — recall plane offline" % d)]
 
 
+def check_inject_coverage():
+    """The crown-jewel wiring: how many claude homes carry the per-turn inject
+    hook (present + resolvable helm + fail-open contract)."""
+    from . import hooks
+    try:
+        rows = hooks.status_rows()
+    except Exception as e:
+        return [(WARN, "inject coverage unknown (%s: %s)" % (e.__class__.__name__, e))]
+    if not rows:
+        return []
+    n = sum(1 for r in rows if r["hook"] and r["resolvable"] and r["fail_open"])
+    msg = "inject coverage: %d of %d claude homes" % (n, len(rows))
+    if n < len(rows):
+        return [(WARN, msg + " — `helm hooks install` closes the gap")]
+    return [(OK, msg)]
+
+
 def check_env():
     """HELM_*/MELD_* overrides in effect."""
     out = [(OK, "env override: %s=%s" % (var, os.environ[var]))
@@ -168,7 +190,10 @@ def check_physics_currency():
         try:
             v = _sp.run([tool, "--version"], capture_output=True, text=True,
                         timeout=15).stdout.strip()
-        except (_sp.TimeoutExpired, OSError):
+        except (_sp.TimeoutExpired, OSError) as e:
+            # the sentinel must not fail QUIET exactly when currency is unknowable
+            out.append((WARN, "%s --version failed (%s) — physics facts probed "
+                              "at %s, currency UNKNOWN" % (tool, type(e).__name__, probed)))
             continue
         m = re.search(r"\d+\.\d+\.\d+", v)
         if not m:
@@ -185,8 +210,8 @@ def check_physics_currency():
 
 
 CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
-          "check_adopted_store", "check_know_your_user", "check_cv", "check_env",
-          "check_physics_currency")
+          "check_adopted_store", "check_know_your_user", "check_cv",
+          "check_inject_coverage", "check_env", "check_physics_currency")
 
 
 def cmd_doctor(args):

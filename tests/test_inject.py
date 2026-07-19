@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 
-from helm import home, inject, store  # noqa: E402
+from helm import home, inject, pk, store  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
             "HELM_CACHE_DIR", "MELD_CACHE_DIR")
@@ -342,6 +342,113 @@ class LedgerTest(InjectBase):
             self.plant_jit("jit-%d" % i, "flux fact %d" % i, "fluxcap")
         rc, out, _ = self.run_inject(["--explain"], stdin_text="tune the fluxcap")
         self.assertEqual(out.count("(over cap)"), 3)  # 7 hits, cap 4
+
+
+class HookJsonTest(InjectBase):
+    """--hook-json: the harness hook payload on stdin + cwd->project scope
+    derivation (longest-prefix over registry paths, global fallback)."""
+
+    def seed_registry(self, **paths):
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            n: {"name": n, "path": p, "kind": "git", "status": "active",
+                "sessions": {}} for n, p in paths.items()}})
+
+    def hook_stdin(self, prompt, cwd=None, session="sid-1", **extra):
+        d = {"prompt": prompt, "cwd": cwd, "session_id": session,
+             "hook_event_name": "UserPromptSubmit", **extra}
+        return json.dumps({k: v for k, v in d.items() if v is not None})
+
+    def ledger_rows(self):
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            return [json.loads(l) for l in f.read().splitlines()]
+
+    def test_parse_extracts_and_tolerates_unknown_keys(self):
+        p, c, s = inject.parse_hook_json(self.hook_stdin(
+            "tune the fluxcap", cwd="/tmp/x", transcript_path="/t.jsonl"))
+        self.assertEqual((p, c, s), ("tune the fluxcap", "/tmp/x", "sid-1"))
+        self.assertEqual(inject.parse_hook_json("{}"), ("", None, None))
+
+    def test_malformed_json_fails_open_empty_rc0(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        for bad in ("not json{", "[1, 2]", '"a string"', ""):
+            rc, out, err = self.run_inject(["--hook-json"], stdin_text=bad)
+            self.assertEqual((rc, out, err), (0, "", ""), bad)
+        self.assertFalse(os.path.exists(inject._ledger_path()),
+                         "a garbled payload must not ledger a turn")
+
+    def test_hook_json_fires_like_plain_stdin(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        rc, out, _ = self.run_inject(["--hook-json"],
+                                     stdin_text=self.hook_stdin("tune the fluxcap"))
+        self.assertEqual(rc, 0)
+        self.assertIn("PRIOR 0.80 jit-a: a flux fact", out)
+
+    def test_cwd_derives_project_longest_prefix_wins(self):
+        outer = os.path.join(self.tmp, "repos", "outer")
+        inner = os.path.join(outer, "inner")
+        self.seed_registry(outer=outer, inner=inner)
+        for name in ("outer", "inner"):
+            store.write_prior(
+                {"id": name + "-pin", "statement": name + " truth",
+                 "confidence": "1.0", "pin": "true"},
+                root_dir=os.path.join(home.project_dir(name), "premises"))
+        rc, out, _ = self.run_inject(
+            ["--hook-json"],
+            stdin_text=self.hook_stdin("x", cwd=os.path.join(inner, "sub")))
+        self.assertEqual(rc, 0)
+        self.assertIn("inner-pin", out)   # deepest registered path wins
+        self.assertNotIn("outer-pin", out)
+        r = self.ledger_rows()[-1]
+        self.assertEqual(r["project"], "inner")
+        self.assertEqual(r["session"], "sid-1")
+        # prefix is path-boundary, not string-boundary: outerX is NOT outer
+        self.assertIsNone(inject.project_for_cwd(outer + "X"))
+        self.assertEqual(inject.project_for_cwd(outer), "outer")
+
+    def test_unregistered_cwd_falls_back_to_global(self):
+        self.seed_registry(p1=os.path.join(self.tmp, "repos", "p1"))
+        self.plant_pinned("g-pin", "global truth")
+        rc, out, _ = self.run_inject(
+            ["--hook-json"],
+            stdin_text=self.hook_stdin("x", cwd=os.path.join(self.tmp, "elsewhere")))
+        self.assertEqual(rc, 0)
+        self.assertIn("g-pin", out)
+        r = self.ledger_rows()[-1]
+        self.assertIsNone(r["project"])
+        self.assertEqual(r["session"], "sid-1")
+
+    def test_explicit_project_flag_beats_derivation(self):
+        outer = os.path.join(self.tmp, "repos", "outer")
+        self.seed_registry(outer=outer)
+        store.write_prior({"id": "p2-pin", "statement": "p2 truth",
+                           "confidence": "1.0", "pin": "true"},
+                          root_dir=os.path.join(home.project_dir("p2"), "premises"))
+        rc, out, _ = self.run_inject(
+            ["--hook-json", "--project", "p2"],
+            stdin_text=self.hook_stdin("x", cwd=outer))
+        self.assertIn("p2-pin", out)
+        self.assertEqual(self.ledger_rows()[-1]["project"], "p2")
+
+    def test_explain_shows_scope_line_only_when_derived(self):
+        outer = os.path.join(self.tmp, "repos", "outer")
+        self.seed_registry(outer=outer)
+        rc, out, _ = self.run_inject(
+            ["--hook-json", "--explain"], stdin_text=self.hook_stdin("x", cwd=outer))
+        self.assertEqual(rc, 0)
+        self.assertIn("[scope: outer via %s]" % outer, out)
+        self.assertFalse(os.path.exists(inject._ledger_path()),
+                         "--explain must never write the ledger")
+        rc, out, _ = self.run_inject(
+            ["--hook-json", "--explain"],
+            stdin_text=self.hook_stdin("x", cwd=os.path.join(self.tmp, "elsewhere")))
+        self.assertNotIn("[scope:", out)
+
+    def test_plain_stdin_contract_unchanged_no_session(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        rc, out, _ = self.run_inject([], stdin_text="tune the fluxcap")
+        self.assertEqual(rc, 0)
+        self.assertIn("jit-a", out)
+        self.assertNotIn("session", self.ledger_rows()[-1])
 
 
 if __name__ == "__main__":
