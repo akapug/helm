@@ -612,7 +612,9 @@ def gather(text, project=None, session=None):
         except Exception:
             pass
     try:
-        fired_reflex = reflex.fire(text, project=project)
+        # session threads the recorder counters in so counter/latch reflexes
+        # fire live (and latch per-session); no session -> v1 degrade, never raise
+        fired_reflex = reflex.fire(text, project=project, session=session)
     except Exception:
         fired_reflex = []
     steers = ["REFLEX: " + e["steer"] for e in fired_reflex]
@@ -714,7 +716,7 @@ def _explain(text, project=None, session=None):
         mark, over = ("  + ", "") if rank < JIT_CAP else ("  - ", " (over cap)")
         rank += 1
         print(mark + str(e["id"]) + " [matched: " + why + "] score %.3f" % score + over)
-    fired_reflex = reflex.fire(text, project=project)
+    fired_reflex = reflex.fire(text, project=project, session=session, persist=False)
     if fired_reflex:
         print("reflex:")
     for e in fired_reflex:
