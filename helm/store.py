@@ -111,13 +111,58 @@ def adopted_dir():
     return home.env("ADOPTED_DIR") or home.adopted_memory_dir()
 
 
+# project -> (registry.json mtime, [claude memory dirs]); the mtime key keeps
+# the registry load + dir stats off the per-turn hot path (20+ dirs otherwise).
+_ADOPTED_PROJECT_CACHE = {}
+
+
+def _project_adopted_dirs(project):
+    """The claude per-project memory dirs helm ADOPTS as project-scoped store
+    roots: the project's canonical cwd + observed worktree cwds, collapsed to
+    the one project (like sessions). Resolved from the registry, mtime-cached.
+    Fail-open: no registry / unknown project / no memory dir -> [] (existing
+    single-store behavior — every hermetic test that never seeds a registry is
+    unaffected)."""
+    if not project:
+        return []
+    try:
+        mtime = os.path.getmtime(home.registry_path())
+    except OSError:
+        return []
+    cached = _ADOPTED_PROJECT_CACHE.get(project)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    dirs, seen = [], set()
+    try:
+        from . import registry
+        rec = registry.get(project)
+    except Exception:
+        rec = None
+    if rec:
+        for cwd in [rec.get("path")] + list(rec.get("cwds") or []):
+            if not cwd:
+                continue
+            d = home.claude_memory_dir_for(cwd)
+            if d not in seen and os.path.isdir(d):
+                seen.add(d)
+                dirs.append(d)
+    _ADOPTED_PROJECT_CACHE[project] = (mtime, dirs)
+    return dirs
+
+
 def roots(project=None):
     """The ordered physical root set as (root, scope, dir) triples, WIDEST
     first — a later root SHADOWS an earlier one on a same-type same-slug
-    collision, which is exactly the project > helm-global > adopted law."""
+    collision, which is exactly the project > adopted-project > helm-global >
+    adopted law. adopted-project is the project's OWN claude memory dir(s)
+    (raw live store); it beats helm-global (project-specific raw over global)
+    and is beaten by the authored ~/.helm/<name> layer. The same-slug shadow
+    also dedups a byte-duplicated clone across two of a project's dirs."""
     out = [("adopted", "global", adopted_dir()),
            ("helm-global", "global", home.global_dir())]
     if project:
+        for d in _project_adopted_dirs(project):
+            out.append(("adopted-project", "project:" + project, d))
         out.append(("project", "project:" + project, home.project_dir(project)))
     return out
 
@@ -352,7 +397,9 @@ def _parse_entry(path, name):
 # ---------------------------------------------------------------------------
 
 def _entry_files(root, d):
-    dirs = [d] if root == "adopted" else [os.path.join(d, s) for s in _SCAN_SUBDIRS]
+    # adopted + adopted-project are flat claude memory dirs; helm roots nest
+    dirs = [d] if root in ("adopted", "adopted-project") \
+        else [os.path.join(d, s) for s in _SCAN_SUBDIRS]
     for sub in dirs:
         try:
             names = sorted(os.listdir(sub))

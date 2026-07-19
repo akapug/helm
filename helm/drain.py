@@ -41,9 +41,64 @@ _FM_DEFAULTS = {"name": "", "description": "", "type": "", "load_class": "",
 TYPED_PREFIXES = ("prior-", "lex-", "heuristic-", "ref-", "reflex-")
 DRAIN_CONFIDENCE = 0.9  # human feedback is strong evidence, not certainty
 
+# Built-in alias map: bulk global entries name a project by a short/old handle
+# the registry knows under a different canonical name — the 60 unroutable
+# global entries. Per-project authored `aliases` (registry AUTHORED_FIELDS) are
+# folded in on top when present (registry.py is another lane's — we only READ).
+_BUILTIN_ALIASES = {"buildr": "buildr-private-beta", "mc": "mission-control"}
+
 
 def _mem_dir():
     return home.adopted_memory_dir()
+
+
+def _project_mem_dir(project):
+    """The claude memory dir to drain for `--project P`: the project's canonical
+    cwd, else the first observed worktree cwd with a memory dir (collapsed to
+    the one project, like sessions). None -> unknown/unmapped project."""
+    rec = registry.get(project)
+    if not rec:
+        return None
+    for cwd in [rec.get("path")] + list(rec.get("cwds") or []):
+        if not cwd:
+            continue
+        d = home.claude_memory_dir_for(cwd)
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def _alias_map(reg):
+    """alias(lowercased) -> canonical project name. Built-ins plus every
+    project record's authored `aliases` list."""
+    m = dict(_BUILTIN_ALIASES)
+    for name, rec in (reg.get("projects") or {}).items():
+        for a in rec.get("aliases") or []:
+            if str(a).strip():
+                m[str(a).strip().lower()] = name
+    return m
+
+
+def _route_target(base, blob, project_names, aliases):
+    """The project an entry routes to, canonical names first (filename prefix or
+    exact, then a specific >=6-char description word), aliases second — a short
+    alias like 'mc' matches by filename only (a 2-char word wallpapers)."""
+    low = base.lower()
+    for pn in project_names:
+        if low.startswith(pn.lower() + "-") or low == pn.lower():
+            return pn
+    for alias, canon in aliases.items():
+        if canon in project_names and (low.startswith(alias + "-") or low == alias):
+            return canon
+    for pn in project_names:
+        if len(pn) >= 6 and re.search(
+                r"(?<![a-z0-9])" + re.escape(pn.lower()) + r"(?![a-z0-9])", blob):
+            return pn
+    for alias, canon in aliases.items():
+        if canon in project_names and len(alias) >= 6 and re.search(
+                r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", blob):
+            return canon
+    return None
 
 
 def _entries(mem):
@@ -77,7 +132,9 @@ def classify(mem=None):
     """-> list of action dicts. Pure derivation, no writes."""
     mem = mem or _mem_dir()
     names = set(os.listdir(mem)) if os.path.isdir(mem) else set()
-    project_names = sorted(registry.load()["projects"], key=len, reverse=True)
+    reg = registry.load()
+    project_names = sorted(reg["projects"], key=len, reverse=True)
+    aliases = _alias_map(reg)
     plan = []
     planned_dsts = {}   # dst filename -> first src that claimed it (collision guard)
     for n, p in _entries(mem):
@@ -102,16 +159,12 @@ def classify(mem=None):
             plan.append(_retype_or_conflict(n, dst, slug, "reference", e, names, planned_dsts))
             continue
         if etype == "project" or n.startswith(("proj-", "proj_", "project_")):
-            # filename-prefix match always counts; a description match needs a
-            # name specific enough not to wallpaper (short names like "dev"
-            # appear as ordinary words in half the corpus)
+            # filename-prefix / exact match always counts; a description match
+            # needs a name specific enough not to wallpaper (short names like
+            # "dev" appear as ordinary words in half the corpus). The alias map
+            # routes entries that name a project by a short/old handle.
             blob = (e.get("description") or "").lower()
-            target = next(
-                (pn for pn in project_names
-                 if base.lower().startswith(pn.lower() + "-") or base.lower() == pn.lower()
-                 or (len(pn) >= 6 and re.search(
-                     r"(?<![a-z0-9])" + re.escape(pn.lower()) + r"(?![a-z0-9])", blob))),
-                None)
+            target = _route_target(base, blob, project_names, aliases)
             if target:
                 plan.append({"op": "route-project", "src": n, "project": target,
                              "dst": os.path.join(home.project_dir(target), "journal", n)})
@@ -313,7 +366,7 @@ def expire_candidates(days=14, apply=False, project=None):
     return receipt
 
 
-def _cmd_expire_candidates(args):
+def _cmd_expire_candidates(args, project=None):
     days = 14
     if "--days" in args:
         try:
@@ -321,7 +374,7 @@ def _cmd_expire_candidates(args):
         except (ValueError, IndexError):
             print("helm drain --expire-candidates: --days needs an integer", file=sys.stderr)
             return 2
-    r = expire_candidates(days=days, apply="--apply" in args)
+    r = expire_candidates(days=days, apply="--apply" in args, project=project)
     print("helm drain --expire-candidates: %d unconfirmed candidate%s older than %dd"
           % (r["found"], "s"[:r["found"] != 1], r["days"]))
     for cid in r["ids"][:8]:
@@ -415,16 +468,32 @@ def apply(plan, mem=None, sweep_dups=False, limit=None):
 
 
 def cmd_drain(args):
-    """drain [--apply] [--sweep-dups] [--limit N] | drain --rekey [--apply] |
-    drain --expire-candidates [--days N] [--apply] — classify raw memory
-    entries and route them to typed homes; --rekey is the one-time
-    drained-cohort keyword migration; --expire-candidates prunes unconfirmed
-    candidates older than N days (14 default). Dry-run by default."""
+    """drain [--apply] [--sweep-dups] [--limit N] [--project P] | drain --rekey
+    [--apply] | drain --expire-candidates [--days N] [--apply] — classify raw
+    memory entries and route them to typed homes; --project P drains that
+    project's OWN claude memory dir (the adopted per-project pile) with the
+    identical gauntlet; --rekey is the one-time drained-cohort keyword
+    migration; --expire-candidates prunes unconfirmed candidates older than N
+    days (14 default). Dry-run by default."""
+    project = None
+    if "--project" in args:
+        i = args.index("--project")
+        project = args[i + 1] if i + 1 < len(args) else None
+        if not project:
+            print("helm drain: --project needs a name", file=sys.stderr)
+            return 2
     if "--rekey" in args:
         return _cmd_rekey(args)
     if "--expire-candidates" in args:
-        return _cmd_expire_candidates(args)
-    mem = _mem_dir()
+        return _cmd_expire_candidates(args, project=project)
+    if project:
+        mem = _project_mem_dir(project)
+        if not mem:
+            print("helm drain: no claude memory dir for project '%s' "
+                  "(helm sync, or check `helm show %s`)" % (project, project))
+            return 1
+    else:
+        mem = _mem_dir()
     if not os.path.isdir(mem):
         print("helm drain: no adopted memory dir at " + mem)
         return 1
@@ -432,7 +501,8 @@ def cmd_drain(args):
     by_op = {}
     for a in plan:
         by_op.setdefault(a["op"], []).append(a)
-    print("helm drain plan (%d raw entries):" % len(plan))
+    print("helm drain plan (%d raw entries%s):"
+          % (len(plan), (" — project " + project + " @ " + mem) if project else ""))
     # per op: (rows shown, "... more" threshold); everything else defaults (3, 3)
     show_limit = {"conflict": (5, 5), "keep": (2, 3)}
     for op in ("retype", "route-project", "sweep-dup", "conflict", "keep"):

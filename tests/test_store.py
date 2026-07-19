@@ -935,6 +935,70 @@ class AddGuardTest(StoreBase):
                          ["definition"], "able to be you, sharpened")
 
 
+class AdoptProjectMemdirsTest(StoreBase):
+    """Per-project claude memory dirs adopted as project-scoped store roots:
+    roots(project) gains ('adopted-project', ...) triples, shadow order is
+    project > adopted-project > helm-global > adopted. Hermetic: the claude
+    memdir resolver is patched to a tmp dir (never the real ~/.claude)."""
+
+    def setUp(self):
+        super().setUp()
+        store._ADOPTED_PROJECT_CACHE.clear()
+        self.projmem = os.path.join(self.tmp, "projmem")
+        os.makedirs(self.projmem)
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "polyana": {"name": "polyana", "path": "/dev/polyana", "kind": "git",
+                        "sessions": {}, "cwds": []}}})
+
+    def tearDown(self):
+        store._ADOPTED_PROJECT_CACHE.clear()
+        super().tearDown()
+
+    def _patch(self):
+        return mock.patch.object(
+            home, "claude_memory_dir_for",
+            side_effect=lambda p: self.projmem if p == "/dev/polyana" else "/nonexistent-xyz")
+
+    def test_project_adopted_root_fires_its_own_priors(self):
+        store.write_prior({"id": "polyana-law", "statement": "polyana's own prior",
+                           "confidence": 0.9, "keywords": "polyanaword"},
+                          root_dir=self.projmem)
+        with self._patch():
+            store._ADOPTED_PROJECT_CACHE.clear()
+            self.assertIn("adopted-project", [t[0] for t in store.roots(project="polyana")])
+            e = self.one(store.load_all(project="polyana"), "polyana-law")
+            self.assertEqual((e["root"], e["scope"]), ("adopted-project", "project:polyana"))
+            self.assertEqual([x["id"] for x in
+                              store.resolve_prompt("polyanaword now", project="polyana")],
+                             ["polyana-law"])
+        # without the project lens the adopted-project root is NOT in play
+        self.assertEqual(store.load_all(), [])
+
+    def test_shadow_order_project_over_adopted_project_over_global(self):
+        self.seed_prior("foo", "global sense", conf=0.9)
+        store.write_prior({"id": "foo", "statement": "adopted-project sense",
+                           "confidence": 0.9}, root_dir=self.projmem)
+        with self._patch():
+            store._ADOPTED_PROJECT_CACHE.clear()
+            e = self.one(store.load_all(project="polyana"), "foo")
+            self.assertEqual((e["statement"], e["root"]),
+                             ("adopted-project sense", "adopted-project"))
+        self.seed_prior("foo", "authored project sense", conf=0.9,
+                        root_dir=self.project_dir("polyana", "premises"))
+        with self._patch():
+            store._ADOPTED_PROJECT_CACHE.clear()
+            e = self.one(store.load_all(project="polyana"), "foo")
+            self.assertEqual((e["statement"], e["root"]),
+                             ("authored project sense", "project"))
+
+    def test_no_registry_falls_back_to_single_store(self):
+        # a project lens with no registry file adds no adopted-project root
+        os.remove(home.registry_path())
+        store._ADOPTED_PROJECT_CACHE.clear()
+        self.assertEqual([t[0] for t in store.roots(project="polyana")],
+                         ["adopted", "helm-global", "project"])
+
+
 class CandidateTierTest(StoreBase):
     """Candidate tier (v1: lexicon): safe inferred capture — a candidate is a
     non-live status EXCLUDED from every injecting lane (the hard law), surfaced

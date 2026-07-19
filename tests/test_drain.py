@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 
@@ -229,6 +230,109 @@ class RekeyTest(unittest.TestCase):
             rc = drain.cmd_drain(["--rekey", "--apply"])
         self.assertEqual(rc, 0)
         self.assertIn("REKEYED 1", out.getvalue())
+
+
+class AliasRoutingTest(unittest.TestCase):
+    """The registry alias map fixes unroutable global project entries: a short
+    or old handle (built-in buildr->buildr-private-beta, mc->mission-control,
+    plus authored per-project aliases) routes to the canonical project."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-alias-")
+        self.env_prior = {"HELM_HOME": os.environ.get("HELM_HOME")}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        self.mem = os.path.join(self.tmp, "mem")
+        os.makedirs(self.mem)
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "buildr-private-beta": {"name": "buildr-private-beta", "path": "/x/b",
+                                    "kind": "git", "sessions": {}},
+            "mission-control": {"name": "mission-control", "path": "/x/mc",
+                                "kind": "git", "sessions": {}, "aliases": ["mc"]}}})
+
+    def tearDown(self):
+        for k, v in self.env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _classify(self):
+        return {a["src"]: a for a in drain.classify(self.mem)}
+
+    def test_builtin_alias_routes_by_description(self):
+        pk.atomic_write(os.path.join(self.mem, "proj-note.md"),
+                        _mem_entry("proj-note.md", "project", "the buildr roadmap and vision"))
+        a = self._classify()["proj-note.md"]
+        self.assertEqual((a["op"], a["project"]), ("route-project", "buildr-private-beta"))
+
+    def test_authored_short_alias_routes_by_filename(self):
+        # 'mc' is 2 chars — filename prefix only (a 2-char word wallpapers the corpus)
+        pk.atomic_write(os.path.join(self.mem, "mc-standup.md"),
+                        _mem_entry("mc-standup.md", "project", "the standup notes"))
+        a = self._classify()["mc-standup.md"]
+        self.assertEqual((a["op"], a["project"]), ("route-project", "mission-control"))
+
+    def test_short_alias_never_wallpapers_by_description(self):
+        # 'mc' appearing as a description word must NOT route (len < 6 guard)
+        pk.atomic_write(os.path.join(self.mem, "random-thing.md"),
+                        _mem_entry("random-thing.md", "project", "the mc was loud"))
+        self.assertEqual(self._classify()["random-thing.md"]["op"], "keep")
+
+
+class DrainProjectTest(unittest.TestCase):
+    """drain --project P drains the project's OWN claude memory dir with the
+    identical gauntlet. Hermetic: the claude memdir resolver is patched."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-drainproj-")
+        self.env_prior = {"HELM_HOME": os.environ.get("HELM_HOME")}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        self.projmem = os.path.join(self.tmp, "projmem")
+        os.makedirs(self.projmem)
+        pk.atomic_write(os.path.join(self.projmem, "feedback-x.md"),
+                        _mem_entry("feedback-x.md", "feedback", "an x rule to keep"))
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "polyana": {"name": "polyana", "path": "/dev/polyana", "kind": "git",
+                        "sessions": {}}}})
+
+    def tearDown(self):
+        for k, v in self.env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _patch(self):
+        return mock.patch.object(
+            home, "claude_memory_dir_for",
+            side_effect=lambda p: self.projmem if p == "/dev/polyana" else "/nonexistent-xyz")
+
+    def test_drain_project_scans_project_memdir(self):
+        with self._patch():
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = drain.cmd_drain(["--project", "polyana"])
+        self.assertEqual(rc, 0)
+        self.assertIn("project polyana", out.getvalue())
+        self.assertIn("retype", out.getvalue())
+        self.assertIn("DRY-RUN", out.getvalue())
+
+    def test_drain_project_apply_routes_in_place(self):
+        with self._patch():
+            plan = drain.classify(self.projmem)
+            receipt = drain.apply(plan, self.projmem)
+        self.assertGreaterEqual(receipt["applied"], 1)
+        self.assertTrue(os.path.isfile(os.path.join(self.projmem, "prior-x.md")))
+
+    def test_unknown_project_fails_open(self):
+        with self._patch():
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = drain.cmd_drain(["--project", "ghost"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no claude memory dir", out.getvalue())
 
 
 class ExpireCandidatesTest(unittest.TestCase):
