@@ -363,18 +363,20 @@ def cmd_drain(args):
     by_op = {}
     for a in plan:
         by_op.setdefault(a["op"], []).append(a)
-    n_do = len(by_op.get("retype", [])) + len(by_op.get("route-project", []))
     print("helm drain plan (%d raw entries):" % len(plan))
+    # per op: (rows shown, "... more" threshold); everything else defaults (3, 3)
+    show_limit = {"conflict": (5, 5), "keep": (2, 3)}
     for op in ("retype", "route-project", "sweep-dup", "conflict", "keep"):
         acts = by_op.get(op, [])
         if not acts:
             continue
+        shown, more_at = show_limit.get(op, (3, 3))
         print("  %-14s %d" % (op, len(acts)))
-        for a in acts[:3 if op not in ("keep", "conflict") else (5 if op == "conflict" else 2)]:
+        for a in acts[:shown]:
             tgt = a.get("dst") or a.get("twin") or a.get("why", "")
             print("      %s -> %s" % (a["src"], tgt))
-        if len(acts) > (5 if op == "conflict" else 3):
-            print("      ... %d more" % (len(acts) - (5 if op == "conflict" else 3)))
+        if len(acts) > more_at:
+            print("      ... %d more" % (len(acts) - more_at))
     if by_op.get("conflict"):
         print("  note: %d conflict%s NOT auto-drained (would overwrite a curated "
               "entry or collide) — resolve by hand" % (

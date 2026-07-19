@@ -238,10 +238,14 @@ def cmd_hooks(args):
             return 0
         print("helm hooks status (claude):")
         print("  %-28s %-5s %-5s %s" % ("home", "hook", "helm", "fail-open"))
+        def mark(r, k):
+            if not r["hook"]:
+                return "-"
+            return "ok" if r[k] else "NO"
         for r in rows:
-            mark = lambda k: ("ok" if r[k] else "NO") if r["hook"] else "-"
             print("  %-28s %-5s %-5s %s" % (
-                r["home"], "yes" if r["hook"] else "-", mark("resolvable"), mark("fail_open")))
+                r["home"], "yes" if r["hook"] else "-",
+                mark(r, "resolvable"), mark(r, "fail_open")))
         n, m = coverage()
         line = "inject coverage: %d of %d claude homes" % (n, m)
         print(line if n == m else line + " — `helm hooks install` closes the gap")

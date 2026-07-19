@@ -865,7 +865,7 @@ def _near_dup(etype, eid, statement, project=None):
 _USAGE = """usage: helm store <verb> [args] [--project P]
   list [--type T] [--all]                     entries (live; --all incl. retired)
   get <id>                                    one entry, full record
-  resolve <text>                              JIT lookup — what would fire for this prompt
+  resolve <text>                              JIT lookup — what fires for this prompt (or pipe on stdin)
   pinned                                      the always-on lane
   add <type> <id> | <statement> [| ...]       type: prior|premise|lexicon|heuristic|reference
       prior:     <id> | <statement> [| conf [| keywords [| domain]]]  (belief, default 0.6)
@@ -876,8 +876,6 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
       flags: [--source S] [--rationale <text...>]   (rationale seeds evidence_log)
       a LIVE same-id add is REFUSED (supersede/evidence instead, printed);
       a near-identical statement warns and proceeds (lexicon redefines freely)
-  resolve                                     prompt on stdin -> JIT hits
-  pinned                                      the always-on lane
   evidence <ts> <id> <delta> <reason...>      move a belief (logged + clamped)
   supersede <ts> <old-id> <new-id> [reason]   TOMBSTONE old (file kept)
   retire <ts> <id> [why...]                   retire (file kept as the record)
