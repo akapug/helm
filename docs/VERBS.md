@@ -128,7 +128,23 @@ harness hook's full JSON on stdin instead (`prompt`/`cwd`/`session_id`),
 derives `--project` from the cwd (longest registry-path prefix, global-only
 fallback) and stamps the session onto the fire-ledger row; malformed JSON
 injects nothing, rc 0 (fail-open). `--explain` shows what would fire and why
-(plus the derived `[scope: …]`), writing no ledger row.
+(plus the derived `[scope: …]`), writing no ledger row and mutating no state.
+
+With a session, the habituation guard extends to the JIT lane: a fired entry
+**cools down** for 15 turns of that session (state per session under
+`_global/.state/inject-seen/`, stale files self-pruning) unless its score
+jumps to ~2x its score at last fire — pinned and reflex lanes are exempt,
+suppression happens pre-cap so freed slots reach the next candidates, and
+suppressed ids ride the ledger row (`suppressed`). `--explain` renders a
+cooled hit as `- id (cooldown, fired Nt ago)`. Plain stdin (no session) never
+cools. inject is also the **coinage 3-strikes** recorder: quoted 1-3 word
+phrases and hyphenated neologisms (code identifiers and file paths are
+structurally excluded) are counted per distinct turn in
+`_global/.state/coinages.json`; a term hitting 3 turns while missing the
+lexicon gets ONE reflex-lane nudge — offer to define it via `helm coach` if
+the owner is present, write a lexicon candidate if away — then latches
+forever: one line per term, ever. Both are fully fail-open: any state trouble
+means no cooldown and no nudge, never a blocked turn.
 
 ```console
 $ echo "how should we drain the memory backlog?" | helm inject --project myproject
@@ -399,7 +415,7 @@ helm cell: node LIVE at http://127.0.0.1:8899 — chain head 43 ...
 
 ## chat — the human-included groupchat
 
-### `helm chat [post <text...> | read [--since N] [--follow] | rooms] [--room R]`
+### `helm chat [post <text...> | read [--since N] [--follow] | rooms | react <n> <emoji> | log-flush | node up|down|status] [--room R]`
 One shared conversation log + notify + read/write loop, **owner in the room**.
 Rooms live in RAM (`/dev/shm/helm-chat/<room>.jsonl`, dir 0700, default room
 `main`; `HELM_CHAT_DIR` overrides) — ephemeral presence-chat, not the durable
@@ -408,16 +424,53 @@ must outlive the room. `post` writes as `$HELM_CHAT_NAME` (else the best local
 identity guess: session, then user). `read` prints the room (`--since N` skips
 the first N messages); `read --follow` polls and prints new lines until Ctrl-C.
 
-The notify loop: when the owner posts from the web panel, helm drops a
-`<room>.owner-unread` marker and the shipped `owner-chat-unread` reflex steers
-every local agent's **next turn** to read and reply — any `helm chat read`
-that consumes past the owner's post clears it. Agents never poll; the
-already-installed inject hooks deliver the nudge.
+**The signed transport (v2).** When the chat **room node** answers — a dregg
+cave whose data-dir lives on tmpfs, so a chat turn never lands on a
+disk-persisted chain — every post also rides a **signed self-write turn** on
+the poster's cell there: the turn payload carries the message digest
+(`chat:b2b:<blake2b-256>`), the RAM room carries the text (thin claim, fat
+corroboration — the same pattern as premise attestation, see
+[ATTESTATION.md](ATTESTATION.md)). Signed rows render clean (the web panel
+shows a subtle ✓ tick, chain index on hover); node down → the v1 path
+automatically, tagged `[unsigned]` — the message never dies, the signature is
+what degrades. Agents sign as `HELM_CELL_PROFILE` (else `meld-agent`); the
+owner's web posts sign server-side as `david`. `helm chat node up` provisions
+the room node (`helm-chat-cave.service`, `dregg-cave-node` on
+`/dev/shm/helm-chat-cave`, port 8898, faucet ON — the node auto-funds joining
+cells and helm tops up before each turn: **chat turns never die on
+computrons**). The transport is node-agnostic (`HELM_CHAT_NODE_URL`; empty
+disables) — the ONE-CAVE unification (`scripts/cave-unification.sh`) just
+repoints it.
+
+**The log-after leg.** RAM stays pure in the hot path (premise
+`a2a-ram-only-disk-log-after`): the ONLY disk writer is `helm chat
+log-flush`, an out-of-band append of delivered history to
+`~/.helm/helm/journal/chat-<date>.log` — idempotent (per-room high-water
+mark; a rotation gap is logged loudly), run by the operator, a cron, or
+`helm --human` at exit. `HELM_CHAT_LOG=0` disables it.
+
+**Emojis + reactions.** `:fire:` → 🔥 at post time on every surface (CLI,
+web input, TUI input — ~140 shortcodes, `helm/emoji.py`). `helm chat react
+<n> :tada:` attaches a reaction to message *n* (1-based; `-1` = latest),
+rendered inline (`🎉×2`) in the web panel and TUI; the web panel gets
+click-to-react on hover. Reactions ride the same transport as posts (signed
+turns on v2). Nothing gates emojis to humans — **agents are encouraged to
+emoji and react like anyone else in the room**.
+
+The notify loop: when the owner posts (web panel or `helm --human`), helm
+drops a `<room>.owner-unread` marker and the shipped `owner-chat-unread`
+reflex steers every local agent's **next turn** to read and reply — any
+`helm chat read` that consumes past the owner's post clears it. Agents never
+poll; the already-installed inject hooks deliver the nudge. Identical in
+both transports.
 
 ```console
-$ helm chat post "seat B: web slice landed, starting docs"
+$ helm chat post "seat B: web slice landed :rocket:"
+$ helm chat react -1 :tada:
 $ helm chat read --since 40
 $ helm chat read --follow        # the owner's orca pane sidecar, exactly this
+$ helm chat node status          # room node + chain head + cell balances
+$ helm chat log-flush            # the durable record, out-of-band
 ```
 
 **Chat path (the AX↔UX law — the owner never types the CLI).** Say it and
@@ -429,8 +482,20 @@ your agent runs it:
 - "**that chat point about X — keep it**" → `/premise` (chat is ephemeral;
   the store is the record)
 
-The owner's own surface is the web panel (**chat** tab in `helm web`): type
-there and every local agent sees it next turn — see [WEB.md](WEB.md).
+The owner's own surfaces are the web panel (**chat** tab in `helm web`) and
+`helm --human` in a terminal: type there and every local agent sees it next
+turn — see [WEB.md](WEB.md).
+
+### `helm --human` (alias `helm human`)
+The operator's TUI — stdlib curses, runs beautifully as an orca pane. v1
+panes: the chat room (scrollback with reactions inline + live follow + an
+input line posting **as you**, dropping the owner-unread marker) and a
+one-line status strip: transport `SIGNED #<chain-head>` / `UNSIGNED`, and the
+quota headline from **cached** creds observations only (never a probe — no
+cache says `run helm creds`). Input: Enter posts, `:shortcodes:` expand,
+`/react <n> <emoji>` reacts, `q` on an empty line or Ctrl-C exits clean; exit
+runs the log-after flush unless `HELM_CHAT_LOG=0`. Built as panes so
+brief/sessions views bolt on later.
 
 ## ops — health, evolution, the browser
 

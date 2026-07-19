@@ -7,8 +7,12 @@ Pins the load-bearing constants (PINNED_BUDGET / JIT_CAP / LINE_CAP), the
 salience law (no match -> empty stdout, rc 0), the --json shape, inline-arg vs
 stdin precedence, the fail-open law (a raising store must never block a turn),
 the parsed-entry cache added for the twice-per-prompt parse fix (including the
-entries= seam short-circuiting ALL store parsing), and the fire-ledger (row
-shape, ids-never-text, rotation, fail-open, --explain writes no row)."""
+entries= seam short-circuiting ALL store parsing), the fire-ledger (row
+shape, ids-never-text, rotation, fail-open, --explain writes no row), the
+per-session JIT cooldown (fires/cools/refires, 2x score escape, cross-session
+independence, freed cap slots, explain rendering, state fail-open), and the
+coinage 3-strikes recorder (K=3 distinct turns, offer-once-latch-forever,
+narrowest detector's structural stoplist, one nudge per turn, fail-open)."""
 import contextlib
 import io
 import json
@@ -451,6 +455,306 @@ class HookJsonTest(InjectBase):
         self.assertEqual(rc, 0)
         self.assertIn("jit-a", out)
         self.assertNotIn("session", self.ledger_rows()[-1])
+
+
+class SessionCooldownTest(InjectBase):
+    """The habituation guard extended to the JIT lane: per-session suppression
+    at _global/.state/inject-seen/<session>.json, COOLDOWN_TURNS window, 2x
+    score escape, pinned/reflex exempt, freed cap slots, fail-open."""
+
+    PROMPT = "tune the fluxcap"
+
+    def hook_stdin(self, prompt, session="sid-1"):
+        return json.dumps({"prompt": prompt, "session_id": session,
+                           "hook_event_name": "UserPromptSubmit"})
+
+    def rows(self):
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            return [json.loads(l) for l in f.read().splitlines()]
+
+    def seen(self, session="s1"):
+        with open(inject._seen_path(session), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_fires_then_cools_then_refires_after_window(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        first = inject.gather(self.PROMPT, session="s1")
+        self.assertEqual(first["jit"], ["PRIOR 0.80 jit-a: a flux fact"])
+        self.assertEqual(self.seen()["fired"]["jit-a"][0], 1)
+        for i in range(inject.COOLDOWN_TURNS):  # turns 2..16: cooled
+            self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"], [],
+                             "turn %d must be cooled" % (i + 2))
+        r = self.rows()[-1]  # a suppressed-to-silence turn is still measurable
+        self.assertIs(r["silent"], True)
+        self.assertEqual(r["suppressed"], ["jit-a"])
+        self.assertEqual(r["session"], "s1")
+        again = inject.gather(self.PROMPT, session="s1")  # turn 17: window past
+        self.assertEqual(again["jit"], first["jit"])
+        self.assertNotIn("suppressed", self.rows()[-1])
+        self.assertEqual(self.seen()["fired"]["jit-a"][0], 17)  # re-recorded
+
+    def test_cooldown_counts_turns_not_fires(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        inject.gather(self.PROMPT, session="s1")  # fires, turn 1
+        for _ in range(inject.COOLDOWN_TURNS - 1):  # turns 2..15: silent, still counted
+            self.assertEqual(inject.gather("unrelated words", session="s1")["jit"], [])
+        self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"], [],
+                         "turn 16 is inside the window")
+        self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"],
+                         ["PRIOR 0.80 jit-a: a flux fact"], "turn 17 refires")
+        self.assertEqual(self.seen()["turn"], 17)
+
+    def test_cross_session_independence(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        inject.gather(self.PROMPT, session="s1")
+        self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"], [])
+        self.assertEqual(inject.gather(self.PROMPT, session="s2")["jit"],
+                         ["PRIOR 0.80 jit-a: a flux fact"],
+                         "another session must have its own cooldown state")
+
+    def test_stdin_mode_no_session_no_cooldown_no_state(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        for _ in range(3):  # re-fires every turn, exactly the pre-cooldown law
+            rc, out, _ = self.run_inject([], stdin_text=self.PROMPT)
+            self.assertEqual(rc, 0)
+            self.assertIn("jit-a", out)
+        self.assertFalse(os.path.exists(inject._seen_dir()),
+                         "plain stdin must write no seen-state")
+
+    def test_2x_score_escape_refires_through_the_window(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap,quantum")
+        inject.gather(self.PROMPT, session="s1")  # fires: score 0.8 (fluxcap df=1)
+        self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"], [])
+        # both keywords hit -> score 1.6 = 2.0x the recorded 0.8 -> escapes
+        got = inject.gather("tune the fluxcap quantum", session="s1")["jit"]
+        self.assertEqual(got, ["PRIOR 0.80 jit-a: a flux fact"])
+        self.assertEqual(self.seen()["fired"]["jit-a"], [3, 1.6])  # re-recorded
+        # and the refreshed record cools it again, even at the higher score
+        self.assertEqual(inject.gather("tune the fluxcap quantum", session="s1")["jit"], [])
+
+    def test_pinned_and_reflex_lanes_exempt(self):
+        from helm import reflex
+        self.plant_pinned("pin-a", "always truth")
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        reflex.write({"id": "flux-reflex", "steer": "flux steer",
+                      "signal": "prompt", "pattern": "fluxcap"})
+        first = inject.gather(self.PROMPT, session="s1")
+        second = inject.gather(self.PROMPT, session="s1")
+        self.assertEqual(second["pinned"], first["pinned"])  # exempt
+        self.assertEqual(second["reflex"], ["REFLEX: flux steer"])  # exempt
+        self.assertEqual((first["jit"], second["jit"]),
+                         (["PRIOR 0.80 jit-a: a flux fact"], []))
+
+    def test_freed_cap_slots_reach_lower_candidates(self):
+        for i, conf in enumerate(("0.9", "0.8", "0.7", "0.6", "0.5")):
+            self.plant_jit("jit-%d" % i, "flux fact %d" % i, "fluxcap", conf=conf)
+        first = inject.gather(self.PROMPT, session="s1")
+        self.assertEqual(len(first["jit"]), inject.JIT_CAP)
+        self.assertFalse(any("jit-4" in l for l in first["jit"]))
+        second = inject.gather(self.PROMPT, session="s1")
+        self.assertEqual(second["jit"], ["PRIOR 0.50 jit-4: flux fact 4"],
+                         "suppression is pre-cap: the crowded-out 5th fires")
+        self.assertEqual(sorted(self.rows()[-1]["suppressed"]),
+                         ["jit-0", "jit-1", "jit-2", "jit-3"])
+
+    def test_explain_renders_cooldown_read_only(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        rc, _, _ = self.run_inject(["--hook-json"],
+                                   stdin_text=self.hook_stdin(self.PROMPT))
+        self.assertEqual(rc, 0)
+        before = self.seen("sid-1")
+        n_rows = len(self.rows())
+        rc, out, _ = self.run_inject(["--hook-json", "--explain"],
+                                     stdin_text=self.hook_stdin(self.PROMPT))
+        self.assertEqual(rc, 0)
+        self.assertIn("- jit-a (cooldown, fired 1t ago)", out)
+        self.assertNotIn("+ jit-a", out)
+        self.assertEqual(self.seen("sid-1"), before,
+                         "--explain must never mutate seen-state")
+        self.assertEqual(len(self.rows()), n_rows,
+                         "--explain must never write the ledger")
+        # another session's explain sees it hot
+        rc, out, _ = self.run_inject(
+            ["--hook-json", "--explain"],
+            stdin_text=self.hook_stdin(self.PROMPT, session="sid-9"))
+        self.assertIn("+ jit-a", out)
+        self.assertNotIn("cooldown", out)
+
+    def test_garbled_seen_state_reads_fresh_never_crashes(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        inject.gather(self.PROMPT, session="s1")
+        for garbage in ("{not json", '{"turn": "x", "fired": []}',
+                        '{"turn": -3, "fired": {"jit-a": ["a"]}}'):
+            with open(inject._seen_path("s1"), "w") as f:
+                f.write(garbage)
+            self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"],
+                             ["PRIOR 0.80 jit-a: a flux fact"], garbage)
+
+    def test_unwritable_state_hook_contract_rc0(self):
+        g = os.path.join(os.environ["HELM_HOME"], "_global")
+        os.makedirs(g)
+        with open(os.path.join(g, ".state"), "w") as f:
+            f.write("x")  # .state is a FILE: seen-state AND ledger writes raise
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        for _ in range(2):  # no cooldown possible -> fires every turn, rc 0
+            rc, out, err = self.run_inject(["--hook-json"],
+                                           stdin_text=self.hook_stdin(self.PROMPT))
+            self.assertEqual(rc, 0)
+            self.assertIn("jit-a", out)
+            self.assertEqual(err, "")
+
+    def test_stale_files_pruned_and_expired_window_refires(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        os.makedirs(inject._seen_dir())
+        stale = os.path.join(inject._seen_dir(), "old-session.json")
+        with open(stale, "w") as f:
+            f.write("{}")
+        os.utime(stale, (1, 1))  # epoch-old: beyond SEEN_TTL
+        pk.write_json(inject._seen_path("s1"),
+                      {"v": 1, "ts": pk.now_ts(), "turn": 40,
+                       "fired": {"jit-a": [1, 0.8]}})  # fired 39 turns ago
+        got = inject.gather(self.PROMPT, session="s1")["jit"]
+        self.assertEqual(got, ["PRIOR 0.80 jit-a: a flux fact"])
+        self.assertFalse(os.path.exists(stale), "stale session file must be pruned")
+        self.assertEqual(self.seen()["fired"]["jit-a"][0], 41)
+
+    def test_induced_errors_preserve_hook_contract(self):
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        with mock.patch.object(inject, "_seen_load",
+                               side_effect=RuntimeError("seen exploded")), \
+                mock.patch.object(inject, "_coinage",
+                                  side_effect=RuntimeError("coinage exploded")):
+            rc, out, err = self.run_inject(["--hook-json"],
+                                           stdin_text=self.hook_stdin(self.PROMPT))
+        self.assertEqual(rc, 0)
+        self.assertIn("jit-a", out)
+        self.assertEqual(err, "")
+
+
+class CoinageTest(InjectBase):
+    """3-strikes coinage recorder: K distinct turns -> ONE define nudge ->
+    permanent latch. Narrowest detector (quoted + hyphenated), structural
+    code/path stoplist, one nudge per turn, O(1) state, fail-open."""
+
+    def state(self):
+        with open(inject._coinage_path(), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_three_strikes_nudges_once_then_latched_forever(self):
+        for i in range(inject.COINAGE_STRIKES - 1):
+            got = inject.gather("the fire-ledger idea again %d" % i)
+            self.assertEqual(got["reflex"], [], "strike %d must be silent" % (i + 1))
+        nudged = inject.gather("more fire-ledger talk")["reflex"]
+        self.assertEqual(len(nudged), 1)
+        self.assertIn("coinage 'fire-ledger'", nudged[0])
+        self.assertIn("helm coach", nudged[0])
+        self.assertIn("owner present", nudged[0])       # offer-if-present
+        self.assertIn("lexicon candidate", nudged[0])   # write-if-away
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            last = json.loads(f.read().splitlines()[-1])
+        self.assertEqual(last["fired"]["reflex"], ["coinage:fire-ledger"])
+        d = self.state()
+        self.assertEqual(d["offered"], ["fire-ledger"])  # the latch
+        self.assertNotIn("fire-ledger", d["terms"])
+        for i in range(4):  # forever means forever
+            self.assertEqual(inject.gather("fire-ledger yet again %d" % i)["reflex"],
+                             [], "latched term must never re-nudge")
+
+    def test_quoted_phrase_counts_and_merges_with_hyphenated(self):
+        inject.gather('we should call it "fire ledger"')
+        inject.gather("the fire-ledger grows on me")
+        got = inject.gather('one more vote for "fire ledger"')["reflex"]
+        self.assertEqual(len(got), 1)
+        self.assertIn("coinage 'fire-ledger'", got[0])
+
+    def test_same_turn_repeats_count_once(self):
+        inject.gather("fire-ledger fire-ledger \"fire-ledger\" fire-ledger")
+        self.assertEqual(self.state()["terms"]["fire-ledger"][0], 1,
+                         "distinct TURNS, not occurrences")
+
+    def test_store_known_term_never_nudges(self):
+        store.write_lexicon({"term": "fire-ledger",
+                             "definition": "the inject measurement spine"})
+        for i in range(inject.COINAGE_STRIKES + 1):
+            got = inject.gather("the fire-ledger idea %d" % i)["reflex"]
+            self.assertEqual(got, [], "a term already in the store never nudges")
+
+    def test_detector_structural_stoplist(self):
+        c = inject._coinage_candidates
+        self.assertEqual(c("check store.load_all in helm/store.py via --hook-json "
+                           "plus camelCase-name, cap-4 and snake_case-thing"), set())
+        self.assertEqual(c("a so-called well-known long-term idea"), set())
+        self.assertEqual(c('the fire-ledger, "flux capacitor" and '
+                           "offer-once-latch-forever"),
+                         {"fire-ledger", "flux-capacitor",
+                          "offer-once-latch-forever"})
+        self.assertEqual(c(""), set())
+        self.assertEqual(c(None), set())
+
+    def test_tag_context_terms_never_counted(self):
+        # live-estate tuning: 'task-id'/'output-file'/'task-notification' were
+        # harness tags in the prompt, not owner coinages
+        prompt = ('per <task-id>42</task-id> write the <output-file/> — the '
+                  'task-id and output-file machinery aside, I call this '
+                  '"flux capacitor"')
+        self.assertEqual(inject._coinage_candidates(prompt), {"flux-capacitor"},
+                         "a tagged term is disqualified even where it rides "
+                         "prose; the genuine coinage in the SAME prompt counts")
+        for i in range(inject.COINAGE_STRIKES + 1):
+            got = inject.gather(prompt + " %d" % i)["reflex"]
+            self.assertTrue(all("task-id" not in l and "output-file" not in l
+                                for l in got))
+        self.assertNotIn("task-id", self.state()["terms"])
+        self.assertIn("flux-capacitor", self.state()["offered"])
+
+    def test_system_notification_prompts_skipped_entirely(self):
+        for machine in ("[SYSTEM NOTIFICATION] agent done, see fire-ledger",
+                        "<task-notification>fire-ledger done</task-notification>",
+                        'note [system notification: "flux capacitor" fired]'):
+            self.assertEqual(inject._coinage_candidates(machine), set(), machine)
+        for i in range(inject.COINAGE_STRIKES + 1):  # machine text never counts
+            got = inject.gather(
+                "[SYSTEM NOTIFICATION] the fire-ledger run %d" % i)["reflex"]
+            self.assertEqual(got, [])
+        self.assertFalse(os.path.exists(inject._coinage_path()),
+                         "machine prompts must not touch coinage state")
+
+    def test_one_nudge_per_turn_second_term_waits(self):
+        for i in range(inject.COINAGE_STRIKES - 1):
+            inject.gather("alpha-coin and beta-coin, take %d" % i)
+        both_hot = inject.gather("alpha-coin and beta-coin at K together")["reflex"]
+        self.assertEqual(len(both_hot), 1, "max ONE nudge per turn")
+        self.assertIn("coinage 'alpha-coin'", both_hot[0])
+        nxt = inject.gather("beta-coin once more")["reflex"]
+        self.assertEqual(len(nxt), 1)
+        self.assertIn("coinage 'beta-coin'", nxt[0])
+        self.assertEqual(self.state()["offered"], ["alpha-coin", "beta-coin"])
+
+    def test_no_candidates_no_state_write(self):
+        inject.gather("plain words with no quotes or neologisms")
+        self.assertFalse(os.path.exists(inject._coinage_path()),
+                         "a candidate-free prompt must not touch coinage state")
+
+    def test_latch_survives_alien_terms_state(self):
+        for i in range(inject.COINAGE_STRIKES):
+            inject.gather("the fire-ledger idea %d" % i)
+        d = self.state()
+        d["terms"] = {"fire-ledger": "garbage", "other": 7}  # alien shapes
+        pk.write_json(inject._coinage_path(), d)
+        got = inject.gather("fire-ledger after corruption")["reflex"]
+        self.assertEqual(got, [], "the offered latch must hold through torn counts")
+
+    def test_unwritable_state_fails_open_silent(self):
+        g = os.path.join(os.environ["HELM_HOME"], "_global")
+        os.makedirs(g)
+        with open(os.path.join(g, ".state"), "w") as f:
+            f.write("x")
+        for i in range(inject.COINAGE_STRIKES + 1):
+            rc, out, err = self.run_inject([], stdin_text="fire-ledger turn %d" % i)
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            self.assertNotIn("coinage", out,
+                             "counts that cannot persist must never nudge")
 
 
 if __name__ == "__main__":
