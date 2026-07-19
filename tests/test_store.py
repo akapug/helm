@@ -591,6 +591,18 @@ class CliTest(StoreBase):
         rc, out = self.run_cli(["counts"])
         self.assertIn("helm-global", out)
 
+    def test_resolve_keeps_query_words_equal_to_project_name(self):
+        # audit MEDIUM: resolve --project P stripped EVERY query word equal to
+        # P (the flag pair is already deleted from args) — false "no JIT match"
+        # exactly when the query names the project
+        self.run_cli(["add", "premise", "myproj-rule | follow the myproj law | myproj",
+                      "--project", "myproj"])
+        rc, out = self.run_cli(["resolve", "--project", "myproj",
+                                "deploy", "myproj", "now"])
+        self.assertEqual(rc, 0)
+        self.assertIn("myproj-rule", out)
+        self.assertNotIn("no JIT match", out)
+
     def test_evidence_supersede_retire(self):
         self.run_cli(["add", "prior", "cli-x | the statement | 0.7 | clikw"])
         rc, out = self.run_cli(["evidence", TS, "cli-x", "0.1", "held up in practice"])

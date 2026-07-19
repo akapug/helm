@@ -982,8 +982,11 @@ def cmd_store(args):
 
     if cmd == "resolve":
         # explicit args win; stdin is the hook path (may be an empty pipe —
-        # ignoring args silently made an advertised verb a no-op)
-        text = " ".join(a for a in rest if not a.startswith("--") and a != project)
+        # ignoring args silently made an advertised verb a no-op). The --project
+        # flag PAIR was already stripped above — filtering every word equal to
+        # the project name here ate real query tokens (exactly the keyword most
+        # likely to match that project's entries).
+        text = " ".join(a for a in rest if not a.startswith("--"))
         from_args = bool(text)
         if not text and not sys.stdin.isatty():
             text = sys.stdin.read()
