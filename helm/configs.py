@@ -433,10 +433,21 @@ def write_file(path, content):
             return {"error": f"could not create parent dir: {e}"}
     backup = _backup(rp)
     existed = os.path.isfile(rp)
-    mode = 0o600 if os.path.basename(rp) in (".claude.json", ".credentials.json") else 0o644
+    # an EXISTING file keeps its exact mode — replacing a 0600 settings.json
+    # with a 0644 inode widened cred-home files to other local users
+    # (codex-seat review HIGH, 2026-07-19). New files: owner-only for anything
+    # in a cred home; 0644 only for ordinary project-tree configs.
+    if existed:
+        mode = os.stat(rp).st_mode & 0o777
+    elif os.path.basename(rp) in (".claude.json", ".credentials.json") \
+            or "/.claude" in rp or "/.codex" in rp:
+        mode = 0o600
+    else:
+        mode = 0o644
     tmp = f"{rp}.helm-tmp.{os.getpid()}"
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        os.fchmod(fd, mode)  # exact — os.open's mode arg is umask-masked
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
             f.flush()

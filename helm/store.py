@@ -994,21 +994,26 @@ def cmd_store(args):
                 print("helm store add: '%s' is already LIVE [%s %s] — refusing to "
                       "overwrite (supersede-not-duplicate law)"
                       % (parts[0], gt, cur["root"]), file=sys.stderr)
+                # the printed commands must carry the SCOPE of the refused add —
+                # without --project they resolve against global and can mutate
+                # the wrong entry (codex-seat review)
+                pflag = (" --project " + project) if project else ""
                 if gt == "prior":
                     print("  update its confidence:  helm store evidence %s %s "
-                          "<delta> <reason...>" % (ts, parts[0]), file=sys.stderr)
-                print("  or replace it:          helm store add %s <new-id> | <statement...>"
-                      % etype, file=sys.stderr)
+                          "<delta> <reason...>%s" % (ts, parts[0], pflag), file=sys.stderr)
+                print("  or replace it:          helm store add %s <new-id> | <statement...>%s"
+                      % (etype, pflag), file=sys.stderr)
                 print("                          helm store supersede %s %s <new-id> "
-                      "[reason...]" % (ts, parts[0]), file=sys.stderr)
+                      "[reason...]%s" % (ts, parts[0], pflag), file=sys.stderr)
                 return 1
             dup, ov = _near_dup(gt, parts[0], parts[1], project=project)
             if dup:
+                pflag = (" --project " + project) if project else ""
                 print("helm store add: WARNING possible duplicate of '%s' (%d%% "
                       "statement overlap) — if it IS the same knowledge, supersede "
                       "instead of accumulating:" % (dup["id"], round(ov * 100)))
-                print("  helm store supersede %s %s %s <reason...>"
-                      % (ts, dup["id"], parts[0]))
+                print("  helm store supersede %s %s %s <reason...>%s"
+                      % (ts, dup["id"], parts[0], pflag))
 
         if etype in ("prior", "premise"):
             path = os.path.join(_default_dir("prior", project),
@@ -1032,6 +1037,12 @@ def cmd_store(args):
                 # the prior verb mints BELIEFS; certainty (1.0) is the premise
                 # verb's human-only lane — an add-prior 0.999/1.0 clamps to 0.99
                 conf = min(conf, BELIEF_CLAMP[1])
+            # re-minting a retired/superseded id starts a FRESH lifecycle: the
+            # old record's tombstone metadata must not ride into a live entry
+            # ("live but replaced_by X" corrupts provenance — codex-seat review)
+            for stale in ("replaced_by", "supersedes", "retired_ts", "retired_why",
+                          "evidence_log", "confidence_history"):
+                e.pop(stale, None)
             e.update({"id": parts[0], "statement": parts[1], "status": STATUS_LIVE,
                       "stated_ts": ts, "last_updated": ts, "confidence": conf,
                       "keywords": kw, "domain": dom, "source": src})

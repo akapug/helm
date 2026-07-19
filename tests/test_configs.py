@@ -135,6 +135,33 @@ class ConfigsModelTest(unittest.TestCase):
             self.assertEqual(configs.cmd_configs(["cascade"]), 2)
 
 
+class WriteModeTest(unittest.TestCase):
+    """codex-seat review HIGH: write_file replaced a 0600 settings.json with a
+    0644 inode — an existing file must keep its exact mode; a new cred-home
+    file is born owner-only."""
+
+    def test_existing_mode_preserved_exactly(self):
+        import stat as _st
+        os.makedirs(_HOMEDIR, exist_ok=True)
+        p = os.path.join(_HOMEDIR, "settings.json")
+        with open(p, "w") as f:
+            f.write("{}")
+        os.chmod(p, 0o600)
+        res = configs.write_file(p, '{"a": 1}')
+        self.assertNotIn("error", res)
+        self.assertEqual(_st.S_IMODE(os.stat(p).st_mode), 0o600)
+
+    def test_new_cred_file_is_owner_only(self):
+        import stat as _st
+        os.makedirs(_HOMEDIR, exist_ok=True)
+        p = os.path.join(_HOMEDIR, ".claude.json")
+        if os.path.exists(p):
+            os.unlink(p)
+        res = configs.write_file(p, "{}")
+        self.assertNotIn("error", res)
+        self.assertEqual(_st.S_IMODE(os.stat(p).st_mode), 0o600)
+
+
 class ConfigsWebTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

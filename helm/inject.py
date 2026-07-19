@@ -165,10 +165,17 @@ def project_for_cwd(cwd):
         want = os.path.abspath(os.path.expanduser(str(cwd)))
         best = None
         for key, rec in (registry.load().get("projects") or {}).items():
-            path = str(rec.get("path") or "").rstrip("/")
-            if path and (want == path or want.startswith(path + "/")) \
-                    and len(path) > len(best[0] if best else ""):
-                best = (path, str(rec.get("name") or key))
+            # the FULL cwd lens, not just the canonical path — the registry
+            # records sibling-worktree and alternate cwds in cv_scope
+            # (codex-seat review: a hook fired in a worktree fell back to
+            # global-only, silently dropping project premises + reflexes)
+            prefixes = (rec.get("cv_scope") or {}).get("cwd_prefixes") \
+                or [rec.get("path")]
+            for pre in prefixes:
+                pre = str(pre or "").rstrip("/")
+                if pre and (want == pre or want.startswith(pre + "/")) \
+                        and len(pre) > len(best[0] if best else ""):
+                    best = (pre, str(rec.get("name") or key))
         return best[1] if best else None
     except Exception:
         return None

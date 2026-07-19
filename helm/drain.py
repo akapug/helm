@@ -223,7 +223,16 @@ def rekey(apply=False):
     ts = pk.now_ts()
     drained = already = malformed = 0
     changes = []
-    for e in store.load_all(include_retired=True):
+    # PHYSICAL roots, not the merged view: a drained adopted prior shadowed by
+    # a same-slug global winner would never surface through load_all and its
+    # file would stay un-rekeyed forever (codex-seat review)
+    entries, seen = [], set()
+    for root, scope, d in store.roots(None):
+        for e in store._load_root(root, scope, d).values():
+            if e["path"] not in seen:
+                seen.add(e["path"])
+                entries.append(e)
+    for e in entries:
         log = [i for i in (e.get("evidence_log") or []) if isinstance(i, dict)]
         if e["type"] != "prior" or \
                 not any(DRAINED_MARK in str(i.get("reason") or "") for i in log):

@@ -169,11 +169,15 @@ def _seats():
             a = r.get("account") if isinstance(r, dict) else None
             if not a or not r.get("gauges"):
                 continue
-            if a not in best or str(r.get("probed_at") or "") > str(best[a].get("probed_at") or ""):
-                best[a] = r
+            # key by (provider, account) — one email can seat BOTH an
+            # anthropic and a codex identity; account-only keying let the
+            # most-recent probe silently replace the other provider's seat
+            k = (r.get("provider") or "?", a)
+            if k not in best or str(r.get("probed_at") or "") > str(best[k].get("probed_at") or ""):
+                best[k] = r
     from .providers import NativeQuotaProvider
     out = []
-    for a, r in best.items():
+    for (_prov, a), r in best.items():
         g = NativeQuotaProvider._primary(r["gauges"])
         out.append({"account": a, "provider": r.get("provider") or "?",
                     "headroom_pct": round(100 - g["utilization"] * 100, 1) if g else None,
