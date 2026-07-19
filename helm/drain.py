@@ -49,7 +49,11 @@ _BUILTIN_ALIASES = {"buildr": "buildr-private-beta", "mc": "mission-control"}
 
 
 def _mem_dir():
-    return home.adopted_memory_dir()
+    # store.adopted_dir() honors HELM_ADOPTED_DIR (the test-isolation override);
+    # home.adopted_memory_dir() does not — routing through store keeps the drain
+    # intake path hermetic and consistent with what the resolver reads.
+    from . import store
+    return store.adopted_dir()
 
 
 def _project_mem_dir(project):
@@ -386,6 +390,239 @@ def _cmd_expire_candidates(args, project=None):
     elif r["expired"]:
         print("helm drain: PRUNED %d candidate%s; net + receipt at %s"
               % (r["expired"], "s"[:r["expired"] != 1], r.get("net", "-")))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# promote — the episodic->durable funnel: recent USER messages -> drain intake
+# ---------------------------------------------------------------------------
+
+# Explicit durable-knowledge markers in USER-typed text. Precision is
+# load-bearing (the card's own RISKS): the USER-role restriction, the length
+# guard, the cap, and the dedupe keep agent-authored text and task prompts out.
+_PROMOTE_MARKERS = ("from now on", "remember this", "remember that",
+                    "make it a rule", "going forward", "the rule is",
+                    "always ", "never ")
+_PROMOTE_MAXLEN = 600  # a durable rule is a sentence, not an essay/task prompt
+
+
+def _promote_cache_path():
+    return os.path.join(registry.cache_root(), "promote-scan.json")
+
+
+def _user_texts(path):
+    """Yield (line_no, text) for REAL user-typed messages in a harness jsonl —
+    content str, or list TEXT blocks (tool_result/other blocks skipped, so tool
+    output injected as role:user never counts). Claude (type:user +
+    message.role) and the generic role:user shape both parse. Fail-open."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                msg, role = d, d.get("role")
+                if d.get("type") == "user" and isinstance(d.get("message"), dict):
+                    msg = d["message"]
+                    role = msg.get("role") or "user"
+                if role != "user":
+                    continue
+                content = msg.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = "\n".join(
+                        b["text"] for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                        and isinstance(b.get("text"), str))
+                else:
+                    text = ""
+                text = text.strip()
+                if text:
+                    yield i, text
+    except OSError:
+        return  # unreadable transcript -> no user texts (fail-open)
+
+
+def _jsonl_files(roots, since_days):
+    cutoff = time.time() - max(since_days, 0) * 86400
+    out = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dp, _dn, fn in os.walk(root):
+            for n in fn:
+                if not n.endswith(".jsonl"):
+                    continue
+                p = os.path.join(dp, n)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                if st.st_mtime >= cutoff:
+                    out.append((p, st.st_mtime, st.st_size))
+    return sorted(out)
+
+
+def _promotion_slug(text):
+    kw = _keywords_from("", text)
+    slug = "-".join([k for k in kw.split(",") if k][:4]) or text[:40]
+    return pk.slug(slug)
+
+
+def promote(since_days=7, cap=20, apply=False, roots=None, mem=None):
+    """Scan recent USER messages for durable-knowledge markers and write each
+    hit as a CANDIDATE file in the drain intake dir (never directly into the
+    typed store — the existing classify->dry-run->apply gauntlet gates it).
+    Deduped by keyword/token overlap against existing priors and already-written
+    intake candidates; capped per run; incremental via a (mtime,size) scan cache
+    (catalog-cache's pattern). Dry-run returns the plan untouched. -> receipt."""
+    from . import store
+    ts = pk.now_ts()
+    mem = mem or _mem_dir()
+    if roots is None:
+        roots = [os.path.join(os.path.expanduser("~"), ".claude", "projects")]
+    cache = pk.read_json(_promote_cache_path(), {}) or {}
+    new_cache = dict(cache)
+    existing = store.load_all(include_retired=True, types=("prior",))
+    ex_slugs = {store._slug(str(e["id"])) for e in existing}
+    ex_tokens = [t for t in (store._tokens(e.get("statement")) for e in existing) if t]
+    planned, scanned, skipped_cache, hit_cap = {}, 0, 0, False
+    for p, mtime, size in _jsonl_files(roots, since_days):
+        if cache.get(p) == [mtime, size]:
+            skipped_cache += 1
+            continue
+        scanned += 1
+        sid = os.path.basename(p)[:-6]
+        file_done = True
+        for line_no, text in _user_texts(p):
+            if len(text) > _PROMOTE_MAXLEN:
+                continue
+            low = text.lower()
+            marker = next((m for m in _PROMOTE_MARKERS if m in low), None)
+            if not marker:
+                continue
+            slug = _promotion_slug(text)
+            if not slug or slug in planned or slug in ex_slugs:
+                continue
+            if os.path.exists(os.path.join(mem, "feedback-promoted-" + slug + ".md")):
+                continue
+            ctoks = store._tokens(text)
+            if ctoks and any(len(ctoks & et) / len(ctoks | et) >= 0.6 for et in ex_tokens):
+                continue
+            planned[slug] = {"slug": slug, "statement": text[:300],
+                             "marker": marker.strip(), "origin_session": sid,
+                             "origin_line": line_no, "proposed_type": "prior",
+                             "capture_confidence": 0.5}
+            if len(planned) >= cap:
+                hit_cap = file_done = False
+                break
+        if file_done:
+            new_cache[p] = [mtime, size]
+        if hit_cap:
+            break
+    acts = list(planned.values())
+    receipt = {"ts": ts, "since_days": since_days, "scanned": scanned,
+               "skipped_cache": skipped_cache, "found": len(acts),
+               "written": 0, "actions": acts}
+    if not apply:
+        return receipt
+    os.makedirs(mem, exist_ok=True)
+    for a in acts:
+        _write_promotion_candidate(mem, a, ts)
+    pk.write_json(_promote_cache_path(), new_cache)
+    receipt["written"] = len(acts)
+    if acts:
+        pk.event("drain.promote", "intake",
+                 "%d promotion candidate%s -> intake (awaiting drain)"
+                 % (len(acts), "s"[:len(acts) != 1]))
+    return receipt
+
+
+def _write_promotion_candidate(mem, a, ts):
+    """One intake candidate file drain routes as feedback->prior. proposed_type,
+    capture_confidence, origin_line + session ride the frontmatter for the
+    operator's dry-run review; the body preserves the provenance line."""
+    slug = a["slug"]
+    st = re.sub(r"\s+", " ", a["statement"].replace('"', "'"))[:300]
+    body = [
+        "---",
+        "name: feedback-promoted-" + slug,
+        'description: "' + st[:170] + '"',
+        "metadata:",
+        "  node_type: memory",
+        "  type: feedback",
+        "  originSessionId: " + a["origin_session"],
+        "  origin_line: " + str(a["origin_line"]),
+        "  proposed_type: " + a["proposed_type"],
+        "  capture_confidence: %.2f" % a["capture_confidence"],
+        "  promoted_marker: " + a["marker"],
+        "  promoted_ts: " + ts,
+        "---",
+        "",
+        "Promoted from transcript %s line %s (USER message, marker: '%s')."
+        % (a["origin_session"], a["origin_line"], a["marker"]),
+        "",
+        st,
+        "",
+    ]
+    pk.atomic_write(os.path.join(mem, "feedback-promoted-" + slug + ".md"),
+                    "\n".join(body))
+
+
+def pending_promotions(mem=None):
+    """Count of un-drained promotion candidates in the intake dir — the seam
+    evolve reads for 'N promotion candidates awaiting drain'."""
+    mem = mem or _mem_dir()
+    try:
+        return sum(1 for n in os.listdir(mem)
+                   if n.startswith("feedback-promoted-") and n.endswith(".md"))
+    except OSError:
+        return 0
+
+
+def cmd_promote(args):
+    """promote [--since Nd] [--cap N] [--apply] — the episodic->durable funnel:
+    scan recent USER messages for durable-knowledge markers, write each as a
+    drain-intake candidate (dry-run default; drain then gates them)."""
+    since = 7
+    if "--since" in args:
+        try:
+            since = int(str(args[args.index("--since") + 1]).rstrip("dD"))
+        except (ValueError, IndexError):
+            print("helm promote: --since needs Nd (e.g. --since 14d)", file=sys.stderr)
+            return 2
+    cap = 20
+    if "--cap" in args:
+        try:
+            cap = int(args[args.index("--cap") + 1])
+        except (ValueError, IndexError):
+            print("helm promote: --cap needs an integer", file=sys.stderr)
+            return 2
+    apply = "--apply" in args
+    r = promote(since_days=since, cap=cap, apply=apply)
+    print("helm promote: scanned %d file%s (%d cached-skip), %d promotion candidate%s %s"
+          % (r["scanned"], "s"[:r["scanned"] != 1], r["skipped_cache"],
+             r["found"], "s"[:r["found"] != 1], "written" if apply else "found"))
+    for a in r["actions"][:8]:
+        print("  + %s [%s c=%.2f] (%s L%s): %s"
+              % (a["slug"], a["proposed_type"], a["capture_confidence"],
+                 a["origin_session"][:8], a["origin_line"], a["statement"][:70]))
+    if len(r["actions"]) > 8:
+        print("  ... %d more" % (len(r["actions"]) - 8))
+    if not apply:
+        print("helm promote: DRY-RUN (no intake files written). Re-run with "
+              "--apply, then `helm drain` to route them.")
+    elif r["written"]:
+        print("helm promote: WROTE %d candidate%s to the drain intake — review "
+              "with `helm drain`, land with `helm drain --apply`."
+              % (r["written"], "s"[:r["written"] != 1]))
     return 0
 
 

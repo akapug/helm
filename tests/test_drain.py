@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import re
 import shutil
@@ -333,6 +334,126 @@ class DrainProjectTest(unittest.TestCase):
                 rc = drain.cmd_drain(["--project", "ghost"])
         self.assertEqual(rc, 1)
         self.assertIn("no claude memory dir", out.getvalue())
+
+
+class PromoteTest(unittest.TestCase):
+    """helm promote: the episodic->durable funnel. USER-role only, length +
+    marker gated, deduped, capped, incremental via (mtime,size) cache; hits land
+    as drain-intake candidates the existing gauntlet then routes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-promote-")
+        self.env_prior = {k: os.environ.get(k)
+                          for k in ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_CACHE_DIR")}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        self.mem = os.path.join(self.tmp, "adopted")
+        os.makedirs(self.mem)
+        os.environ["HELM_ADOPTED_DIR"] = self.mem
+        os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
+        self.tx = os.path.join(self.tmp, "tx")
+        os.makedirs(self.tx)
+
+    def tearDown(self):
+        for k, v in self.env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _jsonl(self, name, lines):
+        with open(os.path.join(self.tx, name), "w", encoding="utf-8") as f:
+            for d in lines:
+                f.write(json.dumps(d) + "\n")
+
+    def _user(self, text):
+        return {"type": "user", "message": {"role": "user", "content": text}}
+
+    def _asst(self, text):
+        return {"type": "assistant", "message": {"role": "assistant", "content": text}}
+
+    def test_user_markers_only_land_as_candidates(self):
+        self._jsonl("11111111-1111-1111-1111-111111111111.jsonl", [
+            self._user("From now on always squelch the flimflam before deploy"),
+            self._asst("Sure, from now on I will always do that"),   # assistant: ignored
+            self._user("what's the weather"),                        # no marker: ignored
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "content": "always ran the tool"}]}},  # tool_result: ignored
+        ])
+        r = drain.promote(since_days=30, apply=False, roots=[self.tx])
+        self.assertEqual(r["found"], 1)
+        self.assertEqual(r["actions"][0]["proposed_type"], "prior")
+        self.assertIn("flimflam", r["actions"][0]["slug"])
+        self.assertEqual(r["written"], 0)                            # dry-run
+        self.assertEqual(os.listdir(self.mem), [])
+
+    def test_apply_writes_intake_then_drain_routes_to_prior(self):
+        self._jsonl("22222222-2222-2222-2222-222222222222.jsonl", [
+            self._user("Remember this: the quorumward gate must be signed before ship"),
+        ])
+        r = drain.promote(since_days=30, apply=True, roots=[self.tx])
+        self.assertEqual(r["written"], 1)
+        cand = [n for n in os.listdir(self.mem) if n.startswith("feedback-promoted-")]
+        self.assertEqual(len(cand), 1)
+        with open(os.path.join(self.mem, cand[0])) as f:
+            raw = f.read()
+        self.assertIn("proposed_type: prior", raw)
+        self.assertIn("origin_line: 1", raw)
+        self.assertIn("capture_confidence: 0.50", raw)
+        self.assertIn("type: feedback", raw)   # drain-routable
+        # the existing gauntlet routes it to a typed prior
+        receipt = drain.apply(drain.classify(self.mem), self.mem)
+        self.assertGreaterEqual(receipt["applied"], 1)
+        newp = [n for n in os.listdir(self.mem) if n.startswith("prior-promoted-")]
+        self.assertEqual(len(newp), 1)
+
+    def test_length_guard_skips_task_prompts(self):
+        self._jsonl("33333333-3333-3333-3333-333333333333.jsonl", [
+            self._user("always " + "x" * 700),   # long -> a task prompt, not a rule
+        ])
+        self.assertEqual(drain.promote(since_days=30, roots=[self.tx])["found"], 0)
+
+    def test_dedupe_against_existing_prior(self):
+        from helm import store
+        store.write_prior({"id": "quorumward-gate",
+                           "statement": "the quorumward gate must be signed before ship",
+                           "confidence": 0.9})
+        self._jsonl("44444444-4444-4444-4444-444444444444.jsonl", [
+            self._user("Always the quorumward gate must be signed before ship please"),
+        ])
+        self.assertEqual(drain.promote(since_days=30, roots=[self.tx])["found"], 0)
+
+    def test_incremental_mtime_size_cache_and_cap(self):
+        self._jsonl("55555555-5555-5555-5555-555555555555.jsonl", [
+            self._user("From now on prefer the alpha1 path over beta2"),
+            self._user("Never touch the gamma3 store directly"),
+        ])
+        r = drain.promote(since_days=30, cap=1, apply=True, roots=[self.tx])
+        self.assertEqual(r["found"], 1)          # cap honored
+        # the cap stopped mid-file, so it is NOT cached -> re-run sees the rest
+        r2 = drain.promote(since_days=30, cap=5, apply=True, roots=[self.tx])
+        self.assertEqual(r2["scanned"], 1)
+        self.assertEqual(r2["found"], 1)         # the second rule (first already an intake dup)
+        # a third run: file fully processed + cached -> skipped
+        r3 = drain.promote(since_days=30, cap=5, apply=True, roots=[self.tx])
+        self.assertEqual(r3["skipped_cache"], 1)
+        self.assertEqual(r3["found"], 0)
+        self.assertEqual(drain.pending_promotions(self.mem), 2)
+
+    def test_cmd_dry_run_default(self):
+        self._jsonl("66666666-6666-6666-6666-666666666666.jsonl", [
+            self._user("From now on the widgetron must idle at 40hz"),
+        ])
+        # cmd_promote's default roots are ~/.claude; force them at the tmp tx
+        orig = drain.promote
+        with mock.patch.object(drain, "promote",
+                               side_effect=lambda **kw: orig(**{**kw, "roots": [self.tx]})):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = drain.cmd_promote([])
+        self.assertEqual(rc, 0)
+        self.assertIn("DRY-RUN", out.getvalue())
+        self.assertIn("widgetron", out.getvalue())
 
 
 class ExpireCandidatesTest(unittest.TestCase):
