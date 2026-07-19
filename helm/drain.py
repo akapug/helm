@@ -146,8 +146,19 @@ def classify(mem=None):
             twin = "prior-" + n[len("prem-"):]
             if twin in names:
                 plan.append({"op": "sweep-dup", "src": n, "twin": twin})
-            continue  # un-twinned prem files stay: the store dual-reads them
+                continue
+            act = _upgrade_action(n, p, names, planned_dsts)  # un-twinned prem -> upgrade
+            if act:
+                plan.append(act)
+            continue
         if n.startswith(TYPED_PREFIXES):
+            # prior-/lex- that FELL BACK to episodic (typed prefix, no typed
+            # fields) become upgrade candidates; real typed entries + ref-/reflex-
+            # return None and stay governed by the store.
+            if n.startswith(("prior-", "lex-")):
+                act = _upgrade_action(n, p, names, planned_dsts)
+                if act:
+                    plan.append(act)
             continue
         e = pk.parse_simple_frontmatter(p, _FM_DEFAULTS) or {}
         etype = (e.get("type") or "").lower()
@@ -238,6 +249,104 @@ def _retype_text(src_path, act, ts):
 
 
 DRAINED_MARK = "drained from feedback memory"  # the evidence reason drain seeds
+UPGRADE_MARK = "upgraded from typed-prefix bulk memory"  # drain-v2 evidence reason
+
+
+def _upgrade_text(src_path, act, ts):
+    """The drain-v2 upgrade: synthesize real typed frontmatter for a
+    typed-PREFIX file that never carried typed fields (episodic fallback),
+    body preserved verbatim. prem-/prior- -> a PRIOR at 0.9 jit — NOT 1.0: a
+    prem- prefix on bulk memory is a naming accident, not an attestation (the
+    premise tier requires the ledger path). lex- -> a real LEXICON entry."""
+    with open(src_path, encoding="utf-8", errors="replace") as f:
+        raw = f.read()
+    body = raw.split("---", 2)[2].lstrip("\n") if raw.count("---") >= 2 else raw
+    st = re.sub(r"\s+", " ", (act["statement"] or act["id"]).replace('"', "'"))[:300]
+    kw = act.get("keywords") or _keywords_from(act["id"], act["statement"] or "")
+    if act["to_type"] == "lexicon":
+        fm = [
+            "---",
+            "name: " + act["dst"][:-3],
+            'description: "' + ("lexicon: " + act["id"] + " = " + st)[:200] + '"',
+            "metadata:",
+            "  node_type: memory",
+            "  type: lexicon",
+            "  term: " + act["id"],
+            "  scope: global",
+            "  kind: phrase",
+            "  source: drain-upgrade",
+            "  updated_ts: " + ts,
+            "  hits: 0",
+            "  definition: " + st,
+            "  upgraded_from: " + act["src"],
+            "---", "",
+        ]
+        return "\n".join(fm) + body
+    fm = [
+        "---",
+        "name: " + act["dst"][:-3],
+        'description: "prior: ' + (act["id"] + " - " + st)[:170] + '"',
+        "metadata:",
+        "  node_type: memory",
+        "  type: prior",
+        "  id: " + act["id"],
+        "  statement: " + st,
+        "  confidence: %.2f" % DRAIN_CONFIDENCE,
+        "  class: prior",
+        "  load_class: jit",
+        "  evidence_log: " + '[{"ts":"%s","type":"stated","delta":%.2f,"reason":"%s","by":"drain"}]'
+        % (ts, DRAIN_CONFIDENCE, UPGRADE_MARK),
+        "  confidence_history: " + '[{"ts":"%s","value":%.2f,"reason":"%s"}]'
+        % (ts, DRAIN_CONFIDENCE, UPGRADE_MARK),
+        "  status: live",
+        "  keywords: " + kw,
+        "  source: drain-upgrade",
+        "  stated_ts: " + ts,
+        "  last_updated: " + ts,
+        "  upgraded_from: " + act["src"],
+        "---", "",
+    ]
+    return "\n".join(fm) + body
+
+
+def _upgrade_action(n, p, names, planned_dsts):
+    """A typed-PREFIX file (prem-/prior-/lex-) that FAILS typed parse (episodic
+    fallback — the 194 dark files) -> an 'upgrade' op. Real typed entries are
+    already governed (None). The >=2-specific-keyword gate is load-bearing: a
+    terse description that yields <2 distinctive keywords stays episodic and is
+    reported, never force-upgraded into a generic wallpaper prior."""
+    from . import store
+    e = store._parse_entry(p, n)
+    if not e or e.get("type") != "episodic":
+        return None  # parses as a real typed entry already -> skip (governed)
+    statement = (e.get("statement") or "").strip()
+    if not statement:
+        return {"op": "keep", "src": n, "why": "typed-prefix, no description to upgrade"}
+    if n.startswith("lex-"):
+        to_type = "lexicon"
+        slug = pk.slug(n[len("lex-"):-3])
+        dst = "lex-" + slug + ".md"
+    else:  # prem- or prior-
+        to_type = "prior"
+        slug = pk.slug(re.sub(r"^pr(?:em|ior)-", "", n[:-3]))
+        dst = "prior-" + slug + ".md"
+    kw = _keywords_from(slug, statement)
+    specific = [k for k in kw.split(",") if k]
+    if len(specific) < 2:
+        return {"op": "keep", "src": n,
+                "why": "typed-prefix bulk, %d specific keyword(s) (<2) — kept episodic"
+                       % len(specific)}
+    if dst != n:  # prem- -> prior- rename must not clobber a curated entry
+        if dst in names:
+            return {"op": "conflict", "src": n, "dst": dst,
+                    "why": "upgrade target %s already exists — resolve by hand" % dst}
+        if dst in planned_dsts:
+            return {"op": "conflict", "src": n, "dst": dst,
+                    "why": "two intake files map to %s (also %s)" % (dst, planned_dsts[dst])}
+        planned_dsts[dst] = n
+    return {"op": "upgrade", "src": n, "dst": dst, "to_type": to_type,
+            "id": slug, "statement": statement, "keywords": kw,
+            "origin": e.get("originsessionid") or ""}
 
 
 def _rekey_edit(raw, new_kw, ts):
@@ -648,7 +757,7 @@ def apply(plan, mem=None, sweep_dups=False, limit=None):
     """Execute a plan. Archive-first with a verified net; returns the receipt."""
     mem = mem or _mem_dir()
     ts = pk.now_ts()
-    doable = [a for a in plan if a["op"] in ("retype", "route-project")
+    doable = [a for a in plan if a["op"] in ("retype", "route-project", "upgrade")
               or (sweep_dups and a["op"] == "sweep-dup")]
     if limit:
         doable = doable[:limit]
@@ -664,7 +773,8 @@ def apply(plan, mem=None, sweep_dups=False, limit=None):
     for a in doable:
         to_net[a["src"]] = os.path.join(mem, a["src"])
         dst = a.get("dst")
-        if a["op"] == "retype" and dst and os.path.isfile(os.path.join(mem, dst)):
+        if a["op"] in ("retype", "upgrade") and dst and dst != a["src"] \
+                and os.path.isfile(os.path.join(mem, dst)):
             # a subdir, not a name prefix: a src literally named
             # overwritten-<dst> must never collide with the netted dst
             os.makedirs(os.path.join(net, "overwritten"), exist_ok=True)
@@ -688,6 +798,11 @@ def apply(plan, mem=None, sweep_dups=False, limit=None):
         elif a["op"] == "retype":
             pk.atomic_write(os.path.join(mem, a["dst"]), _retype_text(src, a, ts))
             os.remove(src)
+            renames[a["src"]] = a["dst"]
+        elif a["op"] == "upgrade":
+            pk.atomic_write(os.path.join(mem, a["dst"]), _upgrade_text(src, a, ts))
+            if a["dst"] != a["src"]:   # prem- -> prior- rename; in-place keeps src==dst
+                os.remove(src)
             renames[a["src"]] = a["dst"]
         elif a["op"] == "route-project":
             os.makedirs(os.path.dirname(a["dst"]), exist_ok=True)
@@ -742,7 +857,7 @@ def cmd_drain(args):
           % (len(plan), (" — project " + project + " @ " + mem) if project else ""))
     # per op: (rows shown, "... more" threshold); everything else defaults (3, 3)
     show_limit = {"conflict": (5, 5), "keep": (2, 3)}
-    for op in ("retype", "route-project", "sweep-dup", "conflict", "keep"):
+    for op in ("retype", "upgrade", "route-project", "sweep-dup", "conflict", "keep"):
         acts = by_op.get(op, [])
         if not acts:
             continue

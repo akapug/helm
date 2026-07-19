@@ -35,7 +35,12 @@ class DrainTest(unittest.TestCase):
         write("prem-old-truth.md", _mem_entry("prem-old-truth.md", "prior", "x"))
         write("prior-old-truth.md", _mem_entry("prior-old-truth.md", "prior", "x"))
         write("prem-lonely.md", _mem_entry("prem-lonely.md", "prior", "no twin"))
-        write("lex-term.md", _mem_entry("lex-term.md", "lexicon", "typed already"))
+        # a GENUINELY typed lexicon (term + definition) — drain-v2 leaves it
+        # governed; the old fixture (name+description only) was never real-typed
+        pk.atomic_write(os.path.join(self.mem, "lex-term.md"),
+                        "---\nname: lex-term\ndescription: \"lexicon: term = defined\"\n"
+                        "metadata:\n  node_type: memory\n  type: lexicon\n  term: term\n"
+                        "  definition: a defined word\n---\nbody\n")
         pk.atomic_write(os.path.join(self.mem, "MEMORY.md"),
                         "# idx\n- [short dms](feedback-short-dms.md) hook\n")
         # a registry with one project so route-project resolves
@@ -57,8 +62,11 @@ class DrainTest(unittest.TestCase):
         self.assertEqual(plan["proj-meldproj-vision.md"]["project"], "meldproj")
         self.assertEqual(plan["proj-unknown-thing.md"]["op"], "keep")
         self.assertEqual(plan["prem-old-truth.md"]["op"], "sweep-dup")
-        self.assertNotIn("prem-lonely.md", plan)   # un-twinned prem stays governed
-        self.assertNotIn("lex-term.md", plan)      # already typed
+        # drain-v2: an un-twinned prem- bulk file is now an upgrade candidate;
+        # "no twin" is too terse (<2 specific keywords) so it stays episodic
+        self.assertEqual(plan["prem-lonely.md"]["op"], "keep")
+        self.assertIn("specific keyword", plan["prem-lonely.md"]["why"])
+        self.assertNotIn("lex-term.md", plan)      # genuinely typed -> governed
         self.assertEqual(plan["random-note.md"]["op"], "keep")
 
     def test_apply_retype_preserves_body_and_seeds_evidence(self):
@@ -454,6 +462,128 @@ class PromoteTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("DRY-RUN", out.getvalue())
         self.assertIn("widgetron", out.getvalue())
+
+
+def _bulk(name, description, mtype="project", body="the full body\nwith detail\n"):
+    """A typed-PREFIX file with NO typed fields (name+description only) — the
+    bulk-memory shape that falls back to episodic (the 194 dark files)."""
+    return ("---\nname: %s\ndescription: \"%s\"\nmetadata:\n  node_type: memory\n"
+            "  type: %s\n---\n\n%s" % (name[:-3], description, mtype, body))
+
+
+class UpgradeTest(unittest.TestCase):
+    """drain-v2 upgrade: typed-prefix files that fell back to episodic get real
+    typed frontmatter (prem-/prior- -> prior 0.9 jit; lex- -> lexicon), body
+    verbatim, archive-first net + receipt. The >=2-specific-keyword gate holds."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-upgrade-")
+        self.env_prior = {k: os.environ.get(k)
+                          for k in ("HELM_HOME", "HELM_ADOPTED_DIR")}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        self.mem = os.path.join(self.tmp, "mem")
+        os.makedirs(self.mem)
+        os.environ["HELM_ADOPTED_DIR"] = self.mem
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {}})
+
+    def tearDown(self):
+        for k, v in self.env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _w(self, name, text):
+        pk.atomic_write(os.path.join(self.mem, name), text)
+
+    def _plan(self):
+        return {a["src"]: a for a in drain.classify(self.mem)}
+
+    def test_prem_bulk_upgrades_to_prior_at_0_9(self):
+        self._w("prem-scrub-docs.md",
+                _bulk("prem-scrub-docs.md", "scrub internal planning documents before every push"))
+        act = self._plan()["prem-scrub-docs.md"]
+        self.assertEqual((act["op"], act["to_type"], act["dst"]),
+                         ("upgrade", "prior", "prior-scrub-docs.md"))
+        receipt = drain.apply(drain.classify(self.mem), self.mem)
+        self.assertGreaterEqual(receipt["applied"], 1)
+        newp = os.path.join(self.mem, "prior-scrub-docs.md")
+        with open(newp) as f:
+            raw = f.read()
+        self.assertIn("type: prior", raw)
+        self.assertIn("confidence: 0.90", raw)          # 0.9, NOT 1.0
+        self.assertIn("class: prior", raw)
+        self.assertIn("upgraded from typed-prefix bulk memory", raw)
+        self.assertIn("the full body", raw)             # body verbatim
+        self.assertIn("upgraded_from: prem-scrub-docs.md", raw)
+        self.assertFalse(os.path.exists(os.path.join(self.mem, "prem-scrub-docs.md")))
+        # it was DARK before; now it resolves + fires
+        from helm import store
+        e = self.one_store(store.load_all(), "scrub-docs")
+        self.assertEqual((e["type"], e["load_class"]), ("prior", "jit"))
+        self.assertAlmostEqual(e["confidence"], 0.9)
+        self.assertTrue(store.resolve_prompt("scrub the planning documents"))
+
+    def one_store(self, es, eid):
+        hits = [e for e in es if e["id"] == eid]
+        assert len(hits) == 1, [x["id"] for x in es]
+        return hits[0]
+
+    def test_lex_bulk_upgrades_to_real_lexicon(self):
+        self._w("lex-quorumward.md",
+                _bulk("lex-quorumward.md", "quorumward means toward a signed quorum gate"))
+        act = self._plan()["lex-quorumward.md"]
+        self.assertEqual((act["op"], act["to_type"], act["dst"]),
+                         ("upgrade", "lexicon", "lex-quorumward.md"))    # in-place
+        drain.apply(drain.classify(self.mem), self.mem)
+        with open(os.path.join(self.mem, "lex-quorumward.md")) as f:
+            raw = f.read()
+        self.assertIn("type: lexicon", raw)
+        self.assertIn("term: quorumward", raw)
+        self.assertIn("definition: quorumward means toward a signed quorum gate", raw)
+        from helm import store
+        e = self.one_store(store.load_all(types=("lexicon",)), "quorumward")
+        self.assertEqual(e["type"], "lexicon")
+
+    def test_prior_bulk_upgrades_in_place(self):
+        self._w("prior-widget-idle.md",
+                _bulk("prior-widget-idle.md", "the widgetron must idle at forty hertz baseline"))
+        act = self._plan()["prior-widget-idle.md"]
+        self.assertEqual((act["op"], act["dst"]), ("upgrade", "prior-widget-idle.md"))
+        drain.apply(drain.classify(self.mem), self.mem)
+        with open(os.path.join(self.mem, "prior-widget-idle.md")) as f:
+            self.assertIn("confidence: 0.90", f.read())
+
+    def test_two_keyword_gate_keeps_terse_episodic(self):
+        self._w("prem-go.md", _bulk("prem-go.md", "go fast"))   # <2 specific kw
+        act = self._plan()["prem-go.md"]
+        self.assertEqual(act["op"], "keep")
+        self.assertIn("specific keyword", act["why"])
+        # nothing upgraded on apply
+        drain.apply(drain.classify(self.mem), self.mem)
+        self.assertTrue(os.path.exists(os.path.join(self.mem, "prem-go.md")))
+
+    def test_real_typed_entry_never_upgraded(self):
+        from helm import store
+        store.write_prior({"id": "already-real", "statement": "a real typed prior",
+                           "confidence": 0.8, "keywords": "realkw"}, root_dir=self.mem)
+        self.assertNotIn("prior-already-real.md", self._plan())  # governed, skipped
+
+    def test_dry_run_mutates_nothing(self):
+        self._w("prem-scrub-docs.md",
+                _bulk("prem-scrub-docs.md", "scrub internal planning documents before push"))
+        before = sorted(os.listdir(self.mem))
+        drain.classify(self.mem)
+        self.assertEqual(before, sorted(os.listdir(self.mem)))
+
+    def test_upgrade_netted_and_receipted(self):
+        self._w("prem-scrub-docs.md",
+                _bulk("prem-scrub-docs.md", "scrub internal planning documents before push"))
+        receipt = drain.apply(drain.classify(self.mem), self.mem)
+        net = receipt["net"]
+        self.assertTrue(os.path.isfile(os.path.join(net, "prem-scrub-docs.md")))
+        self.assertTrue(os.path.isfile(os.path.join(net, "RECEIPT.json")))
 
 
 class ExpireCandidatesTest(unittest.TestCase):
