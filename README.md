@@ -136,4 +136,10 @@ lineage, and web views are live; reflexes and the self-evolution loop are in
 active development. Issues and harness-format reports welcome — see
 [CONTRIBUTING.md](CONTRIBUTING.md) for the on-ramp.
 
-License: TBD (see [docs/LICENSE-TODO.md](docs/LICENSE-TODO.md)).
+## License
+
+[AGPL-3.0-or-later](LICENSE) — matching the licensing of the truth-engine
+family helm composes with (dregg, cv). Modified network-served versions must
+share source; running helm for yourself, or inside your own fleet, asks
+nothing of you. The decision record is in
+[docs/LICENSE-TODO.md](docs/LICENSE-TODO.md).

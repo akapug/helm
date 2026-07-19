@@ -49,3 +49,20 @@ courts.
 Awaiting: owner approval (and optionally an OSS-license review from ember,
 the resident license expert) — then LICENSE lands at the repo root with a
 one-line README section, closing the public-flip blocker.
+
+## DECIDED (2026-07-19): AGPL-3.0-or-later
+
+Owner rule: "whatever ember's projects are is my basic preference unless
+there are extenuating circumstances." Ground truth: emberian/dregg and
+emberian/cv are both AGPL-3.0 — so helm is AGPL-3.0-or-later, matching the
+truth-engine family it composes with.
+
+The extenuating factors considered and judged NON-blocking: (a) enterprise
+AGPL-aversion is real adoption friction, but helm's operator runs it for
+themselves — the network clause only binds someone SERVING a modified helm to
+third parties, which is exactly the extraction case copyleft exists to catch;
+(b) no patent grant à la Apache-2.0 — acceptable at this scale. The owner is
+the sole copyright holder today, so a future relicense or herdr-style
+dual-license (AGPL + commercial) stays a one-party decision until outside
+contributions arrive. The earlier Apache-2.0 recommendation is superseded by
+the ember-match rule.
