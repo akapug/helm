@@ -113,6 +113,7 @@ VERBS = {
     "cell": _lazy("cell", "cmd_cell"),
     "premise": _lazy("premise", "cmd_premise"),
     "premise-check": _lazy("premise", "cmd_premise_check"),
+    "seat": _lazy("seat", "cmd_seat"),
     "search": _lazy("transcripts", "cmd_search"),
     "transcript": _lazy("transcripts", "cmd_transcript"),
     "rehome": _lazy("transcripts", "cmd_rehome"),
@@ -143,6 +144,7 @@ _VERB_HELP = {
     "cell": "cell join|send|recv|heartbeat|roster|status — the a2a substrate, helm-named",
     "premise": "premise <id> | <statement> — capture a certain truth, attested on the ledger",
     "premise-check": "premise-check <id> — verify digest + quote the finality tier",
+    "seat": "seat add|up|down|launch|smoke|list|status — multimodel seats (codex family via local proxy)",
     "search": "search <text> [--scope P] [--refs] — content search inside transcripts",
     "transcript": "transcript <sid> [--find T] [--limit N] — windowed role-tagged transcript read",
     "rehome": "rehome <sid> <new-cwd>|--reset — re-home a session (claude slug symlink)",
@@ -159,7 +161,7 @@ _VERB_HELP = {
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ("-h", "--help", "help"):
-        print("helm — the personal knowledge home for people who build with agents\n")
+        print("helm — the steering station for you and your agent fleet\n")
         print("usage: helm <verb> [args]\n")
         for name in VERBS:
             doc = _VERB_HELP.get(name) or (VERBS[name].__doc__ or "").strip().split("\n")[0]
