@@ -82,7 +82,8 @@ class KeepaliveTest(unittest.TestCase):
         res = keepalive.refresh_home(d)
         self.assertEqual(res["action"], "skip")
         self.assertIn("live holder pid 4242", res["reason"])
-        self.assertEqual(open(os.path.join(d, ".credentials.json")).read(), before)
+        with open(os.path.join(d, ".credentials.json")) as _f:
+            self.assertEqual(_f.read(), before)
 
     def test_skip_when_not_due(self):
         far = int(time.time() * 1000) + 100 * 3600 * 1000
@@ -130,7 +131,8 @@ class KeepaliveTest(unittest.TestCase):
             res = keepalive.refresh_home(d)
         self.assertEqual(res["action"], "needs_reauth")
         self.assertIn("HTTP 403", res["reason"])
-        self.assertEqual(open(os.path.join(d, ".credentials.json")).read(), before)
+        with open(os.path.join(d, ".credentials.json")) as _f:
+            self.assertEqual(_f.read(), before)
 
     # -- sweep: claude rolled forward, codex read-only stale-risk -----------
     def test_sweep_covers_claude_and_flags_stale_codex(self):
@@ -148,7 +150,8 @@ class KeepaliveTest(unittest.TestCase):
         self.assertIn(("old-codex", "stale-risk"), actions)
         stale = next(r for r in results if r["action"] == "stale-risk")
         self.assertEqual(stale["provider"], "codex")
-        self.assertEqual(open(ap).read(), "{}")               # codex NEVER written
+        with open(ap) as _f:
+            self.assertEqual(_f.read(), "{}")           # codex NEVER written
 
     # -- cmd leg: second-instance refusal + sweep smoke ---------------------
     def test_cmd_keepalive_refuses_beside_live_keepalive(self):
