@@ -8,3 +8,13 @@ __pycache__/
 *.pyc
 .pytest_cache/
 PROGRESS.md
+ADVISOR_ANSWERS.md
+HANDOFF_NEXT_SESSION.md
+MORNING_BRIEF_*.md
+DOGFOOD_*.md
+docs/MULTIMODEL_SEATS_ADDENDUM.md
+docs/PARITY_MATRIX.md
+docs/DECISION-*.md
+.playwright-mcp/
+.claude/settings.json
+*.png
