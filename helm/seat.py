@@ -475,10 +475,11 @@ def _smoke(family):
     )
     ok = True
     for name, prompt, allowed, marker in legs:
-        cmd = ["claude", "-p", "--model", model]
+        # prompt rides directly after -p: --allowedTools is variadic and
+        # swallows a trailing positional (live-found 2026-07-18)
+        cmd = ["claude", "-p", prompt, "--model", model]
         if allowed:
             cmd += ["--allowedTools", allowed]
-        cmd.append(prompt)
         try:
             p = subprocess.run(cmd, env=_seat_env(family, smoke_dir),
                                capture_output=True, text=True, timeout=300)
