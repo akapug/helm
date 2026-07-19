@@ -348,16 +348,17 @@ def _entry_files(root, d):
                 yield n, p
 
 
-def _load_root(root, scope, d, include_retired=False):
-    """One root -> {(type, slug): entry}. Inside a root: prior-* always wins
-    over a same-id legacy prem-* (dual-read migration law), and the narrowest
-    authored lexicon scope wins per term (space: > project: > global)."""
+def _load_root(root, scope, d):
+    """One root -> {(type, slug): entry}, ALL statuses. Inside a root: prior-*
+    always wins over a same-id legacy prem-* (dual-read migration law), and the
+    narrowest authored lexicon scope wins per term (space: > project: > global).
+    The live/retired filter is applied AFTER the cross-root merge (load_all) —
+    filtering per-root let a retired narrow-scope entry vanish from the shadow
+    map, resurrecting the stale wide-scope entry it shadowed."""
     out = {}
     for name, path in _entry_files(root, d):
         e = _parse_entry(path, name)
         if not e:
-            continue
-        if not include_retired and e.get("status") != STATUS_LIVE:
             continue
         e.update({"root": root, "scope": scope, "path": path})
         key = (e["type"], _slug(str(e["id"])))
@@ -380,9 +381,14 @@ def load_all(project=None, include_retired=False, include_dormant=True, types=No
         types = (types,)
     merged = {}
     for root, scope, d in roots(project):
-        merged.update(_load_root(root, scope, d, include_retired=include_retired))
+        merged.update(_load_root(root, scope, d))
     out = []
     for e in merged.values():
+        # status filter AFTER the merge: a retired/tombstoned shadow-WINNER
+        # drops out entirely — it must not un-bury the wider-scope entry it
+        # shadowed (the tombstone law survives scope precedence).
+        if not include_retired and e.get("status") != STATUS_LIVE:
+            continue
         if not include_dormant and e.get("load_class") == "dormant":
             continue
         if types and e["type"] not in types:
@@ -402,7 +408,7 @@ def counts(project=None):
     out = {}
     for root, scope, d in roots(project):
         per = {}
-        for e in _load_root(root, scope, d, include_retired=True).values():
+        for e in _load_root(root, scope, d).values():
             per[e["type"]] = per.get(e["type"], 0) + 1
         out[root] = per
     return out

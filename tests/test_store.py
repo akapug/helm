@@ -418,6 +418,43 @@ class ScopeTest(StoreBase):
         e = self.one(store.load_all(), "foo")
         self.assertEqual(e["root"], "helm-global")
 
+    def test_retiring_shadow_winner_never_resurrects_the_shadowed(self):
+        # audit HIGH: a stale wide-scope belief shadowed by a narrow-scope
+        # override must STAY buried when the override is retired/superseded —
+        # per-root status filtering resurrected it as live.
+        store.write_prior({"id": "shipfast", "statement": "old stale belief",
+                          "confidence": 0.6, "keywords": "shipfast"},
+                          root_dir=self.adopted)
+        self.seed_prior("shipfast", "NEW corrected belief", conf=0.9,
+                        keywords="shipfast",
+                        root_dir=self.project_dir("myproj", "premises"))
+        e = self.one(store.load_all(project="myproj"), "shipfast")
+        self.assertEqual(e["root"], "project")
+        _, err = store.retire("shipfast", TS, "no longer holds", project="myproj")
+        self.assertIsNone(err)
+        # the retired project override does NOT un-bury the adopted copy
+        self.assertEqual(store.load_all(project="myproj"), [])
+        self.assertEqual(store.resolve_prompt("shipfast plan", project="myproj"), [])
+        # asked-for retired view shows the shadow winner, tombstoned
+        e = self.one(store.load_all(project="myproj", include_retired=True), "shipfast")
+        self.assertEqual((e["root"], e["status"]), ("project", "retired"))
+        # the GLOBAL lens (no project root in play) still sees the adopted copy
+        e = self.one(store.load_all(), "shipfast")
+        self.assertEqual((e["root"], e["status"]), ("adopted", "live"))
+
+    def test_superseding_shadow_winner_never_resurrects_the_shadowed(self):
+        store.write_prior({"id": "shipfast", "statement": "old stale belief",
+                          "confidence": 0.6}, root_dir=self.adopted)
+        self.seed_prior("shipfast", "project override", conf=0.9,
+                        root_dir=self.project_dir("myproj", "premises"))
+        self.seed_prior("shipslow", "the replacement", conf=0.9,
+                        root_dir=self.project_dir("myproj", "premises"))
+        _, err = store.mark_superseded("shipfast", "shipslow", TS,
+                                       "replaced", project="myproj")
+        self.assertIsNone(err)
+        self.assertEqual([e["id"] for e in store.load_all(project="myproj")],
+                         ["shipslow"])
+
     def test_no_cross_type_shadowing(self):
         self.seed_prior("shared-slug", "the belief", conf=0.9)
         store.write_lexicon({"term": "shared-slug", "definition": "the term"})
