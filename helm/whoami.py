@@ -13,8 +13,11 @@ Store: ~/.helm/_global/know-your-user/
                  history stays on disk.
 
 The INTERVIEW is the first-run step that fills the leg: interactive on a tty,
-copy-pasteable question sheet otherwise. Never nags — done latches it off.
-Import-safe, side-effect-free.
+copy-pasteable question sheet otherwise. A profile that already HAS content is
+interviewed by CONFIRMATION — every line is a draft to keep/correct/drop, because
+correcting is faster than composing. Off a tty, drafts are printed and NOTHING is
+written: an agent never stands in for the owner (the certainty rail). Never nags —
+done latches it off. Import-safe, side-effect-free.
 """
 import os
 import sys
@@ -154,7 +157,11 @@ def merge_scaffold(mc_path=None):
         status = str(mc.get("interview_status") or "").strip()
         if _STATUS_RANK.get(status, 0) > _STATUS_RANK.get(p["interview_status"], 0):
             p["interview_status"] = status
-        p["source"] = "merged-from-mc"
+        if _content_key(p) != before:
+            # only an ACTUAL import stamps the source — an empty scaffold must
+            # not clobber a richer provenance note (it did once: a derived
+            # profile's source was overwritten by a no-op merge)
+            p["source"] = "merged-from-mc"
     if not os.path.exists(profile_path()) or _content_key(p) != before:
         save_profile(p)
     return p
@@ -338,15 +345,97 @@ def _run_interview(p):
     return 0
 
 
+def _drafts(p):
+    """The profile's content flattened to confirmable (key, line) rows."""
+    lvl = [("technical_level", p["technical_level"])] if p["technical_level"] else []
+    return lvl + [("guidance", g) for g in p["guidance"]]
+
+
+def _print_drafts(p):
+    """No tty: show the drafts a live interview would confirm and write NOTHING —
+    an agent must never stand in for the owner (the certainty rail)."""
+    rows = _drafts(p)
+    print("helm interview — %d draft answer%s on file, awaiting owner confirmation." % (
+        len(rows), "s"[:len(rows) != 1]))
+    print("(source: %s)\n" % p["source"])
+    for i, (key, val) in enumerate(rows, 1):
+        print("%2d. [%s] %s" % (i, key, val))
+    print("\nNot a tty — nothing was written; drafts stay drafts. Run `helm interview`")
+    print("in a terminal to keep/correct/drop each line — only the owner confirms.")
+    return 0
+
+
+def _confirm_one(i, n, key, val):
+    """One draft -> confirmed value, or None to drop. Blank/y keeps, e prompts a
+    rewrite, d drops, any other text IS the correction (the fastest edit).
+    EOFError propagates — the caller keeps the rest as drafted."""
+    print("%d/%d [%s] %s" % (i, n, key, val))
+    a = input("  y(keep) / e(dit) / d(rop) / corrected text > ").strip()
+    if a.lower() in ("", "y", "yes", "k", "keep", "ok"):
+        return val
+    if a.lower() in ("d", "drop", "n", "no"):
+        return None
+    if a.lower() in ("e", "edit"):
+        return input("  rewrite > ").strip() or val
+    return a
+
+
+def _confirm_interview(p):
+    """Interview by confirmation: helm drafted the answers, the owner corrects.
+    ctrl-d keeps the remaining drafts; completion marks the profile
+    owner-confirmed and latches the interview done."""
+    rows = _drafts(p)
+    kept = [v for _, v in rows]  # ctrl-d = remaining drafts stand
+    print("helm interview — %d draft answer%s already on file (%s)." % (
+        len(rows), "s"[:len(rows) != 1], p["source"]))
+    print("Blank/y keeps a line, e rewrites, d drops, or type the correction directly.")
+    print("ctrl-d keeps the rest as drafted.\n")
+    try:
+        for i, (key, val) in enumerate(rows):
+            kept[i] = _confirm_one(i + 1, len(rows), key, val)
+            print()
+        while True:
+            a = input("add guidance (blank to finish) > ").strip()
+            if not a:
+                break
+            rows.append(("guidance", a))
+            kept.append(a)
+    except EOFError:
+        print()
+    p["technical_level"] = ""
+    p["guidance"] = []
+    for (key, _), v in zip(rows, kept):
+        if v is None:
+            continue
+        if key == "technical_level":
+            p["technical_level"] = v
+        else:
+            p["guidance"].append(v)
+    p["interview_status"] = "done"
+    p["source"] = "owner-confirmed %s" % pk.now_ts()[:10]
+    save_profile(p)
+    confirmed = sum(v is not None for v in kept)
+    print("Thank you — %d line%s confirmed, %d dropped. `helm whoami` shows what your" % (
+        confirmed, "s"[:confirmed != 1], len(kept) - confirmed))
+    print("agents see, and `helm whoami note` grows it any time.")
+    return 0
+
+
 def cmd_interview(args):
     """interview [--questions] [--redo] — the first-run step that fills the
-    warmth leg. Interactive on a tty; prints the question sheet otherwise.
-    Never nags: done latches it off."""
+    warmth leg. A populated profile is confirmed line-by-line (drafts to
+    keep/correct/drop); an empty one gets the blank questions. Interactive on a
+    tty; otherwise prints the sheet, or the drafts unwritten. Never nags: done
+    latches it off."""
     p = merge_scaffold()
     if p["interview_status"] == "done" and "--redo" not in args and "--questions" not in args:
         print("helm interview: already done (updated %s) — you're known." % (p["updated_at"] or "?"))
         print("  `helm whoami` shows the profile; `helm interview --redo` revisits it.")
         return 0
-    if "--questions" in args or not sys.stdin.isatty():
+    if "--questions" in args:
+        return _print_questions(p)
+    if _drafts(p):
+        return _confirm_interview(p) if sys.stdin.isatty() else _print_drafts(p)
+    if not sys.stdin.isatty():
         return _print_questions(p)
     return _run_interview(p)

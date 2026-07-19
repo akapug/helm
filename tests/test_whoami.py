@@ -72,7 +72,9 @@ class TestMergeScaffold(WhoamiBase):
         self.assertEqual(p["technical_level"], "technical")
         self.assertEqual(p["guidance"], ["batch deploys"])
         self.assertEqual(p["interview_status"], "done")  # offered never downgrades done
-        self.assertEqual(p["source"], "merged-from-mc")
+        # a no-op merge must NOT stamp the source: an empty scaffold once
+        # clobbered a derived profile's provenance note with "merged-from-mc"
+        self.assertEqual(p["source"], "fresh")
 
     def test_no_mc_profile_is_fresh(self):
         p = whoami.merge_scaffold(mc_path=os.path.join(self.tmp.name, "nope.json"))
@@ -211,6 +213,82 @@ class TestInterview(WhoamiBase):
         rc, out = self.run_cmd(["--redo"], tty=True, answers=answers)
         self.assertEqual(rc, 0)
         self.assertEqual(whoami.load_profile()["technical_level"], "some-technical")
+
+
+class TestInterviewConfirm(WhoamiBase):
+    """Populated profile -> interview by confirmation: drafts to keep/correct/drop."""
+    run_cmd = TestInterview.run_cmd
+    POP = {"schema_version": 2, "technical_level": "expert founder-operator",
+           "guidance": ["headline first", "never punt", "batch deploys"],
+           "interview_status": "offered", "updated_at": "",
+           "source": "derived-from-buildr/mc-corpus 2026-07-19"}
+
+    def populate(self):
+        whoami.save_profile(dict(self.POP, guidance=list(self.POP["guidance"])))
+
+    def test_confirm_all_renders_drafts_and_transitions(self):
+        self.populate()
+        rc, out = self.run_cmd([], tty=True, answers=[""] * 5)  # 4 keeps + end add-new
+        self.assertEqual(rc, 0)
+        self.assertIn("draft", out)
+        self.assertIn(self.POP["technical_level"], out)
+        for g in self.POP["guidance"]:
+            self.assertIn(g, out)
+        self.assertNotIn(whoami.QUESTIONS[1]["question"], out)  # no blank questions
+        p = whoami.load_profile()
+        self.assertEqual(p["technical_level"], self.POP["technical_level"])
+        self.assertEqual(p["guidance"], self.POP["guidance"])
+        self.assertEqual(p["interview_status"], "done")
+        self.assertTrue(p["source"].startswith("owner-confirmed 20"))
+        self.assertTrue(p["updated_at"])
+        raw = pk.read_json(whoami.profile_path())
+        self.assertEqual(set(raw), {"schema_version", "technical_level", "guidance",
+                                    "interview_status", "updated_at", "source"})
+        self.assertEqual(raw["schema_version"], 2)
+
+    def test_edit_drop_direct_correction_and_add(self):
+        self.populate()
+        rc, _ = self.run_cmd([], tty=True, answers=[
+            "e", "expert",                 # level: edit -> rewrite
+            "",                            # guidance[0]: keep
+            "d",                           # guidance[1]: drop
+            "batch deploys to slice ends", # guidance[2]: typed correction in-place
+            "new: bias-loud", ""])         # add-new, then finish
+        self.assertEqual(rc, 0)
+        p = whoami.load_profile()
+        self.assertEqual(p["technical_level"], "expert")
+        self.assertEqual(p["guidance"], ["headline first", "batch deploys to slice ends",
+                                         "new: bias-loud"])
+
+    def test_eof_keeps_remaining_drafts_and_completes(self):
+        self.populate()
+        rc, _ = self.run_cmd([], tty=True, answers=["d", EOFError()])
+        self.assertEqual(rc, 0)
+        p = whoami.load_profile()
+        self.assertEqual(p["technical_level"], "")  # dropped before ctrl-d
+        self.assertEqual(p["guidance"], self.POP["guidance"])  # rest stand as drafted
+        self.assertEqual(p["interview_status"], "done")
+
+    def test_empty_profile_falls_back_to_blank_interview(self):
+        answers = ["expert"] + [""] * (len(whoami.QUESTIONS) - 1)
+        rc, out = self.run_cmd([], tty=True, answers=answers)
+        self.assertEqual(rc, 0)
+        self.assertIn(whoami.QUESTIONS[1]["question"], out)  # blank questions asked
+        self.assertNotIn("draft", out)
+        self.assertEqual(whoami.load_profile()["technical_level"], "expert")
+
+    def test_non_tty_prints_drafts_and_writes_nothing(self):
+        self.populate()
+        with open(whoami.profile_path(), "rb") as f:
+            before = f.read()
+        rc, out = self.run_cmd([], tty=False)  # any input() would StopIteration
+        self.assertEqual(rc, 0)
+        for g in self.POP["guidance"]:
+            self.assertIn(g, out)
+        self.assertIn("nothing was written", out)
+        with open(whoami.profile_path(), "rb") as f:
+            self.assertEqual(f.read(), before)  # byte-identical: no fake confirmation
+        self.assertEqual(whoami.load_profile()["interview_status"], "offered")
 
 
 if __name__ == "__main__":
