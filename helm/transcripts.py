@@ -123,7 +123,7 @@ def get_catalog(refresh=False):
     if refresh:
         with _lock:
             _state.pop("catalog", None)
-    cat = _cached("catalog", 10**9, build)
+    cat = _cached("catalog", 300, build)  # 5-min TTL: a resume verb must never act on a days-stale list
     # cwd overrides: applied at read time (never baked into the cache) so they
     # survive rescans; cwd is metadata, never identity.
     with _lock:

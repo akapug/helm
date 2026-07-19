@@ -69,6 +69,36 @@ class TestWeb(unittest.TestCase):
             with e:
                 return e.code, e.headers.get("Content-Type", ""), e.read()
 
+    def _raw_get(self, path, headers):
+        """A GET with fully custom headers (Host/Origin) via http.client, so we
+        can forge the values the loopback origin-guard checks."""
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("GET", path, headers=headers)
+            r = conn.getresponse()
+            return r.status, r.read()
+        finally:
+            conn.close()
+
+    def test_same_origin_guard_rejects_foreign_host(self):
+        # DNS-rebinding defense: a request whose Host is not our loopback bind
+        # is refused before any data or the templated token can leak.
+        status, body = self._raw_get("/api/registry", {"Host": "attacker.example"})
+        self.assertEqual(status, 403)
+        self.assertNotIn(b"alpha", body)
+
+    def test_same_origin_guard_rejects_cross_origin(self):
+        status, body = self._raw_get("/api/registry", {
+            "Host": "127.0.0.1:%d" % self.port,
+            "Origin": "http://attacker.example"})
+        self.assertEqual(status, 403)
+
+    def test_same_origin_guard_allows_loopback(self):
+        status, body = self._raw_get("/api/registry", {"Host": "127.0.0.1:%d" % self.port})
+        self.assertEqual(status, 200)
+        self.assertIn(b"alpha", body)
+
     def test_root_serves_ui(self):
         status, ctype, body = self.get("/")
         self.assertEqual(status, 200)

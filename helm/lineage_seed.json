@@ -1,7 +1,7 @@
 {
   "_source": "founding brief 2026-07-18 (buildr → mc+tokaware(+dregg+cv) → meld+sesh → helm) + docs/lineage-map-decisions-2026-07-18.md + advisor git-proven corrections (ADVISOR_ANSWERS.md, 2026-07-18): root at herdr, cv truth-engine, tokaware cred/quota layer",
   "_deliberately_unlinked": [
-    "dev-homelab (/home/owner/dev/homelab) vs homelab (/home/owner/dev/akapug/homelab) — unknown relation, left unlinked",
+    "dev-homelab (~/dev/homelab) vs homelab (~/dev/akapug/homelab) — unknown relation, left unlinked",
     "dep-scan signal (projects a repo USES vs builds — cv/dregg consumed as binaries) — designed, not yet a discovery source"
   ],
   "edges": [
@@ -19,7 +19,7 @@
     {"src": "polyanna", "rel": "checkout-of", "dst": "polyana", "note": "orca workspace checkout [founding brief 2026-07-18]", "confirmed": true}
   ],
   "external": [
-    {"name": "references", "path": "/home/owner/dev/references", "note": "read-only prior art [founding brief 2026-07-18]"},
-    {"name": "herdr", "path": "/home/owner/dev/akapug/herdr-worktrees", "note": "upstream ogulcancelik/herdr — the family ROOT (shared root a57b9728 with buildr/mc); local main checkout absent, worktrees remain [advisor git-proven 2026-07-18]"}
+    {"name": "references", "path": "~/dev/references", "note": "read-only prior art [founding brief 2026-07-18]"},
+    {"name": "herdr", "path": "~/dev/akapug/herdr-worktrees", "note": "upstream ogulcancelik/herdr — the family ROOT (shared root a57b9728 with buildr/mc); local main checkout absent, worktrees remain [advisor git-proven 2026-07-18]"}
   ]
 }

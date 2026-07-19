@@ -1608,7 +1608,7 @@ async function openSession(sid, opts = {}) {
   $("#dhead").innerHTML = `<div class="acts">${acts}</div>
     <span class="hbadge ${badgeH(S.harness || "claude")}" style="display:inline-block">${esc((S.harness || "?").slice(0, 2))}</span> <span class="t">${esc((S.title || "(untitled)").slice(0, 90))}</span>
     <div class="meta">${esc(mysid)} · ${esc(S.cwd || "?")}${S.branch ? " · ⑂ " + esc(S.branch) : ""}${S.model ? " · " + esc(S.model) : ""} · ${d.total.toLocaleString()} messages${r ? " · " + fmtB(r.z) : ""}</div>
-    <div id="cwdedit"><input id="cwdinput" placeholder="new absolute directory for this session, e.g. /home/owner/dev/x" value="${esc(S.cwd || "")}"><button class="chip" id="cwdgo">move</button></div>`;
+    <div id="cwdedit"><input id="cwdinput" placeholder="new absolute directory for this session, e.g. ~/dev/project" value="${esc(S.cwd || "")}"><button class="chip" id="cwdgo">move</button></div>`;
   $("#dclose").onclick = () => $("#drawer").classList.remove("show");
   if (DRAW.resumable) {
     $("#dresume").onclick = async () => {
