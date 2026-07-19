@@ -21,6 +21,7 @@ ENV_KEYS = ("HELM_HOME", "HELM_CELL_BIN", "MELD_CELL_BIN", "HELM_NODE_URL",
             "HELM_CELL_PROFILE", "HELM_NODE_TOKEN", "HELM_NODE_PASSPHRASE",
             "HELM_ROSTER", "MELD_NODE_URL", "MELD_AGENT_PROFILE",
             "MELD_NODE_TOKEN", "MELD_NODE_PASSPHRASE", "MELD_ROSTER",
+            "HELM_SNAPSHOT_HOOK", "MELD_SNAPSHOT_HOOK",
             "STUB_LOG", "STUB_CELL", "STUB_TURN")
 
 # One stub for every subcommand: records argv + the mapped env per call,
@@ -50,6 +51,7 @@ class CellBase(unittest.TestCase):
         for k in ENV_KEYS:
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        os.environ["HELM_SNAPSHOT_HOOK"] = ""  # never a real cave snapshot
         self.log = os.path.join(self.tmp, "stub.log")
         os.environ["STUB_LOG"] = self.log
         os.environ["STUB_CELL"] = CELL_HEX
@@ -198,6 +200,29 @@ class SendSelfTest(CellBase):
         info, err = cell.send_self("prem:b2b:deadbeef", "p1")
         self.assertIsNone(info)
         self.assertIn("meld send failed", err)
+
+    def test_snapshot_hook_fires_after_attestation_only(self):
+        # the log-after leg of the unified cave: a SUCCESSFUL send_self fires
+        # the snapshot hook; a failed one (no turn landed) must not
+        mark = os.path.join(self.tmp, "snapped")
+        hook = os.path.join(self.tmp, "snapshot-hook")
+        with open(hook, "w") as f:
+            f.write("#!/bin/sh\necho hit >> %s\n" % mark)
+        os.chmod(hook, 0o755)
+        os.environ["HELM_SNAPSHOT_HOOK"] = hook
+        self.write_stub(FAILING_STUB)
+        cell.send_self("prem:b2b:deadbeef", "p1")
+        self.assertFalse(os.path.exists(mark))
+        self.write_stub()
+        info, err = cell.send_self("prem:b2b:deadbeef", "p1")
+        self.assertIsNone(err)
+        with open(mark) as f:
+            self.assertEqual(f.read().strip(), "hit")
+
+    def test_snapshot_hook_absent_or_disabled_is_a_noop(self):
+        self.assertFalse(cell.fire_snapshot_hook())          # "" -> disabled
+        os.environ["HELM_SNAPSHOT_HOOK"] = os.path.join(self.tmp, "missing")
+        self.assertFalse(cell.fire_snapshot_hook())          # not executable
 
 
 class StatusTest(CellBase):

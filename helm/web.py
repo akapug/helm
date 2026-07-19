@@ -669,8 +669,10 @@ def _api_physics_diff(qs):
 # the shipped reflex surfaces the message to every local agent next turn.
 
 def _api_chat(qs):
-    """Poll read: messages after ?since= (count already seen) + the new total.
-    The panel polls this every ~2s while open; since past the end resets."""
+    """Poll read: rows after ?since= (count already seen) + the new total +
+    the transport truth (signed/unsigned + chain head — the panel's tick and
+    strip). The panel polls this every ~2s while open; since past the end
+    resets. Rows include reaction rows; the client aggregates."""
     try:
         since = int(_q1(qs, "since", "0"))
     except ValueError:
@@ -679,21 +681,49 @@ def _api_chat(qs):
         from . import chat
         room = _q1(qs, "room", "main")
         msgs, total = chat.read(room, since)
-        return {"room": room, "lines": msgs, "total": total}, 200
+        return {"room": room, "lines": msgs, "total": total,
+                "transport": chat.transport_status()}, 200
     except Exception:
         return {"unavailable": True}, 200
 
 
+def _chat_profile():
+    """Server-side signing identity for the owner's web posts: the server's
+    HELM_CELL_PROFILE (the PRD's contract), else the owner's cell `david` —
+    never the agent default (the web panel IS the owner surface)."""
+    return os.environ.get("HELM_CELL_PROFILE") \
+        or os.environ.get("MELD_AGENT_PROFILE") or "david"
+
+
 def _api_chat_post(payload):
-    """The owner's post: append + mark owner-unread. name defaults to david."""
+    """The owner's post: append (signed server-side when the room node
+    answers) + mark owner-unread. name defaults to david."""
     from . import chat
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip():
         return {"error": 'payload wants {"text": "..."} (non-empty)'}, 400
     room = str(payload.get("room") or "main")
-    msg = chat.post(text.strip(), room, who=str(payload.get("name") or "david"))
+    msg = chat.post(text.strip(), room, who=str(payload.get("name") or "david"),
+                    profile=_chat_profile())
     chat.mark_owner_unread(room)
     return {"ok": True, "msg": msg, "total": chat.read(room)[1]}, 200
+
+
+def _api_chat_react(payload):
+    """The owner's click-to-react: target by ts+from (the row the panel
+    holds). Signed like a post; rides the same transport."""
+    from . import chat
+    e = payload.get("emoji")
+    tts, tfrom = payload.get("tts"), payload.get("tfrom")
+    if not (isinstance(e, str) and e and isinstance(tts, str) and isinstance(tfrom, str)):
+        return {"error": 'payload wants {"emoji", "tts", "tfrom"}'}, 400
+    room = str(payload.get("room") or "main")
+    row, err = chat.react((tts, tfrom), e, room,
+                          who=str(payload.get("name") or "david"),
+                          profile=_chat_profile())
+    if err:
+        return {"error": err}, 400
+    return {"ok": True, "msg": row, "total": chat.read(room)[1]}, 200
 
 
 # ── sessions surface: catalog / search / session / cmd / cwd / prune ──
@@ -842,6 +872,7 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
     "/api/configs/entry": _api_configs_entry_post,
     "/api/configs/restore": _api_configs_restore_post,
     "/api/chat": _api_chat_post,
+    "/api/chat/react": _api_chat_react,
 }
 
 

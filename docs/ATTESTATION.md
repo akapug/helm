@@ -108,6 +108,28 @@ When the substrate is down at capture time, the attestation is appended to
 annotates the stored entry and leaves the queue; failures (and rows whose
 entry has since left the store) stay queued. Nothing expires.
 
+## Backfill — attesting the corpus that predates attestation
+
+Entries captured before the substrate leg existed (the adopted corpus
+included) are attested **in place**:
+
+- `helm premise --attest-existing <id> [--project P]` — digest per the same
+  contract from the entry's *current* stored statement, one self-write turn,
+  then annotation only: the byte diff is exactly the `attest_*` lines,
+  wherever the file lives. Never a rewrite, never a twin of an adopted entry,
+  never through `add` (so the supersede-guard cannot trip). Only live
+  confidence-1.0 entries qualify — the attestable set is exactly the
+  operator's stated truths.
+- `helm premise --attest-sweep [--dry] [--limit N]` — every live certain
+  entry lacking a recorded turn, across all roots, sequentially. `--dry`
+  reports the certain-set count and a computron estimate. The sweep unlocks
+  the node **once** and rides the minted bearer for every send (the unlock
+  endpoint rate-limits 5/60s and counts successes), auto-refuels via the dev
+  faucet on an insufficient-balance refusal, retries each failure once, and
+  lets a persistent failure fall to the attest-queue — it never crashes.
+  Already-attested entries are skipped (idempotent), and queue rows made
+  stale by a direct attestation are pruned at the end of the pass.
+
 ## Supersession is a chain, not an edit
 
 Retiring or superseding an attested premise is a **new signed turn**
@@ -143,3 +165,32 @@ Two tamper-evidence layers serve two different moments, deliberately:
 
 The digest check in `helm doctor` stays regardless — it catches accidental
 drift cheaply, whichever history layer is carrying the record.
+
+## Chat rides the same substrate
+
+`helm chat` v2 reuses this exact pattern for the groupchat: each post's
+digest (`chat:b2b:<blake2b-256>`, the same algorithm-tagged shape) rides a
+signed self-write turn on the poster's cell — on a **separate room node**
+whose data-dir lives on tmpfs, so a chat turn never lands on a
+disk-persisted chain (premise `a2a-ram-only-disk-log-after`). Thin claim,
+fat corroboration, twice over: the ledger holds digests, the store holds
+premise text, the RAM room holds chat text. See the chat section of
+[VERBS.md](VERBS.md).
+
+## The cave-unification ceremony (ONE CAVE)
+
+The target topology is ONE cave per local team — RAM-hot (tmpfs data-dir)
+with disk as **log-after**: restore-on-boot, a snapshot after every
+attestation turn (`helm/cell.py` fires `~/.local/bin/dregg-cave-snapshot`
+after each successful `send_self`), an interval snapshot timer, and a
+snapshot on unit stop. The interim second chat node dissolves into it.
+
+The prepared ceremony is `scripts/cave-unification.sh` — run `--dry-run`
+first (it exercises every read-only gate for real). Its hard gates: a full
+tarball backup before anything; the restore-on-boot path **proven before the
+flip**; `premise-check` MATCH on every attested premise plus a
+chain-head/receipt comparison before *and* after; a paste-ready rollback
+(`--rollback`); the whisper daemon stopped around the flip and verified
+back. A digest MISMATCH on any attested premise aborts the ceremony — edit
+drift must be re-attested (supersession is a chain, not an edit) before the
+chain moves homes.

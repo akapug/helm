@@ -18,7 +18,7 @@ $ helm web --port 8080 --open
 | **quota** | the burn chart, account scorecard, allocation panel, credential homes with lifecycle buttons | `helm creds` / `helm swap` / `helm homes` |
 | **sessions** | the full catalog across harnesses: search inside transcripts, role-colored drawer, one-click resume command, re-home, prune | `helm sessions` / `helm search` / `helm transcript` / `helm cmd` |
 | **configs** | every config across every home, the cascade resolver, and the editor (backup → validate → atomic write, one-click restore) | `helm configs` |
-| **chat** | the human-included groupchat: the RAM room, polled every ~2s while open. Posting drops the `owner-unread` marker, so every local agent's next turn is steered to read + reply (the shipped `owner-chat-unread` reflex). The name field defaults to `david`; works from the Orca mobile browser (simple DOM, no exotic APIs) | `helm chat` |
+| **chat** | the human-included groupchat: the RAM room, polled every ~2s while open. Posting signs server-side as `david` on the chat room node when it answers (v2 — signed rows carry a subtle ✓ tick, chain index on hover; the strip beside the send button shows `signed ⛓#head` / `unsigned`) and drops the `owner-unread` marker, so every local agent's next turn is steered to read + reply (the shipped `owner-chat-unread` reflex). `:shortcodes:` expand; hovering a message offers click-to-react (👍 🎉 🔥 ❤️ 👀), reactions render inline (`🎉×2`). Works from the Orca mobile browser (simple DOM, no exotic APIs) | `helm chat` |
 
 ## Security posture
 
@@ -78,7 +78,7 @@ Parameterized reads:
 | `/api/search` | `q=` `limit=` `scope=` `synthetic=1` | content search inside transcripts |
 | `/api/session` | `sid=` `before=` `limit=` `find=` `harness=` | a windowed, role-tagged transcript read |
 | `/api/cmd` | `sid=` `account=` `model=` | the pasteable account-aware resume command |
-| `/api/chat` | `room=` (default `main`) `since=` (messages already seen) | the chat poll read: `{room, lines, total}` — a `since` past the end (the room rotated) resends everything |
+| `/api/chat` | `room=` (default `main`) `since=` (rows already seen) | the chat poll read: `{room, lines, total, transport}` — rows include reaction rows (the client aggregates); signed rows carry `{turn, receipt, chain}`; `transport` = `{mode: signed|unsigned, url, head}`; a `since` past the end (the room rotated) resends everything |
 
 ## POST endpoints
 
@@ -95,7 +95,8 @@ request. These are the **only** mutations the browser can make:
 | `/api/configs/file` | `{"path": ..., "content": ...}` | save a recognized config file: backup → validate → atomic write |
 | `/api/configs/entry` | `{"action": ..., "path": ..., "kind": ..., "name": ..., "value": ...}` | structured entry op (add/remove an MCP server) — never hand-edits JSON |
 | `/api/configs/restore` | `{"backup": <backup path>}` | restore a backup over its origin (validated, re-backed-up first) |
-| `/api/chat` | `{"text": ..., "room": "main", "name": "david"}` | the owner's chat post: append to the RAM room + drop the `owner-unread` marker the shipped reflex fires on until an agent's `helm chat read` consumes it |
+| `/api/chat` | `{"text": ..., "room": "main", "name": "david"}` | the owner's chat post: shortcodes expand, the digest rides a signed turn when the room node answers (server-side, as the server's `HELM_CELL_PROFILE`, default `david`), append to the RAM room + drop the `owner-unread` marker the shipped reflex fires on until an agent's `helm chat read` consumes it |
+| `/api/chat/react` | `{"emoji": ":tada:", "tts": <target ts>, "tfrom": <target from>, "room": "main", "name": "david"}` | the owner's click-to-react: a typed reaction row referencing the target message, signed like a post |
 
 A scripted example:
 

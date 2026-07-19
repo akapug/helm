@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from helm import chat, home, reflex  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
-            "HELM_CHAT_NAME", "MELD_CHAT_NAME")
+            "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
+            "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG")
 
 
 class ChatBase(unittest.TestCase):
@@ -30,6 +31,9 @@ class ChatBase(unittest.TestCase):
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
+        # SET-BUT-EMPTY disables the signed transport — v1 behavior, hermetic
+        # even when a real room node is live on this machine
+        os.environ["HELM_CHAT_NODE_URL"] = ""
 
     def tearDown(self):
         for k, v in self.env_prior.items():

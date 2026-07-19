@@ -102,6 +102,7 @@ VERBS = {
     "drain": _lazy("drain", "cmd_drain"),
     "drift": _lazy("drift", "cmd_drift"),
     "reflex": _lazy("reflex", "cmd_reflex"),
+    "record": _lazy("record", "cmd_record"),
     "lineage": _lazy("lineage", "cmd_lineage"),
     "whoami": _lazy("whoami", "cmd_whoami"),
     "interview": _lazy("whoami", "cmd_interview"),
@@ -114,6 +115,7 @@ VERBS = {
     "hooks": _lazy("hooks", "cmd_hooks"),
     "cell": _lazy("cell", "cmd_cell"),
     "chat": _lazy("chat", "cmd_chat"),
+    "human": _lazy("human", "cmd_human"),
     "premise": _lazy("premise", "cmd_premise"),
     "premise-check": _lazy("premise", "cmd_premise_check"),
     "seat": _lazy("seat", "cmd_seat"),
@@ -136,6 +138,7 @@ _VERB_HELP = {
     "drain": "drain [--apply] — route raw memory intake to typed homes (dry-run default)",
     "drift": "drift — surface belief drift; silent when steady",
     "reflex": "reflex list|add|retire — (signal -> steer) entries",
+    "record": "record [--hook-json]|status|install — session-keyed tool-outcome recorder (PostToolUse leg)",
     "lineage": "lineage [seed|add|external|archive-report] — the project family tree",
     "whoami": "whoami [note ...] — the operator profile + dated notes",
     "interview": "interview — the five-minute warmth-leg interview",
@@ -147,7 +150,8 @@ _VERB_HELP = {
     "configs": "configs [list|show|cascade <cwd>] — every config across every home, read-only",
     "hooks": "hooks [install [--dry]|status] — self-wire the per-turn inject hook into every claude home",
     "cell": "cell join|send|recv|heartbeat|roster|status — the a2a substrate, helm-named",
-    "chat": "chat post <text...>|read [--since N|--follow]|rooms [--room R] — the human-included groupchat (RAM room; web panel = the owner's surface)",
+    "chat": "chat post|read [--since N|--follow]|rooms|react <n> <emoji>|log-flush|node up|down|status [--room R] — the human-included groupchat (RAM room + signed dregg transport; web panel = the owner's surface)",
+    "human": "human (or helm --human) — the operator's curses TUI: chat room + status strip, posts as you",
     "premise": "premise <id> | <statement> — capture a certain truth, attested on the ledger",
     "premise-check": "premise-check <id> — verify digest + quote the finality tier",
     "seat": "seat add|up|down|launch|smoke|list|status — multimodel seats (codex family via local proxy)",
@@ -166,6 +170,8 @@ _VERB_HELP = {
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "--human":   # the operator flag IS the verb
+        argv[0] = "human"
     if argv and argv[0] in ("--version", "-V", "version"):
         from . import __version__
         print("helm " + __version__)

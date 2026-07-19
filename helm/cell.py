@@ -108,16 +108,20 @@ def roster_path():
         or os.path.join(os.path.expanduser("~"), ".dregg", "roster.toml")
 
 
-def run_bin(args, timeout=90):
+def run_bin(args, timeout=90, env_extra=None):
     """Run the binary captured. (rc, stdout, stderr); rc None + reason in the
-    third slot when the substrate is unavailable (missing binary/launch fail)."""
+    third slot when the substrate is unavailable (missing binary/launch fail).
+    env_extra lays over the mapped env — the seam chat v2 uses to aim one
+    call at the ROOM node without touching the caller's environment."""
     b = bin_path()
     if not b or not os.path.exists(b):
         return None, "", ("substrate client not found — set HELM_CELL_BIN or "
                           "put `meld` on PATH (attestation is optional; helm "
                           "runs fully without it)")
+    env = build_env()
+    env.update(env_extra or {})
     try:
-        p = subprocess.run([b] + args, env=build_env(), capture_output=True,
+        p = subprocess.run([b] + args, env=env, capture_output=True,
                            text=True, timeout=timeout)
     except OSError as exc:
         return None, "", "meld binary failed to launch: %s" % exc
@@ -168,6 +172,28 @@ def own_cell(profile):
     return info["cell"], None
 
 
+# After the cave-unification ceremony the team cave runs RAM-hot; this hook
+# (installed by scripts/cave-unification.sh) flushes the tmpfs data-dir to its
+# disk snapshot. Fired after every successful ATTESTATION turn — the log-after
+# ordering: the turn commits in RAM first, the durable record follows. Absent
+# hook (pre-unification, fresh clone) = silent no-op; HELM_SNAPSHOT_HOOK
+# overrides the path (set-but-empty disables — how tests stay hermetic).
+SNAPSHOT_HOOK = "~/.local/bin/dregg-cave-snapshot"
+
+
+def fire_snapshot_hook():
+    hook = home.env("SNAPSHOT_HOOK")
+    if hook is None:
+        hook = os.path.expanduser(SNAPSHOT_HOOK)
+    if not hook or not os.access(hook, os.X_OK):
+        return False
+    try:
+        subprocess.run([hook], capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return True
+
+
 def send_self(payload, profile):
     """SELF-WRITE: deposit `payload` into the profile's OWN whisper PAYLOAD
     slots via the proven `meld send` path — never the 8-byte heartbeat tag
@@ -184,15 +210,39 @@ def send_self(payload, profile):
     info = _last_json(out)
     if not (info and info.get("sent")):
         return None, "meld send printed no receipt JSON: %s" % (out or "").strip()[-200:]
+    fire_snapshot_hook()   # attestation landed -> flush the RAM cave to disk
     return info, None
 
 
 def get_json(url, timeout=4):
-    """One node GET -> parsed JSON, fail-open None (down/refused/garbled)."""
+    """One node GET -> parsed JSON, fail-open None (down/refused/garbled).
+    An HTTP error status is CLOSED before dropping — an abandoned HTTPError
+    holds its socket and detonates under -W error::ResourceWarning."""
+    import urllib.error
     import urllib.request
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        e.close()
+        return None
+    except Exception:
+        return None
+
+
+def post_json(url, payload, timeout=8):
+    """One node POST (JSON in, JSON out), same fail-open None law as get_json.
+    Used by the chat room-node provisioning legs (unlock/faucet)."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        e.close()
+        return None
     except Exception:
         return None
 

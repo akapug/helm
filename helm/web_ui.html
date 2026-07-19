@@ -366,6 +366,14 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .chatmsg.owner .cwho{color:var(--accent)}
 .chatmsg .cts{font-size:.72rem;color:var(--sub);margin-left:7px;font-variant-numeric:tabular-nums}
 .chatmsg .ctxt{white-space:pre-wrap;word-break:break-word}
+.chatmsg .ctick{font-size:.72rem;color:var(--sub);margin-left:6px;cursor:default}
+.chatmsg .creacts{font-size:.82rem;margin:2px 0 0 2px;color:var(--sub)}
+.chatmsg .creacts span{margin-right:8px}
+.chatmsg .rbar{display:none;font-size:.85rem;margin-left:8px}
+.chatmsg:hover .rbar{display:inline}
+.chatmsg .rbtn{cursor:pointer;border:none;background:none;padding:0 2px;font-size:.85rem;opacity:.55}
+.chatmsg .rbtn:hover{opacity:1}
+#chattransport{font-size:.72rem;color:var(--sub);align-self:center;white-space:nowrap}
 #chatbar{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);flex-wrap:wrap}
 #chatname{flex:0 1 110px;min-width:70px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 10px;font-size:.9rem}
 #chattext{flex:1 1 200px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 12px;font-size:1rem}
@@ -495,8 +503,9 @@ details.cfgsec>summary:hover{color:var(--fg)}
     <div id="chatlog"><div class="empty">no messages yet — you and the fleet meet here.<br>agents post with <code>helm chat post &lt;text&gt;</code> · watch with <code>helm chat read --follow</code></div></div>
     <div id="chatbar">
       <input id="chatname" title="post as" autocomplete="off">
-      <input id="chattext" placeholder="message the fleet — agents see it next turn…" autocomplete="off">
+      <input id="chattext" placeholder="message the fleet — agents see it next turn… (:fire: works)" autocomplete="off">
       <button class="chip" id="chatsend">send</button>
+      <span id="chattransport" title="chat transport"></span>
     </div>
   </div>
 </div>
@@ -2052,14 +2061,40 @@ $("#cfgReload").onclick = () => cfgInit(true);
    bearer and drops the owner-unread marker, so every local agent's next turn
    surfaces the message through the shipped reflex. Simple DOM only — the
    panel must work from the Orca mobile app's browser. */
-let CHAT_SINCE = 0, CHAT_TIMER = null;
+let CHAT_SINCE = 0, CHAT_TIMER = null, CHAT_REACTS = {};
+const CHAT_RSET = ["👍", "🎉", "🔥", "❤️", "👀"]; // the tiny click-to-react set
+
+function chatKey(m) { return (m.ts || "") + "|" + (m.from || ""); }
 
 function chatRow(m) {
   const who = String(m.from || "?");
   const owner = who === (($("#chatname").value || "david").trim() || "david");
-  return '<div class="chatmsg' + (owner ? " owner" : "") + '"><span class="cwho">' + esc(who) +
-    '</span><span class="cts">' + esc(String(m.ts || "").slice(11, 16)) + '</span>' +
-    '<div class="ctxt">' + esc(m.text || "") + "</div></div>";
+  // the subtle receipt tick: this row rode a signed turn (chain index on hover)
+  const tick = (m.chain != null)
+    ? '<span class="ctick" title="signed — chain #' + esc(String(m.chain)) + '">✓</span>' : "";
+  const rbar = '<span class="rbar">' + CHAT_RSET.map(e =>
+    '<button class="rbtn" data-e="' + e + '">' + e + "</button>").join("") + "</span>";
+  return '<div class="chatmsg' + (owner ? " owner" : "") + '" data-key="' + esc(chatKey(m)) +
+    '" data-ts="' + esc(m.ts || "") + '" data-from="' + esc(who) + '"><span class="cwho">' + esc(who) +
+    '</span><span class="cts">' + esc(String(m.ts || "").slice(11, 16)) + '</span>' + tick + rbar +
+    '<div class="ctxt">' + esc(m.text || "") + '</div><div class="creacts"></div></div>';
+}
+
+function chatApplyReact(m) {
+  // a reaction row: tally it under its target (skip when the target rotated out)
+  const k = (m.tts || "") + "|" + (m.tfrom || "");
+  (CHAT_REACTS[k] = CHAT_REACTS[k] || {})[m.react] = (CHAT_REACTS[k] || {})[m.react] + 1 || 1;
+  const div = $("#chatlog").querySelector('.chatmsg[data-key="' + CSS.escape(k) + '"]');
+  if (!div) return;
+  div.querySelector(".creacts").innerHTML = Object.entries(CHAT_REACTS[k])
+    .map(([e, n]) => "<span>" + esc(e) + "×" + n + "</span>").join("");
+}
+
+function chatTransport(t) {
+  if (!t) return;
+  $("#chattransport").textContent =
+    t.mode === "signed" ? "signed ⛓" + (t.head == null ? "" : "#" + t.head) : "unsigned";
+  $("#chattransport").title = "chat transport: " + (t.url || "v1 RAM room only");
 }
 
 async function pollChat() {
@@ -2067,15 +2102,27 @@ async function pollChat() {
   let d;
   try { d = await j("/api/chat?room=main&since=" + CHAT_SINCE); } catch (e) { return; }
   if (d.unavailable || !Array.isArray(d.lines)) return;
+  chatTransport(d.transport);
   const log = $("#chatlog");
   if (d.total < CHAT_SINCE) CHAT_SINCE = 0; // the room rotated — server resent everything
   if (d.lines.length) {
-    if (CHAT_SINCE === 0) log.innerHTML = ""; // clear the empty-state (or the stale pre-rotation log)
+    if (CHAT_SINCE === 0) { log.innerHTML = ""; CHAT_REACTS = {}; } // clear the empty-state (or the stale pre-rotation log)
     const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
-    log.insertAdjacentHTML("beforeend", d.lines.map(chatRow).join(""));
+    const msgs = d.lines.filter(m => !m.react);
+    if (msgs.length) log.insertAdjacentHTML("beforeend", msgs.map(chatRow).join(""));
+    d.lines.filter(m => m.react).forEach(chatApplyReact);
     if (stick) log.scrollTop = log.scrollHeight;
   }
   CHAT_SINCE = d.total;
+}
+
+async function sendReact(div, e) {
+  const name = $("#chatname").value.trim() || "david";
+  try {
+    await post("/api/chat/react", {room: "main", emoji: e, name,
+                                   tts: div.dataset.ts, tfrom: div.dataset.from});
+  } catch (err) { toast("react failed: " + err.message); return; }
+  pollChat();
 }
 
 async function sendChat() {
@@ -2095,6 +2142,10 @@ function initChat() {
     CHAT_TIMER = setInterval(pollChat, 2000);
     $("#chatsend").onclick = sendChat;
     $("#chattext").addEventListener("keydown", ev => { if (ev.key === "Enter") sendChat(); });
+    $("#chatlog").addEventListener("click", ev => {   // click-to-react (delegated)
+      const b = ev.target.closest(".rbtn");
+      if (b) sendReact(b.closest(".chatmsg"), b.dataset.e);
+    });
   }
   pollChat();
 }

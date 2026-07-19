@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import chat, web  # noqa: E402
 
-ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR")
+ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
+            "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL")
 
 
 class TestWebChat(unittest.TestCase):
@@ -32,6 +33,7 @@ class TestWebChat(unittest.TestCase):
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = os.path.join(cls.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(cls.tmp, "chat")
+        os.environ["HELM_CHAT_NODE_URL"] = ""  # transport off — hermetic v1
         cls.srv = web.make_server(0)  # ephemeral port
         cls.port = cls.srv.server_address[1]
         cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
@@ -72,7 +74,32 @@ class TestWebChat(unittest.TestCase):
     def test_get_empty_room(self):
         status, d = self.req("/api/chat")
         self.assertEqual(status, 200)
-        self.assertEqual(d, {"room": "main", "lines": [], "total": 0})
+        self.assertEqual(d["room"], "main")
+        self.assertEqual((d["lines"], d["total"]), ([], 0))
+        # the transport truth rides every poll: disabled env -> unsigned, no url
+        self.assertEqual(d["transport"],
+                         {"mode": "unsigned", "url": None, "head": None})
+
+    def test_react_endpoint_roundtrip(self):
+        self.req("/api/chat", {"text": "ship it"})
+        status, d = self.req("/api/chat?since=0")
+        target = d["lines"][0]
+        status, d = self.req("/api/chat/react",
+                             {"emoji": ":tada:", "tts": target["ts"],
+                              "tfrom": target["from"], "name": "david"})
+        self.assertEqual(status, 200)
+        self.assertEqual(d["msg"]["react"], "🎉")
+        self.assertEqual(d["msg"]["tfrom"], "david")
+        status, d = self.req("/api/chat?since=0")
+        self.assertEqual(d["total"], 2)  # reaction rows ride the same poll
+        self.assertEqual(d["lines"][1]["react"], "🎉")
+
+    def test_react_endpoint_rejects_bad_payloads(self):
+        for payload in ({}, {"emoji": ":tada:"},
+                        {"emoji": ":nope-such:", "tts": "x", "tfrom": "y"}):
+            status, d = self.req("/api/chat/react", payload)
+            self.assertEqual(status, 400, payload)
+            self.assertIn("error", d)
 
     def test_post_demands_the_bearer(self):
         status, d = self.req("/api/chat", {"text": "sneak"}, token=False)
