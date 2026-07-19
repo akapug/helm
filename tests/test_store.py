@@ -999,6 +999,100 @@ class AdoptProjectMemdirsTest(StoreBase):
                          ["adopted", "helm-global", "project"])
 
 
+class IndexCapTest(StoreBase):
+    """helm index cap: demote MEMORY.md link lines whose backing entry stays
+    jit-resolvable (lossless), oldest first, until under budget; never
+    always/untyped; archive-first net + receipt; re-read + atomic-write."""
+
+    def run_cli(self, args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_index(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def _index(self, lines):
+        pk.atomic_write(os.path.join(self.adopted, "MEMORY.md"), "\n".join(lines) + "\n")
+
+    def test_demotes_only_lossless_typed_lines_oldest_first(self):
+        # three typed jit priors backing three index links; one always-pin; one
+        # untyped link with no backing entry
+        self.seed_prior("old-one", "old belief", conf=0.8, keywords="oldkw",
+                        root_dir=self.adopted, last_updated="2026-01-01T00:00:00Z")
+        self.seed_prior("mid-one", "mid belief", conf=0.8, keywords="midkw",
+                        root_dir=self.adopted, last_updated="2026-03-01T00:00:00Z")
+        self.seed_prior("new-one", "new belief", conf=0.8, keywords="newkw",
+                        root_dir=self.adopted, last_updated="2026-06-01T00:00:00Z")
+        self.seed_prior("pinned-one", "pinned", conf=1.0, keywords="pinkw",
+                        pin="true", root_dir=self.adopted)
+        self._index([
+            "# MEMORY index",
+            "- [old](prior-old-one.md) old",
+            "- [mid](prior-mid-one.md) mid",
+            "- [new](prior-new-one.md) new",
+            "- [pinned](prior-pinned-one.md) pinned — always, never demote",
+            "- [untyped](random-note.md) no typed backing — never demote",
+            "- freeform line, not a link",
+        ])
+        # budget 4: 7 lines -> 3 over; only 3 are lossless-demotable (old/mid/new);
+        # oldest first
+        r = store.index_cap(budget_lines=4, apply=False)
+        self.assertEqual((r["lines"], r["over"], r["demotable"]), (7, 3, 3))
+        self.assertEqual([b for _l, b in r["plan"]],
+                         ["prior-old-one.md", "prior-mid-one.md", "prior-new-one.md"])
+        # apply demotes them, keeps the pin + untyped + freeform
+        r = store.index_cap(budget_lines=4, apply=True)
+        self.assertEqual(r["demoted"], 3)
+        with open(os.path.join(self.adopted, "MEMORY.md")) as f:
+            kept = f.read()
+        self.assertNotIn("prior-old-one.md", kept)
+        self.assertIn("prior-pinned-one.md", kept)   # always: never demoted
+        self.assertIn("random-note.md", kept)        # untyped: never demoted
+        self.assertIn("freeform line", kept)
+        # the demoted content stays reachable via inject (lossless)
+        self.assertTrue(store.resolve_prompt("oldkw here"))
+        # net + receipt exist
+        self.assertTrue(os.path.isfile(os.path.join(r["net"], "MEMORY-demoted.md")))
+        self.assertTrue(os.path.isfile(os.path.join(r["net"], "RECEIPT.json")))
+
+    def test_under_budget_noop(self):
+        self.seed_prior("a", "s", conf=0.8, keywords="akw", root_dir=self.adopted)
+        self._index(["# idx", "- [a](prior-a.md) a"])
+        r = store.index_cap(budget_lines=60, apply=True)
+        self.assertEqual((r["over"], r["demoted"]), (0, 0))
+
+    def test_over_budget_but_nothing_safe(self):
+        # over budget, but every line is untyped -> nothing lossless-demotable
+        self._index(["# idx", "- [x](random-x.md) x", "- [y](random-y.md) y", "- z"])
+        r = store.index_cap(budget_lines=1, apply=True)
+        self.assertEqual((r["over"], r["demotable"], r["demoted"]), (3, 0, 0))
+        rc, out, _ = self.run_cli(["cap", "--budget-lines", "1", "--apply"])
+        self.assertIn("NOTHING safely demotable", out)
+
+    def test_concurrent_append_preserved_on_apply(self):
+        self.seed_prior("old-one", "old", conf=0.8, keywords="oldkw",
+                        root_dir=self.adopted, last_updated="2026-01-01T00:00:00Z")
+        self._index(["# idx", "- [old](prior-old-one.md) old", "- tail1", "- tail2"])
+        # the re-read + line-set rewrite path drops ONLY the demoted line; every
+        # other line (incl. a concurrent native append) survives
+        r = store.index_cap(budget_lines=2, apply=True)
+        self.assertEqual(r["demoted"], 1)
+        with open(os.path.join(self.adopted, "MEMORY.md")) as f:
+            kept = f.read()
+        self.assertIn("tail1", kept)   # non-demoted lines survive
+        self.assertIn("tail2", kept)
+        self.assertNotIn("prior-old-one.md", kept)
+
+    def test_no_memory_file(self):
+        r = store.index_cap(apply=True)
+        self.assertFalse(r["exists"])
+        rc, out, _ = self.run_cli(["cap"])
+        self.assertIn("no MEMORY.md", out)
+
+    def test_cli_usage(self):
+        rc, _, err = self.run_cli(["frob"])
+        self.assertEqual(rc, 2)
+
+
 class CandidateTierTest(StoreBase):
     """Candidate tier (v1: lexicon): safe inferred capture — a candidate is a
     non-live status EXCLUDED from every injecting lane (the hard law), surfaced
