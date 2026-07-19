@@ -24,6 +24,7 @@ and an embedding web server share one code path.
 """
 import json
 import os
+import re
 import shlex
 import sys
 import threading
@@ -43,6 +44,12 @@ _state = {}
 _inflight = {}
 
 _PROVIDER = None  # lazy singleton; only make_cmd pays for it
+
+# argv-safety for user-controlled values that ride subprocess argv (query/sid/
+# harness reach grep and cv from unauthenticated GET endpoints): every such
+# positional sits AFTER a literal `--`, and ids/harness names must also look
+# like ids — never like flags.
+_SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
 
 def _provider():
@@ -159,8 +166,10 @@ def _grep_sessions(query, rows, cap=60):
     if not paths:
         return hits
     try:
-        # -l first for the file list (fast), then pull one matching line per file
-        out = _sp.run(["grep", "-rilF", query, *paths], capture_output=True,
+        # -l first for the file list (fast), then pull one matching line per file.
+        # `--` terminates option parsing: a query beginning with `-` is a literal
+        # pattern, never a grep flag (argument-injection guard).
+        out = _sp.run(["grep", "-rilF", "--", query, *paths], capture_output=True,
                       text=True, timeout=60).stdout
     except (_sp.TimeoutExpired, OSError):
         return hits
@@ -170,7 +179,7 @@ def _grep_sessions(query, rows, cap=60):
             continue
         snip = ""
         try:
-            line = _sp.run(["grep", "-iF", "-m1", query, path], capture_output=True,
+            line = _sp.run(["grep", "-iF", "-m1", "--", query, path], capture_output=True,
                            text=True, timeout=10).stdout.strip()
             i = line.lower().find(query.lower())
             if i >= 0:
@@ -217,7 +226,9 @@ def deep_search(query, limit=40, scope=None, include_synthetic=False):
             work.append(h)
         return work, syn
     try:
-        p = _sp.run(["cv", "search", query, "--json", "--limit", str(limit)],
+        # flags first, then `--`, then the user-controlled query — a query
+        # beginning with `-` must reach cv as a positional, never a flag
+        p = _sp.run(["cv", "search", "--json", "--limit", str(limit), "--", query],
                     capture_output=True, text=True, timeout=45)
         if p.returncode == 0 and p.stdout.strip().startswith("["):
             hits = [{"harness": h.get("harness", "?"), "id8": (h.get("id") or "")[:8],
@@ -237,7 +248,7 @@ def deep_search(query, limit=40, scope=None, include_synthetic=False):
     except (_sp.TimeoutExpired, ValueError):
         pass  # fall through to the table parse
     try:
-        p = _sp.run(["cv", "search", query, "--limit", str(limit)],
+        p = _sp.run(["cv", "search", "--limit", str(limit), "--", query],
                     capture_output=True, text=True, timeout=60)
     except _sp.TimeoutExpired:
         return {"error": "cv search timed out"}
@@ -269,8 +280,15 @@ def deep_search(query, limit=40, scope=None, include_synthetic=False):
 
 def _cv_show(sid, rng=None, harness=None):
     import subprocess as _sp
-    args = ["cv", "show", sid, "--json"] + (["--range", rng] if rng else []) \
-        + (["--harness", harness] if harness else [])
+    # sid/harness can arrive raw from a GET param (non-catalog sessions read via
+    # cv directly): both must LOOK like ids, and the sid rides after `--` so it
+    # can never be parsed as a cv flag.
+    if not _SAFE_TOKEN.match(sid or ""):
+        raise ProviderError(f"invalid session id {sid!r}")
+    if harness and not _SAFE_TOKEN.match(harness):
+        raise ProviderError(f"invalid harness {harness!r}")
+    args = ["cv", "show", "--json"] + (["--range", rng] if rng else []) \
+        + (["--harness", harness] if harness else []) + ["--", sid]
     p = _sp.run(args, capture_output=True, text=True, timeout=60)
     if p.returncode != 0:
         raise ProviderError(f"cv show failed: {(p.stderr or '').strip()[:200]}")
@@ -506,10 +524,13 @@ def _log_mint(row, account, model):
 
 def _native_cmd(row, model=None):
     """The harness's own resume invocation with no provider in the loop —
-    helm degrades to a single-account tool instead of a broken one."""
+    helm degrades to a single-account tool instead of a broken one.
+    The sid is shell-quoted: catalog ids derive from filenames, and a pasteable
+    command must stay a resume command whatever the filename looked like."""
+    sid = shlex.quote(row["i"])
     if row["h"] == "claude":
-        return "claude" + (f" --model {shlex.quote(model)}" if model else "") + f" --resume {row['i']}"
-    return f"codex resume {row['i']}"
+        return "claude" + (f" --model {shlex.quote(model)}" if model else "") + f" --resume {sid}"
+    return f"codex resume {sid}"
 
 
 def make_cmd(account, sid, model=None):

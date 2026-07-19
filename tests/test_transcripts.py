@@ -104,6 +104,45 @@ class TranscriptsTest(unittest.TestCase):
         # scope that matches nothing
         self.assertEqual(transcripts.deep_search("flux", scope="nosuchproj")["hits"], [])
 
+    # -- argument-injection guards (audit: grep/cv argv without `--`) ------
+    def test_scoped_search_dash_query_is_literal_not_a_flag(self):
+        # a query beginning with '-' must reach grep as a PATTERN (after `--`),
+        # never as a flag; pre-fix grep errored on "unrecognized option" and the
+        # search silently returned nothing (or worse: -f/path read a file)
+        self._plant_claude(SID_A, self.alpha, "note the --evil-flag marker here")
+        self._fresh_catalog()
+        res = transcripts.deep_search("--evil-flag", scope="alpha")
+        self.assertNotIn("error", res)
+        self.assertEqual([h["sid"] for h in res["hits"]], [SID_A])
+        self.assertIn("--evil-flag", res["hits"][0]["snippet"])
+
+    def test_cv_search_query_rides_after_double_dash(self):
+        done = mock.Mock(returncode=0, stdout="[]", stderr="")
+        with mock.patch("subprocess.run", return_value=done) as run:
+            transcripts.deep_search("--limit")
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:2], ["cv", "search"])
+        self.assertIn("--", argv)
+        # the user query is positional AFTER the `--` terminator
+        self.assertEqual(argv[argv.index("--") + 1], "--limit")
+
+    def test_cv_show_rejects_flag_shaped_sid_and_harness(self):
+        with self.assertRaises(transcripts.ProviderError):
+            transcripts._cv_show("--rm-everything")
+        with self.assertRaises(transcripts.ProviderError):
+            transcripts._cv_show("okayid-123456", harness="--json")
+        # a flag-shaped sid via get_session surfaces as an error dict, not argv
+        self._fresh_catalog()
+        res = transcripts.get_session("--harness=evil")
+        self.assertIn("error", res)
+        # a legit sid builds argv with the sid after `--`
+        done = mock.Mock(returncode=0, stdout='{"messages": []}', stderr="")
+        with mock.patch("subprocess.run", return_value=done) as run:
+            transcripts._cv_show("deadbeef-1234", rng="0-1", harness="hermes")
+        argv = run.call_args[0][0]
+        self.assertEqual(argv, ["cv", "show", "--json", "--range", "0-1",
+                                "--harness", "hermes", "--", "deadbeef-1234"])
+
     # -- _resolve_sid ------------------------------------------------------
     def test_resolve_sid_prefix_rules(self):
         self._plant_claude(SID_A, self.alpha, "alpha work")
