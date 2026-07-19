@@ -261,6 +261,65 @@ $ helm record status
   a1b2c3d4       3m    4       0     0     1     2    5
 ```
 
+### `helm mentor [observe <project> [--since 7d] | teach <project> "<id> | <steer>" [--signal S] [--pattern RE] [--marker PATH] [--teacher NAME] [--attest] | review <project> | log [--project P]]`
+The inception actuator — observe / teach / review over a junior, where the
+junior is a **project/seat** (v1 same-home): a taught reflex in
+`<project>/reflexes/` reaches every future session of every harness through
+the inject hooks already installed, so delivery is free and teaching is the
+only new verb.
+
+`observe` is the ranked critique brief, **read-only**: the window's sessions
+(the catalog lens, all harnesses) joined with the recorder's per-session
+counters (stuck / loop-thrash / passive / uncommitted streaks), their
+transcript tails scanned for **lexicon-seeded bug-class terms** — literal
+needles only, seeded exclusively from lexicon entries of kind `bug-class`
+(`helm store add lexicon "<term> | <definition> | bug-class"`), never open
+inference — plus what the estate already observes (drift findings read
+snapshot-free, evolve's fire-ledger and reflex observers). Deterministic
+signals supply the eyes and hands; the senior **model** does the judging:
+every miss-pattern mints a paste-ready `teach` command, nothing is ever
+auto-taught.
+
+`teach` (the incept) is the **one writing subverb**: one reflex file into the
+target project's `reflexes/`, written by the reflex byte-shape owner and then
+annotated in place with `teacher`/`target`/`stated_ts` provenance, plus one
+events-journal receipt. A same-id file in the project is a hard refuse
+(supersede-not-duplicate), an unknown project is refused (a taught reflex
+must have a reachable junior). `--attest` chains the incept onto the premise
+ledger: one signed self-write turn carrying `ment:b2b:<blake2b-256>` over the
+canonical incept text `<target>/<id> | <steer> | teacher: <name>` — teaching
+provenance provable, `premise-check`-style. Substrate down: the reflex still
+lands, said loudly; `helm mentor teach <project> <id> --attest` (no steer)
+backfills the attestation later.
+
+`review` re-runs observe scoped per taught reflex: fires since its
+`stated_ts` off the inject fire-ledger (**did it even fire?**) and the
+id-term's transcript recurrence before → after (session-granular mentions,
+the teaching session included). The ledger logs fires, not heeds; mentions
+are not outcomes — the report says so. `log` is who taught what, when,
+fired-since, retired/attested marked; hand-authored reflexes stay invisible
+(no teacher, not taught).
+
+**Writer gate (loud in `--help`):** teach writes ONE file in THIS helm home —
+`<project>/reflexes/reflex-<id>.md` — and nothing else, ever; observe /
+review / log write nothing (no drift snapshot consumed, no registry sync, no
+ledger row). v1 is same-home; cross-operator teach is out of scope until
+packs exist. Fail-open throughout: a dead catalog, torn counters, or an
+absent ledger degrades to an empty section, never a crash.
+
+```console
+$ helm mentor observe myproject
+helm mentor observe myproject — last 7d: 5 sessions scanned:
+  MISS-PATTERNS — bug-class terms in the window's transcripts:
+    identified-fix-filed-not-fixed       2 sessions, 3 mentions
+      teach: helm mentor teach myproject "identified-fix-filed-not-fixed | <steer>" --pattern "identified\-fix\-filed\-not\-fixed"
+$ helm mentor teach myproject "identified-fix-filed-not-fixed | an identified fix lands in-pass, never a TODO" --attest
+helm mentor: TAUGHT 'identified-fix-filed-not-fixed' -> myproject (prompt) by david
+$ helm mentor review myproject
+  identified-fix-filed-not-fixed  taught 2026-07-19T09:00:00Z by david [attested]
+    fired since taught: 3 turns (inject ledger)
+```
+
 ### `helm whoami [note <text...> [--topic T] [--supersedes <note-name>]]`
 The know-your-user leg: what your agents know about you — profile plus dated,
 superseding notes. Bare `helm whoami` prints it; `note` grows it.
