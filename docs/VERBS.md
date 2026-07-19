@@ -97,10 +97,13 @@ across every root (the adopted live store, the global chain, each project's
 chain). The full sub-grammar:
 
 ```
-helm store list [--type T] [--all]         entries (live; --all incl. retired)
+helm store list [--type T] [--all] [--candidates]
+                                           entries (live; --all incl. retired;
+                                           --candidates = inferred captures only)
 helm store get <id>                        one entry, full record
 helm store resolve <text>                  JIT lookup — what fires for this prompt
                                            (or pipe the prompt on stdin)
+helm store confirm <id> [--edit <def...>]  promote a candidate -> live (lexicon v1)
 helm store pinned [--stats]                the always-on lane (--stats: budget
                                            walk + ledger made-it/starved counts)
 helm store add <type> <id> | <statement> [| ...]
@@ -109,7 +112,9 @@ helm store add <type> <id> | <statement> [| ...]
     lexicon:   <term> | <definition> [| kind [| ex1 || ex2]]
     heuristic: <id> | <move> [| trigger-csv [| domain]]
     reference: <id> | <summary> [| url [| keywords [| domain]]]
-    flags: [--source S] [--rationale <text...>]    rationale seeds evidence_log
+    flags: [--source S] [--rationale <text...>] [--candidate]
+           --candidate (lexicon v1): SAFE inferred capture — writes a non-live
+           candidate EXCLUDED from inject/resolve until `confirm`ed
 helm store evidence <ts> <id> <delta> <reason...>  move a belief (logged + clamped)
 helm store supersede <ts> <old-id> <new-id> [reason]  TOMBSTONE old (file kept)
 helm store retire <ts> <id> [why...]               retire (file kept as the record)
@@ -136,6 +141,25 @@ never blocks. Lexicon is exempt: redefining a term is its update lane.
 many entries carry that keyword), summed and confidence-weighted — one rare
 keyword outranks a pile of shared ones. Ties break most-recently-updated,
 never alphabetical. `helm inject --explain` shows the per-probe contributions.
+
+**Candidate tier (safe inferred capture).** An agent-inferred entry lands as
+`status:candidate` (v1: lexicon; `add lexicon ... --candidate`, `source:
+inferred`). A candidate is a *non-live* status, so the resolver's live-filter
+already EXCLUDES it from resolve / pinned / inject — the hard law: nothing
+inferred is ever silently authoritative. `list --candidates` surfaces them (and
+coach's dup-search reads `store.candidates()`); `helm store confirm <id>
+[--edit <def...>]` promotes candidate → live (`source:explicit`) with an events
+receipt. Decay is operator-visible, never a silent job: `helm drain
+--expire-candidates [--days N] [--apply]` archives-then-prunes unconfirmed
+candidates older than N days (14 default; a no-timestamp candidate never
+expires; dry-run default; net + receipt).
+
+**Adopted project roots.** With `--project P`, the store also reads P's OWN
+claude memory dir(s) as `adopted-project` roots (canonical cwd + observed
+worktrees, collapsed to one project, registry-resolved + mtime-cached). Shadow
+order: `project > adopted-project > helm-global > adopted` — so `--project P`
+fires P's own priors, and the authored `~/.helm/P` layer still overrides raw
+adopted content.
 
 Every mutating verb leaves a **receipt**: one `{v, ts, actor, verb, target,
 summary}` line appended to `_global/.state/events.jsonl` through one pk-level
@@ -213,13 +237,35 @@ $ echo "how should we drain the memory backlog?" | helm inject --project myproje
 TERM drain: routing raw memory intake to typed homes ...
 ```
 
-### `helm drain [--apply] [--sweep-dups] [--limit N] | --rekey [--apply]`
+### `helm drain [--apply] [--sweep-dups] [--limit N] [--project P] | --rekey [--apply] | --expire-candidates [--days N] [--apply]`
 Classify raw memory intake and route entries to their typed homes, archiving
 sources with a reference back. **Dry-run by default** — nothing moves without
 `--apply`, and the rollback net is verified non-empty first. Conflicts are
 never auto-resolved. Drained feedback becomes a prior with keywords derived
 from the full statement's distinctive words (≥ 5 chars, non-generic,
 frequency-then-length ranked, cap 8).
+
+`--project P` drains P's OWN claude memory dir (the adopted per-project pile)
+with the identical classify/apply gauntlet — including the upgrade op below. A
+registry **alias map** (built-in `buildr → buildr-private-beta`, `mc →
+mission-control`, plus any authored per-project `aliases`) routes the otherwise
+unroutable project entries; a short alias (`mc`) matches by filename only (a
+2-char word wallpapers a description scan).
+
+**The upgrade op (drain v2).** Typed-PREFIX files that never carried typed
+fields — `prem-`/`prior-`/`lex-` bulk that falls back to episodic (visible,
+never injected) — are upgraded in place to real typed entries: `lex-` →
+lexicon; `prem-`/`prior-` → a prior at **0.9 jit, NOT 1.0** (a `prem-` prefix
+on bulk memory is a naming accident, not an attestation — the premise tier
+needs the ledger path). id from the filename, statement from the description,
+keywords via the same derivation, body verbatim. Upgrade fires only when **≥ 2
+specific keywords** survive; terser files stay episodic and are reported. All
+the normal machinery applies (dry-run, verified net, receipt, MEMORY.md
+re-pointing); `--sweep-dups` still carries the twin sweeps in the same pass.
+
+`--expire-candidates [--days N]` prunes unconfirmed store candidates older than
+N days (14 default) — the operator-visible candidate decay leg (archive-first
+net + receipt; a no-timestamp candidate never expires).
 
 `--rekey` is the one-time migration for the already-drained cohort: every
 store prior whose evidence log says "drained from feedback memory" gets its
@@ -235,6 +281,51 @@ $ helm drain --rekey
 helm drain --rekey: 413 drained priors — 413 to rekey, 0 already rekeyed
 ...
 helm drain --rekey: DRY-RUN (nothing written). Re-run with --apply.
+```
+
+### `helm promote [--since Nd] [--cap N] [--apply]`
+The episodic → durable funnel: the mouth that moves knowledge from the "did"
+leg (thousands of transcripts) into "believes/means". Scans recent transcript
+jsonl for durable-knowledge markers (`from now on`, `remember this`, `always`,
+`never`, `the rule is`, `going forward`, `make it a rule`) in **REAL
+USER-typed text only** — tool_result blocks and assistant turns never count,
+and a length guard drops long task prompts. Each hit becomes a drain-intake
+CANDIDATE file (`feedback-promoted-*`, `type:feedback`) carrying
+`{origin_session, origin_line, proposed_type, capture_confidence}` — **never
+directly into the typed store**; the existing drain `classify → dry-run →
+apply` gauntlet gates it (routes feedback → prior). Precision is load-bearing:
+USER-role only + length guard + per-run cap + dedupe (slug + token-overlap vs
+existing priors and already-written intake) + an incremental `(mtime,size)`
+scan cache. **Dry-run by default**; `--apply` writes the intake candidates,
+then `helm drain` reviews and `helm drain --apply` lands them.
+
+```console
+$ helm promote --since 3d
+helm promote: scanned 278 files (0 cached-skip), 34 promotion candidates found
+  + codex-final-blackboard-delivery [prior c=0.50] (b8477e64 L34576): Codex delivery rule: always end ...
+helm promote: DRY-RUN (no intake files written). Re-run with --apply, then `helm drain` to route them.
+```
+
+### `helm index cap [--budget-lines N] [--apply]`
+The MEMORY.md budget actuator (memGC's missing half). MEMORY.md is injected
+natively at every SessionStart and post-compact and nothing evicts it, so it
+regrows past budget. `index cap` DEMOTES (unlinks) index link lines whose
+backing file is a typed jit-resolvable entry — the safety rail: the content
+stays reachable through inject, so unlinking is **provably lossless** — ranked
+oldest `last_updated` first, until under the line budget (60 default). It
+**never** demotes an always-class line (pinned) or an untyped/dormant line
+(unreachable via inject — run `helm drain` v2 first so more lines gain a typed
+backing; sequencing is the point). Demoted lines archive to a drain-style net +
+receipt; **dry-run by default**; on `--apply` MEMORY.md is re-read fresh and
+atomically rewritten so a concurrent native append survives. The self-firing
+half is one documented **Stop-hook line** — `helm index cap --apply` — so the
+write path structurally cannot exceed budget.
+
+```console
+$ helm index cap
+helm index cap: MEMORY.md 65 lines / 19402B (budget 60 lines, 5 over); 36 demotable (typed jit-resolvable — lossless)
+  - - [payload frugality](prior-payload-frugality.md) — ...  [prior-payload-frugality.md stays live via inject]
+helm index cap: DRY-RUN (MEMORY.md untouched). Re-run with --apply.
 ```
 
 ### `helm sweep [--apply] [--project P]`
