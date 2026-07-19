@@ -7,10 +7,10 @@ import unittest
 
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 
-from helm import home, reflex  # noqa: E402
+from helm import chat, home, reflex  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
-            "HELM_CACHE_DIR", "MELD_CACHE_DIR")
+            "HELM_CACHE_DIR", "MELD_CACHE_DIR", "HELM_CHAT_DIR", "MELD_CHAT_DIR")
 
 
 class ReflexTest(unittest.TestCase):
@@ -67,6 +67,7 @@ class SeedBase(unittest.TestCase):
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
         os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
+        os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.makedirs(os.environ["HELM_ADOPTED_DIR"])
 
     def tearDown(self):
@@ -82,16 +83,23 @@ class SeedBase(unittest.TestCase):
 
 
 class SeedDefaultsTest(SeedBase):
-    def test_seed_installs_three_marked_defaults(self):
+    def test_seed_installs_four_marked_defaults(self):
         wrote = reflex.seed_defaults()
-        self.assertEqual(len(wrote), 3)
+        self.assertEqual(len(wrote), 4)
         es = self.by_id()
-        self.assertEqual(sorted(es), ["compaction-continuity",
-                                      "correction-language", "punt-tell"])
+        self.assertEqual(sorted(es), ["compaction-continuity", "correction-language",
+                                      "owner-chat-unread", "punt-tell"])
         for e in es.values():
             self.assertEqual(e["source"], "helm-default")  # shipped, legibly
-            self.assertEqual(e["signal"], "prompt")
-            self.assertTrue(e["pattern"])
+        for rid in ("compaction-continuity", "correction-language", "punt-tell"):
+            self.assertEqual(es[rid]["signal"], "prompt")
+            self.assertTrue(es[rid]["pattern"])
+        # the chat notify reflex: marker-file on the room's owner-unread flag,
+        # path resolved at SEED time from HELM_CHAT_DIR (env-respecting)
+        e = es["owner-chat-unread"]
+        self.assertEqual(e["signal"], "marker-file")
+        self.assertEqual(e["marker"], chat.marker_path("main"))
+        self.assertTrue(e["marker"].startswith(os.environ["HELM_CHAT_DIR"]))
 
     def test_reseed_is_a_byte_identical_noop(self):
         reflex.seed_defaults()
@@ -126,9 +134,9 @@ class SeedDefaultsTest(SeedBase):
 
     def test_scaffold_global_seeds_and_stays_idempotent(self):
         home.scaffold_global()
-        self.assertEqual(len(reflex.load_all()), 3)
+        self.assertEqual(len(reflex.load_all()), 4)
         home.scaffold_global()
-        self.assertEqual(len(reflex.load_all()), 3)
+        self.assertEqual(len(reflex.load_all()), 4)
 
 
 class DefaultPackFiringTest(SeedBase):
@@ -152,6 +160,15 @@ class DefaultPackFiringTest(SeedBase):
                   "good enough for now",
                   "park it until next session"):
             self.assertEqual(self.fired(t), ["punt-tell"], t)
+
+    def test_owner_chat_unread_fires_on_marker_only(self):
+        # the chat notify loop: marker present -> fires on ANY turn text;
+        # consumed (cleared) -> silent again
+        chat.post("agents, status?", who="david")
+        chat.mark_owner_unread()
+        self.assertEqual(self.fired("totally unrelated turn"), ["owner-chat-unread"])
+        chat.consume(total=chat.read()[1])
+        self.assertEqual(reflex.fire("totally unrelated turn"), [])
 
     def test_compaction_continuity_fires(self):
         for t in ("This session is being continued from a previous conversation.",

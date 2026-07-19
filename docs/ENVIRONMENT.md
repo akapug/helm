@@ -39,6 +39,13 @@ overrides are in effect.
 | `HELM_CONFIG_ROOTS` | `~/dev` | `helm configs` — colon-separated roots for the project-scope config tree walk | `SESH_CONFIG_ROOTS` |
 | `HELM_SKILL_DECK` | — (no deck; nothing provisioned) | `helm homes create` — a directory of skill dirs (each carrying a `SKILL.md`), symlinked into every new claude home's `skills/` so any credential loads the same setup; existing entries are never touched | — |
 
+## chat
+
+| variable | default | read by | legacy fallback |
+|---|---|---|---|
+| `HELM_CHAT_DIR` | `/dev/shm/helm-chat` (tmpfs — the rooms live in RAM) | `helm chat` + the web chat panel — the room dir (one `<room>.jsonl` + `<room>.owner-unread` marker per room); the override is how tests point it at a tmp dir | — |
+| `HELM_CHAT_NAME` | — (the best local identity guess: session id, then user) | `helm chat post` — the `from` name on every message | — |
+
 ## accounts and quota
 
 | variable | default | read by | legacy fallback |

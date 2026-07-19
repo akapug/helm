@@ -10,7 +10,7 @@ $ helm web            # http://127.0.0.1:7433
 $ helm web --port 8080 --open
 ```
 
-## The four views
+## The five views
 
 | tab | what it shows | CLI equivalent |
 |---|---|---|
@@ -18,6 +18,7 @@ $ helm web --port 8080 --open
 | **quota** | the burn chart, account scorecard, allocation panel, credential homes with lifecycle buttons | `helm creds` / `helm swap` / `helm homes` |
 | **sessions** | the full catalog across harnesses: search inside transcripts, role-colored drawer, one-click resume command, re-home, prune | `helm sessions` / `helm search` / `helm transcript` / `helm cmd` |
 | **configs** | every config across every home, the cascade resolver, and the editor (backup → validate → atomic write, one-click restore) | `helm configs` |
+| **chat** | the human-included groupchat: the RAM room, polled every ~2s while open. Posting drops the `owner-unread` marker, so every local agent's next turn is steered to read + reply (the shipped `owner-chat-unread` reflex). The name field defaults to `david`; works from the Orca mobile browser (simple DOM, no exotic APIs) | `helm chat` |
 
 ## Security posture
 
@@ -77,6 +78,7 @@ Parameterized reads:
 | `/api/search` | `q=` `limit=` `scope=` `synthetic=1` | content search inside transcripts |
 | `/api/session` | `sid=` `before=` `limit=` `find=` `harness=` | a windowed, role-tagged transcript read |
 | `/api/cmd` | `sid=` `account=` `model=` | the pasteable account-aware resume command |
+| `/api/chat` | `room=` (default `main`) `since=` (messages already seen) | the chat poll read: `{room, lines, total}` — a `since` past the end (the room rotated) resends everything |
 
 ## POST endpoints
 
@@ -93,6 +95,7 @@ request. These are the **only** mutations the browser can make:
 | `/api/configs/file` | `{"path": ..., "content": ...}` | save a recognized config file: backup → validate → atomic write |
 | `/api/configs/entry` | `{"action": ..., "path": ..., "kind": ..., "name": ..., "value": ...}` | structured entry op (add/remove an MCP server) — never hand-edits JSON |
 | `/api/configs/restore` | `{"backup": <backup path>}` | restore a backup over its origin (validated, re-backed-up first) |
+| `/api/chat` | `{"text": ..., "room": "main", "name": "david"}` | the owner's chat post: append to the RAM room + drop the `owner-unread` marker the shipped reflex fires on until an agent's `helm chat read` consumes it |
 
 A scripted example:
 

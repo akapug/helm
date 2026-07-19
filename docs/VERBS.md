@@ -361,6 +361,41 @@ $ helm cell status
 helm cell: node LIVE at http://127.0.0.1:8899 — chain head 43 ...
 ```
 
+## chat — the human-included groupchat
+
+### `helm chat [post <text...> | read [--since N] [--follow] | rooms] [--room R]`
+One shared conversation log + notify + read/write loop, **owner in the room**.
+Rooms live in RAM (`/dev/shm/helm-chat/<room>.jsonl`, dir 0700, default room
+`main`; `HELM_CHAT_DIR` overrides) — ephemeral presence-chat, not the durable
+record: past ~2 MB the oldest half rotates out, so `/premise` anything that
+must outlive the room. `post` writes as `$HELM_CHAT_NAME` (else the best local
+identity guess: session, then user). `read` prints the room (`--since N` skips
+the first N messages); `read --follow` polls and prints new lines until Ctrl-C.
+
+The notify loop: when the owner posts from the web panel, helm drops a
+`<room>.owner-unread` marker and the shipped `owner-chat-unread` reflex steers
+every local agent's **next turn** to read and reply — any `helm chat read`
+that consumes past the owner's post clears it. Agents never poll; the
+already-installed inject hooks deliver the nudge.
+
+```console
+$ helm chat post "seat B: web slice landed, starting docs"
+$ helm chat read --since 40
+$ helm chat read --follow        # the owner's orca pane sidecar, exactly this
+```
+
+**Chat path (the AX↔UX law — the owner never types the CLI).** Say it and
+your agent runs it:
+
+- "**tell the fleet:** …" / "**post in helm chat:** …" → `helm chat post "…"`
+- "**any chat for me?**" / "**read the room**" → `helm chat read`
+- "**watch the chat**" (in an orca pane) → `helm chat read --follow`
+- "**that chat point about X — keep it**" → `/premise` (chat is ephemeral;
+  the store is the record)
+
+The owner's own surface is the web panel (**chat** tab in `helm web`): type
+there and every local agent sees it next turn — see [WEB.md](WEB.md).
+
 ## ops — health, evolution, the browser
 
 ### `helm brief [--hours N] [--json]`
@@ -394,8 +429,8 @@ evidence, what's missing. **Proposes, never mutates** — the anti-rulesurf
 gate is constitutional (see [EVOLUTION.md](EVOLUTION.md)).
 
 ### `helm web [--port N] [--open]`
-The same truth, warm, in a browser: four views (knowledge home, quota,
-sessions, configs) served self-contained on `127.0.0.1:7433`. `--open`
+The same truth, warm, in a browser: five views (knowledge home, quota,
+sessions, configs, chat) served self-contained on `127.0.0.1:7433`. `--open`
 launches your browser. Full surface, API table, and a systemd unit:
 [WEB.md](WEB.md).
 

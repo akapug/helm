@@ -34,7 +34,8 @@ EVERY_TURN_BUDGET = 3  # max constant steers per injection — habituation guard
 # the lane is live out of the box. Each lands as a normal store entry marked
 # source: helm-default (shipped vs authored stays legible); operators edit or
 # retire them like any authored reflex and seeding never touches an existing id
-# again. All prompt-signal: none fires on a generic turn (specificity law).
+# again. Nothing here fires on a generic turn (specificity law): the prompt
+# signals demand their phrase, the marker signal demands the owner's chat post.
 DEFAULT_PACK = (
     {"id": "correction-language",
      "pattern": r"\b(no,? actually|that'?s (wrong|not what)|i (said|told you)|stop doing)\b",
@@ -53,6 +54,12 @@ DEFAULT_PACK = (
      "pattern": r"\b(summarized|compacted|continu(ed|ing) from)\b",
      "steer": "Compaction marker detected: re-read .remember/now and the live task "
               "state before acting — settled decisions are not re-derived."},
+    {"id": "owner-chat-unread",
+     # the chat notify loop: the owner's web post drops the marker; any
+     # `helm chat read` that consumes past it clears it (chat.consume)
+     "signal": "marker-file",
+     "steer": "Owner posted in helm chat — read it (`helm chat read`) and reply "
+              "(`helm chat post ...`) before continuing."},
 )
 
 
@@ -60,12 +67,18 @@ def seed_defaults():
     """Install DEFAULT_PACK into _global/reflexes, marked source: helm-default.
     Idempotent by id: an existing file — operator-edited, re-worded, or retired
     — is never overwritten; a re-seed of a present id is a no-op. Returns the
-    paths actually written (empty on re-seed)."""
+    paths actually written (empty on re-seed). The chat marker path resolves at
+    SEED time (env-respecting — HELM_CHAT_DIR), never at import time."""
     out = []
     for d in DEFAULT_PACK:
         if os.path.exists(reflex_path(d["id"])):
             continue
-        out.append(write(dict(d, signal="prompt", source="helm-default")))
+        e = dict(d, source="helm-default")
+        e.setdefault("signal", "prompt")
+        if e["signal"] == "marker-file" and not e.get("marker"):
+            from . import chat
+            e["marker"] = chat.marker_path("main")
+        out.append(write(e))
     return out
 
 

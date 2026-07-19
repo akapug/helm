@@ -7,9 +7,10 @@ delete = move to trash — archive-not-delete, nothing is ever destroyed;
 census-validated), the homes lifecycle verbs (prepare/verify/archive/
 unarchive/migrate — directory moves only, archive-not-delete, live-agent
 refusals; logins stay human-only), the session verbs (cwd re-home / prune —
-metadata + new-copy only) and the configs editor (backup→validate→atomic,
-recognized files only). All of it localhost-only, and every mutation demands
-the per-process bearer token (MUTATION_TOKEN) — 403 without.
+metadata + new-copy only), the configs editor (backup→validate→atomic,
+recognized files only) and the chat post (an append to the RAM room — the
+owner's side of the groupchat). All of it localhost-only, and every mutation
+demands the per-process bearer token (MUTATION_TOKEN) — 403 without.
 
 Laws: localhost-only bind (127.0.0.1, default port 7433), Python stdlib only,
 one self-contained UI file (web_ui.html) served at /. The store and whoami
@@ -661,6 +662,40 @@ def _api_physics_diff(qs):
                                 cwd=_q1(qs, "cwd") or None), 200
 
 
+# ── chat: the human-included groupchat (chat.py owns rooms + markers) ──
+# The web panel is the OWNER's surface (gui-first-owner law); agents live on
+# `helm chat`. GET is an open read (loopback + same-origin only, like every
+# GET); POST rides the mutation bearer and drops the owner-unread marker so
+# the shipped reflex surfaces the message to every local agent next turn.
+
+def _api_chat(qs):
+    """Poll read: messages after ?since= (count already seen) + the new total.
+    The panel polls this every ~2s while open; since past the end resets."""
+    try:
+        since = int(_q1(qs, "since", "0"))
+    except ValueError:
+        return {"error": "since wants an integer"}, 400
+    try:
+        from . import chat
+        room = _q1(qs, "room", "main")
+        msgs, total = chat.read(room, since)
+        return {"room": room, "lines": msgs, "total": total}, 200
+    except Exception:
+        return {"unavailable": True}, 200
+
+
+def _api_chat_post(payload):
+    """The owner's post: append + mark owner-unread. name defaults to david."""
+    from . import chat
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return {"error": 'payload wants {"text": "..."} (non-empty)'}, 400
+    room = str(payload.get("room") or "main")
+    msg = chat.post(text.strip(), room, who=str(payload.get("name") or "david"))
+    chat.mark_owner_unread(room)
+    return {"ok": True, "msg": msg, "total": chat.read(room)[1]}, 200
+
+
 # ── sessions surface: catalog / search / session / cmd / cwd / prune ──
 # ABSORBED contracts from sesh (server/sesh.py route handlers): same query
 # params + response shapes, thin wrappers over transcripts.py (which owns the
@@ -794,6 +829,7 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/search": _api_search,
     "/api/session": _api_session,
     "/api/cmd": _api_cmd,
+    "/api/chat": _api_chat,
 }
 
 POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
@@ -805,6 +841,7 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
     "/api/configs/file": _api_configs_file_post,
     "/api/configs/entry": _api_configs_entry_post,
     "/api/configs/restore": _api_configs_restore_post,
+    "/api/chat": _api_chat_post,
 }
 
 
