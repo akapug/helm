@@ -95,6 +95,7 @@ VERBS = {
     "home": cmd_home,
     "sync": cmd_sync,
     "projects": cmd_projects,
+    "projections": _lazy("registry", "cmd_projections"),
     "show": cmd_show,
     "brief": _lazy("brief", "cmd_brief"),
     "store": _lazy("store", "cmd_store"),
@@ -135,6 +136,7 @@ VERBS = {
 
 _VERB_HELP = {
     "brief": "brief [--hours N] [--json] — the operator's morning brief: sessions, knowledge delta, seats, owner gates (read-only, never probes)",
+    "projections": "projections [--json] — the projection registry: every derived store, its class, source + rebuild (laws 2+3's read surface; doctor enforces)",
     "store": "store list|get|add|resolve|demote|events|... — the one typed knowledge store",
     "inject": "inject [--project P] [--json|--explain|--hook-json|--lane-report] — per-turn context for harness hooks (stdin: prompt or hook JSON)",
     "drain": "drain [--apply] — route raw memory intake to typed homes (dry-run default)",
