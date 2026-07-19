@@ -36,6 +36,27 @@ def check_home():
     return out
 
 
+def check_authored():
+    """The authored registry layer: file parses, entries merge (path-matched
+    projection record, or an external anchor). Raw reads only — never triggers
+    the load()-time migration."""
+    path = home.authored_path()
+    if not os.path.exists(path):
+        return []
+    auth = pk.read_json(path)
+    entries = auth.get("projects") if isinstance(auth, dict) else None
+    if not isinstance(entries, dict):
+        return [(FAIL, "registry-authored.json does not parse (%s)" % path)]
+    reg = pk.read_json(home.registry_path())
+    projects = (reg.get("projects") if isinstance(reg, dict) else None) or {}
+    live = sum(1 for n, e in entries.items()
+               if e.get("external") or (n in projects and
+                  e.get("path", projects[n].get("path")) == projects[n].get("path")))
+    n = len(entries)
+    return [(OK, "authored layer: %d entr%s, %d live in merge"
+             % (n, "y" if n == 1 else "ies", live))]
+
+
 def check_projects():
     """Per registry project: home dir sane (broken symlink = FAIL), repo path
     still on disk (gone = WARN), memory_dir pointer still valid (gone = WARN)."""
@@ -163,8 +184,9 @@ def check_physics_currency():
     return out
 
 
-CHECKS = ("check_home", "check_projects", "check_adoption", "check_adopted_store",
-          "check_know_your_user", "check_cv", "check_env", "check_physics_currency")
+CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
+          "check_adopted_store", "check_know_your_user", "check_cv", "check_env",
+          "check_physics_currency")
 
 
 def cmd_doctor(args):

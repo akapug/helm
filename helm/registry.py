@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """The helm registry — the master project list + per-project overlay pointers.
 
-The registry is a PROJECTION of observed reality (harness stores + disk) plus
-two authored layers that survive re-sync: lineage EDGES and manual annotations.
-Sync law: additive and idempotent — a re-sync refreshes observations, never
-deletes a known project, never touches authored fields.
+Two files under the helm home, composed at read time:
+  registry.json           the PROJECTION of observed reality (harness stores +
+                          disk) — rebuildable from a re-scan, safe to regenerate.
+  registry-authored.json  the AUTHORED layer (AUTHORED_FIELDS: what a human or
+                          agent wrote) — keyed by project name, path-stamped,
+                          unrebuildable, never regenerated.
+load() returns the merged view (authored fields overlay their path-matched
+projection record; external anchors materialize even with no projection record)
+so every caller sees the pre-split shape; save() splits the merged view back
+out. A mixed-era registry.json migrates its authored fields out ONCE, at load,
+losslessly. Sync law: additive and idempotent — a re-sync refreshes
+observations, never deletes a known project, never touches authored fields.
 
 Adoption law: where a project already has a knowledge home (mission-control's
 ~/.mc/mission-control), ~/.helm/<name> becomes a SYMLINK to it — one chain,
@@ -24,13 +32,66 @@ ADOPTED_HOMES = {
 }
 
 
+def _authored_load():
+    return pk.read_json(home.authored_path(), {"version": 1, "projects": {}})
+
+
 def load():
-    return pk.read_json(home.registry_path(), {"version": 1, "projects": {}})
+    """The merged view. Migration: authored fields found inline in a mixed-era
+    registry.json move to the authored file ONCE (idempotent; an already-
+    authored value outranks a stale mixed copy; a same-name entry authored
+    against a different path is never grafted onto — the collision class that
+    once let a project inherit another's edges)."""
+    reg = pk.read_json(home.registry_path(), {"version": 1, "projects": {}})
+    projects = reg.setdefault("projects", {})
+    auth = _authored_load()
+    entries = auth.setdefault("projects", {})
+    moved = False
+    for name, rec in projects.items():
+        found = [k for k in AUTHORED_FIELDS if k in rec]
+        if not found:
+            continue
+        entry = entries.setdefault(name, {"path": rec.get("path", "")})
+        if entry.get("path", rec.get("path")) != rec.get("path"):
+            continue
+        for k in found:
+            entry.setdefault(k, rec.pop(k))
+        moved = True
+    if moved:
+        pk.write_json(home.authored_path(), auth)
+        pk.write_json(home.registry_path(), reg)
+    for name, rec in projects.items():
+        entry = entries.get(name)
+        if entry and entry.get("path", rec.get("path")) == rec.get("path"):
+            rec.update({k: entry[k] for k in AUTHORED_FIELDS if k in entry})
+    for name, entry in entries.items():  # external anchors outlive a projection wipe
+        if name in projects or not entry.get("external"):
+            continue
+        rec = {"name": name, "path": entry.get("path", ""), "kind": "external",
+               "status": "external", "sessions": {}, "last_seen": None}
+        rec.update({k: entry[k] for k in AUTHORED_FIELDS if k in entry})
+        projects[name] = rec
+    return reg
 
 
 def save(reg):
+    """Split write: authored fields -> registry-authored.json (per project,
+    path-stamped), everything else -> registry.json (pure projection). Entries
+    for projects absent from reg are left alone — a partial save never deletes
+    authored content."""
     reg["generated_ts"] = pk.now_ts()
-    pk.write_json(home.registry_path(), reg)
+    auth = _authored_load()
+    entries = auth.setdefault("projects", {})
+    proj = dict(reg)
+    proj["projects"] = {}
+    for name, rec in reg.get("projects", {}).items():
+        keep = {k: rec[k] for k in AUTHORED_FIELDS if k in rec}
+        if keep:
+            keep["path"] = rec.get("path", "")
+            entries[name] = keep
+        proj["projects"][name] = {k: v for k, v in rec.items() if k not in AUTHORED_FIELDS}
+    pk.write_json(home.authored_path(), auth)
+    pk.write_json(home.registry_path(), proj)
 
 
 def _overlay_pointers(rec):
@@ -112,6 +173,7 @@ def sync(observations=None):
             continue
         _adopt_or_scaffold(name)
     save(reg)
+    reg = load()  # re-compose: a re-discovered project picks its authored fields back up
     _write_project_registries(reg)
     return reg, report
 

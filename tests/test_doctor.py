@@ -79,6 +79,29 @@ class TestChecks(DoctorBase):
         results = doctor.check_home()
         self.assertTrue(any("5 projects" in m for m in levels(results, doctor.OK)))
 
+    def test_authored_absent_is_silent(self):
+        home.scaffold_global()
+        self.assertEqual(doctor.check_authored(), [])
+
+    def test_authored_garbled_is_fail(self):
+        home.scaffold_global()
+        pk.atomic_write(home.authored_path(), "not json{")
+        results = doctor.check_authored()
+        self.assertTrue(any("registry-authored" in m and "does not parse" in m
+                            for m in levels(results, doctor.FAIL)))
+
+    def test_authored_merge_counts(self):
+        self.seed_home()
+        good = os.path.join(self.tmp.name, "repos", "good")
+        pk.write_json(home.authored_path(), {"version": 1, "projects": {
+            "good": {"path": good, "notes": "n"},           # path-matched: live
+            "ghost": {"path": "/gone/elsewhere", "notes": "x"},  # orphan: not live
+            "vend": {"path": "/v", "external": True},       # external anchor: live
+        }})
+        ok = levels(doctor.check_authored(), doctor.OK)[0]
+        self.assertIn("3 entries", ok)
+        self.assertIn("2 live in merge", ok)
+
     def test_projects_broken_symlink_missing_path_stale_memory(self):
         self.seed_home()
         results = doctor.check_projects()

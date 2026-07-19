@@ -51,8 +51,16 @@ def project_dir(name):
 
 
 def registry_path():
-    """The master project list (the auto-map output)."""
+    """The master project list (the auto-map output) — pure PROJECTION,
+    rebuildable from a re-scan, safe to regenerate."""
     return os.path.join(global_dir(), "registry.json")
+
+
+def authored_path():
+    """The AUTHORED registry layer (notes/edges/aliases/external/retired),
+    keyed by project name. Unrebuildable — registry.json can be wiped and
+    re-synced, this file cannot."""
+    return os.path.join(global_dir(), "registry-authored.json")
 
 
 def adopted_memory_dir():
