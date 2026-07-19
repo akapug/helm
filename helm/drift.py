@@ -10,8 +10,11 @@ Drift =
      (0.85) in either direction, or fell dormant (< 0.4).
   3. DECAY: beliefs sitting dormant — held so weakly they no longer inject.
 
-State: one snapshot of {id: confidence} under _global/.state/ — the diff
-between runs is what makes crossings reportable exactly once.
+State: one snapshot of {id: confidence} PER SCOPE under _global/.state/ —
+the diff between same-scope runs is what makes crossings reportable exactly
+once. Scope-keying matters: a --project run resolves shadowed confidences,
+and writing those into the global snapshot minted spurious tier-crossings
+on the next global run (and vice versa).
 """
 import os
 
@@ -21,8 +24,10 @@ ACT_AT = 0.85
 DORMANT_BELOW = 0.4
 
 
-def _state_path():
-    return os.path.join(home.global_dir(), ".state", "drift-snapshot.json")
+def _state_path(project=None):
+    name = ("drift-snapshot-%s.json" % pk.slug(project)) if project \
+        else "drift-snapshot.json"
+    return os.path.join(home.global_dir(), ".state", name)
 
 
 def _contradictions(e):
@@ -35,7 +40,7 @@ def report(project=None, snapshot=True):
     """-> (lines, counts). Empty lines list == no drift."""
     from . import store
     entries = store.load_all(project=project, include_dormant=True, types=("prior",))
-    prev = pk.read_json(_state_path(), {})
+    prev = pk.read_json(_state_path(project), {})
     lines = []
     for e in sorted(entries, key=lambda x: x["id"]):
         eid, conf = e["id"], e["confidence"]
@@ -58,8 +63,8 @@ def report(project=None, snapshot=True):
             lines.append("DECAYED       %s — confidence %.2f, no longer injecting "
                          "(re-confirm or retire)" % (eid, conf))
     if snapshot:
-        pk.write_json(_state_path(), {e["id"]: e["confidence"] for e in entries
-                                      if e.get("class") != "certain"})
+        pk.write_json(_state_path(project), {e["id"]: e["confidence"] for e in entries
+                                             if e.get("class") != "certain"})
     return lines, len(entries)
 
 
