@@ -80,6 +80,21 @@ time.)
 | `HELM_CELL_PROFILE` | `meld-agent` for cell passthrough; `helm-test` for premise attestation (a deliberate split — see ATTESTATION.md) | the signing identity profile in `~/.dregg/profiles` | `MELD_AGENT_PROFILE` |
 | `HELM_ROSTER` | `~/.dregg/roster.toml` | the substrate roster file | `MELD_ROSTER` |
 
+## the shadow resolver backend (all optional — see [ARCHITECTURE.md](ARCHITECTURE.md) Pluggability)
+
+The local keyword JIT resolver is the authority. A shadow backend runs in
+parallel and its results are logged/compared, never trusted. **Unset ⇒ the
+shadow is OFF** — the fleet-live default, zero per-turn cost. Set the endpoint
+and every turn logs one divergence row; `helm inject --shadow-report` renders
+the accumulated local-vs-shadow verdict. The Cloudflare agentic-memory
+connector is a thin stdlib-`urllib` stub; helm never invents credentials and
+never calls a real endpoint in tests.
+
+| variable | default | read by | legacy fallback |
+|---|---|---|---|
+| `HELM_CF_ENDPOINT` | — (**unset ⇒ shadow OFF**, the default) | the CF shadow backend — the Cloudflare agentic-memory query URL. Set it to activate the shadow (the owner one-step). Wire shape: `POST <endpoint>` with `{"query", "project", "top_k"}` → `{"results": [{"id": …}, …]}` (ranked; helm reads the ids only) | `MELD_CF_ENDPOINT` |
+| `HELM_CF_TOKEN` | — (sent as `Authorization: Bearer <token>` when set) | the CF shadow backend — the bearer for the agentic-memory endpoint | `MELD_CF_TOKEN` |
+
 ## multimodel seats
 
 | variable | default | read by | legacy fallback |

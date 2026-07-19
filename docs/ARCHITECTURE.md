@@ -127,3 +127,36 @@ but the store's `type`/`load_class` schema is deliberately orthogonal to
 *placement*, and resolvers are behind one interface — so a backing store
 (vector recall, attested records, a hosted memory service) can be plugged in
 per-type without consumers changing.
+
+### The shadow-resolver seam
+
+The interface is small: a backend has a `name`, a **mandatory `source`
+declaration** (law 3 — a backend that cannot name its source is pretending to
+be canonical), a `configured()` gate, and `resolve(text, project) -> ranked
+entry-id list`. The **local keyword JIT resolver is the AUTHORITY**; a
+registered SHADOW backend runs in **parallel** and its results are
+**logged/compared, never trusted as truth** (the overlay-not-store law: a
+projection is compared, not injected).
+
+Shipped shadow backend: **Cloudflare agentic-memory** (owner decision #21 — the
+private-beta seat is warm), a thin stdlib-`urllib` stub behind `HELM_CF_*`
+([ENVIRONMENT.md](ENVIRONMENT.md)). Its laws, enforced in `helm/inject.py`:
+
+- **OFF by default, zero cost.** No `HELM_CF_ENDPOINT` ⇒ the shadow is simply
+  off; the turn pays one env read, no import / object build / I/O / store parse.
+- **Fail-open.** A raising, slow, or failing shadow logs an `{error}` row and
+  returns — it never touches the authoritative local lane and never blocks the
+  turn (a short-lived hook process cannot host a background thread, so the
+  query is synchronous + hard-timeboxed).
+- **Byte-identical local lane.** The shadow step runs *after* the injected
+  sections are assembled and only *reads* the computed local ids, so the local
+  output is identical whether the shadow is on or off.
+- **Measurement over vibes.** Each configured turn appends one divergence row
+  (local-only vs shadow-only vs agreed, ids never prompt text) to
+  `_global/.state/shadow-ledger.jsonl`; `helm inject --shadow-report` renders
+  the accumulated verdict so the owner judges a real backend on evidence.
+
+The write leg (`helm backend push` mirroring typed entries up as an explicit,
+never-canonical replica; a `_global/backends.json` registry) is the connector's
+outbound half and lives on its own lane — the seam above is the read/compare
+half that needs no Cloudflare account.

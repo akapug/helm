@@ -192,7 +192,7 @@ $ helm store add prior "prefer-small-prs | small reviewable PRs land faster | 0.
 $ helm store evidence 2026-07-18T09:00:00Z prefer-small-prs +0.1 "three clean merges this week"
 ```
 
-### `helm inject [--project P] [--json] [--explain] [--hook-json]`
+### `helm inject [--project P] [--json] [--explain] [--hook-json] [--shadow-report]`
 The active-fire surface: prompt text on stdin, injection-worthy context on
 stdout — the pinned lane (budget-capped), just-in-time store matches, live
 reflex steers. Empty on no match; salience is the scarce resource. This is the
@@ -232,9 +232,27 @@ rollover re-greets. Fully fail-open: brief unavailable → no whisper, never a
 blocked hook; the latch is stamped on the first attempt, so a bad brief costs
 the day's greeting, not a per-turn read. `--explain` renders it read-only.
 
+**Pluggable shadow resolver** (the [ARCHITECTURE.md](ARCHITECTURE.md)
+Pluggability seam): the local keyword JIT resolver is the AUTHORITY; a
+registered SHADOW backend runs in parallel and is logged/compared, never
+trusted. It is **OFF by default** — no `HELM_CF_ENDPOINT` ⇒ zero cost (one env
+read). Set the endpoint (the owner one-step; see [ENVIRONMENT.md](ENVIRONMENT.md))
+and each turn appends one divergence row (local-only vs shadow-only vs agreed,
+ids never prompt text) to `_global/.state/shadow-ledger.jsonl`.
+`helm inject --shadow-report` renders the accumulated verdict — or `shadow off
+(set HELM_CF_ENDPOINT)` when unconfigured — so the owner judges a real backend
+(Cloudflare agentic-memory) on evidence, not a vibe. Fail-open (a shadow error
+never touches the local lane or blocks the turn) and the local output is
+byte-identical whether the shadow is on or off. The connector is a thin
+stdlib-`urllib` stub: helm never invents credentials and never calls a real
+endpoint in tests.
+
 ```console
 $ echo "how should we drain the memory backlog?" | helm inject --project myproject
 TERM drain: routing raw memory intake to typed homes ...
+
+$ helm inject --shadow-report
+shadow off (set HELM_CF_ENDPOINT). No shadow backend is configured ...
 ```
 
 ### `helm drain [--apply] [--sweep-dups] [--limit N] [--project P] | --rekey [--apply] | --expire-candidates [--days N] [--apply]`

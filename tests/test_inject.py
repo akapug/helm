@@ -30,7 +30,10 @@ os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 from helm import home, inject, pk, store  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
-            "HELM_CACHE_DIR", "MELD_CACHE_DIR")
+            "HELM_CACHE_DIR", "MELD_CACHE_DIR",
+            # the shadow backend's activation env — popped so the WHOLE suite is
+            # hermetic (a stray HELM_CF_ENDPOINT must never let a test reach out)
+            "HELM_CF_ENDPOINT", "MELD_CF_ENDPOINT", "HELM_CF_TOKEN", "MELD_CF_TOKEN")
 
 
 class InjectBase(unittest.TestCase):
@@ -1059,6 +1062,148 @@ class WhisperTest(InjectBase):
                          "--explain must never stamp the greeted latch")
         self.assertFalse(os.path.exists(inject._ledger_path()),
                          "--explain must never write the ledger")
+
+
+class _FakeBackend:
+    """A shadow-backend test double — the honest injection seam (no network, no
+    monkeypatch). resolve returns the planted ids (or raises for the fail-open
+    path); records its calls so the zero-cost / empty-prompt gates are provable."""
+    name = "fake"
+    source = "test double"
+
+    def __init__(self, ids=None, raises=False):
+        self.ids = list(ids or [])
+        self.raises = raises
+        self.calls = []
+
+    def configured(self):
+        return True
+
+    def resolve(self, text, project=None):
+        self.calls.append((text, project))
+        if self.raises:
+            raise RuntimeError("boom")
+        return list(self.ids)
+
+
+class ShadowBackendTest(InjectBase):
+    """The pluggable shadow-resolver seam (cf-shadow-backend card): interface
+    dispatch, the CF stub's env gate (no network), divergence logging with an
+    injected fake, the shadow-off zero-cost path, fail-open on a raising backend,
+    --shadow-report both states, and the byte-identical local lane law."""
+
+    def test_interface_local_is_authority(self):
+        # the local backend behind the interface reproduces the resolver output
+        self.plant_jit("jit-a", "alpha fact", "alpha")
+        self.plant_jit("jit-b", "beta fact", "beta")
+        self.assertEqual(inject.LOCAL_BACKEND.resolve("tune the alpha now"), ["jit-a"])
+        self.assertEqual(inject.LOCAL_BACKEND.name, "local")
+        # law 3 (name your source): a mandatory declaration on every backend
+        self.assertTrue(inject.LOCAL_BACKEND.source)
+        self.assertTrue(inject.CFShadowBackend().source)
+
+    def test_active_shadow_off_by_default_cf_when_configured(self):
+        self.assertIsNone(inject._active_shadow())  # unconfigured => OFF
+        os.environ["HELM_CF_ENDPOINT"] = "https://example.invalid/query"
+        b = inject._active_shadow()
+        self.assertIsNotNone(b)
+        self.assertEqual(b.name, "cf")
+
+    def test_cf_stub_empty_without_endpoint_no_network(self):
+        # the zero-network guard: unconfigured resolve returns [] before urllib
+        cf = inject.CFShadowBackend()
+        self.assertFalse(cf.configured())
+        self.assertEqual(cf.resolve("anything at all"), [])
+        # configured-but-empty-prompt also short-circuits before any network
+        os.environ["HELM_CF_ENDPOINT"] = "https://example.invalid/query"
+        self.assertEqual(cf.resolve("   "), [])
+
+    def test_divergence_logged_with_fake_backend(self):
+        self.plant_jit("jit-a", "alpha fact", "alpha")
+        self.plant_jit("jit-b", "beta fact", "beta")
+        fake = _FakeBackend(ids=["jit-a", "cf-x"])  # local finds [jit-a]
+        inject.gather("tune the alpha now", shadow=fake)
+        rows = inject._shadow_rows()
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["backend"], "fake")
+        self.assertEqual(r["agreed"], ["jit-a"])
+        self.assertEqual(r["shadow_only"], ["cf-x"])
+        self.assertEqual(r["local_only"], [])
+        self.assertEqual(r["local_n"], 1)
+        self.assertEqual(r["shadow_n"], 2)
+
+    def test_shadow_ledger_holds_ids_never_prompt_text(self):
+        self.plant_jit("jit-a", "alpha fact", "alpha")
+        inject.gather("tune the alpha now", shadow=_FakeBackend(ids=["cf-x"]))
+        with open(inject._shadow_ledger_path(), encoding="utf-8") as f:
+            self.assertNotIn("tune the alpha", f.read())  # ids ride, not the prompt
+
+    def test_shadow_off_writes_no_ledger_zero_cost(self):
+        self.plant_jit("jit-a", "alpha fact", "alpha")
+        inject.gather("tune the alpha now")  # no shadow param, no env => OFF
+        self.assertFalse(os.path.exists(inject._shadow_ledger_path()))
+
+    def test_shadow_skips_empty_prompt(self):
+        fake = _FakeBackend(ids=["cf-x"])
+        inject.gather("   ", shadow=fake)
+        self.assertEqual(fake.calls, [])  # never queried on an empty turn
+        self.assertFalse(os.path.exists(inject._shadow_ledger_path()))
+
+    def test_fail_open_on_backend_raise(self):
+        self.plant_jit("jit-a", "alpha fact", "alpha")
+        sections = inject.gather("tune the alpha now", shadow=_FakeBackend(raises=True))
+        self.assertTrue(sections["jit"], "the local lane must survive a shadow raise")
+        rows = inject._shadow_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["error"])
+        self.assertEqual(rows[0]["backend"], "fake")
+
+    def test_local_lane_byte_identical_with_and_without_shadow(self):
+        self.plant_pinned("pin-1", "a pinned truth")
+        self.plant_jit("jit-a", "alpha fact", "alpha")
+        off = inject.gather("tune the alpha now")
+        on = inject.gather("tune the alpha now", shadow=_FakeBackend(ids=["totally", "other"]))
+        self.assertEqual(off, on)
+        boom = inject.gather("tune the alpha now", shadow=_FakeBackend(raises=True))
+        self.assertEqual(off, boom)
+
+    def test_shadow_report_off_state(self):
+        rc, out, err = self.run_inject(["--shadow-report"])
+        self.assertEqual(rc, 0)
+        self.assertIn("shadow off", out)
+        self.assertIn("HELM_CF_ENDPOINT", out)
+        self.assertEqual(err, "")
+
+    def test_shadow_report_renders_divergence(self):
+        self.plant_jit("jit-a", "alpha fact", "alpha")
+        fake = _FakeBackend(ids=["jit-a", "cf-x", "cf-y"])
+        inject.gather("tune the alpha now", shadow=fake)
+        inject.gather("tune the alpha again", shadow=fake)
+        rc, out, err = self.run_inject(["--shadow-report"])
+        self.assertEqual(rc, 0)
+        self.assertIn("agreed", out)
+        self.assertIn("shadow-only", out)
+        self.assertIn("cf-x", out)  # the concrete hot id, not a vibe
+        self.assertIn("2 comparison turns", out)
+
+    def test_shadow_report_no_ledger_row_written(self):
+        self.plant_jit("jit-a", "alpha fact", "alpha")
+        inject.gather("tune the alpha now", shadow=_FakeBackend(ids=["cf-x"]))
+        before = len(inject._shadow_rows())
+        self.run_inject(["--shadow-report"])
+        self.assertEqual(len(inject._shadow_rows()), before)  # read-only
+
+    def test_explain_surfaces_active_shadow_read_only(self):
+        self.plant_jit("jit-a", "alpha fact", "alpha")
+        # off => no shadow line (salience)
+        _, off_out, _ = self.run_inject(["--explain"], stdin_text="tune the alpha now")
+        self.assertNotIn("shadow: backend", off_out)
+        os.environ["HELM_CF_ENDPOINT"] = "https://example.invalid/query"
+        _, on_out, _ = self.run_inject(["--explain"], stdin_text="tune the alpha now")
+        self.assertIn("shadow: backend cf active", on_out)
+        # --explain is a dry look: it never queries and never writes the ledger
+        self.assertFalse(os.path.exists(inject._shadow_ledger_path()))
 
 
 if __name__ == "__main__":
