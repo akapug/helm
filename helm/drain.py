@@ -251,6 +251,9 @@ def rekey(apply=False):
         changes.append((str(e["id"]), e.get("keywords") or "", new_kw))
         if apply:
             pk.atomic_write(e["path"], edited)
+    if apply and changes:
+        pk.event("drain.rekey", "drained-cohort",
+                 "%d prior%s rekeyed in place" % (len(changes), "s"[:len(changes) != 1]))
     return {"ts": ts, "drained": drained, "already": already,
             "malformed": malformed, "changes": changes,
             "rekeyed": len(changes) if apply else 0}
@@ -346,6 +349,8 @@ def apply(plan, mem=None, sweep_dups=False, limit=None):
     receipt = {"ts": ts, "applied": len(applied), "actions": applied,
                "index_lines_repointed": repointed, "net": net}
     pk.write_json(os.path.join(net, "RECEIPT.json"), receipt)
+    pk.event("drain.apply", net, "%d action%s routed, %d index lines re-pointed"
+             % (len(applied), "s"[:len(applied) != 1], repointed))
     return receipt
 
 

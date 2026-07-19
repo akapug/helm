@@ -81,7 +81,8 @@ helm store list [--type T] [--all]         entries (live; --all incl. retired)
 helm store get <id>                        one entry, full record
 helm store resolve <text>                  JIT lookup — what fires for this prompt
                                            (or pipe the prompt on stdin)
-helm store pinned                          the always-on lane
+helm store pinned [--stats]                the always-on lane (--stats: budget
+                                           walk + ledger made-it/starved counts)
 helm store add <type> <id> | <statement> [| ...]
     prior:     <id> | <statement> [| conf [| keywords [| domain]]]   belief, default 0.6
     premise:   <id> | <statement> [| keywords [| domain]]            certain, conf 1.0
@@ -92,6 +93,9 @@ helm store add <type> <id> | <statement> [| ...]
 helm store evidence <ts> <id> <delta> <reason...>  move a belief (logged + clamped)
 helm store supersede <ts> <old-id> <new-id> [reason]  TOMBSTONE old (file kept)
 helm store retire <ts> <id> [why...]               retire (file kept as the record)
+helm store demote <id> [--undo] <reason...>        flip always->jit with a receipt
+                                                   (--undo = provenanced restore)
+helm store events [--limit N]                      the mutation-receipt trail
 helm store counts                                  per-root type inventory
 ```
 
@@ -112,6 +116,32 @@ never blocks. Lexicon is exempt: redefining a term is its update lane.
 many entries carry that keyword), summed and confidence-weighted — one rare
 keyword outranks a pile of shared ones. Ties break most-recently-updated,
 never alphabetical. `helm inject --explain` shows the per-probe contributions.
+
+Every mutating verb leaves a **receipt**: one `{v, ts, actor, verb, target,
+summary}` line appended to `_global/.state/events.jsonl` through one pk-level
+chokepoint (`pk.event`) — `add`/`evidence`/`supersede`/`retire`/`demote`, and
+drain `--apply`/`--rekey`. Receipts, never truth: the files stay source and
+nothing may read the journal over them (a hand-edit is legal; it just has no
+receipt). Fire-ledger laws apply — O(1) append, 5MB one-generation rotation
+(`.1`), fail-open (journal trouble never fails the write it describes). The
+actor is `$HELM_ACTOR`, else `$CLAUDE_SESSION_ID` (the hook session), else
+`cli`. `helm store events [--limit N]` renders the recent trail. The `.state/`
+home is deliberate: the journal is host-local telemetry and **never ships**
+(the authored/derived split) — a rotating trail is not a durable record;
+durable provenance rides in the artifacts themselves (evidence logs, attest
+keys, tombstones).
+
+The pinned lane injects under a byte budget, so membership is not delivery.
+The budget walk is deterministic and **earned**: confidence desc, then recency
+(mixed ISO/epoch timestamps normalized; a blank timestamp ranks last), then id
+— the old alphabetical walk silently starved 8 of 11 live always-entries.
+`helm store pinned --stats` renders the walk exactly as inject would (who fits
+under the budget now) plus each entry's made-the-budget count over the
+fire-ledger window, and names every starved entry. `helm store demote <id>
+<reason...>` flips always→jit with an evidence receipt carrying the exact
+prior state (`was: {load_class, pin}`) — never silent, never a delete;
+`--undo` is the one provenanced flip back. An explicit `pin: false` beats the
+founding-pin tuple, which is what makes a demote stick.
 
 ```console
 $ helm store add prior "prefer-small-prs | small reviewable PRs land faster | 0.7 | pr,review"

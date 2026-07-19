@@ -134,7 +134,7 @@ VERBS = {
 
 _VERB_HELP = {
     "brief": "brief [--hours N] [--json] — the operator's morning brief: sessions, knowledge delta, seats, owner gates (read-only, never probes)",
-    "store": "store list|get|add|resolve|... — the one typed knowledge store",
+    "store": "store list|get|add|resolve|demote|events|... — the one typed knowledge store",
     "inject": "inject [--project P] [--json|--explain|--hook-json|--lane-report] — per-turn context for harness hooks (stdin: prompt or hook JSON)",
     "drain": "drain [--apply] — route raw memory intake to typed homes (dry-run default)",
     "drift": "drift — surface belief drift; silent when steady",

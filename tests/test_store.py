@@ -4,6 +4,7 @@ at a tempdir via HELM_HOME + HELM_ADOPTED_DIR. The real ~/.claude, ~/.helm and
 ~/.mc are never read or written."""
 import contextlib
 import io
+import json
 import os
 import shutil
 import sys
@@ -539,6 +540,146 @@ class PinnedTest(StoreBase):
         # the flag survives the file round-trip
         with open(got[1]["path"]) as f:
             self.assertIn("  pin: true", f.read())
+
+    def test_walk_order_confidence_recency_id(self):
+        # the deterministic budget-walk law: confidence desc, then recency desc
+        # (mixed ISO/epoch/blank timestamps all comparable), then id asc — the
+        # old (-conf, id) key made an all-1.0 lane alphabetical (starvation)
+        self.seed_prior("b-old", "iso ts", conf=1.0, pin="true",
+                        last_updated="2026-06-01")
+        self.seed_prior("a-new", "epoch ts newer", conf=1.0, pin="true",
+                        last_updated="1782000000")  # ~2026-06-21 > 2026-06-01
+        self.seed_prior("t-x", "iso tie", conf=1.0, pin="true",
+                        last_updated="2026-06-01")
+        self.seed_prior("z-blank", "no ts ranks last", conf=1.0, pin="true",
+                        stated_ts="", last_updated="")
+        self.seed_prior("c-low", "freshest but lower conf", conf=0.9, pin="true",
+                        last_updated="2026-07-01")
+        want = ["a-new", "b-old", "t-x", "z-blank", "c-low"]
+        self.assertEqual([e["id"] for e in store.pinned()], want)
+        self.assertEqual([e["id"] for e in store.pinned()], want)  # deterministic
+
+    def test_explicit_unpin_beats_pinned_slugs_tuple(self):
+        self.seed_prior("drift-is-the-enemy", "founding pin", conf=1.0)
+        e = self.one(store.load_all(), "drift-is-the-enemy")
+        self.assertTrue(e["pinned"])  # the tuple pins it with no flag at all
+        store.write_prior({"id": "drift-is-the-enemy", "statement": "founding pin",
+                           "confidence": 1.0, "pin": "false", "load_class": "jit",
+                           "stated_ts": TS}, path=e["path"])
+        e = self.one(store.load_all(), "drift-is-the-enemy")
+        self.assertFalse(e["pinned"])
+        self.assertEqual(e["load_class"], "jit")
+        with open(e["path"]) as f:
+            self.assertIn("  pin: false", f.read())  # the un-pin survives rewrites
+
+
+class DemoteTest(StoreBase):
+    def test_demote_flips_with_receipt_never_silent(self):
+        self.seed_prior("pin-a", "always on", conf=0.9, pin="true")
+        e, err = store.demote("pin-a", TS, "starved under the byte budget")
+        self.assertIsNone(err)
+        e = self.one(store.load_all(), "pin-a")  # reload: the flip is on disk
+        self.assertEqual((e["load_class"], e["pinned"], e["status"]),
+                         ("jit", False, "live"))
+        self.assertEqual(store.pinned(), [])
+        last = e["evidence_log"][-1]
+        self.assertEqual((last["type"], last["by"], last["reason"]),
+                         ("demoted", "human", "starved under the byte budget"))
+        self.assertEqual(last["was"], {"load_class": "always", "pin": True})
+
+    def test_demote_founding_pin_sticks(self):
+        self.seed_prior("drift-is-the-enemy", "founding", conf=1.0)
+        e, err = store.demote("drift-is-the-enemy", TS, "measured starved")
+        self.assertIsNone(err)
+        e = self.one(store.load_all(), "drift-is-the-enemy")
+        self.assertEqual((e["load_class"], e["pinned"]), ("jit", False))
+
+    def test_undo_restores_via_the_receipt(self):
+        self.seed_prior("pin-a", "always on", conf=0.9, pin="true")
+        store.demote("pin-a", TS, "starved")
+        e, err = store.demote("pin-a", TS, "load-bearing after all", undo=True)
+        self.assertIsNone(err)
+        e = self.one(store.load_all(), "pin-a")
+        self.assertEqual((e["load_class"], e["pinned"]), ("always", True))
+        self.assertEqual([r["type"] for r in e["evidence_log"]],
+                         ["demoted", "undemoted"])
+
+    def test_demote_guards(self):
+        self.seed_prior("pin-a", "always on", conf=0.9, pin="true")
+        self.seed_prior("plain", "jit entry", conf=0.8)
+        for args, msg in ((("pin-a", TS, " "), "reason is required"),
+                          (("plain", TS, "why"), "not in the always lane"),
+                          (("ghost", TS, "why"), "not found")):
+            e, err = store.demote(*args)
+            self.assertIsNone(e)
+            self.assertIn(msg, err)
+        e, err = store.demote("plain", TS, "why", undo=True)
+        self.assertIn("no demote receipt", err)
+        e, err = store.demote("pin-a", TS, "why", undo=True)
+        self.assertIn("already in the always lane", err)
+
+    def test_demote_reference_flip_and_undo(self):
+        store.write_reference({"id": "ref-a", "statement": "harvested",
+                               "load_class": "always", "stated_ts": TS})
+        e, err = store.demote("ref-a", TS, "starved")
+        self.assertIsNone(err)
+        self.assertEqual(self.one(store.load_all(), "ref-a")["load_class"], "jit")
+        e, err = store.demote("ref-a", TS, "restore", undo=True)
+        self.assertIsNone(err)
+        self.assertEqual(self.one(store.load_all(), "ref-a")["load_class"], "always")
+
+
+class PinnedStatsTest(StoreBase):
+    """pinned --stats: the budget walk as inject renders it now + made-it
+    counts over the fire-ledger window — read-only against a planted ledger."""
+
+    def setUp(self):
+        super().setUp()
+        # 4 pins, each line truncating to exactly LINE_CAP (400B) -> 3 fit the
+        # 1200B budget, pin-3 (same conf, same ts, id-last) starves
+        for i in range(4):
+            self.seed_prior("pin-%d" % i, "x" * 400, conf=1.0, pin="true")
+
+    def ledger(self, rows):
+        from helm import inject
+        path = inject._ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("\n".join(rows) + "\n")
+        return path
+
+    def run_cli(self, args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = store.cmd_store(list(args))
+        return rc, out.getvalue()
+
+    def test_stats_walk_and_ledger_window_read_only(self):
+        row = lambda ids: json.dumps(
+            {"v": 1, "ts": "2026-07-19T00:00:00Z", "fired": {"pinned": ids}})
+        path = self.ledger([row(["pin-0"]), row(["pin-0"]), row(["pin-0"]),
+                            '{"v":1,"ts":"x","silent":true}', "not json",
+                            row(["pin-1", "ghost-id"])])
+        with open(path, "rb") as f:
+            before = f.read()
+        rc, out = self.run_cli(["pinned", "--stats"])
+        self.assertEqual(rc, 0)
+        self.assertIn("4 always, budget 1200B", out)
+        self.assertIn("+ pin-0  made 3/4", out)
+        self.assertIn("+ pin-1  made 1/4", out)  # ghost-id ignored, row counted
+        self.assertIn("+ pin-2  made 0/4", out)
+        self.assertIn("- pin-3  made 0/4", out)  # over budget NOW and starved
+        self.assertIn("2 of 4 always-entries NEVER made the budget", out)
+        self.assertIn("pin-2, pin-3", out)
+        self.assertIn("helm store demote <id>", out)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), before)  # stats never writes the ledger
+
+    def test_stats_without_ledger(self):
+        rc, out = self.run_cli(["pinned", "--stats"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no fire-ledger rows with a pinned lane yet", out)
+        self.assertIn("- pin-3", out)  # the walk still names the over-budget entry
 
 
 class EntriesSeamTest(StoreBase):

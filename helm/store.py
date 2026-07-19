@@ -42,6 +42,7 @@ lives — including adopted; that is the adoption contract.
 
 Import-safe, side-effect-free, stdlib-only.
 """
+import calendar
 import json
 import os
 import re
@@ -159,9 +160,14 @@ def derive_load_class(e, conf, pinned_flag):
 
 
 def _is_pinned(e):
+    """pin: true/1/yes pins; an EXPLICIT false/0/no un-pins — it beats the
+    PINNED_SLUGS tuple (what makes `helm store demote` stick on a founding
+    pin); an absent flag falls through to the tuple."""
     flag = str(e.get("pin") or "").strip().lower()
     if flag in ("true", "1", "yes"):
         return True
+    if flag in ("false", "0", "no"):
+        return False
     return _slug(str(e.get("id") or "")) in PINNED_SLUGS
 
 
@@ -525,14 +531,34 @@ def resolve_prompt(text, project=None, cap=4, entries=None):
     return [t[2] for t in scored[:max(n, 0)]]
 
 
+def _recency(e):
+    """One comparable recency scalar (epoch seconds) from the store's mixed
+    timestamp formats — ISO ('2026-06-17' / full Z stamps), raw epoch strings,
+    blank. Unknown/blank reads 0 (oldest): an entry with no timestamp ranks
+    LAST in the pinned walk — date it (evidence) or demote it."""
+    raw = str(e.get("last_updated") or e.get("updated_ts")
+              or e.get("stated_ts") or "").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2}))?", raw)
+        return float(calendar.timegm(
+            tuple(int(x or 0) for x in m.groups()) + (0, 0, 0))) if m else 0.0
+
+
 def pinned(project=None, entries=None):
-    """load_class=always entries — returned ALWAYS (no relevance gate), ranked
-    confidence-desc then id so the always-on consumer can budget the top-N.
+    """load_class=always entries — returned ALWAYS (no relevance gate), in the
+    ONE deterministic budget-walk order the injecting consumer truncates:
+    confidence desc, then recency desc (_recency over last_updated/updated_ts/
+    stated_ts), then id asc. The old (-confidence, id) key made an
+    all-conf-1.0 lane effectively ALPHABETICAL — 8 of 11 live always-entries
+    sat past the byte-budget fold forever (the pinned-starvation class); now
+    the winners are earned by freshness and the tie-break is still total.
     entries= as in resolve_prompt: a supplied load_all() list skips the parse."""
     if entries is None:
         entries = load_all(project=project)
     out = [e for e in entries if e.get("load_class") == "always"]
-    out.sort(key=lambda e: (-e["confidence"], str(e["id"])))
+    out.sort(key=lambda e: (-e["confidence"], -_recency(e), str(e["id"])))
     return out
 
 
@@ -583,6 +609,10 @@ def write_prior(e, root_dir=None, path=None):
     ]
     if pin:
         body.append("  pin: true")
+    elif str(e.get("pin") or "").strip().lower() in ("false", "0", "no"):
+        # an explicit un-pin (demote) must survive the rewrite — on read it
+        # beats the PINNED_SLUGS tuple, which is what keeps the flip stuck
+        body.append("  pin: false")
     # attestation annotations survive rewrites — the ledger is the truth, but a
     # store rewrite (evidence/retire) must never orphan the entry's receipt keys
     for opt in ("attest_payload", "attest_ts", "attest_by", "attest_turn",
@@ -778,6 +808,8 @@ def apply_evidence(pid, ts, delta, reason, by="agent", kind=None, project=None):
     e["confidence"] = new
     e["last_updated"] = ts
     write_prior(e, path=e["path"])
+    pk.event("store.evidence", str(e["id"]),
+             "%+.2f -> %.2f by %s: %s" % (d, new, by, reason))
     return e, surfaced_msg
 
 
@@ -810,6 +842,8 @@ def mark_superseded(old_id, new_id, ts, reason="", project=None):
         new["supersedes"] = str(old["id"])
         new["last_updated"] = ts
         _WRITERS[new["type"]](new, path=new["path"])
+    pk.event("store.supersede", str(old["id"]),
+             "-> " + str(new["id"]) + ((" — " + reason) if reason else ""))
     return old, None
 
 
@@ -821,7 +855,100 @@ def retire(eid, ts, why="", project=None):
     e.update({"status": STATUS_RETIRED, "retired_ts": ts, "retired_why": why,
               "last_updated": ts})
     _WRITERS[e["type"]](e, path=e["path"])
+    pk.event("store.retire", str(e["id"]), why or "retired")
     return e, None
+
+
+def demote(eid, ts, reason, by="human", project=None, undo=False):
+    """The pinned lane's growth path: flip an always-entry OUT of the lane
+    (always -> jit) — NEVER silent, never a delete (the memGC demote law: the
+    statement, its history and its file all stay; only the injection tier
+    moves). A prior's 'demoted' evidence receipt carries the exact prior state
+    (was: {load_class, pin}); undo=True replays that receipt's was-state back —
+    restoration is one provenanced flip — and appends 'undemoted'. References
+    flip their authored load_class the same way; their receipt is the events
+    journal row (refs carry no evidence_log)."""
+    if not str(reason or "").strip():
+        return None, "a reason is required (silent tier flips are forbidden)"
+    e = _find(eid, project=project, types=("prior", "reference"))
+    if not e:
+        return None, "'" + str(eid) + "' not found"
+    if undo:
+        if e.get("load_class") == "always":
+            return None, "'%s' is already in the always lane" % e["id"]
+        was = next((r.get("was") for r in reversed(e.get("evidence_log") or [])
+                    if isinstance(r, dict) and r.get("type") == "demoted"
+                    and isinstance(r.get("was"), dict)), None)
+        if e["type"] == "prior" and was is None:
+            return None, "'%s' has no demote receipt to undo" % e["id"]
+        was = was or {"load_class": "always", "pin": False}
+        e["load_class"] = was.get("load_class") or "always"
+        e["pin"] = "true" if was.get("pin") else ""
+        kind = "undemoted"
+    else:
+        if e.get("load_class") != "always":
+            return None, "'%s' is not in the always lane (load_class=%s)" \
+                % (e["id"], e.get("load_class"))
+        was = {"load_class": "always", "pin": bool(e.get("pinned"))}
+        e["load_class"] = "jit"
+        # an explicit un-pin: beats both the pin flag and the PINNED_SLUGS tuple
+        e["pin"] = "false" if was["pin"] else ""
+        kind = "demoted"
+    if e["type"] == "prior":
+        e["evidence_log"] = list(e.get("evidence_log") or []) + [
+            {"ts": ts, "type": kind, "delta": 0, "reason": reason, "by": by,
+             "was": was}]
+    e["last_updated"] = ts
+    _WRITERS[e["type"]](e, path=e["path"])
+    pk.event("store.undemote" if undo else "store.demote", str(e["id"]),
+             ("-> %s — %s" % (e["load_class"], reason)) if undo
+             else "always -> jit — " + reason)
+    return e, None
+
+
+def pinned_stats(project=None):
+    """The pinned lane's MEASURED reality, READ-ONLY: the deterministic budget
+    walk exactly as inject renders it now (who fits under PINNED_BUDGET with
+    inject's own line shape), plus each always-entry's made-the-budget count
+    over the fire-ledger window (current + rotated generation; a row counts
+    when it carries a fired.pinned lane). Nothing here writes — the ledger is
+    inject's, borrowed through its one path/line/budget surface."""
+    from . import inject
+    always = pinned(project=project)
+    fits, used = set(), 0
+    for e in always:
+        line = inject._entry_line(e)
+        if used + len(line) > inject.PINNED_BUDGET:
+            break  # gather's greedy walk: the first overflow ends the lane
+        fits.add(str(e["id"]))
+        used += len(line)
+    made = {str(e["id"]): 0 for e in always}
+    path = inject._ledger_path()
+    lines = []
+    for p in (path + ".1", path):
+        try:
+            with open(p, encoding="utf-8") as f:
+                lines += f.read().splitlines()
+        except OSError:
+            continue
+    rows, first, last = 0, "", ""
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        ids = (r.get("fired") or {}).get("pinned") if isinstance(r, dict) else None
+        if not isinstance(ids, list):
+            continue
+        rows += 1
+        ts = str(r.get("ts") or "")
+        first, last = first or ts, ts or last
+        for i in ids:
+            if str(i) in made:
+                made[str(i)] += 1
+    return {"always": always, "fits": fits, "used": used,
+            "budget": inject.PINNED_BUDGET, "rows": rows,
+            "first": first, "last": last, "made": made}
 
 
 # ---------------------------------------------------------------------------
@@ -866,7 +993,7 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
   list [--type T] [--all]                     entries (live; --all incl. retired)
   get <id>                                    one entry, full record
   resolve <text>                              JIT lookup — what fires for this prompt (or pipe on stdin)
-  pinned                                      the always-on lane
+  pinned [--stats]                            the always-on lane (--stats: budget walk + ledger made-it/starved)
   add <type> <id> | <statement> [| ...]       type: prior|premise|lexicon|heuristic|reference
       prior:     <id> | <statement> [| conf [| keywords [| domain]]]  (belief, default 0.6)
       premise:   <id> | <statement> [| keywords [| domain]]           (certain, conf 1.0)
@@ -879,6 +1006,8 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
   evidence <ts> <id> <delta> <reason...>      move a belief (logged + clamped)
   supersede <ts> <old-id> <new-id> [reason]   TOMBSTONE old (file kept)
   retire <ts> <id> [why...]                   retire (file kept as the record)
+  demote <id> [--undo] <reason...>            flip always->jit with a receipt (--undo = provenanced restore)
+  events [--limit N]                          the mutation-receipt trail (_global/.state/events.jsonl)
   counts                                      per-root type inventory"""
 
 
@@ -902,7 +1031,7 @@ def _fmt(e):
 
 
 def cmd_store(args):
-    """store <list|get|add|resolve|pinned|evidence|supersede|retire|counts> — the ONE typed personal-knowledge store."""
+    """store <list|get|add|resolve|pinned|evidence|supersede|retire|demote|events|counts> — the ONE typed personal-knowledge store."""
     args = list(args)
     project = None
     if "--project" in args:
@@ -1053,6 +1182,7 @@ def cmd_store(args):
                 e["confidence_history"] = [{"ts": ts, "value": round(conf, 4),
                                             "reason": rationale}]
             p = write_prior(e, path=path)
+            pk.event("store.add", parts[0], etype + " — " + parts[1])
             print("helm store: LIVE '" + parts[0] + "' [" + derive_class(conf) + " "
                   + ("%.2f" % conf) + "] - " + parts[1])
             print("  stored: " + p)
@@ -1067,6 +1197,7 @@ def cmd_store(args):
             if len(parts) > 3 and parts[3]:
                 e["examples"] = [x.strip() for x in parts[3].split("||") if x.strip()]
             p = write_lexicon(e, root_dir=_default_dir("lexicon", project))
+            pk.event("store.add", parts[0], "lexicon — " + parts[1])
             print("helm store: LIVE '" + parts[0] + "' [lexicon " + scope + "] - " + parts[1])
             print("  stored: " + p)
             return 0
@@ -1082,6 +1213,7 @@ def cmd_store(args):
                       "stated_ts": ts, "last_updated": ts,
                       "source": source or e.get("source") or "human"})
             p = write_heuristic(e, path=path)
+            pk.event("store.add", parts[0], "heuristic — " + parts[1])
             print("helm store: LIVE '" + parts[0] + "' [heuristic conf=1 jit] - " + parts[1])
             if trig:
                 print("  trigger: " + trig)
@@ -1099,6 +1231,7 @@ def cmd_store(args):
                   "status": STATUS_LIVE, "stated_ts": e.get("stated_ts") or ts,
                   "last_updated": ts, "source": source or e.get("source") or "harvest"})
         p = write_reference(e, path=path)
+        pk.event("store.add", parts[0], "reference — " + parts[1])
         print("helm store: LIVE '" + parts[0] + "' [reference jit] - " + parts[1])
         print("  stored: " + p)
         return 0
@@ -1128,8 +1261,35 @@ def cmd_store(args):
         return 0
 
     if cmd == "pinned":
-        for e in pinned(project=project):
-            print(_fmt(e))
+        if "--stats" not in rest:
+            for e in pinned(project=project):
+                print(_fmt(e))
+            return 0
+        s = pinned_stats(project=project)
+        if not s["always"]:
+            print("helm store pinned: no always-entries")
+            return 0
+        print("pinned lane (%d always, budget %dB, walk: confidence > recency > id):"
+              % (len(s["always"]), s["budget"]))
+        w = max(len(str(e["id"])) for e in s["always"])
+        for e in s["always"]:
+            eid = str(e["id"])
+            win = ("made %d/%d" % (s["made"][eid], s["rows"])) if s["rows"] \
+                else "no ledger rows"
+            print("  %s %-*s  %s" % ("+" if eid in s["fits"] else "-", w, eid, win))
+        if not s["rows"]:
+            print("no fire-ledger rows with a pinned lane yet — historical "
+                  "counts arrive as turns run")
+            return 0
+        print("ledger window: %d pinned-lane rows (%s .. %s)"
+              % (s["rows"], s["first"], s["last"]))
+        starved = [str(e["id"]) for e in s["always"]
+                   if s["made"][str(e["id"])] == 0]
+        if starved:
+            print("%d of %d always-entries NEVER made the budget over this window:"
+                  % (len(starved), len(s["always"])))
+            print("  " + ", ".join(starved))
+            print("  demote one: helm store demote <id> <reason...>")
         return 0
 
     if cmd == "evidence":
@@ -1172,6 +1332,49 @@ def cmd_store(args):
             return 1
         print("helm store: RETIRED '" + rest[1] + "' (" + (e.get("retired_why") or "")
               + ") - file kept as the record")
+        return 0
+
+    if cmd == "demote":
+        undo = "--undo" in rest
+        words = [a for a in rest if a != "--undo"]
+        if len(words) < 2:
+            print("usage: helm store demote <id> [--undo] <reason...>", file=sys.stderr)
+            return 2
+        e, err = demote(words[0], pk.now_ts(), " ".join(words[1:]),
+                        project=project, undo=undo)
+        if err:
+            print("helm store demote: " + err, file=sys.stderr)
+            return 1
+        if undo:
+            print("helm store: RESTORED '%s' -> %s (undemoted receipt appended "
+                  "— one provenanced flip)" % (e["id"], e["load_class"]))
+        else:
+            print("helm store: DEMOTED '%s' always -> jit (receipt carries the "
+                  "prior state; restore: helm store demote %s --undo <reason...>)"
+                  % (e["id"], e["id"]))
+        return 0
+
+    if cmd == "events":
+        n = "20"
+        if "--limit" in rest:
+            i = rest.index("--limit")
+            n = rest[i + 1] if i + 1 < len(rest) else ""
+        try:
+            n = int(n)
+        except ValueError:
+            print("usage: helm store events [--limit N]", file=sys.stderr)
+            return 2
+        rows = pk.read_events(n)
+        if not rows:
+            print("helm store events: no mutation receipts yet (writers journal "
+                  "to " + pk.events_path() + ")")
+            return 0
+        print("helm store events (last %d):" % len(rows))
+        for r in rows:
+            print("  %s  %-10s %-16s %s — %s"
+                  % (r.get("ts") or "-", str(r.get("actor") or "-")[:10],
+                     r.get("verb") or "-", r.get("target") or "-",
+                     r.get("summary") or ""))
         return 0
 
     if cmd == "counts":
