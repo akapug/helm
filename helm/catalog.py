@@ -140,8 +140,10 @@ def _count_lines(f):
 def _session_id(path, harness):
     base = re.sub(r"\.jsonl$", "", os.path.basename(path))
     if harness == "codex":
-        # rollout-2026-07-11T15-30-00-<uuid>  ->  <uuid>
-        base = re.sub(r"^rollout-[\d-]*T[\d-]*-", "", base)
+        # rollout-2026-07-11T15-30-00-<uuid>  ->  <uuid>. The timestamp is
+        # anchored EXACTLY: a greedy [\d-]* ate into the uuid whenever its
+        # first group was all digits, minting an unresumable truncated id.
+        base = re.sub(r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-", "", base)
     return base
 
 
@@ -331,6 +333,9 @@ def build(progress=None):
                 row["mt"] = ent["mt"]
             if "syn" not in row:  # backfill classification onto pre-existing cache
                 _classify(row)
+            sid = _session_id(path, harness)
+            if row.get("i") != sid:  # repair ids cached by the greedy pre-fix regex
+                row["i"] = sid
         else:
             row = _row(path, harness, st)
             changed += 1
