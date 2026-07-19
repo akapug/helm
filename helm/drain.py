@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import sys
+import time
 
 from . import home, pk, registry
 
@@ -276,6 +277,65 @@ def _cmd_rekey(args):
     return 0
 
 
+def expire_candidates(days=14, apply=False, project=None):
+    """The candidate DECAY leg — operator-visible hygiene, never a silent
+    background job. An unconfirmed candidate older than `days` (by its own
+    timestamp; a candidate with NO timestamp is never expired) is archived to a
+    drain-style net and removed on --apply. Dry-run returns the plan untouched.
+    Telemetry-unseen is subsumed by age here: candidates never inject, so 'stale
+    and unconfirmed' IS the decay signal. -> receipt dict."""
+    from . import store
+    ts = pk.now_ts()
+    cutoff = time.time() - max(days, 0) * 86400
+    stale = [e for e in store.candidates(project=project)
+             if store._recency(e) and store._recency(e) < cutoff]
+    receipt = {"ts": ts, "days": days, "found": len(stale), "expired": 0,
+               "ids": [str(e["id"]) for e in stale]}
+    if not apply or not stale:
+        return receipt
+    net = os.path.join(home.global_dir(), "archive",
+                       "candidate-expiry-" + ts.replace(":", "").replace("-", "")[:13])
+    os.makedirs(net, exist_ok=True)
+    for e in stale:
+        shutil.copy2(e["path"], os.path.join(net, os.path.basename(e["path"])))
+    for e in stale:  # the rollback net must be verified before ANY delete
+        cop = os.path.join(net, os.path.basename(e["path"]))
+        if not os.path.isfile(cop) or os.path.getsize(cop) != os.path.getsize(e["path"]):
+            raise RuntimeError("drain: candidate net incomplete for %s — ABORTING, "
+                               "nothing removed" % os.path.basename(e["path"]))
+    for e in stale:
+        os.remove(e["path"])
+    receipt.update({"expired": len(stale), "net": net})
+    pk.write_json(os.path.join(net, "RECEIPT.json"), receipt)
+    pk.event("drain.expire-candidates", net,
+             "%d unconfirmed candidate%s pruned (>%dd, net kept)"
+             % (len(stale), "s"[:len(stale) != 1], days))
+    return receipt
+
+
+def _cmd_expire_candidates(args):
+    days = 14
+    if "--days" in args:
+        try:
+            days = int(args[args.index("--days") + 1])
+        except (ValueError, IndexError):
+            print("helm drain --expire-candidates: --days needs an integer", file=sys.stderr)
+            return 2
+    r = expire_candidates(days=days, apply="--apply" in args)
+    print("helm drain --expire-candidates: %d unconfirmed candidate%s older than %dd"
+          % (r["found"], "s"[:r["found"] != 1], r["days"]))
+    for cid in r["ids"][:8]:
+        print("  - " + cid)
+    if len(r["ids"]) > 8:
+        print("  ... %d more" % (len(r["ids"]) - 8))
+    if "--apply" not in args:
+        print("helm drain: DRY-RUN (nothing pruned). Re-run with --apply.")
+    elif r["expired"]:
+        print("helm drain: PRUNED %d candidate%s; net + receipt at %s"
+              % (r["expired"], "s"[:r["expired"] != 1], r.get("net", "-")))
+    return 0
+
+
 def _repoint_index(mem, renames):
     """MEMORY.md is a projection — re-point lines whose link target moved."""
     idx = os.path.join(mem, "MEMORY.md")
@@ -355,11 +415,15 @@ def apply(plan, mem=None, sweep_dups=False, limit=None):
 
 
 def cmd_drain(args):
-    """drain [--apply] [--sweep-dups] [--limit N] | drain --rekey [--apply] —
-    classify raw memory entries and route them to typed homes; --rekey is the
-    one-time drained-cohort keyword migration. Dry-run by default."""
+    """drain [--apply] [--sweep-dups] [--limit N] | drain --rekey [--apply] |
+    drain --expire-candidates [--days N] [--apply] — classify raw memory
+    entries and route them to typed homes; --rekey is the one-time
+    drained-cohort keyword migration; --expire-candidates prunes unconfirmed
+    candidates older than N days (14 default). Dry-run by default."""
     if "--rekey" in args:
         return _cmd_rekey(args)
+    if "--expire-candidates" in args:
+        return _cmd_expire_candidates(args)
     mem = _mem_dir()
     if not os.path.isdir(mem):
         print("helm drain: no adopted memory dir at " + mem)

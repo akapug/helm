@@ -61,6 +61,11 @@ BELIEF_CLAMP = (0.05, 0.99)  # a belief NEVER auto-reaches 1.0 (human-only rail)
 STATUS_LIVE = "live"
 STATUS_RETIRED = "retired"
 STATUS_DELETE_ELIGIBLE = "delete_eligible"
+# CANDIDATE (safe inferred capture): an agent-inferred entry lands here, NEVER
+# live — it is a non-live status, so the load_all live-filter already excludes
+# it from resolve/pinned/inject (the hard law: never silently authoritative).
+# `helm store confirm` promotes it. source: inferred|asked-once|explicit.
+STATUS_CANDIDATE = "candidate"
 
 # PINNED priors inject EVERY turn (load_class always). Pin = a `pin: true`
 # flag OR membership here (belt-and-suspenders, same tuple as mc so the live
@@ -217,7 +222,8 @@ _PRIOR_DEFAULTS = {
 }
 
 _LEX_DEFAULTS = {"term": "", "scope": "global", "definition": "", "kind": "",
-                 "source": "", "examples": [], "updated_ts": "", "hits": "0"}
+                 "source": "", "examples": [], "updated_ts": "", "hits": "0",
+                 "status": "live"}
 
 _HEUR_DEFAULTS = {
     "id": "", "move": "", "statement": "", "trigger": "", "keywords": "",
@@ -255,9 +261,10 @@ def _parse_lexicon(path):
     if not (e and e["term"] and e["definition"]):
         return None
     e["term_scope"] = e.pop("scope")  # authored scope; entry scope is root-derived
+    status = e.get("status") or STATUS_LIVE  # a candidate lexicon is non-live
     e.update({"type": "lexicon", "id": e["term"], "statement": e["definition"],
               "confidence": 1.0, "class": "lexicon", "load_class": "jit",
-              "status": STATUS_LIVE, "keywords": "", "domain": "", "pinned": False})
+              "status": status, "keywords": "", "domain": "", "pinned": False})
     return e
 
 
@@ -409,6 +416,14 @@ def load_all(project=None, include_retired=False, include_dormant=True, types=No
 def entries(project=None):
     """The web/status projection alias — same list as load_all()."""
     return load_all(project=project)
+
+
+def candidates(project=None, types=None):
+    """The safe-inferred-capture tier: every status:candidate entry (excluded
+    from every injecting lane by the load_all live-filter — the hard law). The
+    surface `list --candidates` and coach's dup-search read here."""
+    return [e for e in load_all(project=project, include_retired=True, types=types)
+            if e.get("status") == STATUS_CANDIDATE]
 
 
 def counts(project=None):
@@ -662,6 +677,11 @@ def write_lexicon(e, root_dir=None, path=None):
         "  hits: " + str(e.get("hits") or "0"),
         "  definition: " + re.sub(r"\s+", " ", e.get("definition") or e.get("statement") or "").strip(),
     ]
+    # a candidate carries an explicit status line (excluded from inject until
+    # confirmed); a live lexicon keeps its historical byte-shape (no status key)
+    status = str(e.get("status") or STATUS_LIVE)
+    if status != STATUS_LIVE:
+        body.insert(6, "  status: " + status)
     ex = e.get("examples") or []
     if ex:
         body.append("  examples: " + " || ".join(ex))
@@ -859,6 +879,30 @@ def retire(eid, ts, why="", project=None):
     return e, None
 
 
+def confirm(eid, ts, new_statement=None, project=None):
+    """Promote a candidate -> live (the owner/confirm gate that makes inferred
+    capture safe to leave on). v1 is lexicon-only (the schema-touch is bounded
+    to one type); --edit swaps the definition in the same turn. source flips to
+    'explicit' — the knowledge is now human-confirmed — and the events journal
+    carries the promotion receipt (lexicon has no evidence_log)."""
+    e = _find(eid, project=project)
+    if not e:
+        return None, "'" + str(eid) + "' not found"
+    if e.get("status") != STATUS_CANDIDATE:
+        return None, "'%s' is not a candidate (status=%s)" % (eid, e.get("status"))
+    if e["type"] != "lexicon":
+        return None, "candidate confirm is lexicon-only in v1 (got %s)" % e["type"]
+    edited = bool(str(new_statement or "").strip())
+    if edited:
+        e["definition"] = new_statement.strip()
+        e["statement"] = new_statement.strip()
+    e.update({"status": STATUS_LIVE, "source": "explicit", "updated_ts": ts})
+    write_lexicon(e, path=e["path"])
+    pk.event("store.confirm", str(e["id"]),
+             "candidate -> live" + (" (edited)" if edited else ""))
+    return e, None
+
+
 def demote(eid, ts, reason, by="human", project=None, undo=False):
     """The pinned lane's growth path: flip an always-entry OUT of the lane
     (always -> jit) — NEVER silent, never a delete (the memGC demote law: the
@@ -990,7 +1034,7 @@ def _near_dup(etype, eid, statement, project=None):
 # ---------------------------------------------------------------------------
 
 _USAGE = """usage: helm store <verb> [args] [--project P]
-  list [--type T] [--all]                     entries (live; --all incl. retired)
+  list [--type T] [--all] [--candidates]      entries (live; --all incl. retired; --candidates only)
   get <id>                                    one entry, full record
   resolve <text>                              JIT lookup — what fires for this prompt (or pipe on stdin)
   pinned [--stats]                            the always-on lane (--stats: budget walk + ledger made-it/starved)
@@ -1000,9 +1044,12 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
       lexicon:   <term> | <definition> [| kind [| ex1 || ex2]]
       heuristic: <id> | <move> [| trigger-csv [| domain]]
       reference: <id> | <summary> [| url [| keywords [| domain]]]
-      flags: [--source S] [--rationale <text...>]   (rationale seeds evidence_log)
+      flags: [--source S] [--rationale <text...>] [--candidate]
+             --candidate (lexicon only, v1): safe inferred capture — writes a
+             non-live candidate EXCLUDED from inject until confirmed
       a LIVE same-id add is REFUSED (supersede/evidence instead, printed);
       a near-identical statement warns and proceeds (lexicon redefines freely)
+  confirm <id> [--edit <new definition...>]   promote a candidate -> live (lexicon v1)
   evidence <ts> <id> <delta> <reason...>      move a belief (logged + clamped)
   supersede <ts> <old-id> <new-id> [reason]   TOMBSTONE old (file kept)
   retire <ts> <id> [why...]                   retire (file kept as the record)
@@ -1051,6 +1098,20 @@ def cmd_store(args):
         if "--type" in rest:
             i = rest.index("--type")
             t = rest[i + 1] if i + 1 < len(rest) else None
+        if "--candidates" in rest:
+            cs = candidates(project=project, types=(t,) if t else None)
+            if not cs:
+                print("helm store: no candidates (safe-inferred capture is empty)")
+                return 0
+            cs.sort(key=lambda e: (e["type"], str(e["id"])))
+            print("helm store candidates (%d — excluded from inject until confirmed):"
+                  % len(cs))
+            for e in cs:
+                print("  ? " + str(e["id"]) + " [" + e["type"] + " src="
+                      + (e.get("source") or "?") + " " + e["scope"] + "]: "
+                      + (e.get("statement") or "")[:100])
+                print("      confirm: helm store confirm " + str(e["id"]))
+            return 0
         es = load_all(project=project, include_retired=("--all" in rest),
                       types=(t,) if t else None)
         if not es:
@@ -1081,6 +1142,27 @@ def cmd_store(args):
         print("  path: " + e["path"])
         return 0
 
+    if cmd == "confirm":
+        new_stmt = None
+        if "--edit" in rest:
+            i = rest.index("--edit")
+            eid = " ".join(a for a in rest[:i] if not a.startswith("--")).strip()
+            new_stmt = " ".join(rest[i + 1:]).strip() or None
+        else:
+            eid = " ".join(a for a in rest if not a.startswith("--")).strip()
+        if not eid:
+            print("usage: helm store confirm <id> [--edit <new definition...>]",
+                  file=sys.stderr)
+            return 2
+        e, err = confirm(eid, pk.now_ts(), new_statement=new_stmt, project=project)
+        if err:
+            print("helm store confirm: " + err, file=sys.stderr)
+            return 1
+        print("helm store: CONFIRMED '" + eid + "' candidate -> live"
+              + (" (definition edited)" if new_stmt else "")
+              + " - now fires in the JIT lane")
+        return 0
+
     if cmd == "add":
         if len(rest) < 2:
             print(_USAGE, file=sys.stderr)
@@ -1093,6 +1175,7 @@ def cmd_store(args):
         tail = rest[1:]
         source = None
         rationale = ""
+        candidate = False
         kept = []
         i = 0
         while i < len(tail):
@@ -1100,11 +1183,19 @@ def cmd_store(args):
                 source = tail[i + 1]
                 i += 2
                 continue
+            if tail[i] == "--candidate":
+                candidate = True
+                i += 1
+                continue
             if tail[i] == "--rationale":
                 rationale = " ".join(tail[i + 1:]).strip()
                 break
             kept.append(tail[i])
             i += 1
+        if candidate and etype != "lexicon":
+            print("helm store add: --candidate is lexicon-only in v1 (the "
+                  "candidate schema-touch is bounded to one type)", file=sys.stderr)
+            return 2
         parts = [p.strip() for p in " ".join(kept).split("|")]
         if len(parts) < 2 or not parts[0] or not parts[1]:
             print(_USAGE, file=sys.stderr)
@@ -1190,15 +1281,23 @@ def cmd_store(args):
 
         if etype == "lexicon":
             scope = ("project:" + project) if project else "global"
+            status = STATUS_CANDIDATE if candidate else STATUS_LIVE
             e = {"term": parts[0], "definition": parts[1],
                  "kind": parts[2] if len(parts) > 2 and parts[2] else "phrase",
-                 "term_scope": scope, "source": source or "define",
+                 "term_scope": scope, "status": status,
+                 "source": source or ("inferred" if candidate else "define"),
                  "updated_ts": ts, "hits": "0"}
             if len(parts) > 3 and parts[3]:
                 e["examples"] = [x.strip() for x in parts[3].split("||") if x.strip()]
             p = write_lexicon(e, root_dir=_default_dir("lexicon", project))
-            pk.event("store.add", parts[0], "lexicon — " + parts[1])
-            print("helm store: LIVE '" + parts[0] + "' [lexicon " + scope + "] - " + parts[1])
+            pk.event("store.add", parts[0],
+                     ("lexicon candidate — " if candidate else "lexicon — ") + parts[1])
+            if candidate:
+                print("helm store: CANDIDATE '" + parts[0] + "' [lexicon " + scope
+                      + " src=" + e["source"] + "] - " + parts[1])
+                print("  excluded from inject until confirmed: helm store confirm " + parts[0])
+            else:
+                print("helm store: LIVE '" + parts[0] + "' [lexicon " + scope + "] - " + parts[1])
             print("  stored: " + p)
             return 0
 

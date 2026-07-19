@@ -935,5 +935,103 @@ class AddGuardTest(StoreBase):
                          ["definition"], "able to be you, sharpened")
 
 
+class CandidateTierTest(StoreBase):
+    """Candidate tier (v1: lexicon): safe inferred capture — a candidate is a
+    non-live status EXCLUDED from every injecting lane (the hard law), surfaced
+    only in list --candidates, promoted by confirm."""
+
+    def add(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(["add", *args])
+        return rc, out.getvalue(), err.getvalue()
+
+    def run_cli(self, args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_candidate_write_shape_and_excluded_from_inject(self):
+        rc, out, _ = self.add("lexicon", "glorpterm | a coined word", "--candidate")
+        self.assertEqual(rc, 0)
+        self.assertIn("CANDIDATE 'glorpterm'", out)
+        self.assertIn("src=inferred", out)
+        # the file carries the candidate status line + inferred source
+        e = self.one(store.candidates(), "glorpterm")
+        with open(e["path"]) as f:
+            raw = f.read()
+        self.assertIn("  status: candidate", raw)
+        self.assertIn("  source: inferred", raw)
+        # the hard law: excluded from load_all default, resolve, and pinned
+        self.assertEqual(store.load_all(), [])
+        self.assertEqual(store.resolve_prompt("is this glorpterm at all"), [])
+        self.assertEqual(store.resolve_prompt("glorpterm here"), [])
+        # but visible in the include_retired view and candidates()
+        self.assertEqual([e["id"] for e in store.candidates()], ["glorpterm"])
+        self.assertEqual(self.one(store.load_all(include_retired=True),
+                                  "glorpterm")["status"], "candidate")
+
+    def test_candidate_only_lexicon_in_v1(self):
+        rc, _, err = self.add("prior", "x-law | inferred belief", "--candidate")
+        self.assertEqual(rc, 2)
+        self.assertIn("lexicon-only", err)
+
+    def test_list_candidates_surface(self):
+        self.add("lexicon", "glorpterm | a coined word", "--candidate")
+        self.add("lexicon", "realterm | a live one")   # live, not a candidate
+        rc, out, _ = self.run_cli(["list", "--candidates"])
+        self.assertEqual(rc, 0)
+        self.assertIn("glorpterm", out)
+        self.assertNotIn("realterm", out)
+        self.assertIn("helm store confirm glorpterm", out)
+        # a store with no candidates says so
+        store.confirm("glorpterm", TS)
+        rc, out, _ = self.run_cli(["list", "--candidates"])
+        self.assertIn("no candidates", out)
+
+    def test_confirm_promotes_and_fires(self):
+        self.add("lexicon", "glorpterm | a coined word", "--candidate")
+        e, err = store.confirm("glorpterm", TS)
+        self.assertIsNone(err)
+        self.assertEqual((e["status"], e["source"]), ("live", "explicit"))
+        # reload from disk: live, the candidate status line is gone, fires JIT
+        e = self.one(store.load_all(), "glorpterm")
+        self.assertEqual(e["status"], "live")
+        with open(e["path"]) as f:
+            self.assertNotIn("status: candidate", f.read())
+        self.assertEqual([x["id"] for x in store.resolve_prompt("glorpterm now")],
+                         ["glorpterm"])
+        # the promotion left an events receipt
+        self.assertTrue(any(r.get("verb") == "store.confirm"
+                            and r.get("target") == "glorpterm"
+                            for r in pk.read_events(50)))
+
+    def test_confirm_edit_swaps_definition(self):
+        self.add("lexicon", "glorpterm | first guess", "--candidate")
+        e, err = store.confirm("glorpterm", TS, new_statement="the sharpened sense")
+        self.assertIsNone(err)
+        self.assertEqual(self.one(store.load_all(), "glorpterm")["definition"],
+                         "the sharpened sense")
+
+    def test_confirm_guards(self):
+        e, err = store.confirm("ghost", TS)
+        self.assertIsNone(e)
+        self.assertIn("not found", err)
+        self.add("lexicon", "liveterm | a live one")
+        e, err = store.confirm("liveterm", TS)
+        self.assertIsNone(e)
+        self.assertIn("not a candidate", err)
+
+    def test_confirm_cli_edit(self):
+        self.add("lexicon", "glorpterm | first", "--candidate")
+        rc, out, _ = self.run_cli(["confirm", "glorpterm", "--edit", "the real sense"])
+        self.assertEqual(rc, 0)
+        self.assertIn("CONFIRMED 'glorpterm'", out)
+        self.assertIn("edited", out)
+        self.assertEqual(self.one(store.load_all(), "glorpterm")["definition"],
+                         "the real sense")
+
+
 if __name__ == "__main__":
     unittest.main()

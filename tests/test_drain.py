@@ -231,5 +231,74 @@ class RekeyTest(unittest.TestCase):
         self.assertIn("REKEYED 1", out.getvalue())
 
 
+class ExpireCandidatesTest(unittest.TestCase):
+    """drain --expire-candidates: the operator-visible candidate DECAY leg —
+    unconfirmed candidates older than N days archived + removed on --apply,
+    dry-run default, age-gated (no-timestamp candidates never expire)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-expcand-")
+        self.env_prior = {k: os.environ.get(k)
+                          for k in ("HELM_HOME", "HELM_ADOPTED_DIR")}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        self.mem = os.path.join(self.tmp, "adopted")
+        os.makedirs(self.mem)
+        os.environ["HELM_ADOPTED_DIR"] = self.mem
+
+    def tearDown(self):
+        for k, v in self.env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cand(self, term, updated_ts):
+        from helm import store, home
+        store.write_lexicon({"term": term, "definition": "d", "status": "candidate",
+                             "source": "inferred", "updated_ts": updated_ts},
+                            root_dir=os.path.join(home.global_dir(), "lexicon"))
+
+    def test_dry_run_then_apply_age_gated(self):
+        from helm import store
+        self._cand("stale-cand", "2026-01-01T00:00:00Z")   # ancient -> expires
+        self._cand("fresh-cand", pk.now_ts())              # today -> kept
+        self._cand("undated-cand", "")                     # no ts -> never expires
+        # a live lexicon is never a candidate and never touched
+        store.write_lexicon({"term": "live-term", "definition": "d"})
+        r = drain.expire_candidates(days=14, apply=False)
+        self.assertEqual(r["found"], 1)
+        self.assertEqual(r["ids"], ["stale-cand"])
+        self.assertEqual(r["expired"], 0)   # dry-run mutates nothing
+        self.assertEqual({e["id"] for e in store.candidates()},
+                         {"stale-cand", "fresh-cand", "undated-cand"})
+        r = drain.expire_candidates(days=14, apply=True)
+        self.assertEqual(r["expired"], 1)
+        self.assertEqual({e["id"] for e in store.candidates()},
+                         {"fresh-cand", "undated-cand"})
+        # the net + receipt exist and the expired file is recoverable
+        self.assertTrue(os.path.isfile(os.path.join(r["net"], "lex-stale-cand.md")))
+        self.assertTrue(os.path.isfile(os.path.join(r["net"], "RECEIPT.json")))
+        # the live term survived
+        self.assertEqual([e["id"] for e in store.load_all()], ["live-term"])
+
+    def test_cmd_dry_run_default(self):
+        self._cand("stale-cand", "2026-01-01T00:00:00Z")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = drain.cmd_drain(["--expire-candidates"])
+        self.assertEqual(rc, 0)
+        self.assertIn("1 unconfirmed candidate older than 14d", out.getvalue())
+        self.assertIn("DRY-RUN", out.getvalue())
+        from helm import store
+        self.assertEqual(len(store.candidates()), 1)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = drain.cmd_drain(["--expire-candidates", "--days", "5", "--apply"])
+        self.assertEqual(rc, 0)
+        self.assertIn("PRUNED 1 candidate", out.getvalue())
+        self.assertEqual(len(store.candidates()), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
