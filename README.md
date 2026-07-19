@@ -96,12 +96,14 @@ $ ln -s "$PWD/bin/helm" ~/.local/bin/helm
 ```
 
 **What first run does.** `helm sync` scaffolds `~/.helm` (the global chain +
-one dir per discovered project) and, if you already use Claude Code, **adopts
-your live memory dir in place** — the resolver reads
-`~/.claude/projects/<slug-of-home>/memory` as one more root, same files, no
-copy, byte-shape-compatible writes (your existing hooks keep working
-untouched; new helm entries land in `~/.helm`, never there unless you point
-them there). On a fresh machine with no harness stores at all, everything
+one dir per discovered project); and if you already use Claude Code, the
+typed store **adopts your live memory dir in place** — the resolver reads
+`~/.claude/projects/<slug-of-home>/memory` as one more root: same files, no
+copy, byte-shape-compatible writes, so your existing hooks keep working
+untouched. New helm entries land in `~/.helm`, never there; only the
+lifecycle verbs (evidence / supersede / retire) write back wherever an entry
+lives, adopted included — and those tombstone, never delete. On a fresh
+machine with no harness stores at all, everything
 still works: sync scaffolds an empty home, the project list is empty until an
 agent runs somewhere, and `helm doctor` tells you exactly what it is (and
 isn't) seeing. Quota, recall, and the attestation substrate are all

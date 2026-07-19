@@ -160,6 +160,10 @@ _VERB_HELP = {
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("--version", "-V", "version"):
+        from . import __version__
+        print("helm " + __version__)
+        return 0
     if not argv or argv[0] in ("-h", "--help", "help"):
         print("helm — the steering station for you and your agent fleet\n")
         print("usage: helm <verb> [args]\n")

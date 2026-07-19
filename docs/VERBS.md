@@ -6,10 +6,11 @@ prints the one-liner; running a multi-action verb bare prints its sub-grammar).
 Verbs never take a config file — behavior is shaped by `HELM_*` environment
 variables only, documented in [ENVIRONMENT.md](ENVIRONMENT.md).
 
-A convention used throughout: `<sid>` is a session id **prefix** (any
+Conventions used throughout: `<sid>` is a session id **prefix** (any
 unambiguous head of the full uuid); `--project P` names a project from
-`helm projects`; `|`-separated capture arguments are one shell argument each
-or one quoted string — helm splits on the pipes.
+`helm projects`. Capture verbs take `|`-separated fields — **quote the whole
+capture as one argument** (`helm premise "id | statement"`): helm joins its
+args and splits on the pipes itself, and an unquoted `|` is a shell pipe.
 
 ## map — discovery and the registry
 
@@ -101,7 +102,7 @@ agent evidence keeps its confidence: the contradiction is logged and the drift
 report surfaces it.
 
 ```console
-$ helm store add prior prefer-small-prs | "small reviewable PRs land faster" | 0.7 | pr,review
+$ helm store add prior "prefer-small-prs | small reviewable PRs land faster | 0.7 | pr,review"
 $ helm store evidence 2026-07-18T09:00:00Z prefer-small-prs +0.1 "three clean merges this week"
 ```
 
@@ -146,7 +147,7 @@ id as a word), `every-turn`, `marker-file --marker <path>` (fires while the
 file exists). Retire is a one-line status flip; the file stays.
 
 ```console
-$ helm reflex add checkpoint-green | "checkpoint the green slice before refactoring" --signal prompt --pattern "refactor"
+$ helm reflex add "checkpoint-green | checkpoint the green slice before refactoring" --pattern "refactor"
 ```
 
 ### `helm whoami [note <text...> [--topic T] [--supersedes <note-name>]]`
@@ -171,7 +172,7 @@ The full substrate story is [ATTESTATION.md](ATTESTATION.md); helm works
 fully without it.
 
 ```console
-$ helm premise naming-extremes | "metaphors live at the extremes only"
+$ helm premise "naming-extremes | metaphors live at the extremes only"
 helm premise: LIVE 'naming-extremes' [certain 1.00] - metaphors live at the extremes only
 ```
 

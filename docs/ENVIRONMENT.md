@@ -27,7 +27,7 @@ overrides are in effect.
 
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
-| `HELM_SCAN_ROOTS` | `~/dev/akapug:~/dev` | the repo-scan tier of `helm sync` — colon-separated roots under which git repos register as shelf projects | — |
+| `HELM_SCAN_ROOTS` | `~/dev/akapug:~/dev` (the shipped default — set your own checkout roots) | the repo-scan tier of `helm sync` — colon-separated roots under which git repos register as shelf projects | — |
 | `HELM_CLAUDE_ROOTS` | — (extra roots; `~/.claude/projects` is always scanned) | the session catalog — colon-separated additional Claude transcript roots | `SESH_CLAUDE_ROOTS` |
 | `HELM_CODEX_ROOTS` | — (extra roots; `~/.codex/sessions` and `~/.codex-homes` are always scanned) | the session catalog — additional Codex transcript roots | `SESH_CODEX_ROOTS` |
 | `HELM_CATALOG` | — (`scanner` forces the built-in scanner, skipping the `cv` recall index as catalog source) | the session catalog | `SESH_CATALOG` |

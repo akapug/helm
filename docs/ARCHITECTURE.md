@@ -69,10 +69,17 @@ rank by recency. Additive: re-sync never deletes a known project.
 ## The typed store
 
 One resolver over several roots (the adopted live store, the global helm
-chain, each project's chain), with scope precedence `project > global`.
-Entries are single markdown files with fenced `key: value` frontmatter —
-human-editable, git-friendly, no database. Types and load classes are
-documented in [CONCEPTS.md](CONCEPTS.md).
+chain, each project's chain), with scope precedence `project > helm-global >
+adopted` (narrowest wins on a same-type same-slug collision). The adopted
+root is the live Claude memory dir, taken in place —
+`~/.claude/projects/<slug-of-$HOME>/memory` (`HELM_ADOPTED_DIR` overrides;
+tests point it at a tmp dir). The adoption contract: helm's writers are
+byte-shape-compatible with the incumbent writers, new writes never target the
+adopted root unless explicitly pointed there, and lifecycle updates
+(evidence/supersede/retire) write back in place wherever the entry lives —
+adopted included. Entries are single markdown files with fenced `key: value`
+frontmatter — human-editable, git-friendly, no database. Types and load
+classes are documented in [CONCEPTS.md](CONCEPTS.md).
 
 The active-fire surface is `helm inject`: one call a harness hook makes per
 turn, returning the pinned lane (budget-capped) plus just-in-time matches for

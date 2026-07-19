@@ -34,8 +34,16 @@ import sys
 
 from . import home, pk
 
-KNOWN_BIN = "/home/owner/dev/akapug/meld/target/release/meld"
 DEFAULT_NODE_URL = "http://127.0.0.1:8899"
+
+# The substrate client ("meld") is an optional external dependency, resolved at
+# runtime — never a build-path literal. Set HELM_CELL_BIN to its path, or put
+# `meld` on PATH. A conventional sibling-checkout location is probed last so a
+# co-located dev tree works with zero config, without hardcoding any home.
+def _sibling_guess():
+    # <...>/<something>/helm/helm/cell.py -> guess a sibling meld release build
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(repo, "meld", "target", "release", "meld")
 
 ENV_MAP = (
     ("HELM_NODE_URL", "MELD_NODE_URL"),
@@ -67,14 +75,16 @@ def build_env():
 
 
 def bin_path():
-    """HELM_CELL_BIN (legacy MELD_CELL_BIN) env, else the known build path,
-    else `meld` on PATH; None when nothing resolves."""
+    """HELM_CELL_BIN (legacy MELD_CELL_BIN) env, else `meld` on PATH, else a
+    sibling-checkout build; None when nothing resolves."""
     explicit = home.env("CELL_BIN")
     if explicit:
         return explicit
-    if os.path.exists(KNOWN_BIN):
-        return KNOWN_BIN
-    return shutil.which("meld")
+    on_path = shutil.which("meld")
+    if on_path:
+        return on_path
+    guess = _sibling_guess()
+    return guess if os.path.exists(guess) else None
 
 
 def node_url():
@@ -103,8 +113,9 @@ def run_bin(args, timeout=90):
     third slot when the substrate is unavailable (missing binary/launch fail)."""
     b = bin_path()
     if not b or not os.path.exists(b):
-        return None, "", ("meld binary not found (set HELM_CELL_BIN, or build "
-                          + KNOWN_BIN + ", or put `meld` on PATH)")
+        return None, "", ("substrate client not found — set HELM_CELL_BIN or "
+                          "put `meld` on PATH (attestation is optional; helm "
+                          "runs fully without it)")
     try:
         p = subprocess.run([b] + args, env=build_env(), capture_output=True,
                            text=True, timeout=timeout)
@@ -248,7 +259,7 @@ def cmd_cell(args):
     b = bin_path()
     if not b or not os.path.exists(b):
         print("helm cell: substrate unavailable — meld binary not found "
-              "(set HELM_CELL_BIN, or build " + KNOWN_BIN
+              "(set HELM_CELL_BIN, put `meld` on PATH, or build the substrate client"
               + ", or put `meld` on PATH)", file=sys.stderr)
         return 1
     try:
