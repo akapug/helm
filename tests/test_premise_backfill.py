@@ -264,6 +264,82 @@ class AttestExistingTest(BackfillBase):
             self.assertIsNone(why)
 
 
+class AnnotateSafetyTest(BackfillBase):
+    def test_non_utf8_file_refuses_annotation_never_raises(self):
+        # the store PARSES latin-1 via errors='replace', but rewriting
+        # replacement chars back would corrupt bytes — _annotate refuses
+        # (False), it never raises (a raise crashed the sweep mid-pass)
+        p = os.path.join(os.environ["HELM_ADOPTED_DIR"], "prior-latin.md")
+        with open(p, "wb") as f:
+            f.write(b"---\nmetadata:\n  type: prior\n  id: latin\n"
+                    b"  statement: caf\xe9 truth\n  confidence: 1.0\n---\n")
+        self.assertFalse(premise._annotate(p, [("attest_turn", TURN)]))
+        with open(p, "rb") as f:
+            self.assertIn(b"caf\xe9", f.read())  # bytes untouched
+
+    def test_crlf_file_keeps_its_line_endings(self):
+        # in-place means BYTE-safe: a CRLF corpus file gains exactly the
+        # attest lines — the survivors are never re-terminated
+        raw = ADOPTED_RAW.replace("\n", "\r\n")
+        p = self.write_adopted(raw=raw, name="prior-crlf.md")
+        self.assertTrue(premise._annotate(p, [("attest_turn", TURN)]))
+        with open(p, "rb") as f:
+            data = f.read()
+        self.assertIn(b"attest_turn: " + TURN.encode(), data)
+        self.assertEqual(data.count(b"\r\n"), raw.count("\r\n"))
+
+
+class QueueSafetyTest(BackfillBase):
+    def test_retry_queue_drops_already_attested_rows_unsent(self):
+        # attested directly after the row was queued: replaying would
+        # double-attest the ledger and double-annotate the file
+        self.write_certain("done-law", "already signed", attest_payload="x",
+                           attest_turn="tt", attest_by="stub-prof")
+        premise._enqueue({"ts": "t", "id": "done-law", "project": None,
+                          "payload": "p", "profile": "stub-prof",
+                          "reason": "down"})
+        with mock.patch.object(cell, "send_self",
+                               side_effect=AssertionError("must not send")):
+            rc, out, _ = self.run_verb(["--retry-queue"])
+        self.assertEqual(rc, 0)
+        self.assertIn("1 already-attested row dropped", out)
+        self.assertEqual(self.queue_rows(), [])
+        e = store._find("done-law", types=("prior",))
+        with open(e["path"]) as f:
+            self.assertEqual(f.read().count("attest_turn:"), 1)
+
+    def test_queue_rewrite_preserves_a_concurrent_enqueue(self):
+        # the replay window spans network sends — a capture enqueued inside
+        # it must survive the rewrite (whole-file replace once dropped it)
+        self.write_certain("law-a", "truth a")
+        premise._enqueue({"ts": "t", "id": "law-a", "project": None,
+                          "payload": premise.digest_payload("truth a"),
+                          "profile": "stub-prof", "reason": "down"})
+
+        def send_and_race(payload, profile):
+            premise._enqueue({"ts": "t2", "id": "law-b", "project": None,
+                              "payload": "pb", "profile": "stub-prof",
+                              "reason": "concurrent capture"})
+            return ok_info()
+
+        with mock.patch.object(cell, "send_self", send_and_race):
+            rc, _, _ = self.run_verb(["--retry-queue"])
+        self.assertEqual(rc, 0)
+        self.assertEqual([r["id"] for r in self.queue_rows()], ["law-b"])
+
+    def test_torn_queue_line_never_wedges_the_replay(self):
+        self.write_certain("law-a", "truth a")
+        premise._enqueue({"ts": "t", "id": "law-a", "project": None,
+                          "payload": premise.digest_payload("truth a"),
+                          "profile": "stub-prof", "reason": "down"})
+        with open(premise._queue_path(), "a", encoding="utf-8") as f:
+            f.write('{"ts": "torn mid-app')  # a crash mid-append
+        with mock.patch.object(cell, "send_self", return_value=ok_info()):
+            rc, out, _ = self.run_verb(["--retry-queue"])
+        self.assertEqual(rc, 0)
+        self.assertIn("1 attested", out)
+
+
 class SweepTest(BackfillBase):
     def seed_corpus(self):
         """adopted + global + project certains (unattested), one belief, one
@@ -389,6 +465,32 @@ class SweepTest(BackfillBase):
         self.assertIn("minted once", out)
         self.assertEqual(os.environ.get("MELD_NODE_TOKEN"), "tok-once")
         self.assertNotIn("HELM_NODE_PASSPHRASE", os.environ)  # meld rides the token
+
+    def test_sweep_remint_survives_the_popped_passphrase(self):
+        # _install_token pops the passphrase from the env; the advertised
+        # mid-sweep re-mint must still mint — from the phrase captured
+        # BEFORE the pop (it read the env and was dead without this)
+        self.write_certain("global-law", "the global truth")
+        os.environ["HELM_NODE_PASSPHRASE"] = "pp"
+        minted = []
+
+        def unlock(url, payload, timeout=10):
+            minted.append(payload["passphrase"])
+            return {"success": True,
+                    "bearer_token": "tok-%d" % len(minted)}, None
+
+        def send(payload, profile):
+            if os.environ.get("MELD_NODE_TOKEN") == "tok-2":
+                return ({"turn_hash": TURN, "receipt_hash": "rb",
+                         "chain_index": 3}, None)
+            return None, "meld send failed (rc 1): unauthorized: bearer expired"
+
+        with mock.patch.object(premise, "_post_json", unlock), \
+                mock.patch.object(cell, "send_self", send):
+            rc, out, _ = self.run_verb(["--attest-sweep"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(minted, ["pp", "pp"])  # the re-mint really minted
+        self.assertIn("1 attested, 0 queued", out)
 
 
 if __name__ == "__main__":

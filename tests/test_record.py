@@ -162,13 +162,15 @@ class ArtifactTest(RecordBase):
             record.record(self.ev(tool="Bash",
                                   tin={"command": "pytest -q secret_arg"},
                                   resp={"exitCode": 0}))
+            # claude's success shape carries NO exit key: success IS exit 0
+            # by construction (nonzero fires PostToolUseFailure, probed live)
             record.record(self.ev(tool="Bash", tin={"command": "just check"},
-                                  resp={"stdout": "ok"}))  # no exit key -> -1
+                                  resp={"stdout": "ok"}))
             record.record(self.ev(tool="Bash", tin={"command": "ls -la"},
                                   resp={"exitCode": 0}))  # not a runner
         rows = [json.loads(l) for l in
                 self.artifact("command-log.jsonl").splitlines()]
-        self.assertEqual([r["exit"] for r in rows], [1, 0, -1])
+        self.assertEqual([r["exit"] for r in rows], [1, 0, 0])
         self.assertIn("unittest", rows[0]["token"])
         self.assertEqual(rows[1]["token"], "pytest")
         self.assertEqual(rows[2]["token"], "just check")
@@ -192,6 +194,79 @@ class ArtifactTest(RecordBase):
                                       resp={"exitCode": 0}))
         d = record.session_dir("sess-1")
         self.assertTrue(os.path.exists(os.path.join(d, "command-log.jsonl.1")))
+
+
+class FailureEventTest(RecordBase):
+    """The PostToolUseFailure leg (contract probed live 2026-07-19): nonzero
+    Bash and failed tools land here with a top-level error, NO tool_response.
+    A success-only recorder was blind to every failed run — every logged exit
+    read -1 and stuck never armed off a failure."""
+
+    def fev(self, tool="Bash", sid="sess-1", tin=None, error="Exit code 1",
+            **extra):
+        e = {"session_id": sid, "tool_name": tool, "cwd": self.tmp,
+             "hook_event_name": record.FAIL_EVENT, "error": error,
+             "is_interrupt": False}
+        if tin is not None:
+            e["tool_input"] = tin
+        e.update(extra)
+        return e
+
+    def test_failed_runner_records_the_real_nonzero_exit(self):
+        with mock.patch.object(record, "_git_dirty", return_value=False):
+            record.record(self.fev(tin={"command": "pytest -q"},
+                                   error="Exit code 2"))
+            record.record(self.ev(tool="Bash", tin={"command": "pytest -q"},
+                                  resp={"stdout": "ok"}))
+        rows = [json.loads(l) for l in
+                self.artifact("command-log.jsonl").splitlines()]
+        self.assertEqual([r["exit"] for r in rows], [2, 0])
+
+    def test_unparseable_failure_reads_exit_1_interrupt_reads_unknown(self):
+        with mock.patch.object(record, "_git_dirty", return_value=False):
+            record.record(self.fev(tin={"command": "pytest"},
+                                   error="tool blew up"))
+            record.record(self.fev(tin={"command": "pytest"},
+                                   error="killed", is_interrupt=True))
+        rows = [json.loads(l) for l in
+                self.artifact("command-log.jsonl").splitlines()]
+        self.assertEqual([r["exit"] for r in rows], [1, -1])
+
+    def test_failure_error_text_arms_stuck(self):
+        with mock.patch.object(record, "_git_dirty", return_value=False):
+            record.record(self.fev(tin={"command": "gh api /x"},
+                                   error="HTTP 401: not authenticated"))
+        self.assertEqual(self.counters()["stuck-signal"], 1)
+        self.assertEqual(self.counters()["stuck-streak"], 1)
+
+    def test_failed_edit_is_not_forward_progress_and_lands_no_target(self):
+        with mock.patch.object(record, "_git_dirty", return_value=False):
+            record.record(self.ev(tool="Read"))
+            record.record(self.fev(tool="Edit", tin={"file_path": "/a/b.py"},
+                                   error="String to replace not found"))
+        self.assertEqual(self.counters()["passive-streak"], 2)
+        self.assertEqual(self.artifact("edit-targets.log"), "")
+
+    def test_failed_commit_gets_no_commit_credit(self):
+        with mock.patch.object(record, "_git_dirty", return_value=True):
+            record.record(self.ev(tool="Edit", tin={"file_path": "/x.py"}))
+            self.assertEqual(self.counters()["dirty-streak"], 1)
+            record.record(self.fev(tin={"command": "git commit -m x"},
+                                   error="Exit code 1"))
+        self.assertEqual(self.counters()["dirty-streak"], 2)   # still dirty
+        self.assertEqual(self.counters()["passive-streak"], 1)  # no forward credit
+
+
+class GitProbeUnknownTest(RecordBase):
+    def test_git_probe_failure_keeps_the_cached_dirty_state(self):
+        # timeout/git-error is UNKNOWN, not clean — the cache stands
+        with mock.patch.object(record, "_git_dirty", return_value=True):
+            record.record(self.ev(tool="Edit", tin={"file_path": "/x.py"}))
+        self.assertEqual(self.counters()["last-dirty"], 1)
+        with mock.patch.object(record, "_git_dirty", return_value=None):
+            record.record(self.ev(tool="Bash", tin={"command": "ls"}))
+        self.assertEqual(self.counters()["last-dirty"], 1)
+        self.assertEqual(self.counters()["dirty-streak"], 2)
 
 
 class KeyingAndFailOpenTest(RecordBase):
@@ -311,6 +386,24 @@ class WiringTest(WiringBase):
         self.assertIn("hook up to date", out)
         self.assertEqual(len([c for c in record._event_cmds(self.read_settings(a))
                               if record._ours(c)]), 1)
+
+    def test_install_wires_both_event_legs(self):
+        a = self.mk_home("a-user-dev")
+        rc, _, err = self.run_cmd(["install"])
+        self.assertEqual(rc, 0, err)
+        got = self.read_settings(a)
+        for ev in record.HOOK_EVENTS:
+            self.assertIn(record.hook_command(), record._event_cmds(got, ev))
+        # a success-only home is a coverage gap the installer closes
+        del got["hooks"][record.FAIL_EVENT]
+        with open(os.path.join(a, "settings.json"), "w") as f:
+            json.dump(got, f, indent=2)
+        row = next(r for r in record.status_rows() if r["path"] == a)
+        self.assertFalse(row["hook"])
+        rc, _, _ = self.run_cmd(["install"])
+        self.assertEqual(rc, 0)
+        row = next(r for r in record.status_rows() if r["path"] == a)
+        self.assertTrue(row["hook"])
 
     def test_install_dry_writes_nothing(self):
         self.mk_home("a-user-dev")

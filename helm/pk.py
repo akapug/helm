@@ -56,8 +56,8 @@ def parse_simple_frontmatter(path, defaults, list_keys=()):
 def atomic_write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
+    with open(tmp, "w", encoding="utf-8") as f:  # never the locale's guess —
+        f.write(text)                            # readers open utf-8 explicitly
     os.replace(tmp, path)
 
 

@@ -146,8 +146,8 @@ def _paint(scr, m, curses):
             except (curses.error, UnicodeEncodeError):
                 try:  # degrade law: shortcode text, never a crash on an emoji
                     scr.addnstr(y, 0, emoji.demojize(ln), w - 1, attr)
-                except curses.error:
-                    pass
+                except (curses.error, UnicodeEncodeError):
+                    pass  # an unmapped glyph on a legacy locale: skip the line
     scr.refresh()
 
 
@@ -198,13 +198,15 @@ def cmd_human(args):
     import curses
     import locale
     locale.setlocale(locale.LC_ALL, "")
-    try:
-        rc = curses.wrapper(_shell)
-    except KeyboardInterrupt:
-        rc = 0
-    if not chat.log_disabled():
-        n = chat.log_flush()
-        if n > 0:
-            print("helm chat: log-flush appended %d row%s (the log-after leg)"
-                  % (n, "s"[:n != 1]))
+    try:  # the exit-time flush runs on EVERY exit path, a crashed shell too
+        try:
+            rc = curses.wrapper(_shell)
+        except KeyboardInterrupt:
+            rc = 0
+    finally:
+        if not chat.log_disabled():
+            n = chat.log_flush()
+            if n > 0:
+                print("helm chat: log-flush appended %d row%s (the log-after leg)"
+                      % (n, "s"[:n != 1]))
     return rc

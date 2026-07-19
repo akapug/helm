@@ -115,11 +115,14 @@ def _enqueue(rec):
 def _annotate(path, fields):
     """Insert attest_* keys into the entry's metadata block (just before the
     closing frontmatter fence). fields = ordered (key, value) pairs; blank
-    values are skipped. Fail-open False on a shape surprise."""
+    values are skipped. Fail-open False on a shape surprise — a non-UTF-8
+    file included (ValueError: the store parses it with errors='replace',
+    but rewriting replacement chars back would corrupt bytes). newline=''
+    keeps CRLF files byte-identical outside the inserted lines."""
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", newline="") as f:
             lines = f.read().split("\n")
-    except OSError:
+    except (OSError, ValueError):
         return False
     fences = [i for i, l in enumerate(lines) if l.strip() == "---"]
     if len(fences) < 2:
@@ -223,26 +226,55 @@ def cmd_premise(args):
     return 0
 
 
-def _retry_queue():
-    """Replay pending attestations. Each success annotates the stored entry
-    and drops the row; failures (and rows whose entry vanished) are kept."""
-    qp = _queue_path()
+def _read_queue(qp):
+    """Queue rows, parsed. A torn/unparseable line (a crash mid-append) is
+    skipped — it cannot be replayed, and it must never wedge the queue."""
+    rows = []
     try:
         with open(qp, encoding="utf-8") as f:
-            rows = [json.loads(l) for l in f if l.strip()]
+            for l in f:
+                if l.strip():
+                    try:
+                        rows.append(json.loads(l))
+                    except ValueError:
+                        pass
     except OSError:
-        rows = []
+        pass
+    return rows
+
+
+def _rewrite_queue(qp, examined, kept):
+    """Atomic queue rewrite that PRESERVES rows appended while the caller
+    worked: replay/prune windows span network sends, and a concurrent
+    capture's enqueue landing inside one must survive the rewrite (the
+    queue is append-only, so everything past `examined` rides along)."""
+    rows = kept + _read_queue(qp)[examined:]
+    pk.atomic_write(qp, "".join(json.dumps(r, ensure_ascii=False) + "\n"
+                                for r in rows))
+
+
+def _retry_queue():
+    """Replay pending attestations. Each success annotates the stored entry
+    and drops the row; failures (and rows whose entry vanished) are kept.
+    A row whose entry ALREADY carries an attest_turn (attested directly
+    after it was queued) is dropped unsent — replaying it would double-
+    attest the ledger and double-annotate the file."""
+    qp = _queue_path()
+    rows = _read_queue(qp)
     if not rows:
         print("helm premise: attest queue empty.")
         return 0
     kept = []
-    done = 0
+    done = dropped = 0
     for rec in rows:
         e = store._find(rec.get("id", ""), types=("prior",),
                         project=rec.get("project"))
         if not e:
             rec["reason"] = "entry no longer in the store"
             kept.append(rec)
+            continue
+        if e.get("attest_turn"):
+            dropped += 1
             continue
         info, err = cell.send_self(rec["payload"], rec.get("profile") or attest_profile())
         if err:
@@ -258,8 +290,11 @@ def _retry_queue():
         print("helm premise: attested '%s' from queue — turn %s"
               % (rec["id"], (info.get("turn_hash") or "")[:16]))
         done += 1
-    pk.atomic_write(qp, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept))
-    print("helm premise: queue replay — %d attested, %d still pending." % (done, len(kept)))
+    _rewrite_queue(qp, len(rows), kept)
+    tail = (", %d already-attested row%s dropped" % (dropped, "s"[:dropped != 1])) \
+        if dropped else ""
+    print("helm premise: queue replay — %d attested, %d still pending%s."
+          % (done, len(kept), tail))
     return 0 if not kept else 1
 
 
@@ -316,13 +351,15 @@ def refuel(profile):
     return True, None
 
 
-def mint_node_token(wait_on_limit=False, pause=None):
+def mint_node_token(wait_on_limit=False, pause=None, phrase=None):
     """POST /api/cipherclerk/unlock ONCE -> (bearer token, None) or (None,
     reason). The node allows 5 unlocks/60s and counts successes
     (emberian/dregg#60) — the limiter's refusal is an empty-body 429; with
-    wait_on_limit a single limiter-window wait buys one re-mint."""
+    wait_on_limit a single limiter-window wait buys one re-mint. `phrase`
+    overrides the env read — the sweep's re-mint passes the passphrase it
+    captured BEFORE _install_token popped it from the env."""
     pause = time.sleep if pause is None else pause
-    phrase = home.env("NODE_PASSPHRASE")
+    phrase = phrase or home.env("NODE_PASSPHRASE")
     if not phrase:
         return None, "no HELM_NODE_PASSPHRASE/MELD_NODE_PASSPHRASE to mint from"
     url = cell.node_url() + "/api/cipherclerk/unlock"
@@ -476,17 +513,12 @@ def _prune_queue():
     was attested directly after the row was queued — replaying the row would
     double-annotate). Missing-entry rows stay, as ever. Returns rows dropped."""
     qp = _queue_path()
-    try:
-        with open(qp, encoding="utf-8") as f:
-            rows = [json.loads(l) for l in f if l.strip()]
-    except OSError:
-        return 0
+    rows = _read_queue(qp)
     kept = [r for r in rows
             if not ((store._find(r.get("id", ""), types=("prior",),
                                  project=r.get("project")) or {}).get("attest_turn"))]
     if len(kept) != len(rows):
-        pk.atomic_write(qp, "".join(json.dumps(r, ensure_ascii=False) + "\n"
-                                    for r in kept))
+        _rewrite_queue(qp, len(rows), kept)
     return len(rows) - len(kept)
 
 
@@ -517,6 +549,9 @@ def _attest_sweep(dry=False, limit=None):
                   % (pruned, "s"[:pruned != 1]))
         print("helm premise sweep: nothing to attest.")
         return 0
+    # the passphrase, captured BEFORE _install_token pops it from the env —
+    # the mid-sweep re-mint below is dead without it
+    phrase = home.env("NODE_PASSPHRASE")
     mode, merr = _enter_token_mode()
     print("  auth: " + (mode if mode
                         else "per-send passphrase unlocks (%s) — the 5/60s "
@@ -529,7 +564,7 @@ def _attest_sweep(dry=False, limit=None):
             # one mid-sweep re-mint covers an expired bearer (a balance
             # refusal is not an auth failure — re-minting buys nothing)
             reminted = True
-            tok, _terr = mint_node_token(wait_on_limit=True)
+            tok, _terr = mint_node_token(wait_on_limit=True, phrase=phrase)
             if tok:
                 _install_token(tok)
                 info, err = attest_existing(e, profile=profile)

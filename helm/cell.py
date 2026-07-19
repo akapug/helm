@@ -188,10 +188,10 @@ def fire_snapshot_hook():
     if not hook or not os.access(hook, os.X_OK):
         return False
     try:
-        subprocess.run([hook], capture_output=True, timeout=60)
+        p = subprocess.run([hook], capture_output=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return True
+    return p.returncode == 0  # a failed flush must not read as snapshotted
 
 
 def send_self(payload, profile):

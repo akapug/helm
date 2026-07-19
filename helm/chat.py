@@ -257,16 +257,22 @@ def _sign_send(payload, profile):
 def _signed_row(row, payload_text, profile, sign):
     """Common signing leg for posts and reactions: attempt the turn when the
     transport is up; annotate the row with its receipt on success. sign=None
-    probes; True forces the attempt; False skips (v1 path)."""
-    if sign is None:
-        sign = bool(node_url()) and node_head() is not None
-    if not sign:
-        return row
-    info, _err = _sign_send(digest_payload(payload_text),
-                            profile or cell.profile_name())
-    if info:
-        row.update(turn=info.get("turn_hash"), receipt=info.get("receipt_hash"),
-                   chain=info.get("chain_index"))
+    probes; True forces the attempt; False skips (v1 path). FAIL-OPEN TOTAL:
+    any surprise in the signing leg (a raced cache write, a raising client)
+    degrades to the v1 unsigned row — the fallback law is drop the SIGNATURE,
+    never the message."""
+    try:
+        if sign is None:
+            sign = bool(node_url()) and node_head() is not None
+        if not sign:
+            return row
+        info, _err = _sign_send(digest_payload(payload_text),
+                                profile or cell.profile_name())
+        if info:
+            row.update(turn=info.get("turn_hash"), receipt=info.get("receipt_hash"),
+                       chain=info.get("chain_index"))
+    except Exception:
+        pass
     return row
 
 

@@ -224,6 +224,15 @@ class SendSelfTest(CellBase):
         os.environ["HELM_SNAPSHOT_HOOK"] = os.path.join(self.tmp, "missing")
         self.assertFalse(cell.fire_snapshot_hook())          # not executable
 
+    def test_snapshot_hook_nonzero_exit_is_not_a_snapshot(self):
+        # a failed flush (disk full) must not read as snapshotted
+        hook = os.path.join(self.tmp, "bad-hook")
+        with open(hook, "w") as f:
+            f.write("#!/bin/sh\nexit 3\n")
+        os.chmod(hook, 0o755)
+        os.environ["HELM_SNAPSHOT_HOOK"] = hook
+        self.assertFalse(cell.fire_snapshot_hook())
+
 
 class StatusTest(CellBase):
     def test_unreachable_node_is_graceful(self):

@@ -144,6 +144,29 @@ class SubmitTest(HumanBase):
 
 
 class ShellSmokeTest(HumanBase):
+    def test_paint_degrades_twice_never_raises(self):
+        # degrade law: addnstr raising UnicodeEncodeError on BOTH passes
+        # (an unmapped emoji on a legacy locale) skips the line, never crashes
+        class BoomScreen:
+            def getmaxyx(self):
+                return (5, 20)
+
+            def erase(self):
+                pass
+
+            def refresh(self):
+                pass
+
+            def addnstr(self, *a):
+                raise UnicodeEncodeError("ascii", "x", 0, 1, "boom")
+
+        class FakeCurses:
+            error = RuntimeError
+            A_REVERSE = 1
+            A_NORMAL = 0
+
+        human._paint(BoomScreen(), human.model_new(), FakeCurses)  # no raise
+
     def test_no_tty_refuses_cleanly(self):
         out, err = io.StringIO(), io.StringIO()  # StringIO.isatty() is False
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

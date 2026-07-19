@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""helm record — the session-keyed tool-outcome recorder. A PostToolUse hook
-pipes each tool event's FULL JSON here (claude first; codex when its hook
-surface lands); helm keeps tiny per-session counters that upgrade steering
-from static to situational — the state the stuck-hook, dynamic reflexes,
-mentor observe triggers, and evolve's behavior observers read.
+"""helm record — the session-keyed tool-outcome recorder. A hook pipes each
+tool event's FULL JSON here (claude first; codex when its hook surface lands);
+helm keeps tiny per-session counters that upgrade steering from static to
+situational — the state the stuck-hook, dynamic reflexes, mentor observe
+triggers, and evolve's behavior observers read.
+
+TWO legs on claude (contract probed live 2026-07-19): a SUCCESSFUL tool fires
+PostToolUse (Bash tool_response = stdout/stderr/interrupted — NO exit code;
+success IS exit 0 by construction), a FAILED tool — nonzero Bash included —
+fires PostToolUseFailure (no tool_response; top-level error e.g. 'Exit code
+1' + is_interrupt). One event leg alone is blind: without the failure leg no
+failed run is ever recorded and every logged exit reads -1.
 
 State, under <helm home>/_global/.state/reflex-state/<session_id>/:
   counters.json       passive-streak, dirty-streak + cached last-dirty,
@@ -36,6 +43,8 @@ import time
 from . import home, pk
 
 HOOK_EVENT = "PostToolUse"
+FAIL_EVENT = "PostToolUseFailure"    # failed tools (nonzero Bash included) land here
+HOOK_EVENTS = (HOOK_EVENT, FAIL_EVENT)
 PASSIVE = ("Read", "Grep", "Glob")   # error text here is DATA — never arms stuck
 EDITS = ("Edit", "Write", "NotebookEdit")
 FORWARD = EDITS + ("Agent", "Task")  # forward progress; + git commit below
@@ -93,25 +102,46 @@ def parse_event(raw):
 
 
 def _git_dirty(wd):
-    """`git status --porcelain` in the TOOL's workdir. Dirtying tools only —
+    """`git status --porcelain` in the TOOL's workdir -> True/False, or None
+    when git itself failed (timeout/error) — the caller keeps its cached
+    last-dirty then; unknown must never read as clean. Dirtying tools only —
     the caller gates; passive ops must never reach a subprocess."""
     import subprocess
     try:
         out = subprocess.run(["git", "-C", wd, "status", "--porcelain"],
                              capture_output=True, text=True, timeout=3)
-        return out.returncode == 0 and bool(out.stdout.strip())
     except Exception:
-        return False
+        return None
+    if out.returncode != 0:
+        return None
+    return bool(out.stdout.strip())
 
 
 def _exit_code(resp):
-    """The REAL exit code out of a tool_response dict; -1 when the harness
-    payload carries none (claude's Bash carries exitCode)."""
+    """An explicit exit code out of a tool_response dict; -1 when the payload
+    carries none (codex-shaped payloads carry one; claude's does NOT)."""
     if isinstance(resp, dict):
         for k in ("exitCode", "exit_code", "returncode", "code"):
             if isinstance(resp.get(k), int):
                 return resp[k]
     return -1
+
+
+def _event_exit(event, resp, failed):
+    """The truthful exit for a runner event. Explicit int keys win; else the
+    EVENT KIND decides (claude's probed contract, module docstring): a
+    success event with a response dict is exit 0 by construction — nonzero
+    fired the failure event — and a failure event parses 'Exit code N' from
+    its error (1 when unparseable; -1 on an interrupt: killed, no verdict)."""
+    code = _exit_code(resp)
+    if code != -1:
+        return code
+    if failed:
+        if event.get("is_interrupt"):
+            return -1
+        m = re.search(r"exit code (\d+)", str(event.get("error") or ""), re.I)
+        return int(m.group(1)) if m else 1
+    return 0 if isinstance(resp, dict) else -1
 
 
 def _append(path, line):
@@ -145,20 +175,26 @@ def _record(event):
     cmd = str(tin.get("command") or "")
     resp = event.get("tool_response") if "tool_response" in event \
         else event.get("tool_result")
+    failed = str(event.get("hook_event_name") or "") == FAIL_EVENT
     sd = session_dir(sid)
     c = pk.read_json(os.path.join(sd, "counters.json"), {}) or {}
 
-    is_commit = bool(re.search(r"\bgit\b.*\bcommit\b", cmd))
-    forward = tool in FORWARD or is_commit
+    # a FAILED tool made no progress: no forward credit, no commit credit
+    is_commit = bool(re.search(r"\bgit\b.*\bcommit\b", cmd)) and not failed
+    forward = (tool in FORWARD and not failed) or is_commit
     c["passive-streak"] = 0 if forward else int(c.get("passive-streak") or 0) + 1
 
     # dirty-streak: git probed ONLY on dirtying tools, in the tool's workdir;
-    # everything else reads the cached last-dirty.
+    # everything else reads the cached last-dirty. A probe that FAILED (None:
+    # timeout, git error) keeps the cache — unknown never masquerades as clean.
     if tool in DIRTYING:
         wd = str(tin.get("workdir") or tin.get("cwd") or event.get("cwd") or "") \
             or os.getcwd()
         dirty = _git_dirty(wd)
-        c["last-dirty"] = int(dirty)
+        if dirty is None:
+            dirty = bool(c.get("last-dirty"))
+        else:
+            c["last-dirty"] = int(dirty)
     else:
         dirty = bool(c.get("last-dirty"))
     c["dirty-streak"] = 0 if (is_commit or not dirty) \
@@ -173,9 +209,12 @@ def _record(event):
         c["loop-streak"] = int(c.get("loop-streak") or 0) + 1 if h in chain else 0
         c["cmd-hash-chain"] = (chain + [h])[-HASH_WINDOW:]
 
-    # stuck-signal: action tools only — reads carry error text as data.
+    # stuck-signal: action tools only — reads carry error text as data. A
+    # failure event carries its tells in the top-level error, not a response.
     rtext = resp if isinstance(resp, str) else \
         json.dumps(resp) if resp is not None else ""
+    if failed:
+        rtext = "\n".join(x for x in (rtext, str(event.get("error") or "")) if x)
     if tool not in PASSIVE:
         stuck = bool(rtext) and bool(STUCK_RE.search(rtext))
         c["stuck-signal"] = int(stuck)
@@ -194,12 +233,13 @@ def _record(event):
             import hashlib
             _append(os.path.join(sd, "command-log.jsonl"), json.dumps(
                 {"token": " ".join(tok.split()).lower()[:80],
-                 "exit": _exit_code(resp), "ts": int(time.time()),
+                 "exit": _event_exit(event, resp, failed), "ts": int(time.time()),
                  "digest": hashlib.sha1(cmd.encode()).hexdigest()[:12]},
                 separators=(",", ":")) + "\n")
 
-    # edit-targets: the file a real edit landed on (basename only).
-    if tool in EDITS:
+    # edit-targets: the file a real edit landed on (basename only) — a
+    # FAILED edit landed nowhere and must not ground verify.
+    if tool in EDITS and not failed:
         fp = tin.get("file_path") or tin.get("path") or tin.get("notebook_path")
         if fp:
             _append(os.path.join(sd, "edit-targets.log"),
@@ -255,17 +295,17 @@ def _resolvable(cmd):
     return False
 
 
-def _merge_hook(settings, cmd):
+def _merge_hook(settings, cmd, event=HOOK_EVENT):
     """-> (merged_copy, ok|add|update). MERGE-preserving (hooks.py law): only
-    OUR PostToolUse entry is written; foreign hooks — the UserPromptSubmit
+    OUR <event> entry is written; foreign hooks — the UserPromptSubmit
     inject entry included — and every other key survive byte-identical."""
     out = json.loads(json.dumps(settings))
     hks = out.setdefault("hooks", {})
     if not isinstance(hks, dict):
         raise ValueError("existing 'hooks' key is not an object — fix it by hand")
-    groups = hks.setdefault(HOOK_EVENT, [])
+    groups = hks.setdefault(event, [])
     if not isinstance(groups, list):
-        raise ValueError("existing hooks.%s is not a list — fix it by hand" % HOOK_EVENT)
+        raise ValueError("existing hooks.%s is not a list — fix it by hand" % event)
     for g in groups:
         if not isinstance(g, dict):
             continue
@@ -299,10 +339,16 @@ def install_home(path, dry=False):
         if not isinstance(cur, dict):
             return "fail", "settings.json root is not an object — refusing to touch it"
     cmd = hook_command()
-    try:
-        merged, action = _merge_hook(cur, cmd)
+    merged = cur
+    actions = []
+    try:  # BOTH legs — a success-only recorder is blind to every failed tool
+        for ev in HOOK_EVENTS:
+            merged, act = _merge_hook(merged, cmd, ev)
+            actions.append(act)
     except ValueError as e:
         return "fail", str(e)
+    action = "add" if "add" in actions else \
+        "update" if "update" in actions else "ok"
     if action == "ok":
         return "ok", "hook up to date"
     new_raw = json.dumps(merged, indent=2) + "\n"
@@ -315,7 +361,8 @@ def install_home(path, dry=False):
         return "fail", res["error"]
     try:  # validate AFTER the write; anything torn restores the backup
         with open(sp, encoding="utf-8") as f:
-            ok = cmd in _event_cmds(json.load(f))
+            got = json.load(f)
+        ok = all(cmd in _event_cmds(got, ev) for ev in HOOK_EVENTS)
     except (OSError, ValueError):
         ok = False
     if not ok:
@@ -329,14 +376,19 @@ def install_home(path, dry=False):
 
 
 def status_rows():
-    """Per-claude-home recorder coverage, read-only (hooks.status_rows shape)."""
+    """Per-claude-home recorder coverage, read-only (hooks.status_rows shape).
+    hook=True demands BOTH event legs — success-only wiring is a gap the
+    installer closes."""
     from . import hooks
     rows = []
     for name, path in hooks.claude_homes():
         cmd = None
         try:
             with open(os.path.join(path, "settings.json"), encoding="utf-8") as f:
-                cmd = next((c for c in _event_cmds(json.load(f)) if _ours(c)), None)
+                s = json.load(f)
+            per = [next((c for c in _event_cmds(s, ev) if _ours(c)), None)
+                   for ev in HOOK_EVENTS]
+            cmd = per[0] if all(per) else None
         except (OSError, ValueError):
             pass
         rows.append({"home": name, "path": path, "hook": bool(cmd), "command": cmd,
@@ -410,7 +462,7 @@ def _cmd_status(rest):
     session = rest[rest.index("--session") + 1] if "--session" in rest else None
     try:
         n, m = coverage()
-        line = "wiring: %d of %d claude homes (%s)" % (n, m, HOOK_EVENT)
+        line = "wiring: %d of %d claude homes (%s)" % (n, m, "+".join(HOOK_EVENTS))
         print("  " + (line if n == m or not m
                       else line + " — `helm record install` closes the gap"))
     except Exception:

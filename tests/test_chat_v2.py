@@ -93,6 +93,21 @@ class TransportTest(V2Base):
         self.assertNotIn("chain", m)
         self.assertEqual(chat.read()[1], 1)  # the message never dies
 
+    def test_sign_leg_raising_falls_back_to_unsigned(self):
+        # fallback law, hardened: a RAISING signing leg (a raced .cells.json
+        # tmp write, a surprised client) degrades to the v1 row — the post
+        # must never die on the signature (a raise once killed a web POST)
+        with mock.patch.object(chat, "_sign_send",
+                               side_effect=RuntimeError("raced tmp write")):
+            m = chat.post("survives", who="a1", sign=True)
+        self.assertNotIn("chain", m)
+        self.assertEqual(chat.read()[1], 1)
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:9"
+        with mock.patch.object(chat, "node_head",
+                               side_effect=OSError("probe blew up")):
+            chat.post("still lands", who="a1")  # sign=None probe path
+        self.assertEqual(chat.read()[1], 2)
+
     def test_sign_send_recovery_lap(self):
         """First send fails (locked/dry) -> ONE revive + faucet -> retry wins."""
         calls = []
@@ -265,6 +280,20 @@ class NodeSupervisorTest(V2Base):
     def test_bin_path_env_override(self):
         os.environ["HELM_CHAT_NODE_BIN"] = "/custom/node-bin"
         self.assertEqual(chatnode.bin_path(), "/custom/node-bin")
+
+    def test_write_state_is_0600_from_birth(self):
+        # the credential (passphrase + token) must never ride a umask-mode
+        # tmp — 0600 from creation, a stale permissive tmp re-tightened
+        stale = chatnode.state_path() + ".tmp"
+        os.makedirs(os.path.dirname(stale), exist_ok=True)
+        with open(stale, "w") as f:
+            f.write("old")
+        os.chmod(stale, 0o644)
+        chatnode.write_state({"url": "u", "passphrase": "secret", "token": "t"})
+        p = chatnode.state_path()
+        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+        self.assertFalse(os.path.exists(stale))
+        self.assertEqual(chatnode.state()["passphrase"], "secret")
 
     def test_bootstrap_cell_is_deterministic_hex(self):
         h = chatnode.bootstrap_cell_hex()

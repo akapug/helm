@@ -97,8 +97,19 @@ def state():
 
 
 def write_state(d):
-    pk.write_json(state_path(), d)
-    os.chmod(state_path(), 0o600)
+    """0600 FROM BIRTH: the tmp is created (and fchmod'd, covering a stale
+    leftover) before the credential bytes land — pk.write_json's umask-mode
+    tmp would expose the passphrase/token for a window on a shared host."""
+    import json
+    path = state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
 
 
 def default_url():
