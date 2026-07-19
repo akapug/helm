@@ -535,6 +535,63 @@ sessions, configs, chat) served self-contained on `127.0.0.1:7433`. `--open`
 launches your browser. Full surface, API table, and a systemd unit:
 [WEB.md](WEB.md).
 
+## continuity — the authored chain over git
+
+### `helm ship [--apply] [--remote URL] [--message M] | ship pull | ship hosts`
+
+Cross-machine continuity on the overlay-not-store constitution: the ONLY
+thing worth syncing is the **AUTHORED chain** — premises/heuristics/lexicon/
+prd/journal/evals/archive, know-your-user, reflexes, priors/references, and
+`registry-authored.json` (lineage edges + notes: unrebuildable). Everything
+**DERIVED** re-derives per host via `helm sync` and never ships:
+`registry.json` at any depth (the `_global` projection and every per-project
+mirror), `.state/`, caches, `seats/` (host-local seat runtime — carries
+provider auth). Adopted-by-symlink homes (mission-control) are host-local:
+the symlink is ignored; that chain ships from its own repo. RAM-canon (chat
+rooms, tmpfs node state) never touches this disk — always out of scope.
+
+Bare `helm ship` is a **dry-run** (the drain law): it reports what would
+ship, names the derived exclusions, and runs the secret scan — touching
+nothing. `--apply` git-inits `~/.helm` (branch `main`), refreshes the managed
+`.gitignore` block, writes this host's observation block, commits, and pushes
+when an origin is set; **no remote = commit-only, said explicitly**. The
+remote must be **private** — journal/premise content is operator-internal.
+
+**Nothing-secret-staged law:** before any commit exists, every staged byte
+is scanned for token/key patterns (anthropic/api keys, github tokens/PATs,
+AWS key ids, slack tokens, private-key blocks, JWTs, bearer headers). A hit
+refuses loudly, names the file and pattern, and unstages everything.
+
+`helm ship pull` fetches + merges the chain, then regenerates the local
+projections (`helm sync`). Merges are **append-only by construction**:
+entries are per-file, and two hosts revising the same knowledge meet through
+the store's supersede-chains (tombstone + replacement file), never three-way
+markdown conflicts. pull resolves no content — git merges files, the store's
+status filter picks live over tombstone. A rejected push says exactly what
+to do: `helm ship pull`, then re-ship.
+
+`helm ship hosts` reads the per-host observation blocks
+(`_global/hosts/<host>.json` — one file per host, so they never conflict):
+who observed what, when — live-on-pug, dormant-on-droopy.
+
+```console
+$ helm ship
+helm ship --dry (nothing touched):
+  home:   /home/owner/.helm
+  git:    not initialized (would `git init -b main`)
+  remote: none configured — would COMMIT ONLY (add --remote <private-url>)
+  would ship: 82 authored files, 0.9MB
+  derived (never ships): .state/ x1 adopted-symlink x1 registry.json x22 seats/ x1
+  adopted symlink homes (host-local): mission-control
+  secret scan: clean (9 patterns over 82 files)
+  apply with: helm ship --apply [--remote <private-url>]
+```
+
+Deferred to v2 (by the card, deliberately): `helm manifest` — digested
+store-state roots per host, `--attest` self-written receipts, and pull's
+CONTRADICTED-ACROSS-HOSTS drift entry when the same id diverges with no
+supersede link.
+
 ---
 
 **A note on `helm seat`:** the multimodel-seat verb (giving a non-Claude

@@ -127,6 +127,7 @@ VERBS = {
     "creds": _lazy("creds", "cmd_creds"),
     "swap": _lazy("creds", "cmd_swap"),
     "capsule": _lazy("capsule", "cmd_capsule"),
+    "ship": _lazy("ship", "cmd_ship"),
     "cmd": _lazy("transcripts", "cmd_cmd"),
     "web": _lazy("web", "cmd_web"),
 }
@@ -163,6 +164,7 @@ _VERB_HELP = {
     "creds": "creds — live account scorecard (headroom/state/reset), all providers",
     "swap": "swap <home|email> — seat ran dry: print resume-under-healthier-account blocks",
     "capsule": "capsule <sid> — the session's git era: worktree + resume commands",
+    "ship": "ship [--apply] [--remote URL] | ship pull | ship hosts — the authored chain over git (dry-run default; pull merges + re-derives)",
     "cmd": "cmd <sid> [--account A] [--model M] — account-aware pasteable resume command",
     "web": "web [--port N] — the same, warm, in a browser",
 }
