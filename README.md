@@ -1,12 +1,19 @@
 # helm ⎈
 
-**The personal knowledge home for people who build with coding agents.**
+**The steering station for you and your agent fleet — everything they know,
+everything they're doing, everything they run on, one helm.**
 
-Every coding-agent harness leaves knowledge scattered: hundreds of session
-directories keyed by lossy path slugs, memory files nobody re-reads, glossaries
-and beliefs and specs spread across repos, dotfiles, and half-remembered
-conventions. helm is the layer that gathers it into one home — `~/.helm` — and
-keeps it alive:
+Working with coding agents at any real scale scatters your operation across
+harnesses: sessions in path-slug jails, accounts and quota windows in your
+head, knowledge in memory files nobody re-reads, credentials in fragile
+dotfile homes, coordination in tribal convention. helm gathers the whole
+operation into one place — a CLI and a warm web app over one home
+(`~/.helm`) — and serves it back to both audiences: **you** get the cockpit
+(sessions, accounts, configs, projects, the family tree of everything you've
+built), and **your agents** get the same truth injected into their context
+every turn (beliefs, vocabulary, reflexes — budget-capped, salience-gated).
+
+The pillars:
 
 - **`helm projects`** — your real project list, discovered from what your
   agents actually did, across every harness (Claude Code, Codex, OpenCode —
