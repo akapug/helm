@@ -100,5 +100,29 @@ class ScopeKeyedSnapshotTest(DriftBase):
         self.assertFalse(os.path.isfile(drift._state_path()))
 
 
+class FindingsFeedTest(DriftBase):
+    """findings() is the structured feed evolve mints commands from — pin the
+    row shapes and that report() is exactly its rendering."""
+
+    def test_rows_carry_what_a_command_needs(self):
+        self.seed("cert-x", 1.0, evidence_log=[
+            {"ts": TS, "type": "contradict", "delta": -0.1,
+             "reason": "agents disagree", "by": "agent"}])
+        self.seed("dorm", 0.3)
+        self.seed("tierx", 0.9)
+        drift.report()
+        self.seed("tierx", 0.5)
+        rows, n = drift.findings(snapshot=False)
+        self.assertEqual(n, 3)
+        self.assertEqual(rows, [
+            {"kind": "contradicted", "id": "cert-x", "n": 1,
+             "latest": "agents disagree"},
+            {"kind": "decayed", "id": "dorm", "conf": 0.3},
+            {"kind": "tier", "id": "tierx", "tier": "auto-act", "dir": "fell",
+             "was": 0.9, "now": 0.5}])
+        lines, _ = drift.report(snapshot=False)
+        self.assertEqual(lines, [drift._line(f) for f in rows])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,25 @@ notice -> name -> layer -> build -> adopt -> verify
 - **verify** — evidence logs and the drift report close the loop: an adopted
   belief that stops matching reality surfaces itself.
 
+## The observer roster (`helm evolve [--project P]`)
+
+| observer | reads | proposes |
+|---|---|---|
+| sync | project scan | new-project registrations (the one documented write: registry + scaffold) |
+| drain | raw intake | `helm drain --apply` routing / dup sweeps |
+| drift | priors + snapshot (peek, never consumed) | the summary line, plus per-belief paste-ready commands off the structured feed: contradicted certainty → `store supersede`, tier fall → `store evidence +Δ` (Δ computed to re-cross), decayed → `store retire`; rises stay quiet; one command per belief; `--project` rides every command when scoped |
+| fire: wallpaper | inject fire-ledger (+ .1 rotation) | a live jit entry firing in >50% of non-silent turns (min 20) → tighten keywords or demote, with the numbers (`store evidence` for beliefs, `store get` for the rest) |
+| fire: dead-weight | fire-ledger | live jit entries with ZERO fires over ≥200 turns → ONE batched dormancy-review proposal, never per-entry spam |
+| fire: silence | fire-ledger + store | ≥95% silent turns (min 20) over a populated store → `helm hooks status` (injection may be dark) |
+| reflex | fire-ledger reflex lane | a reflex re-firing within 3 turns of firing, ≥3 episodes → steer not landing; reword or retire. Honesty: the ledger logs fires, not heeds — proximity re-fire is the only proxy, and the proposal says so |
+| whoami | profile + notes | the five-minute interview |
+
+Behavior proposals are ranked by evidence strength, capped at 10 per cycle,
+and the cycle output names its data window ("over N turns since T"). The
+ledger observers tolerate absence and garbage (no ledger, no claims) and read
+the ledger estate-wide — fire behavior is not scope-sliced, but the store and
+reflex sets resolve under the cycle's scope.
+
 ## The anti-rulesurf gate (constitutional)
 
 `helm evolve` **proposes, never mutates**. Every proposal is an explicit verb
