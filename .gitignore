@@ -18,3 +18,5 @@ docs/DECISION-*.md
 .playwright-mcp/
 .claude/settings.json
 *.png
+.env
+.env.*
