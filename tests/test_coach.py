@@ -2,8 +2,8 @@
 
 Hermetic: HELM_HOME + HELM_ADOPTED_DIR point at fresh tmp dirs so the router,
 the dedupe search, and every landing path run against an isolated store (never
-the real ~/.claude corpus). The premise-attest leg is stubbed at cell.send_self
-so --apply stays fully offline — coach's contract is placement, not the wire.
+the real ~/.claude corpus). Attestation is native + offline; the OPTIONAL
+dregg anchor is stubbed at cell.anchor_submit so --apply never touches a node.
 """
 import contextlib
 import io
@@ -22,9 +22,11 @@ from helm import coach, home, pk, store  # noqa: E402
 class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-coach-")
-        self.prev = {k: os.environ.get(k) for k in ("HELM_HOME", "HELM_ADOPTED_DIR")}
+        self.prev = {k: os.environ.get(k)
+                     for k in ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_NODE_URL")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
+        os.environ["HELM_NODE_URL"] = "http://127.0.0.1:1"  # dead: anchor fails open
         os.makedirs(os.environ["HELM_ADOPTED_DIR"])
         home.scaffold_global()
 
@@ -192,7 +194,7 @@ class ApplyTest(_Base):
     def test_apply_premise_lands_certain(self):
         r = coach.plan("never commit secrets to any remote, no exceptions")
         self.assertEqual(r["layer"], "premise")
-        with mock.patch("helm.cell.send_self", return_value=(None, "hermetic")):
+        with mock.patch("helm.cell.anchor_submit", return_value=(None, "hermetic")):
             _rc, outcome = coach.apply(r)
         self.assertEqual(outcome, "new")
         got = store._find(r["id"], types=("prior",))

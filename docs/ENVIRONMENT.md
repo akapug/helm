@@ -75,16 +75,22 @@ overrides are in effect.
 the template placeholder the server substitutes the live token into at serve
 time.)
 
-## the attestation substrate (all optional — see [ATTESTATION.md](ATTESTATION.md))
+## attestation (native + stdlib) — these vars are for the OPTIONAL dregg anchor only
+
+Premise attestation is **native**: a stdlib, offline hash chain that needs no
+binary and no node (see [ATTESTATION.md](ATTESTATION.md)). The variables below
+configure only the OPTIONAL external dregg anchor and the OPTIONAL, explicit
+a2a transport. Each `MELD_*` is accepted READ-ONLY as an env2 migration
+fallback and is never canonical.
 
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
-| `HELM_CELL_BIN` | `meld` on `PATH`, else a sibling-checkout build (`../meld/target/release/meld`) | `helm cell` / `helm premise` — the ledger-node client binary | `MELD_CELL_BIN` |
-| `HELM_NODE_URL` | `http://127.0.0.1:8899` | the ledger node's HTTP API | `MELD_NODE_URL` |
-| `HELM_NODE_TOKEN` | — | bearer for the node's submit endpoint | `MELD_NODE_TOKEN` |
-| `HELM_NODE_PASSPHRASE` | — | unlock alternative to the token | `MELD_NODE_PASSPHRASE` |
-| `HELM_CELL_PROFILE` | `meld-agent` for cell passthrough; `helm-test` for premise attestation (a deliberate split — see ATTESTATION.md) | the signing identity profile in `~/.dregg/profiles` | `MELD_AGENT_PROFILE` |
-| `HELM_ROSTER` | `~/.dregg/roster.toml` | the substrate roster file | `MELD_ROSTER` |
+| `HELM_NODE_URL` | `http://127.0.0.1:8899` | the OPTIONAL dregg anchor node's HTTP API (fail-open) | `MELD_NODE_URL` |
+| `HELM_NODE_TOKEN` | — | OPTIONAL bearer for a gated anchor node | `MELD_NODE_TOKEN` |
+| `HELM_NODE_PASSPHRASE` | — | reserved (operator-side node unlock) | `MELD_NODE_PASSPHRASE` |
+| `HELM_CELL_PROFILE` | `helm-test` recording label for attestation; `helm-agent` for the optional a2a transport | the provenance LABEL (`attest_by`) — not a cryptographic signer | `MELD_AGENT_PROFILE` |
+| `HELM_CELL_BIN` | **unset ⇒ off** (no auto-resolution — never a `PATH`/sibling probe) | the OPTIONAL, explicit-opt-in `helm cell` a2a transport — **not** attestation | `MELD_CELL_BIN` |
+| `HELM_ROSTER` | `~/.dregg/roster.toml` | the OPTIONAL a2a transport's roster file | `MELD_ROSTER` |
 
 ## the comparison resolver backend (all optional — see [ARCHITECTURE.md](ARCHITECTURE.md) Pluggability)
 

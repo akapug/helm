@@ -384,7 +384,7 @@ helm sweep: DRY-RUN (nothing superseded). Re-run with --apply to tombstone via s
 ### `helm drift [--project P] [--peek]`
 Surface belief drift — contradictions, tier-crossings, decays, and evolutions
 — and only that. A superseded premise reports `EVOLVED`, exactly once:
-*attested chain* when its signed supersession link verifies (offline; the
+*attested chain* when its native supersession link verifies (offline; the
 biography is one `helm premise-check --chain` away), *unbacked* when the
 supersession is store-only. Steady beliefs print one summary line. `--peek`
 reads without updating the snapshot.
@@ -487,12 +487,13 @@ target project's `reflexes/`, written by the reflex byte-shape owner and then
 annotated in place with `teacher`/`target`/`stated_ts` provenance, plus one
 events-journal receipt. A same-id file in the project is a hard refuse
 (supersede-not-duplicate), an unknown project is refused (a taught reflex
-must have a reachable junior). `--attest` chains the incept onto the premise
-ledger: one signed self-write turn carrying `ment:b2b:<blake2b-256>` over the
+must have a reachable junior). `--attest` records the incept into the **native
+attestation chain**: one record carrying `ment:b2b:<blake2b-256>` over the
 canonical incept text `<target>/<id> | <steer> | teacher: <name>` — teaching
-provenance provable, `premise-check`-style. Substrate down: the reflex still
-lands, said loudly; `helm mentor teach <project> <id> --attest` (no steer)
-backfills the attestation later.
+provenance provable, `premise-check`-style, offline. The native record always
+lands; only an OPTIONAL dregg anchor is best-effort. `helm mentor teach
+<project> <id> --attest` (no steer) backfills the record later if the primitive
+was interrupted.
 
 `review` re-runs observe scoped per taught reflex: fires since its
 `stated_ts` off the inject fire-ledger (**did it even fire?**) and the
@@ -537,11 +538,13 @@ completed interview. Never nags — done latches it off.
 
 ### `helm premise <id> | <statement> [| keywords [| domain]] [--project P] [--no-attest]`
 Capture a confidence-1.0 truth: written to the typed store (same shape as
-`helm store add premise`) **and** attested — a signed digest committed to the
-verifiable ledger when the substrate is up, queued for retry when it isn't.
-`--no-attest` stores only. `helm premise --retry-queue` replays the queue.
-The full substrate story is [ATTESTATION.md](ATTESTATION.md); helm works
-fully without it.
+`helm store add premise`) **and** attested into the **native, offline hash
+chain** — the primary, tamper-evident proof, which always lands with no binary
+and no node. If a dregg node is reachable, the record hash is also posted as an
+OPTIONAL external anchor (fail-open; honestly labelled a node commitment, never
+a user-cell signature); when no node answers the anchor is queued.
+`--no-attest` stores only. `helm premise --retry-queue` re-attempts pending
+anchors. The full story is [ATTESTATION.md](ATTESTATION.md).
 
 ```console
 $ helm premise "naming-extremes | metaphors live at the extremes only"
@@ -551,37 +554,41 @@ helm premise: LIVE 'naming-extremes' [certain 1.00] - metaphors live at the extr
 ### `helm premise --supersede <old-id> <new-id> | <statement> [| keywords [| domain]]`
 Evolve the chain instead of editing in place: captures the NEW premise,
 tombstones the old one through the store's own lifecycle (`replaced_by` /
-`supersedes`, file kept), and commits ONE signed turn linking the chain —
-`sup:b2b:<new digest>:<prior turn prefix>`. The store legs land even with
-the node down; only the turn queues, and replay binds the prior turn hash in
-queue order. Re-stating a LIVE attested premise with a different statement
-is refused toward this verb — an in-place edit would orphan the attestation.
+`supersedes`, file kept), and appends ONE native `op: supersede` record whose
+`supersedes_record` links to the old premise's record hash (mirrored on the new
+entry as `attest_supersedes_record`). All three legs land offline. Re-stating a
+LIVE attested premise with a different statement is refused toward this verb —
+an in-place edit would orphan the attestation.
 
 ```console
 $ helm premise --supersede naming-extremes "naming-poles | metaphors live at the poles"
 helm premise: LIVE 'naming-poles' [certain 1.00] - metaphors live at the poles
   supersedes 'naming-extremes' — tombstoned (delete_eligible, file kept)
-  attested: turn 41c2... (chain_index 7) signed by profile 'david'
+  attested (native): record 4d8a4c1306028e80 at chain_index 7 — recorded by 'david'
+  chain: -> prior record 29114915ece8b4c2 (attest_supersedes_record)
 ```
 
 ### `helm premise-check <id> [--chain] [--project P]`
-Re-verify an attested premise: recompute the digest from the stored statement,
-compare to the attested payload (`prem:` or `sup:` form), and quote the
-finality tier the ledger node proves. Exit 0 on a digest match. `--chain`
-walks the whole supersession chain through any link — every digest and hop
-linkage re-verified, every turn's tier quoted — and prints the attested
-biography ("held X until T, then Y"). The on-ledger link is a 16-hex
-**pointer**; the full prior-turn hash rides frontmatter
-(`attest_supersedes_turn`) — a pointer, not a proof, and the output says so.
+Re-verify an attested premise, honestly tiered: recompute the digest from the
+stored statement (payload binding), verify the **native chain** record
+recomputes and links to its predecessor (the primary proof), and — if an
+external anchor was taken — report whether a reachable dregg node still shows it
+(CONFIRMED / unverified / none). Exit 0 when the digest matches AND the native
+record verifies; the anchor never fails the check. `--chain` walks the whole
+supersession chain through any link — every digest, every record, every hop
+linkage re-verified — and prints the attested biography ("held X until T, then
+Y").
 
 ```console
 $ helm premise-check naming-poles
-  digest: MATCH sup:b2b:9f2c...
-  finality tier: attested-after-next-height (consensus_final at attested_height 43)
+  digest: MATCH prem:b2b:9f2c...
+  native chain: VERIFIED — record 4d8a4c130602 at index 7 links to 29114915ece8…
+  external anchor: none (native-only)
 $ helm premise-check --chain naming-poles
   1. naming-extremes [delete_eligible] - metaphors live at the extremes only
   2. naming-poles [live] - metaphors live at the poles
-       link 1->2 ATTESTED — full linkage in frontmatter
+       native chain VERIFIED — record 4d8a4c130602 at index 7 links to 29114915ece8…
+       link 1->2 ATTESTED — native record linkage verified (29114915ece8 -> 4d8a4c130602)
   biography:
     held 'metaphors live at the extremes only' until 2026-07-19T..., then 'metaphors live at the poles' — LIVE now
 ```
@@ -853,7 +860,7 @@ corroboration — the same pattern as premise attestation, see
 [ATTESTATION.md](ATTESTATION.md)). Signed rows render clean (the web panel
 shows a subtle ✓ tick, chain index on hover); node down → the v1 path
 automatically, tagged `[unsigned]` — the message never dies, the signature is
-what degrades. Agents sign as `HELM_CELL_PROFILE` (else `meld-agent`); the
+what degrades. Agents sign as `HELM_CELL_PROFILE` (else `helm-agent`); the
 owner's web posts sign server-side as `david`. `helm chat node up` provisions
 the room node (`helm-chat-node.service`, `dregg-cave-node` on
 `/dev/shm/helm-chat-node`, port 8898, faucet ON — the node auto-funds joining

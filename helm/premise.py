@@ -1,82 +1,85 @@
 #!/usr/bin/env python3
-"""helm premise — attested premise capture per
-docs/DECISION-dregg-attested-premises.md (+ the live-proof addendum).
+"""helm premise — attested premise capture, NATIVE-primary.
 
 A premise (a confidence-1.0 truth) is written into the typed store
-(store.write_prior — the same premise path `helm store add premise` takes)
-AND attested on the dregg substrate as ONE self-write turn: the digest of the
-canonical statement rides the WHISPER PAYLOAD slots via the proven meld-send
-path — NEVER the 8-byte heartbeat tag (addendum law #1). `premise-check`
-recomputes the digest from the STORED statement, compares it to the attested
-payload, and quotes the FINALITY TIER the node proved (addendum law #2).
+(store.write_prior — the same path `helm store add premise` takes) AND attested
+by helm ITSELF, with no external binary and no network dependency. The PRIMARY
+attestation is a stdlib, append-only, tamper-evident HASH CHAIN kept under the
+helm home; a dregg node, if one is reachable, is an OPTIONAL external anchor.
+
+WHY NATIVE-PRIMARY (the corrected de-Meld design). helm rides dregg + cv only;
+it never depends on the meld binary. An agent-run capture cannot be signed by
+the owner's cell, and the stdlib-feasible dregg ingress is signed by the NODE
+operator, not the user — so a "the user's cell signed this premise" claim would
+be dishonest. Instead the proof is the QUOTE plus a chain: provenance (owner
+said X, at T, source) bound into a record whose hash links to its predecessor.
+This verifies OFFLINE and is the primary evidence. The dregg anchor, when
+present, is honestly labelled "dregg node <url> anchored digest at turn <hash>"
+— never a signer claim.
+
+THE NATIVE CHAIN (<helm-home>/_global/.state/attest-chain.jsonl). One JSON
+record per line. Each record's tamper-evident CORE carries:
+  v                 schema/evidence version (CHAIN_V)
+  op                create | supersede | retire
+  premise_id        the entry id
+  root, project     provenance root (global/project/adopted) + project name
+  digest            the canonical statement digest (prem:b2b:<blake2b-256 hex>)
+  ts, source        capture timestamp + source (human)
+  attest_by         the RECORDING label (profile/agent) — provenance, NOT a
+                    cryptographic signer (honest: native attestation is not a
+                    cell signature)
+  supersedes,       the superseded id + its record hash (a supersede op links
+  supersedes_record the chain across premise evolution)
+and then:
+  prev              the predecessor record's rec_hash ("" at genesis)
+  rec_hash          blake2b256( canonical(core) + prev )
+  chain_index       the record's ordinal (convenience; not hashed)
+So rec_hash = hash(canonical_serialization + predecessor_hash): reorder, insert
+or edit any record and every subsequent rec_hash fails to recompute. A local
+chain is tamper-evident relative to a retained head — git, another copy, or the
+optional dregg anchor supplies the external commitment.
 
 CANONICALIZATION (the digest contract — stable by construction):
   1. unicodedata.normalize("NFC", statement)
-  2. replace every '"' with "'"  — mirrors store.write_prior's serialization
-     (it swaps double quotes for single on write), so the digest recomputed
-     from the stored statement always equals the digest taken at capture
-  3. collapse every whitespace run to one space  (re.sub(r"\\s+", " ", s))
-  4. strip leading/trailing whitespace
+  2. replace every '"' with "'"  (mirrors store.write_prior's serialization, so
+     the digest recomputed from the stored statement equals the capture digest)
+  3. collapse every whitespace run to one space
+  4. strip
+DIGEST — algorithm-tagged (blake2b-256; blake3 tooling is absent on this host):
+  payload = "prem:b2b:" + blake2b(canonical_utf8, digest_size=32).hexdigest()
 
-DIGEST — ALGORITHM-TAGGED because blake3 tooling is absent on this host
-(verified 2026-07-18: no b3sum on PATH, no python `blake3` module):
-  payload = "prem:b2b:" + hashlib.blake2b(canonical_utf8, digest_size=32).hexdigest()
-73 ASCII bytes — inside the whisper frame's 104-byte budget. The tag makes the
-algorithm self-describing and upgradeable: when blake3 tooling lands, a
-"prem:b3:<hex>" payload coexists and old attestations stay verifiable.
+FRONTMATTER pointer (the entry's attest_* keys point back at the chain):
+  attest_payload    the digest (prem:b2b:<hex>)
+  attest_ts         capture ts
+  attest_by         the recording label (provenance, NOT a signer)
+  attest_record     the native rec_hash — the PRIMARY proof pointer
+  attest_chain_index the record's index in the native chain
+  attest_supersedes_record  the prior premise's rec_hash (supersede linkage)
+  attest_anchor, attest_anchor_turn  OPTIONAL external dregg anchor (honest)
 
-IDENTITY: an agent-run capture CANNOT be user-signed — the user's cell signs
-only when the USER captures. The signing profile is recorded on the entry as
-`attest_by`; the default (no HELM_CELL_PROFILE / MELD_AGENT_PROFILE set) is
-the TEST profile 'helm-test', so a test-signed attestation is never mistaken
-for the user's. The user-cell activation is the owner's first /premise with
-their own profile set — by design.
+GRACEFUL DEGRADE. The store write and the native record ALWAYS land — offline,
+with no node, with nothing configured. Only the OPTIONAL dregg anchor can be
+pending; a pending anchor is queued to attest-queue.jsonl and `--retry-queue`
+re-anchors it once a node appears. Capture never raises and never blocks on the
+network.
 
-Substrate down / binary missing / no profile: the premise is STORED anyway,
-the attestation is queued to <helm-home>/_global/.state/attest-queue.jsonl for
-retry, and the capture reports "attestation pending (substrate unavailable)".
+SUPERSESSION (DECISION clauses 5-6): `--supersede <old-id> <new-id> |
+<statement>` captures NEW, tombstones OLD through the store's own lifecycle
+(local — lands with no node), and appends ONE native supersede record linking
+`supersedes_record` to OLD's rec_hash. `premise-check --chain <id>` walks the
+chain and prints the attested biography; drift.py reads the same linkage
+offline and reports a verified supersession as EVOLVED.
 
-SUPERSESSION CHAIN (DECISION clauses 5-6): `--supersede <old-id> <new-id> |
-<statement>` captures the NEW premise, tombstones OLD through the store's own
-lifecycle (mark_superseded — the existing supersedes/replaced_by fields, zero
-schema change, file kept), and commits ONE signed turn linking the chain:
-"sup:b2b:<64-hex new digest>:<16-hex prior attest_turn prefix>" — 89 bytes,
-inside the 104-byte whisper budget. The truncated prefix on the ledger is a
-POINTER, not a proof; the full prior turn hash rides the new entry's
-frontmatter as attest_supersedes_turn (stated honestly wherever the chain is
-quoted — store rewrites carry only the six attest_* keys, so chain
-verification hinges on the surviving attest_payload/attest_turn fields and
-treats the frontmatter full hash as corroboration). Node-down supersession:
-the store lifecycle lands NOW (local, never blocked) and the turn queues with
-the link UNBOUND — replay binds the prior turn at send time, so a pending
-prem: turn earlier in the queue lands before the sup: turn that references it
-(replayed in order). An in-place edit of a LIVE attested premise is refused
-toward --supersede: it would orphan the attestation (premise-check MISMATCH).
-`premise-check --chain <id>` walks the chain and prints the attested
-biography ("held X until T, then Y"); drift.py reads the same linkage offline
-and reports a verified supersession as EVOLVED (attested belief-evolution)
-instead of losing the history.
+BACKFILL (--attest-existing <id> / --attest-sweep): entries captured before
+attestation existed (the adopted corpus included) get a native record appended
+IN PLACE — the digest is computed from the entry's CURRENT stored statement and
+the file is annotated with the attest_* keys ONLY (never a rewrite, never a
+twin). The sweep is offline + free: no computrons, no faucet, no bearer token.
 
-BACKFILL (--attest-existing <id> / --attest-sweep): entries captured BEFORE
-attestation existed (the adopted corpus included) are attested IN PLACE — the
-digest is computed per the same contract from the entry's CURRENT stored
-statement, one self-write turn is submitted, and the entry's file is annotated
-with the attest_* keys ONLY (never a rewrite, never a global twin of an
-adopted entry, never through add — so the supersede-guard cannot trip). The
-sweep covers every live certain (confidence-1.0) prior across ALL roots,
-sequentially, under ONE minted bearer token: the node rate-limits
-/api/cipherclerk/unlock to 5/60s COUNTING SUCCESSES (emberian/dregg#60) and
-meld re-unlocks per send when only a passphrase is set, so the sweep unlocks
-once and rides MELD_NODE_TOKEN. Per-entry resilience: insufficient balance
-auto-refuels via the dev faucet and resends; any other failure resends once
-after a pause, then falls to the attest-queue — the sweep never crashes.
-
-NOTE on the attest_* frontmatter: store.write_prior owns the entry's byte
-shape, so this module appends the attest keys into the metadata block after
-the write; the store's parsers + lifecycle writers carry all six attest_*
-keys through rewrites (evidence/retire), so an annotation survives the
-entry's lifecycle. The attestation TRUTH lives on the ledger either way —
-the file keys are the pointer back to it (turn hash, receipt, chain index).
+env2 legacy note: the OPTIONAL dregg config vars (HELM_NODE_URL /
+HELM_NODE_TOKEN) accept the legacy MELD_* name READ-ONLY as a migration
+fallback (via home.env). No MELD_* value is ever canonical, and no meld binary
+is ever needed.
 
 Import-safe, stdlib-only.
 """
@@ -85,21 +88,19 @@ import json
 import os
 import re
 import sys
-import time
 import unicodedata
 
 from . import cell, home, pk, store
 
 DIGEST_TAG = "prem:b2b:"          # blake2b-256 (see module docstring)
-SUP_TAG = "sup:b2b:"              # supersession link (see sup_payload)
-SUP_PTR_LEN = 16                  # prior-turn prefix on the ledger — a pointer, not a proof
-DEFAULT_PROFILE = "helm-test"     # test-signed by default — never the user's cell
+CHAIN_V = 2                       # native attestation-chain schema/evidence version
+DEFAULT_PROFILE = "helm-test"     # recording label default — never the user's cell
+RETRY_PAUSE_S = 2                 # pause between queued anchor-retry failures
 
-# Backfill resilience knobs (the sweep exercises the live node at corpus scale):
-RETRY_PAUSE_S = 2      # pause before the one retry + between queued failures
-FAUCET_AMOUNT = 10000  # dev-faucet grant ceiling per request (computrons)
-FAUCET_WINDOW_S = 61   # the faucet allows 1 grant per cell per 60s — wait it out
-ATTEST_COST_HINT = 1442  # one attest turn's computron cost, observed live 2026-07-19
+# The tamper-evident core of a native record (hashed; prev/rec_hash/chain_index
+# are structural, never part of the hashed body).
+_CORE_KEYS = ("v", "op", "premise_id", "root", "project", "digest", "ts",
+              "source", "attest_by", "supersedes", "supersedes_record")
 
 _USAGE_PREMISE = ("usage: helm premise <id> | <statement> [| keywords [| domain]] "
                   "[--project P] [--no-attest]\n"
@@ -111,6 +112,10 @@ _USAGE_PREMISE = ("usage: helm premise <id> | <statement> [| keywords [| domain]
 _USAGE_CHECK = "usage: helm premise-check <id> [--chain] [--project P]"
 
 
+# ---------------------------------------------------------------------------
+# canonicalization + digest
+# ---------------------------------------------------------------------------
+
 def canonicalize(statement):
     """The exact canonical text the digest covers (see module docstring):
     NFC -> '\"'->\"'\" -> collapse-whitespace -> strip."""
@@ -120,63 +125,173 @@ def canonicalize(statement):
 
 
 def digest_payload(statement):
-    """The algorithm-tagged attestation payload for a statement (73 bytes)."""
+    """The algorithm-tagged statement digest (73 bytes)."""
     h = hashlib.blake2b(canonicalize(statement).encode("utf-8"), digest_size=32)
     return DIGEST_TAG + h.hexdigest()
 
 
-def sup_payload(statement, prior_turn):
-    """The supersession-link payload (89 bytes): the NEW statement's digest
-    plus a SUP_PTR_LEN-hex POINTER to the superseded premise's attest turn."""
-    return (SUP_TAG + digest_payload(statement)[len(DIGEST_TAG):]
-            + ":" + prior_turn[:SUP_PTR_LEN])
-
-
 def payload_digest(payload):
-    """The 64-hex statement digest inside either payload form ('' = neither)."""
-    for tag in (DIGEST_TAG, SUP_TAG):
-        if payload.startswith(tag):
-            return payload[len(tag):].split(":")[0]
+    """The 64-hex statement digest inside a prem: payload ('' if not one)."""
+    return payload[len(DIGEST_TAG):].split(":")[0] if payload.startswith(DIGEST_TAG) else ""
+
+
+# ---------------------------------------------------------------------------
+# the native attestation chain (the PRIMARY proof)
+# ---------------------------------------------------------------------------
+
+def _chain_path():
+    return os.path.join(home.global_dir(), ".state", "attest-chain.jsonl")
+
+
+def chain_records():
+    """Every native record, in append order. A torn/unparseable line (a crash
+    mid-append) is skipped, never a wedge."""
+    rows = []
+    try:
+        with open(_chain_path(), encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return rows
+
+
+def _canon_core(core):
+    """The one canonical byte representation of a record's core (sorted keys,
+    compact, NFC-safe) — the exact bytes the record hash covers."""
+    return json.dumps(core, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def _record_hash(core, prev):
+    return hashlib.blake2b((_canon_core(core) + (prev or "")).encode("utf-8"),
+                           digest_size=32).hexdigest()
+
+
+def _append_record(op, premise_id, digest, *, root, project, ts, source,
+                   attest_by, supersedes, supersedes_record):
+    """Append ONE record to the native chain, linked to the current head.
+    Returns the stored record dict. This never touches the network."""
+    recs = chain_records()
+    prev = recs[-1].get("rec_hash", "") if recs else ""
+    core = {"v": CHAIN_V, "op": op, "premise_id": str(premise_id),
+            "root": root or "", "project": project or "", "digest": digest,
+            "ts": ts, "source": source or "", "attest_by": attest_by or "",
+            "supersedes": supersedes or "", "supersedes_record": supersedes_record or ""}
+    rec = dict(core, prev=prev, rec_hash=_record_hash(core, prev),
+               chain_index=len(recs))
+    path = _chain_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return rec
+
+
+def record_attestation(op, premise_id, digest, *, root, project="", ts=None,
+                       source="human", attest_by="", supersedes="",
+                       supersedes_record="", anchor=True):
+    """Attest: append ONE native record (the PRIMARY, offline, tamper-evident
+    proof) and, best-effort, submit an OPTIONAL dregg external anchor. Returns
+    {rec_hash, chain_index, ts, anchor_turn, anchor_label, anchor_reason}. The
+    native record always lands; the anchor fails open. Never raises."""
+    ts = ts or pk.now_ts()
+    rec = _append_record(op, premise_id, digest, root=root, project=project,
+                         ts=ts, source=source, attest_by=attest_by,
+                         supersedes=supersedes, supersedes_record=supersedes_record)
+    out = {"rec_hash": rec["rec_hash"], "chain_index": rec["chain_index"],
+           "ts": ts, "anchor_turn": "", "anchor_label": "", "anchor_reason": ""}
+    if anchor:
+        turn, err = cell.anchor_submit(
+            rec["rec_hash"], memo="helm-attest:v%d:%s" % (CHAIN_V, premise_id))
+        if turn:
+            out["anchor_turn"] = turn
+            out["anchor_label"] = cell.anchor_label(turn)
+        else:
+            out["anchor_reason"] = err
+    return out
+
+
+def verify_chain():
+    """Recompute every record hash + confirm predecessor linkage across the
+    WHOLE native chain. (ok, detail); one break => tamper-evident fail."""
+    recs = chain_records()
+    prev = ""
+    for i, rec in enumerate(recs):
+        if rec.get("prev", "") != prev:
+            return False, "record %d (%s): prev breaks the chain" \
+                % (i, rec.get("premise_id"))
+        core = {k: rec.get(k, "") for k in _CORE_KEYS}
+        if _record_hash(core, prev) != rec.get("rec_hash"):
+            return False, "record %d (%s): rec_hash does not recompute" \
+                % (i, rec.get("premise_id"))
+        prev = rec.get("rec_hash", "")
+    return True, "chain verified (%d record%s)" % (len(recs), "s"[:len(recs) != 1])
+
+
+def verify_record(rec_hash):
+    """Verify ONE record in place: recompute its hash + confirm its prev links
+    to the record before it. (ok, detail)."""
+    recs = chain_records()
+    for i, rec in enumerate(recs):
+        if rec.get("rec_hash") != rec_hash:
+            continue
+        prev = recs[i - 1].get("rec_hash", "") if i > 0 else ""
+        if rec.get("prev", "") != prev:
+            return False, "predecessor linkage broken at index %d" % i
+        core = {k: rec.get(k, "") for k in _CORE_KEYS}
+        if _record_hash(core, prev) != rec_hash:
+            return False, "record does not recompute (tampered) at index %d" % i
+        return True, ("record %s at index %d links to %s"
+                      % (rec_hash[:12], i, ((prev[:12] + "…") if prev else "genesis")))
+    return False, "no native record %s in the chain" % (rec_hash or "")[:12]
+
+
+# ---------------------------------------------------------------------------
+# frontmatter helpers + supersession-link verification (OFFLINE)
+# ---------------------------------------------------------------------------
+
+def _front(e, key):
+    """Read `key` from the entry dict, falling back to its frontmatter file."""
+    v = e.get(key)
+    if v not in (None, ""):
+        return v
+    if e.get("path"):
+        return (pk.parse_simple_frontmatter(e["path"], {key: ""}) or {}).get(key) or ""
     return ""
 
 
-def payload_ptr(payload):
-    """The prior-turn pointer inside a sup: payload ('' on any other form)."""
-    rest = payload[len(SUP_TAG):].split(":") if payload.startswith(SUP_TAG) else []
-    return rest[1] if len(rest) > 1 else ""
-
-
 def verify_link(old_e, new_e):
-    """OFFLINE hop verification old -> new (no node call — the drift path):
-    -> (state, detail).
-      attested  the sup: payload matches new's STORED statement and points at
-                old's attest_turn (frontmatter full hash corroborates when present)
-      broken    a sup: payload contradicting the stored statement, the pointer,
-                or the frontmatter full hash
-      unbacked  no signed link (store-only supersession, or a chain start over
-                a never-attested prior)
-    Hinges only on fields store rewrites carry (attest_payload/attest_turn);
-    attest_supersedes_turn is corroboration, never the hinge."""
-    payload = new_e.get("attest_payload") or ""
-    if not payload.startswith(SUP_TAG):
-        return "unbacked", "no sup: payload on '%s'" % new_e["id"]
+    """OFFLINE hop verification old -> new via the native chain (no node):
+      attested  new carries attest_supersedes_record == old's attest_record and
+                new's digest matches its STORED statement
+      broken    the link points elsewhere, old has no record, or the digest no
+                longer matches the stored statement
+      unbacked  no native supersession record (store-only supersession, or a
+                chain start over a never-attested prior)."""
+    link = _front(new_e, "attest_supersedes_record")
+    if not link:
+        return "unbacked", "no native supersession record on '%s'" % new_e["id"]
+    payload = _front(new_e, "attest_payload")
     if payload_digest(payload) != payload_digest(digest_payload(new_e.get("statement") or "")):
-        return "broken", "sup digest != stored statement of '%s'" % new_e["id"]
-    prior = old_e.get("attest_turn") or ""
+        return "broken", "attested digest != stored statement of '%s'" % new_e["id"]
+    prior = _front(old_e, "attest_record")
     if not prior:
-        return "broken", "'%s' carries a sup: link but '%s' has no attest_turn" \
+        return "broken", "'%s' links but '%s' has no attest_record" \
             % (new_e["id"], old_e["id"])
-    if payload_ptr(payload) != prior[:SUP_PTR_LEN]:
-        return "broken", "pointer %s != prior turn %s" \
-            % (payload_ptr(payload), prior[:SUP_PTR_LEN])
-    full = (pk.parse_simple_frontmatter(new_e["path"],
-                                        {"attest_supersedes_turn": ""}) or {}) \
-        .get("attest_supersedes_turn") or ""
-    if full and full != prior:
-        return "broken", "frontmatter attest_supersedes_turn contradicts the prior turn"
-    return "attested", ("full linkage in frontmatter" if full
-                        else "pointer verified; frontmatter full-hash key absent")
+    if link != prior:
+        return "broken", "supersedes_record %s != prior record %s" \
+            % (link[:12], prior[:12])
+    return "attested", "native record linkage verified (%s -> %s)" \
+        % (prior[:12], (_front(new_e, "attest_record") or "?")[:12])
 
+
+# ---------------------------------------------------------------------------
+# the anchor-retry queue (only the OPTIONAL external anchor ever queues)
+# ---------------------------------------------------------------------------
 
 def _queue_path():
     return os.path.join(home.global_dir(), ".state", "attest-queue.jsonl")
@@ -190,13 +305,40 @@ def _enqueue(rec):
     return path
 
 
+def _read_queue(qp):
+    rows = []
+    try:
+        with open(qp, encoding="utf-8") as f:
+            for l in f:
+                if l.strip():
+                    try:
+                        rows.append(json.loads(l))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return rows
+
+
+def _rewrite_queue(qp, examined, kept):
+    """Atomic queue rewrite that PRESERVES rows appended while the caller
+    worked (the queue is append-only, so everything past `examined` rides
+    along)."""
+    rows = kept + _read_queue(qp)[examined:]
+    pk.atomic_write(qp, "".join(json.dumps(r, ensure_ascii=False) + "\n"
+                                for r in rows))
+
+
+# ---------------------------------------------------------------------------
+# annotation
+# ---------------------------------------------------------------------------
+
 def _annotate(path, fields):
     """Insert attest_* keys into the entry's metadata block (just before the
     closing frontmatter fence). fields = ordered (key, value) pairs; blank
-    values are skipped. Fail-open False on a shape surprise — a non-UTF-8
-    file included (ValueError: the store parses it with errors='replace',
-    but rewriting replacement chars back would corrupt bytes). newline=''
-    keeps CRLF files byte-identical outside the inserted lines."""
+    values skipped. Fail-open False on a shape surprise (non-UTF-8 file, or a
+    metadata block without two fences). newline='' keeps CRLF byte-identical
+    outside the inserted lines."""
     try:
         with open(path, encoding="utf-8", newline="") as f:
             lines = f.read().split("\n")
@@ -211,8 +353,37 @@ def _annotate(path, fields):
     return True
 
 
+def _attest_fields(digest, ts, profile, info, supersedes_record=""):
+    """The ordered attest_* frontmatter for one attestation."""
+    fields = [("attest_payload", digest), ("attest_ts", ts),
+              ("attest_by", profile), ("attest_record", info["rec_hash"]),
+              ("attest_chain_index", info["chain_index"])]
+    if supersedes_record:
+        fields.append(("attest_supersedes_record", supersedes_record))
+    if info.get("anchor_turn"):
+        fields.append(("attest_anchor", info["anchor_label"]))
+        fields.append(("attest_anchor_turn", info["anchor_turn"]))
+    return fields
+
+
+def _report_anchor(info, pid, project, ts, rec_hash=None):
+    """Print the OPTIONAL anchor's honest status; queue it for retry if it did
+    not land (the native record is already the proof)."""
+    if info.get("anchor_turn"):
+        print("  external anchor: " + info["anchor_label"])
+        return
+    _enqueue({"ts": ts, "id": str(pid), "project": project,
+              "rec_hash": rec_hash or info["rec_hash"], "kind": "anchor",
+              "reason": info.get("anchor_reason") or "no node"})
+    print("  external anchor: none yet — native record stands; queued for retry")
+    print("    reason: " + (info.get("anchor_reason") or "no dregg node reachable"))
+
+
+# ---------------------------------------------------------------------------
+# argument helpers
+# ---------------------------------------------------------------------------
+
 def _pop_flag(args, flag, takes_value):
-    """Remove `flag` (and its value) from args; return the value (or True)."""
     if flag not in args:
         return None
     i = args.index(flag)
@@ -227,24 +398,31 @@ def _pop_flag(args, flag, takes_value):
 
 
 def attest_profile():
-    """The signing profile for THIS capture (env else the test default)."""
+    """The recording label for THIS capture (env else the test default). A
+    LABEL only — helm's native attestation is not a cell signature."""
     return cell.profile_name(default=DEFAULT_PROFILE)
 
 
+def _root_label(e, project):
+    return e.get("root") or ("project" if project else "global")
+
+
+# ---------------------------------------------------------------------------
+# capture
+# ---------------------------------------------------------------------------
+
 def _capture_store(parts, project, ts):
-    """The store leg every capture path shares (same target + shape as `helm
-    store add premise`: write_prior, confidence CERTAIN, source human).
-    Re-minting over a NON-live prior life starts FRESH — stale tombstone/
-    evidence/attest metadata never rides into the new lifecycle. A LIVE
-    attested entry whose canonical statement would CHANGE is refused toward
-    --supersede: the in-place edit orphans the attestation (premise-check
-    would MISMATCH — the chain law). -> (path, entry, None) or (None, None,
-    refusal-text)."""
+    """The store leg every capture path shares (write_prior, CERTAIN, human).
+    Re-minting over a NON-live prior life starts FRESH (stale tombstone/attest
+    metadata never rides into the new lifecycle). A LIVE attested entry whose
+    canonical statement would CHANGE is refused toward --supersede (an in-place
+    edit orphans the attestation). -> (path, entry, None) or (None, None,
+    refusal)."""
     pid, statement = parts[0], parts[1]
     path = os.path.join(store._default_dir("prior", project),
                         store.PRIOR_PREFIX + pk.slug(pid) + ".md")
     e = store._parse_prior(path) or {}
-    if e.get("status") == store.STATUS_LIVE and e.get("attest_turn") \
+    if e.get("status") == store.STATUS_LIVE and _front(e, "attest_record") \
             and canonicalize(e.get("statement")) != canonicalize(statement):
         return None, None, (
             "'%s' is LIVE and attested — an in-place edit orphans the "
@@ -254,8 +432,10 @@ def _capture_store(parts, project, ts):
     if e and e.get("status") != store.STATUS_LIVE:
         for stale in ("replaced_by", "supersedes", "retired_ts", "retired_why",
                       "evidence_log", "confidence_history", "attest_payload",
-                      "attest_ts", "attest_by", "attest_turn", "attest_receipt",
-                      "attest_chain_index"):
+                      "attest_ts", "attest_by", "attest_record",
+                      "attest_chain_index", "attest_supersedes_record",
+                      "attest_anchor", "attest_anchor_turn",
+                      "attest_turn", "attest_receipt", "attest_supersedes_turn"):
             e.pop(stale, None)
     e.update({"id": pid, "statement": statement, "confidence": store.CERTAIN,
               "keywords": parts[2] if len(parts) > 2 else e.get("keywords", ""),
@@ -268,14 +448,11 @@ def _capture_store(parts, project, ts):
 
 def cmd_premise(args):
     """premise <id> | <statement> [| keywords [| domain]] — store + attest.
-    premise --supersede <old-id> <new-id> | <statement> — evolve the chain:
-    capture NEW, tombstone OLD (store lifecycle), ONE signed linking turn.
-    premise --retry-queue — replay attestations queued while the substrate
-    was down (success annotates the entry + leaves the queue; failures stay).
-    premise --attest-existing <id> — backfill-attest one entry already in the
-    store (annotation in place, wherever the file lives).
-    premise --attest-sweep [--dry] [--limit N] — backfill every live certain
-    entry lacking a recorded turn, across all roots."""
+    premise --supersede <old-id> <new-id> | <statement> — evolve the chain.
+    premise --retry-queue — re-attempt OPTIONAL dregg anchors queued while no
+    node was reachable (the native record already stands).
+    premise --attest-existing <id> — backfill a native record for one entry.
+    premise --attest-sweep [--dry] [--limit N] — backfill every live certain."""
     args = list(args)
     if "--retry-queue" in args:
         return _retry_queue()
@@ -312,7 +489,7 @@ def cmd_premise(args):
     pid, statement = parts[0], parts[1]
     ts = pk.now_ts()
 
-    # 1. STORE — attestation failure never loses it.
+    # 1. STORE — the native record + store both land offline; nothing lost.
     path, e, refuse = _capture_store(parts, project, ts)
     if refuse:
         print("helm premise: " + refuse, file=sys.stderr)
@@ -324,40 +501,29 @@ def cmd_premise(args):
         print("  attestation skipped (--no-attest)")
         return 0
 
-    # 2. ATTEST — the digest rides the whisper PAYLOAD slots (self-write send).
-    payload = digest_payload(statement)
-    if e.get("attest_turn") and \
-            payload_digest(e.get("attest_payload") or "") == payload_digest(payload):
-        # idempotent re-state: the standing turn already proves this exact
-        # statement — a second send would double-attest + double-annotate
-        print("  already attested — turn %s (verify: helm premise-check %s)"
-              % (e["attest_turn"], pid))
+    # 2. ATTEST — the native chain record is the primary proof.
+    digest = digest_payload(statement)
+    if _front(e, "attest_record") and \
+            payload_digest(_front(e, "attest_payload")) == payload_digest(digest):
+        print("  already attested — record %s (verify: helm premise-check %s)"
+              % (_front(e, "attest_record")[:16], pid))
         return 0
     profile = attest_profile()
-    info, err = cell.send_self(payload, profile)
-    if err:
-        qp = _enqueue({"ts": ts, "id": pid, "project": project,
-                       "payload": payload, "profile": profile, "reason": err})
-        print("  attestation pending (substrate unavailable) — queued: " + qp)
-        print("    reason: " + err)
-        return 0
-    _annotate(path, [("attest_payload", payload), ("attest_ts", ts),
-                     ("attest_by", profile),
-                     ("attest_turn", info.get("turn_hash", "")),
-                     ("attest_receipt", info.get("receipt_hash", "")),
-                     ("attest_chain_index", info.get("chain_index", ""))])
-    print("  attested: turn %s (chain_index %s) signed by profile '%s'"
-          % (info.get("turn_hash"), info.get("chain_index"), profile))
-    print("  payload: " + payload)
+    info = record_attestation("create", pid, digest, root=_root_label(e, project),
+                              project=project, ts=ts, attest_by=profile)
+    _annotate(path, _attest_fields(digest, ts, profile, info))
+    print("  attested (native): record %s at chain_index %s — recorded by '%s'"
+          % (info["rec_hash"][:16], info["chain_index"], profile))
+    print("  payload: " + digest)
+    _report_anchor(info, pid, project, ts)
     return 0
 
 
 def _supersede(old_id, parts, project):
-    """--supersede <old-id> <new-id> | <statement> [| keywords [| domain]]:
-    capture the NEW premise, tombstone OLD through the store's own lifecycle
-    (local — lands even with the node down), and commit ONE signed turn
-    linking the chain (DECISION clauses 5-6). A never-attested OLD is stated
-    honestly: the chain starts at the new premise with a plain prem: turn."""
+    """--supersede <old-id> <new-id> | <statement>: capture NEW, tombstone OLD
+    (store lifecycle — lands with no node), and append ONE native supersede
+    record linking supersedes_record to OLD's rec_hash. A never-attested OLD is
+    stated honestly: the chain starts at the new premise."""
     old = store._find(old_id, project=project, types=("prior",))
     if not old:
         print("helm premise: '%s' not found (helm store list)" % old_id,
@@ -373,115 +539,44 @@ def _supersede(old_id, parts, project):
               "needs a new id", file=sys.stderr)
         return 1
     ts = pk.now_ts()
+    old_record = _front(old, "attest_record")   # capture before the tombstone
     path, _e, refuse = _capture_store(parts, project, ts)
     if refuse:
         print("helm premise: " + refuse, file=sys.stderr)
         return 1
-    # a sup-minted OLD carries attest_supersedes_turn that mark_superseded's
-    # rewrite drops (store carries only the six attest_* keys) — capture it
-    # before the tombstone and restore it after, or every chain EXTENSION
-    # would silently shed the mid-link full-linkage frontmatter
-    old_link = (pk.parse_simple_frontmatter(old["path"],
-                                            {"attest_supersedes_turn": ""}) or {}) \
-        .get("attest_supersedes_turn") or ""
     _old, err = store.mark_superseded(str(old["id"]), parts[0], ts,
                                       reason="premise --supersede", project=project)
     if err:
         print("helm premise: " + err, file=sys.stderr)
         return 1
-    if old_link:
-        _annotate(old["path"], [("attest_supersedes_turn", old_link)])
     print("helm premise: LIVE '%s' [certain 1.00] - %s" % (parts[0], parts[1]))
     print("  supersedes '%s' — tombstoned (delete_eligible, file kept)"
           % old["id"])
-    prior = old.get("attest_turn") or ""
-    payload = sup_payload(parts[1], prior) if prior else digest_payload(parts[1])
-    if not prior:
-        print("  note: '%s' was never attested — the chain starts here "
-              "(plain prem: turn)" % old["id"])
+    if not old_record:
+        print("  note: '%s' was never attested — the chain starts here" % old["id"])
+    digest = digest_payload(parts[1])
     profile = attest_profile()
-    info, err = cell.send_self(payload, profile)
-    if err:
-        # the store lifecycle above already landed — only the TURN queues; the
-        # row carries the raw digest + sup_of so replay binds the prior turn
-        # at send time (replayed in order — see _row_payload)
-        qp = _enqueue({"ts": ts, "id": parts[0], "project": project,
-                       "digest": payload_digest(payload),
-                       "sup_of": str(old["id"]), "profile": profile,
-                       "reason": err})
-        print("  attestation pending (substrate unavailable) — queued: " + qp)
-        print("    reason: " + err)
-        print("    store lifecycle already landed; replay binds the prior "
-              "turn at send time (replayed in order)")
-        return 0
-    fields = [("attest_payload", payload), ("attest_ts", ts),
-              ("attest_by", profile), ("attest_turn", info.get("turn_hash", "")),
-              ("attest_receipt", info.get("receipt_hash", "")),
-              ("attest_chain_index", info.get("chain_index", ""))]
-    if prior:
-        fields.append(("attest_supersedes_turn", prior))
-    _annotate(path, fields)
-    print("  attested: turn %s (chain_index %s) signed by profile '%s'"
-          % (info.get("turn_hash"), info.get("chain_index"), profile))
-    print("  payload: " + payload)
-    if prior:
-        print("  chain: -> prior turn %s (full hash in attest_supersedes_turn; "
-              "the on-ledger %d-hex is a pointer, not a proof)"
-              % (prior[:SUP_PTR_LEN], SUP_PTR_LEN))
+    info = record_attestation("supersede", parts[0], digest,
+                              root=_root_label(_e, project), project=project,
+                              ts=ts, attest_by=profile, supersedes=str(old["id"]),
+                              supersedes_record=old_record)
+    _annotate(path, _attest_fields(digest, ts, profile, info,
+                                   supersedes_record=old_record))
+    print("  attested (native): record %s at chain_index %s — recorded by '%s'"
+          % (info["rec_hash"][:16], info["chain_index"], profile))
+    print("  payload: " + digest)
+    _report_anchor(info, parts[0], project, ts)
+    if old_record:
+        print("  chain: -> prior record %s (attest_supersedes_record)"
+              % old_record[:16])
     return 0
 
 
-def _read_queue(qp):
-    """Queue rows, parsed. A torn/unparseable line (a crash mid-append) is
-    skipped — it cannot be replayed, and it must never wedge the queue."""
-    rows = []
-    try:
-        with open(qp, encoding="utf-8") as f:
-            for l in f:
-                if l.strip():
-                    try:
-                        rows.append(json.loads(l))
-                    except ValueError:
-                        pass
-    except OSError:
-        pass
-    return rows
-
-
-def _rewrite_queue(qp, examined, kept):
-    """Atomic queue rewrite that PRESERVES rows appended while the caller
-    worked: replay/prune windows span network sends, and a concurrent
-    capture's enqueue landing inside one must survive the rewrite (the
-    queue is append-only, so everything past `examined` rides along)."""
-    rows = kept + _read_queue(qp)[examined:]
-    pk.atomic_write(qp, "".join(json.dumps(r, ensure_ascii=False) + "\n"
-                                for r in rows))
-
-
-def _row_payload(rec):
-    """(payload, full prior turn) for one queue row. A plain row replays its
-    frozen payload. A sup row ("sup_of" + 64-hex "digest") binds the link at
-    SEND time: the prior premise's attest_turn may have landed from an earlier
-    row in this same pass — the replayed-in-order law; a still-unattested
-    prior falls back to a plain prem: turn (the chain starts at the new
-    premise)."""
-    if "sup_of" not in rec:
-        return rec.get("payload") or "", ""
-    old = store._find(rec["sup_of"], types=("prior",), project=rec.get("project"))
-    prior = (old or {}).get("attest_turn") or ""
-    if prior:
-        return SUP_TAG + rec["digest"] + ":" + prior[:SUP_PTR_LEN], prior
-    return DIGEST_TAG + rec["digest"], ""
-
-
 def _retry_queue():
-    """Replay pending attestations IN QUEUE ORDER. Each success annotates the
-    stored entry and drops the row; failures (and rows whose entry vanished)
-    are kept. A row whose entry ALREADY carries an attest_turn (attested
-    directly after it was queued) is dropped unsent — replaying it would
-    double-attest the ledger and double-annotate the file. Order matters:
-    a sup row binds its prior turn at send time (_row_payload), so a chain
-    queued during one outage replays whole."""
+    """Re-attempt the OPTIONAL dregg anchors queued while no node was reachable.
+    The native records already stand; this only tries to add the external
+    checkpoint. Success annotates attest_anchor* and drops the row; failures
+    (and rows whose entry vanished) are kept."""
     qp = _queue_path()
     rows = _read_queue(qp)
     if not rows:
@@ -496,177 +591,51 @@ def _retry_queue():
             rec["reason"] = "entry no longer in the store"
             kept.append(rec)
             continue
-        if e.get("attest_turn"):
+        if _front(e, "attest_anchor_turn"):
             dropped += 1
             continue
-        payload, prior = _row_payload(rec)
-        info, err = cell.send_self(payload, rec.get("profile") or attest_profile())
+        rh = rec.get("rec_hash") or _front(e, "attest_record")
+        turn, err = cell.anchor_submit(rh, memo="helm-attest:v%d:%s"
+                                       % (CHAIN_V, rec.get("id")))
         if err:
             rec["reason"] = err
             kept.append(rec)
             continue
-        fields = [("attest_payload", payload),
-                  ("attest_ts", pk.now_ts()),
-                  ("attest_by", rec.get("profile") or attest_profile()),
-                  ("attest_turn", info.get("turn_hash", "")),
-                  ("attest_receipt", info.get("receipt_hash", "")),
-                  ("attest_chain_index", info.get("chain_index", ""))]
-        if prior:
-            fields.append(("attest_supersedes_turn", prior))
-        _annotate(e["path"], fields)
-        print("helm premise: attested '%s' from queue — turn %s"
-              % (rec["id"], (info.get("turn_hash") or "")[:16]))
+        _annotate(e["path"], [("attest_anchor", cell.anchor_label(turn)),
+                              ("attest_anchor_turn", turn)])
+        print("helm premise: anchored '%s' — turn %s" % (rec["id"], turn[:16]))
         done += 1
     _rewrite_queue(qp, len(rows), kept)
-    tail = (", %d already-attested row%s dropped" % (dropped, "s"[:dropped != 1])) \
+    tail = (", %d already-anchored row%s dropped" % (dropped, "s"[:dropped != 1])) \
         if dropped else ""
-    print("helm premise: queue replay — %d attested, %d still pending%s."
+    print("helm premise: anchor replay — %d anchored, %d still pending%s."
           % (done, len(kept), tail))
     return 0 if not kept else 1
 
 
 # ---------------------------------------------------------------------------
-# backfill — attest entries ALREADY in the store (see the module docstring)
+# backfill — append a native record for entries ALREADY in the store
 # ---------------------------------------------------------------------------
 
-def _post_json(url, payload, timeout=10):
-    """One JSON POST -> (parsed body, None) or (None, reason). An empty or
-    garbled body (the unlock limiter's empty-body 429) is a reason, never a
-    crash; a caught HTTPError is closed (the ResourceWarning gate)."""
-    import urllib.error
-    import urllib.request
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        exc.close()
-        return None, "HTTP %s" % exc.code
-    except Exception as exc:
-        return None, str(exc)
-    try:
-        return json.loads(raw), None
-    except ValueError:
-        return None, "unparseable response body: %r" % raw[:80]
-
-
-def refuel(profile):
-    """Dev-faucet refuel: POST /api/faucet for FAUCET_AMOUNT computrons to the
-    profile's OWN cell — recipient + public key read programmatically (cell
-    cache + ~/.dregg/profiles/<name>.json), never typed in. (True, None) or
-    (False, reason). The faucet answers a refusal as HTTP 200 with
-    success:false + error (per-cell limiter: 1 grant/60s) — an unchecked body
-    read as success starved a whole sweep once; the body's own verdict is the
-    verdict. One grant covers ~6 attest turns (ATTEST_COST_HINT)."""
-    hexid, err = cell.own_cell(profile)
-    if err:
-        return False, err
-    prof = pk.read_json(os.path.join(cell.profiles_dir(), profile + ".json"),
-                        {}) or {}
-    pub = str(prof.get("public_key_hex") or "")
-    if not pub:
-        return False, "profile '%s' carries no public_key_hex" % profile
-    body, perr = _post_json(cell.node_url() + "/api/faucet",
-                            {"recipient": hexid, "amount": FAUCET_AMOUNT,
-                             "public_key": pub})
-    if perr:
-        return False, "faucet refused: " + perr
-    if not (body or {}).get("success"):
-        return False, "faucet refused: " + str((body or {}).get("error")
-                                               or "no success in response")
-    return True, None
-
-
-def mint_node_token(wait_on_limit=False, pause=None, phrase=None):
-    """POST /api/cipherclerk/unlock ONCE -> (bearer token, None) or (None,
-    reason). The node allows 5 unlocks/60s and counts successes
-    (emberian/dregg#60) — the limiter's refusal is an empty-body 429; with
-    wait_on_limit a single limiter-window wait buys one re-mint. `phrase`
-    overrides the env read — the sweep's re-mint passes the passphrase it
-    captured BEFORE _install_token popped it from the env."""
-    pause = time.sleep if pause is None else pause
-    phrase = phrase or home.env("NODE_PASSPHRASE")
-    if not phrase:
-        return None, "no HELM_NODE_PASSPHRASE/MELD_NODE_PASSPHRASE to mint from"
-    url = cell.node_url() + "/api/cipherclerk/unlock"
-    body, err = _post_json(url, {"passphrase": phrase})
-    if not (body and body.get("bearer_token")) and wait_on_limit:
-        pause(60)  # the unlock limiter window
-        body, err = _post_json(url, {"passphrase": phrase})
-    if body and body.get("success") and body.get("bearer_token"):
-        return body["bearer_token"], None
-    return None, ("unlock mint failed: "
-                  + (err or (body or {}).get("error") or "no bearer_token"))
-
-
-def _install_token(tok):
-    """Ride the minted bearer for every subsequent meld send in THIS process:
-    the passphrase leaves the env so meld prefers the token over a per-send
-    unlock (cell.build_env maps MELD_NODE_TOKEN through untouched)."""
-    os.environ["MELD_NODE_TOKEN"] = tok
-    for k in ("HELM_NODE_PASSPHRASE", "MELD_NODE_PASSPHRASE"):
-        os.environ.pop(k, None)
-
-
-def _enter_token_mode(pause=None):
-    """The sweep's auth posture: a token already in env rides as-is; else ONE
-    bearer is minted from the passphrase and installed. (mode-line, None) or
-    (None, reason) — reason means per-send passphrase unlocks remain, which
-    the 5/60s limiter will throttle at corpus scale."""
-    if home.env("NODE_TOKEN"):
-        return "bearer token (from env)", None
-    tok, err = mint_node_token(wait_on_limit=True, pause=pause)
-    if not tok:
-        return None, err
-    _install_token(tok)
-    return "bearer token (minted once from the passphrase)", None
-
-
-def attest_existing(e, profile=None, pause=None):
-    """Attest an entry ALREADY in the store, wherever its file lives (adopted
-    included): digest per the capture contract from the CURRENT stored
-    statement, one self-write turn, then annotation ONLY — the byte diff is
-    exactly the attest_* lines; statement/keywords/confidence are never
-    touched, no twin is minted, add's supersede-guard never runs (this path
-    never goes through add). Resilience: an insufficient-balance refusal
-    refuels via the dev faucet and resends — waiting out the faucet's
-    1-grant/cell/60s window once when the grant itself is rate-limited (the
-    faucet cadence IS the sweep's sustainable pace, ~6 turns/grant); any
-    other failure resends once after RETRY_PAUSE_S. Returns (info, None) or
-    (None, reason); info["annotated"] False = the turn landed but the file's
-    shape refused the annotation (the receipt still lives on the ledger)."""
-    pause = time.sleep if pause is None else pause
-    payload = digest_payload(e.get("statement") or "")
+def attest_existing(e, profile=None, project=None, anchor=True):
+    """Append a native record for an entry already in the store (adopted
+    included) + annotate in place. The digest is computed from the CURRENT
+    stored statement; the byte diff is exactly the attest_* lines. Returns
+    (info, None) — the native record always lands; info['annotated'] False = a
+    file whose shape refused the annotation (the record still stands in the
+    chain), info['anchor_reason'] set = the OPTIONAL anchor did not land."""
     profile = profile or attest_profile()
-    refueled = retried = False
-    info, err = cell.send_self(payload, profile)
-    while err:
-        if not refueled and "insufficient balance" in err:
-            refueled = True
-            ok, ferr = refuel(profile)
-            if not ok and "rate limited" in (ferr or ""):
-                pause(FAUCET_WINDOW_S)  # the per-cell grant window
-                ok, ferr = refuel(profile)
-            if ok:
-                info, err = cell.send_self(payload, profile)
-                continue
-        if retried:
-            return None, err
-        retried = True
-        pause(RETRY_PAUSE_S)
-        info, err = cell.send_self(payload, profile)
-    info["annotated"] = _annotate(e["path"], [
-        ("attest_payload", payload), ("attest_ts", pk.now_ts()),
-        ("attest_by", profile),
-        ("attest_turn", info.get("turn_hash", "")),
-        ("attest_receipt", info.get("receipt_hash", "")),
-        ("attest_chain_index", info.get("chain_index", ""))])
+    digest = digest_payload(e.get("statement") or "")
+    info = record_attestation("create", str(e["id"]), digest,
+                              root=e.get("root") or "global", project=project,
+                              ts=pk.now_ts(), attest_by=profile, anchor=anchor)
+    info["annotated"] = _annotate(e["path"], _attest_fields(
+        digest, info["ts"], profile, info))
     return info, None
 
 
 def _attest_one(pid, project):
-    """--attest-existing <id>: backfill-attest one existing entry in place."""
+    """--attest-existing <id>: backfill a native record for one existing entry."""
     e = store._find(pid, project=project, types=("prior",))
     if not e:
         print("helm premise: '%s' not found (helm store list)" % pid,
@@ -681,26 +650,21 @@ def _attest_one(pid, project):
               "is exactly the confidence-1.0 truths (beliefs never attest)"
               % (pid, e["confidence"]), file=sys.stderr)
         return 1
-    if e.get("attest_turn"):
-        print("helm premise: '%s' already attested — turn %s (verify: helm "
-              "premise-check %s)" % (pid, e["attest_turn"], pid))
+    if _front(e, "attest_record"):
+        print("helm premise: '%s' already attested — record %s (verify: helm "
+              "premise-check %s)" % (pid, _front(e, "attest_record")[:16], pid))
         return 0
     profile = attest_profile()
-    info, err = attest_existing(e, profile=profile)
-    if err:
-        qp = _enqueue({"ts": pk.now_ts(), "id": str(e["id"]), "project": project,
-                       "payload": digest_payload(e.get("statement") or ""),
-                       "profile": profile, "reason": err})
-        print("  attestation pending (substrate unavailable) — queued: " + qp)
-        print("    reason: " + err)
-        return 1
-    print("helm premise: attested existing '%s' [%s] — turn %s (chain_index %s)"
-          " signed by profile '%s'" % (e["id"], e["root"], info.get("turn_hash"),
-                                       info.get("chain_index"), profile))
+    info, _err = attest_existing(e, profile=profile, project=project)
+    print("helm premise: attested existing '%s' [%s] — record %s (chain_index "
+          "%s) recorded by '%s'" % (e["id"], e["root"], info["rec_hash"][:16],
+                                    info["chain_index"], profile))
     print("  payload: " + digest_payload(e.get("statement") or ""))
     if not info.get("annotated"):
-        print("  WARNING: file shape refused the annotation — the receipt "
-              "lives on the ledger (turn above)")
+        print("  WARNING: file shape refused the annotation — the record still "
+              "stands in the native chain (record %s)" % info["rec_hash"][:16])
+    if info.get("anchor_turn"):
+        print("  external anchor: " + info["anchor_label"])
     return 0
 
 
@@ -715,11 +679,8 @@ def _project_names():
 
 
 def certain_set():
-    """Every LIVE certain (confidence-1.0) prior across ALL physical roots —
-    the attestable set (exactly the operator's stated truths, ATTESTATION.md).
-    The global view covers adopted + helm-global; each project home under the
-    helm root adds its project-scoped entries. (entry, project) pairs, deduped
-    by real path (a symlinked project home never yields a double)."""
+    """Every LIVE certain (confidence-1.0) prior across ALL physical roots — the
+    attestable set. (entry, project) pairs, deduped by real path."""
     seen = set()
     out = []
     for proj in [None] + _project_names():
@@ -736,28 +697,25 @@ def certain_set():
 
 
 def _prune_queue():
-    """Drop attest-queue rows whose entry ALREADY carries an attest_turn (it
-    was attested directly after the row was queued — replaying the row would
-    double-annotate). Missing-entry rows stay, as ever. Returns rows dropped."""
+    """Drop anchor-queue rows whose entry ALREADY carries an anchor turn.
+    Missing-entry rows stay. Returns rows dropped."""
     qp = _queue_path()
     rows = _read_queue(qp)
     kept = [r for r in rows
-            if not ((store._find(r.get("id", ""), types=("prior",),
-                                 project=r.get("project")) or {}).get("attest_turn"))]
+            if not _front(store._find(r.get("id", ""), types=("prior",),
+                                      project=r.get("project")) or {},
+                          "attest_anchor_turn")]
     if len(kept) != len(rows):
         _rewrite_queue(qp, len(rows), kept)
     return len(rows) - len(kept)
 
 
 def _attest_sweep(dry=False, limit=None):
-    """--attest-sweep: backfill-attest every live certain entry lacking a
-    recorded turn, across all roots, via the SAME per-entry path as
-    --attest-existing. Never crashes: a persistent per-entry failure falls to
-    the attest-queue; the whole pass runs under one minted bearer; one
-    mid-sweep re-mint covers a bearer expiring (TTL unknown). --dry reports
-    the certain-set count + estimated computrons and sends nothing."""
+    """--attest-sweep: append a native record for every live certain entry that
+    lacks one, across all roots. Offline + free — no computrons, no faucet, no
+    bearer. A best-effort dregg anchor is attempted per entry (fail-open)."""
     allc = certain_set()
-    todo = [(e, p) for e, p in allc if not e.get("attest_turn")]
+    todo = [(e, p) for e, p in allc if not _front(e, "attest_record")]
     profile = attest_profile()
     print("helm premise sweep: %d live certain entries — %d attested, %d to attest"
           % (len(allc), len(allc) - len(todo), len(todo)))
@@ -765,101 +723,66 @@ def _attest_sweep(dry=False, limit=None):
         todo = todo[:limit]
         print("  --limit: at most %d this pass" % limit)
     if dry:
-        print("  dry run — estimated ~%d computrons (~%d/turn observed live); "
-              "signing profile '%s'; nothing sent"
-              % (len(todo) * ATTEST_COST_HINT, ATTEST_COST_HINT, profile))
+        print("  dry run — %d native records to append (offline, no cost); "
+              "recording label '%s'; nothing written" % (len(todo), profile))
         return 0
     if not todo:
         pruned = _prune_queue()
         if pruned:
-            print("  pruned %d stale queue row%s (entries already attested)"
+            print("  pruned %d stale queue row%s (entries already anchored)"
                   % (pruned, "s"[:pruned != 1]))
         print("helm premise sweep: nothing to attest.")
         return 0
-    # the passphrase, captured BEFORE _install_token pops it from the env —
-    # the mid-sweep re-mint below is dead without it
-    phrase = home.env("NODE_PASSPHRASE")
-    mode, merr = _enter_token_mode()
-    print("  auth: " + (mode if mode
-                        else "per-send passphrase unlocks (%s) — the 5/60s "
-                             "unlock limiter may throttle" % merr))
-    reminted = False
-    done = queued = 0
+    done = pending = 0
     for e, proj in todo:
-        info, err = attest_existing(e, profile=profile)
-        if err and mode and not reminted and "insufficient balance" not in err:
-            # one mid-sweep re-mint covers an expired bearer (a balance
-            # refusal is not an auth failure — re-minting buys nothing)
-            reminted = True
-            tok, _terr = mint_node_token(wait_on_limit=True, phrase=phrase)
-            if tok:
-                _install_token(tok)
-                info, err = attest_existing(e, profile=profile)
-        if err:
-            _enqueue({"ts": pk.now_ts(), "id": str(e["id"]), "project": proj,
-                      "payload": digest_payload(e.get("statement") or ""),
-                      "profile": profile, "reason": err})
-            queued += 1
-            print("  QUEUED '%s' — %s"
-                  % (e["id"], err.strip().splitlines()[-1][:110]))
-            # pace the failure path: a fast queue-storm (2 sends/entry) once
-            # tripped the node's 60-submits/60s limiter and 429'd the rest
-            time.sleep(RETRY_PAUSE_S)
-            continue
-        done += 1
+        info, _err = attest_existing(e, profile=profile, project=proj)
         note = "" if info.get("annotated") else \
-            " [ANNOTATION FAILED — receipt on ledger only]"
-        print("  attested '%s' [%s] — turn %s (chain %s)%s"
-              % (e["id"], e["root"], (info.get("turn_hash") or "")[:16],
-                 info.get("chain_index"), note))
+            " [ANNOTATION FAILED — record in the native chain]"
+        anchor = "" if info.get("anchor_turn") else " (anchor pending)"
+        if not info.get("anchor_turn"):
+            _enqueue({"ts": pk.now_ts(), "id": str(e["id"]), "project": proj,
+                      "rec_hash": info["rec_hash"], "kind": "anchor",
+                      "reason": info.get("anchor_reason") or "no node"})
+            pending += 1
+        print("  attested '%s' [%s] — record %s (chain %s)%s%s"
+              % (e["id"], e["root"], info["rec_hash"][:16], info["chain_index"],
+                 note, anchor))
+        done += 1
     pruned = _prune_queue()
     tail = (", %d stale queue row%s pruned" % (pruned, "s"[:pruned != 1])) \
         if pruned else ""
-    print("helm premise sweep: %d attested, %d queued for retry%s."
-          % (done, queued, tail))
-    return 0 if not queued else 1
+    print("helm premise sweep: %d attested (native), %d anchor%s pending%s."
+          % (done, pending, "s"[:pending != 1], tail))
+    return 0
 
 
 # ---------------------------------------------------------------------------
-# premise-check
+# premise-check — honest tiering (native primary; anchor secondary)
 # ---------------------------------------------------------------------------
 
 _CHECK_DEFAULTS = {"attest_payload": "", "attest_ts": "", "attest_by": "",
-                   "attest_turn": "", "attest_receipt": "",
-                   "attest_supersedes_turn": ""}
+                   "attest_record": "", "attest_chain_index": "",
+                   "attest_supersedes_record": "", "attest_anchor": "",
+                   "attest_anchor_turn": ""}
 
 
-def _fetch_turn_status(turn_hash):
-    """GET /api/turn/{hash}/status. Observed live response shape:
-    {"attested_height": N, "consensus_final": bool, "receipt_hash": hex,
-     "receipt_present": bool, "turn_hash": hex}. None when unreachable."""
-    return cell.get_json(cell.node_url() + "/api/turn/" + turn_hash + "/status")
-
-
-def finality_tier(st):
-    """Map the node's turn-status response to the finality tier it PROVES —
-    quoted verbatim in the check output (addendum law #2). Honest mapping of
-    the observed fields: consensus_final at an attested height is the
-    after-next-height tier; a receipt alone is only ingress-immediate."""
-    if not st:
-        return "unverified (node unreachable)"
-    if st.get("consensus_final") and st.get("attested_height") is not None:
-        return ("attested-after-next-height (consensus_final at attested_height %s)"
-                % st["attested_height"])
-    if st.get("receipt_present"):
-        return ("ingress-immediate (receipted on the node; not yet "
-                "consensus-final at an attested height)")
-    return "unverified (turn not found on the node)"
+def _anchor_line(meta):
+    """The honest external-anchor status line for one entry."""
+    aturn = meta.get("attest_anchor_turn")
+    if not aturn:
+        return "  external anchor: none (native-only)"
+    observed, detail = cell.verify_anchor(aturn)
+    return "  external anchor: %s — %s" % (
+        "CONFIRMED" if observed else "unverified", detail)
 
 
 def _chain(pid, project):
-    """--chain: the supersession chain THROUGH pid, origin first — walk
-    `supersedes` back and `replaced_by` forward, re-verify every link's
-    digest + every hop's offline linkage (verify_link), quote each attested
-    turn's finality tier from the node, then print the attested biography
-    ("held X until T, then Y" — DECISION clause 6). Exit 0 = every digest
-    matches and no hop is BROKEN; an unbacked (store-only) hop prints loudly
-    but is a stated design state, not corruption."""
+    """--chain: the supersession chain THROUGH pid, origin first. Re-verify each
+    link's digest (vs its stored statement), each record's native-chain
+    integrity, and each hop's offline linkage (verify_link); print the attested
+    biography. Exit 0 = every digest matches, every record verifies, no hop is
+    BROKEN. An unbacked (store-only) hop prints loudly but is a stated design
+    state, not corruption."""
     e = store._find(pid, project=project, types=("prior",))
     if not e:
         print("helm premise-check: '%s' not found (helm store list)" % pid,
@@ -872,7 +795,7 @@ def _chain(pid, project):
         while cur.get(key):
             nxt = store._find(cur[key], project=project, types=("prior",))
             if not nxt or pk.slug(str(nxt["id"])) in seen:
-                break  # dangling ref or a cycle — the walk ends honestly
+                break
             chain.insert(0, nxt) if front else chain.append(nxt)
             seen.add(pk.slug(str(nxt["id"])))
             cur = nxt
@@ -882,7 +805,7 @@ def _chain(pid, project):
     for i, c in enumerate(chain):
         print("  %d. %s [%s] - %s"
               % (i + 1, c["id"], c["status"], c.get("statement") or ""))
-        payload = c.get("attest_payload") or ""
+        payload = _front(c, "attest_payload")
         if not payload:
             print("       unattested (no payload recorded)")
         else:
@@ -890,10 +813,12 @@ def _chain(pid, project):
                 payload_digest(digest_payload(c.get("statement") or ""))
             ok = ok and match
             print("       digest %s %s" % ("MATCH" if match else "MISMATCH", payload))
-            turn = c.get("attest_turn") or ""
-            if turn:
-                print("       turn %s — %s"
-                      % (turn, finality_tier(_fetch_turn_status(turn))))
+            rec = _front(c, "attest_record")
+            if rec:
+                rok, detail = verify_record(rec)
+                ok = ok and rok
+                print("       native chain %s — %s"
+                      % ("VERIFIED" if rok else "BROKEN", detail))
         if i:
             state, why = verify_link(chain[i - 1], c)
             ok = ok and state != "broken"
@@ -910,16 +835,16 @@ def _chain(pid, project):
                      next_e.get("statement") or "", tail))
     else:
         print("  no supersession links — single-entry chain")
-    print("  note: the on-ledger link is a %d-hex POINTER; the full prior-turn "
-          "hash rides frontmatter (attest_supersedes_turn) — a pointer, not "
-          "a proof" % SUP_PTR_LEN)
+    print("  note: the native hash chain is the primary proof; a dregg anchor, "
+          "when present, is an external checkpoint (node-anchored, not "
+          "cell-signed)")
     return 0 if ok else 1
 
 
 def cmd_premise_check(args):
     """premise-check <id> — recompute the digest from the stored statement,
-    compare to the attested payload (prem: or sup: form), and quote the
-    verified finality tier. --chain walks the supersession chain instead."""
+    verify the native chain record (primary), and report the OPTIONAL dregg
+    anchor honestly. --chain walks the supersession chain instead."""
     args = list(args)
     project = _pop_flag(args, "--project", True)
     chain = bool(_pop_flag(args, "--chain", False))
@@ -937,10 +862,9 @@ def cmd_premise_check(args):
     print("helm premise-check: " + str(e["id"]))
     print("  statement: " + (e.get("statement") or ""))
     meta = pk.parse_simple_frontmatter(e["path"], _CHECK_DEFAULTS) or {}
-    if not meta.get("attest_payload"):
-        print("  no attestation recorded — captured with --no-attest or while "
-              "the substrate was down (a pending record may sit in "
-              + _queue_path() + ")")
+    if not meta.get("attest_payload") and not meta.get("attest_record"):
+        print("  no attestation recorded — captured with --no-attest (a pending "
+              "anchor row may sit in " + _queue_path() + ")")
         return 0
     recomputed = digest_payload(e.get("statement") or "")
     match = payload_digest(meta["attest_payload"]) == payload_digest(recomputed)
@@ -951,18 +875,19 @@ def cmd_premise_check(args):
               "the attested payload")
         print("    attested:   " + meta["attest_payload"])
         print("    recomputed: " + recomputed)
-    print("  attested by profile '%s' at %s"
+    print("  recorded by '%s' at %s (provenance label, not a cell signer)"
           % (meta.get("attest_by") or "?", meta.get("attest_ts") or "?"))
-    turn = meta.get("attest_turn")
-    if turn:
-        print("  turn: " + turn)
-        print("  finality tier: " + finality_tier(_fetch_turn_status(turn)))
+    rec = meta.get("attest_record")
+    if rec:
+        rok, detail = verify_record(rec)
+        match = match and rok
+        print("  native chain: %s — %s"
+              % ("VERIFIED" if rok else "BROKEN", detail))
     else:
-        print("  finality tier: unverified (no turn hash recorded)")
-    if meta["attest_payload"].startswith(SUP_TAG):
-        print("  chain: supersedes prior turn %s (pointer; full hash %s) — "
-              "walk it: helm premise-check --chain %s"
-              % (payload_ptr(meta["attest_payload"]),
-                 meta.get("attest_supersedes_turn") or "MISSING from frontmatter",
-                 pid))
+        print("  native chain: no record hash recorded (legacy or --no-attest)")
+    print(_anchor_line(meta))
+    if meta.get("attest_supersedes_record"):
+        print("  chain: supersedes prior record %s — walk it: helm "
+              "premise-check --chain %s"
+              % (meta["attest_supersedes_record"][:16], pid))
     return 0 if match else 1

@@ -1,57 +1,40 @@
 #!/usr/bin/env python3
-"""supersession-chain tests — DECISION clauses 5-6: `premise --supersede`
-(store lifecycle + ONE signed linking turn), `premise-check --chain` (the
-attested biography), the bind-at-replay queue ordering, and the capture
-guard that refuses attestation-orphaning edits. Hermetic: HELM_HOME is a
-tempdir, the substrate binary is a stub or cell.send_self is mocked — the
-real node, ~/.dregg and ~/.helm are never touched."""
+"""supersession-chain tests — NATIVE linkage. `premise --supersede` captures
+NEW, tombstones OLD (store lifecycle, offline), and appends ONE native
+supersede record linking supersedes_record -> OLD's rec_hash. `premise-check
+--chain` prints the attested biography. Hermetic: HELM_HOME is a tempdir and
+the OPTIONAL dregg node points at a dead port."""
 import contextlib
 import io
 import json
 import os
 import shutil
-import stat
 import tempfile
 import unittest
-from unittest import mock
 
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 
-from helm import cell, home, pk, premise, store  # noqa: E402
+from helm import home, pk, premise, store  # noqa: E402
 
-CELL_HEX = "ab" * 32
-TURN1 = "cd" * 32
-TURN2 = "ef" * 32
-
-ENV_KEYS = ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_CELL_BIN", "MELD_CELL_BIN",
-            "HELM_NODE_URL", "HELM_CELL_PROFILE", "MELD_NODE_URL",
-            "MELD_AGENT_PROFILE", "STUB_LOG", "STUB_CELL", "STUB_TURN")
-
-STUB = """#!/bin/sh
-echo "argv:$@" >> "$STUB_LOG"
-case "$1" in
-  join) echo '{"joined":true,"cell":"'"$STUB_CELL"'","turn_hash":"tj","receipt_hash":"rj","chain_index":1}';;
-  send) echo '{"sent":true,"to":"'"$STUB_CELL"'","seq":1,"bytes":89,"slots":11,"turn_hash":"'"$STUB_TURN"'","receipt_hash":"rs","chain_index":2}';;
-esac
-exit 0
-"""
-
-FAILING_STUB = "#!/bin/sh\necho 'node down' >&2\nexit 1\n"
+DEAD = "http://127.0.0.1:1"
+REC_A = "a1" * 32
+REC_B = "b2" * 32
 
 
 class SupBase(unittest.TestCase):
+    ENV_KEYS = ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_NODE_URL",
+                "HELM_CELL_PROFILE", "MELD_NODE_URL", "MELD_AGENT_PROFILE")
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-sup-")
-        self.env_prior = {k: os.environ.get(k) for k in ENV_KEYS}
-        for k in ENV_KEYS:
+        self.env_prior = {k: os.environ.get(k) for k in self.ENV_KEYS}
+        for k in self.ENV_KEYS:
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
         os.makedirs(os.environ["HELM_ADOPTED_DIR"])
-        os.environ["STUB_LOG"] = os.path.join(self.tmp, "stub.log")
-        os.environ["STUB_CELL"] = CELL_HEX
-        os.environ["STUB_TURN"] = TURN1
-        os.environ["HELM_CELL_PROFILE"] = "stub-prof"
+        os.environ["HELM_NODE_URL"] = DEAD
+        os.environ["HELM_CELL_PROFILE"] = "owner-cell"
 
     def tearDown(self):
         for k, v in self.env_prior.items():
@@ -60,14 +43,6 @@ class SupBase(unittest.TestCase):
             else:
                 os.environ[k] = v
         shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def write_stub(self, body=STUB):
-        path = os.path.join(self.tmp, "meld-stub")
-        with open(path, "w") as f:
-            f.write(body)
-        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
-        os.environ["HELM_CELL_BIN"] = path
-        return path
 
     def run_verb(self, fn, args):
         out, err = io.StringIO(), io.StringIO()
@@ -92,70 +67,55 @@ class SupBase(unittest.TestCase):
                                  ["law-v1 | truth one"] + list(extra))
         self.assertEqual(rc, 0)
 
-
-class SupPayloadTest(SupBase):
-    def test_sup_payload_form_and_budget(self):
-        p = premise.sup_payload("truth two", TURN1)
-        digest = premise.digest_payload("truth two")[len(premise.DIGEST_TAG):]
-        self.assertEqual(p, "sup:b2b:" + digest + ":" + TURN1[:16])
-        self.assertEqual(len(p.encode("utf-8")), 89)  # inside the 104B budget
-
-    def test_payload_digest_and_ptr_cover_both_forms(self):
-        prem = premise.digest_payload("x")
-        sup = premise.sup_payload("x", TURN1)
-        self.assertEqual(premise.payload_digest(prem), premise.payload_digest(sup))
-        self.assertEqual(premise.payload_ptr(sup), TURN1[:16])
-        self.assertEqual(premise.payload_ptr(prem), "")
-        self.assertEqual(premise.payload_digest("garbage"), "")
+    def rec_hash_of(self, pid):
+        meta = pk.parse_simple_frontmatter(
+            os.path.join(home.global_dir(), "premises", "prior-%s.md" % pid),
+            {"attest_record": ""})
+        return (meta or {}).get("attest_record") or ""
 
 
 class SupersedeFlowTest(SupBase):
     def test_full_flow_links_chain(self):
-        self.write_stub()
         self.capture_v1()
-        os.environ["STUB_TURN"] = TURN2  # the sup turn gets its own hash
+        v1_rec = self.rec_hash_of("law-v1")
+        self.assertTrue(v1_rec)
         rc, out, _ = self.run_verb(
             premise.cmd_premise,
             ["--supersede", "law-v1", "law-v2 | truth two | kw2 | dev"])
         self.assertEqual(rc, 0)
         self.assertIn("LIVE 'law-v2' [certain 1.00] - truth two", out)
         self.assertIn("supersedes 'law-v1'", out)
-        self.assertIn("attested: turn " + TURN2, out)
-        self.assertIn("pointer, not a proof", out)
+        self.assertIn("attested (native): record ", out)
+        self.assertIn("prior record " + v1_rec[:16], out)
         # OLD: tombstoned in place, attest keys carried through the rewrite
         old = self.entry_raw("law-v1")
         self.assertIn("  status: delete_eligible", old)
         self.assertIn("  replaced_by: law-v2", old)
-        self.assertIn("  attest_turn: " + TURN1, old)
-        # NEW: backpointer + the sup: payload + FULL linkage in frontmatter
+        self.assertIn("  attest_record: " + v1_rec, old)
+        # NEW: backpointer + a PLAIN prem: digest payload + native linkage
         new = self.entry_raw("law-v2")
         self.assertIn("  supersedes: law-v1", new)
-        self.assertIn("  attest_payload: " + premise.sup_payload("truth two", TURN1),
-                      new)
-        self.assertIn("  attest_turn: " + TURN2, new)
-        self.assertIn("  attest_supersedes_turn: " + TURN1, new)
-        # the payload rode the SEND path (whisper slots), never heartbeat
-        with open(os.environ["STUB_LOG"]) as f:
-            log = f.read()
-        self.assertIn("argv:send --profile stub-prof --to " + CELL_HEX + " "
-                      + premise.sup_payload("truth two", TURN1), log)
-        self.assertNotIn("heartbeat", log)
+        self.assertIn("  attest_payload: " + premise.digest_payload("truth two"), new)
+        self.assertIn("  attest_supersedes_record: " + v1_rec, new)
+        self.assertNotIn("attest_turn:", new)   # never node-signed
+        # the native chain is intact and the supersede record is op=supersede
+        self.assertTrue(premise.verify_chain()[0])
+        recs = premise.chain_records()
+        self.assertEqual(recs[-1]["op"], "supersede")
+        self.assertEqual(recs[-1]["supersedes_record"], v1_rec)
 
     def test_never_attested_old_starts_chain_honestly(self):
-        self.write_stub()
         self.capture_v1(["--no-attest"])
         rc, out, _ = self.run_verb(premise.cmd_premise,
                                    ["--supersede", "law-v1", "law-v2 | truth two"])
         self.assertEqual(rc, 0)
         self.assertIn("never attested — the chain starts here", out)
         new = self.entry_raw("law-v2")
-        self.assertIn("  attest_payload: " + premise.digest_payload("truth two"),
-                      new)
-        self.assertNotIn("attest_supersedes_turn", new)
+        self.assertIn("  attest_payload: " + premise.digest_payload("truth two"), new)
+        self.assertNotIn("attest_supersedes_record", new)
         self.assertIn("  replaced_by: law-v2", self.entry_raw("law-v1"))
 
     def test_refusals(self):
-        self.write_stub()
         self.capture_v1()
         cases = (
             (["--supersede", "ghost", "law-v2 | t"], 1, "not found"),
@@ -169,7 +129,7 @@ class SupersedeFlowTest(SupBase):
             rc, _, err = self.run_verb(premise.cmd_premise, args)
             self.assertEqual(rc, want_rc, args)
             self.assertIn(want_err, err)
-        # a tip never forks: superseding an already-superseded id is refused
+        # a tip never forks
         rc, _, _ = self.run_verb(premise.cmd_premise,
                                  ["--supersede", "law-v1", "law-v2 | truth two"])
         self.assertEqual(rc, 0)
@@ -178,102 +138,35 @@ class SupersedeFlowTest(SupBase):
         self.assertEqual(rc, 1)
         self.assertIn("never forks", err)
 
-    def test_node_down_lifecycle_lands_and_sup_row_queues(self):
-        self.write_stub()
+    def test_node_down_lifecycle_and_native_record_both_land(self):
+        # the corrected design: with no node, BOTH the store lifecycle AND the
+        # native supersede record land offline — only the OPTIONAL anchor queues
         self.capture_v1()
-        self.write_stub(FAILING_STUB)
+        v1_rec = self.rec_hash_of("law-v1")
         rc, out, _ = self.run_verb(premise.cmd_premise,
                                    ["--supersede", "law-v1", "law-v2 | truth two"])
         self.assertEqual(rc, 0)
-        self.assertIn("attestation pending (substrate unavailable)", out)
-        self.assertIn("replayed in order", out)
-        # the STORE lifecycle landed despite the outage
+        self.assertIn("external anchor: none yet", out)
         self.assertIn("  status: delete_eligible", self.entry_raw("law-v1"))
         new = self.entry_raw("law-v2")
         self.assertIn("  supersedes: law-v1", new)
-        self.assertNotIn("attest_payload", new)
-        rows = self.queue_rows()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["id"], "law-v2")
-        self.assertEqual(rows[0]["sup_of"], "law-v1")
-        self.assertEqual(rows[0]["digest"],
-                         premise.payload_digest(premise.digest_payload("truth two")))
-        self.assertNotIn("payload", rows[0])
-
-    def test_replay_binds_prior_turn_in_queue_order(self):
-        """The money path: BOTH the prem: and the sup: turn queued during one
-        outage — replay attests the old premise first, then the sup row binds
-        that fresh turn hash at send time."""
-        with mock.patch.object(cell, "send_self",
-                               return_value=(None, "node down")):
-            self.capture_v1()
-            rc, _, _ = self.run_verb(premise.cmd_premise,
-                                     ["--supersede", "law-v1", "law-v2 | truth two"])
-            self.assertEqual(rc, 0)
-        self.assertEqual([r["id"] for r in self.queue_rows()],
-                         ["law-v1", "law-v2"])
-        sent = []
-
-        def working(payload, profile):
-            sent.append(payload)
-            return ({"turn_hash": TURN1 if len(sent) == 1 else TURN2,
-                     "receipt_hash": "rq", "chain_index": len(sent)}, None)
-
-        with mock.patch.object(cell, "send_self", working):
-            rc, out, _ = self.run_verb(premise.cmd_premise, ["--retry-queue"])
-        self.assertEqual(rc, 0)
-        self.assertIn("2 attested, 0 still pending", out)
-        self.assertEqual(sent, [premise.digest_payload("truth one"),
-                                premise.sup_payload("truth two", TURN1)])
-        self.assertIn("  attest_turn: " + TURN1, self.entry_raw("law-v1"))
-        new = self.entry_raw("law-v2")
-        self.assertIn("  attest_payload: " + premise.sup_payload("truth two", TURN1),
-                      new)
-        self.assertIn("  attest_supersedes_turn: " + TURN1, new)
-
-    def test_replay_of_sup_row_over_still_unattested_prior_falls_back(self):
-        with mock.patch.object(cell, "send_self",
-                               return_value=(None, "node down")):
-            self.capture_v1(["--no-attest"])
-            self.run_verb(premise.cmd_premise,
-                          ["--supersede", "law-v1", "law-v2 | truth two"])
-        with mock.patch.object(cell, "send_self",
-                               return_value=({"turn_hash": TURN2,
-                                              "receipt_hash": "rq",
-                                              "chain_index": 1}, None)):
-            rc, _, _ = self.run_verb(premise.cmd_premise, ["--retry-queue"])
-        self.assertEqual(rc, 0)
-        new = self.entry_raw("law-v2")
-        self.assertIn("  attest_payload: " + premise.digest_payload("truth two"),
-                      new)
-        self.assertNotIn("attest_supersedes_turn", new)
+        self.assertIn("  attest_supersedes_record: " + v1_rec, new)  # native landed
+        # both captures queued an anchor row (best-effort external checkpoint)
+        ids = [r["id"] for r in self.queue_rows()]
+        self.assertEqual(sorted(ids), ["law-v1", "law-v2"])
+        self.assertTrue(all(r["kind"] == "anchor" for r in self.queue_rows()))
 
 
 class CaptureGuardTest(SupBase):
     def test_orphaning_edit_refused_toward_supersede(self):
-        self.write_stub()
         self.capture_v1()
         rc, _, err = self.run_verb(premise.cmd_premise, ["law-v1 | a NEW truth"])
         self.assertEqual(rc, 1)
         self.assertIn("orphans the attestation", err)
         self.assertIn("--supersede law-v1", err)
-        self.assertIn("truth one", self.entry_raw("law-v1"))  # untouched
-
-    def test_idempotent_restate_skips_the_second_turn(self):
-        self.write_stub()
-        self.capture_v1()
-        rc, out, _ = self.run_verb(premise.cmd_premise,
-                                   ["law-v1 | truth one | fresh-kw"])
-        self.assertEqual(rc, 0)
-        self.assertIn("already attested — turn " + TURN1, out)
-        with open(os.environ["STUB_LOG"]) as f:
-            self.assertEqual(f.read().count("argv:send"), 1)  # ONE turn ever
-        raw = self.entry_raw("law-v1")
-        self.assertIn("  keywords: fresh-kw", raw)
-        self.assertEqual(raw.count("attest_turn:"), 1)  # never double-annotated
+        self.assertIn("truth one", self.entry_raw("law-v1"))
 
     def test_remint_over_tombstone_starts_fresh_lifecycle(self):
-        self.write_stub()
         self.capture_v1()
         self.run_verb(premise.cmd_premise,
                       ["--supersede", "law-v1", "law-v2 | truth two"])
@@ -281,88 +174,60 @@ class CaptureGuardTest(SupBase):
         self.assertEqual(rc, 0)
         raw = self.entry_raw("law-v1")
         self.assertIn("  status: live", raw)
-        for stale in ("replaced_by", "retired_ts", "attest_supersedes_turn"):
+        for stale in ("replaced_by", "retired_ts", "attest_supersedes_record"):
             self.assertNotIn(stale, raw)
-        # freshly re-attested: exactly one attest block, the new statement's
         self.assertEqual(raw.count("attest_payload:"), 1)
-        self.assertIn("  attest_payload: " + premise.digest_payload("resurrected"),
-                      raw)
+        self.assertIn("  attest_payload: " + premise.digest_payload("resurrected"), raw)
 
 
 class VerifyLinkTest(SupBase):
-    _n = 0
-
-    def entries(self, new_payload, old_turn=TURN1, full=None):
-        VerifyLinkTest._n += 1  # unique file per case — cases build eagerly
-        path = os.path.join(self.tmp, "x", "prior-new-%d.md" % VerifyLinkTest._n)
-        lines = ["---", "metadata:", "  id: new"]
-        if full:
-            lines.append("  attest_supersedes_turn: " + full)
-        lines += ["---", ""]
-        pk.atomic_write(path, "\n".join(lines))
-        old = {"id": "old", "statement": "so", "attest_turn": old_turn}
+    def link(self, *, new_payload, sup_record=REC_A, old_record=REC_A):
+        old = {"id": "old", "statement": "so", "attest_record": old_record}
         new = {"id": "new", "statement": "sn", "attest_payload": new_payload,
-               "path": path}
+               "attest_supersedes_record": sup_record}
         return old, new
 
     def test_states(self):
-        good = premise.sup_payload("sn", TURN1)
+        good = premise.digest_payload("sn")
         cases = (
-            (self.entries(good), "attested"),
-            (self.entries(good, full=TURN1), "attested"),
-            (self.entries(premise.digest_payload("sn")), "unbacked"),
-            (self.entries(""), "unbacked"),
-            (self.entries(premise.sup_payload("WRONG stmt", TURN1)), "broken"),
-            (self.entries(good, old_turn=""), "broken"),
-            (self.entries(premise.sup_payload("sn", TURN2)), "broken"),
-            (self.entries(good, full=TURN2), "broken"),
+            (self.link(new_payload=good), "attested"),
+            (self.link(new_payload=good, sup_record=""), "unbacked"),
+            (self.link(new_payload=premise.digest_payload("WRONG")), "broken"),
+            (self.link(new_payload=good, old_record=""), "broken"),
+            (self.link(new_payload=good, sup_record=REC_B), "broken"),
         )
         for (old, new), want in cases:
             self.assertEqual(premise.verify_link(old, new)[0], want,
-                             (new["attest_payload"], want))
+                             (new.get("attest_supersedes_record"), want))
 
 
 class ChainCheckTest(SupBase):
-    STATUS = {"attested_height": 43, "consensus_final": True,
-              "receipt_present": True}
-
     def build_chain(self):
-        """law-a -> law-b -> law-c, each hop signed with its own turn."""
-        self.write_stub()
+        """law-a -> law-b -> law-c via native supersede records."""
         rc, _, _ = self.run_verb(premise.cmd_premise, ["law-a | truth one"])
         self.assertEqual(rc, 0)
-        os.environ["STUB_TURN"] = TURN2
         rc, _, _ = self.run_verb(premise.cmd_premise,
                                  ["--supersede", "law-a", "law-b | truth two"])
         self.assertEqual(rc, 0)
-        os.environ["STUB_TURN"] = "77" * 32
         rc, _, _ = self.run_verb(premise.cmd_premise,
                                  ["--supersede", "law-b", "law-c | truth three"])
         self.assertEqual(rc, 0)
 
-    def check_chain(self, pid, status=STATUS):
-        prior = premise._fetch_turn_status
-        premise._fetch_turn_status = lambda turn: status
-        try:
-            return self.run_verb(premise.cmd_premise_check, ["--chain", pid])
-        finally:
-            premise._fetch_turn_status = prior
-
     def test_walks_whole_chain_from_any_link(self):
         self.build_chain()
         for pid in ("law-a", "law-b", "law-c"):
-            rc, out, _ = self.check_chain(pid)
+            rc, out, _ = self.run_verb(premise.cmd_premise_check, ["--chain", pid])
             self.assertEqual(rc, 0, out)
             self.assertIn("3 links through '%s', origin first" % pid, out)
             self.assertIn("1. law-a [delete_eligible] - truth one", out)
             self.assertIn("3. law-c [live] - truth three", out)
             self.assertEqual(out.count("digest MATCH"), 3)
-            self.assertIn("link 1->2 ATTESTED — full linkage in frontmatter", out)
+            self.assertEqual(out.count("native chain VERIFIED"), 3)
+            self.assertIn("link 1->2 ATTESTED — native record linkage", out)
             self.assertIn("link 2->3 ATTESTED", out)
-            self.assertIn("attested-after-next-height", out)
             self.assertIn("held 'truth one' until", out)
             self.assertIn("then 'truth three' — LIVE now", out)
-            self.assertIn("pointer, not a proof", out)
+            self.assertIn("primary proof", out)
 
     def test_tampered_statement_fails_the_chain(self):
         self.build_chain()
@@ -370,15 +235,12 @@ class ChainCheckTest(SupBase):
         with open(p) as f:
             raw = f.read()
         pk.atomic_write(p, raw.replace("truth two", "tampered two"))
-        rc, out, _ = self.check_chain("law-a")
+        rc, out, _ = self.run_verb(premise.cmd_premise_check, ["--chain", "law-a"])
         self.assertEqual(rc, 1)
         self.assertIn("digest MISMATCH", out)
-        # b's sup: digest no longer matches its stored statement -> 1->2 breaks;
-        # the b->c pointer rides turn hashes, so 2->3 stays attested
+        # b's stored statement no longer hashes to its attest_payload -> the
+        # b hop's digest breaks; the a->b link also breaks (digest check)
         self.assertIn("link 1->2 BROKEN", out)
-        self.assertIn("link 2->3 ATTESTED", out)
-        rc2, _, _ = self.check_chain("law-c")
-        self.assertEqual(rc2, 1)
 
     def test_store_only_hop_reads_unbacked_but_not_broken(self):
         self.build_chain()
@@ -387,15 +249,14 @@ class ChainCheckTest(SupBase):
         self.assertEqual(rc, 0)
         _e, err = store.mark_superseded("law-c", "law-d", pk.now_ts())
         self.assertIsNone(err)
-        rc, out, _ = self.check_chain("law-a")
-        self.assertEqual(rc, 0)  # stated design state, not corruption
+        rc, out, _ = self.run_verb(premise.cmd_premise_check, ["--chain", "law-a"])
+        self.assertEqual(rc, 0)   # stated design state, not corruption
         self.assertIn("4 links", out)
         self.assertIn("link 3->4 UNBACKED", out)
 
     def test_single_entry_chain(self):
-        self.write_stub()
         self.run_verb(premise.cmd_premise, ["solo | alone"])
-        rc, out, _ = self.check_chain("solo")
+        rc, out, _ = self.run_verb(premise.cmd_premise_check, ["--chain", "solo"])
         self.assertEqual(rc, 0)
         self.assertIn("1 link through 'solo'", out)
         self.assertIn("no supersession links", out)
@@ -406,23 +267,16 @@ class ChainCheckTest(SupBase):
         self.assertIn("not found", err)
 
 
-class CheckSupPayloadTest(SupBase):
-    def test_single_check_reads_sup_form_and_states_the_pointer(self):
-        self.write_stub()
+class CheckSupRecordTest(SupBase):
+    def test_single_check_reads_sup_record(self):
         self.run_verb(premise.cmd_premise, ["law-a | truth one"])
-        os.environ["STUB_TURN"] = TURN2
+        a_rec = self.rec_hash_of("law-a")
         self.run_verb(premise.cmd_premise,
                       ["--supersede", "law-a", "law-b | truth two"])
-        prior = premise._fetch_turn_status
-        premise._fetch_turn_status = lambda turn: {"receipt_present": True}
-        try:
-            rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-b"])
-        finally:
-            premise._fetch_turn_status = prior
+        rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-b"])
         self.assertEqual(rc, 0)
-        self.assertIn("digest: MATCH sup:b2b:", out)
-        self.assertIn("chain: supersedes prior turn " + TURN1[:16], out)
-        self.assertIn("full hash " + TURN1, out)
+        self.assertIn("digest: MATCH prem:b2b:", out)
+        self.assertIn("supersedes prior record " + a_rec[:16], out)
         self.assertIn("helm premise-check --chain law-b", out)
 
 

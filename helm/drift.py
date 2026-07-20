@@ -9,10 +9,10 @@ Drift =
   2. TIER CROSSING since the last report: a belief crossed the auto-act line
      (0.85) in either direction, or fell dormant (< 0.4).
   3. DECAY: beliefs sitting dormant — held so weakly they no longer inject.
-  4. EVOLVED: a superseded premise. When the signed supersession chain
+  4. EVOLVED: a superseded premise. When the native supersession chain
      verifies (premise.verify_link — OFFLINE, drift never calls the node) it
      is ATTESTED belief-evolution ("held X until T, then Y", provable);
-     without a signed link it is an unbacked store-only supersession. Either
+     without a native link it is an unbacked store-only supersession. Either
      way the history is READ, never silently lost (DECISION clause 6).
 
 State: one snapshot of {id: confidence} PER SCOPE under _global/.state/ —
@@ -117,7 +117,7 @@ def _line(f):
         if f["attested"]:
             return "EVOLVED       %s -> %s — attested chain (biography: helm " \
                 "premise-check --chain %s)" % (f["id"], f["to"], f["id"])
-        return "EVOLVED       %s -> %s — NO signed chain (store-only " \
+        return "EVOLVED       %s -> %s — NO native chain (store-only " \
             "supersession, unbacked)" % (f["id"], f["to"])
     return "DECAYED       %s — confidence %.2f, no longer injecting " \
         "(re-confirm or retire)" % (f["id"], f["conf"])

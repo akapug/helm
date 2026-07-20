@@ -1,240 +1,218 @@
-# Attested premises — the substrate leg
+# Attested premises — the native chain (+ optional anchor)
 
 A premise is a confidence-1.0 truth: human-stated, entirely load-bearing (the
 store's belief clamp keeps agent-held beliefs at ≤0.99 forever, so the
 confidence-1.0 set is *exactly* the operator's stated truths — see
 [CONCEPTS.md](CONCEPTS.md)). Because premises are standing, provable claims,
-helm can do better than keeping them in files: `helm premise` also commits a
-signed digest of each one to a verifiable ledger, and `helm premise-check`
-re-verifies it on demand.
+helm can do better than keeping them in files: `helm premise` also records a
+tamper-evident digest of each one into a **native, append-only hash chain**,
+and `helm premise-check` re-verifies it on demand — offline, with no external
+service.
 
-## The default is: no substrate, full function
+## The default is: no node, no binary, full function
 
-Start here, because it is the posture a fresh clone is in: **helm works fully
-without the attestation substrate.** Capture stores the premise in the typed
-store either way; a missing binary or unreachable node is one informative
-line ("attestation pending (substrate unavailable)") plus a queued retry —
-never a traceback, never a lost premise. Every other helm surface is
-independent of this leg. Attestation is an upgrade, not a dependency.
+Start here, because it is the posture a fresh clone is in and the posture it
+stays in: **helm attests entirely by itself, with stdlib only.** There is no
+meld binary, no bundled service, and no network dependency. Capture writes the
+premise to the typed store AND appends a native attestation record; both land
+offline. A dregg node, if one happens to be reachable, is an *optional external
+checkpoint* — never required, never on the critical path. Attestation is a
+first-class helm feature, not an upgrade you have to install.
 
-## The moving parts
+## Native-primary — and why it is honest
 
-- **The ledger node** — a small append-only verifiable ledger running as a
-  local service (default `http://127.0.0.1:8899`). It orders signed turns
-  into a receipted chain and answers two read surfaces helm uses:
-  `/api/receipts` (the chain head) and `/api/turn/<hash>/status` (one turn's
-  finality). helm never talks to it directly for writes.
-- **The client binary** (`meld`, from helm's substrate-lineage predecessor —
-  see [ATTRIBUTION.md](../ATTRIBUTION.md)) — signs and submits turns. It is
-  **not bundled** with helm: point `HELM_CELL_BIN` at a build, or put `meld`
-  on your `PATH`. `helm cell` wraps its verbs
-  (`join|accept|send|recv|heartbeat|roster`) with helm-named env mapped in;
-  `helm cell status` is the one-stop liveness check.
-- **The identity profile** — a keypair under `~/.dregg/profiles/<name>.json`,
-  named by `HELM_CELL_PROFILE`. Its **cell** (the ledger identity derived
-  from the public key) is minted on first use by `helm cell join` and cached.
+The primary proof is a **local hash chain**, not a signature from a remote
+service. This is a deliberate honesty choice:
 
-Environment (each `HELM_*` wins; without it the binary sees its own legacy
-variable — the full table is in [ENVIRONMENT.md](ENVIRONMENT.md)):
+- An agent-run capture cannot be signed by the owner's cell — only the owner,
+  capturing with their own key, could do that.
+- The stdlib-feasible dregg ingress signs turns with the **node operator's**
+  cell, not the user's. Labelling those "the user's cell signed this premise"
+  would be false.
+
+So helm does not pretend. The proof is the **quote plus the chain**:
+provenance (owner said X, at T, source) bound into a record whose hash links
+to its predecessor. That verifies offline and is the primary evidence. When a
+dregg anchor is present it is labelled exactly for what it is — *"dregg node
+`<url>` anchored digest at turn `<hash>`"* — a node-anchored external
+checkpoint, **never** a user-cell signature.
+
+## The native chain
+
+`<helm-home>/_global/.state/attest-chain.jsonl` — one JSON record per line,
+append-only. Each record's tamper-evident **core** carries:
+
+| field | meaning |
+|---|---|
+| `v` | schema/evidence version (`2`) |
+| `op` | `create` \| `supersede` \| `retire` |
+| `premise_id` | the entry id |
+| `root`, `project` | provenance root (global/project/adopted) + project name |
+| `digest` | the canonical statement digest (`prem:b2b:<blake2b-256 hex>`) |
+| `ts`, `source` | capture timestamp + source (`human`) |
+| `attest_by` | the **recording label** (profile/agent) — provenance, *not* a signer |
+| `supersedes`, `supersedes_record` | the superseded id + its record hash (a supersede op links the chain) |
+
+and then the structural fields: `prev` (the predecessor record's `rec_hash`,
+`""` at genesis), `rec_hash`, and `chain_index`.
+
+```
+rec_hash = blake2b256( canonical_serialization(core) + prev )
+```
+
+Reorder, insert, or edit any record and every subsequent `rec_hash` fails to
+recompute — that is the tamper evidence. A local chain is tamper-evident
+**relative to a retained head**: an attacker who controls the entire local
+history could rewrite both the records and the head, so git, another retained
+copy, or the optional dregg anchor supplies the external commitment.
+
+Environment (each `HELM_*` wins; the legacy `MELD_*` name is accepted
+READ-ONLY as a migration fallback — the full table is in
+[ENVIRONMENT.md](ENVIRONMENT.md)):
 
 | variable | meaning | default |
 |---|---|---|
-| `HELM_CELL_BIN` | the client binary | `meld` on PATH |
-| `HELM_NODE_URL` | the node's HTTP API | `http://127.0.0.1:8899` |
-| `HELM_NODE_TOKEN` | bearer for the node's submit endpoint | — |
-| `HELM_NODE_PASSPHRASE` | unlock alternative to the token | — |
-| `HELM_CELL_PROFILE` | the signing identity | `helm-test` for attestation |
+| `HELM_NODE_URL` | OPTIONAL dregg node for the external anchor | `http://127.0.0.1:8899` |
+| `HELM_NODE_TOKEN` | OPTIONAL bearer for a gated node | — |
+| `HELM_CELL_PROFILE` | the recording label (provenance, not a signer) | `helm-test` for attestation |
 
-## Who signs — the identity law
+## Who "recorded" — the provenance label
 
-Confidence 1.0 is human-only by construction, so the attestable set is
-precisely the operator's stated truths — which makes **the operator's own
-cell** the semantically exact signer, not just the warm choice. Two rules
-follow:
+`attest_by` is a **provenance label**, not a cryptographic signer. With no
+profile configured it is the test label `helm-test` — visibly not the user.
+The owner's own label rides when `HELM_CELL_PROFILE` is set to their profile.
+It records *who vouched* for the entry; it never claims a cell signature the
+native chain does not carry.
 
-- An agent- or test-run capture must never impersonate the operator. With no
-  profile configured, premise attestation signs as the **test profile
-  `helm-test`** — visibly not the user's cell. (Cell passthrough verbs keep
-  the binary's own default, `meld-agent`.)
-- The operator's cell activates on their **first personal capture** with
-  `HELM_CELL_PROFILE` set to their own profile — `helm cell join` mints the
-  cell on first use, by design. From then on, their premises are their
-  signature.
-
-The signing profile is recorded on every entry as `attest_by`, so a check
-always shows who vouched.
-
-## Capture → digest → check
+## Capture → digest → record → check
 
 **Capture** (`helm premise <id> | <statement>`):
 
 1. The premise is written to the typed store — same path and byte shape as
-   `helm store add premise`. This step never depends on the substrate.
+   `helm store add premise`.
 2. The statement is **canonicalized**: Unicode NFC → double quotes become
    single (mirroring the store's own serialization, so a digest recomputed
    from the stored file always matches) → whitespace runs collapse to one
    space → trimmed.
-3. The **digest** is computed, algorithm-tagged:
-   `prem:b2b:<blake2b-256 hex>` — 73 ASCII bytes, self-describing and
-   upgradeable (a future `prem:b3:` payload coexists; old attestations stay
-   verifiable).
-4. The digest rides a **self-write turn**: the profile sends it to its own
-   cell through the proven send path (the whisper payload slots — never the
-   tiny heartbeat tag; that is a decision-record law). The ledger orders and
-   receipts it. Thin claim, fat corroboration: the ledger holds only the
-   digest; the text stays in the store.
+3. The **digest** is computed, algorithm-tagged: `prem:b2b:<blake2b-256 hex>`
+   — self-describing and upgradeable (a future `prem:b3:` payload coexists;
+   old records stay verifiable).
+4. A **native record** is appended to the chain (`op: create`), linked to the
+   current head. This is the primary proof and always lands, offline.
 5. The entry is annotated with `attest_payload`, `attest_ts`, `attest_by`,
-   `attest_turn`, `attest_receipt`, `attest_chain_index`.
+   `attest_record` (the native `rec_hash`), and `attest_chain_index`.
+6. **Best-effort:** if a dregg node is reachable, the record hash is posted to
+   its thin ingress as an external anchor; on success the entry also gains
+   `attest_anchor` (the honest label) and `attest_anchor_turn`. On failure the
+   native record still stands and the anchor is queued for retry.
 
-**Check** (`helm premise-check <id>`): recompute the digest from the *stored*
-statement, compare it to the attested payload (MATCH/MISMATCH — a mismatch
-means the stored text no longer says what was attested), then ask the node
-for the turn's status and quote the **finality tier it proves**:
+**Check** (`helm premise-check <id>`) reports the evidence tiers *separately
+and honestly*:
 
 | tier | meaning |
 |---|---|
-| `attested-after-next-height` | consensus-final at an attested height — the strong tier |
-| `ingress-immediate` | receipted on the node, not yet consensus-final |
-| `unverified (node unreachable)` | the store-side digest check still ran; finality unknown |
-| `unverified (turn not found on the node)` | no ledger corroboration for the recorded turn |
+| `digest MATCH` / `MISMATCH` | the stored statement still hashes to the attested payload (payload binding) |
+| `native chain VERIFIED` / `BROKEN` | the record recomputes and links to its predecessor (the **primary** proof) |
+| `external anchor CONFIRMED` | a reachable node still shows the anchor turn |
+| `external anchor unverified` | node unreachable or the turn is not found — the native proof still stands |
+| `external anchor none (native-only)` | no external checkpoint was ever taken |
 
-Exit status follows the digest: 0 on MATCH, 1 on MISMATCH.
+Exit status follows the primary proof: 0 when the digest matches AND the
+native record verifies; 1 otherwise. The anchor is never allowed to fail the
+check — it is a bonus, not the basis.
 
-## Queue and retry
+## Queue and retry (the OPTIONAL anchor only)
 
-When the substrate is down at capture time, the attestation is appended to
-`<helm-home>/_global/.state/attest-queue.jsonl` and the premise reports
-"attestation pending". `helm premise --retry-queue` replays it: each success
-annotates the stored entry and leaves the queue; failures (and rows whose
-entry has since left the store) stay queued. Nothing expires.
+The native record is the proof and always lands, so nothing is ever "pending"
+about the primary attestation. Only the **external anchor** can be pending:
+when no node is reachable, an anchor row is appended to
+`<helm-home>/_global/.state/attest-queue.jsonl`. `helm premise --retry-queue`
+re-attempts the anchor once a node appears — each success annotates
+`attest_anchor*` and drops the row; failures (and rows whose entry has since
+left the store) stay.
 
-## Backfill — attesting the corpus that predates attestation
+## Backfill — recording the corpus that predates attestation
 
-Entries captured before the substrate leg existed (the adopted corpus
-included) are attested **in place**:
+Entries captured before the native chain existed (the adopted corpus included)
+get a record appended **in place**:
 
 - `helm premise --attest-existing <id> [--project P]` — digest per the same
-  contract from the entry's *current* stored statement, one self-write turn,
+  contract from the entry's *current* stored statement, one native record,
   then annotation only: the byte diff is exactly the `attest_*` lines,
-  wherever the file lives. Never a rewrite, never a twin of an adopted entry,
-  never through `add` (so the supersede-guard cannot trip). Only live
-  confidence-1.0 entries qualify — the attestable set is exactly the
-  operator's stated truths.
-- `helm premise --attest-sweep [--dry] [--limit N]` — every live certain
-  entry lacking a recorded turn, across all roots, sequentially. `--dry`
-  reports the certain-set count and a computron estimate. The sweep unlocks
-  the node **once** and rides the minted bearer for every send (the unlock
-  endpoint rate-limits 5/60s and counts successes), auto-refuels via the dev
-  faucet on an insufficient-balance refusal, retries each failure once, and
-  lets a persistent failure fall to the attest-queue — it never crashes.
-  Already-attested entries are skipped (idempotent), and queue rows made
-  stale by a direct attestation are pruned at the end of the pass.
+  wherever the file lives. Never a rewrite, never a twin, never through `add`.
+  Only live confidence-1.0 entries qualify.
+- `helm premise --attest-sweep [--dry] [--limit N]` — every live certain entry
+  lacking a native record, across all roots. Offline and **free**: no
+  computrons, no faucet, no bearer token. `--dry` reports the count and writes
+  nothing. A best-effort anchor is attempted per entry (fail-open, queued when
+  no node answers).
 
 ## Supersession is a chain, not an edit
 
-Superseding an attested premise is a **new signed turn** referencing the
-prior one — append-only, mirroring the store's record law (files are kept;
-status flips). Belief history thereby becomes a provable chain — *held X
-until T, then Y* — which the drift report reads as attested belief evolution
-rather than lost history.
+Superseding an attested premise appends a **native supersede record** whose
+`supersedes_record` points at the prior premise's record hash — append-only,
+mirroring the store's record law (files are kept; status flips). Belief
+history thereby becomes a provable chain — *held X until T, then Y* — which the
+drift report reads as attested belief evolution rather than lost history.
 
 `helm premise --supersede <old-id> <new-id> | <statement> [| keywords [|
 domain]]` does all three legs in one verb:
 
-1. **Store** — the new premise is captured (same shape as a plain capture)
-   and the old one is tombstoned through the store's own lifecycle
-   (`status: delete_eligible`, the existing `replaced_by`/`supersedes`
-   backpointers — zero schema change, the file stays). This leg is local and
-   lands even with the node down.
-2. **Ledger** — ONE signed turn commits the link:
-   `sup:b2b:<64-hex new digest>:<16-hex prior attest_turn prefix>` — 89
-   bytes, inside the 104-byte whisper budget. The truncated prefix is a
-   **pointer, not a proof**; the full prior turn hash rides the new entry's
-   frontmatter as `attest_supersedes_turn`, and every surface that quotes the
-   chain states that distinction.
-3. **Queue** — with the substrate down, the turn queues with the link
-   *unbound*: replay binds the prior turn hash at send time, so a pending
-   `prem:` turn earlier in the queue lands before the `sup:` turn that
-   references it (replayed in order). A never-attested predecessor is stated
-   honestly — the chain starts at the new premise with a plain `prem:` turn.
+1. **Store** — the new premise is captured and the old one is tombstoned
+   through the store's own lifecycle (`status: delete_eligible`, the existing
+   `replaced_by`/`supersedes` backpointers — zero schema change, the file
+   stays). Local; lands with no node.
+2. **Native record** — ONE `op: supersede` record links `supersedes_record` to
+   the old premise's `rec_hash`; the new entry's frontmatter carries
+   `attest_supersedes_record`. Also offline, always lands.
+3. **Anchor** — best-effort external checkpoint, exactly as for a plain
+   capture. A never-attested predecessor is stated honestly — the chain starts
+   at the new premise.
 
 An edit that would orphan an attestation is refused at capture: re-stating a
-LIVE attested premise with a *different* statement points you at
-`--supersede` (an identical re-statement is recognized as already attested
-and sends nothing).
+LIVE attested premise with a *different* statement points you at `--supersede`
+(an identical re-statement is recognized as already attested and records
+nothing new).
 
 **Reading the chain.** `helm premise-check --chain <id>` walks the chain
 through any link (back via `supersedes`, forward via `replaced_by`),
-re-verifies every digest and every hop's linkage, quotes each turn's
-finality tier from the node, and prints the attested biography — *held X
-until T, then Y*. Exit 0 means every digest matches and no link is broken; a
-store-only (unbacked) hop prints loudly but is a stated design state, not
-corruption.
+re-verifies every digest, every record's native-chain integrity, and every
+hop's linkage, and prints the attested biography — *held X until T, then Y*.
+Exit 0 means every digest matches, every record verifies, and no link is
+broken; a store-only (unbacked) hop prints loudly but is a stated design
+state, not corruption.
 
-**Drift reads it too.** A superseded premise whose chain verifies (offline —
-the drift path never calls the node) reports as `EVOLVED … attested chain`,
-exactly once per hop; a store-only supersession reports as unbacked. Belief
-evolution surfaces as provable history instead of disappearing silently.
+**Drift reads it too.** A superseded premise whose native linkage verifies
+(offline — the drift path never calls a node) reports as `EVOLVED … attested
+chain`, exactly once per hop; a store-only supersession reports as unbacked.
 
 The store's lifecycle writers carry the `attest_*` keys through rewrites
-(evidence, retire) — a lifecycle update never orphans the entry's receipt
-annotations. (`attest_supersedes_turn` is the one exception — store rewrites
-shed it — so chain verification hinges on the surviving
-`attest_payload`/`attest_turn` fields and treats the frontmatter full hash
-as corroboration; `--supersede` itself restores it when extending a chain.)
-The attestation **truth still lives on the ledger**; the file
-keys are the convenient pointer back to it (turn hash, receipt, chain index),
-recoverable from the queue/receipts if a file is ever hand-edited without
-them. The design record behind all of this is an
-internal decision document; its ratified shape is summarized in
-[CONCEPTS.md](CONCEPTS.md) and implemented in `helm/premise.py` (whose
-docstring is the normative spec for the digest contract).
+(evidence, retire) — a lifecycle update never orphans the entry's pointer
+keys. The attestation truth lives in the native chain; the file keys are the
+convenient pointer back to it (record hash, chain index), and `verify_chain`
+recomputes the whole ledger from `attest-chain.jsonl` alone. The normative
+spec for the digest + record contract is the `helm/premise.py` docstring.
 
-## Sequencing: git history vs the ledger
+## Sequencing: git history vs the external anchor
 
 Two tamper-evidence layers serve two different moments, deliberately:
 
-- **Solo-operator history** wants git: the planned authored/derived split
-  (`helm ship`/`pull`) git-backs the authored chain, and the supersession
-  history — *who believed what, when* — rides content-addressed commits with
-  zero daemons. For one operator on their own machines, that is the right
-  weight.
-- **Second-party proof** is what the ledger adds: the day a belief must be
-  proven *to someone else* (multi-operator helm, cross-machine finality), a
-  self-writable git history is no longer evidence — signed turns on the
-  substrate are. That is why the substrate ships optional and propose-only:
-  helm runs fully without it, and it is sequenced to the moment it pays.
+- **Solo-operator history** wants git and the native chain: the supersession
+  history — *who believed what, when* — rides content-addressed commits and a
+  local hash chain with zero daemons. For one operator on their own machines,
+  that is the right weight, and it is what ships by default.
+- **Second-party proof** is what the optional dregg anchor adds: the day a
+  belief must be proven *to someone else* (cross-machine finality), an
+  external commitment to the chain head matters. That anchor is honestly a
+  *node* commitment, not a user signature — and it is strictly optional, so
+  helm runs fully without it and takes it only when it pays.
 
-The digest check in `helm doctor` stays regardless — it catches accidental
-drift cheaply, whichever history layer is carrying the record.
+The digest + native-chain check in `helm doctor`/`premise-check` stays
+regardless — it catches accidental drift cheaply, offline.
 
-## Chat rides the same substrate
+## Chat rides the same digest shape
 
-`helm chat` v2 reuses this exact pattern for the groupchat: each post's
-digest (`chat:b2b:<blake2b-256>`, the same algorithm-tagged shape) rides a
-signed self-write turn on the poster's cell — on a **separate room node**
-whose data-dir lives on tmpfs, so a chat turn never lands on a
-disk-persisted chain (premise `a2a-ram-only-disk-log-after`). Thin claim,
-fat corroboration, twice over: the ledger holds digests, the store holds
-premise text, the RAM room holds chat text. See the chat section of
-[VERBS.md](VERBS.md).
-
-## The node migration (one node per team)
-
-The target topology is ONE node per local team — RAM-hot (tmpfs data-dir)
-with disk as **log-after**: restore-on-boot, a snapshot after every
-attestation turn (`helm/cell.py` fires `~/.local/bin/dregg-cave-snapshot`
-after each successful `send_self`), an interval snapshot timer, and a
-snapshot on unit stop. The interim second chat node dissolves into it.
-
-The migration is `scripts/node-migration.sh` — run `--dry-run`
-first (it exercises every gate for real; the probe mints append-only turns).
-Its hard gates: a full
-tarball backup before anything; the restore-on-boot path **proven before the
-flip**; `premise-check` MATCH on every attested premise before *and* after;
-a post-flip durability cycle (a fresh turn must survive snapshot -> stop ->
-tmpfs wipe -> cold boot); a paste-ready rollback
-(`--rollback`); the whisper daemon stopped around the flip and verified
-back. A digest MISMATCH on any attested premise aborts the migration — edit
-drift must be re-attested (supersession is a chain, not an edit) before the
-chain moves homes.
+`helm chat` v2 reuses the same algorithm-tagged digest shape
+(`chat:b2b:<blake2b-256>`) for groupchat rows. Chat's optional signed-row
+transport is a separate, explicit opt-in and is **not** the attestation path;
+premise attestation needs no binary and no node.

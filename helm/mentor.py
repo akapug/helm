@@ -23,9 +23,10 @@ is free, teaching is the only new verb.
       byte-shape owner), then annotates teacher/target provenance in place
       (the premise annotate pattern) + one events-journal receipt. A same-id
       file in the project is a hard refuse (supersede-not-duplicate), never a
-      silent overwrite. --attest chains the incept onto the ledger: ONE
-      signed self-write turn carrying ment:b2b:<blake2b-256> over the
-      canonical incept text — teaching provenance PROVABLE. Substrate down =
+      silent overwrite. --attest chains the incept onto the native
+      attest-chain: ONE record carrying ment:b2b:<blake2b-256> over the
+      canonical incept text — teaching provenance PROVABLE (offline, no
+      signature). Substrate down =
       the reflex still lands, said loudly; `teach <project> <id> --attest`
       (no steer) backfills later. Mentor rows never ride premise's retry
       queue: its replay annotates store priors by id and would keep an alien
@@ -257,7 +258,8 @@ def _cmd_observe(args):
 
 _TAUGHT_DEFAULTS = dict(reflex._DEFAULTS, teacher="", target="",
                         attest_payload="", attest_ts="", attest_by="",
-                        attest_turn="", attest_receipt="", attest_chain_index="")
+                        attest_record="", attest_chain_index="",
+                        attest_anchor="", attest_anchor_turn="")
 
 
 def teacher_name():
@@ -299,27 +301,30 @@ def incept_payload(target, rid, steer, teacher):
 
 
 def _attest(e):
-    """ONE signed self-write turn for a taught reflex + in-place attest_*
-    annotation. -> (ok, line). Never raises; failure names the payload so the
-    incept stays independently checkable."""
-    from . import cell, premise
+    """ONE native attestation record for a taught reflex (+ optional dregg
+    anchor) + in-place attest_* annotation. -> (ok, line). Never raises; the
+    native record always lands, so the incept stays independently checkable."""
+    from . import premise
     payload = incept_payload(e["target"], e["id"], e["steer"], e["teacher"])
     profile = premise.attest_profile()
     try:
-        info, err = cell.send_self(payload, profile)
+        info = premise.record_attestation(
+            "create", "%s/%s" % (e["target"], e["id"]), payload,
+            root="reflex", attest_by=profile)
     except Exception as ex:
-        info, err = None, "%s: %s" % (ex.__class__.__name__, ex)
-    if err:
-        return False, "attestation NOT recorded (%s) — reflex is live; backfill: " \
-            "helm mentor teach %s %s --attest  [payload %s]" \
-            % (err, e["target"], e["id"], payload)
-    premise._annotate(e["path"], [
-        ("attest_payload", payload), ("attest_ts", pk.now_ts()),
-        ("attest_by", profile), ("attest_turn", info.get("turn_hash", "")),
-        ("attest_receipt", info.get("receipt_hash", "")),
-        ("attest_chain_index", info.get("chain_index", ""))])
-    return True, "attested: turn %s (chain_index %s) signed by '%s'" % (
-        info.get("turn_hash"), info.get("chain_index"), profile)
+        return False, "attestation NOT recorded (%s: %s) — reflex is live; " \
+            "backfill: helm mentor teach %s %s --attest  [payload %s]" \
+            % (ex.__class__.__name__, ex, e["target"], e["id"], payload)
+    fields = [("attest_payload", payload), ("attest_ts", info["ts"]),
+              ("attest_by", profile), ("attest_record", info["rec_hash"]),
+              ("attest_chain_index", info["chain_index"])]
+    if info.get("anchor_turn"):
+        fields += [("attest_anchor", info["anchor_label"]),
+                   ("attest_anchor_turn", info["anchor_turn"])]
+    premise._annotate(e["path"], fields)
+    anchored = (" — %s" % info["anchor_label"]) if info.get("anchor_turn") else ""
+    return True, "attested (native): record %s (chain_index %s) recorded by " \
+        "'%s'%s" % (info["rec_hash"][:16], info["chain_index"], profile, anchored)
 
 
 def _cmd_teach(args):

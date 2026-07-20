@@ -128,6 +128,17 @@ but the store's `type`/`load_class` schema is deliberately orthogonal to
 (vector recall, attested records, a hosted memory service) can be plugged in
 per-type without consumers changing.
 
+### Attestation is native-primary
+
+Premise attestation is a **helm-native, stdlib, append-only hash chain** — the
+primary, offline, tamper-evident proof (`<helm-home>/_global/.state/attest-chain.jsonl`,
+`rec_hash = blake2b256(canonical(core) + prev)`). It depends on no binary and
+no service. A dregg node, when reachable, is an **OPTIONAL external checkpoint**
+that anchors a record hash and is honestly labelled a *node* commitment, never
+a user-cell signature (fail-open — the native record stands regardless). helm
+rides dregg + cv only; it never depends on the meld binary. See
+[ATTESTATION.md](ATTESTATION.md).
+
 ### The comparison-resolver seam
 
 The interface is small: a backend has a `name`, a **mandatory `source`

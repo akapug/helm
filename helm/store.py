@@ -261,9 +261,14 @@ _PRIOR_DEFAULTS = {
     "evidence_log": "", "confidence_history": "",
     "supersedes": "", "replaced_by": "", "source_prior": "",
     "retired_ts": "", "retired_why": "",
-    # attestation receipt (premise.py annotates; parse + rewrite carry through)
-    "attest_payload": "", "attest_ts": "", "attest_by": "", "attest_turn": "",
-    "attest_receipt": "", "attest_chain_index": "",
+    # attestation pointer (premise.py annotates; parse + rewrite carry through).
+    # attest_record is the NATIVE hash-chain record (the primary proof);
+    # attest_anchor* is the OPTIONAL dregg anchor; attest_turn/attest_receipt/
+    # attest_supersedes_turn are legacy (read-only, pre-native attestations).
+    "attest_payload": "", "attest_ts": "", "attest_by": "",
+    "attest_record": "", "attest_chain_index": "",
+    "attest_supersedes_record": "", "attest_anchor": "", "attest_anchor_turn": "",
+    "attest_turn": "", "attest_receipt": "", "attest_supersedes_turn": "",
 }
 
 _LEX_DEFAULTS = {"term": "", "scope": "global", "definition": "", "kind": "",
@@ -675,10 +680,12 @@ def write_prior(e, root_dir=None, path=None):
         # an explicit un-pin (demote) must survive the rewrite — on read it
         # beats the PINNED_SLUGS tuple, which is what keeps the flip stuck
         body.append("  pin: false")
-    # attestation annotations survive rewrites — the ledger is the truth, but a
-    # store rewrite (evidence/retire) must never orphan the entry's receipt keys
-    for opt in ("attest_payload", "attest_ts", "attest_by", "attest_turn",
-                "attest_receipt", "attest_chain_index"):
+    # attestation annotations survive rewrites — the native chain is the truth,
+    # but a store rewrite (evidence/retire) must never orphan the pointer keys
+    for opt in ("attest_payload", "attest_ts", "attest_by", "attest_record",
+                "attest_chain_index", "attest_supersedes_record",
+                "attest_anchor", "attest_anchor_turn",
+                "attest_turn", "attest_receipt", "attest_supersedes_turn"):
         if e.get(opt) not in (None, ""):
             body.append("  " + opt + ": " + str(e[opt]))
     for opt in ("supersedes", "replaced_by", "source_prior"):

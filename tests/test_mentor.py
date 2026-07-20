@@ -28,14 +28,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 
-from helm import cell, home, inject, mentor, pk, record, reflex, sessions, store  # noqa: E402
+from helm import home, inject, mentor, pk, premise, record, reflex, sessions, store  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "HELM_CACHE_DIR",
             "HELM_ACTOR", "CLAUDE_SESSION_ID", "HELM_CELL_PROFILE",
-            "MELD_AGENT_PROFILE")
+            "MELD_AGENT_PROFILE", "HELM_NODE_URL", "MELD_NODE_URL")
 
 TS_OLD = "2026-01-01T00:00:00Z"
-INFO = {"turn_hash": "t1", "receipt_hash": "r1", "chain_index": 7, "sent": True}
 
 
 def snapshot(root):
@@ -58,6 +57,7 @@ class MentorBase(unittest.TestCase):
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
         os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
+        os.environ["HELM_NODE_URL"] = "http://127.0.0.1:1"  # dead: anchor fails open
         os.makedirs(os.environ["HELM_ADOPTED_DIR"])
 
     def tearDown(self):
@@ -282,46 +282,48 @@ class AttestTest(MentorBase):
         self.assertNotEqual(a, mentor.incept_payload("proj", "id", "other", "t"))
 
     def test_attest_success_annotates_in_place(self):
-        with mock.patch.object(cell, "send_self",
-                               return_value=(dict(INFO), None)) as sent:
-            rc, out, _ = self.teach(extra=["--attest"])
+        # the native record always lands; the OPTIONAL anchor is down (dead port)
+        rc, out, _ = self.teach(extra=["--attest"])
         self.assertEqual(rc, 0)
-        self.assertIn("attested: turn t1 (chain_index 7) signed by 'helm-test'", out)
+        self.assertIn("attested (native): record ", out)
+        self.assertIn("recorded by 'helm-test'", out)
         e = mentor.taught("proj")[0]
-        self.assertEqual(sent.call_args[0], (e["attest_payload"], "helm-test"))
-        self.assertEqual((e["attest_turn"], e["attest_receipt"],
-                          e["attest_chain_index"], e["attest_by"]),
-                         ("t1", "r1", "7", "helm-test"))
+        self.assertTrue(e["attest_record"])
+        self.assertEqual(e["attest_chain_index"], "0")
+        self.assertEqual(e["attest_by"], "helm-test")
+        self.assertNotIn("attest_turn", [k for k in e if e.get(k)])   # never node-signed
         self.assertEqual(e["attest_payload"], mentor.incept_payload(
             "proj", e["id"], e["steer"], e["teacher"]))
+        self.assertTrue(premise.verify_chain()[0])
         fired = reflex.fire("parked-human-resolvable-gate", project="proj")
         self.assertEqual(len(fired), 1, "annotation must not break the reflex")
 
-    def test_substrate_down_lands_the_reflex_and_backfills(self):
-        with mock.patch.object(cell, "send_self", return_value=(None, "node down")):
+    def test_primitive_raising_degrades_to_not_recorded(self):
+        # belt-and-suspenders: if the native primitive raises, the reflex is
+        # still live and the payload is named for a backfill
+        with mock.patch.object(premise, "record_attestation",
+                               side_effect=RuntimeError("boom")):
             rc, out, _ = self.teach(extra=["--attest"])
         self.assertEqual(rc, 0)
-        self.assertIn("attestation NOT recorded (node down)", out)
+        self.assertIn("attestation NOT recorded (RuntimeError: boom)", out)
         self.assertIn("--attest  [payload ment:b2b:", out)
-        e = mentor.taught("proj")[0]
-        self.assertEqual(e["attest_payload"], "")
-        with mock.patch.object(sessions, "rows_for", return_value=[]), \
-                mock.patch.object(cell, "send_self", return_value=(dict(INFO), None)):
-            out2, ctx = io.StringIO(), contextlib.redirect_stdout
-            with ctx(out2):
+        self.assertEqual(mentor.taught("proj")[0]["attest_payload"], "")
+        # a later --attest with the primitive working backfills the record
+        with mock.patch.object(sessions, "rows_for", return_value=[]):
+            out2 = io.StringIO()
+            with contextlib.redirect_stdout(out2):
                 rc2 = mentor.cmd_mentor(["teach", "proj",
                                          "parked-human-resolvable-gate", "--attest"])
         self.assertEqual(rc2, 0)
-        self.assertIn("attested: turn t1", out2.getvalue())
-        self.assertEqual(mentor.taught("proj")[0]["attest_turn"], "t1")
+        self.assertIn("attested (native): record ", out2.getvalue())
+        self.assertTrue(mentor.taught("proj")[0]["attest_record"])
 
     def test_backfill_is_idempotent_and_bounded(self):
-        with mock.patch.object(cell, "send_self", return_value=(dict(INFO), None)):
-            self.teach(extra=["--attest"])
-            rc, out, _ = self.run_cmd(
-                ["teach", "proj", "parked-human-resolvable-gate", "--attest"])
-            self.assertEqual(rc, 0)
-            self.assertIn("already attested (ment:b2b:", out)
+        self.teach(extra=["--attest"])
+        rc, out, _ = self.run_cmd(
+            ["teach", "proj", "parked-human-resolvable-gate", "--attest"])
+        self.assertEqual(rc, 0)
+        self.assertIn("already attested (ment:b2b:", out)
         rc, _, err = self.run_cmd(["teach", "proj", "ghost-id", "--attest"])
         self.assertEqual(rc, 1)
         self.assertIn("nothing taught as 'ghost-id'", err)

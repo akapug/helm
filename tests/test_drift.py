@@ -100,21 +100,21 @@ class ScopeKeyedSnapshotTest(DriftBase):
         self.assertFalse(os.path.isfile(drift._state_path()))
 
 
-TURN = "cd" * 32
-SUPTURN = "ef" * 32
+OLD_REC = "cd" * 32
 
 
 class EvolvedTest(DriftBase):
-    """The fourth class: a superseded premise reads as EVOLVED — attested
-    when the signed sup: chain verifies OFFLINE, unbacked when store-only.
+    """The fourth class: a superseded premise reads as EVOLVED — attested when
+    the native supersession record links OFFLINE, unbacked when store-only.
     Latched exactly once per hop via the scope-keyed evolved-state file."""
 
     def hop(self, attested=True, old="law-old", new="law-new"):
         old_kw = {"attest_payload": premise.digest_payload("s-" + old),
-                  "attest_turn": TURN} if attested else {}
+                  "attest_record": OLD_REC} if attested else {}
         self.seed(old, 1.0, **old_kw)
-        new_kw = {"attest_payload": premise.sup_payload("s-" + new, TURN),
-                  "attest_turn": SUPTURN} if attested else {}
+        new_kw = {"attest_payload": premise.digest_payload("s-" + new),
+                  "attest_record": "ab" * 32,
+                  "attest_supersedes_record": OLD_REC} if attested else {}
         self.seed(new, 1.0, **new_kw)
         _e, err = store.mark_superseded(old, new, TS)
         self.assertIsNone(err)
@@ -137,7 +137,7 @@ class EvolvedTest(DriftBase):
         rows, _ = drift.findings()
         self.assertEqual(rows, [{"kind": "evolved", "id": "law-old",
                                  "to": "law-new", "attested": False}])
-        self.assertIn("NO signed chain", drift._line(rows[0]))
+        self.assertIn("NO native chain", drift._line(rows[0]))
 
     def test_peek_never_latches(self):
         self.hop()

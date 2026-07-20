@@ -72,29 +72,38 @@ scarce resource; spend it only when newly relevant.
 ## Attested premises (shipped)
 
 Premises (confidence 1.0) are provable, standing truths — so they live as
-*attested records* on a verifiable ledger, not just files. The design
-converged 2026-07-18 between the build and substrate poles, was ratified in
-that convergence, and was live-proven on the node the same day; it ships as
-`helm premise` / `helm premise-check` (operational detail:
-[ATTESTATION.md](ATTESTATION.md)). The shape:
+*attested records* on a verifiable chain, not just files. The design converged
+2026-07-18 between the build and substrate poles; the attestation model was
+**corrected 2026-07-20 to be native-first** (the earlier "the operator's cell
+signs each premise" plan was not reproducible in stdlib and, per the owner, not
+required — his stated quote *is* the proof). It ships as `helm premise` /
+`helm premise-check` (operational detail: [ATTESTATION.md](ATTESTATION.md)).
+The shape:
 
-- **The operator's own cell signs** premise capture and supersession. This is
-  semantically exact, not just warm: confidence 1.0 is human-only by law, so
-  the attestable set is precisely the operator's stated truths.
-- **Thin claim, fat corroboration**: the ledger holds only a signed digest of
-  the canonical premise text; the text stays in the storehouse. A checker
-  recomputes the digest — match means attested.
-- **Supersession is a new signed turn** referencing the prior turn-hash
-  (append-only, never delete — the store's record law, mirrored — retire keeps the file). Belief
-  history becomes a provable chain: *held X until T, then Y* — which the
-  drift report can read as attested belief evolution.
-- **Zero new substrate**: rides the existing self-write receipt shape;
-  delivery rides the existing whisper lane. `type`/`load_class` stay
-  orthogonal to placement, so no consumer changes when a premise's backing
-  migrates from file to attested record.
+- **The proof is the quote plus a native hash-chain.** A premise's provenance
+  (the operator stated it, with a date and source) is the attestation;
+  confidence 1.0 is human-only by law, so the attestable set is precisely the
+  operator's stated truths. Each capture appends a record to a local
+  append-only chain (`_global/.state/attest-chain.jsonl`) whose
+  `rec_hash = blake2b(canonical(core) + predecessor_hash)` — tamper-evident and
+  verifiable entirely offline.
+- **Thin claim, fat corroboration**: the record holds an *unsigned* blake2b
+  digest of the canonical premise text; the text stays in the storehouse. A
+  checker recomputes the digest and re-walks the chain — match plus intact
+  linkage means the native record is verified.
+- **Supersession is a new chain record** linking `attest_supersedes_record` to
+  the prior `rec_hash` (append-only, never delete — retire keeps the file).
+  Belief history becomes a provable chain: *held X until T, then Y* — which the
+  drift report reads as attested belief evolution.
+- **dregg is an optional external checkpoint, never the proof.** When a dregg
+  node is configured and reachable, helm may anchor the record digest to it,
+  labeled honestly ("node `<url>` anchored digest at turn `<hash>`") — the node
+  signs as *its own* operator cell, so this is never labeled as the user's cell
+  signing. Best-effort and fail-open: no node ⇒ the native record stands and
+  the anchor queues for `--retry-queue`.
 
-One activation note: captures sign as a visibly-test profile until the
-operator sets their own — the operator's first personal capture with their
-profile configured is what activates user-cell signing, by design. And the
-substrate is an upgrade, never a dependency: without it, premises store
-normally and attestations queue for retry.
+`attest_by`/`attest_profile` are **provenance labels, not signers**.
+`premise-check` reports three independent tiers — digest match, native chain
+verified, external anchor confirmed/unverified/none — and never collapses them
+or over-claims a signer. The substrate is an upgrade, never a dependency:
+without it, premises store normally and the native chain records offline.
