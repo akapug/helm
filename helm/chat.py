@@ -74,18 +74,19 @@ def _ensure_dir():
 
 
 def whoname():
-    """$HELM_CHAT_NAME, else the best local identity guess: session, then user."""
+    """$HELM_CHAT_NAME, else a session-derived AGENT name — never the operator's
+    identity. The unix login is the operator's machine account (pug/david); an
+    agent CLI post that fell through to it impersonated the owner in the room
+    (owner-flagged 2026-07-19). The operator's own surfaces name themselves
+    explicitly (web posts as 'david'; `helm --human` sets HELM_CHAT_NAME), so a
+    bare CLI post is ALWAYS an agent — it gets an agent tag, never the login."""
     name = home.env("CHAT_NAME")
     if name:
         return name
     sid = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_SESSION_ID")
     if sid:
         return "agent-" + sid[:8]
-    import getpass
-    try:
-        return getpass.getuser()
-    except Exception:
-        return "anon"
+    return "agent"
 
 
 # ---------------------------------------------------------------------------
