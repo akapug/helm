@@ -10,7 +10,7 @@ $ helm web            # http://127.0.0.1:7433
 $ helm web --port 8080 --open
 ```
 
-## The five views
+## The six views
 
 | tab | what it shows | CLI equivalent |
 |---|---|---|
@@ -19,6 +19,7 @@ $ helm web --port 8080 --open
 | **sessions** | the full catalog across harnesses: search inside transcripts, role-colored drawer, one-click resume command, re-home, prune | `helm sessions` / `helm search` / `helm transcript` / `helm cmd` |
 | **configs** | every config across every home, the cascade resolver, and the editor (backup → validate → atomic write, one-click restore) | `helm configs` |
 | **chat** | the human-included groupchat: the RAM room, polled every ~2s while open. Posting signs server-side as `david` on the chat room node when it answers (v2 — signed rows carry a subtle ✓ tick, chain index on hover; the strip beside the send button shows `signed ⛓#head` / `unsigned`) and drops the `owner-unread` marker, so every local agent's next turn is steered to read + reply (the shipped `owner-chat-unread` reflex). `:shortcodes:` expand; hovering a message offers click-to-react (👍 🎉 🔥 ❤️ 👀), reactions render inline (`🎉×2`). Works from the Orca mobile browser (simple DOM, no exotic APIs) | `helm chat` |
+| **ledger** | the attestation node's read surfaces, polled every ~3s while open: the turn ledger (recent signed turns, finality tier per turn — the durable `final @ h<N>` consensus certificate over the receipt's hash-bound field — chain head, agent/receipt hashes), a node status strip (ingress vs finalized height, producer, federation), and seat activity (every cell, active/quiet/stuck/idle off the receipt window). Node down = a quiet "substrate offline" strip, never an error. The one write — message a seat — posts `@seat …` through the EXISTING chat POST; the ledger endpoints themselves are GET-only | `helm cell status` |
 
 ## Security posture
 
@@ -79,6 +80,8 @@ Parameterized reads:
 | `/api/session` | `sid=` `before=` `limit=` `find=` `harness=` | a windowed, role-tagged transcript read |
 | `/api/cmd` | `sid=` `account=` `model=` | the pasteable account-aware resume command |
 | `/api/chat` | `room=` (default `main`) `since=` (rows already seen) | the chat poll read: `{room, lines, total, transport}` — rows include reaction rows (the client aggregates); signed rows carry `{turn, receipt, chain}`; `transport` = `{mode: signed|unsigned, url, head}`; a `since` past the end (the room rotated) resends everything |
+| `/api/ledger` | — | the node projection: `{node, status, turns, cells}` — newest 40 signed turns with finality fields, cells with `last_turn_ts`/`recent_turns` joined off the receipt window; node down → `{"offline": true, "node": ...}` at 200 |
+| `/api/ledger/turn` | `hash=` (64 hex chars) | one turn's durable finality certificate, proxied from the node's `/api/turn/<hash>/status`; node down/refused → `{"unavailable": true}` at 200 |
 
 ## POST endpoints
 

@@ -19,6 +19,7 @@ modules are built in parallel — their endpoints DEGRADE GRACEFULLY to
 """
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -726,6 +727,68 @@ def _api_chat_react(payload):
     return {"ok": True, "msg": row, "total": chat.read(room)[1]}, 200
 
 
+# ── ledger: read-only projection of the attestation node's public reads ──
+# The same node `helm cell` talks to (HELM_NODE_URL, default :8899), GET-only:
+# receipts (the signed turn ledger, finality tier per turn), cells (seat
+# activity, joined to the bounded receipt window), turn status by hash. The
+# node is OPTIONAL — down/absent answers {"offline": true} at 200 and the tab
+# shows "substrate offline", never an error page. The tab's ONE write (message
+# a seat) rides the EXISTING /api/chat POST — no new mutation surface.
+
+LEDGER_TURNS = 40
+LEDGER_STATUS_KEYS = ("healthy", "dag_height", "latest_height", "block_count",
+                      "consensus_live", "federation_mode", "state_producer",
+                      "lean_producer", "peer_count", "public_key")
+_TURN_HASH = re.compile(r"[0-9a-f]{64}")
+
+
+def _api_ledger(qs):
+    """Aggregate: node status subset + newest signed turns (bounded) + cells
+    with per-seat last-activity derived from the receipt window (receipt.agent
+    joins cell.id 1:1 — cells with no turn in the window honestly carry None)."""
+    from . import cell
+    url = cell.node_url()
+    status = cell.get_json(url + "/status", timeout=3)
+    receipts = cell.get_json(url + "/api/receipts", timeout=3)
+    if status is None and receipts is None:
+        return {"offline": True, "node": url}, 200
+    turns = sorted((r for r in (receipts or []) if isinstance(r, dict)),
+                   key=lambda r: r.get("chain_index", 0),
+                   reverse=True)[:LEDGER_TURNS]
+    last_ts, seen = {}, {}
+    for r in turns:
+        a, ts = r.get("agent"), r.get("timestamp")
+        if not a:
+            continue
+        seen[a] = seen.get(a, 0) + 1
+        if ts is not None and ts > last_ts.get(a, -1):
+            last_ts[a] = ts
+    rows = [c for c in (cell.get_json(url + "/api/cells", timeout=3) or [])
+            if isinstance(c, dict)]
+    for c in rows:
+        c["last_turn_ts"] = last_ts.get(c.get("id"))
+        c["recent_turns"] = seen.get(c.get("id"), 0)
+    rows.sort(key=lambda c: (c.get("last_turn_ts") is None,
+                             -(c.get("last_turn_ts") or 0), c.get("id") or ""))
+    return {"node": url,
+            "status": {k: (status or {}).get(k) for k in LEDGER_STATUS_KEYS},
+            "turns": turns, "cells": rows}, 200
+
+
+def _api_ledger_turn(qs):
+    """One turn's durable finality certificate: proxy /api/turn/<hash>/status.
+    The hash gate keeps the proxied path literal-only."""
+    h = (_q1(qs, "hash") or "").strip().lower()
+    if not _TURN_HASH.fullmatch(h):
+        return {"error": "hash wants 64 hex chars (a turn hash)"}, 400
+    from . import cell
+    url = cell.node_url()
+    d = cell.get_json(url + "/api/turn/%s/status" % h, timeout=3)
+    if d is None:  # node down OR the node refused the hash — same degrade shape
+        return {"unavailable": True, "node": url, "hash": h}, 200
+    return d, 200
+
+
 # ── sessions surface: catalog / search / session / cmd / cwd / prune ──
 # ABSORBED contracts from sesh (server/sesh.py route handlers): same query
 # params + response shapes, thin wrappers over transcripts.py (which owns the
@@ -860,6 +923,8 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/session": _api_session,
     "/api/cmd": _api_cmd,
     "/api/chat": _api_chat,
+    "/api/ledger": _api_ledger,
+    "/api/ledger/turn": _api_ledger_turn,
 }
 
 POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token

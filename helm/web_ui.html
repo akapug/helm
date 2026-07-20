@@ -381,6 +381,41 @@ details.cfgsec>summary:hover{color:var(--fg)}
 #chatbar .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 14px;font-size:.86rem;cursor:pointer}
 #chatbar .chip:hover{border-color:var(--accent);color:var(--accent)}
 
+/* ================= ledger view (the turn ledger + seat activity, on helm's variables) ================= */
+#ledgerstrip{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;margin:14px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:.84rem;color:var(--mut);font-variant-numeric:tabular-nums}
+#ledgerstrip b{color:var(--fg)}
+#ledgerstrip .offline{color:var(--warn)}
+#ledgersplit{display:grid;grid-template-columns:1fr;gap:14px;margin:14px 0 0;align-items:start}
+@media(min-width:860px){#ledgersplit{grid-template-columns:5fr 3fr}}
+.lcard{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow:hidden}
+.lcard>h3{margin:0;padding:10px 14px;border-bottom:1px solid var(--line);font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--sub);display:flex;gap:8px;align-items:baseline}
+.lcard>h3 .lsub{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:400;font-size:.76rem}
+.lside{display:grid;gap:14px;align-content:start}
+.lrows{max-height:68vh;overflow-y:auto}
+.lrow{padding:8px 14px;border-bottom:1px solid var(--line);font-size:.86rem}
+.lrow:last-child{border-bottom:none}
+.lrow:hover{background:var(--hover)}
+.lhead{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.lhead .lidx{font-weight:700;font-variant-numeric:tabular-nums}
+.lhead .lage{margin-left:auto;color:var(--sub);font-size:.76rem;white-space:nowrap;font-variant-numeric:tabular-nums}
+.lmeta{font-size:.76rem;color:var(--mut);margin-top:2px;word-break:break-all}
+.lbadge{font-size:.66rem;font-weight:700;padding:2px 7px;border-radius:5px;white-space:nowrap;background:color-mix(in srgb,var(--mut) 14%,transparent);color:var(--mut)}
+.lbadge.final{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+.lbadge.tent{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)}
+.lbadge.head{background:var(--accent-soft);color:var(--accent)}
+.lhash{color:var(--accent)}
+.ldot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--sub);flex:none;align-self:center}
+.ldot.active{background:var(--ok);box-shadow:0 0 6px color-mix(in srgb,var(--ok) 60%,transparent)}
+.ldot.quiet{background:var(--warn)}
+.ldot.stuck{background:var(--bad)}
+.llegend{padding:7px 14px;border-bottom:1px solid var(--line);font-size:.72rem;color:var(--sub);display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+#seatform{display:flex;flex-wrap:wrap;gap:8px;padding:12px 14px}
+#seatform input{flex:1 1 100%;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 11px;font-size:.9rem}
+#seatform input:focus{border-color:var(--accent);outline:none}
+#seatform #seatkey{flex:0 1 46%}
+#seatmsg{flex:1 1 100%;font-size:.76rem;color:var(--sub);min-height:1.1em;word-break:break-word}
+#seatmsg.ok{color:var(--ok)}#seatmsg.bad{color:var(--bad)}
+
 /* ---------- toast + theme toggle ---------- */
 .hint{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:9px;font:.82rem ui-monospace,Menlo,monospace;opacity:0;transition:.2s;pointer-events:none;z-index:70;max-width:92vw;word-break:break-all}
 .hint.show{opacity:.96}
@@ -394,6 +429,7 @@ details.cfgsec>summary:hover{color:var(--fg)}
   <button class="navtab" data-v="sessions">sessions</button>
   <button class="navtab" data-v="configs">configs</button>
   <button class="navtab" data-v="chat">chat</button>
+  <button class="navtab" data-v="ledger">ledger</button>
   <div class="stats" id="navstats"></div>
   <button id="trayBtn">tray (0)</button>
 </nav>
@@ -510,6 +546,35 @@ details.cfgsec>summary:hover{color:var(--fg)}
   </div>
 </div>
 
+<div class="view" id="view-ledger">
+  <div id="ledgerstrip">connecting…</div>
+  <div id="ledgersplit">
+    <div class="lcard">
+      <h3>turn ledger <span class="lsub">ingress + consensus finality</span></h3>
+      <div class="lrows" id="ledgerturns"><div class="empty">loading…</div></div>
+    </div>
+    <div class="lside">
+      <div class="lcard">
+        <h3>message a seat <span class="lsub">rides the groupchat</span></h3>
+        <form id="seatform" autocomplete="off">
+          <input id="seatkey" placeholder="seat (e.g. codex-seat)" maxlength="120" aria-label="seat name">
+          <input id="seatline" placeholder="one-line message…" maxlength="400" required aria-label="message">
+          <button class="chip" id="seatsend" type="submit">send →</button>
+          <div id="seatmsg">posts “@seat …” to chat — every local agent’s next turn surfaces it (the owner-unread reflex).</div>
+        </form>
+      </div>
+      <div class="lcard">
+        <h3>seat activity <span class="lsub">cells on the node</span></h3>
+        <div class="llegend"><span><span class="ldot active"></span> active &lt;2m</span>
+          <span><span class="ldot quiet"></span> quiet &lt;30m</span>
+          <span><span class="ldot stuck"></span> stuck?</span>
+          <span><span class="ldot"></span> no recent turn</span></div>
+        <div class="lrows" id="ledgercells"><div class="empty">loading…</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 </div>
 
 <div id="tray"><h3>team tray — one seat per terminal<button id="trayClose" title="close">✕</button></h3>
@@ -560,7 +625,7 @@ function toast(m, ms) {
 }
 
 /* ---------- nav (sesh navtab pattern; helm is the default view) ---------- */
-const VIEWS = ["helm", "quota", "sessions", "configs", "chat"];
+const VIEWS = ["helm", "quota", "sessions", "configs", "chat", "ledger"];
 function showView(v) {
   $$(".navtab").forEach(t => t.classList.toggle("on", t.dataset.v === v));
   $$(".view").forEach(p => p.classList.toggle("on", p.id === "view-" + v));
@@ -570,6 +635,7 @@ function showView(v) {
   if (v === "sessions") initSessions();
   if (v === "configs") cfgInit();
   if (v === "chat") initChat();
+  if (v === "ledger") initLedger();
 }
 $$(".navtab").forEach(t => t.onclick = () => showView(t.dataset.v));
 window.addEventListener("hashchange", () => {
@@ -2148,6 +2214,117 @@ function initChat() {
     });
   }
   pollChat();
+}
+
+/* ================= ledger view (read-only projection of the attestation node) =================
+   Polls /api/ledger every ~3s while open. The node down is a NORMAL state:
+   {"offline": true} renders as a quiet "substrate offline" strip, never an
+   error. The one write here — message a seat — rides the EXISTING /api/chat
+   POST (bearer + owner-unread marker); the ledger endpoints stay GET-only. */
+let LEDGER_TIMER = null;
+const lsh = h => h ? String(h).slice(0, 10) + "…" : "—";
+const lago = t => {
+  if (!t) return "—";
+  const s = Math.max(0, Date.now() / 1e3 - t);
+  return s < 60 ? Math.round(s) + "s ago" : s < 3600 ? Math.round(s / 60) + "m ago"
+    : s < 86400 ? Math.round(s / 3600) + "h ago" : Math.round(s / 86400) + "d ago";
+};
+
+function ledgerStrip(d) {
+  const el = $("#ledgerstrip");
+  if (d.offline) {
+    el.innerHTML = '<span class="offline">substrate offline — node unreachable at <code>' + esc(d.node) + '</code>; retrying quietly…</span>';
+    return;
+  }
+  const s = d.status || {}, fin = s.latest_height ?? 0;
+  el.innerHTML =
+    '<span><b>' + (s.healthy === true ? "healthy" : "degraded") + '</b></span>' +
+    '<span title="turns accepted at ingress">ingress <b>' + esc(String(s.dag_height ?? "?")) + '</b></span>' +
+    '<span title="consensus-finalized height">finalized <b>' + fin + '</b>' + (fin === 0 ? ' <span class="lbadge tent">tentative</span>' : '') + '</span>' +
+    '<span>producer <b>' + esc(String(s.state_producer ?? "?")) + '</b>' + (s.lean_producer ? " ✓" : "") + '</span>' +
+    '<span>' + esc(String(s.federation_mode ?? "?")) + ' · <b>' + (s.peer_count ?? 0) + '</b> peers</span>' +
+    '<span style="margin-left:auto"><code>' + esc(d.node || "") + '</code></span>';
+}
+
+function ledgerBadges(t) {
+  const b = [];
+  if (t.chain_head) b.push('<span class="lbadge head">head</span>');
+  if (t.has_proof) b.push('<span class="lbadge final">proof</span>');
+  if (t.executor_signed) b.push('<span class="lbadge">exec-signed</span>');
+  // Finality tier: the DURABLE consensus certificate (consensus_final +
+  // attested_height) wins; the receipt's own hash-bound `finality` field
+  // honestly stays "tentative" forever on the append-only chain, so it is
+  // only the fallback for nodes that predate the certificate.
+  if (t.consensus_final) b.push('<span class="lbadge final">final @ h' + (t.attested_height ?? "?") + '</span>');
+  else if (t.finality) b.push('<span class="lbadge' + (t.finality !== "final" ? " tent" : " final") + '">' + esc(t.finality) + '</span>');
+  return b.join(" ");
+}
+
+function ledgerTurns(turns) {
+  if (!turns || !turns.length) { $("#ledgerturns").innerHTML = '<div class="empty">no turns yet</div>'; return; }
+  $("#ledgerturns").innerHTML = turns.map(t =>
+    '<div class="lrow"><div class="lhead"><span class="lidx">#' + (t.chain_index ?? "?") + '</span>' +
+    '<span class="mono lhash copy" data-copy="' + esc(t.turn_hash || "") + '" title="turn hash — click to copy">' + lsh(t.turn_hash) + '</span> ' +
+    ledgerBadges(t) + '<span class="lage">' + lago(t.timestamp) + '</span></div>' +
+    '<div class="lmeta">agent <span class="mono">' + lsh(t.agent) + '</span> · receipt <span class="mono">' + lsh(t.receipt_hash) + '</span>' +
+    ' · ' + (t.action_count ?? 0) + ' action(s) · ' + (t.computrons_used ?? 0) + ' ⚙</div></div>').join("");
+}
+
+function seatState(ts) {
+  if (ts == null) return ["", "idle"];
+  const s = Date.now() / 1e3 - ts;
+  return s < 120 ? ["active", "active"] : s < 1800 ? ["quiet", "quiet"] : ["stuck", "stuck?"];
+}
+
+function ledgerCells(cells) {
+  if (!cells || !cells.length) { $("#ledgercells").innerHTML = '<div class="empty">no cells</div>'; return; }
+  $("#ledgercells").innerHTML = cells.map(c => {
+    const [cls, label] = seatState(c.last_turn_ts);
+    return '<div class="lrow"><div class="lhead"><span class="ldot ' + cls + '"></span>' +
+      '<span class="mono lhash copy" data-copy="' + esc(c.id || "") + '" title="cell id — click to copy">' + lsh(c.id) + '</span>' +
+      '<span class="lbadge' + (cls === "active" ? " final" : cls === "quiet" ? " tent" : "") + '">' + label + '</span>' +
+      '<span class="lage">' + (c.last_turn_ts ? lago(c.last_turn_ts) : "—") + '</span></div>' +
+      '<div class="lmeta">' + (c.recent_turns || 0) + ' recent turn(s) · nonce <b>' + (c.nonce ?? 0) + '</b> · ' + (c.balance ?? 0) + ' ⛃' +
+      (c.has_program ? ' · <span class="lbadge">program</span>' : '') +
+      (c.capability_count ? ' · ' + c.capability_count + ' caps' : '') + '</div></div>';
+  }).join("");
+}
+
+async function pollLedger() {
+  if (!$("#view-ledger").classList.contains("on")) return; // poll only while open
+  let d;
+  try { d = await j("/api/ledger"); }
+  catch (e) { $("#ledgerstrip").innerHTML = '<span class="offline">helm isn’t answering — retrying quietly…</span>'; return; }
+  ledgerStrip(d);
+  if (d.offline) {
+    $("#ledgerturns").innerHTML = '<div class="empty">substrate offline — the ledger reappears when the node answers</div>';
+    $("#ledgercells").innerHTML = '<div class="empty">substrate offline</div>';
+    return;
+  }
+  ledgerTurns(d.turns);
+  ledgerCells(d.cells);
+}
+
+async function sendSeatMsg(ev) {
+  ev.preventDefault();
+  const key = $("#seatkey").value.trim(), line = $("#seatline").value.trim(), m = $("#seatmsg");
+  if (!line) return;
+  const name = localStorage.getItem("helm.chatname") || "david";
+  const text = key ? "@" + key + " " + line : line;
+  m.className = ""; m.textContent = "sending…";
+  try { await post("/api/chat", {room: "main", text, name}); }
+  catch (e) { m.className = "bad"; m.textContent = "✗ " + e.message; return; }
+  m.className = "ok";
+  m.textContent = "✓ posted to chat" + (key ? " for @" + key : "") + " — surfaced to agents next turn";
+  $("#seatline").value = "";
+}
+
+function initLedger() {
+  if (!LEDGER_TIMER) {
+    LEDGER_TIMER = setInterval(pollLedger, 3000);
+    $("#seatform").addEventListener("submit", sendSeatMsg);
+  }
+  pollLedger();
 }
 
 /* ================= boot ================= */
