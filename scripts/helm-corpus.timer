@@ -1,0 +1,12 @@
+# Daily trigger for helm-corpus.service. Persistent=true back-fills a run
+# missed while the machine slept — the archive never silently skips a day.
+[Unit]
+Description=daily helm corpus backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

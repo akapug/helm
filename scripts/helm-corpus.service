@@ -1,0 +1,15 @@
+# helm corpus backup — the training-corpus transcript archive (copy-only).
+# Pairs with helm-corpus.timer. Enable (the owner one-step):
+#   cp scripts/helm-corpus.{service,timer} ~/.config/systemd/user/ \
+#     && systemctl --user daemon-reload && systemctl --user enable --now helm-corpus.timer
+# Point the archive at a bigger mount by uncommenting Environment= below
+# (or `systemctl --user edit helm-corpus` for a drop-in).
+[Unit]
+Description=helm corpus backup — copy-only transcript archive for training data
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/helm corpus backup
+# Environment=HELM_CORPUS_DEST=/run/media/%u/dev-ext/corpus-archive
+Nice=10
+IOSchedulingClass=idle

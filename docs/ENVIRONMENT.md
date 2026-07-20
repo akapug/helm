@@ -39,6 +39,12 @@ overrides are in effect.
 | `HELM_CONFIG_ROOTS` | `~/dev` | `helm configs` — colon-separated roots for the project-scope config tree walk | `SESH_CONFIG_ROOTS` |
 | `HELM_SKILL_DECK` | — (no deck; nothing provisioned) | `helm homes create` — a directory of skill dirs (each carrying a `SKILL.md`), symlinked into every new claude home's `skills/` so any credential loads the same setup; existing entries are never touched | — |
 
+## the training corpus
+
+| variable | default | read by | legacy fallback |
+|---|---|---|---|
+| `HELM_CORPUS_DEST` | `~/corpus-archive` | `helm corpus` — the dated, copy-only transcript archive root (backup + status + the shipped systemd timer). Point it at a larger local mount (e.g. a `/run/media/<you>/…` archive disk) to host the training corpus off the system drive; the manifest/cursor travels with the dest, so switching mounts re-archives from zero there. Extra transcript roots reuse `HELM_CLAUDE_ROOTS`/`HELM_CODEX_ROOTS` above | — |
+
 ## chat
 
 | variable | default | read by | legacy fallback |

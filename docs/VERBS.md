@@ -690,6 +690,54 @@ $ helm cmd 3f2a --account you@example.com
 cd ~/dev/myproject && CLAUDE_CONFIG_DIR=~/.claude-homes/you-example-com claude --resume 3f2a9c81-...
 ```
 
+## corpus — the training-data archive
+
+### `helm corpus backup [--dry] [--dest DIR] | helm corpus status`
+The transcripts-are-training-corpus premise made executable: **copy** every
+local session, subagent, and workflow transcript into a dated archive —
+`~/corpus-archive/<date>/` by default, `HELM_CORPUS_DEST` (or `--dest`)
+points it at a bigger local mount. Sources covered: `~/.claude/projects`
+(top-level sessions **plus** the `<sid>/subagents/**` agent and workflow
+transcripts the session catalog doesn't list), every `~/.claude-homes/*/projects`
+(inode-deduped — symlinked homes cost nothing), `~/.codex/sessions` +
+`~/.codex-homes` rollouts, and transcript-shaped subtrees under `/tmp/claude-*`
+(the reboot-ephemeral ones). Extra roots ride the catalog's own
+`HELM_CLAUDE_ROOTS`/`HELM_CODEX_ROOTS`.
+
+Copy-only by law — no code path moves, rewrites, or deletes a source, and the
+archive is append-only too (a grown transcript re-copies into today's dir;
+older snapshots stay). Incremental like the catalog cache: a manifest under
+`<dest>/.helm-corpus/` skips unchanged files by (size, mtime_ns), so re-runs
+cost stats, not bytes; mtime-only churn is hash-detected and never duplicates
+a body. Fail-open per file (errors report, land nothing in the manifest, retry
+next run); fail-safe on space (the plan must fit the dest filesystem plus
+margin or the run aborts before the first byte). `--dry` reports the full plan
+and copies nothing.
+
+```console
+$ helm corpus backup --dry
+helm corpus backup — 6031 transcripts on the estate (dry-run — reporting only) -> /home/owner/corpus-archive
+  claude   5173 transcripts  43.7GB — 5173 new/changed (43.7GB)
+  codex     857 transcripts  4.4GB — 857 new/changed (4.4GB)
+  tmp         1 transcripts  13.7KB — 1 new/changed (13.7KB)
+helm corpus: 6031 would be copied (48.1GB) into /home/owner/corpus-archive/2026-07-20 — nothing copied (--dry)
+$ helm corpus status
+helm corpus status — dest /home/owner/corpus-archive
+  ...
+  archived: 6031 of 6031 (100.0%) · pending 0 (0B) · 12 retired sources kept in archive
+  last run: 2026-07-20T09:00:04Z — copied 41, refreshed 2, 0 errors
+```
+
+`helm corpus status` is the coverage view: per-source counts, archived vs
+pending, sources retired upstream but kept in the archive, and the last run's
+receipt. A daily `systemd --user` timer ships in `scripts/` — enable it with
+one step (nothing is enabled by installing helm):
+
+```console
+$ cp scripts/helm-corpus.{service,timer} ~/.config/systemd/user/ \
+    && systemctl --user daemon-reload && systemctl --user enable --now helm-corpus.timer
+```
+
 ## accounts — credentials and quota
 
 ### `helm creds`
