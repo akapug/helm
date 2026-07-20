@@ -31,8 +31,8 @@ from helm import home, inject, pk, store  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
             "HELM_CACHE_DIR", "MELD_CACHE_DIR",
-            # the shadow backend's activation env — popped so the WHOLE suite is
-            # hermetic (a stray HELM_CF_ENDPOINT must never let a test reach out)
+            # the comparison backend's activation env — popped so the WHOLE suite
+            # is hermetic (a stray HELM_CF_ENDPOINT must never let a test reach out)
             "HELM_CF_ENDPOINT", "MELD_CF_ENDPOINT", "HELM_CF_TOKEN", "MELD_CF_TOKEN")
 
 
@@ -1065,7 +1065,7 @@ class WhisperTest(InjectBase):
 
 
 class _FakeBackend:
-    """A shadow-backend test double — the honest injection seam (no network, no
+    """A comparison-backend test double — the honest injection seam (no network, no
     monkeypatch). resolve returns the planted ids (or raises for the fail-open
     path); records its calls so the zero-cost / empty-prompt gates are provable."""
     name = "fake"
@@ -1086,11 +1086,11 @@ class _FakeBackend:
         return list(self.ids)
 
 
-class ShadowBackendTest(InjectBase):
-    """The pluggable shadow-resolver seam (cf-shadow-backend card): interface
-    dispatch, the CF stub's env gate (no network), divergence logging with an
-    injected fake, the shadow-off zero-cost path, fail-open on a raising backend,
-    --shadow-report both states, and the byte-identical local lane law."""
+class CompareBackendTest(InjectBase):
+    """The pluggable comparison-resolver seam: interface dispatch, the CF
+    stub's env gate (no network), divergence logging with an injected fake,
+    the comparison-off zero-cost path, fail-open on a raising backend,
+    --compare-report both states, and the byte-identical local lane law."""
 
     def test_interface_local_is_authority(self):
         # the local backend behind the interface reproduces the resolver output
@@ -1100,18 +1100,18 @@ class ShadowBackendTest(InjectBase):
         self.assertEqual(inject.LOCAL_BACKEND.name, "local")
         # law 3 (name your source): a mandatory declaration on every backend
         self.assertTrue(inject.LOCAL_BACKEND.source)
-        self.assertTrue(inject.CFShadowBackend().source)
+        self.assertTrue(inject.CFCompareBackend().source)
 
-    def test_active_shadow_off_by_default_cf_when_configured(self):
-        self.assertIsNone(inject._active_shadow())  # unconfigured => OFF
+    def test_active_compare_off_by_default_cf_when_configured(self):
+        self.assertIsNone(inject._active_compare())  # unconfigured => OFF
         os.environ["HELM_CF_ENDPOINT"] = "https://example.invalid/query"
-        b = inject._active_shadow()
+        b = inject._active_compare()
         self.assertIsNotNone(b)
         self.assertEqual(b.name, "cf")
 
     def test_cf_stub_empty_without_endpoint_no_network(self):
         # the zero-network guard: unconfigured resolve returns [] before urllib
-        cf = inject.CFShadowBackend()
+        cf = inject.CFCompareBackend()
         self.assertFalse(cf.configured())
         self.assertEqual(cf.resolve("anything at all"), [])
         # configured-but-empty-prompt also short-circuits before any network
@@ -1122,88 +1122,88 @@ class ShadowBackendTest(InjectBase):
         self.plant_jit("jit-a", "alpha fact", "alpha")
         self.plant_jit("jit-b", "beta fact", "beta")
         fake = _FakeBackend(ids=["jit-a", "cf-x"])  # local finds [jit-a]
-        inject.gather("tune the alpha now", shadow=fake)
-        rows = inject._shadow_rows()
+        inject.gather("tune the alpha now", compare=fake)
+        rows = inject._compare_rows()
         self.assertEqual(len(rows), 1)
         r = rows[0]
         self.assertEqual(r["backend"], "fake")
         self.assertEqual(r["agreed"], ["jit-a"])
-        self.assertEqual(r["shadow_only"], ["cf-x"])
+        self.assertEqual(r["compare_only"], ["cf-x"])
         self.assertEqual(r["local_only"], [])
         self.assertEqual(r["local_n"], 1)
-        self.assertEqual(r["shadow_n"], 2)
+        self.assertEqual(r["compare_n"], 2)
 
-    def test_shadow_ledger_holds_ids_never_prompt_text(self):
+    def test_compare_ledger_holds_ids_never_prompt_text(self):
         self.plant_jit("jit-a", "alpha fact", "alpha")
-        inject.gather("tune the alpha now", shadow=_FakeBackend(ids=["cf-x"]))
-        with open(inject._shadow_ledger_path(), encoding="utf-8") as f:
+        inject.gather("tune the alpha now", compare=_FakeBackend(ids=["cf-x"]))
+        with open(inject._compare_ledger_path(), encoding="utf-8") as f:
             self.assertNotIn("tune the alpha", f.read())  # ids ride, not the prompt
 
-    def test_shadow_off_writes_no_ledger_zero_cost(self):
+    def test_compare_off_writes_no_ledger_zero_cost(self):
         self.plant_jit("jit-a", "alpha fact", "alpha")
-        inject.gather("tune the alpha now")  # no shadow param, no env => OFF
-        self.assertFalse(os.path.exists(inject._shadow_ledger_path()))
+        inject.gather("tune the alpha now")  # no compare param, no env => OFF
+        self.assertFalse(os.path.exists(inject._compare_ledger_path()))
 
-    def test_shadow_skips_empty_prompt(self):
+    def test_compare_skips_empty_prompt(self):
         fake = _FakeBackend(ids=["cf-x"])
-        inject.gather("   ", shadow=fake)
+        inject.gather("   ", compare=fake)
         self.assertEqual(fake.calls, [])  # never queried on an empty turn
-        self.assertFalse(os.path.exists(inject._shadow_ledger_path()))
+        self.assertFalse(os.path.exists(inject._compare_ledger_path()))
 
     def test_fail_open_on_backend_raise(self):
         self.plant_jit("jit-a", "alpha fact", "alpha")
-        sections = inject.gather("tune the alpha now", shadow=_FakeBackend(raises=True))
-        self.assertTrue(sections["jit"], "the local lane must survive a shadow raise")
-        rows = inject._shadow_rows()
+        sections = inject.gather("tune the alpha now", compare=_FakeBackend(raises=True))
+        self.assertTrue(sections["jit"], "the local lane must survive a comparison raise")
+        rows = inject._compare_rows()
         self.assertEqual(len(rows), 1)
         self.assertTrue(rows[0]["error"])
         self.assertEqual(rows[0]["backend"], "fake")
 
-    def test_local_lane_byte_identical_with_and_without_shadow(self):
+    def test_local_lane_byte_identical_with_and_without_compare(self):
         self.plant_pinned("pin-1", "a pinned truth")
         self.plant_jit("jit-a", "alpha fact", "alpha")
         off = inject.gather("tune the alpha now")
-        on = inject.gather("tune the alpha now", shadow=_FakeBackend(ids=["totally", "other"]))
+        on = inject.gather("tune the alpha now", compare=_FakeBackend(ids=["totally", "other"]))
         self.assertEqual(off, on)
-        boom = inject.gather("tune the alpha now", shadow=_FakeBackend(raises=True))
+        boom = inject.gather("tune the alpha now", compare=_FakeBackend(raises=True))
         self.assertEqual(off, boom)
 
-    def test_shadow_report_off_state(self):
-        rc, out, err = self.run_inject(["--shadow-report"])
+    def test_compare_report_off_state(self):
+        rc, out, err = self.run_inject(["--compare-report"])
         self.assertEqual(rc, 0)
-        self.assertIn("shadow off", out)
+        self.assertIn("comparison backend off", out)
         self.assertIn("HELM_CF_ENDPOINT", out)
         self.assertEqual(err, "")
 
-    def test_shadow_report_renders_divergence(self):
+    def test_compare_report_renders_divergence(self):
         self.plant_jit("jit-a", "alpha fact", "alpha")
         fake = _FakeBackend(ids=["jit-a", "cf-x", "cf-y"])
-        inject.gather("tune the alpha now", shadow=fake)
-        inject.gather("tune the alpha again", shadow=fake)
-        rc, out, err = self.run_inject(["--shadow-report"])
+        inject.gather("tune the alpha now", compare=fake)
+        inject.gather("tune the alpha again", compare=fake)
+        rc, out, err = self.run_inject(["--compare-report"])
         self.assertEqual(rc, 0)
         self.assertIn("agreed", out)
-        self.assertIn("shadow-only", out)
+        self.assertIn("compare-only", out)
         self.assertIn("cf-x", out)  # the concrete hot id, not a vibe
         self.assertIn("2 comparison turns", out)
 
-    def test_shadow_report_no_ledger_row_written(self):
+    def test_compare_report_no_ledger_row_written(self):
         self.plant_jit("jit-a", "alpha fact", "alpha")
-        inject.gather("tune the alpha now", shadow=_FakeBackend(ids=["cf-x"]))
-        before = len(inject._shadow_rows())
-        self.run_inject(["--shadow-report"])
-        self.assertEqual(len(inject._shadow_rows()), before)  # read-only
+        inject.gather("tune the alpha now", compare=_FakeBackend(ids=["cf-x"]))
+        before = len(inject._compare_rows())
+        self.run_inject(["--compare-report"])
+        self.assertEqual(len(inject._compare_rows()), before)  # read-only
 
-    def test_explain_surfaces_active_shadow_read_only(self):
+    def test_explain_surfaces_active_compare_read_only(self):
         self.plant_jit("jit-a", "alpha fact", "alpha")
-        # off => no shadow line (salience)
+        # off => no comparison line (salience)
         _, off_out, _ = self.run_inject(["--explain"], stdin_text="tune the alpha now")
-        self.assertNotIn("shadow: backend", off_out)
+        self.assertNotIn("comparison: backend", off_out)
         os.environ["HELM_CF_ENDPOINT"] = "https://example.invalid/query"
         _, on_out, _ = self.run_inject(["--explain"], stdin_text="tune the alpha now")
-        self.assertIn("shadow: backend cf active", on_out)
+        self.assertIn("comparison: backend cf active", on_out)
         # --explain is a dry look: it never queries and never writes the ledger
-        self.assertFalse(os.path.exists(inject._shadow_ledger_path()))
+        self.assertFalse(os.path.exists(inject._compare_ledger_path()))
 
 
 if __name__ == "__main__":

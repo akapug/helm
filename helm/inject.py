@@ -90,25 +90,26 @@ byte estimate, session spread, cooldown suppression, and the silent-rate
 trend. Delivery only: fires are not heeds — the outcome-marker protocol lives
 in evals/2026-07-19-lane-split-eval.md. No ledger row, no state mutation.
 
-SHADOW BACKEND (the pluggability seam — cf-shadow-backend card): the local
-keyword JIT resolver is the AUTHORITY; a registered SHADOW backend
-(_SHADOW_BACKENDS) runs in PARALLEL and its ranked ids are LOGGED/COMPARED to
-the local lane, NEVER trusted as truth (ARCHITECTURE.md Pluggability + the
-overlay-not-store law; every backend declares its `source`). OFF by default: no
-HELM_CF_ENDPOINT -> _active_shadow() is None and the turn pays only one env read
-(zero cost — the fleet-live default). Configured -> one divergence row per turn
-on _global/.state/shadow-ledger.jsonl (local-only vs shadow-only vs agreed, ids
-never prompt text). HARD: fail-open (a raising/slow/failing shadow logs an error
-row and returns — never the authoritative local lane, never a blocked turn) and
-the local lane is byte-identical whether the shadow is on or off (the shadow
-step runs AFTER the sections are assembled and only READS the computed local
-ids). `helm inject --shadow-report` is the owner's read side — the accumulated
-local-vs-shadow verdict, or "shadow off (set HELM_CF_ENDPOINT)" when
-unconfigured. The Cloudflare agentic-memory connector (CFShadowBackend) is a
-thin stdlib-urllib STUB: the documented wire shape + the exact env to set; no
-real endpoint is ever called in tests. A short-lived hook process can host no
-thread that outlives it, so the shadow query is synchronous + hard-timeboxed
-(CF_TIMEOUT), never a background job that dies with the process before it logs.
+COMPARISON BACKEND (the pluggability seam): the local keyword JIT resolver is
+the AUTHORITY; a registered COMPARISON backend (_COMPARE_BACKENDS) runs in
+PARALLEL and its ranked ids are LOGGED/COMPARED to the local lane, NEVER
+trusted as truth (ARCHITECTURE.md Pluggability + the overlay-not-store law;
+every backend declares its `source`). OFF by default: no HELM_CF_ENDPOINT ->
+_active_compare() is None and the turn pays only one env read (zero cost — the
+fleet-live default). Configured -> one divergence row per turn on
+_global/.state/compare-ledger.jsonl (local-only vs compare-only vs agreed, ids
+never prompt text). HARD: fail-open (a raising/slow/failing comparison backend
+logs an error row and returns — never the authoritative local lane, never a
+blocked turn) and the local lane is byte-identical whether the comparison is
+on or off (the comparison step runs AFTER the sections are assembled and only
+READS the computed local ids). `helm inject --compare-report` is the owner's
+read side — the accumulated local-vs-comparison verdict, or "comparison
+backend off (set HELM_CF_ENDPOINT)" when unconfigured. The Cloudflare
+agentic-memory connector (CFCompareBackend) is a thin stdlib-urllib STUB: the
+documented wire shape + the exact env to set; no real endpoint is ever called
+in tests. A short-lived hook process can host no thread that outlives it, so
+the comparison query is synchronous + hard-timeboxed (CF_TIMEOUT), never a
+background job that dies with the process before it logs.
 
 FAIL OPEN (docs/HOOKS.md law): a hook that cannot run helm must inject nothing,
 never block — a store or reflex failure yields an empty lane and rc 0.
@@ -128,7 +129,7 @@ LINE_CAP = 400        # per-entry cap — the gloss fires, the full entry stays 
 WHO_CAP = 350         # WHO digest's joint byte cap inside PINNED_BUDGET — the digest stays terse
 WHO_ID = "who:operator"  # the digest's ledger id (the profile cohort in --lane-report)
 LEDGER_MAX = 5 * 1024 * 1024  # ledger rotates here (one .1 generation)
-CF_TIMEOUT = 1.5      # the CF shadow query's hard timebox (s) — a bounded turn, never a hung one
+CF_TIMEOUT = 1.5      # the CF comparison query's hard timebox (s) — a bounded turn, never a hung one
 
 COOLDOWN_TURNS = 15   # a fired JIT entry cools for this many turns per session
 COOLDOWN_ESCAPE = 2.0  # a ~2x score jump at fire-time re-fires through the window
@@ -303,7 +304,7 @@ def _ledger_path():
 
 def _append_jsonl(path, row, max_bytes):
     """ONE appended JSON line — the measurement-spine primitive (fire-ledger +
-    shadow-ledger). HARD LAWS: O(1) (one stat + one append, never a read), IDS
+    compare-ledger). HARD LAWS: O(1) (one stat + one append, never a read), IDS
     never prompt text, one-generation rotation at max_bytes (-> .1), and
     FAIL-OPEN — a ledger that cannot be written must never block or slow the hook."""
     try:
@@ -580,7 +581,7 @@ def _whisper(text, session):
         return []
 
 
-def gather(text, project=None, session=None, shadow=None):
+def gather(text, project=None, session=None, compare=None):
     """-> dict {whisper: [line], pinned: [line], jit: [line], reflex: [line]}
     (each may be empty).
     The pinned lane leads with the WHO digest (_who_lines) as its FIRST entry
@@ -590,17 +591,17 @@ def gather(text, project=None, session=None, shadow=None):
     call appends one fire-ledger row (silent turns log {"silent": true});
     session (the hook's session_id) rides the row when supplied and switches
     on the JIT cooldown (pinned/reflex exempt; no session = no cooldown).
-    shadow: the shadow backend to compare the local JIT lane against — the
-    honest test-injection seam (no monkeypatch); None consults the registry
-    (_active_shadow), which is None unless HELM_CF_ENDPOINT is set. The shadow
-    step runs LAST and only READS the computed local ids, so the returned
-    sections are byte-identical whether the shadow is on or off."""
+    compare: the comparison backend to compare the local JIT lane against —
+    the honest test-injection seam (no monkeypatch); None consults the registry
+    (_active_compare), which is None unless HELM_CF_ENDPOINT is set. The
+    comparison step runs LAST and only READS the computed local ids, so the
+    returned sections are byte-identical whether the comparison is on or off."""
     t0 = time.time()
     try:
         pinned_entries, jit_all, entries = _lanes(text, project=project)
     except Exception:
         pinned_entries, jit_all, entries = [], [], []
-    local_jit_ids = [str(e["id"]) for e in jit_all]  # the resolver's full pre-cap opinion — the shadow baseline
+    local_jit_ids = [str(e["id"]) for e in jit_all]  # the resolver's full pre-cap opinion — the comparison baseline
     who = _who_lines()
     pinned_lines, pinned_ids = [], []
     used = sum(len(l) for l in who)
@@ -676,12 +677,12 @@ def gather(text, project=None, session=None, shadow=None):
     else:
         row["silent"] = True
     _ledger_append(row)
-    # the shadow leg — LAST, sections already assembled and NEVER touched below;
-    # off (None) => one env read, zero cost. Fully guarded: fail-open.
-    backend = shadow if shadow is not None else _active_shadow()
+    # the comparison leg — LAST, sections already assembled and NEVER touched
+    # below; off (None) => one env read, zero cost. Fully guarded: fail-open.
+    backend = compare if compare is not None else _active_compare()
     if backend is not None and (text or "").strip():
         try:
-            _shadow_run(backend, text, local_jit_ids, project=project, session=session)
+            _compare_run(backend, text, local_jit_ids, project=project, session=session)
         except Exception:
             pass
     return sections
@@ -762,10 +763,10 @@ def _explain(text, project=None, session=None):
         print("  + %s [%s]: %s" % (e["id"], e.get("signal") or "prompt", e["steer"]))
     if not (wd or who or pinned_entries or jit_all or fired_reflex):
         print("silent turn — nothing fires (salience law)")
-    sh = _active_shadow()  # read-only status; nothing is queried in a dry look
-    if sh is not None:
-        print("shadow: backend %s active — `helm inject --shadow-report` for the "
-              "local-vs-shadow divergence" % sh.name)
+    cb = _active_compare()  # read-only status; nothing is queried in a dry look
+    if cb is not None:
+        print("comparison: backend %s active — `helm inject --compare-report` for the "
+              "local-vs-comparison divergence" % cb.name)
     return 0
 
 
@@ -906,9 +907,9 @@ def _lane_report(project=None):
 
 
 # ---------------------------------------------------------------------------
-# pluggable shadow-resolver seam (cf-shadow-backend card) — the local JIT
-# resolver is the AUTHORITY; a shadow backend runs in PARALLEL and its results
-# are LOGGED/COMPARED, NEVER trusted as truth. A backend is anything with
+# pluggable comparison-resolver seam — the local JIT
+# resolver is the AUTHORITY; a comparison backend runs in PARALLEL and its
+# results are LOGGED/COMPARED, NEVER trusted as truth. A backend is anything with
 # `name`, a mandatory `source` declaration (law 3: name your source), a
 # configured() gate, and resolve(text, project) -> ranked entry-id list.
 # ---------------------------------------------------------------------------
@@ -916,7 +917,7 @@ def _lane_report(project=None):
 class LocalBackend:
     """The AUTHORITY: today's keyword JIT behind the one interface. resolve
     returns store.resolve_prompt's UNCAPPED ranked ids — the resolver's full
-    opinion, which is what a shadow is compared against (the cap-4 is an
+    opinion, which is what a comparison backend is measured against (the cap-4 is an
     injection-budget policy, not a finding). gather does NOT call this on the
     hot path (it reuses the ids it already computed, keeping the local lane
     byte-identical); it exists so the interface is real and the report can name
@@ -935,12 +936,12 @@ class LocalBackend:
             text, project=project, cap=len(entries), entries=entries)]
 
 
-class CFShadowBackend:
+class CFCompareBackend:
     """A THIN, documented STUB adapter for Cloudflare's agentic-memory (owner
     decision #21: 'just got accepted to cloudflare's agentic memory private
-    beta'). Zero-dep: stdlib urllib only. A SHADOW — a projection of the typed
-    store queried in parallel and COMPARED, NEVER canonical (the `helm backend
-    push` replica-write leg is the OTHER lane's, not this one's).
+    beta'). Zero-dep: stdlib urllib only. A COMPARISON BACKEND — a projection
+    of the typed store queried in parallel and COMPARED, NEVER canonical (the
+    `helm backend push` replica-write leg is the OTHER lane's, not this one's).
 
     OFF unless HELM_CF_ENDPOINT is set (=> the default, zero cost — one env
     read). The wire shape (documented; a real endpoint is NEVER called in tests):
@@ -951,7 +952,7 @@ class CFShadowBackend:
       -> {"results": [{"id": "..."}, ...]}    # ranked; helm reads the ids only
     The call is synchronous + hard-timeboxed (CF_TIMEOUT) because a short-lived
     hook process cannot host a thread that outlives it. resolve() raises on any
-    trouble by design; _shadow_run centralises the fail-open (one attribution
+    trouble by design; _compare_run centralises the fail-open (one attribution
     point) so beta churn degrades to local silently."""
     name = "cf"
     source = "projection of the typed store; truth lives in files (Cloudflare agentic-memory replica, NEVER canonical)"
@@ -979,15 +980,15 @@ class CFShadowBackend:
 
 
 LOCAL_BACKEND = LocalBackend()        # the authority, behind the interface
-_SHADOW_BACKENDS = (CFShadowBackend(),)  # registered shadows, order = priority
+_COMPARE_BACKENDS = (CFCompareBackend(),)  # registered comparison backends, order = priority
 
 
-def _active_shadow():
-    """The first CONFIGURED shadow backend, or None (=> shadow OFF). THE
-    hot-path gate: an unconfigured fleet pays only configured()'s env read(s) —
-    no import, no object build, no I/O, no store parse. Fail-open: a backend
-    whose configured() raises is skipped, never a blocked turn."""
-    for b in _SHADOW_BACKENDS:
+def _active_compare():
+    """The first CONFIGURED comparison backend, or None (=> comparison OFF).
+    THE hot-path gate: an unconfigured fleet pays only configured()'s env
+    read(s) — no import, no object build, no I/O, no store parse. Fail-open: a
+    backend whose configured() raises is skipped, never a blocked turn."""
+    for b in _COMPARE_BACKENDS:
         try:
             if b.configured():
                 return b
@@ -996,59 +997,61 @@ def _active_shadow():
     return None
 
 
-def _shadow_ledger_path():
-    return os.path.join(home.global_dir(), ".state", "shadow-ledger.jsonl")
+def _compare_ledger_path():
+    return os.path.join(home.global_dir(), ".state", "compare-ledger.jsonl")
 
 
-def _shadow_diverge(local_ids, shadow_ids):
-    """(local_only, shadow_only, agreed) sorted id lists — one turn's
-    divergence. local_only = keyword JIT found, shadow missed; shadow_only =
-    shadow found, keyword JIT missed (the beta's candidate signal — owner judges
-    signal vs noise); agreed = both."""
-    ls, ss = set(local_ids), set(shadow_ids)
-    return sorted(ls - ss), sorted(ss - ls), sorted(ls & ss)
+def _compare_diverge(local_ids, compare_ids):
+    """(local_only, compare_only, agreed) sorted id lists — one turn's
+    divergence. local_only = keyword JIT found, comparison backend missed;
+    compare_only = comparison backend found, keyword JIT missed (the beta's
+    candidate signal — owner judges signal vs noise); agreed = both."""
+    ls, cs = set(local_ids), set(compare_ids)
+    return sorted(ls - cs), sorted(cs - ls), sorted(ls & cs)
 
 
-def _shadow_run(backend, text, local_ids, project=None, session=None):
-    """Run the shadow backend in PARALLEL to the AUTHORITATIVE local resolve,
-    COMPARE, and append ONE divergence row to the shadow-ledger. HARD: local_ids
-    is already computed and is NOT touched here; a raising/slow/failing backend
-    logs an {error: true} row and returns — never the local lane, never a blocked
-    turn. Ids only, never prompt text (the ledger law)."""
+def _compare_run(backend, text, local_ids, project=None, session=None):
+    """Run the comparison backend in PARALLEL to the AUTHORITATIVE local
+    resolve, COMPARE, and append ONE divergence row to the compare-ledger.
+    HARD: local_ids is already computed and is NOT touched here; a
+    raising/slow/failing backend logs an {error: true} row and returns — never
+    the local lane, never a blocked turn. Ids only, never prompt text (the
+    ledger law)."""
     t0 = time.time()
     row = {"v": 1, "ts": pk.now_ts(), "project": project,
            "backend": getattr(backend, "name", "?")}
     if session:
         row["session"] = session
     try:
-        shadow_ids = [str(i) for i in backend.resolve(text, project=project)]
+        compare_ids = [str(i) for i in backend.resolve(text, project=project)]
     except Exception:
         row["error"] = True
         row["elapsed_ms"] = round((time.time() - t0) * 1000, 1)
-        _append_jsonl(_shadow_ledger_path(), row, LEDGER_MAX)
+        _append_jsonl(_compare_ledger_path(), row, LEDGER_MAX)
         return
-    local_only, shadow_only, agreed = _shadow_diverge(local_ids, shadow_ids)
-    row.update({"local_n": len(local_ids), "shadow_n": len(shadow_ids),
+    local_only, compare_only, agreed = _compare_diverge(local_ids, compare_ids)
+    row.update({"local_n": len(local_ids), "compare_n": len(compare_ids),
                 "agreed": agreed, "local_only": local_only,
-                "shadow_only": shadow_only,
+                "compare_only": compare_only,
                 "elapsed_ms": round((time.time() - t0) * 1000, 1)})
-    _append_jsonl(_shadow_ledger_path(), row, LEDGER_MAX)
+    _append_jsonl(_compare_ledger_path(), row, LEDGER_MAX)
 
 
-def _shadow_rows():
-    return _read_jsonl(_shadow_ledger_path())
+def _compare_rows():
+    return _read_jsonl(_compare_ledger_path())
 
 
-def shadow_report(project=None):
-    """Aggregate the shadow-ledger into the owner's local-vs-shadow verdict,
-    READ-ONLY. `off` is True when NO shadow is configured AND no rows exist yet
-    (the honest zero-state). Divergence ids ride a count map so the verdict is
-    concrete ('CF found N entries keywords missed') rather than a vibe."""
-    rows = _shadow_rows()
-    active = _active_shadow()
+def compare_report(project=None):
+    """Aggregate the compare-ledger into the owner's local-vs-comparison
+    verdict, READ-ONLY. `off` is True when NO comparison backend is configured
+    AND no rows exist yet (the honest zero-state). Divergence ids ride a count
+    map so the verdict is concrete ('CF found N entries keywords missed')
+    rather than a vibe."""
+    rows = _compare_rows()
+    active = _active_compare()
     agg = {"turns": 0, "errors": 0, "agreed": 0,
-           "local_only": 0, "shadow_only": 0}
-    lo_ids, so_ids = {}, {}
+           "local_only": 0, "compare_only": 0}
+    lo_ids, co_ids = {}, {}
     for r in rows:
         if r.get("error"):
             agg["errors"] += 1
@@ -1058,26 +1061,27 @@ def shadow_report(project=None):
         for i in (r.get("local_only") or ()):
             agg["local_only"] += 1
             lo_ids[i] = lo_ids.get(i, 0) + 1
-        for i in (r.get("shadow_only") or ()):
-            agg["shadow_only"] += 1
-            so_ids[i] = so_ids.get(i, 0) + 1
+        for i in (r.get("compare_only") or ()):
+            agg["compare_only"] += 1
+            co_ids[i] = co_ids.get(i, 0) + 1
     return {"configured": active is not None,
             "backend": getattr(active, "name", None),
             "rows": len(rows), "local_only_ids": lo_ids,
-            "shadow_only_ids": so_ids, **agg}
+            "compare_only_ids": co_ids, **agg}
 
 
 def _hot_ids(counts, n=5):
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
 
 
-def _shadow_report(project=None):
-    """--shadow-report: shadow_report() rendered for the owner. No ledger row,
-    no state mutation, no live query — pure read over the accumulated ledger."""
-    r = shadow_report(project)
+def _compare_report(project=None):
+    """--compare-report: compare_report() rendered for the owner. No ledger
+    row, no state mutation, no live query — pure read over the accumulated
+    ledger."""
+    r = compare_report(project)
     if not r["configured"] and r["rows"] == 0:
-        print("shadow off (set HELM_CF_ENDPOINT). No shadow backend is configured "
-              "and the shadow-ledger is empty —")
+        print("comparison backend off (set HELM_CF_ENDPOINT). No comparison "
+              "backend is configured and the compare-ledger is empty —")
         print("the local keyword JIT resolver is the sole authority.")
         print("activate: export HELM_CF_ENDPOINT=<cloudflare agentic-memory query URL>"
               " [HELM_CF_TOKEN=<bearer>]")
@@ -1085,17 +1089,17 @@ def _shadow_report(project=None):
               "docs/ENVIRONMENT.md).")
         return 0
     state = ("backend %s active" % r["backend"]) if r["configured"] \
-        else "shadow currently OFF (past rows shown)"
-    print("shadow-report — %s, %d comparison turn%s (%d error%s degraded to local)" % (
+        else "comparison backend currently OFF (past rows shown)"
+    print("compare-report — %s, %d comparison turn%s (%d error%s degraded to local)" % (
         state, r["turns"], "s"[:r["turns"] != 1],
         r["errors"], "s"[:r["errors"] != 1]))
-    print("  agreed      %6d  (both surfaced)" % r["agreed"])
-    print("  local-only  %6d  (keyword JIT found, shadow missed)" % r["local_only"])
-    print("  shadow-only %6d  (shadow found, keyword JIT missed — "
-          "owner judges signal vs noise)" % r["shadow_only"])
-    hot = _hot_ids(r["shadow_only_ids"])
+    print("  agreed       %6d  (both surfaced)" % r["agreed"])
+    print("  local-only   %6d  (keyword JIT found, comparison backend missed)" % r["local_only"])
+    print("  compare-only %6d  (comparison backend found, keyword JIT missed — "
+          "owner judges signal vs noise)" % r["compare_only"])
+    hot = _hot_ids(r["compare_only_ids"])
     if hot:
-        print("  shadow-only hot ids: " + ", ".join("%s x%d" % (i, n) for i, n in hot))
+        print("  compare-only hot ids: " + ", ".join("%s x%d" % (i, n) for i, n in hot))
     if not r["configured"]:
         print("set HELM_CF_ENDPOINT to resume the comparison (docs/ENVIRONMENT.md).")
     return 0
@@ -1103,19 +1107,19 @@ def _shadow_report(project=None):
 
 def cmd_inject(args):
     """inject [--project P] [--json] [--explain] [--hook-json] [--lane-report]
-    [--shadow-report] — prompt text on stdin -> context lines. --hook-json reads
+    [--compare-report] — prompt text on stdin -> context lines. --hook-json reads
     the harness hook's FULL JSON on stdin instead (prompt/cwd/session_id) and
     derives --project from the cwd via the registry; malformed hook JSON injects
     nothing, rc 0 (fail-open). --explain prints what WOULD fire and why, sans
     ledger row. --lane-report renders the lane-split cohort table (read-only).
-    --shadow-report renders the local-vs-shadow divergence verdict (read-only)."""
+    --compare-report renders the local-vs-comparison divergence verdict (read-only)."""
     project = None
     if "--project" in args:
         project = args[args.index("--project") + 1]
     if "--lane-report" in args:
         return _lane_report(project=project)
-    if "--shadow-report" in args:
-        return _shadow_report(project=project)
+    if "--compare-report" in args:
+        return _compare_report(project=project)
     session = scope_via = None
     if "--hook-json" in args:
         text, cwd, session = parse_hook_json(

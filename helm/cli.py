@@ -145,7 +145,7 @@ _VERB_HELP = {
     "projections": "projections [--json] — the projection registry: every derived store, its class, source + rebuild (laws 2+3's read surface; doctor enforces)",
     "store": "store list|get|add|resolve|confirm|demote|events|... — the one typed knowledge store",
     "index": "index cap [--budget-lines N] [--apply] — MEMORY.md budget actuator: demote link lines whose backing entry stays jit-resolvable (provably lossless); documented Stop-hook line `helm index cap --apply`",
-    "inject": "inject [--project P] [--json|--explain|--hook-json|--lane-report|--shadow-report] — per-turn context for harness hooks (stdin: prompt or hook JSON); the day's first turn leads with a one-line brief whisper; --shadow-report is the local-vs-shadow (Cloudflare agentic-memory) divergence verdict",
+    "inject": "inject [--project P] [--json|--explain|--hook-json|--lane-report|--compare-report] — per-turn context for harness hooks (stdin: prompt or hook JSON); the day's first turn leads with a one-line brief whisper; --compare-report is the local-vs-comparison (Cloudflare agentic-memory) divergence verdict",
     "drain": "drain [--apply] — route raw memory intake to typed homes (dry-run default)",
     "promote": "promote [--since Nd] [--cap N] [--apply] — episodic->durable funnel: recent USER messages -> drain-intake candidates (dry-run default)",
     "sweep": "sweep [--apply] [--project P] — lineage-driven supersession sweep of the adopted store (dry-run default)",
