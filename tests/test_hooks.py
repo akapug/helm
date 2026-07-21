@@ -218,6 +218,40 @@ class StatusTest(HooksBase):
         self.assertIn("codex: recipe pending", out)
 
 
+class DeliveryLaneTest(HooksBase):
+    def test_install_wires_all_three_events(self):
+        d = self.mk_home("a-user-dev")
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "add")
+        got = self.read_settings(d)
+        for spec in hooks.SPECS:
+            self.assertIn(hooks.spec_command(spec),
+                          hooks._hook_cmds(got, spec["event"]))
+        # the events that take a matcher get the wildcard
+        self.assertEqual(got["hooks"]["PostToolUse"][0]["matcher"], "*")
+        self.assertEqual(got["hooks"]["SessionStart"][0]["matcher"], "*")
+        self.assertEqual(hooks.install_home(d), ("ok", "hook up to date"))
+
+    def test_record_posttooluse_hook_coexists_untouched(self):
+        rec = "timeout 10 /x/bin/helm record --hook-json || true"
+        d = self.mk_home("a-user-dev", settings={
+            "hooks": {"PostToolUse": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": rec}]}]}})
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "add")
+        cmds = hooks._hook_cmds(self.read_settings(d), "PostToolUse")
+        self.assertIn(rec, cmds)   # record's leg survives byte-identical
+        self.assertEqual(len(cmds), 2)
+
+    def test_status_reports_delivery_lanes(self):
+        d = self.mk_home("a-user-dev")
+        hooks.install_home(d)
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertTrue(rows["a-user-dev"]["deliver"])
+        self.assertTrue(rows["a-user-dev"]["join"])
+        self.assertFalse(rows["(default-claude)"]["deliver"])
+
+
 class DoctorCoverageTest(HooksBase):
     def test_doctor_coverage_warn_then_ok(self):
         self.mk_home("a-user-dev")

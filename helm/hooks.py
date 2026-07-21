@@ -30,6 +30,22 @@ from . import configs, homes
 HOOK_EVENT = "UserPromptSubmit"
 TIMEOUT_S = 10  # inject is ~ms; 10s is the never-hold-a-turn ceiling
 
+# The hook estate — one spec per event helm wires. inject is the crown jewel
+# (per-turn context); deliver + join are the meld-half's delivery lane
+# (tool-boundary chat nudge + session autojoin — seats.py). Same laws for
+# every spec: merge-preserving, fail-open text, idempotent. `own` markers
+# identify OUR entry in a settings file (so record.py's PostToolUse hook and
+# any foreign entry are never touched); matcher rides events that take one.
+SPECS = (
+    {"name": "inject", "event": HOOK_EVENT, "args": "inject --hook-json",
+     "timeout": TIMEOUT_S, "own": ("inject --hook-json", "helm inject"),
+     "matcher": None},
+    {"name": "deliver", "event": "PostToolUse", "args": "chat deliver --hook-json",
+     "timeout": 2, "own": ("chat deliver --hook-json",), "matcher": "*"},
+    {"name": "join", "event": "SessionStart", "args": "chat join --hook-json",
+     "timeout": 5, "own": ("chat join --hook-json",), "matcher": "*"},
+)
+
 
 def helm_bin():
     """This checkout's bin/helm, absolute — the generated hook must resolve
@@ -38,11 +54,18 @@ def helm_bin():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "helm"))
 
 
+def spec_command(spec):
+    """The generated hook text for one spec. Fail-open by construction:
+    timeout so a wedged helm can never hold a turn, `|| true` so a
+    missing/failing helm injects nothing instead of blocking (docs/HOOKS.md
+    law)."""
+    return "timeout %d %s %s || true" % (
+        spec["timeout"], shlex.quote(helm_bin()), spec["args"])
+
+
 def hook_command():
-    """The exact generated hook text. Fail-open by construction: timeout so a
-    wedged helm can never hold a turn, `|| true` so a missing/failing helm
-    injects nothing instead of blocking (docs/HOOKS.md law)."""
-    return "timeout %d %s inject --hook-json || true" % (TIMEOUT_S, shlex.quote(helm_bin()))
+    """The inject spec's command — the name every older caller knows."""
+    return spec_command(SPECS[0])
 
 
 def _ours(cmd):
@@ -94,10 +117,10 @@ def claude_homes():
     return out
 
 
-def _hook_cmds(settings):
-    """Every UserPromptSubmit command string in a settings dict (shape-tolerant)."""
+def _hook_cmds(settings, event=HOOK_EVENT):
+    """Every <event> command string in a settings dict (shape-tolerant)."""
     hooks = settings.get("hooks") if isinstance(settings, dict) else None
-    groups = hooks.get(HOOK_EVENT) if isinstance(hooks, dict) else None
+    groups = hooks.get(event) if isinstance(hooks, dict) else None
     out = []
     for g in groups if isinstance(groups, list) else []:
         if isinstance(g, dict):
@@ -107,29 +130,51 @@ def _hook_cmds(settings):
     return out
 
 
-def _merge_hook(settings, cmd):
-    """-> (merged_copy, action ok|add|update). MERGE-preserving: only OUR entry
-    is ever written; foreign hooks and every other settings key survive
-    byte-identical. Raises ValueError on a shape we must not touch."""
-    out = json.loads(json.dumps(settings))  # deep copy — never mutate the input
+def _merge_event(out, spec):
+    """Merge ONE spec's entry into `out` IN PLACE -> action ok|add|update.
+    MERGE-preserving: only the entry carrying this spec's own-marker is ever
+    written; foreign hooks (record.py's PostToolUse leg included) and every
+    other settings key survive byte-identical. Raises ValueError on a shape
+    we must not touch."""
+    cmd = spec_command(spec)
+    own = spec["own"]
     hooks = out.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise ValueError("existing 'hooks' key is not an object — fix it by hand")
-    groups = hooks.setdefault(HOOK_EVENT, [])
+    groups = hooks.setdefault(spec["event"], [])
     if not isinstance(groups, list):
-        raise ValueError("existing hooks.%s is not a list — fix it by hand" % HOOK_EVENT)
+        raise ValueError("existing hooks.%s is not a list — fix it by hand"
+                         % spec["event"])
     for g in groups:
         if not isinstance(g, dict):
             continue
         for h in g.get("hooks") or []:
-            if isinstance(h, dict) and _ours(str(h.get("command") or "")):
+            if isinstance(h, dict) and any(m in str(h.get("command") or "")
+                                           for m in own):
                 if h.get("command") == cmd:
-                    return out, "ok"
+                    return "ok"
                 h["command"] = cmd
                 h["type"] = "command"
-                return out, "update"
-    groups.append({"hooks": [{"type": "command", "command": cmd}]})
-    return out, "add"
+                return "update"
+    entry = {"hooks": [{"type": "command", "command": cmd}]}
+    if spec["matcher"]:
+        entry["matcher"] = spec["matcher"]
+    groups.append(entry)
+    return "add"
+
+
+def _merge_all(settings):
+    """-> (merged_copy, {spec_name: action}) across the whole estate."""
+    out = json.loads(json.dumps(settings))  # deep copy — never mutate the input
+    return out, {s["name"]: _merge_event(out, s) for s in SPECS}
+
+
+def _agg(actions):
+    """One home's aggregate action, worst-first (fail > update > add > ok)."""
+    for a in ("fail", "update", "add"):
+        if a in actions.values():
+            return a
+    return "ok"
 
 
 def install_home(path, dry=False):
@@ -146,11 +191,11 @@ def install_home(path, dry=False):
             return "fail", "settings.json unreadable (%s) — refusing to touch it" % e
         if not isinstance(cur, dict):
             return "fail", "settings.json root is not an object — refusing to touch it"
-    cmd = hook_command()
     try:
-        merged, action = _merge_hook(cur, cmd)
+        merged, actions = _merge_all(cur)
     except ValueError as e:
         return "fail", str(e)
+    action = _agg(actions)
     if action == "ok":
         return "ok", "hook up to date"
     new_raw = json.dumps(merged, indent=2) + "\n"
@@ -164,7 +209,8 @@ def install_home(path, dry=False):
         return "fail", res["error"]
     try:  # JSON-validate AFTER the write; anything torn restores the backup
         with open(sp, encoding="utf-8") as f:
-            ok = cmd in _hook_cmds(json.load(f))
+            got = json.load(f)
+        ok = all(spec_command(s) in _hook_cmds(got, s["event"]) for s in SPECS)
     except (OSError, ValueError):
         ok = False
     if not ok:
@@ -178,20 +224,24 @@ def install_home(path, dry=False):
 
 
 def status_rows():
-    """Per-claude-home coverage: hook present? helm resolvable? fail-open
-    contract present? Read-only."""
+    """Per-claude-home coverage: inject hook present? helm resolvable?
+    fail-open contract present? Plus the delivery lane's two booleans
+    (deliver/join present). Read-only."""
     rows = []
     for name, path in claude_homes():
-        cmd = None
+        cmd, settings = None, {}
         try:
             with open(os.path.join(path, "settings.json"), encoding="utf-8") as f:
-                cmds = _hook_cmds(json.load(f))
-            cmd = next((c for c in cmds if _ours(c)), None)
+                settings = json.load(f)
+            cmd = next((c for c in _hook_cmds(settings) if _ours(c)), None)
         except (OSError, ValueError):
             pass
+        lanes = {s["name"]: any(any(m in c for m in s["own"])
+                                for c in _hook_cmds(settings, s["event"]))
+                 for s in SPECS[1:]}
         rows.append({"home": name, "path": path, "hook": bool(cmd), "command": cmd,
                      "resolvable": bool(cmd) and _resolvable(cmd),
-                     "fail_open": bool(cmd) and _fail_open(cmd)})
+                     "fail_open": bool(cmd) and _fail_open(cmd), **lanes})
     return rows
 
 
@@ -237,18 +287,25 @@ def cmd_hooks(args):
             print("helm hooks: no claude homes found")
             return 0
         print("helm hooks status (claude):")
-        print("  %-28s %-5s %-5s %s" % ("home", "hook", "helm", "fail-open"))
+        print("  %-28s %-5s %-5s %-9s %-7s %s" % (
+            "home", "hook", "helm", "fail-open", "deliver", "join"))
         def mark(r, k):
             if not r["hook"]:
                 return "-"
             return "ok" if r[k] else "NO"
         for r in rows:
-            print("  %-28s %-5s %-5s %s" % (
+            print("  %-28s %-5s %-5s %-9s %-7s %s" % (
                 r["home"], "yes" if r["hook"] else "-",
-                mark(r, "resolvable"), mark(r, "fail_open")))
+                mark(r, "resolvable"), mark(r, "fail_open"),
+                "yes" if r.get("deliver") else "-",
+                "yes" if r.get("join") else "-"))
         n, m = coverage()
         line = "inject coverage: %d of %d claude homes" % (n, m)
         print(line if n == m else line + " — `helm hooks install` closes the gap")
+        d = sum(1 for r in rows if r.get("deliver") and r.get("join"))
+        if d < m:
+            print("delivery lane (chat deliver/join): %d of %d homes — "
+                  "`helm hooks install` wires it" % (d, m))
         print(_CODEX_PENDING)
         return 0
 
@@ -276,7 +333,8 @@ def cmd_hooks(args):
         if not targets:
             print("helm hooks: no claude homes found — `helm homes prepare` starts one")
             return 0
-        print("helm hooks: command: " + hook_command())
+        for s in SPECS:
+            print("helm hooks: %s (%s): %s" % (s["name"], s["event"], spec_command(s)))
         failed = 0
         for name, path in targets:
             action, detail = install_home(path, dry=dry)
