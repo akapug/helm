@@ -17,8 +17,11 @@ seat in the roster under its family name ('codex'/'kimi'/…) — @codex / @kimi
 and owner posts then deliver to it between tool calls. The delivery hooks
 (deliver + join) live in the seat's claude/ config dir; `helm hooks install`
 wires them there (hooks.py's DELIVERY_SPECS) and `helm hooks status` reports
-seat coverage. A seat already running an old session must be relaunched (a
-fresh `helm seat launch`) to pick up the identity + hooks.
+seat coverage. The same launch line wires dregg-native client signing:
+HELM_CELL_BIN=dregg-client-sign + per-seat HELM_CELL_PROFILE/DREGG_PROFILE,
+so each family writes cave turns as its own stable cell instead of inheriting the
+owner's profile. A seat already running an old session must be relaunched (a
+fresh `helm seat launch`) to pick up the identity, signer, and hooks.
 
 Seat dir (~/.helm/_global/seats/<family>/, 0700):
   config.yaml   proxy config (0600 — carries the per-seat proxy token)
@@ -70,6 +73,8 @@ SCRUB_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
 
 CODEX_HOMES = os.path.join(os.path.expanduser("~"), ".codex-homes")
 PROXY_BIN_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin", "cli-proxy-api")
+DREGG_SIGNER_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin",
+                                    "dregg-client-sign")
 
 # Presets as data (the addendum's table). Three modes: "proxy" (OAuth cred
 # translated into CLIProxyAPI, e.g. codex), "proxy-key" (an API-key provider
@@ -321,7 +326,10 @@ def launch_line(family, model=None):
     HELM_CHAT_NAME=<family> is the STABLE seat identity: the SessionStart join
     hook (seats.py derive_seat) keys the roster on it, so the seat joins as
     'codex'/'kimi'/… instead of an ephemeral agent-<sid8> — and @codex / @kimi
-    fleet posts then deliver to it. --dangerously-skip-permissions is CANONICAL
+    fleet posts then deliver to it. HELM_CELL_PROFILE + DREGG_PROFILE bind both
+    helm's signing call and the dregg SDK fallback to that SAME family identity;
+    HELM_CELL_BIN selects the dregg-native client signer. A seat therefore never
+    inherits the owner's ambient profile. --dangerously-skip-permissions is CANONICAL
     for a fleet seat (owner-asked 2026-07-21): an agent pane exists to do work
     unattended, and a per-tool permission prompt strands it silently (the owner
     had to flip kimi/codex into auto-mode by hand). The beacon permit narrows
@@ -336,9 +344,14 @@ def launch_line(family, model=None):
             " CLAUDE_CODE_SUBAGENT_MODEL=%s"
             " CLAUDE_CONFIG_DIR=%s"
             " HELM_CHAT_NAME=%s"
+            " HELM_CELL_BIN=%s"
+            " HELM_CELL_PROFILE=%s"
+            " DREGG_PROFILE=%s"
             " claude --dangerously-skip-permissions --model %s"
             % (fam["port"], _read_token(family) or "<seat-token-missing>",
-               model, cfgdir, shlex.quote(family), model))
+               model, cfgdir, shlex.quote(family),
+               shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(family),
+               shlex.quote(family), model))
 
 
 def _seat_token(family, d):
@@ -604,7 +617,9 @@ def _down(family):
 
 def _seat_env(family, config_dir):
     """The proxied-seat subprocess env: scrubbed base (so a stray inherited
-    ANTHROPIC_API_KEY can never ride along), then the seat's own triple."""
+    ANTHROPIC_API_KEY can never ride along), then the seat's own proxy, chat,
+    and dregg-signing identity. Mirrors launch_line so smoke cannot certify a
+    materially different process shape."""
     fam = FAMILIES[family]
     env = scrub_env(os.environ)
     env.update({
@@ -612,6 +627,10 @@ def _seat_env(family, config_dir):
         "ANTHROPIC_AUTH_TOKEN": _read_token(family) or "",
         "CLAUDE_CONFIG_DIR": config_dir,
         "CLAUDE_CODE_SUBAGENT_MODEL": fam["model"],
+        "HELM_CHAT_NAME": family,
+        "HELM_CELL_BIN": DREGG_SIGNER_DEFAULT,
+        "HELM_CELL_PROFILE": family,
+        "DREGG_PROFILE": family,
     })
     return env
 

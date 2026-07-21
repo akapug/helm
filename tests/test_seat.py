@@ -11,6 +11,7 @@ import stat
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from helm import seat
 
@@ -364,6 +365,9 @@ class SeatTest(unittest.TestCase):
         self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8318", line)
         self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=kimi-k3", line)
         self.assertIn("HELM_CHAT_NAME=kimi", line)   # joins the roster as 'kimi'
+        self.assertIn("HELM_CELL_BIN=" + seat.DREGG_SIGNER_DEFAULT, line)
+        self.assertIn("HELM_CELL_PROFILE=kimi", line)  # helm call-site identity
+        self.assertIn("DREGG_PROFILE=kimi", line)      # signer fallback identity
         self.assertIn("--dangerously-skip-permissions", line)  # canonical seat
         self.assertTrue(line.endswith(
             "claude --dangerously-skip-permissions --model kimi-k3"))
@@ -386,6 +390,9 @@ class SeatTest(unittest.TestCase):
         self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol", line)
         self.assertIn("CLAUDE_CONFIG_DIR=" + os.path.join(seat.seat_dir("codex"), "claude"), line)
         self.assertIn("HELM_CHAT_NAME=codex", line)   # stable seat identity
+        self.assertIn("HELM_CELL_BIN=" + seat.DREGG_SIGNER_DEFAULT, line)
+        self.assertIn("HELM_CELL_PROFILE=codex", line)  # never inherit owner
+        self.assertIn("DREGG_PROFILE=codex", line)
         self.assertIn("--dangerously-skip-permissions", line)  # canonical seat
         self.assertTrue(line.endswith(
             "claude --dangerously-skip-permissions --model gpt-5.6-sol"))
@@ -398,6 +405,18 @@ class SeatTest(unittest.TestCase):
         self.assertIn(
             "claude --dangerously-skip-permissions --model gpt-5.5",
             out.getvalue())
+
+    def test_seat_subprocess_env_overrides_ambient_owner_signer_identity(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.dict(os.environ, {
+                "HELM_CHAT_NAME": "david", "HELM_CELL_PROFILE": "david",
+                "DREGG_PROFILE": "david", "HELM_CELL_BIN": "/tmp/legacy-signer"}):
+            env = seat._seat_env("codex", os.path.join(self.tmp, "smoke"))
+        self.assertEqual(env["HELM_CHAT_NAME"], "codex")
+        self.assertEqual(env["HELM_CELL_PROFILE"], "codex")
+        self.assertEqual(env["DREGG_PROFILE"], "codex")
+        self.assertEqual(env["HELM_CELL_BIN"], seat.DREGG_SIGNER_DEFAULT)
 
     # -- the scrub guard ----------------------------------------------------
     def test_scrub_env_strips_the_triple(self):

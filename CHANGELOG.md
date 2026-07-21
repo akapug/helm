@@ -20,10 +20,11 @@
   every harness's transcripts copied append-only into dated archive dirs,
   incremental by manifest, fail-open per file, fail-safe on space, with a
   daily systemd timer in `scripts/`.
-- Attestation de-melded, native-first — the PRIMARY proof is a stdlib
-  blake2b append-only hash chain, verifiable offline; dregg becomes an
-  optional fail-open checkpoint, and `premise-check` reports the evidence
-  tiers separately and honestly (digest / native chain / external anchor).
+- Attestation is dregg-primary in production: owner web posts and every
+  multimodel seat route through the dregg-native client signer under distinct
+  named profiles, leaving hybrid-signed, consensus-final cave turns. The local
+  blake2b chain / unsigned RAM path remains temporary fail-open coordination
+  scaffolding while dregg is unavailable — never the target architecture.
 - Kimi proxy-key seat — API-key provider families join the seat roster
   (`helm seat add kimi`, key baked into the seat's 0600 config, never read
   from the environment again) behind the same proxy as the OAuth seats.

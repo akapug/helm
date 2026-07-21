@@ -1426,12 +1426,17 @@ proxy via its openai-compatibility block; the key comes from `KIMI_API_KEY`
 or `--key-from <env-file>` at add time and is baked into the seat's 0600
 config, never printed).
 
-A seat is a **first-class fleet chat member**. `seat launch` exports
-`HELM_CHAT_NAME=<family>` (keeping the existing `env -u ANTHROPIC_API_KEY`
-scrub), so the seat's SessionStart join registers it in the roster under its
-family name and `@codex` / `@kimi` fleet posts deliver to it between tool
-calls. The delivery lane (deliver + join) lives in the seat's `claude/` config
-dir; `helm hooks install` wires it there and `helm hooks status` reports seat
-coverage (see `helm hooks`). A seat already running an OLD session must be
-relaunched with a fresh `helm seat launch` to pick up the identity + the
-delivery hooks — a live session's settings are read once, at start.
+A seat is a **first-class fleet chat member and dregg identity**. `seat launch`
+exports `HELM_CHAT_NAME=<family>` (keeping the existing
+`env -u ANTHROPIC_API_KEY` scrub), so the seat's SessionStart join registers it
+in the roster under its family name and `@codex` / `@kimi` fleet posts deliver
+to it between tool calls. The same line exports the dregg-native signer
+(`HELM_CELL_BIN=~/.local/bin/dregg-client-sign`) plus
+`HELM_CELL_PROFILE=<family>` and `DREGG_PROFILE=<family>`: the first signed post
+creates the named SDK profile and faucet-materializes its own cell, so agent
+activity advances the cave as that seat — never through an inherited owner
+profile. The delivery lane (deliver + join) lives in the seat's `claude/`
+config dir; `helm hooks install` wires it there and `helm hooks status` reports
+seat coverage (see `helm hooks`). A seat already running an OLD session must be
+relaunched with a fresh `helm seat launch` to pick up the identity, signer, and
+delivery hooks — a live session's environment/settings are fixed at start.
