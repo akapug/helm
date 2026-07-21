@@ -10,23 +10,49 @@
 @media (prefers-color-scheme:light){:root{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--hl:#efe7d8;--ok:#3e8a6e;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}}
 :root[data-theme=dark]{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--hl:#2a231a;--ok:#7eb8a2;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
 :root[data-theme=light]{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--hl:#efe7d8;--ok:#3e8a6e;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}
+/* ---------- design tokens: ONE type scale + radii, so the whole UI reads as
+   one system. Six steps (was ~30 ad-hoc sizes); three weights; tabular numerals
+   are the default so every column of numbers aligns (Tufte: strict alignment).
+   Colours stay in the palette above and carry signal only. ---------- */
+:root{
+  --f0:.72rem;   /* micro: uppercase labels, chips, flags */
+  --f1:.82rem;   /* small: secondary meta, table sub-lines */
+  --f2:.9rem;    /* base: body text, table cells */
+  --f3:1rem;     /* control: inputs, primary buttons */
+  --f4:1.15rem;  /* section head, card title */
+  --f5:1.4rem;   /* page title */
+  --w-reg:400;--w-med:600;--w-bold:700;
+  --r-sm:6px;--r:9px;--r-lg:13px;--r-pill:999px;
+  --mono:ui-monospace,Menlo,Consolas,monospace;
+  --num:tabular-nums;
+}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-body::before{content:"";position:fixed;inset:0 0 auto;height:340px;background:radial-gradient(60% 100% at 50% 0,var(--accent-soft),transparent 70%);pointer-events:none}
+body{margin:0;background:var(--bg);color:var(--fg);font:var(--f2)/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-variant-numeric:var(--num)}
+/* a whisper of accent at the very top edge — not a 340px dead band */
+body::before{content:"";position:fixed;inset:0 0 auto;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.5;pointer-events:none;z-index:40}
 .wrap{max-width:1180px;margin:0 auto;padding:0 clamp(14px,3vw,36px);position:relative}
-code,.mono{font:.86em ui-monospace,Menlo,Consolas,monospace}
-code{background:var(--code);color:var(--codefg);padding:1px 5px;border-radius:4px}
+code,.mono{font-family:var(--mono);font-size:.9em}
+code{background:var(--code);color:var(--codefg);padding:1px 5px;border-radius:var(--r-sm)}
 button{font:inherit}
 
-/* ---------- nav (the sesh navtab pattern) ---------- */
-#nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;padding:10px clamp(14px,3vw,36px);background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
-#nav .brand{display:flex;align-items:center;gap:9px;font-size:1.15rem;font-weight:800;letter-spacing:-.03em;margin-right:6px}
-#nav .brand .mark{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 50%,var(--claude)));display:grid;place-items:center;font-size:16px;color:var(--bg);box-shadow:0 1px 4px rgba(0,0,0,.18)}
-.navtab{padding:6px 16px;border-radius:20px;border:1px solid transparent;cursor:pointer;font-weight:600;font-size:.92rem;color:var(--mut);background:none}
+/* ---------- nav ----------
+   A stable single row: brand · tabs · (flexible spacer) · stats · theme · tray.
+   The spacer is the only flexible cell, so the stats + controls stay pinned
+   right and never wrap into the tray button (a baseline-screenshot bug). */
+#nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:10px;padding:9px clamp(14px,3vw,36px);background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+#nav .brand{display:flex;align-items:center;gap:8px;font-size:var(--f4);font-weight:var(--w-bold);letter-spacing:-.03em;margin-right:4px}
+#nav .brand .mark{width:24px;height:24px;border-radius:var(--r-sm);background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 50%,var(--claude)));display:grid;place-items:center;font-size:15px;color:var(--bg)}
+.navtab{padding:6px 14px;border-radius:var(--r-pill);border:1px solid transparent;cursor:pointer;font-weight:var(--w-med);font-size:var(--f2);color:var(--mut);background:none}
 .navtab.on{color:var(--accent);border-color:var(--accent);background:var(--card)}
-.navtab:hover{color:var(--fg)}
-#nav .stats{margin-left:auto;display:flex;gap:14px;font-size:.8rem;color:var(--mut);flex-wrap:wrap;font-variant-numeric:tabular-nums}
-#nav .stats b{color:var(--fg)}
+.navtab:hover:not(.on){color:var(--fg)}
+#nav .spacer{flex:1 1 auto}
+/* stats: fixed label+value pairs, right-aligned, single row, never wraps */
+#nav .stats{display:flex;gap:16px;font-size:var(--f1);color:var(--mut);white-space:nowrap;overflow:hidden}
+#nav .stats .stat{display:flex;flex-direction:column;line-height:1.15;text-align:right}
+#nav .stats .stat b{color:var(--fg);font-weight:var(--w-med);font-size:var(--f2)}
+#nav .stats .stat span{font-size:var(--f0);color:var(--sub);text-transform:uppercase;letter-spacing:.04em}
+#nav .icon{width:32px;height:32px;display:grid;place-items:center;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--card);color:var(--mut);cursor:pointer;font-size:var(--f2);flex:none}
+#nav .icon:hover{color:var(--fg);border-color:var(--line2)}
 
 /* ---------- views ---------- */
 .view{display:none}.view.on{display:block}
@@ -35,37 +61,39 @@ button{font:inherit}
 .empty{padding:24px;text-align:center;color:var(--mut)}
 
 /* ---------- header (helm view) ---------- */
-header{padding:22px 0 6px}
+header{padding:18px 0 4px}
 .brandrow{display:flex;align-items:center;gap:11px}
-.brandrow .mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 50%,var(--claude)));display:grid;place-items:center;font-size:21px;color:var(--bg);box-shadow:0 1px 5px rgba(0,0,0,.25)}
-.brandrow h1{margin:0;font-size:1.45rem;font-weight:800;letter-spacing:-.03em}
-.brandrow .stats{margin-left:auto;font-size:.82rem;color:var(--mut);text-align:right;font-variant-numeric:tabular-nums}
-.brandrow .stats b{color:var(--fg)}
-#hello{margin:10px 0 0;font-size:1.02rem;color:var(--mut)}
-#hello b{color:var(--fg);font-weight:650}
+.brandrow .mark{width:30px;height:30px;border-radius:var(--r);background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 50%,var(--claude)));display:grid;place-items:center;font-size:18px;color:var(--bg)}
+.brandrow h1{margin:0;font-size:var(--f5);font-weight:var(--w-bold);letter-spacing:-.03em}
+.brandrow .stats{margin-left:auto;display:flex;gap:16px}
+.brandrow .stats .stat{display:flex;flex-direction:column;text-align:right;line-height:1.15}
+.brandrow .stats .stat b{color:var(--fg);font-weight:var(--w-med);font-size:var(--f3)}
+.brandrow .stats .stat span{font-size:var(--f0);color:var(--sub);text-transform:uppercase;letter-spacing:.04em}
+#hello{margin:9px 0 0;font-size:var(--f3);color:var(--mut)}
+#hello b{color:var(--fg);font-weight:var(--w-med)}
 
 /* ---------- banner ---------- */
-#banner{display:none;margin:14px 0 0;padding:9px 14px;border:1px solid color-mix(in srgb,var(--warn) 55%,transparent);border-radius:10px;background:var(--card);color:var(--warn);font-size:.86rem}
+#banner{display:none;margin:14px 0 0;padding:9px 14px;border:1px solid color-mix(in srgb,var(--warn) 55%,transparent);border-radius:10px;background:var(--card);color:var(--warn);font-size:var(--f2)}
 #banner.show{display:block}
 
 /* ---------- store strip ---------- */
-#store{display:none;margin:16px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);align-items:baseline;gap:4px 16px;flex-wrap:wrap;font-size:.84rem}
+#store{display:none;margin:16px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);align-items:baseline;gap:4px 16px;flex-wrap:wrap;font-size:var(--f1)}
 #store.show{display:flex}
-#store .slabel{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+#store .slabel{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
 .stype{white-space:nowrap;color:var(--mut)}
 .stype b{color:var(--fg);font-variant-numeric:tabular-nums;margin-right:4px}
-#store .stot{margin-left:auto;color:var(--sub);font-size:.78rem}
-#sessions{display:none;margin:10px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:.84rem}
+#store .stot{margin-left:auto;color:var(--sub);font-size:var(--f1)}
+#sessions{display:none;margin:10px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:var(--f1)}
 #sessions.show{display:block}
-#sessions .slabel{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+#sessions .slabel{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
 
 /* ---------- skills strip (collapsible; enable/disable/delete) ---------- */
-#skillsec{display:none;margin:10px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:.84rem}
+#skillsec{display:none;margin:10px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:var(--f1)}
 #skillsec.show{display:block}
-#skillsec .slabel{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+#skillsec .slabel{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
 #skillsec .shead{display:flex;align-items:baseline;gap:10px;cursor:pointer;user-select:none}
-#skillsec .scount{color:var(--sub);font-size:.78rem}
-#skillsec .chev{margin-left:auto;color:var(--sub);font-size:.68rem;transition:transform .15s}
+#skillsec .scount{color:var(--sub);font-size:var(--f1)}
+#skillsec .chev{margin-left:auto;color:var(--sub);font-size:var(--f0);transition:transform .15s}
 #skillsec.open .chev{transform:rotate(90deg)}
 .skrows{display:none;margin-top:6px;flex-direction:column}
 #skillsec.open .skrows{display:flex}
@@ -73,12 +101,12 @@ header{padding:22px 0 6px}
 .skrow:hover{background:var(--hover)}
 .skrow .skname{font-weight:600;min-width:11em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .skrow.off .skname{color:var(--mut);font-weight:500}
-.skrow .skhome{color:var(--sub);font:.74rem ui-monospace,Menlo,Consolas,monospace;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
-.skflag{flex:none;font-size:.64rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 7px;border-radius:5px;white-space:nowrap}
+.skrow .skhome{color:var(--sub);font:var(--f1) ui-monospace,Menlo,Consolas,monospace;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+.skflag{flex:none;font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 7px;border-radius:5px;white-space:nowrap}
 .skflag.off{background:color-mix(in srgb,var(--mut) 16%,transparent);color:var(--mut)}
 .skflag.shadowed{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)}
 .skflag.diverged{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
-.skbtn{flex:none;border:1px solid var(--line);border-radius:8px;padding:2px 10px;background:transparent;color:var(--mut);font:.74rem inherit;cursor:pointer;transition:border-color .12s,color .12s}
+.skbtn{flex:none;border:1px solid var(--line);border-radius:8px;padding:2px 10px;background:transparent;color:var(--mut);font:var(--f1) inherit;cursor:pointer;transition:border-color .12s,color .12s}
 .skbtn:hover{border-color:var(--line2);color:var(--fg)}
 .skbtn.armed{border-color:var(--bad);color:var(--bad);background:color-mix(in srgb,var(--bad) 12%,transparent)}
 .skbtn.failed{border-color:var(--bad);color:var(--bad)}
@@ -86,19 +114,19 @@ header{padding:22px 0 6px}
 .srow{display:flex;align-items:baseline;gap:10px;padding:3px 6px;border-radius:8px;cursor:copy;overflow:hidden}
 .srow:hover{background:var(--line)}
 .srow.copied{outline:1px solid var(--sub)}
-.srow .sage{color:var(--sub);font-size:.74rem;min-width:3.2em;font-variant-numeric:tabular-nums}
+.srow .sage{color:var(--sub);font-size:var(--f1);min-width:3.2em;font-variant-numeric:tabular-nums}
 .srow .sproj{color:var(--mut);min-width:9em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .srow .stitle{color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
 
 /* ---------- controls ---------- */
 #controls{display:flex;gap:8px;align-items:center;margin:16px 0 0;flex-wrap:wrap}
-#q{flex:1 1 240px;min-width:180px;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:9px 13px;font-size:.95rem;outline:none}
+#q{flex:1 1 240px;min-width:180px;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:9px 13px;font-size:var(--f3);outline:none}
 #q:focus{border-color:var(--accent)}
 #q::placeholder{color:var(--sub)}
-.tog{border:1px solid var(--line);border-radius:16px;padding:5px 13px;background:var(--card);color:var(--mut);font:.8rem inherit;cursor:pointer;display:none}
+.tog{border:1px solid var(--line);border-radius:16px;padding:5px 13px;background:var(--card);color:var(--mut);font:var(--f1) inherit;cursor:pointer;display:none}
 .tog.avail{display:inline-block}
 .tog.on{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
-#count{color:var(--sub);font-size:.8rem;margin-left:auto;white-space:nowrap}
+#count{color:var(--sub);font-size:var(--f1);margin-left:auto;white-space:nowrap}
 
 /* ---------- project cards ---------- */
 #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin:14px 0 0;padding:0}
@@ -111,30 +139,30 @@ header{padding:22px 0 6px}
 .dot.active{background:var(--ok);box-shadow:0 0 6px color-mix(in srgb,var(--ok) 60%,transparent)}
 .dot.dormant{background:var(--sub);opacity:.55}
 .dot.external{background:var(--ext)}
-.pname{font-weight:700;font-size:1.02rem;letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pname{font-weight:700;font-size:var(--f3);letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .card.dormant .pname{color:var(--mut);font-weight:600}
-.age{margin-left:auto;flex:none;font-size:.78rem;color:var(--mut);font-variant-numeric:tabular-nums}
+.age{margin-left:auto;flex:none;font-size:var(--f1);color:var(--mut);font-variant-numeric:tabular-nums}
 .chips{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 0;min-height:1.2em}
-.hchip{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:2.5px 8px;border-radius:5px;white-space:nowrap}
+.hchip{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:2.5px 8px;border-radius:5px;white-space:nowrap}
 .h-claude{background:color-mix(in srgb,var(--claude) 18%,transparent);color:var(--claude)}
 .h-codex{background:color-mix(in srgb,var(--codex) 18%,transparent);color:var(--codex)}
 .h-opencode{background:color-mix(in srgb,var(--opencode) 20%,transparent);color:var(--opencode)}
 .h-other{background:color-mix(in srgb,var(--mut) 18%,transparent);color:var(--mut)}
-.lchip{font-size:.68rem;padding:2.5px 8px;border-radius:5px;color:var(--accent);background:var(--accent-soft);white-space:nowrap}
-.ppath{margin:8px 0 0;font:.76rem ui-monospace,Menlo,Consolas,monospace;color:var(--sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lchip{font-size:var(--f0);padding:2.5px 8px;border-radius:5px;color:var(--accent);background:var(--accent-soft);white-space:nowrap}
+.ppath{margin:8px 0 0;font:var(--f1) ui-monospace,Menlo,Consolas,monospace;color:var(--sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .card:hover .ppath{color:var(--mut)}
 
 /* ---------- detail expansion ---------- */
 .detail{display:none;margin:12px -15px 0;border-top:1px solid var(--line);padding:11px 15px 2px;column-width:340px;column-gap:28px}
 .card.open .detail{display:block}
 .dsec{break-inside:avoid;margin:0 0 12px}
-.dsec h4{margin:0 0 4px;font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
-.dline{font-size:.82rem;color:var(--mut);margin:2px 0;word-break:break-all}
-.dline.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.78rem}
+.dsec h4{margin:0 0 4px;font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+.dline{font-size:var(--f1);color:var(--mut);margin:2px 0;word-break:break-all}
+.dline.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:var(--f1)}
 .dline b{color:var(--fg);font-weight:600}
 .edge .rel{color:var(--accent);font-weight:600}
 .edge .enote{color:var(--sub);font-style:italic}
-.unconf{color:var(--warn);font-size:.7rem;font-style:normal}
+.unconf{color:var(--warn);font-size:var(--f0);font-style:normal}
 .copy{cursor:copy;border-radius:5px;padding:0 3px;margin:0 -3px}
 .copy:hover{background:var(--hover);color:var(--fg)}
 .copy.did{color:var(--ok)}
@@ -143,62 +171,82 @@ header{padding:22px 0 6px}
 #empty{display:none;padding:52px 20px;text-align:center;color:var(--mut)}
 #empty.show{display:block}
 #empty .glyph{font-size:2rem;opacity:.4}
-footer{margin:26px 0 46px;font-size:.76rem;color:var(--sub);display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+footer{margin:26px 0 46px;font-size:var(--f1);color:var(--sub);display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 footer .fmark{color:color-mix(in srgb,var(--accent) 70%,var(--sub))}
 
 /* ================= quota view (CSS ported from sesh, on helm's variables) ================= */
-/* ---------- attention ---------- */
-#attn{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0 0;font-size:.85rem;min-height:1.5em}
-.attn{padding:4px 12px;border-radius:16px;border:1px solid var(--line);background:var(--card)}
-.attn.warn{border-color:color-mix(in srgb,var(--warn) 60%,transparent);color:var(--warn)}
-.attn.bad{border-color:color-mix(in srgb,var(--bad) 60%,transparent);color:var(--bad)}
-.attn.next{color:var(--mut)}.attn.next b{color:var(--fg)}
+/* ---------- attention row ----------
+   Uniform pills: same height, same weight, one border. Colour is a single
+   signal dot on the left, not a full-pill wash — so the row reads as one
+   scale of items differing only by their signal (Tufte: colour as data).
+   Long detail is truncated with the full text on hover-title. */
+#attn{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0 0;min-height:1.6em}
+.attn{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 12px;border-radius:var(--r-pill);border:1px solid var(--line);background:var(--card);font-size:var(--f1);color:var(--mut);max-width:34ch;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.attn b{color:var(--fg);font-weight:var(--w-med)}
+.attn::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--sub);flex:none}
+.attn.ok::before{background:var(--ok)}
+.attn.warn::before{background:var(--warn)}
+.attn.bad::before{background:var(--bad)}
+.attn.next{border-style:dashed}.attn.next::before{background:var(--accent)}
 
 /* ---------- chart card ---------- */
 #chartcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px 6px;position:relative;box-shadow:var(--shadow)}
-#zoomhint{position:absolute;right:16px;bottom:10px;font-size:.72rem;color:var(--sub);pointer-events:none}
+/* a quiet caption UNDER the chart, not floating over its x-axis */
+#zoomhint{text-align:right;font-size:var(--f0);color:var(--sub);pointer-events:none;padding:2px 2px 0}
 #chartcard .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px}
-#chartcard .chead b{font-size:1.05rem}
-.qtab{padding:5px 16px;border-radius:16px;border:1px solid var(--line);font-size:.88rem;cursor:pointer;color:var(--mut);background:none;display:inline-block}
+#chartcard .chead b{font-size:var(--f4)}
+.qtab{padding:5px 16px;border-radius:16px;border:1px solid var(--line);font-size:var(--f2);cursor:pointer;color:var(--mut);background:none;display:inline-block}
 .qtab.on{border-color:var(--accent);color:var(--accent);font-weight:700}
-#qsub{margin-left:auto;font-size:.8rem;color:var(--mut)}
+#qsub{margin-left:auto;font-size:var(--f1);color:var(--mut)}
 #chart{width:100%;height:auto;display:block;cursor:crosshair}
-#tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:.78rem ui-monospace,Menlo,monospace;display:none;z-index:5;box-shadow:0 3px 14px rgba(0,0,0,.18);white-space:nowrap}
+#tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:var(--f1) ui-monospace,Menlo,monospace;display:none;z-index:5;box-shadow:0 3px 14px rgba(0,0,0,.18);white-space:nowrap}
 #tip .tt{color:var(--mut)}
 
 /* ---------- account table ---------- */
 #acctcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 14px;box-shadow:var(--shadow)}
 .afilter{display:flex;gap:6px;margin:2px 0 8px;align-items:center}
-#view-quota .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:.86rem;cursor:pointer;transition:border-color .12s,background .12s}
+#view-quota .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:var(--f2);cursor:pointer;transition:border-color .12s,background .12s}
 #view-quota .chip:hover{background:var(--hover);border-color:var(--line2)}
 #view-quota .chip.on{border-color:var(--accent);color:var(--accent);font-weight:600;background:var(--accent-soft)}
-table.accts{width:100%;border-collapse:collapse;font-size:.92rem;table-layout:auto}
-table.accts th{text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);padding:6px 8px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none;white-space:nowrap}
+/* Account table: one number per window with a slim inline bar for at-a-glance
+   comparison (the redundant leading battery column and the per-cell battery
+   SVGs are gone). Fixed cell padding + one baseline => even row rhythm; the
+   secondary line is muted and quiet. Numbers are tabular and right-aligned. */
+table.accts{width:100%;border-collapse:collapse;font-size:var(--f2);table-layout:auto}
+table.accts th{text-align:left;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);padding:7px 10px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none;white-space:nowrap}
+table.accts th.num{text-align:right}
 table.accts th:hover{color:var(--fg)}
-table.accts td{padding:8px;border-bottom:1px solid var(--line);vertical-align:middle}
+table.accts td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
 table.accts tr:last-child td{border-bottom:none}
 table.accts tr.sel td{background:var(--hl)}
 table.accts tbody tr{cursor:pointer}
 table.accts tbody tr:hover td{background:color-mix(in srgb,var(--hl) 55%,transparent)}
-.adot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px}
-.acct-line2{font-size:.76rem;color:var(--mut);margin-top:1px}
-.qbig{white-space:nowrap;font-variant-numeric:tabular-nums}
-.rst{color:var(--mut);font-size:.78rem}
+.adot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;vertical-align:1px;flex:none}
+.acct-name{display:flex;align-items:center;font-weight:var(--w-med)}
+.acct-name .live{width:6px;height:6px;border-radius:50%;background:var(--ok);margin-left:7px;box-shadow:0 0 5px var(--ok)}
+.acct-line2{font-size:var(--f0);color:var(--sub);margin-top:2px;white-space:nowrap}
+.acct-line2 .sep{opacity:.5;margin:0 5px}
+/* a quota cell: right-aligned % with a slim bar underneath */
+.qcell{text-align:right;white-space:nowrap;font-variant-numeric:var(--num);min-width:66px}
+.qcell .qv{font-weight:var(--w-med)}
+.qcell .qbar{height:3px;border-radius:2px;background:var(--line);margin-top:3px;overflow:hidden}
+.qcell .qbar>i{display:block;height:100%;border-radius:2px}
+.qcell .rst{display:block;font-size:var(--f0);color:var(--sub);margin-top:2px}
+.rst{color:var(--mut);font-size:var(--f1)}
 .st-ok{color:var(--ok)}.st-approaching{color:var(--warn)}.st-exhausted,.st-api-error,.st-unknown{color:var(--bad)}
 .stfix{cursor:pointer;text-decoration:underline dotted}
-.batt{display:inline-block;vertical-align:-2px}
-.flagchip{font-size:.72rem;color:var(--warn)}
+.flagchip{font-size:var(--f0);color:var(--warn)}
 
 /* ---------- collapsible group cards (burn / homes) ---------- */
 .grp{margin:14px 0 0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--card)}
 .grp>summary{cursor:pointer;padding:11px 16px;display:flex;align-items:center;gap:10px;font-weight:600;list-style:none}
 .grp>summary::-webkit-details-marker{display:none}
-.grp>summary::before{content:"▸";color:var(--mut);font-size:.8rem;transition:.15s}
+.grp>summary::before{content:"▸";color:var(--mut);font-size:var(--f1);transition:.15s}
 .grp[open]>summary::before{transform:rotate(90deg)}
-.gmeta{color:var(--mut);font-size:.8rem;font-weight:400;white-space:nowrap}
+.gmeta{color:var(--mut);font-size:var(--f1);font-weight:400;white-space:nowrap}
 #burncard>summary .gmeta{margin-left:auto}
 #homescard>summary .gmeta{margin-left:auto}
-.burnrow{display:flex;gap:14px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:baseline;flex-wrap:wrap;font-size:.86rem}
+.burnrow{display:flex;gap:14px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:baseline;flex-wrap:wrap;font-size:var(--f2)}
 .burnrow:last-of-type{border-bottom:none}
 .burnt{color:var(--mut);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:92px}
 .burnchips{display:flex;gap:10px;flex-wrap:wrap}
@@ -206,200 +254,200 @@ table.accts tbody tr:hover td{background:color-mix(in srgb,var(--hl) 55%,transpa
 .burnsesss{flex:1;min-width:240px;display:flex;gap:4px 14px;flex-wrap:wrap}
 .burnsess{cursor:pointer;color:var(--accent);text-decoration:underline dotted;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .burnsess:hover{text-decoration:underline solid}
-.burnnote{padding:9px 16px;font-size:.78rem;color:var(--mut);border-top:1px solid var(--line)}
+.burnnote{padding:9px 16px;font-size:var(--f1);color:var(--mut);border-top:1px solid var(--line)}
 
 /* ---------- credential homes ---------- */
-.hbadge{font-size:.66rem;font-weight:700;text-transform:uppercase;padding:3px 7px;border-radius:5px;text-align:center}
-.homerow{display:flex;gap:12px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap;font-size:.86rem}
+.hbadge{font-size:var(--f0);font-weight:700;text-transform:uppercase;padding:3px 7px;border-radius:5px;text-align:center}
+.homerow{display:flex;gap:12px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap;font-size:var(--f2)}
 .homerow:last-of-type{border-bottom:none}
-.homerow .hn{font:600 .86rem ui-monospace,Menlo,monospace;white-space:nowrap}
+.homerow .hn{font:600 var(--f2) ui-monospace,Menlo,monospace;white-space:nowrap}
 .homerow .hn .rst{font-weight:400}
 .homerow .hchips{display:flex;gap:10px;flex-wrap:wrap;flex:1;min-width:220px;align-items:baseline}
 .homerow .hacts{display:flex;gap:6px}
-.homerow .hacts button{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:4px 10px;font-size:.78rem;cursor:pointer}
+.homerow .hacts button{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:4px 10px;font-size:var(--f1);cursor:pointer}
 .homerow .hacts button:hover{border-color:var(--accent);color:var(--accent)}
-.homefix{flex-basis:100%;font-size:.78rem;color:var(--mut);white-space:pre-wrap;word-break:break-word}
+.homefix{flex-basis:100%;font-size:var(--f1);color:var(--mut);white-space:pre-wrap;word-break:break-word}
 #homeform{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap;align-items:center}
-#homeform input{flex:1;min-width:220px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font-size:.82rem}
-#homeform select{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 10px;font-size:.82rem;cursor:pointer}
-#homeform .cmdbox{flex-basis:100%;background:var(--fg);color:var(--bg);border-radius:8px;padding:9px 12px;font:.76rem ui-monospace,Menlo,monospace;word-break:break-all;cursor:pointer}
-#homeform .cmdbox .hintline{font:italic .7rem -apple-system,sans-serif;opacity:.7;margin-top:4px}
-.homehdr{padding:8px 16px;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line)}
-.dupwarn{color:var(--bad);font-size:.8rem;margin:6px 0}
+#homeform input{flex:1;min-width:220px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font-size:var(--f1)}
+#homeform select{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 10px;font-size:var(--f1);cursor:pointer}
+#homeform .cmdbox{flex-basis:100%;background:var(--fg);color:var(--bg);border-radius:8px;padding:9px 12px;font:var(--f1) ui-monospace,Menlo,monospace;word-break:break-all;cursor:pointer}
+#homeform .cmdbox .hintline{font:italic var(--f0) -apple-system,sans-serif;opacity:.7;margin-top:4px}
+.homehdr{padding:8px 16px;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line)}
+.dupwarn{color:var(--bad);font-size:var(--f1);margin:6px 0}
 
 /* ================= sessions view (CSS ported from sesh, on helm's variables) ================= */
 #sesscontrols{position:sticky;top:48px;z-index:15;background:color-mix(in srgb,var(--bg) 94%,transparent);backdrop-filter:blur(8px);padding:12px 0 10px;border-bottom:1px solid var(--line)}
 #sesscontrols .row1{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-#view-sessions input[type=search]{flex:1 1 300px;min-width:200px;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:10px 14px;font-size:1rem}
+#view-sessions input[type=search]{flex:1 1 300px;min-width:200px;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:10px 14px;font-size:var(--f3)}
 #view-sessions input[type=search]:focus{border-color:var(--accent);outline:none}
 #view-sessions #scope{max-width:190px;flex:0 1 190px;min-width:120px}
-#view-sessions select{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 11px;font-size:.86rem;cursor:pointer}
-#view-sessions .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:.86rem;cursor:pointer;transition:border-color .12s,background .12s}
+#view-sessions select{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 11px;font-size:var(--f2);cursor:pointer}
+#view-sessions .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:var(--f2);cursor:pointer;transition:border-color .12s,background .12s}
 #view-sessions .chip:hover{background:var(--hover);border-color:var(--line2)}
 #view-sessions .chip.on{border-color:var(--accent);color:var(--accent);font-weight:600;background:var(--accent-soft)}
-#resumeAs{display:flex;gap:6px;align-items:center;font-size:.82rem;color:var(--mut);flex-wrap:wrap}
-.rachip{border:1px solid var(--line);border-radius:16px;padding:4px 12px;cursor:pointer;background:var(--card);font-size:.82rem}
+#resumeAs{display:flex;gap:6px;align-items:center;font-size:var(--f1);color:var(--mut);flex-wrap:wrap}
+.rachip{border:1px solid var(--line);border-radius:16px;padding:4px 12px;cursor:pointer;background:var(--card);font-size:var(--f1)}
 .rachip b{font-weight:700}
-#sesscount{color:var(--mut);font-size:.82rem;margin-left:auto;white-space:nowrap}
-.cwd{font:.92rem ui-monospace,Menlo,monospace;color:var(--accent);flex:1;word-break:break-all}
+#sesscount{color:var(--mut);font-size:var(--f1);margin-left:auto;white-space:nowrap}
+.cwd{font:var(--f2) ui-monospace,Menlo,monospace;color:var(--accent);flex:1;word-break:break-all}
 #view-sessions .rows{border-top:1px solid var(--line)}
 .row{display:grid;grid-template-columns:48px minmax(0,1fr) auto auto;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);align-items:center}
 .row:last-child{border-bottom:none}.row:hover{background:var(--hl)}
-.title{font-size:.95rem;min-width:0}
-.title .l2{font-size:.76rem;color:var(--mut);font-family:ui-monospace,Menlo,monospace;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rmeta{font-size:.78rem;color:var(--mut);text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.title{font-size:var(--f3);min-width:0}
+.title .l2{font-size:var(--f1);color:var(--mut);font-family:ui-monospace,Menlo,monospace;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rmeta{font-size:var(--f1);color:var(--mut);text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
 .act{display:flex;gap:6px;position:relative}
-.act button{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 11px;font-size:.8rem;cursor:pointer}
+.act button{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 11px;font-size:var(--f1);cursor:pointer}
 .act button:hover{border-color:var(--accent);color:var(--accent)}
-.snip{font-size:.8rem;color:var(--mut);padding:0 16px 10px 76px;font-style:italic;cursor:pointer}
+.snip{font-size:var(--f1);color:var(--mut);padding:0 16px 10px 76px;font-style:italic;cursor:pointer}
 .snip:hover{color:var(--fg)}
-.deephdr{padding:11px 16px;font-size:.85rem;color:var(--mut);border-bottom:1px solid var(--line)}
+.deephdr{padding:11px 16px;font-size:var(--f1);color:var(--mut);border-bottom:1px solid var(--line)}
 @keyframes sweep{0%{margin-left:-40%}100%{margin-left:100%}}
 mark{background:var(--accent);color:var(--bg);border-radius:2px;padding:0 1px}
 
 /* command popover: hover to see, click to copy */
-#cmdpop{position:fixed;z-index:60;max-width:min(720px,90vw);background:var(--fg);color:var(--bg);border-radius:10px;padding:10px 14px;font:.8rem ui-monospace,Menlo,monospace;word-break:break-all;box-shadow:0 6px 24px rgba(0,0,0,.3);display:none;cursor:pointer}
-#cmdpop .hintline{font:italic .72rem/1.4 -apple-system,sans-serif;opacity:.7;margin-top:5px}
+#cmdpop{position:fixed;z-index:60;max-width:min(720px,90vw);background:var(--fg);color:var(--bg);border-radius:10px;padding:10px 14px;font:var(--f1) ui-monospace,Menlo,monospace;word-break:break-all;box-shadow:0 6px 24px rgba(0,0,0,.3);display:none;cursor:pointer}
+#cmdpop .hintline{font:italic var(--f0)/1.4 -apple-system,sans-serif;opacity:.7;margin-top:5px}
 #cmdpop.copied{outline:2px solid var(--ok)}
 
 /* ---------- team tray ---------- */
-#trayBtn{border:1px solid var(--line);border-radius:20px;padding:6px 14px;background:var(--card);color:var(--fg);cursor:pointer;font-size:.85rem}
-#trayBtn.has{border-color:var(--accent);color:var(--accent);font-weight:700}
+#trayBtn.has{border-color:var(--accent);color:var(--accent)}
+#trayBtn .n{margin-left:3px;font-variant-numeric:var(--num)}
 #tray{position:fixed;right:18px;top:64px;width:min(420px,92vw);max-height:76vh;overflow:auto;background:var(--card);border:2px solid var(--accent);border-radius:14px;padding:14px;z-index:30;display:none;box-shadow:0 10px 40px rgba(0,0,0,.25)}
 #tray.show{display:block}
-#tray h3{margin:0 0 10px;font-size:1rem;display:flex;align-items:center}
-#trayClose{margin-left:auto;background:none;border:none;font-size:1.1rem;cursor:pointer;color:var(--mut)}
+#tray h3{margin:0 0 10px;font-size:var(--f3);display:flex;align-items:center}
+#trayClose{margin-left:auto;background:none;border:none;font-size:var(--f4);cursor:pointer;color:var(--mut)}
 #trayClose:hover{color:var(--bad)}
-#tray input{background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font-size:.8rem}
-#tray .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 11px;font-size:.82rem;cursor:pointer}
-.seat{border-top:1px solid var(--line);padding:10px 0;font-size:.85rem}
+#tray input{background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font-size:var(--f1)}
+#tray .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 11px;font-size:var(--f1);cursor:pointer}
+.seat{border-top:1px solid var(--line);padding:10px 0;font-size:var(--f1)}
 .seat .t{font-weight:600}
-.seat .m{color:var(--mut);font-size:.76rem;margin:2px 0}
-.seat select{width:100%;margin-top:5px;font-size:.8rem;padding:5px 9px;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px}
-.seat .rm{float:right;cursor:pointer;color:var(--bad);background:none;border:none;font-size:.85rem}
-.seat .showcmd{margin-top:6px;width:100%;text-align:left;background:var(--code);border:1px dashed var(--line);border-radius:8px;padding:7px 10px;font-size:.78rem;color:var(--codefg);cursor:pointer}
-.seat .cmdbox{margin-top:6px;background:var(--fg);color:var(--bg);border-radius:8px;padding:9px 12px;font:.76rem ui-monospace,Menlo,monospace;word-break:break-all;cursor:pointer}
-.seat .cmdbox .hintline{font:italic .7rem -apple-system,sans-serif;opacity:.7;margin-top:4px}
+.seat .m{color:var(--mut);font-size:var(--f1);margin:2px 0}
+.seat select{width:100%;margin-top:5px;font-size:var(--f1);padding:5px 9px;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px}
+.seat .rm{float:right;cursor:pointer;color:var(--bad);background:none;border:none;font-size:var(--f1)}
+.seat .showcmd{margin-top:6px;width:100%;text-align:left;background:var(--code);border:1px dashed var(--line);border-radius:8px;padding:7px 10px;font-size:var(--f1);color:var(--codefg);cursor:pointer}
+.seat .cmdbox{margin-top:6px;background:var(--fg);color:var(--bg);border-radius:8px;padding:9px 12px;font:var(--f1) ui-monospace,Menlo,monospace;word-break:break-all;cursor:pointer}
+.seat .cmdbox .hintline{font:italic var(--f0) -apple-system,sans-serif;opacity:.7;margin-top:4px}
 .seat.done .showcmd{border-style:solid;border-color:var(--ok);color:var(--ok)}
 
 /* ---------- transcript drawer ---------- */
 #drawer{position:fixed;top:0;right:0;bottom:0;width:min(820px,95vw);background:var(--bg);border-left:2px solid var(--accent);z-index:50;display:none;flex-direction:column;box-shadow:-10px 0 36px rgba(0,0,0,.28)}
 #drawer.show{display:flex}
 #dhead{padding:14px 18px;border-bottom:1px solid var(--line);background:var(--card)}
-#dhead .t{font-weight:700;font-size:1.05rem;margin-right:8px}
-#dhead .meta{font-size:.8rem;color:var(--mut);margin-top:4px;word-break:break-all}
+#dhead .t{font-weight:700;font-size:var(--f4);margin-right:8px}
+#dhead .meta{font-size:var(--f1);color:var(--mut);margin-top:4px;word-break:break-all}
 #dhead .acts{float:right;display:flex;gap:6px}
-#dhead .acts button{border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:8px;padding:6px 11px;font-size:.82rem;cursor:pointer}
+#dhead .acts button{border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:8px;padding:6px 11px;font-size:var(--f1);cursor:pointer}
 #dhead .acts button:hover{border-color:var(--accent);color:var(--accent)}
-#dhead .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 11px;font-size:.82rem;cursor:pointer}
+#dhead .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 11px;font-size:var(--f1);cursor:pointer}
 #dbody{flex:1;overflow-y:auto;padding:12px 18px}
-#dbody .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 12px;font-size:.82rem;cursor:pointer}
-.dmsg{margin:0 0 16px;font-size:.92rem}
-.dmsg .role{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-bottom:2px}
+#dbody .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 12px;font-size:var(--f1);cursor:pointer}
+.dmsg{margin:0 0 16px;font-size:var(--f2)}
+.dmsg .role{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-bottom:2px}
 .dmsg.r-user .role{color:var(--claude)}.dmsg.r-assistant .role{color:var(--codex)}.dmsg.r-tool .role,.dmsg.r-system .role{color:var(--mut)}
 .dmsg .txt{white-space:pre-wrap;word-break:break-word}
-.dmsg .toolline{font:.8rem ui-monospace,Menlo,monospace;color:var(--codefg);background:var(--code);border-radius:6px;padding:5px 9px;margin:4px 0;word-break:break-all}
-.dmsg .res{font:.78rem ui-monospace,Menlo,monospace;color:var(--mut);border-left:3px solid var(--line);padding:3px 9px;margin:4px 0;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto}
+.dmsg .toolline{font:var(--f1) ui-monospace,Menlo,monospace;color:var(--codefg);background:var(--code);border-radius:6px;padding:5px 9px;margin:4px 0;word-break:break-all}
+.dmsg .res{font:var(--f1) ui-monospace,Menlo,monospace;color:var(--mut);border-left:3px solid var(--line);padding:3px 9px;margin:4px 0;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto}
 .dmsg .res.err{border-left-color:var(--bad)}
-.dmsg details{margin:4px 0}.dmsg details summary{font-size:.76rem;color:var(--mut);cursor:pointer}
-.dmsg details .txt{font-size:.82rem;color:var(--mut);font-style:italic}
+.dmsg details{margin:4px 0}.dmsg details summary{font-size:var(--f1);color:var(--mut);cursor:pointer}
+.dmsg details .txt{font-size:var(--f1);color:var(--mut);font-style:italic}
 .dmsg.hit{background:color-mix(in srgb,var(--accent) 9%,transparent);border-radius:10px;padding:8px;margin-left:-8px;margin-right:-8px}
 #dmore{margin:6px auto 14px;display:block}
-.dtime{font-size:.7rem;color:var(--mut);margin-left:8px}
+.dtime{font-size:var(--f0);color:var(--mut);margin-left:8px}
 #cwdedit{display:none;margin-top:6px;gap:6px}
 #cwdedit.show{display:flex}
-#cwdedit input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font:.8rem ui-monospace,Menlo,monospace}
+#cwdedit input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:var(--r-sm);padding:6px 10px;font:var(--f1) var(--mono)}
 
 /* ================= configs view (CSS ported from sesh, on helm's variables) ================= */
-#view-configs .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:.86rem;cursor:pointer;transition:border-color .12s,background .12s}
+#view-configs .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:var(--f2);cursor:pointer;transition:border-color .12s,background .12s}
 #view-configs .chip:hover{background:var(--hover);border-color:var(--line2)}
 #view-configs .chip.on{border-color:var(--accent);color:var(--accent);font-weight:600;background:var(--accent-soft)}
 #cfgbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0 12px}
-#cfgFilter{flex:1;min-width:200px;padding:7px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:.9rem}
+#cfgFilter{flex:1;min-width:200px;padding:7px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:var(--f2)}
 #cfgFilter:focus{border-color:var(--accent);outline:none}
-.cfgmut{font-size:.78rem;color:var(--mut)}
+.cfgmut{font-size:var(--f1);color:var(--mut)}
 #cfgsplit{display:grid;grid-template-columns:minmax(280px,38%) 1fr;gap:16px;align-items:start}
 @media(max-width:820px){#cfgsplit{grid-template-columns:1fr}}
 #cfgtree,#cfgdetail{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;max-height:76vh;overflow:auto;box-shadow:var(--shadow)}
 .cfgnode{user-select:none}
-.cfgrow{display:flex;align-items:center;gap:6px;padding:3px 5px;border-radius:6px;cursor:pointer;font-size:.9rem;white-space:nowrap}
+.cfgrow{display:flex;align-items:center;gap:6px;padding:3px 5px;border-radius:6px;cursor:pointer;font-size:var(--f2);white-space:nowrap}
 .cfgrow:hover{background:var(--hl)}
 .cfgrow.sel{background:var(--accent);color:var(--bg)}
 .cfgrow.sel .cfgbadge{border-color:var(--bg);color:var(--bg)}
 .cfgtw{display:inline-block;width:12px;color:var(--mut);text-align:center}
 .cfgname{font-weight:600}
 .cfgkids{margin-left:14px;border-left:1px solid var(--line);padding-left:4px}
-.cfgbadge{font-size:.64rem;border:1px solid var(--line);border-radius:5px;padding:0 4px;color:var(--mut);font-weight:700;letter-spacing:.03em}
+.cfgbadge{font-size:var(--f0);border:1px solid var(--line);border-radius:5px;padding:0 4px;color:var(--mut);font-weight:700;letter-spacing:.03em}
 .cfgbadge.mcp{color:#5470c6;border-color:#5470c6}.cfgbadge.hooks{color:#b4442e;border-color:#b4442e}
 .cfgbadge.memory{color:#3f7d54;border-color:#3f7d54}.cfgbadge.settings{color:#b58a2e;border-color:#b58a2e}
 .cfgbadge.rule{color:#8a5fc0;border-color:#8a5fc0}
 .cfgsec{margin:0 0 16px}
-.cfgsec h4{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 6px;border-bottom:1px solid var(--line);padding-bottom:4px}
-details.cfgsec>summary{cursor:pointer;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:6px;list-style:revert}
+.cfgsec h4{font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 6px;border-bottom:1px solid var(--line);padding-bottom:4px}
+details.cfgsec>summary{cursor:pointer;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:6px;list-style:revert}
 details.cfgsec>summary:hover{color:var(--fg)}
-.cfgitem{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:7px;font-size:.88rem}
+.cfgitem{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:7px;font-size:var(--f2)}
 .cfgitem:hover{background:var(--hl)}
-.cfgitem .src{font-size:.7rem;color:var(--mut);margin-left:auto;white-space:nowrap}
+.cfgitem .src{font-size:var(--f0);color:var(--mut);margin-left:auto;white-space:nowrap}
 .cfgitem.cfgshadow{opacity:.5}
 .cfgitem.cfgshadow b{text-decoration:line-through}
 .cfgitem.cfgshadow .src{color:var(--bad)}
 .cfgfile{cursor:pointer;color:var(--accent);text-decoration:underline;text-decoration-style:dotted}
 .cfgcascade{list-style:none;margin:0;padding:0}
-.cfgcascade li{position:relative;padding:4px 0 4px 20px;font-size:.86rem}
+.cfgcascade li{position:relative;padding:4px 0 4px 20px;font-size:var(--f2)}
 .cfgcascade li:before{content:"↳";position:absolute;left:4px;color:var(--mut)}
 .cfgcascade li:first-child:before{content:"⌂"}
-.cfgwarn{background:color-mix(in srgb,var(--bad) 12%,transparent);border:1px solid var(--bad);border-radius:8px;padding:8px 10px;font-size:.82rem;margin:4px 0;color:var(--fg)}
+.cfgwarn{background:color-mix(in srgb,var(--bad) 12%,transparent);border:1px solid var(--bad);border-radius:8px;padding:8px 10px;font-size:var(--f1);margin:4px 0;color:var(--fg)}
 .cfged{margin-top:10px}
-.cfged textarea{width:100%;min-height:280px;font:.82rem ui-monospace,Menlo,monospace;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);padding:10px;resize:vertical;box-sizing:border-box}
+.cfged textarea{width:100%;min-height:280px;font:var(--f1) ui-monospace,Menlo,monospace;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);padding:10px;resize:vertical;box-sizing:border-box}
 .cfgedbar{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
-.cfgpath{font:.76rem ui-monospace,monospace;color:var(--mut);word-break:break-all}
-.cfgro{color:var(--bad);font-size:.76rem;font-weight:700}
-.cfgpick{padding:5px 10px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:.85rem}
-.cfgdiff{font:.78rem ui-monospace,Menlo,monospace;word-break:break-all;padding:2px 6px;border-radius:6px}
+.cfgpath{font:var(--f1) ui-monospace,monospace;color:var(--mut);word-break:break-all}
+.cfgro{color:var(--bad);font-size:var(--f1);font-weight:700}
+.cfgpick{padding:5px 10px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:var(--f1)}
+.cfgdiff{font:var(--f1) ui-monospace,Menlo,monospace;word-break:break-all;padding:2px 6px;border-radius:6px}
 .cfgdiff.add{color:var(--ok)}.cfgdiff.del{color:var(--bad)}.cfgdiff.chg{color:var(--warn)}
 
 /* ================= chat view (simple DOM — works from the Orca mobile browser) ================= */
 #chatcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);display:flex;flex-direction:column;height:calc(100dvh - 130px);min-height:300px}
 #chatlog{flex:1;overflow-y:auto;padding:14px 16px}
-.chatmsg{margin:0 0 10px;font-size:.92rem}
+.chatmsg{margin:0 0 10px;font-size:var(--f2)}
 .chatmsg .cwho{font-weight:700}
 .chatmsg.owner .cwho{color:var(--accent)}
-.chatmsg .cts{font-size:.72rem;color:var(--sub);margin-left:7px;font-variant-numeric:tabular-nums}
+.chatmsg .cts{font-size:var(--f0);color:var(--sub);margin-left:7px;font-variant-numeric:tabular-nums}
 .chatmsg .ctxt{white-space:pre-wrap;word-break:break-word}
-.chatmsg .ctick{font-size:.72rem;color:var(--sub);margin-left:6px;cursor:default}
-.chatmsg .creacts{font-size:.82rem;margin:2px 0 0 2px;color:var(--sub)}
+.chatmsg .ctick{font-size:var(--f0);color:var(--sub);margin-left:6px;cursor:default}
+.chatmsg .creacts{font-size:var(--f1);margin:2px 0 0 2px;color:var(--sub)}
 .chatmsg .creacts span{margin-right:8px}
-.chatmsg .rbar{display:none;font-size:.85rem;margin-left:8px}
+.chatmsg .rbar{display:none;font-size:var(--f1);margin-left:8px}
 .chatmsg:hover .rbar{display:inline}
-.chatmsg .rbtn{cursor:pointer;border:none;background:none;padding:0 2px;font-size:.85rem;opacity:.55}
+.chatmsg .rbtn{cursor:pointer;border:none;background:none;padding:0 2px;font-size:var(--f1);opacity:.55}
 .chatmsg .rbtn:hover{opacity:1}
-#chattransport{font-size:.72rem;color:var(--sub);align-self:center;white-space:nowrap}
+#chattransport{font-size:var(--f0);color:var(--sub);align-self:center;white-space:nowrap}
 #chatbar{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);flex-wrap:wrap}
-#chatname{flex:0 1 110px;min-width:70px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 10px;font-size:.9rem}
-#chattext{flex:1 1 200px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 12px;font-size:1rem}
+#chatname{flex:0 1 110px;min-width:70px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 10px;font-size:var(--f2)}
+#chattext{flex:1 1 200px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 12px;font-size:var(--f3)}
 #chattext:focus,#chatname:focus{border-color:var(--accent);outline:none}
-#chatbar .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 14px;font-size:.86rem;cursor:pointer}
+#chatbar .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 14px;font-size:var(--f2);cursor:pointer}
 #chatbar .chip:hover{border-color:var(--accent);color:var(--accent)}
 
 /* ================= ledger view (the turn ledger + seat activity, on helm's variables) ================= */
-#ledgerstrip{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;margin:14px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:.84rem;color:var(--mut);font-variant-numeric:tabular-nums}
+#ledgerstrip{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;margin:14px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:var(--f1);color:var(--mut);font-variant-numeric:tabular-nums}
 #ledgerstrip b{color:var(--fg)}
 #ledgerstrip .offline{color:var(--warn)}
 #ledgersplit{display:grid;grid-template-columns:1fr;gap:14px;margin:14px 0 0;align-items:start}
 @media(min-width:860px){#ledgersplit{grid-template-columns:5fr 3fr}}
 .lcard{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow:hidden}
-.lcard>h3{margin:0;padding:10px 14px;border-bottom:1px solid var(--line);font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--sub);display:flex;gap:8px;align-items:baseline}
-.lcard>h3 .lsub{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:400;font-size:.76rem}
+.lcard>h3{margin:0;padding:10px 14px;border-bottom:1px solid var(--line);font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--sub);display:flex;gap:8px;align-items:baseline}
+.lcard>h3 .lsub{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:400;font-size:var(--f1)}
 .lside{display:grid;gap:14px;align-content:start}
 .lrows{max-height:68vh;overflow-y:auto}
-.lrow{padding:8px 14px;border-bottom:1px solid var(--line);font-size:.86rem}
+.lrow{padding:8px 14px;border-bottom:1px solid var(--line);font-size:var(--f2)}
 .lrow:last-child{border-bottom:none}
 .lrow:hover{background:var(--hover)}
 .lhead{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 .lhead .lidx{font-weight:700;font-variant-numeric:tabular-nums}
-.lhead .lage{margin-left:auto;color:var(--sub);font-size:.76rem;white-space:nowrap;font-variant-numeric:tabular-nums}
-.lmeta{font-size:.76rem;color:var(--mut);margin-top:2px;word-break:break-all}
-.lbadge{font-size:.66rem;font-weight:700;padding:2px 7px;border-radius:5px;white-space:nowrap;background:color-mix(in srgb,var(--mut) 14%,transparent);color:var(--mut)}
+.lhead .lage{margin-left:auto;color:var(--sub);font-size:var(--f1);white-space:nowrap;font-variant-numeric:tabular-nums}
+.lmeta{font-size:var(--f1);color:var(--mut);margin-top:2px;word-break:break-all}
+.lbadge{font-size:var(--f0);font-weight:700;padding:2px 7px;border-radius:5px;white-space:nowrap;background:color-mix(in srgb,var(--mut) 14%,transparent);color:var(--mut)}
 .lbadge.final{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
 .lbadge.tent{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)}
 .lbadge.head{background:var(--accent-soft);color:var(--accent)}
@@ -408,18 +456,17 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .ldot.active{background:var(--ok);box-shadow:0 0 6px color-mix(in srgb,var(--ok) 60%,transparent)}
 .ldot.quiet{background:var(--warn)}
 .ldot.stuck{background:var(--bad)}
-.llegend{padding:7px 14px;border-bottom:1px solid var(--line);font-size:.72rem;color:var(--sub);display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.llegend{padding:7px 14px;border-bottom:1px solid var(--line);font-size:var(--f0);color:var(--sub);display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 #seatform{display:flex;flex-wrap:wrap;gap:8px;padding:12px 14px}
-#seatform input{flex:1 1 100%;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 11px;font-size:.9rem}
+#seatform input{flex:1 1 100%;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 11px;font-size:var(--f2)}
 #seatform input:focus{border-color:var(--accent);outline:none}
 #seatform #seatkey{flex:0 1 46%}
-#seatmsg{flex:1 1 100%;font-size:.76rem;color:var(--sub);min-height:1.1em;word-break:break-word}
+#seatmsg{flex:1 1 100%;font-size:var(--f1);color:var(--sub);min-height:1.1em;word-break:break-word}
 #seatmsg.ok{color:var(--ok)}#seatmsg.bad{color:var(--bad)}
 
-/* ---------- toast + theme toggle ---------- */
-.hint{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:9px;font:.82rem ui-monospace,Menlo,monospace;opacity:0;transition:.2s;pointer-events:none;z-index:70;max-width:92vw;word-break:break-all}
+/* ---------- toast (theme + tray toggles now live in the nav) ---------- */
+.hint{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:var(--r);font:var(--f1) var(--mono);opacity:0;transition:.2s;pointer-events:none;z-index:70;max-width:92vw;word-break:break-all}
 .hint.show{opacity:.96}
-#themetog{position:fixed;bottom:16px;right:16px;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:20px;padding:8px 14px;font-size:.82rem;cursor:pointer;z-index:20}
 </style>
 
 <nav id="nav">
@@ -430,8 +477,10 @@ details.cfgsec>summary:hover{color:var(--fg)}
   <button class="navtab" data-v="configs">configs</button>
   <button class="navtab" data-v="chat">chat</button>
   <button class="navtab" data-v="ledger">ledger</button>
+  <span class="spacer"></span>
   <div class="stats" id="navstats"></div>
-  <button id="trayBtn">tray (0)</button>
+  <button class="icon" id="themetog" title="toggle light / dark">◐</button>
+  <button class="icon" id="trayBtn" title="team tray — collect seats">⊞</button>
 </nav>
 
 <div class="wrap">
@@ -593,7 +642,6 @@ details.cfgsec>summary:hover{color:var(--fg)}
 <div id="drawer"><div id="dhead"></div><div id="dbody"></div></div>
 <div id="cmdpop"></div>
 
-<button id="themetog">◐ theme</button>
 <div class="hint" id="hint"></div>
 
 <script>
@@ -834,7 +882,7 @@ function render() {
   $("#empty").classList.toggle("show", !projects.length);
   const active = projects.filter(p => p.status === "active").length;
   const sess = projects.reduce((n, p) => n + Object.values(p.sessions || {}).reduce((a, b) => a + b, 0), 0);
-  $("#stats").innerHTML = "<b>" + projects.length + "</b> projects · <b>" + active + "</b> active<br><b>" + sess + "</b> sessions remembered";
+  $("#stats").innerHTML = statCell(projects.length, "projects") + statCell(active, "active") + statCell(sess, "sessions");
 }
 
 /* ---------- wiring ---------- */
@@ -931,11 +979,16 @@ async function loadCreds(refresh) {
       SEL[p] = best ? best.name : null;
     }
   }
-  NAV_ACC = CREDS.length ? "<span><b>" + CREDS.length + "</b> accounts</span>" : "";
+  NAV_ACC = CREDS.length ? statCell(CREDS.length, "accounts") : "";
   renderNav();
   renderAttn(); renderAccts(); renderResumeAs();
 }
 let NAV_ACC = "", NAV_SESS = "";
+/* one nav stat = a value over an uppercase label, right-aligned; they line up
+   as a fixed row of columns rather than a wrapping run of words. */
+function statCell(val, label, title) {
+  return `<span class="stat"${title ? ` title="${esc(title)}"` : ""}><b>${typeof val === "number" ? val.toLocaleString() : esc(val)}</b><span>${esc(label)}</span></span>`;
+}
 function renderNav() { $("#navstats").innerHTML = NAV_ACC + NAV_SESS; }
 async function loadHist() {
   let d;
@@ -997,26 +1050,29 @@ function strandAtReset(acct) {
   if (slope > 0) slope = 0;
   return Math.max(0, Math.round(pts[pts.length - 1][1] + slope * (S.reset - now)));
 }
+/* One pill per signal class, uniform shape; the leading dot carries the colour.
+   Detail lives in the title so the pill width stays bounded and the row aligns. */
+function attnPill(cls, label, title) {
+  return `<span class="attn ${cls}"${title ? ` title="${esc(title)}"` : ""}>${esc(label)}</span>`;
+}
 function renderAttn() {
   const bits = [];
   // REAL quota problems only: an account with auth that is exhausted or erroring.
   const bad = CREDS.filter(c => c.state === "exhausted" || c.state === "api-error" || c.state === "approaching");
-  if (bad.length) bits.push(`<span class="attn bad" title="${esc(bad.map(c => c.name + ": " + c.state).join(" · "))}">⚠ ${bad.length} need attention: ${esc(bad.map(c => short(c.name, 18)).join(", "))}</span>`);
-  // structural (no auth / no usage endpoint) — a homes concern, kept quiet + muted
-  const nore = CREDS.filter(c => c.state === "unknown");
-  if (nore.length) bits.push(`<span class="attn" style="color:var(--sub);border-style:dashed" title="${esc(nore.map(c => c.name).join(", "))} — no auth or no usage endpoint; manage on the homes card, not a quota alert">${nore.length} home${nore.length > 1 ? "s" : ""} not reporting</span>`);
+  if (bad.length) bits.push(attnPill("bad", `${bad.length} need attention`, bad.map(c => c.name + ": " + c.state).join(" · ")));
   const hyg = CREDS.filter(c => c.name_lies || c.duplicate_homes);
-  if (hyg.length) bits.push(`<span class="attn warn" title="${esc(hyg.map(c => c.name + (c.name_lies ? " dir-name-lies" : "") + (c.duplicate_homes ? " " + c.duplicate_homes.length + "-homes" : "")).join(" · "))}">⚠ ${hyg.length} home issue${hyg.length > 1 ? "s" : ""} — hygiene plan has the marks</span>`);
+  if (hyg.length) bits.push(attnPill("warn", `${hyg.length} home ${hyg.length > 1 ? "issues" : "issue"}`, hyg.map(c => c.name + (c.name_lies ? " dir-name-lies" : "") + (c.duplicate_homes ? " " + c.duplicate_homes.length + "-homes" : "")).join(" · ")));
   const waste = CREDS.filter(c => c.windows_verdict && c.windows_verdict !== "ok" && c.windows_verdict !== "no-weekly");
   if (waste.length) {
-    const det = waste.map(c => {
-      const st = HIST.length ? strandAtReset(c.name) : null;
-      return short(c.name, 18) + (st != null ? ` strands ~${st}%` : "");
-    }).join(", ");
-    bits.push(`<span class="attn warn" title="projected remaining at the weekly reset = capacity that expires unused">${waste.length} window${waste.length > 1 ? "s" : ""} at waste-risk — ${esc(det)}</span>`);
+    const det = waste.map(c => { const st = HIST.length ? strandAtReset(c.name) : null; return short(c.name, 18) + (st != null ? ` strands ~${st}%` : ""); }).join(", ");
+    bits.push(attnPill("warn", `${waste.length} at waste-risk`, "capacity that expires unused at the weekly reset — " + det));
   }
-  const next = Object.entries(ALLOC).filter(([m, v]) => v && v.pick).map(([m, v]) => `${esc(m)}: <b title="headroom ${v.pick.headroom_pct}%">${esc(short(v.pick.account, 20))}</b>`);
-  if (next.length) bits.push(`<span class="attn next">next → ${next.join(" · ")}</span>`);
+  const nore = CREDS.filter(c => c.state === "unknown");
+  if (nore.length) bits.push(attnPill("", `${nore.length} not reporting`, nore.map(c => c.name).join(", ") + " — no auth or usage endpoint; manage on the homes card"));
+  // steady state: say so plainly rather than an empty row
+  if (!bits.length && CREDS.length) bits.push(attnPill("ok", "all accounts healthy"));
+  const next = Object.entries(ALLOC).filter(([m, v]) => v && v.pick).map(([m, v]) => `${m} → ${short(v.pick.account, 18)} (${v.pick.headroom_pct}%)`);
+  if (next.length) bits.push(attnPill("next", "next: " + short(next[0], 26), "recommended account per model — " + next.join(" · ")));
   $("#attn").innerHTML = bits.join("");
 }
 
@@ -1056,7 +1112,8 @@ function renderChart() {
   const histSpan = win === "5h" ? 24 * 3600e3 : 7 * 24 * 3600e3, projSpan = win === "5h" ? 6 * 3600e3 : 20 * 3600e3;
   let t0 = now - histSpan, t1 = now + projSpan;
   if (ZOOMW) { t0 = ZOOMW.t0; t1 = ZOOMW.t1; }
-  const W = 1400, H = 430, PL = 34, PR = 210, PT = 14, PB = 26, IW = W - PL - PR, IH = H - PT - PB;
+  const W = 1400, H = 430, PL = 30, PR = 196, PT = 14, PB = 26, IW = W - PL - PR, IH = H - PT - PB;
+  const LEG_LH = 19; // legend line height — one row per account, no overlap
   const x = t => PL + ((t - t0) / (t1 - t0)) * IW, y = p => PT + (1 - p / 100) * IH;
   let s = `<line x1="${PL}" y1="${y(0)}" x2="${PL + IW}" y2="${y(0)}" stroke="var(--line)"/>`
     + `<line x1="${PL}" y1="${y(50)}" x2="${PL + IW}" y2="${y(50)}" stroke="var(--line)" stroke-dasharray="2,5"/>`
@@ -1113,12 +1170,23 @@ function renderChart() {
           + `<circle cx="${x(S1.reset)}" cy="${y(100)}" r="2.8" fill="none" stroke="${col}" opacity="${op}"/>`;
       }
     }
-    labels.push({acct, col, v: lv, yy: y(lv), op});
+    labels.push({acct, col, v: lv, yy: y(lv), dy: y(lv), op});
   }
+  /* Direct labels in the right gutter, de-collided to one row each and, when
+     packed tight, spread evenly across the plot height. Name is left-aligned;
+     the % is right-aligned at a fixed x so the values form a tabular column
+     (Tufte: put the number where the eye can compare it). A short leader tie
+     joins each label to its line's endpoint. */
   labels.sort((a, b) => a.yy - b.yy);
-  for (let i = 1; i < labels.length; i++) if (labels[i].yy - labels[i - 1].yy < 16) labels[i].yy = labels[i - 1].yy + 16;
-  for (const l of labels)
-    s += `<text data-a="${esc(l.acct)}" x="${PL + IW + 8}" y="${l.yy + 4}" font-size="13" fill="${l.col}" opacity="${l.op}" style="cursor:pointer">${esc(short(l.acct, 24))} ${l.v.toFixed(0)}%</text>`;
+  for (let i = 1; i < labels.length; i++) if (labels[i].yy - labels[i - 1].yy < LEG_LH) labels[i].yy = labels[i - 1].yy + LEG_LH;
+  const overflow = labels.length && labels[labels.length - 1].yy > PT + IH;
+  if (overflow) labels.forEach((l, i) => l.yy = PT + 6 + i * ((IH - 12) / Math.max(1, labels.length - 1)));
+  const nameX = PL + IW + 12, valX = W - 6;
+  for (const l of labels) {
+    s += `<line x1="${(PL + IW + 2).toFixed(1)}" y1="${l.dy.toFixed(1)}" x2="${(nameX - 3).toFixed(1)}" y2="${l.yy.toFixed(1)}" stroke="${l.col}" stroke-width="1" opacity="${l.op * 0.4}"/>`;
+    s += `<text data-a="${esc(l.acct)}" x="${nameX}" y="${l.yy + 4}" font-size="12" fill="${l.col}" opacity="${l.op}" style="cursor:pointer">${esc(short(l.acct, 20))}</text>`;
+    s += `<text data-a="${esc(l.acct)}" x="${valX}" y="${l.yy + 4}" font-size="12" font-weight="600" text-anchor="end" fill="${l.col}" opacity="${l.op}" style="cursor:pointer;font-variant-numeric:tabular-nums">${l.v.toFixed(0)}%</text>`;
+  }
   svgEl.innerHTML = s;
   svgEl._geo = {t0, t1, x, y, S, PL, IW, PT, IH, now};
 }
@@ -1181,15 +1249,8 @@ $("#chart").addEventListener("click", e => {
 updateZoomHint();
 
 /* ================= account table ================= */
-function battery(pct, sel, scale = 1) {
-  const col = pct == null ? "var(--mut)" : pct >= 50 ? "var(--ok)" : pct >= 20 ? "var(--warn)" : "var(--bad)";
-  const w = pct == null ? 0 : Math.max(1, (Math.min(100, pct) / 100) * 16);
-  const sw = 28 * scale, sh = 15 * scale;
-  return `<svg class="batt" width="${sw}" height="${sh}" viewBox="0 0 24 13">
-    <rect x="1" y="1.5" width="20" height="10" rx="2.5" fill="none" stroke="${sel ? "var(--accent)" : "var(--mut)"}" stroke-width="${sel ? 2 : 1.1}"/>
-    <rect x="21.6" y="4.5" width="2" height="4" rx="1" fill="${sel ? "var(--accent)" : "var(--mut)"}"/>
-    <rect x="3" y="3.5" width="${w}" height="6" rx="1.2" fill="${col}"/></svg>`;
-}
+/* the signal colour for a remaining-% (green healthy → amber → red low) */
+function pctCol(pct) { return pct == null ? "var(--mut)" : pct >= 50 ? "var(--ok)" : pct >= 20 ? "var(--warn)" : "var(--bad)"; }
 const LOGIN_CMDS = {anthropic: h => `CLAUDE_CONFIG_DIR=${h} claude /login`, codex: h => `CODEX_HOME=${h} codex login --device-auth`};
 function latestGauges(acct) {
   const out = {}, when = {};
@@ -1205,12 +1266,15 @@ function latestGauges(acct) {
   }
   return out;
 }
+/* one quota cell: right-aligned %, a slim proportional bar, and the reset ETA
+   underneath — no chunky battery glyph, colour only on the bar/number. */
 function qcell(g, fallbackReset) {
-  if (!g) return `<td class="rst">—</td>`;
-  const pct = g.rem;
-  let reset = g.reset && g.reset > Date.now() ? g.reset : (fallbackReset && fallbackReset > Date.now() ? fallbackReset : null);
-  const rl = reset ? ` <span class="rst" title="resets ${new Date(reset).toLocaleString([], {weekday: "short", hour: "numeric", minute: "2-digit"})}">↻${fmtIn(reset)}</span>` : "";
-  return `<td class="qbig">${battery(pct, false)} <b>${pct.toFixed(0)}%</b>${rl}</td>`;
+  if (!g) return `<td class="qcell rst">—</td>`;
+  const pct = g.rem, col = pctCol(pct);
+  const reset = g.reset && g.reset > Date.now() ? g.reset : (fallbackReset && fallbackReset > Date.now() ? fallbackReset : null);
+  const rl = reset ? `<span class="rst" title="resets ${new Date(reset).toLocaleString([], {weekday: "short", hour: "numeric", minute: "2-digit"})}">↻ ${fmtIn(reset)}</span>` : "";
+  return `<td class="qcell"><span class="qv" style="color:${col}">${pct.toFixed(0)}%</span>`
+    + `<div class="qbar"><i style="width:${Math.max(2, Math.min(100, pct))}%;background:${col}"></i></div>${rl}</td>`;
 }
 let SORTA = {key: null, dir: 1};
 function _sortVal(c, key) {
@@ -1225,11 +1289,11 @@ function renderAccts() {
   const tb = $("#atbody");
   if (!CREDS.length) { tb.innerHTML = ""; return; }
   const labels = gaugeLabels(), extras = labels.filter(l => l !== "5h" && l !== "7d");
-  const arrow = k => SORTA.key === k ? (SORTA.dir > 0 ? " ▲" : " ▼") : "";
-  $("#athead").innerHTML = `<th></th><th data-s="account">account${arrow("account")}</th>`
-    + `<th data-s="5h">session (5h)${arrow("5h")}</th><th data-s="7d">weekly (7d)${arrow("7d")}</th>`
-    + extras.map(l => `<th data-s="${esc(l)}">${esc(LBL_NICE[l] || l)}${arrow(l)}</th>`).join("")
-    + `<th data-s="win">win${arrow("win")}</th>`;
+  const arrow = k => SORTA.key === k ? (SORTA.dir > 0 ? " ↑" : " ↓") : "";
+  $("#athead").innerHTML = `<th data-s="account">account${arrow("account")}</th>`
+    + `<th class="num" data-s="5h">session${arrow("5h")}</th><th class="num" data-s="7d">weekly${arrow("7d")}</th>`
+    + extras.map(l => `<th class="num" data-s="${esc(l)}">${esc(LBL_NICE[l] || l)}${arrow(l)}</th>`).join("")
+    + `<th class="num" data-s="win">windows${arrow("win")}</th>`;
   $$("#athead th[data-s]").forEach(th => th.onclick = () => {
     const k = th.dataset.s;
     SORTA = SORTA.key === k ? {key: k, dir: -SORTA.dir} : {key: k, dir: 1};
@@ -1245,21 +1309,21 @@ function renderAccts() {
   });
   tb.innerHTML = show.map(c => {
     const G = latestGauges(c.name), sel = SEL[c.provider] === c.name;
-    const rems = labels.map(k => G[k] && G[k].rem).filter(v => v != null);
-    const binding = rems.length ? Math.min(...rems) : (c.headroom ?? null);
-    const flags = [c.name_lies ? "⚠name" : "", c.duplicate_homes ? `⚠${c.duplicate_homes.length}homes` : ""].filter(Boolean).join(" ");
+    const flags = [c.name_lies ? "name-lies" : "", c.duplicate_homes ? `${c.duplicate_homes.length} homes` : ""].filter(Boolean).join(", ");
     const win = c.windows_left != null ? `${c.windows_left.toFixed(1)}/${c.windows_per_week.toFixed(1)}` : "—";
-    const wv = c.windows_verdict && c.windows_verdict !== "ok" ? ` <span class="flagchip">${esc(c.windows_verdict)}</span>` : "";
+    const wv = c.windows_verdict && c.windows_verdict !== "ok" ? `<span class="rst" title="projected unused capacity at the reset">${esc(c.windows_verdict)}</span>` : "";
     const fix = (LOGIN_CMDS[c.provider] || (x => ""))(c.home);
     const st = c.state === "ok" ? `<span class="st-ok">ok</span>`
-      : `<span class="st-${c.state} stfix" data-fix="${esc(fix)}" title="click to copy the fix (you run the login yourself): ${esc(fix)}">${esc(c.state)} ⧉</span>`;
+      : `<span class="st-${c.state} stfix" data-fix="${esc(fix)}" title="click to copy the login fix (you run it yourself): ${esc(fix)}">${esc(c.state)}</span>`;
+    // account cell: colour dot + name (+ a quiet live-dot), then a muted meta line
+    const meta = [esc((c.tier || c.provider).replace("Max 20x", "Max 20×")), st, "home: " + esc(c.home_name || "?")]
+      .concat(flags ? [`<span class="flagchip">${flags}</span>`] : []).join('<span class="sep">·</span>');
     return `<tr data-a="${esc(c.name)}" data-p="${c.provider}" class="${sel ? "sel" : ""}" title="click to select for ${c.provider === "anthropic" ? "claude" : "codex"} resumes">
-      <td title="binding window: ${binding == null ? "?" : binding.toFixed(0) + "% left"}${sel ? " · SELECTED" : ""}">${battery(binding, sel, 1.15)}</td>
-      <td><span class="adot" style="background:${acol(c.name)}"></span><b>${esc(c.name)}</b>${c.active ? ' <span title="a live agent is on this account right now" style="color:var(--ok)">▶</span>' : ""}
-        <div class="acct-line2">${esc((c.tier || c.provider).replace("Max 20x", "Max 20×"))} · ${st} · home: ${esc(c.home_name || "?")}${flags ? ` · <span class="flagchip">${flags}</span>` : ""}</div></td>
+      <td><div class="acct-name"><span class="adot" style="background:${acol(c.name)}"></span>${esc(c.name)}${c.active ? '<span class="live" title="a live agent is on this account right now"></span>' : ""}</div>
+        <div class="acct-line2">${meta}</div></td>
       ${qcell(G["5h"])}${qcell(G["7d"], c.resets_at_ms)}
       ${extras.map(l => qcell(G[l])).join("")}
-      <td class="qbig">${win}${wv}</td></tr>`;
+      <td class="qcell"><span class="qv">${win}</span>${wv ? '<div style="margin-top:2px">' + wv + "</div>" : ""}</td></tr>`;
   }).join("");
   tb.querySelectorAll("tr").forEach(tr => {
     tr.onclick = e => {
@@ -1457,9 +1521,9 @@ async function loadCatalog(refresh) {
     .map(([b, n]) => `<option value="${esc(b)}">${n ? n + " sessions" : "registry project"}</option>`).join("");
   const gb = DATA.reduce((s, r) => s + r.z, 0) / 1e9, cl = DATA.filter(r => r.h === "claude").length;
   const work = DATA.filter(r => !r.syn).length, refs = DATA.length - work;
-  NAV_SESS = `<span><b>${work.toLocaleString()}</b> work sessions</span>`
-    + (refs ? `<span title="daily-memory summarizers — kept as training data, hidden from resume search by default">+${refs.toLocaleString()} refs</span>` : "")
-    + `<span><b>${cl.toLocaleString()}</b> cl · <b>${(DATA.length - cl).toLocaleString()}</b> cx</span><span><b>${gb.toFixed(1)} GB</b></span>`;
+  NAV_SESS = statCell(work, "sessions", refs ? `+${refs.toLocaleString()} reference transcripts (hidden from resume search)` : "")
+    + statCell(cl + "·" + (DATA.length - cl), "cl·cx", "claude · codex sessions")
+    + statCell(gb.toFixed(1), "GB");
   renderNav();
   renderSessions();
   if (HIST.length) renderChart();
@@ -1797,7 +1861,7 @@ async function loadEarlier() {
 document.addEventListener("keydown", e => { if (e.key === "Escape") { $("#drawer").classList.remove("show"); $("#tray").classList.remove("show"); hidePop(); } });
 
 /* ---------- team tray ---------- */
-function trayCount() { const b = $("#trayBtn"); b.textContent = `tray (${TEAM.length})`; b.classList.toggle("has", TEAM.length > 0); }
+function trayCount() { const b = $("#trayBtn"); b.innerHTML = "⊞" + (TEAM.length ? `<span class="n">${TEAM.length}</span>` : ""); b.classList.toggle("has", TEAM.length > 0); }
 function renderTray() {
   const seats = $("#seats");
   if (!seats) return;
