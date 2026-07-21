@@ -130,12 +130,29 @@ def _hook_cmds(settings, event=HOOK_EVENT):
     return out
 
 
+def _matcher_ok(group, spec):
+    """A spec with a matcher demands EXACTLY that matcher on its group — a
+    stale `PostToolUse` group pinned to `Bash` silently misses most tool
+    boundaries (codex B3). Specs without one (UserPromptSubmit) don't care."""
+    return spec["matcher"] is None or group.get("matcher") == spec["matcher"]
+
+
+def _canonical_entry(spec):
+    entry = {"hooks": [{"type": "command", "command": spec_command(spec)}]}
+    if spec["matcher"]:
+        entry["matcher"] = spec["matcher"]
+    return entry
+
+
 def _merge_event(out, spec):
     """Merge ONE spec's entry into `out` IN PLACE -> action ok|add|update.
-    MERGE-preserving: only the entry carrying this spec's own-marker is ever
-    written; foreign hooks (record.py's PostToolUse leg included) and every
-    other settings key survive byte-identical. Raises ValueError on a shape
-    we must not touch."""
+    An owned entry is CURRENT only when command, type AND the containing
+    group's matcher all match (codex B3). A wrong matcher is repaired in
+    place when the group is exclusively ours; with foreign co-tenants our
+    hook relocates to a canonical group and the foreigners keep their group
+    byte-identical. MERGE-preserving throughout: only the entry carrying
+    this spec's own-marker is ever written. Raises ValueError on a shape we
+    must not touch."""
     cmd = spec_command(spec)
     own = spec["own"]
     hooks = out.setdefault("hooks", {})
@@ -148,18 +165,28 @@ def _merge_event(out, spec):
     for g in groups:
         if not isinstance(g, dict):
             continue
-        for h in g.get("hooks") or []:
-            if isinstance(h, dict) and any(m in str(h.get("command") or "")
-                                           for m in own):
-                if h.get("command") == cmd:
-                    return "ok"
-                h["command"] = cmd
-                h["type"] = "command"
+        hlist = g.get("hooks") or []
+        for h in hlist:
+            if not (isinstance(h, dict) and any(m in str(h.get("command") or "")
+                                                for m in own)):
+                continue
+            if h.get("command") == cmd and h.get("type") == "command" \
+                    and _matcher_ok(g, spec):
+                return "ok"
+            h["command"] = cmd
+            h["type"] = "command"
+            if _matcher_ok(g, spec):
+                return "update"          # command/type were the stale part
+            if len(hlist) == 1:          # the group is ours alone — repair it
+                if spec["matcher"] is None:
+                    g.pop("matcher", None)
+                else:
+                    g["matcher"] = spec["matcher"]
                 return "update"
-    entry = {"hooks": [{"type": "command", "command": cmd}]}
-    if spec["matcher"]:
-        entry["matcher"] = spec["matcher"]
-    groups.append(entry)
+            hlist.remove(h)              # foreign co-tenants stay untouched
+            groups.append(_canonical_entry(spec))
+            return "update"
+    groups.append(_canonical_entry(spec))
     return "add"
 
 
@@ -223,10 +250,26 @@ def install_home(path, dry=False):
     return action, "backup: %s" % (res.get("backup") or "none — new file")
 
 
+def _lane_live(settings, spec):
+    """A delivery lane counts as live ONLY on the exact spec command inside
+    a group whose matcher matches the spec (codex B3): a marker substring
+    under a `Bash`-pinned group is a stale install, not coverage."""
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    groups = hooks.get(spec["event"]) if isinstance(hooks, dict) else None
+    cmd = spec_command(spec)
+    for g in groups if isinstance(groups, list) else []:
+        if not (isinstance(g, dict) and _matcher_ok(g, spec)):
+            continue
+        for h in g.get("hooks") or []:
+            if isinstance(h, dict) and h.get("command") == cmd:
+                return True
+    return False
+
+
 def status_rows():
     """Per-claude-home coverage: inject hook present? helm resolvable?
-    fail-open contract present? Plus the delivery lane's two booleans
-    (deliver/join present). Read-only."""
+    fail-open contract present? Plus the delivery lane's two booleans —
+    exact command + matcher validated, never marker presence. Read-only."""
     rows = []
     for name, path in claude_homes():
         cmd, settings = None, {}
@@ -236,9 +279,7 @@ def status_rows():
             cmd = next((c for c in _hook_cmds(settings) if _ours(c)), None)
         except (OSError, ValueError):
             pass
-        lanes = {s["name"]: any(any(m in c for m in s["own"])
-                                for c in _hook_cmds(settings, s["event"]))
-                 for s in SPECS[1:]}
+        lanes = {s["name"]: _lane_live(settings, s) for s in SPECS[1:]}
         rows.append({"home": name, "path": path, "hook": bool(cmd), "command": cmd,
                      "resolvable": bool(cmd) and _resolvable(cmd),
                      "fail_open": bool(cmd) and _fail_open(cmd), **lanes})
