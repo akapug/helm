@@ -56,7 +56,11 @@ def _pct(h):
 
 
 def cmd_creds(args):
-    """creds [--refresh] — live account scorecard (the quota view, in text)."""
+    """creds [crosscheck] — live account scorecard (the quota view, in text);
+    crosscheck = the local-session-scan second source vs the header truth."""
+    if args and args[0] == "crosscheck":
+        from . import localscan
+        return localscan.cmd_crosscheck(args[1:])
     try:
         rows = _rows()
     except ProviderError as e:

@@ -753,6 +753,28 @@ credential state, reset window, and the use-it-or-lose-it weekly verdict.
 Degrades to a one-line notice on machines with no quota provider — sessions
 and resume still work.
 
+### `helm creds crosscheck [--json]`
+The local-session-scan SECOND SOURCE: sums per-record work
+(`output_tokens + cache_creation_input_tokens` — never raw cumulative input)
+from the local claude session JSONL into the same 5h / 7d / 7d-Fable windows
+the header probe reports, then cross-checks the two. Drift is a **health
+signal, reported never fatal**: header-active/scan-empty means the usage
+happened elsewhere (another machine, an incomplete store);
+scan-active/header-idle means a rolled window or accounting lag. Accounts
+group by the canonical `projects` store behind their homes — the shared store
+(every helm claude home symlinks onto `~/.claude/projects`) yields ONE
+commingled row that never masquerades as a per-account cross-check; only a
+truly isolated store cross-checks its one account. The header stays the
+decision-point read; the scan is observational.
+
+```console
+$ helm creds crosscheck
+helm creds crosscheck — local-session scan vs header truth (drift = a health signal, reported never fatal)
+  ~/.claude/projects  (SHARED by 4: you@example.com, ...)
+    scan:   5h 1.2M | 7d 45M | fable-7d 12M tokens over 1834 records (newest 2026-07-20T17:05Z)
+    commingled — 4 accounts share this store; not a per-account cross-check
+```
+
 ### `helm swap <home-or-account>`
 A seat ran dry mid-work: find its live sessions, pick the healthiest other
 account of the same provider, and print the exact resume-under-that-account

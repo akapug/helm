@@ -177,7 +177,7 @@ _VERB_HELP = {
     "rehome": "rehome <sid> <new-cwd>|--reset — re-home a session (claude slug symlink)",
     "prune": "prune <sid> [--preset lean|window20k] [--dry] — resume-optimized copy, original untouched",
     "keepalive": "keepalive [--home H] [--early N] — roll idle claude homes' tokens (codex read-only)",
-    "creds": "creds — live account scorecard (headroom/state/reset), all providers",
+    "creds": "creds [crosscheck [--json]] — live account scorecard (headroom/state/reset), all providers; crosscheck sums local session JSONL into the same 5h/7d windows and cross-checks the header truth (drift = health signal)",
     "swap": "swap <home|email> — seat ran dry: print resume-under-healthier-account blocks",
     "capsule": "capsule <sid> — the session's git era: worktree + resume commands",
     "ship": "ship [--apply] [--remote URL] | ship pull | ship hosts — the authored chain over git (dry-run default; pull merges + re-derives)",
