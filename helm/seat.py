@@ -62,19 +62,25 @@ SCRUB_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
 CODEX_HOMES = os.path.join(os.path.expanduser("~"), ".codex-homes")
 PROXY_BIN_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin", "cli-proxy-api")
 
-# Presets as data (the addendum's table). v1 wires "codex"; first-party
-# Anthropic-compatible families later need only mode+base_url+key_env — no
-# proxy, e.g.:
-#   "kimi":     {"port": 8318, "model": "kimi-k3", "mode": "first-party",
-#                "base_url": "https://api.moonshot.ai/anthropic",
-#                "key_env": "MOONSHOT_API_KEY"},
-#   "glm" / "deepseek": same shape.
+# Presets as data (the addendum's table). Three modes: "proxy" (OAuth cred
+# translated into CLIProxyAPI, e.g. codex), "proxy-key" (an API-key provider
+# behind the same proxy via its openai-compatibility block, e.g. kimi), and
+# "first-party" (Anthropic-compatible endpoint, no proxy — future glm/deepseek:
+# only mode+base_url+key_env needed).
 FAMILIES = {
     "codex": {"port": 8317, "model": "gpt-5.6-sol", "mode": "proxy"},
+    # kimi rides the kimi.com CODING-plan endpoint (dual-wire; OpenAI wire at
+    # /coding/v1 — live-verified 2026-07-20). A Moonshot PLATFORM key would
+    # need base_url https://api.moonshot.ai/v1 instead; platform endpoints
+    # reject coding-plan keys ("Invalid Authentication") and vice versa.
+    "kimi": {"port": 8318, "model": "kimi-k3", "mode": "proxy-key",
+             "base_url": "https://api.kimi.com/coding/v1",
+             "key_env": "KIMI_API_KEY", "provider": "moonshot"},
 }
 
 _USAGE = """usage: helm seat <verb> [args]
   add <family> [--auth-from <path>]   mint the seat (translate cred read-only)
+               [--key-from <path>]    proxy-key families: .env-style key file
   up <family> | down <family>         start/stop the seat's local proxy
   launch <family> [--model M]         print the exact launch line (never runs it)
   smoke <family>                      the 4-leg acceptance gate (prompt/tool/subagent/whisper)
@@ -268,6 +274,32 @@ def _config_yaml(port, auth_dir, token):
             "  disable-control-panel: true\n") % (port, auth_dir, token)
 
 
+def _config_yaml_key(port, token, provider, base_url, model, api_key):
+    """The proxy-key config: same inbound head (the per-seat token claude
+    presents), no auth-dir (no OAuth cred), plus the openai-compatibility
+    provider block carrying the outbound API key (0600 via _write_private —
+    the same trust level as the seat token beside it)."""
+    return ('host: "127.0.0.1"\n'
+            "port: %d\n"
+            "api-keys:\n"
+            '  - "%s"\n'
+            "debug: false\n"
+            "usage-statistics-enabled: false\n"
+            "remote-management:\n"
+            "  allow-remote: false\n"
+            '  secret-key: ""\n'
+            "  disable-control-panel: true\n"
+            "openai-compatibility:\n"
+            '  - name: "%s"\n'
+            '    base-url: "%s"\n'
+            "    api-key-entries:\n"
+            '      - api-key: "%s"\n'
+            "    models:\n"
+            '      - name: "%s"\n'
+            '        alias: "%s"\n'
+            % (port, token, provider, base_url, api_key, model, model))
+
+
 def launch_line(family, model=None):
     """The exact seat launch command. env -u ANTHROPIC_API_KEY is part of the
     line: an inherited key must never ride into a proxied seat either."""
@@ -284,6 +316,82 @@ def launch_line(family, model=None):
                model, cfgdir, model))
 
 
+def _seat_token(family, d):
+    """Read-or-mint the per-seat proxy token — stable across re-adds so a
+    minted launch line stays valid."""
+    token = _read_token(family)
+    if not token:
+        import secrets
+        token = secrets.token_hex(32)
+        _write_private(os.path.join(d, "token"), token + "\n")
+    return token
+
+
+def _write_launch_assets(family, d):
+    """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
+    identical for every mode."""
+    os.makedirs(os.path.join(d, "claude"), exist_ok=True)
+    _write_private(os.path.join(d, "launch.sh"),
+                   "#!/bin/sh\n# helm seat %s — minted by `helm seat add`; "
+                   "regenerate with `helm seat launch %s`\nexec %s \"$@\"\n"
+                   % (family, family, launch_line(family)), mode=0o700)
+
+
+def _env_file_value(path, key):
+    """The value of the `key=...` line in a .env-style file (`export ` prefix
+    and surrounding quotes tolerated); None absent/unreadable. The value is
+    secret — callers must never print or log it."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if line.startswith(key + "="):
+            val = line.split("=", 1)[1].strip().strip('"').strip("'")
+            if val:
+                return val
+    return None
+
+
+def _add_proxy_key(family, fam, args):
+    """mode "proxy-key": an API-key provider behind the same local proxy via
+    its openai-compatibility block. No OAuth, no auth-dir. Key source order:
+    $<key_env>, then --key-from <.env-style file>. The key is baked into the
+    seat's 0600 config.yaml once, at add time — never printed, never logged."""
+    key_env = fam["key_env"]
+    api_key = os.environ.get(key_env)
+    if not api_key and "--key-from" in args:
+        path = os.path.expanduser(args[args.index("--key-from") + 1])
+        api_key = _env_file_value(path, key_env)
+        if not api_key:
+            print("helm seat: no %s= line found in %s" % (key_env, path),
+                  file=sys.stderr)
+            return 1
+    if not api_key:
+        print("helm seat: no outbound key — export %s=<key> or pass "
+              "--key-from <env-file> carrying a %s= line, then re-run "
+              "`helm seat add %s`" % (key_env, key_env, family), file=sys.stderr)
+        return 1
+    d = seat_dir(family)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    token = _seat_token(family, d)
+    _write_private(os.path.join(d, "config.yaml"),
+                   _config_yaml_key(fam["port"], token, fam["provider"],
+                                    fam["base_url"], fam["model"], api_key))
+    _write_launch_assets(family, d)
+    print("helm seat: %s seat minted at %s" % (family, d))
+    print("  outbound %s key baked into config.yaml (0600 — value never "
+          "printed); provider %s -> %s" % (key_env, fam["provider"], fam["base_url"]))
+    print("  proxy port %d; next: `helm seat up %s`, then `helm seat launch %s`"
+          % (fam["port"], family, family))
+    return 0
+
+
 def _add(family, args):
     fam = FAMILIES.get(family)
     if fam is None:
@@ -292,9 +400,11 @@ def _add(family, args):
               "base_url + key_env — see helm/seat.py." % (family, ", ".join(sorted(FAMILIES))),
               file=sys.stderr)
         return 2
+    if fam["mode"] == "proxy-key":
+        return _add_proxy_key(family, fam, args)
     if fam["mode"] != "proxy":
-        print("helm seat: family '%s' is first-party — proxyless add not yet "
-              "implemented" % family, file=sys.stderr)
+        print("helm seat: family '%s' mode '%s' not yet wired — proxyless add "
+              "not implemented" % (family, fam["mode"]), file=sys.stderr)
         return 2
     src = None
     if "--auth-from" in args:
@@ -325,18 +435,10 @@ def _add(family, args):
         os.remove(stale)  # one cred per seat; re-add refreshes it
     _write_private(os.path.join(auth_dir, fname),
                    json.dumps(rec, indent=2, sort_keys=False) + "\n")
-    token = _read_token(family)
-    if not token:  # stable across re-adds so a minted launch line stays valid
-        import secrets
-        token = secrets.token_hex(32)
-        _write_private(os.path.join(d, "token"), token + "\n")
+    token = _seat_token(family, d)
     _write_private(os.path.join(d, "config.yaml"),
                    _config_yaml(fam["port"], auth_dir, token))
-    os.makedirs(os.path.join(d, "claude"), exist_ok=True)
-    _write_private(os.path.join(d, "launch.sh"),
-                   "#!/bin/sh\n# helm seat %s — minted by `helm seat add`; "
-                   "regenerate with `helm seat launch %s`\nexec %s \"$@\"\n"
-                   % (family, family, launch_line(family)), mode=0o700)
+    _write_launch_assets(family, d)
 
     print("helm seat: %s seat minted at %s" % (family, d))
     print("  cred %s (%s) from %s (read-only), access token valid until %s"
@@ -505,7 +607,8 @@ def _seat_row(family):
     d = seat_dir(family)
     fam = FAMILIES.get(family) or {}
     creds = glob.glob(os.path.join(d, "auth", "*.json"))
-    cred = "no cred"
+    cred = "api-key cred (baked into config.yaml)" \
+        if fam.get("mode") == "proxy-key" else "no cred"
     if creds:
         try:
             with open(creds[0]) as f:

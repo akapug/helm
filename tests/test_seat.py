@@ -28,11 +28,13 @@ class SeatTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-seat-")
         self._env = {k: os.environ.get(k) for k in
-                     ("HELM_HOME", "MELD_HOME", "HELM_PROXY_BIN", "MELD_PROXY_BIN")}
+                     ("HELM_HOME", "MELD_HOME", "HELM_PROXY_BIN",
+                      "MELD_PROXY_BIN", "KIMI_API_KEY")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm-home")
         os.environ.pop("MELD_HOME", None)
         os.environ.pop("HELM_PROXY_BIN", None)
         os.environ.pop("MELD_PROXY_BIN", None)
+        os.environ.pop("KIMI_API_KEY", None)  # hermetic: never the real key
         self._codex_homes = seat.CODEX_HOMES
         seat.CODEX_HOMES = os.path.join(self.tmp, "codex-homes")
         os.makedirs(seat.CODEX_HOMES)
@@ -177,9 +179,111 @@ class SeatTest(unittest.TestCase):
         self.assertIn("expired", err)
 
     def test_unknown_family_refused(self):
-        rc, out, err = self._add(("add", "kimi"))
+        rc, out, err = self._add(("add", "glm"))
         self.assertEqual(rc, 2)
         self.assertIn("not yet wired", err)
+
+    # -- proxy-key families (kimi) ------------------------------------------
+    def test_config_yaml_key_exact_shape(self):
+        cfg = seat._config_yaml_key(8318, "tok-abc", "moonshot",
+                                    "https://api.moonshot.ai/v1", "kimi-k3",
+                                    "fake-key-xyz")
+        self.assertEqual(cfg, (
+            'host: "127.0.0.1"\n'
+            "port: 8318\n"
+            "api-keys:\n"
+            '  - "tok-abc"\n'
+            "debug: false\n"
+            "usage-statistics-enabled: false\n"
+            "remote-management:\n"
+            "  allow-remote: false\n"
+            '  secret-key: ""\n'
+            "  disable-control-panel: true\n"
+            "openai-compatibility:\n"
+            '  - name: "moonshot"\n'
+            '    base-url: "https://api.moonshot.ai/v1"\n'
+            "    api-key-entries:\n"
+            '      - api-key: "fake-key-xyz"\n'
+            "    models:\n"
+            '      - name: "kimi-k3"\n'
+            '        alias: "kimi-k3"\n'))
+        self.assertNotIn("auth-dir", cfg)
+
+    def test_add_kimi_from_env_var(self):
+        os.environ["KIMI_API_KEY"] = "fake-kimi-key-for-tests"
+        rc, out, err = self._add(("add", "kimi"))
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("fake-kimi-key-for-tests", out + err)  # never printed
+        d = seat.seat_dir("kimi")
+        for p, want in ((os.path.join(d, "token"), 0o600),
+                        (os.path.join(d, "config.yaml"), 0o600),
+                        (os.path.join(d, "launch.sh"), 0o700)):
+            self.assertTrue(os.path.exists(p), p)
+            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), want, p)
+        self.assertTrue(os.path.isdir(os.path.join(d, "claude")))
+        self.assertFalse(os.path.exists(os.path.join(d, "auth")))  # no OAuth dir
+        with open(os.path.join(d, "config.yaml")) as f:
+            cfg = f.read()
+        self.assertIn("openai-compatibility:", cfg)
+        self.assertIn('api-key: "fake-kimi-key-for-tests"', cfg)
+        self.assertIn('base-url: "https://api.kimi.com/coding/v1"', cfg)
+        self.assertIn('alias: "kimi-k3"', cfg)
+        self.assertNotIn("auth-dir", cfg)
+        with open(os.path.join(d, "token")) as f:
+            self.assertIn(f.read().strip(), cfg)  # inbound seat token present
+        # the hard law holds for proxy-key seats too
+        for root, _, files in os.walk(d):
+            for name in files:
+                with open(os.path.join(root, name)) as f:
+                    self.assertNotIn("ANTHROPIC_API_KEY=", f.read())
+
+    def test_add_kimi_key_from_file(self):
+        envfile = os.path.join(self.tmp, "fake.env")
+        with open(envfile, "w") as f:
+            f.write("# comment\nexport KIMI_API_KEY='fake-from-file-key'\n")
+        rc, out, err = self._add(("add", "kimi", "--key-from", envfile))
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir("kimi"), "config.yaml")) as f:
+            self.assertIn('api-key: "fake-from-file-key"', f.read())
+
+    def test_add_kimi_env_var_beats_key_from(self):
+        os.environ["KIMI_API_KEY"] = "fake-env-wins"
+        envfile = os.path.join(self.tmp, "fake.env")
+        with open(envfile, "w") as f:
+            f.write("KIMI_API_KEY=fake-file-loses\n")
+        rc, _, err = self._add(("add", "kimi", "--key-from", envfile))
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir("kimi"), "config.yaml")) as f:
+            self.assertIn('api-key: "fake-env-wins"', f.read())
+
+    def test_add_kimi_missing_key_unblock(self):
+        rc, out, err = self._add(("add", "kimi"))
+        self.assertEqual(rc, 1)
+        self.assertIn("KIMI_API_KEY", err)  # names the env-var option
+        self.assertIn("--key-from", err)    # and the file option
+        self.assertFalse(os.path.exists(os.path.join(seat.seat_dir("kimi"),
+                                                     "config.yaml")))
+
+    def test_add_kimi_key_from_missing_line(self):
+        envfile = os.path.join(self.tmp, "empty.env")
+        with open(envfile, "w") as f:
+            f.write("OTHER_VAR=1\n")
+        rc, out, err = self._add(("add", "kimi", "--key-from", envfile))
+        self.assertEqual(rc, 1)
+        self.assertIn("KIMI_API_KEY", err)
+
+    def test_kimi_launch_line_shape(self):
+        os.environ["KIMI_API_KEY"] = "fake-kimi-key-for-tests"
+        self.assertEqual(self._add(("add", "kimi"))[0], 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = seat.cmd_seat(["launch", "kimi"])
+        self.assertEqual(rc, 0)
+        line = out.getvalue().strip()
+        self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8318", line)
+        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=kimi-k3", line)
+        self.assertTrue(line.endswith("claude --model kimi-k3"))
+        self.assertNotIn("fake-kimi-key-for-tests", line)  # key never rides
 
     # -- launch line shape --------------------------------------------------
     def test_launch_line_shape(self):
