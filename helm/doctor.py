@@ -302,11 +302,46 @@ def check_record():
     return record.doctor_rows()
 
 
+def check_cred_families():
+    """Shared-family hygiene (the revocation bomb): byte-identical refresh
+    tokens across credential homes = copies of ONE token family — reuse
+    detection revokes all of them at once, and a fresh login per home is the
+    only fix. Content-hash comparison only (homes.py); token bytes never
+    surface anywhere."""
+    from . import homes
+    try:
+        rows = [r for r in homes.homes_list()
+                if r.get("authed") and not r.get("archived")]
+    except Exception as e:
+        return [(WARN, "cred-family audit unavailable (%s: %s)"
+                 % (e.__class__.__name__, e))]
+    if not rows:
+        return []
+    out, seen = [], set()
+    for r in rows:
+        fam = r.get("shared_family")
+        if not fam:
+            continue
+        group = (r["provider"], tuple(sorted([r["name"]] + fam)))
+        if group in seen:
+            continue
+        seen.add(group)
+        out.append((FAIL, "shared token family: %s homes [%s] hold BYTE-COPIES of "
+                          "one refresh token — reuse detection revokes ALL of them; "
+                          "fresh login per home (`helm homes verify` has the detail)"
+                    % (r["provider"], ", ".join(group[1]))))
+    if not out:
+        families = {(r["provider"], r["family"]) for r in rows if r.get("family")}
+        out.append((OK, "cred token families: %d distinct across %d authed homes — "
+                        "no byte-copies" % (len(families), len(rows))))
+    return out
+
+
 CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
           "check_projection_registry",
           "check_adopted_store", "check_know_your_user", "check_cv",
           "check_inject_coverage", "check_env", "check_physics_currency", "check_record",
-          "check_chat_node")
+          "check_chat_node", "check_cred_families")
 
 
 def cmd_doctor(args):

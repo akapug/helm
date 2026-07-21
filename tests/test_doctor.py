@@ -268,7 +268,9 @@ class TestCmdDoctor(DoctorBase):
         before = self.snapshot(self.tmp.name)
         with mock.patch.object(home, "adopted_memory_dir", lambda: adopted), \
                 mock.patch.object(doctor, "check_cv",
-                                  lambda: [(doctor.OK, "cv stub")]):
+                                  lambda: [(doctor.OK, "cv stub")]), \
+                mock.patch.object(doctor, "check_cred_families",
+                                  lambda: [(doctor.OK, "families stub")]):
             rc, out = self.run_doctor()
         self.assertEqual(rc, 1)  # the broken symlink FAIL
         self.assertIn("FAIL", out)
@@ -297,7 +299,9 @@ class TestCmdDoctor(DoctorBase):
                              "updated_at": "", "source": "fresh"})
         with mock.patch.object(home, "adopted_memory_dir", lambda: adopted), \
                 mock.patch.object(doctor, "check_cv",
-                                  lambda: [(doctor.OK, "cv stub")]):
+                                  lambda: [(doctor.OK, "cv stub")]), \
+                mock.patch.object(doctor, "check_cred_families",
+                                  lambda: [(doctor.OK, "families stub")]):
             rc, out = self.run_doctor()
         self.assertEqual(rc, 0)
         self.assertIn("0 fail", out)

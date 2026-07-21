@@ -792,6 +792,14 @@ structure; **you run every login** — helm never touches an auth flow.
 Archive/restore are directory moves (archive-not-delete); live-agent homes
 are refused.
 
+`verify` (and the list's hygiene column) includes the **shared-family** audit
+— the revocation bomb: byte-identical refresh tokens across homes mean copies
+of ONE token family, and the vendor's reuse detection revokes the whole
+family at once. Detection compares sha256 content hashes only (10-hex digest
+prefix); token bytes are never printed, logged, or persisted. The only fix is
+a fresh login per home — one home = one login = one token family. Doctor
+mirrors it as the `cred token families` row (byte-copies = FAIL).
+
 ```console
 $ helm homes prepare claude you@example.com
 helm homes: prepared claude home you-example-com
@@ -971,7 +979,8 @@ SINCE YOU LEFT — 7 sessions, 4 projects
 ### `helm doctor`
 Read-only health report over the whole estate: home layout, registry,
 adoption, the adopted store, know-your-user, the recall index, env overrides
-in effect. Exit 1 only on FAILs.
+in effect, cred token families (the shared-family/revocation-bomb audit —
+content hashes only, byte-copies = FAIL). Exit 1 only on FAILs.
 
 ### `helm evolve`
 One observe/propose cycle over the stores: what to drain, which beliefs need
