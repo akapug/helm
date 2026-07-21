@@ -924,6 +924,63 @@ cache says `run helm creds`). Input: Enter posts, `:shortcodes:` expand,
 runs the log-after flush unless `HELM_CHAT_LOG=0`. Built as panes so
 brief/sessions views bolt on later.
 
+### The delivery lane — chat at tool boundaries (the meld-half port)
+
+Design: `~/.helm/helm/prd/2026-07-20-meldhalf-design.md`. Meld carried a
+separate tmpfs whisper channel because it had no room; helm has the room, so
+the lane is a **read cadence over the same room** — zero new transports. (The
+word "whisper" stays reserved for inject's first-turn brief and the v1 ledger
+frames; this lane is called *delivery*.)
+
+- **`helm chat join [--hook-json] [--seat S]`** — the SessionStart autojoin:
+  writes the seat's RAM roster row (`.roster.json` in the room dir) and hands
+  the session its identity + protocol line as context. Never posts to the
+  room (presence lives in the roster panel, not the transcript).
+- **`helm chat deliver [--hook-json] [--seat S]`** — the PostToolUse nudge:
+  an agent deep in an autonomous turn is unreachable by turn-start injection;
+  this delivers between tool calls. At most ONE row per boundary (oldest
+  first, the rest collapse to `+N waiting`), 200-byte clip on a codepoint
+  boundary, control-char scrub, labeled information-not-instruction. What
+  delivers: `@seat` / `@all` mentions and owner posts (`HELM_CHAT_OWNER_NAMES`);
+  agent chatter without a mention never does (noise law). Every fire
+  refreshes the seat's roster `last_seen` — presence needs no daemon. The
+  hot path is one stat; `HELM_CHAT_DELIVER=0` kills the lane; fail-open
+  total. The owner-unread marker is untouched (only a real read consumes it).
+- **`helm chat wait [--seat S] [--any] [--timeout N]`** — the beacon: block
+  until the next word addressed to the seat (a delivery — it advances the
+  cursor, so the hook never re-nudges), or any new row with `--any` (cursor
+  untouched). A Monitor armed on this is meld's SSE watcher, natively.
+- **`helm chat seats`** — the roster table: presence (fresh <2m / quiet <15m /
+  absent, off the last tool boundary), pending deliveries, live claims. The
+  web twin is the **seats** panel in the ledger tab (`GET /api/chat/roster`).
+- **`helm chat claim <resource> [--ttl N]` / `release <resource>` / `claims`**
+  — the advisory TTL lease (meld claims, minus the cap-gate: one uid, 0700
+  tmpfs): refused while another holder's lease is live, holder-bound release,
+  expiry sweeps on read. For short-lived same-host mutual exclusion — files,
+  ports, worktrees (the concurrent-lane collision class).
+- **`helm chat verdict <topic> <text…>` / `reveal <topic>`** — the embargoed
+  council kernel: verdicts seal in RAM (the room sees only "sealed a
+  verdict"), `reveal` posts every plaintext at once and lifts the embargo
+  exactly once. Independent judgments without anchoring — the one property
+  plain chat cannot express.
+
+```console
+$ helm chat post "@codex-seat xrev the meldhalf branch when free"
+$ helm chat seats                # who's live, what's pending, what's claimed
+$ helm chat claim worktree-main --ttl 1800
+$ helm chat verdict design-x "approve — the seam is right"
+$ helm chat reveal design-x
+```
+
+### `helm launch [--seat S] [--home H] [--room R] [--no-install] [--] [claude args…]`
+The metaharness seam (meld-launch's capability): wires the full hook estate
+into the target home (idempotent), pre-writes the seat's roster row so
+teammates can address it before the first tool call, exports
+`HELM_CHAT_NAME=<seat>` (a STABLE addressable identity across sessions —
+default `<host>-<cwd-basename>`), then execs `claude` with the pass-through
+args. The fleet needs no wrapper (`helm hooks install` covers every home);
+launch adds the stable name and the per-home pin (`CLAUDE_CONFIG_DIR`).
+
 ## ops — health, evolution, the browser
 
 ### `helm brief [--hours N] [--json]`
