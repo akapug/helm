@@ -251,9 +251,11 @@ def install_home(path, dry=False):
 
 
 def _lane_live(settings, spec):
-    """A delivery lane counts as live ONLY on the exact spec command inside
-    a group whose matcher matches the spec (codex B3): a marker substring
-    under a `Bash`-pinned group is a stale install, not coverage."""
+    """A delivery lane counts as live ONLY on the exact spec command, with
+    type "command", inside a group whose matcher matches the spec (codex
+    B3 + final delta): a marker substring under a `Bash`-pinned group — or
+    the right command string under a foreign type — is a stale install the
+    harness won't run as we expect, not coverage."""
     hooks = settings.get("hooks") if isinstance(settings, dict) else None
     groups = hooks.get(spec["event"]) if isinstance(hooks, dict) else None
     cmd = spec_command(spec)
@@ -261,7 +263,8 @@ def _lane_live(settings, spec):
         if not (isinstance(g, dict) and _matcher_ok(g, spec)):
             continue
         for h in g.get("hooks") or []:
-            if isinstance(h, dict) and h.get("command") == cmd:
+            if isinstance(h, dict) and h.get("command") == cmd \
+                    and h.get("type") == "command":
                 return True
     return False
 

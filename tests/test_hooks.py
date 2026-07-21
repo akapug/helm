@@ -290,6 +290,24 @@ class DeliveryLaneTest(HooksBase):
         rows = {r["home"]: r for r in hooks.status_rows()}
         self.assertTrue(rows["a-user-dev"]["deliver"])
 
+    def test_wrong_type_same_command_not_covered_until_repaired(self):
+        """Final gate delta: the exact command+matcher under a FOREIGN type
+        (type:'http') must not read as coverage — the harness would not run
+        it as a command hook. Install repairs the type; only then live."""
+        deliver = next(s for s in hooks.SPECS if s["name"] == "deliver")
+        d = self.mk_home("a-user-dev", settings={
+            "hooks": {"PostToolUse": [{"matcher": "*", "hooks": [
+                {"type": "http", "command": hooks.spec_command(deliver)}]}]}})
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertFalse(rows["a-user-dev"]["deliver"])
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "update")
+        got = self.read_settings(d)["hooks"]["PostToolUse"]
+        self.assertEqual(len(got), 1)                    # repaired in place
+        self.assertEqual(got[0]["hooks"][0]["type"], "command")
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertTrue(rows["a-user-dev"]["deliver"])
+
     def test_missing_matcher_on_owned_delivery_group_repaired(self):
         join = next(s for s in hooks.SPECS if s["name"] == "join")
         d = self.mk_home("a-user-dev", settings={
