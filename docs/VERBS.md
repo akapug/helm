@@ -916,16 +916,21 @@ must outlive the room. `post` writes as `$HELM_CHAT_NAME` (else the best local
 identity guess: session, then user). `read` prints the room (`--since N` skips
 the first N messages); `read --follow` polls and prints new lines until Ctrl-C.
 
-**The signed transport (v2).** When the chat **room node** answers — a dregg
-node whose data-dir lives on tmpfs, so a chat turn never lands on a
-disk-persisted chain — every post also rides a **signed self-write turn** on
-the poster's cell there: the turn payload carries the message digest
+**The signed transport (v2).** Signing is **opt-in and unsigned by
+default**: it needs BOTH the explicit cell binary (`HELM_CELL_BIN` — unset ⇒
+off, never a `PATH` probe) and a live chat **room node** — a dregg node whose
+data-dir lives on tmpfs, so a chat turn never lands on a disk-persisted
+chain. With both, every post also rides a **signed self-write turn** on the
+poster's cell there: the turn payload carries the message digest
 (`chat:b2b:<blake2b-256>`), the RAM room carries the text (thin claim, fat
 corroboration — the same pattern as premise attestation, see
 [ATTESTATION.md](ATTESTATION.md)). Signed rows render clean (the web panel
 shows a subtle ✓ tick, chain index on hover); node down → the v1 path
 automatically, tagged `[unsigned]` — the message never dies, the signature is
-what degrades. Agents sign as `HELM_CELL_PROFILE` (else `helm-agent`); the
+what degrades. No signer configured → the same honest tag with zero signing
+traffic (no probe, no unlock), and the status strip says
+`unsigned (no signer)` rather than letting a reachable node imply signed
+posts. Agents sign as `HELM_CELL_PROFILE` (else `helm-agent`); the
 owner's web posts sign server-side as `david`. `helm chat node up` provisions
 the room node (`helm-chat-node.service`, `dregg-cave-node` on
 `/dev/shm/helm-chat-node`, port 8898, faucet ON — the node auto-funds joining

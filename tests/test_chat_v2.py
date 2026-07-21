@@ -22,7 +22,8 @@ from helm import chat, chatnode, home  # noqa: E402
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
             "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG",
-            "HELM_CHAT_NODE_BIN", "MELD_CHAT_NODE_BIN")
+            "HELM_CHAT_NODE_BIN", "MELD_CHAT_NODE_BIN",
+            "HELM_CELL_BIN", "MELD_CELL_BIN")
 
 SENT = {"sent": True, "turn_hash": "t" * 64, "receipt_hash": "r" * 64,
         "chain_index": 7}
@@ -51,7 +52,8 @@ class TransportTest(V2Base):
     def test_node_url_env_empty_disables(self):
         self.assertIsNone(chat.node_url())
         self.assertEqual(chat.transport_status(),
-                         {"mode": "unsigned", "url": None, "head": None})
+                         {"mode": "unsigned", "url": None, "head": None,
+                          "signer": False})
 
     def test_node_url_env_wins_and_strips(self):
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:9999/"
@@ -122,7 +124,8 @@ class TransportTest(V2Base):
             return outs.pop(0)
 
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
-        with mock.patch.object(cellmod, "run_bin", side_effect=fake_run), \
+        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(cellmod, "run_bin", side_effect=fake_run), \
              mock.patch.object(chat, "_revive", return_value="tok2") as rv, \
              mock.patch.object(chat, "_faucet") as fc:
             info, err = chat._sign_send("payload", "p1")
@@ -134,6 +137,41 @@ class TransportTest(V2Base):
         # the join result was cached RAM-side (the room dir), not on disk
         with open(chat.cells_path()) as f:
             self.assertEqual(json.load(f)["p1"], "c" * 64)
+
+    def test_no_signer_short_circuits_the_signing_leg(self):
+        """Day-review #1: with HELM_CELL_BIN unset a signed turn is
+        impossible — the leg must decline instantly: no join, no revive
+        (the live unlock POST that burned the node's 5/60s budget on every
+        fleet post), and _signed_row's sign=None probe must not even touch
+        the node. Unsigned-by-configuration is a fact, not a fault."""
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with mock.patch.object(cellmod, "run_bin") as rb, \
+             mock.patch.object(chat, "_revive") as rv:
+            info, err = chat._sign_send("payload", "p1")
+        self.assertIsNone(info)
+        self.assertIn("no signer", err)
+        rb.assert_not_called()
+        rv.assert_not_called()
+        with mock.patch.object(chat, "node_head") as nh, \
+             mock.patch.object(chat, "_revive") as rv:
+            m = chat.post("dark leg", who="a1")   # sign=None probe path
+        nh.assert_not_called()                    # the signer gate comes FIRST
+        rv.assert_not_called()
+        self.assertNotIn("chain", m)
+        self.assertIn("[unsigned]", chat._fmt(m))
+
+    def test_transport_status_reports_the_signer(self):
+        """A reachable node without a signer must never read "signed" —
+        the exact lying status the day review caught live: node answering,
+        every row [unsigned]."""
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with mock.patch.object(chat, "node_head",
+                               return_value={"chain_index": 15}):
+            st = chat.transport_status()
+            self.assertEqual((st["mode"], st["signer"], st["head"]),
+                             ("unsigned (no signer)", False, 15))
+            with mock.patch.object(cellmod, "bin_ready", return_value=True):
+                self.assertEqual(chat.transport_status()["mode"], "signed")
 
     def test_room_cell_cache_hits_without_binary(self):
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"

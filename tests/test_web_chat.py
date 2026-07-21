@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from helm import chat, web  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
-            "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL")
+            "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
+            "HELM_CELL_BIN", "MELD_CELL_BIN")
 
 
 class TestWebChat(unittest.TestCase):
@@ -78,7 +79,8 @@ class TestWebChat(unittest.TestCase):
         self.assertEqual((d["lines"], d["total"]), ([], 0))
         # the transport truth rides every poll: disabled env -> unsigned, no url
         self.assertEqual(d["transport"],
-                         {"mode": "unsigned", "url": None, "head": None})
+                         {"mode": "unsigned", "url": None, "head": None,
+                          "signer": False})
 
     def test_react_endpoint_roundtrip(self):
         self.req("/api/chat", {"text": "ship it"})

@@ -2255,7 +2255,8 @@ function chatApplyReact(m) {
 function chatTransport(t) {
   if (!t) return;
   $("#chattransport").textContent =
-    t.mode === "signed" ? "signed ⛓" + (t.head == null ? "" : "#" + t.head) : "unsigned";
+    t.mode === "signed" ? "signed ⛓" + (t.head == null ? "" : "#" + t.head)
+                        : (t.mode || "unsigned"); // honest label, e.g. "unsigned (no signer)"
   $("#chattransport").title = "chat transport: " + (t.url || "v1 RAM room only");
 }
 

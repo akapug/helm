@@ -17,7 +17,11 @@ there: the turn payload carries the message digest ("chat:b2b:<blake2b-256>",
 claim, fat corroboration, exactly the premise-attestation pattern. The
 message row gains {turn, receipt, chain}; renderers show signed rows clean
 and tag everything else "[unsigned]". Node down -> the v1 path automatically
-(fallback law: drop the signature, never the RAM property). NO transport
+(fallback law: drop the signature, never the RAM property). SIGNING IS
+OPT-IN: it needs the explicit cell binary (HELM_CELL_BIN — unset => off, no
+PATH probe; the de-meld law), so out of the box chat is UNSIGNED BY DEFAULT
+even with a live node — transport_status says "unsigned (no signer)" and no
+signing leg (probe/revive/unlock) ever fires without the binary. NO transport
 path writes disk, ever; RAM-side caches (join cells, node token) live in the
 room dir itself. Transport is NODE-AGNOSTIC (HELM_CHAT_NODE_URL, else the
 node-state url, else :8898) — the node migration just repoints it.
@@ -133,12 +137,21 @@ def node_head(url=None, timeout=1.5):
 
 
 def transport_status():
-    """One probe -> {"mode": "signed"|"unsigned", "url", "head"} — the status
-    strip in `helm --human`, the web panel and doctor all read this."""
+    """One probe -> {"mode", "url", "head", "signer"} — the status strip in
+    `helm --human`, the web panel and doctor all read this. mode reports the
+    SIGNER's truth, not just node reachability: "signed" needs the explicit
+    cell binary AND a live node; a reachable node with no signer is
+    "unsigned (no signer)" — the exact state where every post falls to
+    [unsigned] while the node still answers (day-review #1)."""
+    from . import cell
     u = node_url()
+    signer = cell.bin_ready()
     h = node_head(u) if u else None
-    return {"mode": "signed" if h is not None else "unsigned", "url": u,
-            "head": h.get("chain_index") if h else None}
+    mode = "unsigned"
+    if h is not None:
+        mode = "signed" if signer else "unsigned (no signer)"
+    return {"mode": mode, "url": u, "head": h.get("chain_index") if h else None,
+            "signer": signer}
 
 
 def digest_payload(text):
@@ -236,8 +249,15 @@ def _room_cell(profile, token):
 def _sign_send(payload, profile):
     """One signed self-write turn on the room node carrying `payload`.
     (send-info, None) or (None, reason). One recovery lap (revive + faucet)
-    before giving up — then the caller falls back to unsigned, loudly tagged."""
+    before giving up — then the caller falls back to unsigned, loudly tagged.
+    NO SIGNER => immediate, silent decline: without the explicit cell binary
+    a signed turn is impossible, so the recovery lap (a live unlock POST +
+    ensure_healthy against the node, burning its 5/60s unlock budget) must
+    never fire — a config fact is not a fault (day-review #1)."""
     from . import cell
+    if not cell.bin_ready():
+        return None, ("no signer — HELM_CELL_BIN unset; posts ride the v1 "
+                      "room unsigned")
     token = _node_token()
     hexid, err = _room_cell(profile, token)
     if err:
@@ -270,13 +290,16 @@ def _signed_row(row, payload_text, profile, sign):
     probes; True forces the attempt; False skips (v1 path). FAIL-OPEN TOTAL:
     any surprise in the signing leg (a raced cache write, a raising client)
     degrades to the v1 unsigned row — the fallback law is drop the SIGNATURE,
-    never the message."""
+    never the message. The signer gate comes FIRST: no cell binary => no
+    node probe at all (the row is unsigned by configuration, not by
+    fault)."""
     try:
+        from . import cell
         if sign is None:
-            sign = bool(node_url()) and node_head() is not None
+            sign = cell.bin_ready() and bool(node_url()) \
+                and node_head() is not None
         if not sign:
             return row
-        from . import cell
         info, _err = _sign_send(digest_payload(payload_text),
                                 profile or cell.profile_name())
         if info:

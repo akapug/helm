@@ -285,6 +285,10 @@ def check_chat_node():
     out = [(OK, "chat room node LIVE at %s — chain head %s" % (
         url, head.get("chain_index") if head else "(no receipts yet)"))]
     from . import cell as _cell
+    if not _cell.bin_ready():
+        out.append((WARN, "chat signer OFF (HELM_CELL_BIN unset) — the node "
+                          "answers but every post rides [unsigned]; set "
+                          "HELM_CELL_BIN or accept unsigned-by-default"))
     cells = _pk.read_json(chat.cells_path(), {}) or {}
     for profile in sorted(cells):
         info = _cell.get_json(url + "/api/cell/" + cells[profile], timeout=3) or {}

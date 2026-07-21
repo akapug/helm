@@ -238,6 +238,16 @@ def bin_path():
     return home.env("CELL_BIN") or None
 
 
+def bin_ready():
+    """True only when the explicit HELM_CELL_BIN points at a real file — the
+    ONE signer-availability answer every signing leg and status surface asks
+    before claiming (or attempting) a signed turn. False must short-circuit:
+    no node probe, no revive, no unlock — a missing signer is a configuration
+    fact, not a fault to recover from."""
+    b = bin_path()
+    return bool(b and os.path.exists(b))
+
+
 def roster_path():
     return home.env("ROSTER") \
         or os.path.join(os.path.expanduser("~"), ".dregg", "roster.toml")
