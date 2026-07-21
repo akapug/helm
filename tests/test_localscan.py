@@ -242,6 +242,15 @@ class CrosscheckTest(unittest.TestCase):
         self.assertIn("commingled", rows[0]["signal"])
         self.assertNotIn("header", rows[0])
 
+    def test_subthreshold_header_with_empty_scan_is_not_agreement(self):
+        home = os.path.join(self.tmp, "quiet")
+        os.makedirs(os.path.join(home, "projects"))
+        prov = StubProvider([self.acct("quiet@x.com", home)],
+                            [hist("quiet@x.com", 0.05)])
+        rows = localscan.crosscheck(prov, time.time())
+        self.assertIn("no strong directional drift", rows[0]["signal"])
+        self.assertNotIn("agree on activity", rows[0]["signal"])
+
     def test_no_header_observation(self):
         now = time.time()
         home = self.home_with("h", [rec_line(now - 60, out=10, uuid="q")])

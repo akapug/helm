@@ -75,11 +75,12 @@ class StatTest(WhoBase):
         self.assertEqual(who.ppid_of(999), 0)
         self.assertEqual(who.starttime_of(999), float("inf"))
 
-    def test_environ_var(self):
+    def test_read_environ_splits_read_ok_from_unreadable(self):
         self.plant_proc(50, "claude", env=b"A=1\0CLAUDE_CONFIG_DIR=/x/home\0B=2\0")
-        self.assertEqual(who.environ_var(50, "CLAUDE_CONFIG_DIR"), "/x/home")
-        self.assertIsNone(who.environ_var(50, "MISSING"))
-        self.assertIsNone(who.environ_var(999, "X"))
+        env = who.read_environ(50)
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/x/home")
+        self.assertNotIn("MISSING", env)          # read OK, key absent -> dict
+        self.assertIsNone(who.read_environ(999))  # UNREADABLE -> None, never {}
 
 
 class SessionAttributionTest(WhoBase):
@@ -136,6 +137,37 @@ class ScanTest(WhoBase):
         cx = rows[400]
         self.assertEqual(cx["home"], os.path.expanduser("~/.codex"))
         self.assertIsNone(cx["account"])     # default home unmapped -> never guessed
+        self.assertEqual(cx["attribution"], "default")  # environ READ, key absent
+        self.assertEqual(top["attribution"], "env")
+
+    def test_unreadable_environ_is_visible_but_never_default_attributed(self):
+        d = self.plant_proc(600, "codex", start=40)
+        os.unlink(os.path.join(d, "environ"))  # pid died / permissions / race
+        rows = {r["pid"]: r for r in who.scan([])}
+        r = rows[600]
+        self.assertIsNone(r["home"])     # NOT ~/.codex — no evidence is no home
+        self.assertIsNone(r["account"])
+        self.assertEqual(r["attribution"], "environ-unreadable")
+
+    def test_pid_gone_between_comm_and_environ_is_skipped(self):
+        d = self.plant_proc(700, "claude", start=50)
+        os.unlink(os.path.join(d, "stat"))     # died right after the comm read
+        os.unlink(os.path.join(d, "environ"))
+        self.assertEqual([r for r in who.scan([]) if r["pid"] == 700], [])
+
+    def test_starttime_change_mid_scan_discards_row(self):
+        d = self.plant_proc(800, "codex", start=60)
+        real = who.read_environ
+
+        def racy(pid):  # pid reused mid-scan: starttime moves under the reads
+            if pid == 800:
+                with open(os.path.join(d, "stat"), "w") as f:
+                    f.write("800 (codex) S 1 %s 61 0" % ("0 " * 17))
+            return real(pid)
+
+        with mock.patch.object(who, "read_environ", side_effect=racy):
+            rows = who.scan([])
+        self.assertEqual([r for r in rows if r["pid"] == 800], [])
 
     def test_shared_session_oldest_owns_rest_demote(self):
         rollout = "/store/rollout-2026-07-01T18-12-51-%s.jsonl" % SID
@@ -189,6 +221,13 @@ class CmdTest(WhoBase):
         rows = json.loads(out)
         self.assertEqual(rows[0]["pid"], 100)
         self.assertEqual(rows[0]["session"], SID)
+
+    def test_unattributed_row_renders_loud(self):
+        d = self.plant_proc(600, "codex", start=40)
+        os.unlink(os.path.join(d, "environ"))
+        rc, out = self.run_cmd([])
+        self.assertEqual(rc, 0)
+        self.assertIn("[ENVIRON-UNREADABLE]", out)
 
     def test_shared_marker_renders(self):
         rollout = "/s/rollout-2026-07-01T00-00-00-%s.jsonl" % SID

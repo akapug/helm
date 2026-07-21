@@ -806,15 +806,18 @@ helm attribute — effort by cred, 143 sessions (last 7d, limit 200; measure: ou
 
 ### `helm who [--json]`
 The pid→cred attribution table: every live claude/codex process with its
-cred home (`CLAUDE_CONFIG_DIR`/`CODEX_HOME` from `/proc`, defaulting to the
-provider default), the account that home maps to, cwd, and the session it is
-running. Codex session ids are exact (the rollout file is held open — the fd
-names it); claude ids are exact only when the home+cwd project dir holds a
-single live candidate, else newest-first candidates are listed. Subagent /
-helper processes are marked `child` (rotation targets the top-level session);
-two live processes on one session carry a loud `SHARED` marker — resume once,
-never twice. Reads `/proc` and transcript filenames only, never token
-contents. This is the missing link for a rotation executor: a rebalance names
+cred home (`CLAUDE_CONFIG_DIR`/`CODEX_HOME` from `/proc`; the provider
+default only when the environ was READ and the key is genuinely absent — an
+unreadable environ is no evidence, so that row stays visible but unattributed,
+marked `environ-unreadable`), the account that home maps to, cwd, and the
+session it is running. A pid whose stat starttime changes mid-scan (pid reuse)
+is discarded. Codex session ids are exact (the rollout file is held open —
+the fd names it); claude ids are exact only when the home+cwd project dir
+holds a single live candidate, else newest-first candidates are listed.
+Subagent / helper processes are marked `child` (rotation targets the
+top-level session); two live processes on one session carry a loud `SHARED`
+marker — resume once, never twice. Reads `/proc` and transcript filenames
+only, never token contents. This is the missing link for a rotation executor: a rebalance names
 an account, `who` names the pids on it.
 
 ### `helm homes [prepare <claude|codex> <email> | verify [<name>] | archive <name> | restore <name> | migrate <name> | archives] [--provider claude|codex]`

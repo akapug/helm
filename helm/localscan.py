@@ -173,6 +173,10 @@ def crosscheck(prov=None, now=None):
             row["signal"] = ("DRIFT scan-active/header-idle: %s local 5h tokens but "
                              "header 0%% — session window rolled, or accounting lag"
                              % fmt_tokens(row["session_5h"]))
+        elif h5 and row["session_5h"] == 0:  # header positive but under the bar
+            row["signal"] = ("plausible — header 5h at %d%% with 0 local tokens: "
+                             "no strong directional drift at the configured "
+                             "threshold (10%%)" % round(h5 * 100))
         else:
             row["signal"] = "plausible — both sources agree on activity"
     return rows

@@ -8,6 +8,14 @@ which is exactly the local fleet. The missing link for a third-party rotation
 executor: a rebalance names an account; `who` names the pids ON it, and the
 executor maps pid→pane to stop + resume on the new home.
 
+Attribution is EVIDENCE, never a guess: an environ that READ OK but lacks the
+key is positive evidence of the provider default home (attribution=default);
+an UNREADABLE environ (pid died, permissions, race) is NO evidence — the row
+stays visible with home/account None and attribution=environ-unreadable, so a
+rotation executor never acts on a default-attributed ghost. Each pid's stat
+starttime is captured before and rechecked after its per-pid file reads; a
+changed or unreadable starttime (pid reuse mid-scan) discards the row.
+
 Session attribution: codex holds its rollout jsonl OPEN, so the fd scan's
 filename uuid IS the session id (exact); claude sessions are exact only when
 the home+cwd project dir holds a single LIVE candidate (written within 5
@@ -25,17 +33,21 @@ import os
 PROC = "/proc"  # module-level so tests point it at a fixture tree
 
 
-def environ_var(pid, key):
+def read_environ(pid):
+    """/proc/<pid>/environ as a dict, or None when UNREADABLE. The two states
+    must never conflate: a read-OK environ MISSING a key is evidence the
+    process runs on the provider default; an unreadable one is no evidence."""
     try:
         with open("%s/%d/environ" % (PROC, pid), "rb") as f:
             raw = f.read()
     except OSError:
         return None
-    prefix = (key + "=").encode()
+    env = {}
     for kv in raw.split(b"\0"):
-        if kv.startswith(prefix):
-            return kv[len(prefix):].decode("utf-8", "replace")
-    return None
+        k, sep, v = kv.partition(b"=")
+        if sep:
+            env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+    return env
 
 
 def _stat_field(pid, n, default):
@@ -113,7 +125,10 @@ def _accounts():
 def scan(accounts=None):
     """One row per live claude/codex process, cred-attributed. Accounts map
     by realpath'd home (the provider's account rows carry the homes, default
-    stores included) — no match stays None, never guessed."""
+    stores included) — no match stays None, never guessed. Row attribution:
+    env (home named in environ) | default (environ READ, key absent) |
+    environ-unreadable (no evidence; home/account None, row stays visible).
+    starttime bracketing the per-pid reads discards pid-reuse races."""
     if accounts is None:
         accounts = _accounts()
     defaults = {"anthropic": os.path.expanduser("~/.claude"),
@@ -137,18 +152,33 @@ def scan(accounts=None):
             provider, env_key = "codex", "CODEX_HOME"
         else:
             continue
-        home = environ_var(pid, env_key) or defaults[provider]
+        start = starttime_of(pid)
+        if start == float("inf"):
+            continue  # stat unreadable — identity can't be pinned across reads
+        ppid = ppid_of(pid)
+        env = read_environ(pid)
+        if env is None:  # NO evidence — visible, never default-attributed
+            home, attribution = None, "environ-unreadable"
+        else:
+            home = env.get(env_key) or defaults[provider]
+            attribution = "env" if env.get(env_key) else "default"
         try:
             cwd = os.readlink(os.path.join(entry, "cwd"))
         except OSError:
             cwd = None
         if provider == "codex":
             session, cands = codex_session_from_fds(pid), []
+        elif home and cwd:
+            session, cands = claude_sessions(home, cwd)
         else:
-            session, cands = claude_sessions(home, cwd) if cwd else (None, [])
-        procs.append({"pid": pid, "ppid": ppid_of(pid), "child": False,
+            session, cands = None, []
+        if starttime_of(pid) != start:
+            continue  # pid reused mid-scan — the reads above may mix processes
+        procs.append({"pid": pid, "ppid": ppid, "child": False,
                       "provider": provider, "home": home,
-                      "account": by_home.get(os.path.realpath(home)),
+                      "attribution": attribution,
+                      "account": by_home.get(os.path.realpath(home))
+                      if home else None,
                       "cwd": cwd, "session": session,
                       "session_candidates": cands, "session_shared": False})
     pid_set = {p["pid"] for p in procs}
@@ -201,7 +231,9 @@ def cmd_who(args):
         sess = r["session"] or (", ".join(r["session_candidates"][:2]) + "?"
                                 if r["session_candidates"] else "-")
         flags = "".join((" [child]" if r["child"] else "",
-                         " [SHARED]" if r["session_shared"] else ""))
+                         " [SHARED]" if r["session_shared"] else "",
+                         " [ENVIRON-UNREADABLE]"
+                         if r["attribution"] == "environ-unreadable" else ""))
         print("  %-8d %-9s %-28s %-26s %-40s %s%s" % (
             r["pid"], r["provider"], (r["account"] or "-")[:28],
             tilde(r["home"])[:26], sess[:40], tilde(r["cwd"]), flags))
