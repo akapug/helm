@@ -579,6 +579,30 @@ class RenameTest(SeatsBase):
         self.assertEqual(rc, 2)
 
 
+class RosterTruthTest(SeatsBase):
+    """roster-truth (owner-caught 2026-07-21: 'keep all live agents straight on
+    the roster'). A live-but-idle agent must not vanish — presence stays fresh
+    when it speaks, and even when its delivery is muted."""
+
+    def test_post_refreshes_poster_presence(self):
+        seats.join(session="s-rt1", seat="rt-agent", cwd="/tmp/p")
+        os.remove(seats.seen_path("rt-agent"))          # prove post re-touches
+        chat.post("hello fleet", who="rt-agent")
+        self.assertTrue(os.path.exists(seats.seen_path("rt-agent")))
+
+    def test_owner_post_mints_no_presence(self):
+        chat.post("owner speaks", who="david")          # owner is not a seat
+        self.assertFalse(os.path.exists(seats.seen_path("david")))
+        self.assertNotIn("david", seats.roster())
+
+    def test_muted_deliver_still_refreshes_presence(self):
+        seats.join(session="s-rt2", seat="rt-muted", cwd="/tmp/p")
+        os.remove(seats.seen_path("rt-muted"))
+        os.environ["HELM_CHAT_DELIVER"] = "0"            # delivery muted…
+        self.assertIsNone(seats.deliver(session="s-rt2"))   # …so no nudge…
+        self.assertTrue(os.path.exists(seats.seen_path("rt-muted")))  # …still alive
+
+
 class StopGuardTest(SeatsBase):
     """The idle gate (buildr/mc arbiter port). Hermetic: room + claims in tmp,
     HELM_ADOPTED_DIR in tmp so the silent index-cap leg can never touch a live

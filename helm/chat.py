@@ -388,7 +388,23 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None):
     row = {"ts": pk.now_ts(), "from": who or whoname(), "text": text}
     if origin:
         row["origin"] = origin
+    _touch_poster_presence(row["from"])
     return _append(_signed_row(row, text, profile, sign), room)
+
+
+def _touch_poster_presence(name):
+    """Presence-on-post: a seat that SPEAKS is alive, beacon or no beacon — so
+    keep its roster row fresh and the reaper never drops a live-but-idle poster
+    (roster-truth, owner-caught 2026-07-21). Best-effort + local import
+    (chat<-seats would cycle); owner/broadcast names are not seats — skip them
+    so no spurious presence file is minted."""
+    try:
+        from . import seats
+        if not name or name.lower() in seats.owner_names():
+            return
+        seats.touch_seen(name)
+    except Exception:
+        pass
 
 
 def react(target, code, room="main", who=None, profile=None, sign=None):

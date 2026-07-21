@@ -537,10 +537,11 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None):
     Fan-out: the cursor is per (seat, session) — every co-named session sees
     the same @mention on its own boundary; consuming here never starves a
     sibling session (at-most-once BETWEEN co-named sessions was the bug)."""
-    if (home.env("CHAT_DELIVER") or "").lower() in ("0", "off", "no"):
-        return None
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
-    touch_seen(seat)
+    touch_seen(seat)                       # presence FIRST — a seat muted by the
+    if (home.env("CHAT_DELIVER") or "").lower() in ("0", "off", "no"):
+        return None                        # kill-switch below is still ALIVE:
+                                           # keep its row fresh so it isn't reaped
     with _flocked(cursor_path(room, seat, session) + ".lock"):
         cur = _cursor(room, seat, session)
         if cur is None:
