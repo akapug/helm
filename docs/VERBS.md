@@ -953,23 +953,29 @@ frames; this lane is called *delivery*.)
 - **`helm chat seats`** — the roster table: presence (fresh <2m / quiet <15m /
   absent, off the last tool boundary), pending deliveries, live claims. The
   web twin is the **seats** panel in the ledger tab (`GET /api/chat/roster`).
-- **`helm chat claim <resource> [--ttl N]` / `release <resource>` / `claims`**
-  — the advisory TTL lease (meld claims, minus the cap-gate: one uid, 0700
-  tmpfs): refused while another holder's lease is live, holder-bound release,
-  expiry sweeps on read. For short-lived same-host mutual exclusion — files,
-  ports, worktrees (the concurrent-lane collision class).
-- **`helm chat verdict <topic> <text…>` / `reveal <topic>`** — the embargoed
-  council kernel: verdicts seal in RAM (the room sees only "sealed a
-  verdict"), `reveal` posts every plaintext at once and lifts the embargo
-  exactly once. Independent judgments without anchoring — the one property
-  plain chat cannot express.
+- **`helm chat claim <resource> [--ttl N] [--session SID]` /
+  `release <resource> [--lease ID | --session SID]` / `claims`** — the
+  advisory TTL lease (meld claims, minus the cap-gate): refused while
+  another holder's lease is live, expiry is MONOTONIC, and the grant binds
+  `{session, lease nonce, fence}` — release/extend needs the lease id or the
+  granting session, never just a matching display name (the ABA/stale-holder
+  class). For short-lived same-host mutual exclusion — files, ports,
+  worktrees (the concurrent-lane collision class).
+
+**Trust domain, loudly:** seat names are DISPLAY LABELS and every mechanism
+above is advisory coordination between cooperating same-uid processes in a
+0700 tmpfs dir — not a security boundary. The owner-rule delivers only rows
+the server-side owner rails stamped (`origin: web|tui`); a CLI post claiming
+an owner name delivers as an ordinary mention. Principal cryptography stays
+dregg's. (Council — embargoed verdicts — is DEFERRED to 0.3: a correct
+embargo needs an expected-set freeze + reveal state machine; the spec lives
+in the design doc's codex-round section.)
 
 ```console
 $ helm chat post "@codex-seat xrev the meldhalf branch when free"
 $ helm chat seats                # who's live, what's pending, what's claimed
-$ helm chat claim worktree-main --ttl 1800
-$ helm chat verdict design-x "approve — the seam is right"
-$ helm chat reveal design-x
+$ helm chat claim worktree-main --ttl 1800 --session $CLAUDE_SESSION_ID
+$ helm chat release worktree-main --lease 5f3c9a2d41b0
 ```
 
 ### `helm launch [--seat S] [--home H] [--room R] [--no-install] [--] [claude args…]`

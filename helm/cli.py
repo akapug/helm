@@ -167,7 +167,7 @@ _VERB_HELP = {
     "configs": "configs [list|show|cascade <cwd>] — every config across every home, read-only",
     "hooks": "hooks [install [--dry]|status] — self-wire the per-turn inject hook into every claude home",
     "cell": "cell join|send|recv|heartbeat|roster|status — the a2a substrate, helm-named",
-    "chat": "chat post|read [--since N|--follow]|rooms|react <n> <emoji>|log-flush|node up|down|status|join|deliver|wait|seats|claim|release|claims|verdict|reveal [--room R] — the human-included groupchat (RAM room + signed dregg transport; web panel = the owner's surface) + the delivery lane (tool-boundary nudge, roster, advisory claims, embargoed council)",
+    "chat": "chat post|read [--since N|--follow]|rooms|react <n> <emoji>|log-flush|node up|down|status|join|deliver|wait|seats|claim|release|claims [--room R] — the human-included groupchat (RAM room + signed dregg transport; web panel = the owner's surface) + the delivery lane (tool-boundary nudge, roster presence, advisory session-bound claims)",
     "launch": "launch [--seat S] [--home H] [--room R] [--no-install] [--] [claude args…] — the metaharness seam: wire hooks, seat the roster, exec claude under a stable addressable name",
     "human": "human (or helm --human) — the operator's curses TUI: chat room + status strip, posts as you",
     "premise": "premise <id> | <statement> — capture a certain truth, attested on the ledger; --supersede <old-id> <new-id> | <statement> evolves the chain (one signed linking turn)",
