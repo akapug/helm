@@ -607,28 +607,30 @@ details.cfgsec>summary:hover{color:var(--fg)}
     </div>
     <div class="lside">
       <div class="lcard">
-        <h3>message a seat <span class="lsub">rides the groupchat</span></h3>
+        <h3>message a seat <span class="lsub" id="seatpickcount">rides the groupchat</span></h3>
         <form id="seatform" autocomplete="off">
-          <input id="seatkey" placeholder="seat (e.g. codex-seat)" maxlength="120" aria-label="seat name">
+          <input id="seatkey" list="seatlist" placeholder="pick a live seat — or type @all / a name" maxlength="120" aria-label="seat name" title="live seats from the roster; free-type @all or a not-yet-joined seat">
+          <datalist id="seatlist"></datalist>
           <input id="seatline" placeholder="one-line message…" maxlength="400" required aria-label="message">
           <button class="chip" id="seatsend" type="submit">send →</button>
           <div id="seatmsg">posts “@seat …” to chat — every local agent’s next turn surfaces it (the owner-unread reflex).</div>
         </form>
       </div>
       <div class="lcard">
-        <h3>seat activity <span class="lsub">cells on the node</span></h3>
+        <h3>seat activity <span class="lsub">live delivery roster · who I can message right now</span></h3>
+        <div class="llegend"><span><span class="ldot active"></span> active &lt;2m</span>
+          <span><span class="ldot quiet"></span> quiet &lt;15m</span>
+          <span><span class="ldot"></span> absent</span>
+          <span style="margin-left:auto">off the chat rail · presence + pending</span></div>
+        <div class="lrows" id="ledgerseats"><div class="empty">no seats joined yet — a session joins on its next start (helm hooks install wires it)</div></div>
+      </div>
+      <div class="lcard">
+        <h3>signed-turn cells <span class="lsub">on the node · stale when signing is off</span></h3>
         <div class="llegend"><span><span class="ldot active"></span> active &lt;2m</span>
           <span><span class="ldot quiet"></span> quiet &lt;30m</span>
           <span><span class="ldot stuck"></span> stuck?</span>
           <span><span class="ldot"></span> no recent turn</span></div>
         <div class="lrows" id="ledgercells"><div class="empty">loading…</div></div>
-      </div>
-      <div class="lcard">
-        <h3>seats <span class="lsub">roster · presence off the last tool boundary · pending deliveries</span></h3>
-        <div class="llegend"><span><span class="ldot active"></span> fresh &lt;2m</span>
-          <span><span class="ldot quiet"></span> quiet &lt;15m</span>
-          <span><span class="ldot"></span> absent</span></div>
-        <div class="lrows" id="ledgerseats"><div class="empty">no seats yet — sessions join on their next start (helm hooks install wires it)</div></div>
       </div>
     </div>
   </div>
@@ -2387,17 +2389,22 @@ function ledgerCells(cells) {
   }).join("");
 }
 
+// The delivery roster maps the server's presence ("fresh"/"quiet"/"absent")
+// to the owner-facing word ("active"/"quiet"/"absent") — same word the seat
+// picker and the cave-cells legend use, so the whole tab speaks one dialect.
+const presenceLabel = p => p === "fresh" ? "active" : p;
+
 function rosterSeats(rep) {
   const seats = (rep && rep.seats) || [], claims = (rep && rep.claims) || [];
   if (!seats.length && !claims.length) {
-    $("#ledgerseats").innerHTML = '<div class="empty">no seats yet — sessions join on their next start (helm hooks install wires it)</div>';
+    $("#ledgerseats").innerHTML = '<div class="empty">no seats joined yet — a session joins on its next start (helm hooks install wires it)</div>';
     return;
   }
   const dot = p => p === "fresh" ? "active" : p === "quiet" ? "quiet" : "";
   let html = seats.map(s =>
     '<div class="lrow"><div class="lhead"><span class="ldot ' + dot(s.presence) + '"></span>' +
     '<span class="mono copy" data-copy="' + esc(s.seat) + '" title="seat — click to copy">' + esc(s.seat) + '</span>' +
-    '<span class="lbadge' + (s.presence === "fresh" ? " final" : s.presence === "quiet" ? " tent" : "") + '">' + esc(s.presence) + '</span>' +
+    '<span class="lbadge' + (s.presence === "fresh" ? " final" : s.presence === "quiet" ? " tent" : "") + '">' + esc(presenceLabel(s.presence)) + '</span>' +
     (s.pending ? '<span class="lbadge tent">' + s.pending + ' pending</span>' : '') +
     '<span class="lage">' + (s.last_seen ? lago(s.last_seen) : "—") + '</span></div>' +
     '<div class="lmeta">' + esc(s.project || "") +
@@ -2409,9 +2416,32 @@ function rosterSeats(rep) {
   $("#ledgerseats").innerHTML = html;
 }
 
+// The "message a seat" picker: same live roster feeds a <datalist> so a live
+// seat is one click — value is the RAW seat (clean for the "@seat" post), the
+// label carries presence · project · pending. Ordered active→quiet→absent then
+// most-recently-seen, so the seat you'd reach for sits at the top. Free-typing
+// stays open (datalist), so @all / a not-yet-joined seat still works; an empty
+// roster degrades to a hint, never a dead control.
+function seatPicker(rep) {
+  const seats = ((rep && rep.seats) || []).slice();
+  const rank = p => p === "fresh" ? 0 : p === "quiet" ? 1 : 2;
+  seats.sort((a, b) => rank(a.presence) - rank(b.presence) || (b.last_seen || 0) - (a.last_seen || 0));
+  const glyph = p => p === "fresh" ? "● " : p === "quiet" ? "◐ " : "○ ";
+  $("#seatlist").innerHTML = seats.map(s =>
+    '<option value="' + esc(s.seat) + '" label="' +
+    esc(glyph(s.presence) + presenceLabel(s.presence) + (s.project ? " · " + s.project : "") +
+      (s.pending ? " · " + s.pending + " pending" : "")) + '">').join("");
+  const c = $("#seatpickcount");
+  if (c) c.textContent = seats.length
+    ? seats.length + (seats.length === 1 ? " live seat" : " live seats") + " · pick or type @all"
+    : "no seats joined yet · type @all or a seat";
+}
+
 async function pollLedger() {
   if (!$("#view-ledger").classList.contains("on")) return; // poll only while open
-  try { rosterSeats(await j("/api/chat/roster")); } catch (e) { /* seats panel fails quiet */ }
+  // ONE roster read feeds both the delivery-roster panel and the seat picker.
+  try { const rep = await j("/api/chat/roster"); rosterSeats(rep); seatPicker(rep); }
+  catch (e) { /* roster + picker fail quiet — the tab stays usable */ }
   let d;
   try { d = await j("/api/ledger"); }
   catch (e) { $("#ledgerstrip").innerHTML = '<span class="offline">helm isn’t answering — retrying quietly…</span>'; return; }
