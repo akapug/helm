@@ -723,13 +723,13 @@ and copies nothing.
 
 ```console
 $ helm corpus backup --dry
-helm corpus backup — 6031 transcripts on the estate (dry-run — reporting only) -> /home/owner/corpus-archive
+helm corpus backup — 6031 transcripts on the estate (dry-run — reporting only) -> ~/corpus-archive
   claude   5173 transcripts  43.7GB — 5173 new/changed (43.7GB)
   codex     857 transcripts  4.4GB — 857 new/changed (4.4GB)
   tmp         1 transcripts  13.7KB — 1 new/changed (13.7KB)
-helm corpus: 6031 would be copied (48.1GB) into /home/owner/corpus-archive/2026-07-20 — nothing copied (--dry)
+helm corpus: 6031 would be copied (48.1GB) into ~/corpus-archive/2026-07-20 — nothing copied (--dry)
 $ helm corpus status
-helm corpus status — dest /home/owner/corpus-archive
+helm corpus status — dest ~/corpus-archive
   ...
   archived: 6031 of 6031 (100.0%) · pending 0 (0B) · 12 retired sources kept in archive
   last run: 2026-07-20T09:00:04Z — copied 41, refreshed 2, 0 errors
@@ -1177,7 +1177,7 @@ who observed what, when — live-on-pug, dormant-on-droopy.
 ```console
 $ helm ship
 helm ship --dry (nothing touched):
-  home:   /home/owner/.helm
+  home:   ~/.helm
   git:    not initialized (would `git init -b main`)
   remote: none configured — would COMMIT ONLY (add --remote <private-url>)
   would ship: 82 authored files, 0.9MB
