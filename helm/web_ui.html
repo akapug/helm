@@ -571,6 +571,13 @@ details.cfgsec>summary:hover{color:var(--fg)}
           <span><span class="ldot"></span> no recent turn</span></div>
         <div class="lrows" id="ledgercells"><div class="empty">loading…</div></div>
       </div>
+      <div class="lcard">
+        <h3>seats <span class="lsub">roster · presence off the last tool boundary · pending deliveries</span></h3>
+        <div class="llegend"><span><span class="ldot active"></span> fresh &lt;2m</span>
+          <span><span class="ldot quiet"></span> quiet &lt;15m</span>
+          <span><span class="ldot"></span> absent</span></div>
+        <div class="lrows" id="ledgerseats"><div class="empty">no seats yet — sessions join on their next start (helm hooks install wires it)</div></div>
+      </div>
     </div>
   </div>
 </div>
@@ -2290,8 +2297,31 @@ function ledgerCells(cells) {
   }).join("");
 }
 
+function rosterSeats(rep) {
+  const seats = (rep && rep.seats) || [], claims = (rep && rep.claims) || [];
+  if (!seats.length && !claims.length) {
+    $("#ledgerseats").innerHTML = '<div class="empty">no seats yet — sessions join on their next start (helm hooks install wires it)</div>';
+    return;
+  }
+  const dot = p => p === "fresh" ? "active" : p === "quiet" ? "quiet" : "";
+  let html = seats.map(s =>
+    '<div class="lrow"><div class="lhead"><span class="ldot ' + dot(s.presence) + '"></span>' +
+    '<span class="mono copy" data-copy="' + esc(s.seat) + '" title="seat — click to copy">' + esc(s.seat) + '</span>' +
+    '<span class="lbadge' + (s.presence === "fresh" ? " final" : s.presence === "quiet" ? " tent" : "") + '">' + esc(s.presence) + '</span>' +
+    (s.pending ? '<span class="lbadge tent">' + s.pending + ' pending</span>' : '') +
+    '<span class="lage">' + (s.last_seen ? lago(s.last_seen) : "—") + '</span></div>' +
+    '<div class="lmeta">' + esc(s.project || "") +
+    (s.preview ? ' · <span title="newest pending delivery">“' + esc(s.preview) + '”</span>' : '') + '</div></div>').join("");
+  if (claims.length) {
+    html += '<div class="lmeta" style="margin-top:6px">claims: ' + claims.map(c =>
+      esc(c.resource) + ' → <b>' + esc(c.holder || "?") + '</b> (' + c.remaining + 's left)').join(" · ") + '</div>';
+  }
+  $("#ledgerseats").innerHTML = html;
+}
+
 async function pollLedger() {
   if (!$("#view-ledger").classList.contains("on")) return; // poll only while open
+  try { rosterSeats(await j("/api/chat/roster")); } catch (e) { /* seats panel fails quiet */ }
   let d;
   try { d = await j("/api/ledger"); }
   catch (e) { $("#ledgerstrip").innerHTML = '<span class="offline">helm isn’t answering — retrying quietly…</span>'; return; }
