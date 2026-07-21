@@ -880,6 +880,16 @@ failure). The generated command is fail-open by construction (`timeout` +
 diff per home; `--home NAME` narrows to one. The four entries close the loop:
 turn start + tool boundary + session start + idle gate.
 
+**The beacon permit rides every install.** The join directive's mandatory
+first action — `Monitor(command: "helm chat wait … --follow")` — used to hang
+every fresh session on a human permission prompt (no allow rule existed
+anywhere). `install` now merges `Bash(helm chat wait:*)` +
+`Monitor(helm chat wait:*)` into `permissions.allow` on every home AND seat —
+additive, idempotent, existing entries never dropped, same gated write. A
+fresh seat/home arms its beacon with NO human. `install` also SURFACES any
+RUNNING pane whose named identity has no live roster row (a joined-late idle
+pane can never self-heal — relaunch is the only repair).
+
 **Seats are covered too.** A full `install` (no `--home` filter) ALSO wires the
 delivery lane (deliver + join + stop-guard, **not** inject) into every
 multimodel seat's isolated `CLAUDE_CONFIG_DIR`
@@ -1024,7 +1034,9 @@ frames; this lane is called *delivery*.)
 - **`helm chat join [--hook-json] [--seat S]`** — the SessionStart autojoin:
   writes the seat's RAM roster row (`.roster.json` in the room dir, keyed on
   `HELM_CHAT_NAME` so a launched seat joins under its family name — `codex`,
-  `kimi`, … — not an ephemeral `agent-<sid8>`) and hands the session its
+  `kimi`, …; an UN-named join gets a meaningful stable auto-name,
+  `<project>-<family>` like `helm-fable`, deduped — never opaque
+  `agent-<sid8>` hex) and hands the session its
   identity + protocol line as context. That line makes it a **mandatory first
   action** to arm the idle-wake beacon — `Monitor(command: "helm chat wait
   --seat <seat> --follow", persistent: true)` — because nothing external can
@@ -1067,9 +1079,19 @@ frames; this lane is called *delivery*.)
   bounded reads; no network. With inject (turn start), deliver (tool
   boundary) and join (session start) this completes the loop: an agent
   cannot idle past its inbox.
-- **`helm chat seats`** — the roster table: presence (fresh <2m / quiet <15m /
-  absent, off the last tool boundary), pending deliveries, live claims. The
+- **`helm chat seats [--all]`** — the roster table: presence (fresh <2m /
+  quiet <15m / absent, off the last tool boundary), pending deliveries, live
+  claims. Absent rows hide by default (`--all` shows them), and rows unseen
+  **>1h are REAPED** together with their orphan cursor/seen/latch files (the
+  reaper rides every report read — the roster no longer only grows). The
   web twin is the **seats** panel in the ledger tab (`GET /api/chat/roster`).
+- **`helm chat seat rename <sid|oldname> <newname>`** — bind a live agent to
+  a memorable @name (`old` = seat name or an 8+-char session-id prefix). The
+  roster row AND every keyed state file move together, so tracked delivery
+  ground survives and the hook's `session_id` resolves to the new name from
+  the next boundary. Refuses taken/reserved/unaddressable names; reminds you
+  to re-arm a beacon armed on the old name. Web twin: the **rename** control
+  on each seats-panel row (`POST /api/chat/seat`).
 - **`helm chat claim <resource> [--ttl N] [--lease ID]` /
   `release <resource> --lease ID` / `claims`** — the advisory TTL lease
   (meld claims, minus the cap-gate): refused while another holder's lease is
