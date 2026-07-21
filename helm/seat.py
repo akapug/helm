@@ -91,12 +91,18 @@ FAMILIES = {
               # the real window — shaved to 360k (seats request max_tokens=32k, CC
               # reserves 20k). Small-window codex families (spark 128k) want 128000.
               "max_context": 360000},
-    # kimi rides the kimi.com CODING-plan endpoint (dual-wire; OpenAI wire at
-    # /coding/v1 — live-verified 2026-07-20). A Moonshot PLATFORM key would
-    # need base_url https://api.moonshot.ai/v1 instead; platform endpoints
-    # reject coding-plan keys ("Invalid Authentication") and vice versa.
+    # kimi keys come in two flavors that 401 on each other's endpoint: a
+    # CODING-plan key ("sk-kimi-…") wants api.kimi.com/coding/v1 (dual-wire;
+    # OpenAI wire live-verified 2026-07-20), a Moonshot PLATFORM key (plain
+    # "sk-…") wants api.moonshot.ai/v1 (serves kimi-k3 too — live-verified
+    # 2026-07-21). key_base_urls dispatches by key prefix at add time (first
+    # match wins); base_url is the no-match default. A mismatched pairing is
+    # not a loud failure: the proxy loads the key as an auth, the first call
+    # 401s upstream, and CLIProxyAPI quarantines the auth so every later call
+    # 503s `auth_unavailable` — hence dispatch-by-shape, not one hardcoded URL.
     "kimi": {"port": 8318, "model": "kimi-k3", "mode": "proxy-key",
-             "base_url": "https://api.kimi.com/coding/v1",
+             "base_url": "https://api.moonshot.ai/v1",
+             "key_base_urls": (("sk-kimi-", "https://api.kimi.com/coding/v1"),),
              "key_env": "KIMI_API_KEY", "provider": "moonshot"},
 }
 
@@ -337,6 +343,20 @@ def _config_yaml_key(port, token, provider, base_url, model, api_key):
             '      - name: "%s"\n'
             '        alias: "%s"\n'
             % (port, token, provider, base_url, api_key, model, model))
+
+
+def _key_base_url(fam, api_key):
+    """The outbound base-url for THIS key: some providers mint key flavors
+    bound to different endpoints (kimi coding-plan "sk-kimi-…" vs Moonshot
+    platform "sk-…"), and the wrong pairing 401s upstream — which CLIProxyAPI
+    answers by quarantining the auth (every later call 503s auth_unavailable).
+    Shared by every proxy-key family: an optional key_base_urls tuple of
+    (prefix, url) pairs dispatches by key shape, first match wins; families
+    without it (or with an unmatched key) keep fam["base_url"]."""
+    for prefix, url in fam.get("key_base_urls", ()):
+        if api_key.startswith(prefix):
+            return url
+    return fam["base_url"]
 
 
 def _instance_dir(family, seat):
@@ -648,13 +668,14 @@ def _add_proxy_key(family, fam, args, room=None):
     os.makedirs(d, mode=0o700, exist_ok=True)
     os.chmod(d, 0o700)
     token = _seat_token(family, d)
+    base_url = _key_base_url(fam, api_key)
     _write_private(os.path.join(d, "config.yaml"),
                    _config_yaml_key(fam["port"], token, fam["provider"],
-                                    fam["base_url"], fam["model"], api_key))
+                                    base_url, fam["model"], api_key))
     _write_launch_assets(family, d, room)
     print("helm seat: %s seat minted at %s" % (family, d))
     print("  outbound %s key baked into config.yaml (0600 — value never "
-          "printed); provider %s -> %s" % (key_env, fam["provider"], fam["base_url"]))
+          "printed); provider %s -> %s" % (key_env, fam["provider"], base_url))
     print("  proxy port %d; next: `helm seat up %s`, then `helm seat launch %s`"
           % (fam["port"], family, family))
     return 0

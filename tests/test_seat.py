@@ -291,6 +291,29 @@ class SeatTest(unittest.TestCase):
             '        alias: "kimi-k3"\n'))
         self.assertNotIn("auth-dir", cfg)
 
+    # -- key-flavor -> base-url dispatch (kimi coding vs Moonshot platform) --
+    def test_key_base_url_dispatch(self):
+        fam = seat.FAMILIES["kimi"]
+        # coding-plan flavor -> the kimi.com coding endpoint
+        self.assertEqual(seat._key_base_url(fam, "sk-kimi-abc123"),
+                         "https://api.kimi.com/coding/v1")
+        # platform flavor (plain sk-) -> the Moonshot platform endpoint
+        self.assertEqual(seat._key_base_url(fam, "sk-abc123"),
+                         "https://api.moonshot.ai/v1")
+        # a family with no key_base_urls keeps its single base_url
+        plain = {"base_url": "https://example.test/v1"}
+        self.assertEqual(seat._key_base_url(plain, "sk-anything"),
+                         "https://example.test/v1")
+
+    def test_add_kimi_coding_plan_key_routes_to_coding_endpoint(self):
+        os.environ["KIMI_API_KEY"] = "sk-kimi-fake-coding-plan-key"
+        rc, out, err = self._add(("add", "kimi"))
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir("kimi"), "config.yaml")) as f:
+            cfg = f.read()
+        self.assertIn('base-url: "https://api.kimi.com/coding/v1"', cfg)
+        self.assertIn('api-key: "sk-kimi-fake-coding-plan-key"', cfg)
+
     def test_add_kimi_from_env_var(self):
         os.environ["KIMI_API_KEY"] = "fake-kimi-key-for-tests"
         rc, out, err = self._add(("add", "kimi"))
@@ -308,7 +331,8 @@ class SeatTest(unittest.TestCase):
             cfg = f.read()
         self.assertIn("openai-compatibility:", cfg)
         self.assertIn('api-key: "fake-kimi-key-for-tests"', cfg)
-        self.assertIn('base-url: "https://api.kimi.com/coding/v1"', cfg)
+        # not "sk-kimi-…" -> the Moonshot PLATFORM endpoint (the default)
+        self.assertIn('base-url: "https://api.moonshot.ai/v1"', cfg)
         self.assertIn('alias: "kimi-k3"', cfg)
         self.assertNotIn("auth-dir", cfg)
         with open(os.path.join(d, "token")) as f:
