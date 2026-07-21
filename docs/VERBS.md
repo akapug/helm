@@ -866,23 +866,37 @@ $ helm configs edit ~/.claude/settings.json < settings.json
 ```
 
 ### `helm hooks [install [--harness claude|codex] [--home NAME] [--dry] | status]`
-The self-closing installer for the per-turn inject wiring. `install` merges
-the `UserPromptSubmit` → `helm inject --hook-json` hook into every claude
-home's `settings.json` (the default `~/.claude` included) — MERGE-preserving,
-idempotent (an up-to-date entry reports `ok`), on the configs safety rails
-(backup → validate → atomic write, backup restored on any failure). The
-generated command is fail-open by construction (`timeout` + `|| true` — a
-broken helm never blocks a turn). `--dry` prints the would-be diff per home;
-`--home NAME` narrows to one. `status` is the read-only per-home coverage
-table (hook present / helm resolvable / fail-open intact), mirrored by
-doctor's `inject coverage: N of M claude homes` line. Codex is reported as
-recipe-pending until [HOOKS.md](HOOKS.md) carries a mechanical shape.
+The self-closing installer for the per-turn inject wiring **and the
+fleet-delivery lane**. `install` merges the `UserPromptSubmit` → `helm inject
+--hook-json` hook plus the delivery lane (`PostToolUse` → `chat deliver`,
+`SessionStart` → `chat join`) into every claude home's `settings.json` (the
+default `~/.claude` included) — MERGE-preserving, idempotent (an up-to-date
+entry reports `ok`), on the configs safety rails (backup → validate → atomic
+write, backup restored on any failure). The generated command is fail-open by
+construction (`timeout` + `|| true` — a broken helm never blocks a turn).
+`--dry` prints the would-be diff per home; `--home NAME` narrows to one.
+
+**Seats are covered too.** A full `install` (no `--home` filter) ALSO wires the
+delivery lane (deliver + join, **not** inject) into every multimodel seat's
+isolated `CLAUDE_CONFIG_DIR` (`<helm_home>/_global/seats/<family>/claude`), so a
+launched codex/kimi/… seat receives `@<family>` and owner posts under its family
+name — same merge-preserving laws, a seat's own settings (theme, model,
+permissions, any foreign hook) untouched. `status` shows a `seats (fleet
+delivery)` block and a `seat delivery: N of M seats` line beside the per-home
+coverage table (hook present / helm resolvable / fail-open intact), mirrored by
+doctor's `inject coverage: N of M claude homes` line. Codex-harness NOTIFY hooks
+are reported as recipe-pending until [HOOKS.md](HOOKS.md) carries a mechanical
+shape.
 
 ```console
 $ helm hooks install
-helm hooks: command: timeout 10 /path/to/helm/bin/helm inject --hook-json || true
+helm hooks: inject (UserPromptSubmit): timeout 10 /path/to/helm/bin/helm inject --hook-json || true
   you-example-com    add    backup: none — new file
-helm hooks: 2 of 2 claude homes covered
+helm hooks: seats (fleet delivery — deliver + join):
+  codex              add    backup: ...
+  kimi               add    backup: ...
+helm hooks: 5 of 5 claude homes covered
+helm hooks: 2 of 2 seats covered (fleet delivery)
 ```
 
 ### `helm skills [dupes]`
@@ -1003,9 +1017,15 @@ word "whisper" stays reserved for inject's first-turn brief and the v1 ledger
 frames; this lane is called *delivery*.)
 
 - **`helm chat join [--hook-json] [--seat S]`** — the SessionStart autojoin:
-  writes the seat's RAM roster row (`.roster.json` in the room dir) and hands
-  the session its identity + protocol line as context. Never posts to the
-  room (presence lives in the roster panel, not the transcript).
+  writes the seat's RAM roster row (`.roster.json` in the room dir, keyed on
+  `HELM_CHAT_NAME` so a launched seat joins under its family name — `codex`,
+  `kimi`, … — not an ephemeral `agent-<sid8>`) and hands the session its
+  identity + protocol line as context. That line makes it a **mandatory first
+  action** to arm the idle-wake beacon — `Monitor(command: "helm chat wait
+  --seat <seat> --follow", persistent: true)` — because nothing external can
+  re-invoke a PTY agent (native-wake-only-agent-armed), so the self-armed
+  Monitor is the only thing that wakes an idle session. Never posts to the room
+  (presence lives in the roster panel, not the transcript).
 - **`helm chat deliver [--hook-json] [--seat S]`** — the PostToolUse nudge:
   an agent deep in an autonomous turn is unreachable by turn-start injection;
   this delivers between tool calls. At most ONE row per boundary (oldest
@@ -1016,10 +1036,15 @@ frames; this lane is called *delivery*.)
   refreshes the seat's roster `last_seen` — presence needs no daemon. The
   hot path is one stat; `HELM_CHAT_DELIVER=0` kills the lane; fail-open
   total. The owner-unread marker is untouched (only a real read consumes it).
-- **`helm chat wait [--seat S] [--any] [--timeout N]`** — the beacon: block
-  until the next word addressed to the seat (a delivery — it advances the
-  cursor, so the hook never re-nudges), or any new row with `--any` (cursor
-  untouched). A Monitor armed on this is meld's SSE watcher, natively.
+- **`helm chat wait [--seat S] [--any] [--follow] [--timeout N]`** — the
+  beacon: block until the next word addressed to the seat (a delivery — it
+  advances the cursor, so the hook never re-nudges), or any new row with
+  `--any` (cursor untouched). **`--follow`** is the idle-wake mode the join
+  directive arms: it never returns on a match — it streams EACH new matching
+  row as one line (one line = one agent wake), reusing the delivery address
+  filter (seat mentions + owner posts), and returns only on `--timeout`. A
+  persistent Monitor armed on `wait --follow` is meld's SSE watcher, natively;
+  fail-open + bounded poll, so a delivery hiccup never crashes the beacon.
 - **`helm chat seats`** — the roster table: presence (fresh <2m / quiet <15m /
   absent, off the last tool boundary), pending deliveries, live claims. The
   web twin is the **seats** panel in the ledger tab (`GET /api/chat/roster`).
@@ -1256,3 +1281,13 @@ proxy) and `kimi` (mode "proxy-key" — an API-key provider behind the same
 proxy via its openai-compatibility block; the key comes from `KIMI_API_KEY`
 or `--key-from <env-file>` at add time and is baked into the seat's 0600
 config, never printed).
+
+A seat is a **first-class fleet chat member**. `seat launch` exports
+`HELM_CHAT_NAME=<family>` (keeping the existing `env -u ANTHROPIC_API_KEY`
+scrub), so the seat's SessionStart join registers it in the roster under its
+family name and `@codex` / `@kimi` fleet posts deliver to it between tool
+calls. The delivery lane (deliver + join) lives in the seat's `claude/` config
+dir; `helm hooks install` wires it there and `helm hooks status` reports seat
+coverage (see `helm hooks`). A seat already running an OLD session must be
+relaunched with a fresh `helm seat launch` to pick up the identity + the
+delivery hooks — a live session's settings are read once, at start.
