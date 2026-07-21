@@ -62,6 +62,12 @@ SECRET_PATTERNS = (
     ("private key", rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     ("jwt", rb"\beyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}"),
     ("bearer header", rb"[Aa]uthorization['\"]?\s*[:=]\s*['\"]?Bearer\s+[A-Za-z0-9_.~+/=-]{16,}"),
+    # runbook fix #6 — defense-in-depth behind the wholesale seats/ ignore:
+    # a seat token mints as 64 hex (secrets.token_hex(32)) and rides INLINE
+    # in launch.sh as ANTHROPIC_AUTH_TOKEN=<hex>; if either ever escapes the
+    # ignore it must still be refused here, never reach git history.
+    ("seat token env", rb"ANTHROPIC_AUTH_TOKEN\s*=\s*\S{16,}"),
+    ("bare seat token", rb"(?m)^\s*[0-9a-f]{64}\s*$"),
 )
 
 

@@ -166,6 +166,25 @@ class ApplyTest(ShipBase):
         self.assertNotEqual(self.g(self.hh, "rev-parse", "HEAD").returncode, 0)  # no commit
         self.assertEqual(self.g(self.hh, "ls-files", "--cached").stdout, "")     # unstaged
 
+    def test_secret_scan_refuses_escaped_launch_sh(self):
+        """Runbook fix #6: a launch.sh (inline ANTHROPIC_AUTH_TOKEN=<64hex>)
+        that ever escapes the wholesale seats/ ignore is REFUSED by the belt
+        — seat-token material never reaches git history."""
+        seat_tok = "c20f0ee57a99c6a7ee88e0150bf1176a245e42d89b1f296263c9e739a70f75bf"
+        body = ("#!/bin/sh\n"
+                "env -u ANTHROPIC_API_KEY "
+                "ANTHROPIC_BASE_URL=http://127.0.0.1:8317 "
+                "ANTHROPIC_AUTH_TOKEN=%s "
+                "claude --dangerously-skip-permissions --model gpt-5.6-sol\n"
+                % seat_tok)
+        self._write(self.hh, "_global/premises", "prior-launch.md",
+                    prior_text("launch", "provenance note") + "\n" + body)
+        rc, _, err = self.run_ship(["--apply"])
+        self.assertEqual(rc, 1)
+        self.assertIn("REFUSED", err)
+        self.assertIn("seat token env", err)
+        self.assertNotEqual(self.g(self.hh, "rev-parse", "HEAD").returncode, 0)
+
     def test_hosts_observation_block(self):
         rc, _, err = self.run_ship(["--apply"])
         self.assertEqual(rc, 0, err)
@@ -178,6 +197,35 @@ class ApplyTest(ShipBase):
         self.assertEqual(rc, 0)
         self.assertIn(socket.gethostname(), out)
         self.assertIn("1 projects (1 active)", out)
+
+
+class SecretScanUnitTest(ShipBase):
+    """scan_secrets direct: the fix-#6 patterns fire on real seat-token
+    shapes and stay quiet on innocuous hex (a sha in prose is NOT a token
+    file — only a bare 64-hex LINE trips)."""
+
+    def test_env_assignment_spaced_and_quoted(self):
+        self._write(self.hh, "_global/premises", "p1.md",
+                    prior_text("p1", "x") +
+                    "\nexport ANTHROPIC_AUTH_TOKEN = \"c20f0ee57a99c6a7ee88"
+                    "e0150bf1176a245e42d89b1f296263c9e739a70f75bf\"\n")
+        hits = ship.scan_secrets(self.hh, ["_global/premises/p1.md"])
+        self.assertEqual(hits, [("_global/premises/p1.md", "seat token env")])
+
+    def test_bare_token_file_line(self):
+        self._write(self.hh, "_global/premises", "p2.md",
+                    prior_text("p2", "x") +
+                    "\nc20f0ee57a99c6a7ee88e0150bf1176a245e42d89b1f296263c9e739a70f75bf\n")
+        hits = ship.scan_secrets(self.hh, ["_global/premises/p2.md"])
+        self.assertEqual(hits, [("_global/premises/p2.md", "bare seat token")])
+
+    def test_hex_in_prose_is_clean(self):
+        """A commit sha quoted inside a sentence is not a bare token line —
+        the belt must not false-positive on ordinary dev prose."""
+        self._write(self.hh, "_global/premises", "p3.md",
+                    prior_text("p3", "shipped as c20f0ee57a99c6a7ee88e0150bf1"
+                               "176a245e42d89b1f296263c9e739a70f75bf yesterday."))
+        self.assertEqual(ship.scan_secrets(self.hh, ["_global/premises/p3.md"]), [])
 
 
 class PullTest(ShipBase):
