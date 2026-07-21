@@ -5,13 +5,24 @@ FULL hook JSON to `helm inject --hook-json` (which derives the project scope
 from the turn's cwd). Hand-wiring one home at a time was the adoption gap;
 `install` closes it, `status` + doctor keep it closed.
 
+The estate is TWO surfaces: the claude credential homes (~/.claude-homes/*,
+~/.claude) get the full spec set (inject + the delivery lane); the multimodel
+SEAT config dirs (<helm_home>/_global/seats/<family>/claude — seat.py's
+isolated CLAUDE_CONFIG_DIRs) get the DELIVERY LANE (deliver + join) so a
+launched codex/kimi/… seat receives fleet chat under its family name (seat.py
+exports HELM_CHAT_NAME=<family> on launch; seats.py derive_seat keys the
+roster on it). `install` covers both; `status` reports coverage for both.
+
 Laws:
   * MERGE-preserving: existing settings keys and foreign hook entries are
     NEVER clobbered; re-install is idempotent (an up-to-date entry reports ok);
     a stale helm entry (old path/old style) is updated in place, not doubled.
+    A seat carries its own settings (model, permissions); the install only ever
+    adds/updates helm's own delivery entries, never touches the rest.
   * Safety rails are configs.py's: backup -> validate -> atomic write; the file
     is re-parsed AFTER the write and the backup restored on any failure. A bad
-    install must never brick a home's launch.
+    install must never brick a home's (or a seat's) launch. (configs.HOME_ROOTS
+    recognizes the seat claude dirs so the same gated write path accepts them.)
   * FAIL-OPEN generated text (docs/HOOKS.md law): `timeout` + `|| true` — a
     missing or wedged helm injects nothing, never blocks a turn.
   * codex: docs/HOOKS.md carries no mechanical notify-hook recipe yet —
@@ -25,7 +36,7 @@ import shlex
 import shutil
 import sys
 
-from . import configs, homes
+from . import configs, home, homes
 
 HOOK_EVENT = "UserPromptSubmit"
 TIMEOUT_S = 10  # inject is ~ms; 10s is the never-hold-a-turn ceiling
@@ -45,6 +56,12 @@ SPECS = (
     {"name": "join", "event": "SessionStart", "args": "chat join --hook-json",
      "timeout": 5, "own": ("chat join --hook-json",), "matcher": "*"},
 )
+
+# The delivery lane alone (deliver + join, no inject) — what a SEAT's isolated
+# CLAUDE_CONFIG_DIR receives so @<family> and owner posts reach it. inject (the
+# per-turn context brief) stays a home concern; a seat joins the roster under
+# its family name via HELM_CHAT_NAME (seat.py launch_line).
+DELIVERY_SPECS = tuple(s for s in SPECS if s["name"] in ("deliver", "join"))
 
 
 def helm_bin():
@@ -114,6 +131,21 @@ def claude_homes():
     d = os.path.realpath(homes.DEFAULTS["claude"])
     if os.path.isdir(d) and d not in seen:
         out.append(("(default-claude)", d))
+    return out
+
+
+def seat_homes():
+    """[(family, realpath)] per seat config dir — <helm_home>/_global/seats/
+    <family>/claude, the seat's isolated CLAUDE_CONFIG_DIR (seat.py). These get
+    the delivery lane so a launched seat receives fleet chat under its family
+    name. Discovered by glob; configs.HOME_ROOTS recognizes the same dirs, so
+    the merge-preserving gated write accepts them."""
+    root = os.path.join(home.global_dir(), "seats")
+    out = []
+    for cdir in sorted(glob.glob(os.path.join(root, "*", "claude"))):
+        real = os.path.realpath(cdir)
+        if os.path.isdir(real):
+            out.append((os.path.basename(os.path.dirname(cdir)), real))
     return out
 
 
@@ -190,10 +222,11 @@ def _merge_event(out, spec):
     return "add"
 
 
-def _merge_all(settings):
-    """-> (merged_copy, {spec_name: action}) across the whole estate."""
+def _merge_all(settings, specs=SPECS):
+    """-> (merged_copy, {spec_name: action}) across `specs` — the whole estate
+    for a home (SPECS), the delivery lane for a seat (DELIVERY_SPECS)."""
     out = json.loads(json.dumps(settings))  # deep copy — never mutate the input
-    return out, {s["name"]: _merge_event(out, s) for s in SPECS}
+    return out, {s["name"]: _merge_event(out, s) for s in specs}
 
 
 def _agg(actions):
@@ -204,8 +237,9 @@ def _agg(actions):
     return "ok"
 
 
-def install_home(path, dry=False):
-    """Install/refresh the inject hook in <path>/settings.json.
+def install_home(path, dry=False, specs=SPECS):
+    """Install/refresh `specs` in <path>/settings.json — the full estate for a
+    home (SPECS), the delivery lane for a seat (DELIVERY_SPECS).
     -> (action, detail): ok|add|update|dry-add|dry-update|fail."""
     sp = os.path.join(path, "settings.json")
     raw, cur = "", {}
@@ -219,7 +253,7 @@ def install_home(path, dry=False):
         if not isinstance(cur, dict):
             return "fail", "settings.json root is not an object — refusing to touch it"
     try:
-        merged, actions = _merge_all(cur)
+        merged, actions = _merge_all(cur, specs)
     except ValueError as e:
         return "fail", str(e)
     action = _agg(actions)
@@ -237,7 +271,7 @@ def install_home(path, dry=False):
     try:  # JSON-validate AFTER the write; anything torn restores the backup
         with open(sp, encoding="utf-8") as f:
             got = json.load(f)
-        ok = all(spec_command(s) in _hook_cmds(got, s["event"]) for s in SPECS)
+        ok = all(spec_command(s) in _hook_cmds(got, s["event"]) for s in specs)
     except (OSError, ValueError):
         ok = False
     if not ok:
@@ -297,6 +331,31 @@ def coverage():
                 if r["hook"] and r["resolvable"] and r["fail_open"]), len(rows))
 
 
+def seat_status_rows():
+    """Per-seat delivery-lane coverage: does the seat's claude/settings.json
+    carry the deliver + join hooks (exact command + matcher validated, never
+    marker presence — same _lane_live law as homes)? Read-only. inject is not
+    a seat concern, so it is not reported here."""
+    rows = []
+    for name, path in seat_homes():
+        settings = {}
+        try:
+            with open(os.path.join(path, "settings.json"), encoding="utf-8") as f:
+                settings = json.load(f)
+        except (OSError, ValueError):
+            pass
+        lanes = {s["name"]: _lane_live(settings, s) for s in DELIVERY_SPECS}
+        rows.append({"seat": name, "path": path, **lanes})
+    return rows
+
+
+def seat_coverage():
+    """(covered, total) seats — covered = both delivery hooks (deliver + join)
+    live in the seat's claude config dir."""
+    rows = seat_status_rows()
+    return (sum(1 for r in rows if r["deliver"] and r["join"]), len(rows))
+
+
 _CODEX_PENDING = ("codex: recipe pending — docs/HOOKS.md carries no mechanical "
                   "notify-hook shape yet; wire it by hand per that doc's codex section")
 
@@ -318,7 +377,8 @@ def _select_homes(name):
 
 def cmd_hooks(args):
     """hooks [install [--harness claude|codex] [--home NAME] [--dry] | status]
-    — self-wire the per-turn inject hook into every claude home."""
+    — self-wire the per-turn inject hook into every claude home, and the
+    fleet-delivery lane (deliver + join) into every seat config dir."""
     args = list(args)
     if not args:
         print(_USAGE, file=sys.stderr)
@@ -350,6 +410,17 @@ def cmd_hooks(args):
         if d < m:
             print("delivery lane (chat deliver/join): %d of %d homes — "
                   "`helm hooks install` wires it" % (d, m))
+        srows = seat_status_rows()
+        if srows:
+            print("seats (fleet delivery — chat deliver/join):")
+            print("  %-28s %-8s %s" % ("seat", "deliver", "join"))
+            for r in srows:
+                print("  %-28s %-8s %s" % (
+                    r["seat"], "yes" if r["deliver"] else "NO",
+                    "yes" if r["join"] else "NO"))
+            sc, st = seat_coverage()
+            sline = "seat delivery: %d of %d seats" % (sc, st)
+            print(sline if sc == st else sline + " — `helm hooks install` wires it")
         print(_CODEX_PENDING)
         return 0
 
@@ -380,8 +451,9 @@ def cmd_hooks(args):
         for s in SPECS:
             print("helm hooks: %s (%s): %s" % (s["name"], s["event"], spec_command(s)))
         failed = 0
-        for name, path in targets:
-            action, detail = install_home(path, dry=dry)
+        def _apply(name, path, specs):
+            nonlocal failed
+            action, detail = install_home(path, dry=dry, specs=specs)
             failed += action == "fail"
             if action.startswith("dry-"):
                 print("  %-28s %s (dry — nothing written)" % (name, action[4:]))
@@ -389,9 +461,22 @@ def cmd_hooks(args):
                     print("    " + detail.replace("\n", "\n    "))
             else:
                 print("  %-28s %-6s %s" % (name, action, detail))
+        for name, path in targets:
+            _apply(name, path, SPECS)
+        # seats get the delivery lane (deliver + join) — only on a full install;
+        # a --home-narrowed run stays scoped to that one home.
+        seats = seat_homes() if home_name is None else []
+        if seats:
+            print("helm hooks: seats (fleet delivery — deliver + join):")
+            for name, path in seats:
+                _apply(name, path, DELIVERY_SPECS)
         if not dry:
             n, m = coverage()
             print("helm hooks: %d of %d claude homes covered" % (n, m))
+            sc, st = seat_coverage()
+            if st:
+                print("helm hooks: %d of %d seats covered (fleet delivery)"
+                      % (sc, st))
         return 1 if failed else 0
 
     print("helm hooks: unknown subverb %r" % verb, file=sys.stderr)

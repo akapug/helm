@@ -36,11 +36,19 @@ BACKUP_DIR = os.path.join(HOME, ".cache", "helm", "config-backups")
 # HELM_* preferred, legacy SESH_* accepted — the env2 pattern catalog.py uses).
 CWD_ROOTS = [r for r in os.environ.get(
     "HELM_CONFIG_ROOTS", os.environ.get("SESH_CONFIG_ROOTS", f"{HOME}/dev")).split(":") if r]
+# helm seats are full isolated claude config homes living under the helm home
+# (<helm_home>/_global/seats/<family>/claude — settings.json, .claude.json,
+# sessions). helm_home honors HELM_HOME/MELD_HOME. The delivery-lane wiring
+# writes settings.json here through the same gated path as any home; creds stay
+# denied (auth.json/.credentials.json) and the proxy config.yaml is unrecognized.
+_HELM_HOME = os.path.abspath(os.path.expanduser(
+    os.environ.get("HELM_HOME") or os.environ.get("MELD_HOME") or f"{HOME}/.helm"))
 # credential-home roots (project-scoped configs never live here, but home/user-scope
 # settings do: <home>/settings.json, <home>/.claude.json, <home>/config.toml, …).
 HOME_ROOTS = ([f"{HOME}/.claude", f"{HOME}/.codex"]
               + sorted(glob.glob(f"{HOME}/.claude-homes/*"))
-              + sorted(glob.glob(f"{HOME}/.codex-homes/*")))
+              + sorted(glob.glob(f"{HOME}/.codex-homes/*"))
+              + sorted(glob.glob(os.path.join(_HELM_HOME, "_global", "seats", "*", "claude"))))
 
 MANAGED_DIRS = ("/etc/claude-code", "/Library/Application Support/ClaudeCode")
 # dirs we never descend into when scanning a cwd tree (noise + huge).

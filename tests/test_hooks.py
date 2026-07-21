@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """helm hooks tests — the self-closing inject installer. HERMETIC BY LAW:
 homes.ROOTS/DEFAULTS, configs.HOME_ROOTS and configs.BACKUP_DIR all point at
-tmp dirs (the test_homes patching pattern) — a real install against the live
-~/.claude never runs here."""
+tmp dirs (the test_homes patching pattern), and HELM_HOME is a tmp dir so the
+seat estate (seat_homes reads <helm_home>/_global/seats) never touches the live
+~/.helm — a real install against the live ~/.claude or a live seat never runs
+here."""
 import contextlib
 import io
 import json
@@ -30,12 +32,34 @@ class HooksBase(unittest.TestCase):
         self._cfg_orig = (configs.HOME_ROOTS, configs.BACKUP_DIR)
         configs.HOME_ROOTS = [homes.DEFAULTS["claude"]]
         configs.BACKUP_DIR = j("backups")
+        # HELM_HOME hermetic: seat_homes() globs <helm_home>/_global/seats — a
+        # tmp home keeps the live seats out of every hooks test.
+        self._helm_home_prior = os.environ.get("HELM_HOME")
+        self.helm_home = j("helm-home")
+        os.environ["HELM_HOME"] = self.helm_home
+        self.seats_root = os.path.join(self.helm_home, "_global", "seats")
 
     def tearDown(self):
         for k, v in self._homes_orig.items():
             setattr(homes, k, v)
         configs.HOME_ROOTS, configs.BACKUP_DIR = self._cfg_orig
+        if self._helm_home_prior is None:
+            os.environ.pop("HELM_HOME", None)
+        else:
+            os.environ["HELM_HOME"] = self._helm_home_prior
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def mk_seat(self, family, settings=None):
+        """A fake seat config dir (<helm_home>/_global/seats/<family>/claude),
+        registered as a home root so the gated write path accepts it — the
+        live-seat analogue of mk_home."""
+        d = os.path.join(self.seats_root, family, "claude")
+        os.makedirs(d, exist_ok=True)
+        configs.HOME_ROOTS.append(d)
+        if settings is not None:
+            with open(os.path.join(d, "settings.json"), "w") as f:
+                json.dump(settings, f, indent=2)
+        return d
 
     def mk_home(self, name, settings=None):
         d = os.path.join(homes.ROOTS["claude"], name)
@@ -333,6 +357,83 @@ class DoctorCoverageTest(HooksBase):
         self.assertEqual(rc, 0)
         self.assertEqual(doctor.check_inject_coverage(),
                          [(doctor.OK, "inject coverage: 2 of 2 claude homes")])
+
+
+class SeatCoverageTest(HooksBase):
+    """Seats (multimodel CLAUDE_CONFIG_DIRs) get the delivery lane, not inject —
+    same merge-preserving / backup→validate→atomic / idempotent laws as homes."""
+
+    def test_seat_homes_discovers_seat_config_dirs(self):
+        c = self.mk_seat("codex")
+        self.mk_seat("kimi")
+        found = dict(hooks.seat_homes())
+        self.assertEqual(set(found), {"codex", "kimi"})
+        self.assertEqual(found["codex"], os.path.realpath(c))
+
+    def test_install_wires_both_delivery_hooks_without_dropping_foreign(self):
+        foreign = "echo seat-local-hook"          # a pre-existing foreign hook
+        d = self.mk_seat("codex", settings={
+            "model": "gpt-5.6-sol",
+            "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": foreign}]}]}})
+        deliver = next(s for s in hooks.SPECS if s["name"] == "deliver")
+        join = next(s for s in hooks.SPECS if s["name"] == "join")
+        action, _ = hooks.install_home(d, specs=hooks.DELIVERY_SPECS)
+        self.assertEqual(action, "add")
+        got = self.read_settings(d)
+        # the seat's own settings + foreign hook survive byte-identical
+        self.assertEqual(got["model"], "gpt-5.6-sol")
+        self.assertEqual(got["hooks"]["PreToolUse"][0]["hooks"][0]["command"], foreign)
+        # BOTH delivery hooks are present under the right events + matcher
+        self.assertIn(hooks.spec_command(deliver), hooks._hook_cmds(got, "PostToolUse"))
+        self.assertIn(hooks.spec_command(join), hooks._hook_cmds(got, "SessionStart"))
+        self.assertEqual(got["hooks"]["PostToolUse"][-1]["matcher"], "*")
+        self.assertEqual(got["hooks"]["SessionStart"][-1]["matcher"], "*")
+        # inject is NOT a seat concern — the delivery lane only
+        self.assertEqual(hooks._hook_cmds(got, "UserPromptSubmit"), [])
+        # idempotent: a second install detects up-to-date, writes nothing new
+        self.assertEqual(hooks.install_home(d, specs=hooks.DELIVERY_SPECS),
+                         ("ok", "hook up to date"))
+        self.assertEqual(len(hooks._hook_cmds(got, "PostToolUse")), 1)
+
+    def test_seat_coverage_and_status_surface_the_gap(self):
+        covered = self.mk_seat("codex")
+        hooks.install_home(covered, specs=hooks.DELIVERY_SPECS)
+        self.mk_seat("kimi")                       # bare — no delivery hooks
+        rows = {r["seat"]: r for r in hooks.seat_status_rows()}
+        self.assertTrue(rows["codex"]["deliver"] and rows["codex"]["join"])
+        self.assertFalse(rows["kimi"]["deliver"])
+        self.assertEqual(hooks.seat_coverage(), (1, 2))
+        rc, out, _ = self.run_hooks(["status"])
+        self.assertEqual(rc, 0)
+        self.assertIn("seats (fleet delivery", out)
+        self.assertIn("seat delivery: 1 of 2 seats", out)
+
+    def test_full_install_covers_every_seat_and_reports(self):
+        self.mk_seat("codex")
+        self.mk_seat("kimi", settings={"model": "kimi-k3"})  # foreign key present
+        rc, out, err = self.run_hooks(["install"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("seats (fleet delivery", out)
+        self.assertIn("2 of 2 seats covered", out)
+        for fam in ("codex", "kimi"):
+            got = self.read_settings(os.path.join(self.seats_root, fam, "claude"))
+            self.assertIn("chat deliver --hook-json",
+                          " ".join(hooks._hook_cmds(got, "PostToolUse")))
+            self.assertIn("chat join --hook-json",
+                          " ".join(hooks._hook_cmds(got, "SessionStart")))
+        self.assertEqual(self.read_settings(
+            os.path.join(self.seats_root, "kimi", "claude"))["model"], "kimi-k3")
+
+    def test_home_narrowed_install_leaves_seats_untouched(self):
+        self.mk_home("a-user-dev")
+        self.mk_seat("codex")
+        rc, out, _ = self.run_hooks(["install", "--home", "a-user-dev"])
+        self.assertEqual(rc, 0)
+        # a --home-scoped run never reaches the seats
+        self.assertFalse(os.path.exists(os.path.join(
+            self.seats_root, "codex", "claude", "settings.json")))
+        self.assertEqual(hooks.seat_coverage(), (0, 1))
 
 
 if __name__ == "__main__":

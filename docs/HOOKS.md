@@ -11,13 +11,18 @@ which is what makes your knowledge fire wherever you work.
 For Claude Code you never hand-wire this — helm installs its own hook:
 
 ```console
-$ helm hooks install            # every claude home, incl. the default ~/.claude
-helm hooks: command: timeout 10 /path/to/helm/bin/helm inject --hook-json || true
+$ helm hooks install            # every claude home + every seat, incl. ~/.claude
+helm hooks: inject (UserPromptSubmit): timeout 10 /path/to/helm/bin/helm inject --hook-json || true
+helm hooks: deliver (PostToolUse): timeout 2 /path/to/helm/bin/helm chat deliver --hook-json || true
+helm hooks: join (SessionStart): timeout 5 /path/to/helm/bin/helm chat join --hook-json || true
   you-example-com              add    backup: none — new file
   (default-claude)             update backup: ~/.cache/helm/config-backups/…
+helm hooks: seats (fleet delivery — deliver + join):
+  codex                        add    backup: none — new file
 helm hooks: 2 of 2 claude homes covered
-$ helm hooks status             # per-home coverage table, read-only
-$ helm hooks install --dry      # the would-be diff per home, nothing written
+helm hooks: 1 of 1 seats covered (fleet delivery)
+$ helm hooks status             # per-home + per-seat coverage table, read-only
+$ helm hooks install --dry      # the would-be diff per home/seat, nothing written
 ```
 
 The installer merges the whole hook estate — three entries per home — into
@@ -29,13 +34,23 @@ each home's `settings.json`:
 | `PostToolUse` (`*`) | `helm chat deliver --hook-json` (timeout 2) | the delivery lane: @mentions + owner posts nudge an agent BETWEEN tool calls (see VERBS.md, the delivery lane) |
 | `SessionStart` (`*`) | `helm chat join --hook-json` (timeout 5) | the autojoin: roster presence row + the seat's identity as session context |
 
+**Seats are part of the estate.** A full `install` (no `--home` filter) also
+wires the **delivery lane** (`PostToolUse` deliver + `SessionStart` join —
+**not** inject) into every multimodel seat's isolated `CLAUDE_CONFIG_DIR`
+(`<helm_home>/_global/seats/<family>/claude`), so a launched codex/kimi/… seat
+receives `@<family>` and owner posts under its family name (`seat launch`
+exports `HELM_CHAT_NAME=<family>`; a seat's own settings are never touched).
+`helm hooks status` prints a `seats (fleet delivery)` block plus
+`seat delivery: N of M seats`, and `helm hooks install` reports
+`N of M seats covered (fleet delivery)`.
+
 Same laws for every entry: MERGE-preserving (existing hooks — `helm record`'s
-PostToolUse leg included — and settings keys are never clobbered), idempotent
-(re-install reports `ok`), on configs.py's safety rails (backup → validate →
-atomic write, re-parsed after the write, backup restored on any failure).
-`--home NAME` narrows to one home; `helm doctor` reports
-`inject coverage: N of M claude homes` so a gap can't hide, and
-`helm hooks status` adds per-home `deliver`/`join` columns.
+PostToolUse leg, a seat's foreign hooks — and settings keys are never
+clobbered), idempotent (re-install reports `ok`), on configs.py's safety rails
+(backup → validate → atomic write, re-parsed after the write, backup restored
+on any failure). `--home NAME` narrows to one home (and skips seats); `helm
+doctor` reports `inject coverage: N of M claude homes` so a gap can't hide, and
+`helm hooks status` adds per-home `deliver`/`join` columns plus the seat block.
 
 The generated command pipes the hook's FULL JSON to `helm inject --hook-json`,
 which extracts the prompt, derives `--project` from the hook's `cwd` (longest
