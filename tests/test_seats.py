@@ -1017,7 +1017,8 @@ class StopWhisperTest(SeatsBase):
         stale-unlanded precondition (a fresh set never whispers: echo≠context)."""
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - secs))
         p = os.path.join(chat.chat_dir(), room + ".jsonl")
-        rows = [json.loads(l) for l in open(p)]
+        with open(p) as f:
+            rows = [json.loads(l) for l in f]
         with open(p, "w") as f:
             for r in rows:
                 r["ts"] = old
