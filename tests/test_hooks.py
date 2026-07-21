@@ -375,6 +375,77 @@ class DeliveryLaneTest(HooksBase):
         self.assertEqual(got[0]["matcher"], "*")
 
 
+class BeaconPermitTest(HooksBase):
+    """G-beacon-autopermit: install merges the beacon allow rules into
+    permissions.allow on every home AND seat — additive, idempotent, never
+    dropping an existing entry — so a fresh session's mandatory
+    `Monitor(helm chat wait … --follow)` first action never hangs on a human
+    permission prompt."""
+
+    def test_install_grants_beacon_permits_idempotently(self):
+        d = self.mk_home("a-user-dev", settings={
+            "model": "opus",
+            "permissions": {"allow": ["Bash(git:*)"], "deny": ["WebFetch"],
+                            "defaultMode": "acceptEdits"}})
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "add")
+        got = self.read_settings(d)
+        allow = got["permissions"]["allow"]
+        self.assertIn("Bash(git:*)", allow)              # nothing dropped
+        for rule in hooks.PERMIT_RULES:
+            self.assertIn(rule, allow)
+        self.assertEqual(got["permissions"]["deny"], ["WebFetch"])
+        self.assertEqual(got["permissions"]["defaultMode"], "acceptEdits")
+        # idempotent: re-install adds nothing, duplicates nothing
+        self.assertEqual(hooks.install_home(d), ("ok", "hook up to date"))
+        allow2 = self.read_settings(d)["permissions"]["allow"]
+        self.assertEqual(allow2, allow)
+        self.assertEqual(len(allow2), len(set(allow2)))
+
+    def test_seat_with_no_permissions_key_gains_one(self):
+        d = self.mk_seat("kimi", settings={"model": "kimi-k3"})
+        action, _ = hooks.install_home(d, specs=hooks.DELIVERY_SPECS)
+        self.assertEqual(action, "add")
+        got = self.read_settings(d)
+        self.assertEqual(got["model"], "kimi-k3")
+        self.assertEqual(got["permissions"]["allow"], list(hooks.PERMIT_RULES))
+        self.assertEqual(hooks.install_home(d, specs=hooks.DELIVERY_SPECS),
+                         ("ok", "hook up to date"))
+
+    def test_permits_alone_missing_still_triggers_an_install_write(self):
+        """A home whose hooks are current but whose allow rules are absent is
+        NOT up to date — the exact live gap (hooks installed before this fix)."""
+        d = self.mk_home("a-user-dev")
+        hooks.install_home(d)
+        got = self.read_settings(d)
+        got["permissions"]["allow"] = ["Bash(git:*)"]   # someone pruned ours
+        with open(os.path.join(d, "settings.json"), "w") as f:
+            json.dump(got, f)
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "add")
+        allow = self.read_settings(d)["permissions"]["allow"]
+        self.assertIn("Bash(git:*)", allow)
+        for rule in hooks.PERMIT_RULES:
+            self.assertIn(rule, allow)
+
+    def test_broken_permissions_shape_refused_untouched(self):
+        d = self.mk_home("a-user-dev", settings={"permissions": "nope"})
+        action, detail = hooks.install_home(d)
+        self.assertEqual(action, "fail")
+        self.assertIn("permissions", detail)
+        self.assertEqual(self.read_settings(d), {"permissions": "nope"})
+
+    def test_status_surfaces_the_permit_gap(self):
+        d = self.mk_home("a-user-dev")
+        hooks.install_home(d)
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertTrue(rows["a-user-dev"]["permits"])
+        self.assertFalse(rows["(default-claude)"]["permits"])
+        rc, out, _ = self.run_hooks(["status"])
+        self.assertEqual(rc, 0)
+        self.assertIn("beacon permit", out)
+
+
 class DoctorCoverageTest(HooksBase):
     def test_doctor_coverage_warn_then_ok(self):
         self.mk_home("a-user-dev")

@@ -86,6 +86,18 @@ SPECS = (
 DELIVERY_SPECS = tuple(s for s in SPECS
                        if s["name"] in ("deliver", "join", "stop-guard"))
 
+# The beacon's permission grease (owner hit it live): the SessionStart join
+# line DIRECTS `Monitor(command: "helm chat wait … --follow")` as the
+# mandatory first action, but a fresh home/seat has no allow rule for that
+# command — so the very first act of every new session HANGS on a human
+# permission prompt, and an unattended pane never arms its only wake path.
+# install merges these into permissions.allow on every home AND every seat,
+# through the same gated backup→validate→atomic write as the hooks block:
+# additive + idempotent, existing allow entries are NEVER dropped. Both the
+# Bash and Monitor rule forms ride together — the beacon command is the same
+# either way the harness runs it.
+PERMIT_RULES = ("Bash(helm chat wait:*)", "Monitor(helm chat wait:*)")
+
 
 def helm_bin():
     """This checkout's bin/helm, absolute — the generated hook must resolve
@@ -245,11 +257,38 @@ def _merge_event(out, spec):
     return "add"
 
 
+def _merge_permits(out):
+    """Merge PERMIT_RULES into permissions.allow IN PLACE -> ok|add. Additive
+    only: existing entries (and every sibling permissions key — deny, ask,
+    defaultMode …) survive byte-identical; a home with no permissions key
+    gains one. Raises ValueError on a shape we must not touch."""
+    perms = out.setdefault("permissions", {})
+    if not isinstance(perms, dict):
+        raise ValueError("existing 'permissions' key is not an object — fix it by hand")
+    allow = perms.setdefault("allow", [])
+    if not isinstance(allow, list):
+        raise ValueError("existing permissions.allow is not a list — fix it by hand")
+    missing = [r for r in PERMIT_RULES if r not in allow]
+    allow.extend(missing)
+    return "add" if missing else "ok"
+
+
+def _permits_live(settings):
+    """Every PERMIT_RULE present in permissions.allow (the post-write check)."""
+    perms = settings.get("permissions") if isinstance(settings, dict) else None
+    allow = perms.get("allow") if isinstance(perms, dict) else None
+    return isinstance(allow, list) and all(r in allow for r in PERMIT_RULES)
+
+
 def _merge_all(settings, specs=SPECS):
     """-> (merged_copy, {spec_name: action}) across `specs` — the whole estate
-    for a home (SPECS), the delivery lane for a seat (DELIVERY_SPECS)."""
+    for a home (SPECS), the delivery lane for a seat (DELIVERY_SPECS) — plus
+    the beacon permit rules (every surface that gets the delivery lane must
+    also be ABLE to arm the beacon without a human prompt)."""
     out = json.loads(json.dumps(settings))  # deep copy — never mutate the input
-    return out, {s["name"]: _merge_event(out, s) for s in specs}
+    actions = {s["name"]: _merge_event(out, s) for s in specs}
+    actions["permits"] = _merge_permits(out)
+    return out, actions
 
 
 def _agg(actions):
@@ -294,7 +333,8 @@ def install_home(path, dry=False, specs=SPECS):
     try:  # JSON-validate AFTER the write; anything torn restores the backup
         with open(sp, encoding="utf-8") as f:
             got = json.load(f)
-        ok = all(spec_command(s) in _hook_cmds(got, s["event"]) for s in specs)
+        ok = all(spec_command(s) in _hook_cmds(got, s["event"]) for s in specs) \
+            and _permits_live(got)
     except (OSError, ValueError):
         ok = False
     if not ok:
@@ -342,7 +382,8 @@ def status_rows():
         lanes = {s["name"]: _lane_live(settings, s) for s in SPECS[1:]}
         rows.append({"home": name, "path": path, "hook": bool(cmd), "command": cmd,
                      "resolvable": bool(cmd) and _resolvable(cmd),
-                     "fail_open": bool(cmd) and _fail_open(cmd), **lanes})
+                     "fail_open": bool(cmd) and _fail_open(cmd),
+                     "permits": _permits_live(settings), **lanes})
     return rows
 
 
@@ -368,7 +409,8 @@ def seat_status_rows():
         except (OSError, ValueError):
             pass
         lanes = {s["name"]: _lane_live(settings, s) for s in DELIVERY_SPECS}
-        rows.append({"seat": name, "path": path, **lanes})
+        rows.append({"seat": name, "path": path,
+                     "permits": _permits_live(settings), **lanes})
     return rows
 
 
@@ -441,6 +483,12 @@ def cmd_hooks(args):
         if c < m:
             print("continuity lane (handoff PreCompact/SessionEnd): %d of %d homes — "
                   "`helm hooks install` wires it" % (c, m))
+        p = sum(1 for r in rows if r.get("permits"))
+        if p < m:
+            print("beacon permit (permissions.allow %s): %d of %d homes — "
+                  "`helm hooks install` grants it (without it every fresh "
+                  "session hangs on a human prompt arming its wake beacon)"
+                  % (PERMIT_RULES[0], p, m))
         srows = seat_status_rows()
         if srows:
             print("seats (fleet delivery — chat deliver/join/stop-guard):")
@@ -453,6 +501,10 @@ def cmd_hooks(args):
             sc, st = seat_coverage()
             sline = "seat delivery: %d of %d seats" % (sc, st)
             print(sline if sc == st else sline + " — `helm hooks install` wires it")
+            sp = sum(1 for r in srows if r.get("permits"))
+            if sp < st:
+                print("seat beacon permit: %d of %d seats — `helm hooks "
+                      "install` grants it" % (sp, st))
         print(_CODEX_PENDING)
         return 0
 
