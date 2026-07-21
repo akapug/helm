@@ -30,9 +30,12 @@ class SeatTest(unittest.TestCase):
         self._env = {k: os.environ.get(k) for k in
                      ("HELM_HOME", "MELD_HOME", "HELM_PROXY_BIN",
                       "MELD_PROXY_BIN", "KIMI_API_KEY", "HELM_PROC",
-                      "HELM_CHAT_DIR")}
+                      "HELM_CHAT_DIR", "HELM_CODEX_HOMES_DIR",
+                      "MELD_CODEX_HOMES_DIR")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm-home")
         os.environ.pop("MELD_HOME", None)
+        os.environ.pop("HELM_CODEX_HOMES_DIR", None)
+        os.environ.pop("MELD_CODEX_HOMES_DIR", None)
         os.environ.pop("HELM_PROXY_BIN", None)
         os.environ.pop("MELD_PROXY_BIN", None)
         os.environ.pop("KIMI_API_KEY", None)  # hermetic: never the real key
@@ -104,6 +107,39 @@ class SeatTest(unittest.TestCase):
         # the eval's hard law: the OPENAI_API_KEY field never crosses over
         self.assertNotIn("OPENAI_API_KEY", rec)
 
+    def test_translation_account_id_falls_back_to_jwt_claims(self):
+        """kimi FIX 1 (upstream): tokens.account_id absent -> the
+        chatgpt_account_id claim fills it (id_token first, access_token
+        next) — a minted/pooled record never carries account_id None when
+        identity knows it (dedup + pooled-linkage key off it)."""
+        d = os.path.join(seat.CODEX_HOMES, "claim-only")
+        os.makedirs(d)
+        exp = int(time.time()) + 3600
+        auth = {"tokens": {
+            "id_token": _jwt({"email": "claim@x.com",
+                              "https://api.openai.com/auth":
+                                  {"chatgpt_plan_type": "pro",
+                                   "chatgpt_account_id": "acct-claim-id"}}),
+            "access_token": _jwt({"exp": exp, "sub": "fake"}),
+            "refresh_token": "fake-refresh-token-claim",
+        }, "last_refresh": "2026-07-09T14:52:47.713051089Z"}
+        path = os.path.join(d, "auth.json")
+        with open(path, "w") as f:
+            json.dump(auth, f)
+        rec, _fname, err = seat.translate_codex_auth(path)
+        self.assertIsNone(err)
+        self.assertEqual(rec["account_id"], "acct-claim-id")
+        # the access_token-claim-only shape resolves too
+        auth["tokens"]["id_token"] = _jwt({"email": "claim@x.com"})
+        auth["tokens"]["access_token"] = _jwt(
+            {"exp": exp, "https://api.openai.com/auth":
+                {"chatgpt_account_id": "acct-claim-acc"}})
+        with open(path, "w") as f:
+            json.dump(auth, f)
+        rec, _fname, err = seat.translate_codex_auth(path)
+        self.assertIsNone(err)
+        self.assertEqual(rec["account_id"], "acct-claim-acc")
+
     # -- add: layout + perms + source untouched ----------------------------
     def test_add_seat_layout_perms_and_readonly_source(self):
         path, _, _ = self._plant("home-a")
@@ -134,6 +170,47 @@ class SeatTest(unittest.TestCase):
             for name in files:
                 with open(os.path.join(root, name)) as f:
                     self.assertNotIn("ANTHROPIC_API_KEY=", f.read())
+
+    def test_add_preserves_other_pooled_accounts(self):
+        """kimi FIX 2: `seat add codex` must not collapse the pool — pool
+        three accounts, mint the seat from a fourth: all three survive (the
+        proxy's usage-cap fall-through), plus the minted cred. Unattributable
+        junk survives too (fail-open: never delete what can't be identified)."""
+        from helm import codexhomes
+        os.environ["HELM_CODEX_HOMES_DIR"] = seat.CODEX_HOMES
+        now = time.time()
+        for i, n in enumerate(("pool-a", "pool-b", "pool-c")):
+            self._plant(n, email=n + "@x.com", mtime=now - 500 + i)
+            self.assertTrue(codexhomes.codex_pool(n).get("ok"))
+        auth_dir = os.path.join(seat.seat_dir("codex"), "auth")
+        with open(os.path.join(auth_dir, "codex-junk.json"), "w") as f:
+            f.write("{not json")
+        self._plant("home-d", email="d@x.com", mtime=now)  # newest -> picked
+        rc, out, err = self._add()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(sorted(os.listdir(auth_dir)),
+                         ["codex-d@x.com-pro.json", "codex-junk.json",
+                          "codex-pool-a.json", "codex-pool-b.json",
+                          "codex-pool-c.json"])
+        self.assertNotIn("replaced same-account", out)  # nothing was removed
+        self.assertIn("4 other pooled creds preserved", out)
+
+    def test_re_add_replaces_only_same_account_and_prints_it(self):
+        """kimi FIX 2: a stale pooled spelling of the SAME account is removed
+        (the re-add IS its refresh) and reported; sibling accounts untouched."""
+        auth_dir = os.path.join(seat.seat_dir("codex"), "auth")
+        os.makedirs(auth_dir)
+        with open(os.path.join(auth_dir, "codex-home-a.json"), "w") as f:
+            json.dump({"type": "codex", "account_id": "acct-home-a"}, f)
+        with open(os.path.join(auth_dir, "codex-pool-b.json"), "w") as f:
+            json.dump({"type": "codex", "account_id": "acct-pool-b"}, f)
+        self._plant("home-a")  # mints account acct-home-a
+        rc, out, err = self._add()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(sorted(os.listdir(auth_dir)),
+                         ["codex-fake@example.com-pro.json", "codex-pool-b.json"])
+        self.assertIn("replaced same-account pooled cred: codex-home-a.json", out)
+        self.assertIn("1 other pooled cred preserved", out)
 
     def test_re_add_keeps_token(self):
         self._plant("home-a")

@@ -28,9 +28,10 @@ LAWS:
     https://api.openai.com/auth claim, id_token fallback — decode-only
     identity metadata, tokens discarded.
 
-KNOWN INTERACTION: `helm seat add codex` still enforces one-cred-per-seat and
-clears every codex-*.json from this same auth-dir — re-pool after a seat
-re-add (`helm codex list` shows who fell out).
+KNOWN INTERACTION: `helm seat add codex` replaces only the pooled file(s)
+carrying the SAME account_id it mints — other pooled accounts survive a seat
+re-add (one-cred-per-seat is a default, never an invariant; the pool is the
+proxy's usage-cap fall-through and must not collapse).
 
 Every public function returns a JSON-able dict (or list); errors are
 {"error": "..."} — loud, attributed, never an exception across the API edge.
@@ -83,7 +84,8 @@ def _identity(auth):
     plan = ((acc.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type")
             or (idc.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type"))
     account_id = (t.get("account_id")
-                  or (idc.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id"))
+                  or (idc.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
+                  or (acc.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id"))
     exp = acc.get("exp")
     return (email if isinstance(email, str) and email else None,
             plan if isinstance(plan, str) and plan else None,
@@ -178,6 +180,11 @@ def codex_pool(name):
         return {"error": terr}
     rec["disabled"] = False  # the proxy's own kill-switch field, born live
     email, plan, account_id, exp = _identity(_read_json(src))
+    if not rec.get("account_id") and account_id:
+        # translate + _identity share one resolution today; this guarantees the
+        # pooled record ALWAYS carries what identity knows even if they ever
+        # diverge — dedup, list linkage, and seat-add preservation key off it.
+        rec["account_id"] = account_id
     dupes = [f for a, f in _pooled_by_account().items()
              if a == rec.get("account_id") and f != "codex-%s.json" % canonical]
     dest = os.path.join(pool_dir(), "codex-%s.json" % canonical)

@@ -203,7 +203,10 @@ def translate_codex_auth(src_path):
     """codex CLI auth.json -> CLIProxyAPI codex auth record. READ-ONLY on the
     source. Returns (record, filename, err): email from the id_token JWT claim,
     plan from its https://api.openai.com/auth claim, expired from the
-    access_token exp claim (RFC3339)."""
+    access_token exp claim (RFC3339). account_id falls back to the JWT
+    chatgpt_account_id claim (id_token, then access_token) when tokens.account_id
+    is absent — a shape the codex CLI has emitted; the pooled record must carry
+    the account_id whenever identity knows it (dedup + linkage key off it)."""
     try:
         with open(src_path) as f:
             a = json.load(f)
@@ -211,7 +214,8 @@ def translate_codex_auth(src_path):
         return None, None, "unreadable auth.json %s (%s)" % (src_path, exc)
     t = a.get("tokens") or {}
     idc = _jwt_claims(t.get("id_token"))
-    exp = _jwt_claims(t.get("access_token")).get("exp")
+    acc = _jwt_claims(t.get("access_token"))
+    exp = acc.get("exp")
     if not isinstance(exp, (int, float)):
         return None, None, "no exp claim in access_token (%s)" % src_path
     email = idc.get("email") or "unknown"
@@ -220,7 +224,9 @@ def translate_codex_auth(src_path):
         "id_token": t.get("id_token"),
         "access_token": t.get("access_token"),
         "refresh_token": t.get("refresh_token"),
-        "account_id": t.get("account_id"),
+        "account_id": (t.get("account_id")
+                       or (idc.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
+                       or (acc.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")),
         "last_refresh": a.get("last_refresh"),
         "email": email,
         "type": "codex",
@@ -468,8 +474,27 @@ def _add(family, args):
     os.makedirs(d, mode=0o700, exist_ok=True)
     os.chmod(d, 0o700)
     auth_dir = os.path.join(d, "auth")
-    for stale in glob.glob(os.path.join(auth_dir, "codex-*.json")):
-        os.remove(stale)  # one cred per seat; re-add refreshes it
+    # The pool premise (codexhomes.py): one-cred-per-seat is a DEFAULT, not an
+    # invariant — pooled creds from OTHER accounts are the proxy's usage-cap
+    # fall-through and must survive a seat re-add. Replace only the SAME
+    # account's file(s); never delete what can't be attributed (fail-open —
+    # `helm codex pooled` reports junk, the proxy skips it).
+    removed, kept = [], 0
+    for pooled in glob.glob(os.path.join(auth_dir, "codex-*.json")):
+        base = os.path.basename(pooled)
+        if base == fname:
+            continue  # the mint rewrites this spelling in place below
+        try:
+            with open(pooled) as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            old = None
+        acct = old.get("account_id") if isinstance(old, dict) else None
+        if acct and acct == rec.get("account_id"):
+            os.remove(pooled)  # same account, stale spelling — this re-add IS its refresh
+            removed.append(base)
+            continue
+        kept += 1
     _write_private(os.path.join(auth_dir, fname),
                    json.dumps(rec, indent=2, sort_keys=False) + "\n")
     token = _seat_token(family, d)
@@ -480,6 +505,13 @@ def _add(family, args):
     print("helm seat: %s seat minted at %s" % (family, d))
     print("  cred %s (%s) from %s (read-only), access token valid until %s"
           % (rec["email"], fname.rsplit("-", 1)[1][:-5], src, rec["expired"]))
+    if removed:
+        print("  replaced same-account pooled cred%s: %s"
+              % ("s"[:len(removed) != 1], ", ".join(sorted(removed))))
+    if kept:
+        print("  %d other pooled cred%s preserved (the proxy's usage-cap "
+              "fall-through) — `helm codex pooled` lists them"
+              % (kept, "s"[:kept != 1]))
     print("  proxy port %d; next: `helm seat up %s`, then `helm seat launch %s`"
           % (fam["port"], family, family))
     return 0
@@ -643,7 +675,7 @@ def _smoke(family):
 def _seat_row(family):
     d = seat_dir(family)
     fam = FAMILIES.get(family) or {}
-    creds = glob.glob(os.path.join(d, "auth", "*.json"))
+    creds = sorted(glob.glob(os.path.join(d, "auth", "*.json")))
     cred = "api-key cred (baked into config.yaml)" \
         if fam.get("mode") == "proxy-key" else "no cred"
     if creds:
@@ -659,6 +691,8 @@ def _seat_row(family):
             state = "EXPIRED %s" % _rfc3339(exp) if left <= 0 else \
                 "valid until %s (%dh left)" % (_rfc3339(exp), left // 3600)
         cred = "%s — %s" % (rec.get("email", "?"), state)
+        if len(creds) > 1:
+            cred += " (+%d more pooled)" % (len(creds) - 1)
     pid = _running_pid(family)
     port = fam.get("port")
     live = "proxy UP pid %d port %d%s" % (pid, port, "" if _port_open(port) else

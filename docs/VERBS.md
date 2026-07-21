@@ -863,8 +863,9 @@ file (fail-open when absent); `pooled` lists what the proxy can draw on.
 Sources stay read-only forever; token material never reaches stdout —
 email / account / tier / paths only.
 
-Note: `helm seat add codex` still enforces one-cred-per-seat and clears
-`codex-*.json` from the same auth-dir — re-pool after a seat re-add.
+Note: `helm seat add codex` replaces only the pooled file(s) carrying the
+SAME account it mints — the other pooled accounts survive a seat re-add
+(the usage-cap fall-through stays intact; it prints what it replaced).
 
 ```console
 $ helm codex list

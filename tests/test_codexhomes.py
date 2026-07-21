@@ -46,26 +46,35 @@ class CodexHomesTest(unittest.TestCase):
 
     # -- helpers -----------------------------------------------------------
     def _plant(self, name, email="fake@example.com", plan="pro",
-               plan_in="access", exp_offset=3600, account_id=None):
+               plan_in="access", exp_offset=3600, account_id=None,
+               acct_in="tokens"):
         """A fake codexhome with a CLI-native auth.json. plan_in selects which
         token carries the plan claim (the premise reads access first; the
-        live id_token carries it too — both paths must classify)."""
+        live id_token carries it too — both paths must classify). acct_in
+        plants the account id in tokens.account_id (today's CLI) or ONLY in
+        the id_token chatgpt_account_id claim (a shape the CLI has emitted —
+        the kimi-review FIX-1 fixture)."""
         d = os.path.join(codexhomes.homes_root(), name)
         os.makedirs(d, exist_ok=True)
         exp = int(time.time()) + exp_offset
-        plan_claim = {"https://api.openai.com/auth": {"chatgpt_plan_type": plan}}
-        id_claims = {"email": email}
-        acc_claims = {"exp": exp, "sub": "fake"}
-        (acc_claims if plan_in == "access" else id_claims).update(plan_claim)
+        acct = account_id or ("acct-" + name)
+        id_auth, acc_auth = {}, {}
+        (acc_auth if plan_in == "access" else id_auth)["chatgpt_plan_type"] = plan
+        if acct_in == "id":
+            id_auth["chatgpt_account_id"] = acct
+        tokens = {
+            "id_token": _jwt({"email": email,
+                              "https://api.openai.com/auth": id_auth}),
+            "access_token": _jwt({"exp": exp, "sub": "fake",
+                                  "https://api.openai.com/auth": acc_auth}),
+            "refresh_token": "fake-refresh-token-" + name,
+        }
+        if acct_in == "tokens":
+            tokens["account_id"] = acct
         auth = {
             "OPENAI_API_KEY": None,
             "auth_mode": "chatgpt",
-            "tokens": {
-                "id_token": _jwt(id_claims),
-                "access_token": _jwt(acc_claims),
-                "refresh_token": "fake-refresh-token-" + name,
-                "account_id": account_id or ("acct-" + name),
-            },
+            "tokens": tokens,
             "last_refresh": "2026-07-09T14:52:47.713051089Z",
         }
         path = os.path.join(d, "auth.json")
@@ -150,6 +159,31 @@ class CodexHomesTest(unittest.TestCase):
             self.assertEqual(f.read(), before)  # source byte-identical
         # the result dict is print-safe: no token material rides in it
         self._assert_no_secrets(json.dumps(res))
+
+    def test_pool_account_id_from_id_token_claim_only(self):
+        """kimi FIX 1: an auth.json carrying the account id ONLY in the
+        id_token claim must still pool with account_id present — the naive
+        tokens.account_id copy dropped it, silently breaking dedup + the
+        list pooled-linkage."""
+        self._plant("claim-only", email="claim@x.test", acct_in="id")
+        res = codexhomes.codex_pool("claim-only")
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res["account_id"], "acct-claim-only")
+        with open(os.path.join(codexhomes.pool_dir(),
+                               "codex-claim-only.json")) as f:
+            self.assertEqual(json.load(f)["account_id"], "acct-claim-only")
+        # linkage: list keys the pooled column off the same resolution
+        rows = {r["name"]: r for r in codexhomes.codex_list()}
+        self.assertEqual(rows["claim-only"]["pooled"], "codex-claim-only.json")
+        # dedup: a second home of the SAME account no longer pools blind
+        self._plant("claim-twin", email="claim@x.test",
+                    account_id="acct-claim-only", acct_in="id")
+        res2 = codexhomes.codex_pool("claim-twin")
+        self.assertEqual(res2["also_pooled_as"], ["codex-claim-only.json"])
+        # and the pooled roster shows the account, not an accountless row
+        by_file = {r["file"]: r for r in codexhomes.codex_pooled()}
+        self.assertEqual(by_file["codex-claim-only.json"]["account_id"],
+                         "acct-claim-only")
 
     def test_pool_idempotent_refresh(self):
         self._plant("cto-example")
