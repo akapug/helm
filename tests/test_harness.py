@@ -323,6 +323,40 @@ class SeatResumeTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(fake.stopped, ["p9"])
 
+    def test_resume_stops_stale_pane_before_reminting(self):
+        """The re-mint rewrites launch.sh; a still-running stale pane's `sh`
+        is reading that very file and the metaharness close is not
+        process-synchronous — the stop MUST land before the rewrite."""
+        d, _ = self._mint()
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "codex",
+                                  "status": "idle"}])
+        order = []
+        orig_wla = seat._write_launch_assets
+        def spy_wla(*a, **k):
+            order.append("remint")
+        def spy_stop(h):
+            order.append("stop")
+            fake.stopped.append(h)
+        fake.stop = spy_stop
+        with mock.patch.object(seat, "_write_launch_assets",
+                               side_effect=spy_wla) as wla, \
+                mock.patch.object(harness, "detect", return_value=fake):
+            rc = seat.cmd_seat(["resume", "codex"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(order, ["stop", "remint"])  # stop strictly first
+
+    def test_launch_sh_written_atomically(self):
+        """The re-minted launch.sh is a tmp+rename, never an O_TRUNC-in-place
+        a running reader can catch half-written; mode stays 0700, no litter."""
+        d, launch = self._mint()
+        seat._write_launch_sh(launch, "#!/bin/sh\nexec env X=1 claude \"$@\"\n")
+        with open(launch) as f:
+            self.assertIn("claude", f.read())
+        import stat as _st
+        self.assertEqual(_st.S_IMODE(os.stat(launch).st_mode), 0o700)
+        leftovers = [n for n in os.listdir(d) if n.startswith(".launch-")]
+        self.assertEqual(leftovers, [])
+
     def test_resume_never_mints_a_nonexistent_seat(self):
         fake = FakeAdapter()
         rc, out, err, wla = self._resume(["codex"], fake)

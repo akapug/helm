@@ -577,11 +577,32 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None):
               "deliver + join + stop-guard + beacon permit)" % (seat, action),
               file=sys.stderr)
     _seed_seat_settings(cdir)   # skip the bypass-permissions dialog (settings.json)
-    _write_private(os.path.join(d, "launch.sh"),
-                   "#!/bin/sh\n# helm seat %s — minted by `helm seat add`; "
-                   "regenerate with `helm seat launch %s`\nexec %s \"$@\"\n"
-                   % (seat, seat, launch_line(family, room=room, seat=seat)),
-                   mode=0o700)
+    _write_launch_sh(os.path.join(d, "launch.sh"),
+                     "#!/bin/sh\n# helm seat %s — minted by `helm seat add`; "
+                     "regenerate with `helm seat launch %s`\nexec %s \"$@\"\n"
+                     % (seat, seat, launch_line(family, room=room, seat=seat)))
+
+
+def _write_launch_sh(path, text):
+    """launch.sh lands ATOMICALLY (0700 tmp sibling + os.replace): a running
+    pane's `sh` reads this script, and an O_TRUNC-in-place rewrite (the
+    `_write_private` shape) lets that reader catch a truncated/half file
+    mid-re-mint — the slice-6 pool-write lesson, same class. The token never
+    leaves the file either way; only the write shape changes."""
+    import tempfile
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".launch-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, 0o700)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _env_file_value(path, key):
@@ -952,9 +973,7 @@ def _resume(seat_name, rest):
               "then `helm seat launch %s` first"
               % (seat_name, launch_sh, family, seat_name), file=sys.stderr)
         return 1
-    # env refresh half of the contract: the relaunch rides the LATEST assets
-    # (identity vars, delivery hooks, context-window env), room preserved.
-    _write_launch_assets(family, d, _room_from_launch(launch_sh), seat_name)
+    room = _room_from_launch(launch_sh)
     sid, sess_cwd = _newest_seat_session(d)
     command = "%s %s" % (shlex.quote(launch_sh),
                          ("--resume " + shlex.quote(sid)) if sid else "--continue")
@@ -966,10 +985,17 @@ def _resume(seat_name, rest):
               file=sys.stderr)
         return 1
     try:
+        # Stop the stale pane BEFORE re-minting: its `sh` is executing THIS
+        # launch.sh, and the metaharness's close is not process-synchronous —
+        # a re-mint (even atomic-replace) under a still-running reader can
+        # swap the script mid-read. Stop first, then refresh, then spawn.
         for row in ad.list():
             if row.get("title") == seat_name and row.get("handle"):
                 ad.stop(row["handle"])
                 print("  stopped stale %s pane %s" % (seat_name, row["handle"]))
+        # env refresh half of the contract: the relaunch rides the LATEST
+        # assets (identity vars, delivery hooks, context env), room preserved.
+        _write_launch_assets(family, d, room, seat_name)
         handle = ad.spawn(command, title=seat_name,
                           cwd=sess_cwd or os.getcwd())
     except harness.HarnessError as e:
