@@ -287,7 +287,9 @@ class SeatTest(unittest.TestCase):
         self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8318", line)
         self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=kimi-k3", line)
         self.assertIn("HELM_CHAT_NAME=kimi", line)   # joins the roster as 'kimi'
-        self.assertTrue(line.endswith("claude --model kimi-k3"))
+        self.assertIn("--dangerously-skip-permissions", line)  # canonical seat
+        self.assertTrue(line.endswith(
+            "claude --dangerously-skip-permissions --model kimi-k3"))
         self.assertNotIn("fake-kimi-key-for-tests", line)  # key never rides
 
     # -- launch line shape --------------------------------------------------
@@ -307,14 +309,18 @@ class SeatTest(unittest.TestCase):
         self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol", line)
         self.assertIn("CLAUDE_CONFIG_DIR=" + os.path.join(seat.seat_dir("codex"), "claude"), line)
         self.assertIn("HELM_CHAT_NAME=codex", line)   # stable seat identity
-        self.assertTrue(line.endswith("claude --model gpt-5.6-sol"))
+        self.assertIn("--dangerously-skip-permissions", line)  # canonical seat
+        self.assertTrue(line.endswith(
+            "claude --dangerously-skip-permissions --model gpt-5.6-sol"))
         self.assertNotIn("ANTHROPIC_API_KEY=", line)  # unset, never set
         # --model override rides both slots
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             seat.cmd_seat(["launch", "codex", "--model", "gpt-5.5"])
         self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.5", out.getvalue())
-        self.assertIn("claude --model gpt-5.5", out.getvalue())
+        self.assertIn(
+            "claude --dangerously-skip-permissions --model gpt-5.5",
+            out.getvalue())
 
     # -- the scrub guard ----------------------------------------------------
     def test_scrub_env_strips_the_triple(self):

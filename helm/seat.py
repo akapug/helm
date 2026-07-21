@@ -315,7 +315,12 @@ def launch_line(family, model=None):
     HELM_CHAT_NAME=<family> is the STABLE seat identity: the SessionStart join
     hook (seats.py derive_seat) keys the roster on it, so the seat joins as
     'codex'/'kimi'/… instead of an ephemeral agent-<sid8> — and @codex / @kimi
-    fleet posts then deliver to it."""
+    fleet posts then deliver to it. --dangerously-skip-permissions is CANONICAL
+    for a fleet seat (owner-asked 2026-07-21): an agent pane exists to do work
+    unattended, and a per-tool permission prompt strands it silently (the owner
+    had to flip kimi/codex into auto-mode by hand). The beacon permit narrows
+    an interactive session; a launched seat skips wholesale — it never has a
+    human at its keyboard to answer a prompt."""
     fam = FAMILIES[family]
     model = model or fam["model"]
     cfgdir = shlex.quote(os.path.join(seat_dir(family), "claude"))
@@ -325,7 +330,7 @@ def launch_line(family, model=None):
             " CLAUDE_CODE_SUBAGENT_MODEL=%s"
             " CLAUDE_CONFIG_DIR=%s"
             " HELM_CHAT_NAME=%s"
-            " claude --model %s"
+            " claude --dangerously-skip-permissions --model %s"
             % (fam["port"], _read_token(family) or "<seat-token-missing>",
                model, cfgdir, shlex.quote(family), model))
 
