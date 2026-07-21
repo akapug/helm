@@ -45,6 +45,11 @@ button{font:inherit}
 .navtab{padding:6px 14px;border-radius:var(--r-pill);border:1px solid transparent;cursor:pointer;font-weight:var(--w-med);font-size:var(--f2);color:var(--mut);background:none}
 .navtab.on{color:var(--accent);border-color:var(--accent);background:var(--card)}
 .navtab:hover:not(.on){color:var(--fg)}
+/* the chat tab's unread badge (owner_unread/mentions off every /api/chat poll):
+   quiet count for plain unread, accent fill when an @mention addresses the
+   owner — palette vars only, so both themes carry it. */
+.navbadge{margin-left:7px;padding:1px 7px;border-radius:var(--r-pill);font-size:var(--f0);font-weight:var(--w-bold);font-variant-numeric:tabular-nums;background:var(--line2);color:var(--fg)}
+.navbadge.mention{background:var(--accent);color:var(--bg)}
 #nav .spacer{flex:1 1 auto}
 /* stats: fixed label+value pairs, right-aligned, single row, never wraps */
 #nav .stats{display:flex;gap:16px;font-size:var(--f1);color:var(--mut);white-space:nowrap;overflow:hidden}
@@ -996,13 +1001,23 @@ async function loadCreds(refresh) {
   renderNav();
   renderAttn(); renderAccts(); renderResumeAs();
 }
-let NAV_ACC = "", NAV_SESS = "";
+let NAV_ACC = "", NAV_SESS = "", NAV_CHAT = 0, NAV_CHAT_MENTION = false;
 /* one nav stat = a value over an uppercase label, right-aligned; they line up
    as a fixed row of columns rather than a wrapping run of words. */
 function statCell(val, label, title) {
   return `<span class="stat"${title ? ` title="${esc(title)}"` : ""}><b>${typeof val === "number" ? val.toLocaleString() : esc(val)}</b><span>${esc(label)}</span></span>`;
 }
-function renderNav() { $("#navstats").innerHTML = NAV_ACC + NAV_SESS; }
+function renderNav() {
+  $("#navstats").innerHTML = NAV_ACC + NAV_SESS;
+  // the chat tab's unread badge — the owner must see an @mention from ANY tab
+  const tab = $('.navtab[data-v="chat"]');
+  let b = tab && tab.querySelector(".navbadge");
+  if (!NAV_CHAT) { if (b) b.remove(); return; }
+  if (!b) { b = document.createElement("span"); b.className = "navbadge"; tab.appendChild(b); }
+  b.textContent = NAV_CHAT > 99 ? "99+" : NAV_CHAT;
+  b.classList.toggle("mention", NAV_CHAT_MENTION);
+  b.title = NAV_CHAT_MENTION ? "unread @mentions for you in chat" : "unread chat messages";
+}
 async function loadHist() {
   let d;
   try { d = await j("/api/history?hours=168"); } catch (e) { d = []; }
@@ -2221,11 +2236,14 @@ $$("#cfgbar .chip[data-ch]").forEach(ch => ch.onclick = () => {
 $("#cfgReload").onclick = () => cfgInit(true);
 
 /* ================= chat view (the owner's surface — agents live on `helm chat`) =================
-   Polls /api/chat every ~2s while the panel is open; POST rides the mutation
-   bearer and drops the owner-unread marker, so every local agent's next turn
-   surfaces the message through the shipped reflex. Simple DOM only — the
-   panel must work from the Orca mobile app's browser. */
-let CHAT_SINCE = 0, CHAT_TIMER = null, CHAT_REACTS = {};
+   Polls /api/chat every ~2s on EVERY tab — the poll is the owner's beacon
+   (nav badge + title count + notification when an agent @mentions him), so
+   it must never gate on the chat view being open; rendering into the hidden
+   log is free and keeps CHAT_SINCE one cursor for both. POST rides the
+   mutation bearer and drops the owner-unread marker, so every local agent's
+   next turn surfaces the message through the shipped reflex. Simple DOM
+   only — the panel must work from the Orca mobile app's browser. */
+let CHAT_SINCE = 0, CHAT_WIRED = false, CHAT_REACTS = {}, CHAT_NOTIFY_KEY = "";
 const CHAT_RSET = ["👍", "🎉", "🔥", "❤️", "👀"]; // the tiny click-to-react set
 
 function chatKey(m) { return (m.ts || "") + "|" + (m.from || ""); }
@@ -2263,10 +2281,9 @@ function chatTransport(t) {
 }
 
 async function pollChat() {
-  if (!$("#view-chat").classList.contains("on")) return; // poll only while open
   let d;
-  try { d = await j("/api/chat?room=main&since=" + CHAT_SINCE); } catch (e) { return; }
-  if (d.unavailable || !Array.isArray(d.lines)) return;
+  try { d = await j("/api/chat?room=main&since=" + CHAT_SINCE); } catch (e) { return; } // fail-open: keep the page, keep quiet
+  if (d.unavailable || !Array.isArray(d.lines)) { chatSignal(d); return; }
   chatTransport(d.transport);
   const log = $("#chatlog");
   if (d.total < CHAT_SINCE) CHAT_SINCE = 0; // the room rotated — server resent everything
@@ -2279,6 +2296,55 @@ async function pollChat() {
     if (stick) log.scrollTop = log.scrollHeight;
   }
   CHAT_SINCE = d.total;
+  chatSignal(d);
+}
+
+/* the agent→owner beacon, off every poll: badge + title + favicon are the
+   passive (permissionless, phone-visible) signal; a Notification fires once
+   per NEW mention (dedup key = the newest unseen mention's identity, i.e.
+   keyed on the decision, never the render). Missing fields read as 0 —
+   endpoint degraded ⇒ no badge, never an error. */
+function chatSignal(d) {
+  d = d || {};
+  const mentions = d.owner_mentions | 0, unread = d.owner_unread | 0;
+  NAV_CHAT = mentions || unread;
+  NAV_CHAT_MENTION = mentions > 0;
+  renderNav();
+  document.title = NAV_CHAT ? "(" + NAV_CHAT + ") helm" : "helm";
+  faviconDot(NAV_CHAT_MENTION);
+  if (mentions && d.owner_mention_last && d.owner_mention_last !== CHAT_NOTIFY_KEY) {
+    CHAT_NOTIFY_KEY = d.owner_mention_last;
+    notifyOwner(mentions, d.owner_mention_preview || "");
+  }
+  if (!mentions) CHAT_NOTIFY_KEY = ""; // read — the next mention is a fresh decision
+  // read-ack: chat view open + page visible = the owner has SEEN the room
+  if ((d.total | 0) > (d.owner_read | 0) && $("#view-chat").classList.contains("on") && !document.hidden) {
+    post("/api/chat/read", {room: "main"}).catch(() => {});
+  }
+}
+
+const FAVICON = document.querySelector("link[rel=icon]");
+const FAVICON_BASE = FAVICON ? FAVICON.href : "";
+function faviconDot(on) {
+  if (!FAVICON) return;
+  const dotted = FAVICON_BASE.replace("%3C/svg%3E",
+    "%3Ccircle cx='25' cy='7' r='7' fill='%23e8594f'/%3E%3C/svg%3E");
+  const want = on ? dotted : FAVICON_BASE;
+  if (FAVICON.href !== want) FAVICON.href = want;
+}
+
+function notifyOwner(n, preview) {
+  try {
+    if (!("Notification" in window)) return; // orca webview etc. — the title/badge already carry it
+    const fire = () => { try {
+      new Notification("helm chat — @you", {
+        body: preview || (n + " unread mention" + (n === 1 ? "" : "s")),
+        tag: "helm-chat-mention"});  // tag: replace, never stack
+    } catch (e) {} };
+    if (Notification.permission === "granted") fire();
+    else if (Notification.permission === "default")
+      Notification.requestPermission().then(p => { if (p === "granted") fire(); });
+  } catch (e) {}
 }
 
 async function sendReact(div, e) {
@@ -2303,8 +2369,8 @@ async function sendChat() {
 
 function initChat() {
   $("#chatname").value = localStorage.getItem("helm.chatname") || "david";
-  if (!CHAT_TIMER) {
-    CHAT_TIMER = setInterval(pollChat, 2000);
+  if (!CHAT_WIRED) {
+    CHAT_WIRED = true;
     $("#chatsend").onclick = sendChat;
     $("#chattext").addEventListener("keydown", ev => { if (ev.key === "Enter") sendChat(); });
     $("#chatlog").addEventListener("click", ev => {   // click-to-react (delegated)
@@ -2312,8 +2378,15 @@ function initChat() {
       if (b) sendReact(b.closest(".chatmsg"), b.dataset.e);
     });
   }
-  pollChat();
+  // rows kept landing while the view was hidden (the always-on poll) — jump
+  // to the newest on open, then let the ack (chatSignal) clear the badge.
+  pollChat().then(() => { const log = $("#chatlog"); log.scrollTop = log.scrollHeight; });
 }
+// the poll never gates on the chat view: the badge/notify beacon runs on
+// EVERY tab from page load (owner-notify law — a GUI-first owner on the
+// sessions tab must still see an @mention land).
+setInterval(pollChat, 2000);
+pollChat();
 
 /* ================= ledger view (read-only projection of the attestation node) =================
    Polls /api/ledger every ~3s while open. The node down is a NORMAL state:
