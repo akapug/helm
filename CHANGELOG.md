@@ -2,6 +2,13 @@
 
 ## Unreleased (0.2)
 
+- Evolve's last two behavior-observer legs — dead reflexes (live, zero
+  ledger fires over ≥200 turns, one batched review line) and recorder
+  signatures (a stuck/loop-thrash tell recurring across ≥3 sessions' last
+  counters proposes a captured lesson); propose-only as ever. The drain-v2
+  upgrade pass ran LIVE: 194 dark typed-prefix files upgraded to real
+  priors/lexicon (archive-first net + receipt), the adopted store's episodic
+  pile down from 257 to 37.
 - `helm corpus` — backup/status for the training-corpus transcript archive:
   every harness's transcripts copied append-only into dated archive dirs,
   incremental by manifest, fail-open per file, fail-safe on space, with a
