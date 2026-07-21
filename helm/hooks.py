@@ -466,7 +466,14 @@ def running_panes(proc=None):
             if os.path.dirname(os.path.dirname(real)) == sroot:
                 family = os.path.basename(os.path.dirname(real))
         out.append({"pid": int(pid), "seat": val("HELM_CHAT_NAME") or
-                    val("MELD_CHAT_NAME"), "config_dir": cdir, "family": family})
+                    val("MELD_CHAT_NAME"), "config_dir": cdir, "family": family,
+                    # signing readiness rides the scan (the environ is already
+                    # in hand): a pane launched before launch_line baked the
+                    # trio posts [unsigned] by configuration and cannot
+                    # self-heal — surface it, never let it break silently.
+                    "signer_bin": val("HELM_CELL_BIN") or val("MELD_CELL_BIN"),
+                    "signer_profile": val("DREGG_PROFILE") or
+                    val("HELM_CELL_PROFILE")})
     return out
 
 
@@ -498,20 +505,54 @@ def uncovered_panes(proc=None, quiet_s=900):
         return []
 
 
+def unsigned_panes(proc=None):
+    """Running NAMED panes that cannot sign their posts: HELM_CELL_BIN unset
+    or pointing at a non-executable (cell.bin_ready's law), or the profile
+    pair missing (DREGG_PROFILE/HELM_CELL_PROFILE) — launch_line has carried
+    the trio since seat-signing landed, so such a pane predates it and posts
+    [unsigned] by configuration. Read-only; fail-open []."""
+    try:
+        from . import cell
+        out = []
+        for p in running_panes(proc):
+            if not (p["seat"] or p["family"]):
+                continue
+            b = p.get("signer_bin")
+            if not cell._usable(b):
+                p["sign_reason"] = "no HELM_CELL_BIN (pre-signing launch)"
+            elif not p.get("signer_profile"):
+                p["sign_reason"] = "no DREGG_PROFILE/HELM_CELL_PROFILE"
+            else:
+                continue
+            out.append(p)
+        return out
+    except Exception:
+        return []
+
+
 def surface_uncovered(out=None):
     """Print the uncovered running panes — called by `helm hooks install`
     and `helm seat launch`: nothing external can wake an idle PTY agent, so
-    a relaunch (human/driver) is the only repair and SURFACING is the lever."""
-    rows = uncovered_panes()
-    if not rows:
-        return
+    a relaunch (human/driver) is the only repair and SURFACING is the lever.
+    Same law for signing: a pane launched before the signing trio landed in
+    launch_line posts [unsigned] forever (a process cannot retrofit its own
+    environment) — name those too (no-silent-break)."""
     out = out or sys.stdout
-    print("helm hooks: %d running pane(s) NOT receiving fleet chat — relaunch "
-          "them (an idle pane cannot self-heal into delivery):" % len(rows),
-          file=out)
-    for p in rows:
-        print("  pid %-7d %-14s %s" % (p["pid"], p["seat"] or p["family"] or "?",
-                                       p["reason"]), file=out)
+    rows = uncovered_panes()
+    if rows:
+        print("helm hooks: %d running pane(s) NOT receiving fleet chat — relaunch "
+              "them (an idle pane cannot self-heal into delivery):" % len(rows),
+              file=out)
+        for p in rows:
+            print("  pid %-7d %-14s %s" % (p["pid"], p["seat"] or p["family"] or "?",
+                                           p["reason"]), file=out)
+    sign = unsigned_panes()
+    if sign:
+        print("helm hooks: %d running pane(s) posting UNSIGNED (no signing env) — "
+              "relaunch from their minted launch.sh to sign:" % len(sign), file=out)
+        for p in sign:
+            print("  pid %-7d %-14s %s" % (p["pid"], p["seat"] or p["family"] or "?",
+                                           p["sign_reason"]), file=out)
 
 
 _CODEX_PENDING = ("codex: recipe pending — docs/HOOKS.md carries no mechanical "

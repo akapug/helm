@@ -623,5 +623,60 @@ class UncoveredPanesTest(HooksBase):
         self.assertIn("kimi", out)
 
 
+class UnsignedPanesTest(HooksBase):
+    """No-silent-break for signing: a pane launched before launch_line
+    carried the signing trio posts [unsigned] by configuration and cannot
+    self-heal — surface it for relaunch beside the uncovered panes."""
+
+    def mk_proc(self, pid, cmdline, env):
+        d = os.path.join(self.tmp, "proc", str(pid))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "cmdline"), "wb") as f:
+            f.write(b"\0".join(cmdline) + b"\0")
+        with open(os.path.join(d, "environ"), "wb") as f:
+            f.write(b"\0".join(env) + b"\0")
+        return os.path.join(self.tmp, "proc")
+
+    def test_pane_without_signing_env_flagged(self):
+        signer = os.path.join(self.tmp, "dregg-client-sign")
+        with open(signer, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(signer, 0o755)
+        proc = self.mk_proc(11, [b"claude"], [b"HELM_CHAT_NAME=oldkimi"])
+        self.mk_proc(12, [b"claude"],
+                     [b"HELM_CHAT_NAME=newkimi",
+                      ("HELM_CELL_BIN=%s" % signer).encode(),
+                      b"DREGG_PROFILE=newkimi"])
+        rows = hooks.unsigned_panes(proc)
+        self.assertEqual([(p["pid"], p["seat"]) for p in rows],
+                         [(11, "oldkimi")])
+        self.assertIn("no HELM_CELL_BIN", rows[0]["sign_reason"])
+
+    def test_unexecutable_bin_and_missing_profile_flagged(self):
+        signer = os.path.join(self.tmp, "signer")
+        with open(signer, "w") as f:
+            f.write("x")                       # 0644 — NOT executable
+        proc = self.mk_proc(13, [b"claude"],
+                            [b"HELM_CHAT_NAME=a",
+                             ("HELM_CELL_BIN=%s" % signer).encode(),
+                             b"DREGG_PROFILE=a"])
+        self.mk_proc(14, [b"claude"],
+                     [b"HELM_CHAT_NAME=b",
+                      b"HELM_CELL_BIN=/bin/true"])   # bin ok, profile missing
+        rows = {p["seat"]: p["sign_reason"] for p in hooks.unsigned_panes(proc)}
+        self.assertEqual(rows["a"], "no HELM_CELL_BIN (pre-signing launch)")
+        self.assertIn("PROFILE", rows["b"])
+
+    def test_unnamed_pane_not_judged_and_surface_prints(self):
+        proc = self.mk_proc(15, [b"claude"], [b"TERM=xterm"])
+        self.assertEqual(hooks.unsigned_panes(proc), [])
+        self.mk_proc(16, [b"claude"], [b"HELM_CHAT_NAME=kimi"])
+        out = io.StringIO()
+        hooks.surface_uncovered(out=out)       # HELM_PROC = the fake tree
+        self.assertIn("UNSIGNED", out.getvalue())
+        self.assertIn("kimi", out.getvalue())
+        self.assertIn("launch.sh", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
