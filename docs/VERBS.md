@@ -785,6 +785,38 @@ never an automatic mutation.
 $ helm swap you@example.com
 ```
 
+### `helm attribute [--by project|model|cred] [--since Nd|Nh] [--limit N] [--project P] [--json]`
+Historical token-effort attribution — the HR-capacity frame: how much effort
+(in tokens) has a project / model / cred consumed, so cred homing can follow
+need. A BOUNDED on-demand rollup over the session catalog (the bound is
+always printed — a scoped result never masquerades as a whole-corpus total).
+Effort = output + cache-creation tokens (claude) / output tokens (codex),
+**never** raw cumulative input. Cred attribution is a path-boundary match
+against `-homes/` dirs only: codex rollouts under `~/.codex-homes/<name>/`
+attribute cleanly; claude sessions live in the ONE shared store and stay
+**UNATTRIBUTED** rather than being guessed — that bucket is always visible,
+so a coverage gap never hides inside an attributed total.
+
+```console
+$ helm attribute --by cred --since 7d
+helm attribute — effort by cred, 143 sessions (last 7d, limit 200; measure: output + cache-creation tokens, never raw input)
+  UNATTRIBUTED             123.4M  118 sessions
+  codex:seat@example.com    12.1M  25 sessions
+```
+
+### `helm who [--json]`
+The pid→cred attribution table: every live claude/codex process with its
+cred home (`CLAUDE_CONFIG_DIR`/`CODEX_HOME` from `/proc`, defaulting to the
+provider default), the account that home maps to, cwd, and the session it is
+running. Codex session ids are exact (the rollout file is held open — the fd
+names it); claude ids are exact only when the home+cwd project dir holds a
+single live candidate, else newest-first candidates are listed. Subagent /
+helper processes are marked `child` (rotation targets the top-level session);
+two live processes on one session carry a loud `SHARED` marker — resume once,
+never twice. Reads `/proc` and transcript filenames only, never token
+contents. This is the missing link for a rotation executor: a rebalance names
+an account, `who` names the pids on it.
+
 ### `helm homes [prepare <claude|codex> <email> | verify [<name>] | archive <name> | restore <name> | migrate <name> | archives] [--provider claude|codex]`
 Credential-home lifecycle. Bare `helm homes` lists every home with identity,
 liveness, and duplicate flags. helm prepares directories and verifies
