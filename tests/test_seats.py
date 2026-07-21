@@ -609,6 +609,91 @@ class MultiRoomTest(SeatsBase):
         self.assertNotIn("r00", rooms)                         # oldest dropped
 
 
+class RoomAllowlistTest(SeatsBase):
+    """Multi-team isolation (audit G1-G3): a HOMED seat's delivery lane is
+    allowlisted to {home room, main} — a foreign team's @mention / @all /
+    owner-post can never draft it, gate its stop, or backfill foreign
+    history at it. Un-homed seats keep every-room behavior."""
+
+    def test_home_room_recorded_at_join(self):
+        os.environ["HELM_CHAT_ROOM"] = "team-a"
+        seats.join(session="s-a", seat="ta", cwd="/tmp/p")
+        self.assertEqual(seats.roster()["ta"]["home_room"], "team-a")
+        # a sessionless auto roster write (deliver's path) never strips it
+        seats.write_roster("ta", session="s-a2")
+        self.assertEqual(seats.roster()["ta"]["home_room"], "team-a")
+
+    def test_rejoin_with_new_room_rehomes(self):
+        os.environ["HELM_CHAT_ROOM"] = "team-a"
+        seats.join(session="s-a", seat="mv", cwd="/tmp/p")
+        os.environ["HELM_CHAT_ROOM"] = "team-b"     # the deliberate move
+        seats.join(session="s-a2", seat="mv", cwd="/tmp/p")
+        self.assertEqual(seats.roster()["mv"]["home_room"], "team-b")
+
+    def test_homed_seat_skips_foreign_mention_all_and_owner(self):
+        os.environ["HELM_CHAT_ROOM"] = "team-a"
+        seats.join(session="s-ta", seat="ta", cwd="/tmp/p")
+        del os.environ["HELM_CHAT_ROOM"]
+        # foreign room traffic of every deliverable class
+        chat.post("@ta foreign mention", who="bob", room="team-b")
+        chat.post("@all standup", who="bob", room="team-b")
+        chat.post("owner direction for team b", who="david", origin="web",
+                  room="team-b")
+        self.assertIsNone(seats.deliver_any(session="s-ta", seat="ta"))
+        # …and the foreign room was never even scanned: no backfill cursor
+        self.assertIsNone(seats._cursor("team-b", "ta", "s-ta"))
+        self.assertIsNone(seats._cursor("team-b", "ta"))
+        # home room + main + owner-in-home DO land (primary room first:
+        # main's mention outranks team-a's, one nudge per boundary)
+        chat.post("@ta home word", who="bob", room="team-a")
+        chat.post("@ta main word", who="bob")
+        chat.post("owner in team a", who="david", origin="web", room="team-a")
+        got = [seats.deliver_any(session="s-ta", seat="ta") for _ in range(3)]
+        text = "\n".join(g for g in got if g)
+        self.assertIn("main word", got[0])
+        self.assertIn("home word", text)
+        self.assertIn("owner in team a", text)
+        self.assertIsNone(seats.deliver_any(session="s-ta", seat="ta"))
+
+    def test_unhomed_seat_keeps_every_room(self):
+        seats.join(session="s-u", seat="un", cwd="/tmp/p")   # no HELM_CHAT_ROOM
+        chat.post("@un foreign ping", who="bob", room="team-b")
+        line = seats.deliver_any(session="s-u", seat="un")
+        self.assertIn("foreign ping", line)
+        self.assertIn("#team-b", line)
+
+    def test_stop_guard_ignores_foreign_room_for_homed_seat(self):
+        os.environ["HELM_CHAT_ROOM"] = "team-a"
+        seats.join(session="s-g", seat="ga", cwd="/tmp/p")
+        del os.environ["HELM_CHAT_ROOM"]
+        chat.post("@ga drafted by team b", who="bob", room="team-b")
+        blocks, _warns = seats.stop_guard(session="s-g", seat="ga")
+        self.assertEqual(blocks, [])          # foreign mention must NOT gate
+        chat.post("@ga home call", who="bob", room="team-a")
+        blocks, _warns = seats.stop_guard(session="s-g", seat="ga")
+        self.assertTrue(blocks)               # a home-room mention still gates
+
+    def test_scan_rooms_allowlist_shape(self):
+        os.environ["HELM_CHAT_ROOM"] = "team-a"
+        seats.join(session="s-s", seat="sc", cwd="/tmp/p")
+        del os.environ["HELM_CHAT_ROOM"]
+        chat.post("x", who="bob", room="team-b")
+        chat.post("x", who="bob", room="team-c")
+        # the allowlist admits exactly {home, main}; main is only LISTED when
+        # it exists as a room (not yet posted-in here) — foreign rooms never
+        rooms = seats._scan_rooms("team-a", seat="sc")
+        self.assertEqual(rooms, ["team-a"])
+        self.assertNotIn("team-b", rooms)
+        chat.post("x", who="bob")            # main now exists
+        rooms = seats._scan_rooms("team-a", seat="sc")
+        self.assertEqual(set(rooms), {"team-a", "main"})
+        # un-homed scans everything (cap aside), primary first
+        allrooms = seats._scan_rooms("team-a", seat="nobody")
+        self.assertEqual(allrooms[0], "team-a")
+        self.assertIn("team-b", allrooms)
+        self.assertIn("team-c", allrooms)
+
+
 class AutoNameTest(SeatsBase):
     """G-stable-names: an un-named join gets a MEANINGFUL stable auto-name
     (project+family, deduped) instead of opaque agent-<sid8> hex."""

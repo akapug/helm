@@ -317,17 +317,22 @@ def last_seen(seat, row=None):
 SESSIONS_KEPT = 8   # co-named sessions remembered per roster row (addressing)
 
 
-def write_roster(seat, session=None, cwd=None):
+def write_roster(seat, session=None, cwd=None, home_room=None):
     """The one-time (join) roster write — keyed by seat. `session` is the
     newest writer; every co-named session is ALSO kept in row["sessions"]
     (newest last, capped) so seat_for_session resolves ALL of them and each
     keeps its own delivery cursor (fan-out, never race-consume). Guarded by a
     lock anyway: joins are rare, losing a sibling seat's row at join time is
-    avoidable for one flock."""
+    avoidable for one flock. home_room (multi-team isolation, G1): the seat's
+    team room from HELM_CHAT_ROOM — recorded once at join; a later re-join
+    carrying a DIFFERENT room re-homes (the operator's deliberate move); a
+    sessionless/auto roster write (home_room None) NEVER strips it."""
     chat._ensure_dir()
     with _flocked(roster_path() + ".lock"):
         r = roster()
         row = r.get(seat) or {}
+        if home_room and home_room != row.get("home_room"):
+            row["home_room"] = home_room
         if session:
             row["session"] = str(session)
             sess = [s for s in row.get("sessions") or [] if s != str(session)]
@@ -541,12 +546,26 @@ def _tail(room, cur):
     return st.st_dev, st.st_ino, base, entries
 
 
-def _scan_rooms(primary="main"):
+def _scan_rooms(primary="main", seat=None):
     """Every room the delivery lane considers, bounded: the primary room
     first (whether or not its file exists yet), then the other live rooms
     (chat.list_rooms()) newest-activity-first up to ROOM_SCAN_CAP total —
     under the cap the ACTIVE channels win, and each room's read is already
-    SCAN_CAP-bounded. Fail-open: an unlistable dir is just the primary."""
+    SCAN_CAP-bounded. Fail-open: an unlistable dir is just the primary.
+
+    Multi-team isolation (audit G1-G3): a HOMED seat (roster home_room from
+    HELM_CHAT_ROOM at join) is allowlisted to {its home room, main} — the
+    one chokepoint through which deliver_any, the wait beacon, stop_guard's
+    _pending_all, and roster_report ALL flow, so a foreign team's @mention /
+    @all / owner-post can never draft the seat, gate its stop, or backfill
+    a foreign room's history at it (disallowed rooms are never scanned, so
+    never backfilled). main stays the owner's all-hands. An un-homed seat
+    keeps today's every-room behavior — zero change for the current fleet."""
+    allow = None
+    if seat:
+        home_room = (roster().get(seat) or {}).get("home_room")
+        if home_room:
+            allow = {home_room, "main"}
     try:
         names = chat.list_rooms()
     except OSError:
@@ -560,7 +579,10 @@ def _scan_rooms(primary="main"):
             except OSError:
                 return 0.0
         others.sort(key=mtime, reverse=True)
-    return [primary] + others[:ROOM_SCAN_CAP - 1]
+    rooms = [primary] + others[:ROOM_SCAN_CAP - 1]
+    if allow is not None:
+        rooms = [r for r in rooms if r in allow]
+    return rooms
 
 
 def _room_dirty(room, seat, session=None):
@@ -665,7 +687,7 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main"):
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
     touch_seen(seat)          # presence even when every room is quiet
     tracked = (_cursor(room, seat, session) or _cursor(room, seat)) is not None
-    for r in _scan_rooms(room):
+    for r in _scan_rooms(room, seat=seat):
         if not _room_dirty(r, seat, session):
             continue
         line = deliver(session=session, room=r, seat=seat, emit=emit, cwd=cwd,
@@ -689,8 +711,9 @@ def join(session=None, cwd=None, seat=None, room="main"):
     _scan_rooms) so pre-join backlog never floods anywhere AND deliver_any
     can read a later cursor-less room as born-after-join (backfill)."""
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
-    write_roster(seat, session=session, cwd=cwd)
-    for r in _scan_rooms(room):
+    home_room = home.env("CHAT_ROOM")   # team-room homing (slice 3) recorded
+    write_roster(seat, session=session, cwd=cwd, home_room=home_room)
+    for r in _scan_rooms(room, seat=seat):
         if _cursor(r, seat, session) is None:
             with _flocked(cursor_path(r, seat, session) + ".lock"):
                 if _cursor(r, seat, session) is None:
@@ -841,7 +864,7 @@ def _pending_all(room, seat, session=None):
     backfill rule as deliver_any, same _room_dirty fast path per room."""
     tracked = (_cursor(room, seat, session) or _cursor(room, seat)) is not None
     out = []
-    for r in _scan_rooms(room):
+    for r in _scan_rooms(room, seat=seat):
         if not _room_dirty(r, seat, session):
             continue
         out.extend((r, row) for row in _pending_rows(
