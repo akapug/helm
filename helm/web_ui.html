@@ -663,7 +663,7 @@ let projects = [], showRetired = false;
    not a duration. */
 function age(epoch) {
   if (!epoch) return "never";
-  const d = (Date.now() / 1000 - epoch) / 86400;
+  const d = Math.max(0, (Date.now() / 1000 - epoch) / 86400);  // clamp future stamps to 0d
   if (d < 14) return Math.floor(d) + "d";
   if (d < 70) return Math.floor(d / 7) + "w";
   return Math.floor(d / 30) + "mo";
@@ -742,7 +742,7 @@ function sessStrip(s) {
   const rows = s.sessions.slice(0, 12).map(r =>
     '<div class="srow" data-cmd="' + esc(r.cmd || "") + '" title="click to copy the resume command">' +
     '<span class="sage">' + esc(age(r.mt)) + '</span>' +
-    '<span class="chip h-' + esc(r.h) + '">' + esc(r.h) + '</span>' +
+    '<span class="hchip h-' + esc(r.h) + '">' + esc(r.h) + '</span>' +
     '<span class="sproj">' + esc(r.project || "–") + '</span>' +
     '<span class="stitle">' + esc((r.t || "(untitled)").slice(0, 80)) + '</span></div>').join("");
   $("#sessions").innerHTML = '<span class="slabel">sessions</span><div class="srows">' + rows + "</div>";
