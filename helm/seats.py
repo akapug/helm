@@ -116,7 +116,9 @@ def _family():
             return tok
     if os.environ.get("CODEX_SESSION_ID"):
         return "codex"
-    if os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CLAUDECODE"):
+    if (os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or os.environ.get("CLAUDE_SESSION_ID")
+            or os.environ.get("CLAUDECODE")):
         return "claude"
     return "agent"
 
@@ -399,8 +401,15 @@ def rename_seat(old, new):
                            "8+-char session prefix — helm chat seats --all)" % old)
         if seat == new:
             return True, "seat is already named %s" % new
-        if new in r:
-            return False, "seat name %r is taken (helm chat seats --all)" % new
+        # case-INSENSITIVE taken-check: _seat_key casefolds, the reserved check
+        # lowers, and _mention_re is re.I — a case-variant name (KIMI vs kimi)
+        # is the SAME address + the SAME keyed state downstream, so two such
+        # rows alias mentions, share presence, and cross-fire the reaper onto
+        # the live seat's state (kimi cross-family review, live-probed 2026-07-21).
+        # Exclude `seat` itself so a pure self-case-change isn't falsely blocked.
+        if any(k != seat and k.casefold() == new.casefold() for k in r):
+            return False, ("seat name %r is taken (case-insensitive — the "
+                           "roster keys casefold; helm chat seats --all)" % new)
         r[new] = r.pop(seat)
         pk.write_json(roster_path(), r)
         _move_seat_state(seat, new)
@@ -1013,7 +1022,7 @@ def _flag(args, name, default=None):
 
 
 def _env_session():
-    return os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_SESSION_ID")
+    return home.session_id()
 
 
 def _hook_emit(event):

@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import chat, pk, seats, web  # noqa: E402
+from helm import chat, home, pk, seats, web  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -28,9 +28,11 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_STOP_GUARD", "HELM_STOP_GUARD_INBOX",
             "HELM_STOP_GUARD_CLAIMS", "HELM_STOP_GUARD_INDEX",
             "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
-            "CLAUDE_SESSION_ID", "CODEX_SESSION_ID",
+            "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID",
             # auto_name reads the ambient model/harness marks — scrub them or
             # a test run inside a live harness computes a different family
+            # (CLAUDE_CODE_SESSION_ID is the REAL claude-code var — leaving it
+            # unscrubbed let this very session's id leak into whoname/_family)
             "CLAUDECODE", "CLAUDE_CODE_SUBAGENT_MODEL", "ANTHROPIC_MODEL")
 
 
@@ -481,6 +483,28 @@ class AutoNameTest(SeatsBase):
         with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sess-w1"}):
             self.assertEqual(chat.whoname(), "wren")
 
+    def test_whoname_resolves_the_real_claude_code_session_var(self):
+        """REGRESSION (owner-caught 2026-07-21): Claude Code exports
+        CLAUDE_CODE_SESSION_ID, NOT CLAUDE_SESSION_ID — a bare CLI post fell
+        through to the anon 'agent' floor and the per-session cursor no-op'd.
+        home.session_id() must resolve the real var so whoname() speaks the
+        seat and the co-named cursor keys correctly."""
+        seats.join(session="sess-cc1", seat="opus-integrator", cwd="/tmp/p")
+        with mock.patch.dict(os.environ,
+                             {"CLAUDE_CODE_SESSION_ID": "sess-cc1"}):
+            self.assertEqual(home.session_id(), "sess-cc1")
+            self.assertEqual(chat.whoname(), "opus-integrator")
+
+    def test_session_id_resolution_order(self):
+        """CLAUDE_CODE_SESSION_ID wins over the legacy alias and codex var;
+        None when every harness var is scrubbed (the base's ENV_KEYS scrub
+        leaves them absent, so callers fall to their floor)."""
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "cc",
+                                          "CLAUDE_SESSION_ID": "legacy",
+                                          "CODEX_SESSION_ID": "cx"}):
+            self.assertEqual(home.session_id(), "cc")
+        self.assertIsNone(home.session_id())
+
 
 class RenameTest(SeatsBase):
     """helm chat seat rename — bind a live agent to a memorable @name."""
@@ -519,6 +543,22 @@ class RenameTest(SeatsBase):
         self.assertFalse(ok)
         self.assertIn("no roster row", msg)
         ok, msg = seats.rename_seat("a", "a")          # no-op, not an error
+        self.assertTrue(ok)
+
+    def test_rename_refuses_case_collision(self):
+        """A case-variant of a live seat is the SAME address + keyed state
+        downstream (casefold keys, re.I mentions) — renaming INTO one must be
+        refused, else the two rows alias mentions/presence and the reaper
+        cross-fires onto the live seat's state (kimi cross-family review,
+        live-probed 2026-07-21). A pure self-case-change is still allowed."""
+        seats.join(session="s-k", seat="kimi", cwd="/tmp/p")
+        seats.join(session="s-a", seat="alpha", cwd="/tmp/p")
+        ok, msg = seats.rename_seat("alpha", "KIMI")
+        self.assertFalse(ok, msg)
+        self.assertIn("taken", msg)
+        self.assertNotIn("KIMI", seats.roster())         # no aliased row minted
+        self.assertIn("kimi", seats.roster())
+        ok, _ = seats.rename_seat("kimi", "Kimi")         # self-case-change ok
         self.assertTrue(ok)
 
     def test_cli_and_web_rename(self):
