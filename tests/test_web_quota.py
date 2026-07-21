@@ -16,7 +16,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import home, homes, pk, web  # noqa: E402
+from helm import home, homes, pk, transcripts, web  # noqa: E402
 from helm.providers import ProviderError  # noqa: E402
 
 ACCT = "alice@example.com"
@@ -98,14 +98,19 @@ class TestWebQuota(unittest.TestCase):
         for r in homes.ROOTS.values():
             os.makedirs(r)
         # stub provider + a canned catalog (burn joins against it) — the native
-        # provider and the real catalog build are never exercised here.
+        # provider and the real catalog build are never exercised here. The burn
+        # endpoint reaches the catalog through transcripts.get_catalog() (the ONE
+        # single-flight path both the burn view and /api/catalog now share), so
+        # the stub rides there, not on a web-local cache.
         cls.provider_prior = web._PROVIDER
         web._PROVIDER = StubProvider()
         web._qstate.clear()
         cls.catalog_row = {"h": "claude", "i": "11111111-2222-3333-4444-555555555555",
                            "c": "~/dev/x", "t": "quota burn probe", "z": 4096,
                            "m": 10, "mt": int(time.time() - 1800), "cwd": "/dev/x"}
-        web._qstate["catalog"] = (time.time(), [cls.catalog_row])
+        cls._get_catalog_prior = transcripts.get_catalog
+        transcripts.get_catalog = lambda refresh=False: {
+            "rows": [dict(cls.catalog_row)], "stats": {}, "scanned_at": time.time()}
         cls.srv = web.make_server(0)  # ephemeral port
         cls.port = cls.srv.server_address[1]
         cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
@@ -117,6 +122,7 @@ class TestWebQuota(unittest.TestCase):
         cls.srv.server_close()
         cls.thread.join(timeout=5)
         web._PROVIDER = cls.provider_prior
+        transcripts.get_catalog = cls._get_catalog_prior
         web._qstate.clear()
         for k, v in cls.homes_orig.items():
             setattr(homes, k, v)

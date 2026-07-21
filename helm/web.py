@@ -333,11 +333,13 @@ def _cached(key, ttl, fn):
 
 
 def _catalog_rows():
-    def build():
-        from . import catalog
-        rows, _stats = catalog.build()
-        return rows
-    return _cached("catalog", 600, build)
+    """The catalog through the ONE acquisition path — transcripts.get_catalog()'s
+    single-flight cache (cwd-overrides applied, 5-min TTL). This once ran its own
+    second single-flight over catalog.build() directly: a duplicate cache with a
+    different TTL that skipped the cwd-override pass, so the burn view could show
+    a session under a stale cwd the rest of the UI had already re-homed. One
+    cache, one lens, no divergence."""
+    return _transcripts().get_catalog()["rows"]
 
 
 def _claude_home_identity(home_p):
