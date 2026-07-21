@@ -843,6 +843,39 @@ helm homes: prepared claude home you-example-com
   login (YOU run this): CLAUDE_CONFIG_DIR=~/.claude-homes/you-example-com claude login
 ```
 
+### `helm codex [list | pool <name> | unpool <name> | pooled]`
+The codexhome roster + proxy cred pooling — how helm manages codex accounts
+(the `codex-credhome-proxy-pooling` premise, codified). Accounts live as
+credhomes under `~/.codex-homes/<name>/` (`HELM_CODEX_HOMES_DIR`-overridable);
+codex seats run `claude` against the local CLIProxyAPI, which pools creds
+from its auth-dir (`~/.helm/_global/seats/codex/auth/`), **hot-reloads** that
+dir, and falls through to a working cred when one is usage-capped.
+
+`list` classifies every home by plan tier — `pro` = **ultra** (handles
+multiple concurrent codexes), `team` = one codex each — with symlink aliases
+and same-account dirs folded onto one row, plus whether the account is
+currently pooled. `pool` translates the home's auth.json (nested `tokens`)
+into the proxy's flat record and writes it 0600 as `codex-<name>.json` —
+idempotent, and re-pooling IS the cure for the proxy 401-ing on a stale
+copy (the codex CLI autorefreshes the home; a past access-token `exp` is a
+refresh-first warning, never a death verdict). `unpool` removes the pooled
+file (fail-open when absent); `pooled` lists what the proxy can draw on.
+Sources stay read-only forever; token material never reaches stdout —
+email / account / tier / paths only.
+
+Note: `helm seat add codex` still enforces one-cred-per-seat and clears
+`codex-*.json` from the same auth-dir — re-pool after a seat re-add.
+
+```console
+$ helm codex list
+helm codex: 4 codexhomes under ~/.codex-homes (2 pooled -> ~/.helm/_global/seats/codex/auth)
+  cto-example-invalid  cto@example.invalid  ultra  1f04aa08…  pooled:codex-cto-example-invalid.json
+  team-example-com              hey@simbi.com              team   9c21be77…  -
+$ helm codex pool team-example-com
+helm codex: pooled hey@simbi.com -> ~/.helm/_global/seats/codex/auth/codex-team-example-com.json (team, account 9c21be77…)
+  the proxy hot-reloads its auth-dir — no restart needed
+```
+
 ### `helm keepalive [--home NAME|PATH] [--early HOURS]`
 Roll idle claude homes' OAuth tokens forward before their refresh chains rot —
 the **one** credential-writing verb in helm, with every safety rule inherited:

@@ -2,6 +2,13 @@
 
 ## Unreleased (0.2)
 
+- `helm codex` — codexhome roster + proxy cred pooling as a first-class
+  verb (the manual night codified): `list` classifies ultra/team from the
+  token plan claim with aliases and same-account dirs folded, `pool`
+  translates a home's auth.json into the seat proxy's hot-reloaded auth-dir
+  (0600, idempotent, stale-exp warns never refuses), `unpool` fail-open,
+  `pooled` shows what the :8317 proxy can draw on. Sources read-only
+  forever; token material never printed.
 - Evolve's last two behavior-observer legs — dead reflexes (live, zero
   ledger fires over ≥200 turns, one batched review line) and recorder
   signatures (a stuck/loop-thrash tell recurring across ≥3 sessions' last
