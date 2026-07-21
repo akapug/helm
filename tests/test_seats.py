@@ -24,6 +24,7 @@ from helm import chat, home, pk, seats, web  # noqa: E402
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
             "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG",
+            "HELM_CHAT_ROOM", "MELD_CHAT_ROOM",
             "HELM_CHAT_OWNER_NAMES", "HELM_CHAT_DELIVER",
             "HELM_STOP_GUARD", "HELM_STOP_GUARD_INBOX",
             "HELM_STOP_GUARD_CLAIMS", "HELM_STOP_GUARD_INDEX",
@@ -495,6 +496,28 @@ class MultiRoomTest(SeatsBase):
         self.assertIn("in main", seats.deliver_any(session="s-p", seat="p"))
         self.assertIn("in team", seats.deliver_any(session="s-p", seat="p"))
         self.assertIsNone(seats.deliver_any(session="s-p", seat="p"))
+
+    def test_homed_seat_lives_in_its_room_and_still_hears_main(self):
+        """Slice 3 (team-room homing) composes with the multi-room deliver:
+        HELM_CHAT_ROOM homes the no---room verbs the hooks call — join +
+        deliver run in the team room — while deliver_any still wakes the
+        homed seat on an @mention back in main."""
+        os.environ["HELM_CHAT_ROOM"] = "team-x"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(chat.cmd_chat(["join", "--seat", "tm"]), 0)
+        self.assertIn("in room team-x", out.getvalue())
+        chat.post("@tm team word", who="bob", room="team-x")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(chat.cmd_chat(["deliver", "--seat", "tm"]), 0)
+        self.assertIn("team word", out.getvalue())
+        self.assertIn("#team-x", out.getvalue())   # delivered IN the home room
+        chat.post("@tm back in main", who="bob")   # cross-room mention
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(chat.cmd_chat(["deliver", "--seat", "tm"]), 0)
+        self.assertIn("back in main", out.getvalue())
 
     def test_cross_room_waiting_pointer_names_the_room(self):
         seats.join(session="s-w2", seat="w2", cwd="/tmp/p")

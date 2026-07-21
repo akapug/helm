@@ -20,7 +20,8 @@ from helm import chat, home, reflex  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
-            "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG")
+            "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG",
+            "HELM_CHAT_ROOM", "MELD_CHAT_ROOM")
 
 
 class ChatBase(unittest.TestCase):
@@ -181,6 +182,24 @@ class CmdTest(ChatBase):
         self.assertEqual(chat.read("main"), ([], 0))
         rc, out, _ = self.run_cmd(["read", "--room", "ops"])
         self.assertIn("sidebar", out)
+
+    def test_env_room_homes_the_default(self):
+        """Team-room homing (slice 3): HELM_CHAT_ROOM re-homes every no---room
+        verb — exactly what the hooks call — while an explicit --room still
+        wins; un-homed sessions keep main (test_post_and_read_cycle)."""
+        os.environ["HELM_CHAT_ROOM"] = "team-x"
+        rc, out, _ = self.run_cmd(["post", "homed", "hello"])
+        self.assertEqual(rc, 0)
+        self.assertIn("[team-x]", out)
+        self.assertEqual(chat.read("main"), ([], 0))     # nothing leaked to main
+        self.assertEqual(chat.read("team-x")[1], 1)
+        rc, out, _ = self.run_cmd(["read"])              # default read: homed too
+        self.assertIn("homed hello", out)
+        self.assertEqual(self.run_cmd(["post", "aside", "--room", "main"])[0], 0)
+        self.assertEqual(chat.read("main")[1], 1)        # --room beats the env
+        chat.mark_owner_unread("team-x")                 # a homed read consumes
+        self.assertEqual(self.run_cmd(["read"])[0], 0)   # its OWN room's marker
+        self.assertFalse(os.path.exists(chat.marker_path("team-x")))
 
     def test_empty_read_and_bad_args(self):
         rc, out, _ = self.run_cmd(["read"])

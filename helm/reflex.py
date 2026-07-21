@@ -127,7 +127,8 @@ def seed_defaults():
     Idempotent by id: an existing file — operator-edited, re-worded, or retired
     — is never overwritten; a re-seed of a present id is a no-op. Returns the
     paths actually written (empty on re-seed). The chat marker path resolves at
-    SEED time (env-respecting — HELM_CHAT_DIR), never at import time."""
+    SEED time (env-respecting — HELM_CHAT_DIR + HELM_CHAT_ROOM, so a homed
+    seat's reflex tracks its own team room), never at import time."""
     out = []
     for d in DEFAULT_PACK:
         if os.path.exists(reflex_path(d["id"])):
@@ -136,7 +137,7 @@ def seed_defaults():
         e.setdefault("signal", "prompt")
         if e["signal"] == "marker-file" and not e.get("marker"):
             from . import chat
-            e["marker"] = chat.marker_path("main")
+            e["marker"] = chat.marker_path(home.env("CHAT_ROOM") or "main")
         out.append(write(e))
     return out
 

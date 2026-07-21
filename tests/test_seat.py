@@ -406,6 +406,31 @@ class SeatTest(unittest.TestCase):
             "claude --dangerously-skip-permissions --model gpt-5.5",
             out.getvalue())
 
+    def test_launch_line_room_homing(self):
+        """Team-room homing (slice 3): --room bakes HELM_CHAT_ROOM into the
+        line + launch.sh; no --room exports nothing (un-homed = main, the
+        whole fleet today) — and the identity + signing env stay intact."""
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        self.assertNotIn("HELM_CHAT_ROOM", seat.launch_line("codex"))
+        line = seat.launch_line("codex", room="team-x")
+        self.assertIn("HELM_CHAT_ROOM=team-x", line)
+        self.assertIn("HELM_CHAT_NAME=codex", line)          # identity intact
+        self.assertIn("HELM_CELL_BIN=" + seat.DREGG_SIGNER_DEFAULT, line)
+        self.assertIn("HELM_CELL_PROFILE=codex", line)       # signing intact
+        self.assertIn("DREGG_PROFILE=codex", line)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = seat.cmd_seat(["launch", "codex", "--room", "team-x"])
+        self.assertEqual(rc, 0)
+        self.assertIn("HELM_CHAT_ROOM=team-x", out.getvalue())
+        with open(os.path.join(seat.seat_dir("codex"), "launch.sh")) as f:
+            self.assertIn("HELM_CHAT_ROOM=team-x", f.read())  # preset carries it
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(seat.cmd_seat(["launch", "codex"]), 0)
+        self.assertNotIn("HELM_CHAT_ROOM", out.getvalue())    # default un-homed
+
     def test_seat_subprocess_env_overrides_ambient_owner_signer_identity(self):
         self._plant("home-a")
         self.assertEqual(self._add()[0], 0)

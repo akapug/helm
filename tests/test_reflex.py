@@ -10,7 +10,8 @@ os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 from helm import chat, home, pk, record, reflex  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
-            "HELM_CACHE_DIR", "MELD_CACHE_DIR", "HELM_CHAT_DIR", "MELD_CHAT_DIR")
+            "HELM_CACHE_DIR", "MELD_CACHE_DIR", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
+            "HELM_CHAT_ROOM", "MELD_CHAT_ROOM")
 
 
 class ReflexTest(unittest.TestCase):
@@ -102,6 +103,15 @@ class SeedDefaultsTest(SeedBase):
         self.assertEqual(e["signal"], "marker-file")
         self.assertEqual(e["marker"], chat.marker_path("main"))
         self.assertTrue(e["marker"].startswith(os.environ["HELM_CHAT_DIR"]))
+
+    def test_seed_marker_tracks_a_homed_seats_room(self):
+        """Team-room homing (slice 3): a seed under HELM_CHAT_ROOM points the
+        owner-chat-unread marker at the seat's OWN room, not main."""
+        os.environ["HELM_CHAT_ROOM"] = "team-x"
+        reflex.seed_defaults()
+        e = self.by_id()["owner-chat-unread"]
+        self.assertEqual(e["marker"], chat.marker_path("team-x"))
+        self.assertNotEqual(e["marker"], chat.marker_path("main"))
 
     def test_seeded_counter_pack_has_field_tested_defaults(self):
         reflex.seed_defaults()

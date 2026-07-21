@@ -3,7 +3,8 @@
 read/write loop, owner in the room.
 
 Rooms live in RAM (tmpfs): /dev/shm/helm-chat/<room>.jsonl — append-only, one
-JSON object per line {"ts","from","text"}, dir 0700, default room "main".
+JSON object per line {"ts","from","text"}, dir 0700, default room "main"
+(HELM_CHAT_ROOM re-homes a seat's default — team-room homing).
 HELM_CHAT_DIR overrides (tests point it at a tmp dir). This is ephemeral
 presence-chat, NOT the durable record — /premise anything that must outlive
 the room; past SIZE_CAP the oldest half rotates out (RAM etiquette).
@@ -668,7 +669,11 @@ def cmd_chat(args):
     | seats [--all] | seat rename <sid|oldname> <newname>
     | claim|release <resource> | claims  [--room R]"""
     args = list(args or [])
-    room = "main"
+    # HELM_CHAT_ROOM homes a seat in a team channel (slice 3): every no---room
+    # verb — posts, reads, join, deliver, the hooks pass no --room — defaults
+    # to its room, while deliver_any still hears @mentions from every room.
+    # Unset ⇒ main: zero behavior change for the un-homed fleet.
+    room = home.env("CHAT_ROOM") or "main"
     room_given = "--room" in args
     if room_given:
         i = args.index("--room")

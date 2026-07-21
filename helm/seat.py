@@ -95,8 +95,9 @@ FAMILIES = {
 _USAGE = """usage: helm seat <verb> [args]
   add <family> [--auth-from <path>]   mint the seat (translate cred read-only)
                [--key-from <path>]    proxy-key families: .env-style key file
+               [--room R]             home the seat's chat in team room R
   up <family> | down <family>         start/stop the seat's local proxy
-  launch <family> [--model M]         print the exact launch line (never runs it)
+  launch <family> [--model M] [--room R]  print the exact launch line (never runs it)
   smoke <family>                      the 4-leg acceptance gate (prompt/tool/subagent/whisper)
   list | status                       seats, proxy liveness, cred expiry
   doctor                              binary + cred + seat health, read-only
@@ -320,7 +321,7 @@ def _config_yaml_key(port, token, provider, base_url, model, api_key):
             % (port, token, provider, base_url, api_key, model, model))
 
 
-def launch_line(family, model=None):
+def launch_line(family, model=None, room=None):
     """The exact seat launch command. env -u ANTHROPIC_API_KEY is part of the
     line: an inherited key must never ride into a proxied seat either.
     HELM_CHAT_NAME=<family> is the STABLE seat identity: the SessionStart join
@@ -329,7 +330,11 @@ def launch_line(family, model=None):
     fleet posts then deliver to it. HELM_CELL_PROFILE + DREGG_PROFILE bind both
     helm's signing call and the dregg SDK fallback to that SAME family identity;
     HELM_CELL_BIN selects the dregg-native client signer. A seat therefore never
-    inherits the owner's ambient profile. --dangerously-skip-permissions is CANONICAL
+    inherits the owner's ambient profile. `room` (seat add/launch --room) adds
+    HELM_CHAT_ROOM=<room> — team-room homing (slice 3): the seat's chat
+    defaults (post/read/join/deliver) live in its team channel while the
+    multi-room deliver still hears @mentions from any room; no room ⇒ no
+    export, exactly today's main-homed fleet. --dangerously-skip-permissions is CANONICAL
     for a fleet seat (owner-asked 2026-07-21): an agent pane exists to do work
     unattended, and a per-tool permission prompt strands it silently (the owner
     had to flip kimi/codex into auto-mode by hand). The beacon permit narrows
@@ -338,18 +343,19 @@ def launch_line(family, model=None):
     fam = FAMILIES[family]
     model = model or fam["model"]
     cfgdir = shlex.quote(os.path.join(seat_dir(family), "claude"))
+    homing = (" HELM_CHAT_ROOM=%s" % shlex.quote(room)) if room else ""
     return ("env -u ANTHROPIC_API_KEY"
             " ANTHROPIC_BASE_URL=http://127.0.0.1:%d"
             " ANTHROPIC_AUTH_TOKEN=%s"
             " CLAUDE_CODE_SUBAGENT_MODEL=%s"
             " CLAUDE_CONFIG_DIR=%s"
-            " HELM_CHAT_NAME=%s"
+            " HELM_CHAT_NAME=%s%s"
             " HELM_CELL_BIN=%s"
             " HELM_CELL_PROFILE=%s"
             " DREGG_PROFILE=%s"
             " claude --dangerously-skip-permissions --model %s"
             % (fam["port"], _read_token(family) or "<seat-token-missing>",
-               model, cfgdir, shlex.quote(family),
+               model, cfgdir, shlex.quote(family), homing,
                shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(family),
                shlex.quote(family), model))
 
@@ -365,7 +371,7 @@ def _seat_token(family, d):
     return token
 
 
-def _write_launch_assets(family, d):
+def _write_launch_assets(family, d, room=None):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
     identical for every mode, and refreshed by BOTH `add` and `launch` (a
     stale launch.sh minted before HELM_CHAT_NAME existed is why the live
@@ -390,7 +396,8 @@ def _write_launch_assets(family, d):
     _write_private(os.path.join(d, "launch.sh"),
                    "#!/bin/sh\n# helm seat %s — minted by `helm seat add`; "
                    "regenerate with `helm seat launch %s`\nexec %s \"$@\"\n"
-                   % (family, family, launch_line(family)), mode=0o700)
+                   % (family, family, launch_line(family, room=room)),
+                   mode=0o700)
 
 
 def _env_file_value(path, key):
@@ -413,7 +420,7 @@ def _env_file_value(path, key):
     return None
 
 
-def _add_proxy_key(family, fam, args):
+def _add_proxy_key(family, fam, args, room=None):
     """mode "proxy-key": an API-key provider behind the same local proxy via
     its openai-compatibility block. No OAuth, no auth-dir. Key source order:
     $<key_env>, then --key-from <.env-style file>. The key is baked into the
@@ -439,7 +446,7 @@ def _add_proxy_key(family, fam, args):
     _write_private(os.path.join(d, "config.yaml"),
                    _config_yaml_key(fam["port"], token, fam["provider"],
                                     fam["base_url"], fam["model"], api_key))
-    _write_launch_assets(family, d)
+    _write_launch_assets(family, d, room)
     print("helm seat: %s seat minted at %s" % (family, d))
     print("  outbound %s key baked into config.yaml (0600 — value never "
           "printed); provider %s -> %s" % (key_env, fam["provider"], fam["base_url"]))
@@ -448,7 +455,7 @@ def _add_proxy_key(family, fam, args):
     return 0
 
 
-def _add(family, args):
+def _add(family, args, room=None):
     fam = FAMILIES.get(family)
     if fam is None:
         print("helm seat: family '%s' not yet wired (have: %s). First-party "
@@ -457,7 +464,7 @@ def _add(family, args):
               file=sys.stderr)
         return 2
     if fam["mode"] == "proxy-key":
-        return _add_proxy_key(family, fam, args)
+        return _add_proxy_key(family, fam, args, room)
     if fam["mode"] != "proxy":
         print("helm seat: family '%s' mode '%s' not yet wired — proxyless add "
               "not implemented" % (family, fam["mode"]), file=sys.stderr)
@@ -513,7 +520,7 @@ def _add(family, args):
     token = _seat_token(family, d)
     _write_private(os.path.join(d, "config.yaml"),
                    _config_yaml(fam["port"], auth_dir, token))
-    _write_launch_assets(family, d)
+    _write_launch_assets(family, d, room)
 
     print("helm seat: %s seat minted at %s" % (family, d))
     print("  cred %s (%s) from %s (read-only), access token valid until %s"
@@ -778,8 +785,11 @@ def cmd_seat(args):
             print("usage: helm seat %s <family>" % verb, file=sys.stderr)
             return 2
         family = rest[0]
+        # --room homes the seat in a team channel (default main — un-homed):
+        # add/launch bake HELM_CHAT_ROOM=<room> into the line + launch.sh
+        room = rest[rest.index("--room") + 1] if "--room" in rest else None
         if verb == "add":
-            return _add(family, rest[1:])
+            return _add(family, rest[1:], room=room)
         if verb == "up":
             return _up(family)
         if verb == "down":
@@ -794,8 +804,8 @@ def cmd_seat(args):
         # hooks + beacon permit + a launch.sh carrying the CURRENT identity
         # shape — retrofitting a seat minted before either existed. stdout
         # stays exactly the pasteable line; notes ride stderr.
-        _write_launch_assets(family, seat_dir(family))
-        print(launch_line(family, model))
+        _write_launch_assets(family, seat_dir(family), room)
+        print(launch_line(family, model, room))
         from . import hooks
         hooks.surface_uncovered(out=sys.stderr)  # a running joined-late pane
         return 0                                 # still needs its relaunch
