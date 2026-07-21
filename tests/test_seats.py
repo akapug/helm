@@ -308,6 +308,51 @@ class DeliverTest(SeatsBase):
         self.assertIsNone(seats.deliver(seat="api.a"))   # advances ITS cursor only
         self.assertIn("@api-a second", seats.deliver(seat="api-a"))
 
+    def test_conamed_sessions_both_receive_the_mention(self):
+        """G-cursor-persession: two live sessions sharing one HELM_CHAT_NAME
+        must BOTH see an @mention (fan-out) — the seat-only cursor let
+        whichever boundary fired first race-consume it for the sibling."""
+        seats.join(session="s-one", seat="fable", cwd="/tmp/p")
+        seats.join(session="s-two", seat="fable", cwd="/tmp/p")
+        chat.post("@fable ship it", who="bob")
+        self.assertIn("ship it", seats.deliver(session="s-one", seat="fable"))
+        self.assertIn("ship it", seats.deliver(session="s-two", seat="fable"))
+        # each consumed its OWN cursor — no re-nudge, no cross-consume
+        self.assertIsNone(seats.deliver(session="s-one", seat="fable"))
+        self.assertIsNone(seats.deliver(session="s-two", seat="fable"))
+        # the roster row stays seat-keyed (one row) and resolves BOTH sessions
+        self.assertEqual(len([s for s in seats.roster() if s == "fable"]), 1)
+        self.assertEqual(seats.seat_for_session("s-one"), "fable")
+        self.assertEqual(seats.seat_for_session("s-two"), "fable")
+
+    def test_conamed_join_order_independent_of_hook_seat_resolution(self):
+        """The hook passes only session_id — the OLDER co-named session must
+        still resolve to the shared seat after a newer join overwrote
+        row['session'] (the sessions list is the addressing memory)."""
+        seats.join(session="s-old", seat="fable", cwd="/tmp/p")
+        seats.join(session="s-new", seat="fable", cwd="/tmp/p")
+        chat.post("@fable hello", who="bob")
+        # no --seat: exactly what the PostToolUse hook can supply
+        self.assertIn("hello", seats.deliver(session="s-old"))
+
+    def test_session_cursor_inherits_seat_baseline_on_upgrade(self):
+        """A pre-split install tracked the seat-level cursor; the first
+        session-keyed boundary must deliver from THAT baseline, not skip to
+        EOF (loss is the one forbidden outcome)."""
+        seats.join(seat="alice", cwd="/tmp/p")              # seat-level cursor
+        chat.post("@alice queued before upgrade", who="bob")
+        line = seats.deliver(session="s-later", seat="alice")
+        self.assertIn("queued before upgrade", line)
+
+    def test_wait_shares_the_sessions_cursor(self):
+        """An ambient-session wait must consume the SAME cursor as that
+        session's boundary hook — no double-nudge for one session."""
+        seats.join(session="s-w", seat="alice", cwd="/tmp/p")
+        chat.post("@alice once", who="bob")
+        line = seats.wait(seat="alice", session="s-w", timeout=1, poll=0.01)
+        self.assertIn("once", line)
+        self.assertIsNone(seats.deliver(session="s-w", seat="alice"))
+
     def test_unknown_session_self_heals_roster(self):
         chat.post("noise", who="bob")
         self.assertIsNone(seats.deliver(session="brand-new-session"))

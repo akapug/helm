@@ -58,9 +58,15 @@ correct embargo needs an expected-set freeze, a reveal state machine, salted
 commitments and batch-row reveal; the 0.3 spec is recorded in the design
 doc §11. No live consumer today, so: record, don't build.
 
-Cursor law (codex H5): `<room>.cursor.<seat>` holds {dev, ino, off, rid} —
-the room file's identity, the byte offset of the first unprocessed row, and
-the last processed row's stable id. Fast path = one stat (same inode, size
+Cursor law (codex H5): `<room>.cursor.<seat>[.<sid8>]` holds {dev, ino, off,
+rid} — the room file's identity, the byte offset of the first unprocessed
+row, and the last processed row's stable id. The cursor is PER (seat,
+session): two live sessions sharing one HELM_CHAT_NAME each hold their own
+cursor, so an @mention FANS OUT to all of them instead of being race-consumed
+by whichever boundary fires first (the live @mention-loss class). A caller
+with no session (bare CLI) rides the seat-level cursor; a fresh session
+cursor seeds from the seat-level one when it exists (upgrade continuity —
+rows tracked before the split are not skipped). Fast path = one stat (same inode, size
 == off ⇒ nothing new; a same-size REPLACEMENT changes the inode and is
 caught). Inode change or shrink ⇒ rotation/replacement: reset to 0 and use
 rid to suppress the retained overlap (duplicates acceptable, loss is not).
@@ -91,7 +97,7 @@ _BROADCAST = re.compile(r"(?<![A-Za-z0-9._-])@(all|fleet|everyone)(?![A-Za-z0-9.
 # identity + addressing
 # ---------------------------------------------------------------------------
 
-def derive_seat(session=None):
+def derive_seat(session=None, cwd=None):
     """$HELM_CHAT_NAME first (the launch seam sets it), else the session-
     derived agent name — chat.whoname's law: a bare agent never gets the
     operator's identity."""
@@ -242,17 +248,25 @@ def last_seen(seat, row=None):
         return (row or {}).get("last_seen")
 
 
+SESSIONS_KEPT = 8   # co-named sessions remembered per roster row (addressing)
+
+
 def write_roster(seat, session=None, cwd=None):
-    """The one-time (join) roster write — keyed by seat, last-writer-wins
-    (two sessions under one HELM_CHAT_NAME share a row AND a cursor —
-    documented). Guarded by a lock anyway: joins are rare, losing a sibling
-    seat's row at join time is avoidable for one flock."""
+    """The one-time (join) roster write — keyed by seat. `session` is the
+    newest writer; every co-named session is ALSO kept in row["sessions"]
+    (newest last, capped) so seat_for_session resolves ALL of them and each
+    keeps its own delivery cursor (fan-out, never race-consume). Guarded by a
+    lock anyway: joins are rare, losing a sibling seat's row at join time is
+    avoidable for one flock."""
     chat._ensure_dir()
     with _flocked(roster_path() + ".lock"):
         r = roster()
         row = r.get(seat) or {}
         if session:
             row["session"] = str(session)
+            sess = [s for s in row.get("sessions") or [] if s != str(session)]
+            sess.append(str(session))
+            row["sessions"] = sess[-SESSIONS_KEPT:]
         if cwd:
             row["cwd"] = cwd
             row["project"] = os.path.basename(cwd.rstrip(os.sep)) or cwd
@@ -268,8 +282,9 @@ def write_roster(seat, session=None, cwd=None):
 def seat_for_session(session):
     if not session:
         return None
+    sid = str(session)
     for seat, row in roster().items():
-        if row.get("session") == str(session):
+        if row.get("session") == sid or sid in (row.get("sessions") or []):
             return seat
     return None
 
@@ -278,32 +293,54 @@ def seat_for_session(session):
 # the cursor (codex H5) + the tail scan both deliver and the report use
 # ---------------------------------------------------------------------------
 
-def cursor_path(room, seat):
-    return os.path.join(chat.chat_dir(),
-                        "%s.cursor.%s" % (pk.slug(room), _seat_key(seat)))
+def _sid8(session):
+    """The session's cursor-key token — filename-safe, 8 chars, None-safe."""
+    return pk.slug(str(session))[:8] if session else None
 
 
-def _cursor(room, seat):
-    d = pk.read_json(cursor_path(room, seat), None)
+def cursor_path(room, seat, session=None):
+    """PER (seat, session) when a session is known — co-named sessions each
+    keep their own cursor (fan-out; the @mention-loss fix). Sessionless
+    callers (bare CLI) ride the seat-level file."""
+    p = os.path.join(chat.chat_dir(),
+                     "%s.cursor.%s" % (pk.slug(room), _seat_key(seat)))
+    s8 = _sid8(session)
+    return "%s.%s" % (p, s8) if s8 else p
+
+
+def _cursor(room, seat, session=None):
+    d = pk.read_json(cursor_path(room, seat, session), None)
     if isinstance(d, dict) and isinstance(d.get("off"), int):
         return d
     return None
 
 
-def _write_cursor(room, seat, dev, ino, off, rid):
+def _write_cursor(room, seat, dev, ino, off, rid, session=None):
     chat._ensure_dir()
-    pk.write_json(cursor_path(room, seat),
+    pk.write_json(cursor_path(room, seat, session),
                   {"dev": dev, "ino": ino, "off": off, "rid": rid})
 
 
-def _init_cursor(room, seat):
+def _init_cursor(room, seat, session=None):
     """Baseline at the CURRENT end of room — at JOIN time (codex H5.5), so
-    everything posted after session start delivers at the first boundary."""
+    everything posted after session start delivers at the first boundary.
+    A fresh SESSION cursor inherits the seat-level baseline when one exists
+    (pre-split installs tracked the seat file; those rows must not be
+    skipped by an EOF re-baseline — loss is the one forbidden outcome).
+    -> True iff the baseline was inherited (already-tracked ground)."""
+    if session:
+        base = _cursor(room, seat)
+        if base:
+            _write_cursor(room, seat, base.get("dev"), base.get("ino"),
+                          base["off"], base.get("rid"), session=session)
+            return True
     try:
         st = os.stat(chat.room_path(room))
-        _write_cursor(room, seat, st.st_dev, st.st_ino, st.st_size, None)
+        _write_cursor(room, seat, st.st_dev, st.st_ino, st.st_size, None,
+                      session=session)
     except OSError:
-        _write_cursor(room, seat, None, None, 0, None)
+        _write_cursor(room, seat, None, None, 0, None, session=session)
+    return False
 
 
 def _tail(room, cur):
@@ -363,18 +400,26 @@ def deliver(session=None, room="main", seat=None, emit=None):
 
     At-least-once (codex H7): when `emit` is given it is called with the
     line BEFORE the cursor commits; emit must do its one unbuffered write.
-    A kill between emit and commit re-delivers next boundary."""
+    A kill between emit and commit re-delivers next boundary.
+
+    Fan-out: the cursor is per (seat, session) — every co-named session sees
+    the same @mention on its own boundary; consuming here never starves a
+    sibling session (at-most-once BETWEEN co-named sessions was the bug)."""
     if (home.env("CHAT_DELIVER") or "").lower() in ("0", "off", "no"):
         return None
     seat = seat or seat_for_session(session) or derive_seat(session)
     touch_seen(seat)
-    with _flocked(cursor_path(room, seat) + ".lock"):
-        cur = _cursor(room, seat)
+    with _flocked(cursor_path(room, seat, session) + ".lock"):
+        cur = _cursor(room, seat, session)
         if cur is None:
-            _init_cursor(room, seat)   # a pre-install session self-heals
+            inherited = _init_cursor(room, seat, session)  # pre-install self-heal
             if session and seat_for_session(session) is None:
                 write_roster(seat, session=session)
-            return None
+            if not inherited:
+                return None       # fresh EOF baseline: backlog never floods
+            cur = _cursor(room, seat, session)  # already-tracked ground —
+            if cur is None:                     # deliver from it THIS boundary
+                return None
         got = _tail(room, cur)
         if got is None:
             return None
@@ -387,7 +432,8 @@ def deliver(session=None, room="main", seat=None, emit=None):
                 break
             last_end, last_rid = end, (row or {}).get("id") or last_rid
         if hit is None:
-            _write_cursor(room, seat, dev, ino, last_end, last_rid)
+            _write_cursor(room, seat, dev, ino, last_end, last_rid,
+                          session=session)
             return None
         i, row, end = hit
         waiting = sum(1 for r, _e in entries[i + 1:]
@@ -398,7 +444,8 @@ def deliver(session=None, room="main", seat=None, emit=None):
             line += " (+%d waiting — helm chat read)" % waiting
         if emit is not None:
             emit(line)                  # output FIRST …
-        _write_cursor(room, seat, dev, ino, end, row.get("id"))  # … commit after
+        _write_cursor(room, seat, dev, ino, end, row.get("id"),
+                      session=session)  # … commit after
         return line
 
 
@@ -413,9 +460,15 @@ def join(session=None, cwd=None, seat=None, room="main"):
     only thing that can wake an idle PTY agent (native-wake-only-agent-armed),
     so a SessionStart directive is the strongest enforcement available.
     Idempotent per seat."""
-    seat = seat or seat_for_session(session) or derive_seat(session)
+    seat = seat or seat_for_session(session) or derive_seat(session, cwd)
     write_roster(seat, session=session, cwd=cwd)
-    if _cursor(room, seat) is None:
+    if _cursor(room, seat, session) is None:
+        with _flocked(cursor_path(room, seat, session) + ".lock"):
+            if _cursor(room, seat, session) is None:
+                _init_cursor(room, seat, session)
+    if session and _cursor(room, seat) is None:
+        # the seat-level baseline too: sessionless callers (bare CLI wait/
+        # deliver) must not start blind just because the join was hook-keyed
         with _flocked(cursor_path(room, seat) + ".lock"):
             if _cursor(room, seat) is None:
                 _init_cursor(room, seat)
@@ -433,7 +486,7 @@ def join(session=None, cwd=None, seat=None, room="main"):
 
 
 def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
-         emit=None, follow=False):
+         emit=None, follow=False, session=None):
     """Block until the next word arrives; returns the line or None on
     timeout. Seat mode IS a delivery (advances the cursor via deliver's
     at-least-once path); --any watches the room without touching cursors.
@@ -448,7 +501,10 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
     beacon; the loop just polls again."""
     poll = chat.POLL_S if poll is None else poll
     deadline = time.time() + timeout if timeout else None
-    seat = seat or derive_seat(None)
+    # the ambient session (CLI leg passes _env_session()) keys the SAME
+    # per-session cursor the boundary hook advances — one session, one
+    # cursor, whichever channel fires first; co-named siblings unaffected.
+    seat = seat or seat_for_session(session) or derive_seat(session)
     # single-shot keeps its contract: emit stays as passed (None ⇒ deliver
     # returns the line without emitting). --follow always needs a sink to stream
     # through, so it defaults to print.
@@ -466,7 +522,8 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
         else:
             while True:                     # drain all currently-matching rows
                 try:
-                    line = deliver(room=room, seat=seat, emit=stream)
+                    line = deliver(session=session, room=room, seat=seat,
+                                   emit=stream)
                 except Exception:
                     line = None             # fail-open: never crash the beacon
                 if not line:
@@ -494,18 +551,22 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
 # SCAN_CAP), no network.
 # ---------------------------------------------------------------------------
 
-def _stop_fp_path(room, seat):
-    """The once-per-fingerprint latch — in the room dir, per seat (RAM-side,
-    dies with the boot like the rest of the lane's state)."""
-    return os.path.join(chat.chat_dir(),
-                        "%s.stopfp.%s" % (pk.slug(room), _seat_key(seat)))
+def _stop_fp_path(room, seat, session=None):
+    """The once-per-fingerprint latch — in the room dir, per (seat, session)
+    like the cursor it gates (RAM-side, dies with the boot like the rest of
+    the lane's state)."""
+    p = os.path.join(chat.chat_dir(),
+                     "%s.stopfp.%s" % (pk.slug(room), _seat_key(seat)))
+    s8 = _sid8(session)
+    return "%s.%s" % (p, s8) if s8 else p
 
 
-def _pending_rows(room, seat):
-    """Deliverable rows past the seat's cursor WITHOUT consuming them —
-    roster_report's read pattern (the cursor never moves here; the stop-guard
-    is a gate, not a delivery)."""
-    cur = _cursor(room, seat)
+def _pending_rows(room, seat, session=None):
+    """Deliverable rows past the (seat, session) cursor WITHOUT consuming
+    them — roster_report's read pattern (the cursor never moves here; the
+    stop-guard is a gate, not a delivery). Falls back to the seat-level
+    cursor when the session has none yet (pre-install sessions)."""
+    cur = _cursor(room, seat, session) or _cursor(room, seat)
     got = _tail(room, cur) if cur else None
     if not got:
         return []
@@ -538,13 +599,13 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
     blocks, warns, pending = [], [], []
 
     if not _off("STOP_GUARD_INBOX"):
-        pending = _pending_rows(room, seat)
+        pending = _pending_rows(room, seat, session)
         if pending:
             import hashlib
             fp = hashlib.blake2b(
                 "|".join(str(r.get("id") or chat.rkey(r)) for r in pending)
                 .encode("utf-8"), digest_size=16).hexdigest()
-            fpp = _stop_fp_path(room, seat)
+            fpp = _stop_fp_path(room, seat, session)
             try:
                 with open(fpp) as f:
                     last = f.read().strip()
@@ -720,7 +781,9 @@ def roster_report(room="main"):
     Pending is computed from each seat's cursor WITHOUT moving it."""
     seats = []
     for seat, row in sorted(roster().items()):
-        cur = _cursor(room, seat)
+        # pending reads the row's newest session cursor (hook joins are
+        # session-keyed), falling back to the seat-level file (bare CLI).
+        cur = _cursor(room, seat, row.get("session")) or _cursor(room, seat)
         pending, preview = 0, None
         got = _tail(room, cur) if cur else None
         if got:
@@ -828,7 +891,7 @@ def cmd(verb, args, room="main"):
                     any_row="--any" in args,
                     timeout=float(timeout) if timeout else None,
                     emit=None if "--any" in args and not follow else print,
-                    follow=follow)
+                    follow=follow, session=_env_session())
         if follow:               # --follow streams via emit; returns on timeout
             return 0
         if line is None:
