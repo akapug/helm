@@ -111,6 +111,7 @@ VERBS = {
     "whoami": _lazy("whoami", "cmd_whoami"),
     "interview": _lazy("whoami", "cmd_interview"),
     "doctor": _lazy("doctor", "cmd_doctor"),
+    "watchdog": _lazy("watchdog", "cmd_watchdog"),
     "gc": _lazy("gc", "cmd_gc"),
     "skills": _lazy("skills", "cmd_skills"),
     "evolve": _lazy("evolve", "cmd_evolve"),
