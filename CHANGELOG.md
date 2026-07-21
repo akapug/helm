@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased (0.2)
+
+- `helm corpus` — backup/status for the training-corpus transcript archive:
+  every harness's transcripts copied append-only into dated archive dirs,
+  incremental by manifest, fail-open per file, fail-safe on space, with a
+  daily systemd timer in `scripts/`.
+- Attestation de-melded, native-first — the PRIMARY proof is a stdlib
+  blake2b append-only hash chain, verifiable offline; dregg becomes an
+  optional fail-open checkpoint, and `premise-check` reports the evidence
+  tiers separately and honestly (digest / native chain / external anchor).
+- Kimi proxy-key seat — API-key provider families join the seat roster
+  (`helm seat add kimi`, key baked into the seat's 0600 config, never read
+  from the environment again) behind the same proxy as the OAuth seats.
+- tokaware parity — creds crosscheck against a local-session second source,
+  shared-refresh-token-family hygiene in list/verify/doctor, `helm attribute`
+  (token-effort rollup) + `helm who` (pid→cred attribution, evidence-only),
+  hermetic providers.py test coverage, and a git-presence doctor row.
+- The A2A delivery lane — meld's agent-facing half collapsed onto the chat
+  room: deliver/join hooks reach a seat mid-autonomous-turn at tool
+  boundaries, TTL claims whose lease nonce is the capability, the seats
+  panel in the ledger tab, and `helm launch` (the metaharness seam).
+- Web UI Tuftian pass — one type scale, aligned nav stats, uniform
+  attention pills, collision-free chart legend, decluttered account table;
+  plus the ledger tab (the turn-ledger viewer ported in) and a proper
+  'home' landing tab.
+
 ## 0.1.0-alpha — 2026-07-19
 
 The founding release: the whole steering station, built and fleet-deployed in
