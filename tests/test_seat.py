@@ -423,6 +423,31 @@ class SeatTest(unittest.TestCase):
         self.assertIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=78", kline)
         self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", kline)
 
+    def test_seat_gets_host_skills(self):
+        """A seat's fresh config dir has no skills of its own, so seat agents
+        couldn't /learn — _write_launch_assets shares the minting host's skills
+        in via symlink (resolved from CLAUDE_CONFIG_DIR); a real skills dir on a
+        seat is never clobbered."""
+        host = os.path.join(self.tmp, "host-config")
+        os.makedirs(os.path.join(host, "skills", "learn"))
+        d = seat.seat_dir("codex")
+        os.makedirs(d, exist_ok=True)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
+            seat._write_launch_assets("codex", d)
+        link = os.path.join(d, "claude", "skills")
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.path.realpath(link),
+                         os.path.realpath(os.path.join(host, "skills")))
+        self.assertTrue(os.path.isdir(os.path.join(link, "learn")))  # resolves through
+        # a real skills dir on the seat is never replaced
+        os.unlink(link)
+        os.makedirs(link)
+        open(os.path.join(link, "own.md"), "w").close()
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
+            seat._write_launch_assets("codex", d)
+        self.assertFalse(os.path.islink(link))
+        self.assertTrue(os.path.exists(os.path.join(link, "own.md")))
+
     def test_launch_line_room_homing(self):
         """Team-room homing (slice 3): --room bakes HELM_CHAT_ROOM into the
         line + launch.sh; no --room exports nothing (un-homed = main, the

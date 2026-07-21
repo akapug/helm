@@ -406,6 +406,35 @@ def _seat_token(family, d):
     return token
 
 
+def _link_skills(cdir):
+    """A seat's config dir is a fresh CLAUDE_CONFIG_DIR, so CC discovers NO
+    skills there (it never reads the host's ~/.claude or the owner's home) —
+    without this a seat agent can't /learn, /premise, /afk, etc. Share the
+    minting host's skills into <cdir>/skills so a seat has the same skill verbs
+    as the owner. Symlink (not copy) so skill edits propagate live; only ever
+    replace a STALE symlink, never a real dir. Source = the minting process's
+    CLAUDE_CONFIG_DIR (the home whose skills we mirror), falling back to
+    ~/.claude. Best-effort: a link failure is loud (stderr) but never fatal —
+    the seat still mints, exactly like the delivery-hook install."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude")
+    src = os.path.join(base, "skills")
+    if not os.path.isdir(src):
+        return
+    link = os.path.join(cdir, "skills")
+    try:
+        if os.path.islink(link):
+            if os.path.realpath(link) == os.path.realpath(src):
+                return
+            os.unlink(link)
+        elif os.path.exists(link):
+            return           # a real skills dir already present — never clobber
+        os.symlink(src, link)
+    except OSError as e:
+        print("helm seat: skills not linked into %s (%s); a seat agent won't "
+              "see /learn until fixed" % (cdir, e), file=sys.stderr)
+
+
 def _write_launch_assets(family, d, room=None, seat=None):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
     identical for every mode, and refreshed by BOTH `add` and `launch` (a
@@ -421,6 +450,7 @@ def _write_launch_assets(family, d, room=None, seat=None):
     seat = seat or family
     cdir = os.path.join(d, "claude")
     os.makedirs(cdir, exist_ok=True)
+    _link_skills(cdir)   # seat agents get the host's /learn, /premise, /afk, …
     from . import hooks
     action, detail = hooks.install_home(cdir, specs=hooks.DELIVERY_SPECS)
     if action == "fail":
