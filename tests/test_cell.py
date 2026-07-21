@@ -21,7 +21,8 @@ TURN = "cd" * 32
 
 ENV_KEYS = ("HELM_HOME", "HELM_CELL_BIN", "MELD_CELL_BIN", "HELM_NODE_URL",
             "HELM_CELL_PROFILE", "HELM_NODE_TOKEN", "HELM_NODE_PASSPHRASE",
-            "HELM_ROSTER", "MELD_NODE_URL", "MELD_AGENT_PROFILE",
+            "HELM_ROSTER", "HELM_NODE_ANCHOR_FEE", "HELM_NODE_ANCHOR_TIMEOUT",
+            "MELD_NODE_URL", "MELD_AGENT_PROFILE",
             "MELD_NODE_TOKEN", "MELD_NODE_PASSPHRASE", "MELD_ROSTER")
 
 DEAD = "http://127.0.0.1:1"   # nothing listens — fail-open, fast
@@ -90,6 +91,34 @@ class AnchorSubmitTest(CellBase):
         self.assertIsNone(turn)
         self.assertIn("locked", err)
 
+    def test_non_dict_json_fails_open_never_raises(self):
+        # A2: a valid JSON list/string/number is NOT acceptance — guard with
+        # isinstance(dict) before .get(), fail open, never raise AttributeError.
+        for resp in ([1, 2, 3], "ok", 42, [{"turn_hash": TURN}]):
+            with mock.patch.object(cell, "post_json", return_value=resp):
+                turn, err = cell.anchor_submit("ab" * 32)
+            self.assertIsNone(turn, resp)
+            self.assertIn("non-object", err)
+
+    def test_anchor_stamps_supported_fee_env_overridable(self):
+        # B3: fee 0 never commits on dregg — stamp dregg's supported default
+        # (1000), env-overridable via HELM_NODE_ANCHOR_FEE.
+        seen = {}
+
+        def fake_post(url, payload, timeout=8, headers=None):
+            seen["fee"] = payload.get("fee")
+            return {"accepted": True, "turn_hash": TURN}
+
+        self.assertEqual(cell.DEFAULT_ANCHOR_FEE, 1000)
+        with mock.patch.object(cell, "post_json", fake_post):
+            cell.anchor_submit("ab" * 32)
+        self.assertEqual(seen["fee"], 1000)
+        self.assertNotEqual(seen["fee"], 0)
+        os.environ["HELM_NODE_ANCHOR_FEE"] = "2500"
+        with mock.patch.object(cell, "post_json", fake_post):
+            cell.anchor_submit("ab" * 32)
+        self.assertEqual(seen["fee"], 2500)
+
     def test_unreachable_is_failopen(self):
         # real fail-open against the dead port — no mock, must not raise
         turn, err = cell.anchor_submit("ab" * 32)
@@ -124,12 +153,15 @@ class AnchorSubmitTest(CellBase):
 
 
 class VerifyAnchorTest(CellBase):
-    def test_proof_present_is_confirmed(self):
+    def test_proof_present_is_turn_observed_not_payload_bound(self):
+        # A1: a present proof means the turn EXISTS, not that it commits this
+        # record's hash — the detail says so honestly.
         with mock.patch.object(cell, "get_json",
                                return_value={"turn_hash": TURN, "proof_len": 12}):
             ok, detail = cell.verify_anchor(TURN)
         self.assertTrue(ok)
-        self.assertIn("proof present", detail)
+        self.assertIn("turn present", detail)
+        self.assertIn("payload binding unavailable", detail)
 
     def test_receipt_present_is_confirmed(self):
         def by_endpoint(url, timeout=4):

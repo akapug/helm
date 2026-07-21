@@ -216,11 +216,11 @@ class AuthoredSafetyTest(GcBase):
     def test_premise_check_survives_a_gc_pass(self):
         # the card's declared risk test: gc must never break digest verification
         stmt = "gc reaps exhaust, never authored bytes"
-        rc, _, _ = run(premise.cmd_premise, ["gc-law", "|", stmt, "--no-attest"])
+        # a REAL attested entry (native record lands) — the risk test is that gc
+        # must never break the primary proof, so it must be a proof, not a
+        # payload-only stub (which is now honestly NOT ATTESTED).
+        rc, _, _ = run(premise.cmd_premise, ["gc-law", "|", stmt])
         self.assertEqual(rc, 0)
-        e = store._find("gc-law", types=("prior",))
-        premise._annotate(e["path"],
-                          [("attest_payload", premise.digest_payload(stmt))])
         self.plant(gc._cache("keepalive-log.jsonl"), "x" * BIG)
         self.plant(gc._state("inject-seen", "old.json"), days_old=OLD // gc.DAY)
         rc, out, _ = run(gc.cmd_gc, ["--apply"])

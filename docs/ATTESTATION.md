@@ -16,8 +16,11 @@ stays in: **helm attests entirely by itself, with stdlib only.** There is no
 meld binary, no bundled service, and no network dependency. Capture writes the
 premise to the typed store AND appends a native attestation record; both land
 offline. A dregg node, if one happens to be reachable, is an *optional external
-checkpoint* — never required, never on the critical path. Attestation is a
-first-class helm feature, not an upgrade you have to install.
+checkpoint* — never required, and never allowed to *prevent* capture: it is a
+**bounded best-effort on the capture path** (a small timeout, ~2s, overridable
+with `HELM_NODE_ANCHOR_TIMEOUT`); on any delay or failure the native record
+still stands and the anchor is queued. Attestation is a first-class helm
+feature, not an upgrade you have to install.
 
 ## Native-primary — and why it is honest
 
@@ -74,7 +77,18 @@ READ-ONLY as a migration fallback — the full table is in
 |---|---|---|
 | `HELM_NODE_URL` | OPTIONAL dregg node for the external anchor | `http://127.0.0.1:8899` |
 | `HELM_NODE_TOKEN` | OPTIONAL bearer for a gated node | — |
+| `HELM_NODE_ANCHOR_FEE` | computron fee budget the anchor turn stamps — dregg charges the `EmitEvent` a real cost and REFUSES a turn whose `fee` is below it (a `fee: 0` submit **never commits**), so this matches dregg's `DEFAULT_ANCHOR_FEE` | `1000` |
+| `HELM_NODE_ANCHOR_TIMEOUT` | bound (seconds) on the optional anchor POST on the capture path | `2` |
 | `HELM_CELL_PROFILE` | the recording label (provenance, not a signer) | `helm-test` for attestation |
+
+> **Honest note on the live anchor.** With `fee: 0` dregg's executor rejects the
+> anchor turn (`computron budget exceeded`), so helm now stamps dregg's supported
+> fee (`1000`). Whether a turn actually *commits* still depends on the node: the
+> submitting operator cell must hold enough computrons (funded once via the node's
+> faucet at devnet bring-up), and a node may reject an anonymous/advisory-agent
+> anchor outright. A live, funded-cell commit is **not proven in this
+> environment**; the fee fix removes the guaranteed-underfunded rejection, and the
+> native chain remains the primary proof regardless.
 
 ## Who "recorded" — the provenance label
 
@@ -112,14 +126,24 @@ and honestly*:
 | tier | meaning |
 |---|---|
 | `digest MATCH` / `MISMATCH` | the stored statement still hashes to the attested payload (payload binding) |
-| `native chain VERIFIED` / `BROKEN` | the record recomputes and links to its predecessor (the **primary** proof) |
-| `external anchor CONFIRMED` | a reachable node still shows the anchor turn |
+| `native chain VERIFIED` / `BROKEN` | the record recomputes, links to its predecessor, AND its **hashed fields bind to this exact premise** — premise id, canonical statement digest, operation, root/project, supersession link. A record that is internally valid but commits a *different* claim (a foreign premise's record, or the old record after the statement changed) reads `BROKEN`, never `VERIFIED` (the **primary** proof) |
+| `native chain NOT ATTESTED` | no native record exists (captured with `--no-attest`, or a legacy entry) — the primary proof is *absent*, distinct from present-but-broken |
+| `external anchor turn OBSERVED` | a reachable node still shows a turn with the stored hash **exists** — this does *not* prove that turn commits this record's hash (`attest_anchor_turn` is mutable frontmatter, swappable for any real turn), so it is turn-existence only, never independent re-verification, until dregg exposes payload disclosure |
 | `external anchor unverified` | node unreachable or the turn is not found — the native proof still stands |
 | `external anchor none (native-only)` | no external checkpoint was ever taken |
 
-Exit status follows the primary proof: 0 when the digest matches AND the
-native record verifies; 1 otherwise. The anchor is never allowed to fail the
-check — it is a bonus, not the basis.
+**Exit contract** (so automation can never mistake absence of the primary proof
+for success):
+
+- `0` — VERIFIED: the digest matches AND the native record recomputes AND binds
+  to this exact premise.
+- `1` — BROKEN: a record is present but the digest mismatches, the record is
+  tampered, or it commits a different/foreign claim.
+- `3` — NOT ATTESTED: the primary (native) proof is *absent* — `--no-attest` or a
+  legacy entry with no record hash. A deliberate informational state, on its own
+  non-success exit so it is never confused with a verified premise.
+
+The anchor is never allowed to fail the check — it is a bonus, not the basis.
 
 ## Queue and retry (the OPTIONAL anchor only)
 

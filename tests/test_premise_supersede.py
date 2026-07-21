@@ -250,7 +250,10 @@ class ChainCheckTest(SupBase):
         _e, err = store.mark_superseded("law-c", "law-d", pk.now_ts())
         self.assertIsNone(err)
         rc, out, _ = self.run_verb(premise.cmd_premise_check, ["--chain", "law-a"])
-        self.assertEqual(rc, 0)   # stated design state, not corruption
+        # Store-only hop is UNBACKED, not corrupt: the corrected B2 contract maps
+        # missing native proof to EXIT_NO_NATIVE_PROOF (3) — distinct from broken
+        # (1) and from a fully-attested chain (0). Not-attested must never read 0.
+        self.assertEqual(rc, premise.EXIT_NO_NATIVE_PROOF)
         self.assertIn("4 links", out)
         self.assertIn("link 3->4 UNBACKED", out)
 

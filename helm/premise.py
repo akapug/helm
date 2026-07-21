@@ -60,8 +60,13 @@ FRONTMATTER pointer (the entry's attest_* keys point back at the chain):
 GRACEFUL DEGRADE. The store write and the native record ALWAYS land — offline,
 with no node, with nothing configured. Only the OPTIONAL dregg anchor can be
 pending; a pending anchor is queued to attest-queue.jsonl and `--retry-queue`
-re-anchors it once a node appears. Capture never raises and never blocks on the
-network.
+re-anchors it once a node appears. Capture never raises and is never PREVENTED
+by the network: the OPTIONAL anchor is a bounded best-effort on the capture path
+(cell.DEFAULT_ANCHOR_TIMEOUT, ~2s; env HELM_NODE_ANCHOR_TIMEOUT) — on any delay
+or failure it queues and the native record still stands. If an in-place
+annotation ever refuses (a file-shape surprise), the native record is NOT
+orphaned: a durable reconciliation row is queued and `--retry-queue` re-annotates
+it (the record already stands in the chain).
 
 SUPERSESSION (DECISION clauses 5-6): `--supersede <old-id> <new-id> |
 <statement>` captures NEW, tombstones OLD through the store's own lifecycle
@@ -90,12 +95,23 @@ import re
 import sys
 import unicodedata
 
+try:
+    import fcntl                  # POSIX inter-process advisory lock (Linux fleet)
+except ImportError:               # pragma: no cover - non-POSIX; the fleet is Linux
+    fcntl = None
+
 from . import cell, home, pk, store
 
 DIGEST_TAG = "prem:b2b:"          # blake2b-256 (see module docstring)
 CHAIN_V = 2                       # native attestation-chain schema/evidence version
 DEFAULT_PROFILE = "helm-test"     # recording label default — never the user's cell
 RETRY_PAUSE_S = 2                 # pause between queued anchor-retry failures
+# premise-check exit contract: 0 = primary proof VERIFIED (digest matches AND the
+# native record recomputes AND binds to this premise); 1 = present but BROKEN
+# (mismatch/tamper/foreign record); EXIT_NO_NATIVE_PROOF = the primary proof is
+# ABSENT (never attested / --no-attest / legacy). Absence must NEVER look like
+# success to automation, but is distinct from a present-but-broken proof.
+EXIT_NO_NATIVE_PROOF = 3
 
 # The tamper-evident core of a native record (hashed; prev/rec_hash/chain_index
 # are structural, never part of the hashed body).
@@ -172,22 +188,54 @@ def _record_hash(core, prev):
                            digest_size=32).hexdigest()
 
 
+def _read_head(f):
+    """Re-read the chain from an open file handle (already positioned/locked) ->
+    (prev_rec_hash, count). A torn/unparseable line is skipped, never a wedge."""
+    f.seek(0)
+    n = 0
+    prev = ""
+    for line in f:
+        if not line.strip():
+            continue
+        try:
+            prev = json.loads(line).get("rec_hash", prev)
+        except ValueError:
+            continue
+        n += 1
+    return prev, n
+
+
 def _append_record(op, premise_id, digest, *, root, project, ts, source,
                    attest_by, supersedes, supersedes_record):
     """Append ONE record to the native chain, linked to the current head.
-    Returns the stored record dict. This never touches the network."""
-    recs = chain_records()
-    prev = recs[-1].get("rec_hash", "") if recs else ""
-    core = {"v": CHAIN_V, "op": op, "premise_id": str(premise_id),
-            "root": root or "", "project": project or "", "digest": digest,
-            "ts": ts, "source": source or "", "attest_by": attest_by or "",
-            "supersedes": supersedes or "", "supersedes_record": supersedes_record or ""}
-    rec = dict(core, prev=prev, rec_hash=_record_hash(core, prev),
-               chain_index=len(recs))
+    Returns the stored record dict. This never touches the network.
+
+    CONCURRENCY (B4): the read-head + construct + append is done under an
+    exclusive inter-process lock (fcntl.flock) held on the chain file itself, so
+    two agents capturing at once serialize and NEVER fork the chain (same prev +
+    index). 'a+' creates the file and, being O_APPEND, always writes at EOF
+    regardless of the read cursor; flush + fsync make the row durable before the
+    lock releases."""
     path = _chain_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    with open(path, "a+", encoding="utf-8") as f:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            prev, count = _read_head(f)
+            core = {"v": CHAIN_V, "op": op, "premise_id": str(premise_id),
+                    "root": root or "", "project": project or "", "digest": digest,
+                    "ts": ts, "source": source or "", "attest_by": attest_by or "",
+                    "supersedes": supersedes or "",
+                    "supersedes_record": supersedes_record or ""}
+            rec = dict(core, prev=prev, rec_hash=_record_hash(core, prev),
+                       chain_index=count)
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            if fcntl is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     return rec
 
 
@@ -206,7 +254,8 @@ def record_attestation(op, premise_id, digest, *, root, project="", ts=None,
            "ts": ts, "anchor_turn": "", "anchor_label": "", "anchor_reason": ""}
     if anchor:
         turn, err = cell.anchor_submit(
-            rec["rec_hash"], memo="helm-attest:v%d:%s" % (CHAIN_V, premise_id))
+            rec["rec_hash"], memo="helm-attest:v%d:%s" % (CHAIN_V, premise_id),
+            timeout=cell.anchor_timeout())   # bounded best-effort on the capture path
         if turn:
             out["anchor_turn"] = turn
             out["anchor_label"] = cell.anchor_label(turn)
@@ -232,9 +281,49 @@ def verify_chain():
     return True, "chain verified (%d record%s)" % (len(recs), "s"[:len(recs) != 1])
 
 
-def verify_record(rec_hash):
-    """Verify ONE record in place: recompute its hash + confirm its prev links
-    to the record before it. (ok, detail)."""
+def _record_by_hash(rec_hash):
+    """The native record with this rec_hash, or None. Read-only; no lock."""
+    if not rec_hash:
+        return None
+    for rec in chain_records():
+        if rec.get("rec_hash") == rec_hash:
+            return rec
+    return None
+
+
+def _norm_root(r):
+    """Normalize the provenance-root vocabulary so a bound comparison is honest
+    across the capture path (_root_label over an entry with no root key -> its
+    'global'/'project' label) and the load/backfill path (the physical root name
+    'helm-global'). The two name the SAME global root."""
+    r = r or "global"
+    return "global" if r in ("global", "helm-global") else r
+
+
+def _record_expect(e, project):
+    """The HASHED record fields a valid attest_record MUST commit for entry `e`.
+    A record that recomputes but commits a DIFFERENT claim (a foreign premise's
+    record, or the OLD record after the statement changed) does NOT prove THIS
+    premise and must read BROKEN. Binds premise_id, the canonical statement
+    digest, the operation, provenance root (normalized) + project, and the
+    supersession link."""
+    sup = _front(e, "attest_supersedes_record")
+    return {"premise_id": str(e["id"]),
+            "digest": digest_payload(e.get("statement") or ""),
+            "op": "supersede" if sup else "create",
+            "root": _root_label(e, project),
+            "project": project or "",
+            "supersedes_record": sup or ""}
+
+
+def verify_record(rec_hash, expect=None):
+    """Verify ONE record in place: recompute its hash, confirm its prev links to
+    the record before it, and — when `expect` is given (see _record_expect) —
+    confirm the record's HASHED fields BIND to the premise being checked. A
+    record that recomputes but commits a different premise_id/digest/op/root/
+    project/supersession link is BROKEN, not VERIFIED: an internally-valid
+    record belonging to ANOTHER claim, or the OLD record after the statement
+    changed, is NOT this premise's proof. (ok, detail)."""
     recs = chain_records()
     for i, rec in enumerate(recs):
         if rec.get("rec_hash") != rec_hash:
@@ -245,6 +334,14 @@ def verify_record(rec_hash):
         core = {k: rec.get(k, "") for k in _CORE_KEYS}
         if _record_hash(core, prev) != rec_hash:
             return False, "record does not recompute (tampered) at index %d" % i
+        for k, want in (expect or {}).items():
+            got = rec.get(k, "")
+            if k == "root":
+                got, want = _norm_root(got), _norm_root(want)
+            if str(got) != str(want):
+                return False, ("record commits %s=%r, not the checked premise's "
+                               "%r — a foreign or stale record, not this proof"
+                               % (k, rec.get(k, ""), want))
         return True, ("record %s at index %d links to %s"
                       % (rec_hash[:12], i, ((prev[:12] + "…") if prev else "genesis")))
     return False, "no native record %s in the chain" % (rec_hash or "")[:12]
@@ -285,8 +382,18 @@ def verify_link(old_e, new_e):
     if link != prior:
         return "broken", "supersedes_record %s != prior record %s" \
             % (link[:12], prior[:12])
+    # BIND the pointer to the ledger: NEW's own native record must actually
+    # commit this supersedes_record (mutable frontmatter alone is forgeable). A
+    # record that resolves in the chain but hashes a DIFFERENT link is broken; a
+    # record that does not resolve falls back to the frontmatter (legacy).
+    new_rec = _front(new_e, "attest_record")
+    rec = _record_by_hash(new_rec)
+    if rec is not None and str(rec.get("supersedes_record", "")) != str(link):
+        return "broken", "'%s' native record commits supersedes_record %s, not %s" \
+            % (new_e["id"], (str(rec.get("supersedes_record", "")) or "«none»")[:12],
+               link[:12])
     return "attested", "native record linkage verified (%s -> %s)" \
-        % (prior[:12], (_front(new_e, "attest_record") or "?")[:12])
+        % (prior[:12], (new_rec or "?")[:12])
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +471,26 @@ def _attest_fields(digest, ts, profile, info, supersedes_record=""):
         fields.append(("attest_anchor", info["anchor_label"]))
         fields.append(("attest_anchor_turn", info["anchor_turn"]))
     return fields
+
+
+def _reconcile_enqueue(pid, project, fields):
+    """Durably remember an attestation whose in-place annotation FAILED (a file-
+    shape surprise), so the native record is NEVER orphaned: the record already
+    stands in the chain, and a later `--retry-queue` re-annotates the entry from
+    this row. fields = the ordered attest_* (key, value) pairs."""
+    _enqueue({"ts": pk.now_ts(), "id": str(pid), "project": project,
+              "kind": "annotate",
+              "fields": [[k, str(v)] for k, v in fields],
+              "reason": "annotation failed (file shape) — native record stands"})
+
+
+def _annotate_or_reconcile(path, fields, pid, project):
+    """Annotate the entry in place; on a shape refusal, queue a durable
+    reconciliation row so the native record is not orphaned. -> annotated bool."""
+    if _annotate(path, fields):
+        return True
+    _reconcile_enqueue(pid, project, fields)
+    return False
 
 
 def _report_anchor(info, pid, project, ts, rec_hash=None):
@@ -511,10 +638,15 @@ def cmd_premise(args):
     profile = attest_profile()
     info = record_attestation("create", pid, digest, root=_root_label(e, project),
                               project=project, ts=ts, attest_by=profile)
-    _annotate(path, _attest_fields(digest, ts, profile, info))
+    annotated = _annotate_or_reconcile(path, _attest_fields(digest, ts, profile, info),
+                                       pid, project)
     print("  attested (native): record %s at chain_index %s — recorded by '%s'"
           % (info["rec_hash"][:16], info["chain_index"], profile))
     print("  payload: " + digest)
+    if not annotated:
+        print("  WARNING: file shape refused the attest_* annotation — the native "
+              "record %s STANDS in the chain; queued for reconciliation "
+              "(helm premise --retry-queue)" % info["rec_hash"][:16])
     _report_anchor(info, pid, project, ts)
     return 0
 
@@ -560,11 +692,16 @@ def _supersede(old_id, parts, project):
                               root=_root_label(_e, project), project=project,
                               ts=ts, attest_by=profile, supersedes=str(old["id"]),
                               supersedes_record=old_record)
-    _annotate(path, _attest_fields(digest, ts, profile, info,
-                                   supersedes_record=old_record))
+    annotated = _annotate_or_reconcile(
+        path, _attest_fields(digest, ts, profile, info,
+                             supersedes_record=old_record), parts[0], project)
     print("  attested (native): record %s at chain_index %s — recorded by '%s'"
           % (info["rec_hash"][:16], info["chain_index"], profile))
     print("  payload: " + digest)
+    if not annotated:
+        print("  WARNING: file shape refused the attest_* annotation — the native "
+              "record %s STANDS in the chain; queued for reconciliation "
+              "(helm premise --retry-queue)" % info["rec_hash"][:16])
     _report_anchor(info, parts[0], project, ts)
     if old_record:
         print("  chain: -> prior record %s (attest_supersedes_record)"
@@ -572,18 +709,61 @@ def _supersede(old_id, parts, project):
     return 0
 
 
+def _replay_annotate(rec, e):
+    """A 'annotate' reconciliation row: the native record already stands but its
+    in-place attest_* annotation once failed. Re-attempt it. -> ('done'|'skip'|
+    'keep'). Never re-anchors, never touches the native chain."""
+    if _front(e, "attest_record"):
+        return "skip"    # already reconciled out of band
+    fields = [(k, v) for k, v in (rec.get("fields") or [])]
+    if fields and _annotate(e["path"], fields):
+        print("helm premise: reconciled '%s' — attest_* annotation landed"
+              % rec.get("id"))
+        return "done"
+    rec["reason"] = "annotation still failing — file shape refuses it"
+    return "keep"
+
+
+def _replay_anchor(rec, e):
+    """An 'anchor' reconciliation row. If a prior pass already anchored (turn
+    stored on the row) only the annotation is left — re-annotate, never re-anchor.
+    Otherwise submit the anchor; on a SUCCESSFUL anchor whose annotation refuses,
+    keep the row WITH the turn so the anchor is never lost and never re-sent.
+    -> ('done'|'skip'|'keep')."""
+    if _front(e, "attest_anchor_turn"):
+        return "skip"
+    turn = rec.get("anchor_turn")
+    if not turn:
+        rh = rec.get("rec_hash") or _front(e, "attest_record")
+        turn, err = cell.anchor_submit(rh, memo="helm-attest:v%d:%s"
+                                       % (CHAIN_V, rec.get("id")))
+        if err:
+            rec["reason"] = err
+            return "keep"
+    if _annotate(e["path"], [("attest_anchor", cell.anchor_label(turn)),
+                             ("attest_anchor_turn", turn)]):
+        print("helm premise: anchored '%s' — turn %s" % (rec.get("id"), turn[:16]))
+        return "done"
+    # Anchor LANDED but annotation refused: never drop a successful anchor —
+    # retain the turn on the row for a lock-free re-annotation next pass.
+    rec["anchor_turn"] = turn
+    rec["reason"] = "anchored — annotation deferred (file shape refuses it)"
+    return "keep"
+
+
 def _retry_queue():
-    """Re-attempt the OPTIONAL dregg anchors queued while no node was reachable.
-    The native records already stand; this only tries to add the external
-    checkpoint. Success annotates attest_anchor* and drops the row; failures
-    (and rows whose entry vanished) are kept."""
+    """Drain the reconciliation queue. Two kinds ride it, both fail-open and both
+    off the capture path: 'anchor' rows re-attempt the OPTIONAL dregg checkpoint;
+    'annotate' rows re-attempt an in-place attest_* annotation that once refused
+    (the native record already stands). A successful anchor is NEVER dropped on an
+    annotation failure; rows whose entry vanished, or that still refuse, are kept."""
     qp = _queue_path()
     rows = _read_queue(qp)
     if not rows:
         print("helm premise: attest queue empty.")
         return 0
     kept = []
-    done = dropped = 0
+    done = dropped = reconciled = 0
     for rec in rows:
         e = store._find(rec.get("id", ""), types=("prior",),
                         project=rec.get("project"))
@@ -591,23 +771,27 @@ def _retry_queue():
             rec["reason"] = "entry no longer in the store"
             kept.append(rec)
             continue
-        if _front(e, "attest_anchor_turn"):
+        if rec.get("kind") == "annotate":
+            outcome = _replay_annotate(rec, e)
+            if outcome == "done":
+                reconciled += 1
+            elif outcome == "skip":
+                dropped += 1
+            else:
+                kept.append(rec)
+            continue
+        outcome = _replay_anchor(rec, e)
+        if outcome == "done":
+            done += 1
+        elif outcome == "skip":
             dropped += 1
-            continue
-        rh = rec.get("rec_hash") or _front(e, "attest_record")
-        turn, err = cell.anchor_submit(rh, memo="helm-attest:v%d:%s"
-                                       % (CHAIN_V, rec.get("id")))
-        if err:
-            rec["reason"] = err
+        else:
             kept.append(rec)
-            continue
-        _annotate(e["path"], [("attest_anchor", cell.anchor_label(turn)),
-                              ("attest_anchor_turn", turn)])
-        print("helm premise: anchored '%s' — turn %s" % (rec["id"], turn[:16]))
-        done += 1
     _rewrite_queue(qp, len(rows), kept)
     tail = (", %d already-anchored row%s dropped" % (dropped, "s"[:dropped != 1])) \
         if dropped else ""
+    if reconciled:
+        tail += ", %d annotation%s reconciled" % (reconciled, "s"[:reconciled != 1])
     print("helm premise: anchor replay — %d anchored, %d still pending%s."
           % (done, len(kept), tail))
     return 0 if not kept else 1
@@ -629,8 +813,9 @@ def attest_existing(e, profile=None, project=None, anchor=True):
     info = record_attestation("create", str(e["id"]), digest,
                               root=e.get("root") or "global", project=project,
                               ts=pk.now_ts(), attest_by=profile, anchor=anchor)
-    info["annotated"] = _annotate(e["path"], _attest_fields(
-        digest, info["ts"], profile, info))
+    info["annotated"] = _annotate_or_reconcile(
+        e["path"], _attest_fields(digest, info["ts"], profile, info),
+        str(e["id"]), project)
     return info, None
 
 
@@ -702,7 +887,8 @@ def _prune_queue():
     qp = _queue_path()
     rows = _read_queue(qp)
     kept = [r for r in rows
-            if not _front(store._find(r.get("id", ""), types=("prior",),
+            if r.get("kind") == "annotate"     # reconciliation rows never prune here
+            or not _front(store._find(r.get("id", ""), types=("prior",),
                                       project=r.get("project")) or {},
                           "attest_anchor_turn")]
     if len(kept) != len(rows):
@@ -767,13 +953,17 @@ _CHECK_DEFAULTS = {"attest_payload": "", "attest_ts": "", "attest_by": "",
 
 
 def _anchor_line(meta):
-    """The honest external-anchor status line for one entry."""
+    """The honest external-anchor status line for one entry. A reachable node can
+    only show that a turn with the stored hash EXISTS ('turn OBSERVED') — it does
+    NOT prove that turn commits this record's hash (attest_anchor_turn is mutable
+    frontmatter, swappable for any real turn). So this is never 'CONFIRMED'/
+    independent re-verification until dregg exposes payload disclosure (A1)."""
     aturn = meta.get("attest_anchor_turn")
     if not aturn:
         return "  external anchor: none (native-only)"
     observed, detail = cell.verify_anchor(aturn)
     return "  external anchor: %s — %s" % (
-        "CONFIRMED" if observed else "unverified", detail)
+        "turn OBSERVED" if observed else "unverified", detail)
 
 
 def _chain(pid, project):
@@ -801,13 +991,15 @@ def _chain(pid, project):
             cur = nxt
     print("helm premise-check --chain: %d link%s through '%s', origin first"
           % (len(chain), "s"[:len(chain) != 1], pid))
-    ok = True
+    ok = True        # cleared on any BROKEN digest / record / link
+    absent = False   # set when an entry's PRIMARY native proof is missing
     for i, c in enumerate(chain):
         print("  %d. %s [%s] - %s"
               % (i + 1, c["id"], c["status"], c.get("statement") or ""))
         payload = _front(c, "attest_payload")
         if not payload:
             print("       unattested (no payload recorded)")
+            absent = True
         else:
             match = payload_digest(payload) == \
                 payload_digest(digest_payload(c.get("statement") or ""))
@@ -815,10 +1007,14 @@ def _chain(pid, project):
             print("       digest %s %s" % ("MATCH" if match else "MISMATCH", payload))
             rec = _front(c, "attest_record")
             if rec:
-                rok, detail = verify_record(rec)
+                rok, detail = verify_record(rec, _record_expect(c, project))
                 ok = ok and rok
                 print("       native chain %s — %s"
                       % ("VERIFIED" if rok else "BROKEN", detail))
+            else:
+                print("       native chain: NOT ATTESTED — no native record "
+                      "(legacy/--no-attest); a digest match alone is not proof")
+                absent = True
         if i:
             state, why = verify_link(chain[i - 1], c)
             ok = ok and state != "broken"
@@ -838,7 +1034,9 @@ def _chain(pid, project):
     print("  note: the native hash chain is the primary proof; a dregg anchor, "
           "when present, is an external checkpoint (node-anchored, not "
           "cell-signed)")
-    return 0 if ok else 1
+    # Match the plain-path exit contract: BROKEN (1) beats missing-primary-proof
+    # (EXIT_NO_NATIVE_PROOF) beats verified (0). Absence never reads as success.
+    return 1 if not ok else (EXIT_NO_NATIVE_PROOF if absent else 0)
 
 
 def cmd_premise_check(args):
@@ -862,32 +1060,42 @@ def cmd_premise_check(args):
     print("helm premise-check: " + str(e["id"]))
     print("  statement: " + (e.get("statement") or ""))
     meta = pk.parse_simple_frontmatter(e["path"], _CHECK_DEFAULTS) or {}
-    if not meta.get("attest_payload") and not meta.get("attest_record"):
-        print("  no attestation recorded — captured with --no-attest (a pending "
-              "anchor row may sit in " + _queue_path() + ")")
-        return 0
+    rec = meta.get("attest_record")
+    if not meta.get("attest_payload") and not rec:
+        # The PRIMARY proof is absent (never attested / --no-attest). This is a
+        # deliberate informational state — but it MUST NOT read as success to
+        # automation, so it exits on its own contract (EXIT_NO_NATIVE_PROOF),
+        # distinct from a present-but-broken proof (1).
+        print("  native chain: NOT ATTESTED — no native record (captured with "
+              "--no-attest; a pending anchor row may sit in " + _queue_path() + ")")
+        print("  status: NOT ATTESTED (no primary proof to verify)")
+        return EXIT_NO_NATIVE_PROOF
     recomputed = digest_payload(e.get("statement") or "")
-    match = payload_digest(meta["attest_payload"]) == payload_digest(recomputed)
+    match = payload_digest(meta.get("attest_payload") or "") == payload_digest(recomputed)
     if match:
         print("  digest: MATCH " + meta["attest_payload"])
     else:
         print("  digest: MISMATCH — the stored statement no longer hashes to "
               "the attested payload")
-        print("    attested:   " + meta["attest_payload"])
+        print("    attested:   " + (meta.get("attest_payload") or "«none»"))
         print("    recomputed: " + recomputed)
     print("  recorded by '%s' at %s (provenance label, not a cell signer)"
           % (meta.get("attest_by") or "?", meta.get("attest_ts") or "?"))
-    rec = meta.get("attest_record")
-    if rec:
-        rok, detail = verify_record(rec)
-        match = match and rok
-        print("  native chain: %s — %s"
-              % ("VERIFIED" if rok else "BROKEN", detail))
-    else:
-        print("  native chain: no record hash recorded (legacy or --no-attest)")
+    if not rec:
+        # A payload is recorded but the native record hash is not — the primary
+        # proof is absent, so a digest match ALONE is not verification. Absence
+        # of the primary proof never exits success.
+        print("  native chain: NOT ATTESTED — no native record hash recorded "
+              "(legacy or --no-attest); a digest match alone is not verification")
+        print(_anchor_line(meta))
+        return EXIT_NO_NATIVE_PROOF
+    # BIND the native record to THIS premise: a record that recomputes but
+    # commits a different premise_id/digest/op/root/project/link is BROKEN.
+    rok, detail = verify_record(rec, _record_expect(e, project))
+    print("  native chain: %s — %s" % ("VERIFIED" if rok else "BROKEN", detail))
     print(_anchor_line(meta))
     if meta.get("attest_supersedes_record"):
         print("  chain: supersedes prior record %s — walk it: helm "
               "premise-check --chain %s"
               % (meta["attest_supersedes_record"][:16], pid))
-    return 0 if match else 1
+    return 0 if (match and rok) else 1

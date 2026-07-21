@@ -30,10 +30,38 @@ import sys
 from . import home
 
 DEFAULT_NODE_URL = "http://127.0.0.1:8899"
+# dregg REFUSES a turn whose fee budget is below the anchor's real computron cost
+# (its EmitEvent costs ~100; dregg's DEFAULT_ANCHOR_FEE is 1000) — a `fee: 0`
+# submit NEVER commits (see dregg node-target/src/lib.rs). Match it, env-overridable.
+DEFAULT_ANCHOR_FEE = 1000
+# The OPTIONAL anchor rides the capture path best-effort: keep the bound SMALL so
+# a slow/hung node never noticeably delays capture (the native record is the proof).
+DEFAULT_ANCHOR_TIMEOUT = 2
 
 
 def node_url():
     return (home.env("NODE_URL") or DEFAULT_NODE_URL).rstrip("/")
+
+
+def anchor_fee():
+    """The per-anchor computron fee budget the submit stamps. dregg charges the
+    EmitEvent a real cost and rejects an underfunded turn, so this is >= dregg's
+    DEFAULT_ANCHOR_FEE. Override with HELM_NODE_ANCHOR_FEE (legacy MELD_*)."""
+    v = home.env("NODE_ANCHOR_FEE")
+    try:
+        return int(v) if v not in (None, "") else DEFAULT_ANCHOR_FEE
+    except (TypeError, ValueError):
+        return DEFAULT_ANCHOR_FEE
+
+
+def anchor_timeout():
+    """The bounded best-effort anchor timeout on the capture path (small by
+    design). Override with HELM_NODE_ANCHOR_TIMEOUT (legacy MELD_*)."""
+    v = home.env("NODE_ANCHOR_TIMEOUT")
+    try:
+        return int(v) if v not in (None, "") else DEFAULT_ANCHOR_TIMEOUT
+    except (TypeError, ValueError):
+        return DEFAULT_ANCHOR_TIMEOUT
 
 
 def profile_name(default="helm-agent"):
@@ -113,7 +141,7 @@ def anchor_submit(rec_hash, memo=None, timeout=8):
         c in "0123456789abcdef" for c in word) else []
     body = {
         "agent": "00" * 32,          # advisory only — the node signs as itself
-        "nonce": 0, "fee": 0,
+        "nonce": 0, "fee": anchor_fee(),   # fee:0 NEVER commits on dregg
         "memo": memo or ("helm-attest:" + (rec_hash or "")),
         "actions": [{
             "method": "attest",
@@ -129,6 +157,8 @@ def anchor_submit(rec_hash, memo=None, timeout=8):
                      headers=headers)
     if resp is None:
         return None, "node unreachable/locked at " + node_url()
+    if not isinstance(resp, dict):   # a valid JSON list/string is NOT acceptance
+        return None, "node returned a non-object anchor response — fail open"
     if resp.get("accepted") and resp.get("turn_hash"):
         return resp["turn_hash"], None
     return None, "node did not accept the anchor: %s" \
@@ -142,18 +172,26 @@ def anchor_label(turn_hash):
 
 
 def verify_anchor(turn_hash, timeout=4):
-    """Best-effort read-back: does the dregg node still show this anchor turn?
-    (observed, detail). Tries /api/turn/<hash>/proof then the starbridge
-    receipt filter. Reports only what the node shows — never a signer identity
-    helm cannot prove."""
+    """Best-effort read-back: does the dregg node still show a turn with this
+    hash? (observed, detail). Tries /api/turn/<hash>/proof then the starbridge
+    receipt filter.
+
+    HONEST SCOPE (helm A1): this only OBSERVES that a turn with the stored hash
+    EXISTS on the node — it does NOT prove that turn's EmitEvent carries the
+    entry's native record hash. attest_anchor_turn is mutable frontmatter and is
+    not part of the native record, so an unrelated real turn could be substituted
+    and still 'observe' here. Until dregg exposes payload disclosure helm can
+    consume, this is 'turn observed', NEVER independent re-verification of the
+    external commitment. Reports only what the node shows — never a signer
+    identity helm cannot prove."""
     url = node_url()
     proof = get_json("%s/api/turn/%s/proof" % (url, turn_hash), timeout=timeout)
     if isinstance(proof, dict) and proof.get("turn_hash"):
-        return True, "proof present on " + url
+        return True, "turn present on %s (payload binding unavailable)" % url
     rec = get_json("%s/api/starbridge/receipts?turn_hash=%s" % (url, turn_hash),
                    timeout=timeout)
     if isinstance(rec, list) and rec:
-        return True, "receipt present on " + url
+        return True, "receipt present on %s (payload binding unavailable)" % url
     if proof is None and rec is None:
         return False, "node unreachable at " + url
     return False, "turn not found on " + url

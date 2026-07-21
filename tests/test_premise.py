@@ -221,10 +221,13 @@ class CheckTest(PremiseBase):
         with mock.patch.object(cell, "anchor_submit", return_value=(TURN, None)):
             self.capture()
         with mock.patch.object(cell, "verify_anchor",
-                               return_value=(True, "proof present on node")):
+                               return_value=(True, "turn present on node "
+                                             "(payload binding unavailable)")):
             rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-x"])
         self.assertEqual(rc, 0)
-        self.assertIn("external anchor: CONFIRMED", out)
+        # A1: turn OBSERVED, never CONFIRMED — existence, not payload binding
+        self.assertIn("external anchor: turn OBSERVED", out)
+        self.assertNotIn("CONFIRMED", out)
 
     def test_anchor_unverified_when_node_absent(self):
         with mock.patch.object(cell, "anchor_submit", return_value=(TURN, None)):
@@ -262,11 +265,14 @@ class CheckTest(PremiseBase):
         self.assertEqual(rc, 1)
         self.assertIn("native chain: BROKEN", out)
 
-    def test_no_attestation_recorded_is_plain(self):
+    def test_no_attestation_recorded_is_nonzero_and_distinct(self):
+        # B2: absence of the primary proof MUST NOT read as success. It exits on
+        # its own contract (EXIT_NO_NATIVE_PROOF), distinct from broken (1).
         self.run_verb(premise.cmd_premise, ["law-x | The X truth", "--no-attest"])
         rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-x"])
-        self.assertEqual(rc, 0)
-        self.assertIn("no attestation recorded", out)
+        self.assertEqual(rc, premise.EXIT_NO_NATIVE_PROOF)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("NOT ATTESTED", out)
 
     def test_unknown_id(self):
         rc, _, err = self.run_verb(premise.cmd_premise_check, ["ghost"])
@@ -274,6 +280,136 @@ class CheckTest(PremiseBase):
         self.assertIn("not found", err)
         rc, _, _ = self.run_verb(premise.cmd_premise_check, [])
         self.assertEqual(rc, 2)
+
+
+class BindingTest(PremiseBase):
+    """B1 — the native record must BIND to the exact premise. A record that is
+    internally valid but commits a DIFFERENT claim (a foreign premise's record,
+    or the OLD record after the statement changed) is BROKEN, never VERIFIED,
+    and premise-check exits non-zero — even when the mutable frontmatter
+    (attest_payload) was ALSO tampered to match the new statement."""
+
+    def two(self):
+        self.run_verb(premise.cmd_premise, ["law-x | The X truth"])
+        self.run_verb(premise.cmd_premise, ["law-y | The Y truth"])
+
+    def meta(self, pid):
+        return pk.parse_simple_frontmatter(
+            self.entry_path(pid),
+            {"attest_payload": "", "attest_record": ""}) or {}
+
+    def test_foreign_record_verifies_broken_and_check_nonzero(self):
+        self.two()
+        y_rec = self.meta("law-y")["attest_record"]
+        mx = self.meta("law-x")
+        self.assertTrue(y_rec and mx["attest_record"] and y_rec != mx["attest_record"])
+        evil = "evil injected truth"
+        raw = self.entry_raw("law-x")
+        raw = raw.replace("The X truth", evil)                       # statement
+        raw = raw.replace(mx["attest_payload"], premise.digest_payload(evil))  # payload
+        raw = raw.replace("attest_record: " + mx["attest_record"],
+                          "attest_record: " + y_rec)                 # foreign record
+        pk.atomic_write(self.entry_path("law-x"), raw)
+        rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-x"])
+        self.assertEqual(rc, 1)                     # present-but-broken, not absent
+        self.assertIn("digest: MATCH", out)         # the frontmatter forgery "worked"
+        self.assertIn("native chain: BROKEN", out)  # the record binding catches it
+
+    def test_stale_old_record_after_statement_change_broken(self):
+        self.run_verb(premise.cmd_premise, ["law-x | The X truth"])
+        m = self.meta("law-x")
+        evil = "evil injected truth"
+        raw = self.entry_raw("law-x")
+        raw = raw.replace("The X truth", evil)
+        raw = raw.replace(m["attest_payload"], premise.digest_payload(evil))
+        # attest_record UNCHANGED — the OLD record still commits the old digest
+        pk.atomic_write(self.entry_path("law-x"), raw)
+        rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-x"])
+        self.assertEqual(rc, 1)
+        self.assertIn("digest: MATCH", out)
+        self.assertIn("native chain: BROKEN", out)
+
+    def test_verify_record_binding_rejects_foreign_accepts_own(self):
+        self.two()
+        ex = store._find("law-x")
+        ok, detail = premise.verify_record(self.meta("law-y")["attest_record"],
+                                           premise._record_expect(ex, None))
+        self.assertFalse(ok)
+        self.assertIn("foreign or stale", detail)
+        ok2, _ = premise.verify_record(self.meta("law-x")["attest_record"],
+                                       premise._record_expect(ex, None))
+        self.assertTrue(ok2)
+
+    def test_payload_without_native_record_is_not_success(self):
+        # B2: a matching payload but NO native record hash is not verification —
+        # absence of the primary proof exits non-zero (distinct: NOT ATTESTED).
+        self.run_verb(premise.cmd_premise, ["law-x | The X truth", "--no-attest"])
+        e = store._find("law-x")
+        premise._annotate(e["path"],
+                          [("attest_payload", premise.digest_payload("The X truth"))])
+        rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-x"])
+        self.assertEqual(rc, premise.EXIT_NO_NATIVE_PROOF)
+        self.assertIn("digest: MATCH", out)   # the payload matches the statement...
+        self.assertIn("NOT ATTESTED", out)    # ...but there is no primary proof
+
+
+class AnnotationDurabilityTest(PremiseBase):
+    """B5 — a failed in-place annotation must NEVER orphan the native record: a
+    durable reconciliation row is queued and --retry-queue re-annotates it."""
+
+    def test_capture_annotation_failure_queues_reconciliation(self):
+        # force _annotate to refuse (as a shape surprise would)
+        with mock.patch.object(premise, "_annotate", return_value=False):
+            rc, out, _ = self.run_verb(premise.cmd_premise, ["law-x | The X truth"])
+        self.assertEqual(rc, 0)
+        self.assertIn("WARNING: file shape refused", out)
+        self.assertEqual(len(premise.chain_records()), 1)     # record STANDS
+        rows = [r for r in _queue(premise) if r.get("kind") == "annotate"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "law-x")
+        # the native record is orphaned RIGHT NOW (no pointer) — check reflects it
+        rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-x"])
+        self.assertEqual(rc, premise.EXIT_NO_NATIVE_PROOF)
+        # --retry-queue reconciles the annotation (record already stands)
+        rc, out, _ = self.run_verb(premise.cmd_premise, ["--retry-queue"])
+        self.assertIn("reconciled 'law-x'", out)
+        self.assertIn("attest_record: ", self.entry_raw("law-x"))
+        rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-x"])
+        self.assertEqual(rc, 0)
+        self.assertIn("native chain: VERIFIED", out)
+
+    def test_replay_never_drops_a_landed_anchor_on_annotation_failure(self):
+        self.run_verb(premise.cmd_premise, ["law-x | The X truth"])   # queues anchor
+        # anchor lands on replay, but annotation refuses -> the row is KEPT with
+        # the turn (never dropped, never re-anchored), then reconciled next pass.
+        calls = {"n": 0}
+
+        def anchor_once(rec_hash, memo=None, timeout=8):
+            calls["n"] += 1
+            return TURN, None
+
+        with mock.patch.object(cell, "anchor_submit", anchor_once), \
+                mock.patch.object(premise, "_annotate", return_value=False):
+            rc, out, _ = self.run_verb(premise.cmd_premise, ["--retry-queue"])
+        self.assertEqual(rc, 1)   # still pending (annotation deferred)
+        row = [r for r in _queue(premise) if r.get("id") == "law-x"][0]
+        self.assertEqual(row["anchor_turn"], TURN)   # the landed turn is retained
+        # second pass: annotation now works, no RE-anchor (turn reused)
+        with mock.patch.object(cell, "anchor_submit",
+                               side_effect=AssertionError("must not re-anchor")):
+            rc, out, _ = self.run_verb(premise.cmd_premise, ["--retry-queue"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls["n"], 1)   # anchored exactly once, ever
+        self.assertIn("attest_anchor_turn: " + TURN, self.entry_raw("law-x"))
+
+
+def _queue(premise_mod):
+    import json as _json
+    try:
+        with open(premise_mod._queue_path()) as f:
+            return [_json.loads(l) for l in f if l.strip()]
+    except OSError:
+        return []
 
 
 if __name__ == "__main__":
