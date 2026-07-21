@@ -57,6 +57,16 @@ overrides are in effect.
 | `HELM_CHAT_OWNER_NAMES` | `david` + the unix login (csv override) | the delivery lane (`helm chat deliver`) — senders whose posts reach every seat at tool boundaries WITHOUT an @mention (the owner steers mid-flight) | — |
 | `HELM_CHAT_DELIVER` | on (`0`/`off`/`no` disables) | the delivery lane's kill switch — the PostToolUse nudge goes silent fleet-wide; the room, roster and inject lanes are untouched | — |
 
+## local multiplayer
+
+| variable | default | read by | legacy fallback |
+|---|---|---|---|
+| `HELM_MULTIPLAYER_DIR` | `/dev/shm/helm-multiplayer` | `helm multiplayer` — the tmpfs root for opaque per-document update logs and the separate presence snapshots | — |
+| `HELM_MULTIPLAYER_CAVE` | `HELM_CHAT_ROOM`, else `main` | `helm multiplayer` — the default local collaboration cave | — |
+| `HELM_MULTIPLAYER_ACTOR` | `HELM_CHAT_NAME`, else the normal seat identity | `helm multiplayer` — the default update/presence actor | — |
+| `HELM_MULTIPLAYER_CONNECTION` | the harness session id, else actor | `helm multiplayer` — the presence connection identity; two tabs/sessions under one actor remain independent | — |
+| `HELM_MULTIPLAYER_BACKEND` | `local` | `helm multiplayer` — selected registered relay/presence adapter pair | — |
+
 ## accounts and quota
 
 | variable | default | read by | legacy fallback |

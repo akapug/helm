@@ -1083,7 +1083,8 @@ class StopWhisperTest(SeatsBase):
         self.plant("s-w9", **{"dirty-streak": 8})
         self.assertEqual(self.guard({"session_id": "s-w9"})[0], 2)
         lp = os.path.join(home.global_dir(), ".state", "stop-whisper-ledger.jsonl")
-        rows = [json.loads(l) for l in open(lp)]
+        with open(lp) as f:
+            rows = [json.loads(l) for l in f]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["id"], "dirty:1")
         self.assertEqual(rows[0]["session"], "s-w9")

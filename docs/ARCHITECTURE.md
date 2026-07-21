@@ -120,6 +120,14 @@ everywhere.
 - **lineage** — the registry's edge layer; cleanup is archive-not-delete,
   gated on dry-run + confirm, and never touches external nodes.
 
+## Local multiplayer
+
+Helm's multiplayer boundary is local and adapter-first: an append-only blind
+relay carries opaque client-owned CRDT updates, while a separate TTL channel
+carries disposable presence. Neither interface names a terminal, browser,
+metaharness, model, or CRDT library. The shipped implementation is tmpfs-local;
+builders.dev owns remote/web bridges. See [MULTIPLAYER.md](MULTIPLAYER.md).
+
 ## Pluggability
 
 Memory tooling evolves fast. helm's core is local markdown + JIT resolution,

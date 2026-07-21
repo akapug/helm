@@ -1283,6 +1283,28 @@ $ helm chat meld say  meld-1784663842-converge-the-reflex-nami --marker YIELD "p
 $ helm chat meld say  meld-1784663842-converge-the-reflex-nami --marker DONE "state: converged; next: I land it"
 ```
 
+### `helm multiplayer publish|read|presence|peers|leave`
+
+Local human+agent shared-state transport. `publish` appends a client-owned opaque
+CRDT update (`--stdin` keeps it out of shell history); `read --json` returns
+updates after a generation-bound cursor. Helm never decodes or merges payloads,
+and publish acknowledgements never echo them. `presence`/`peers`/`leave` use a
+separate connection-scoped TTL snapshot, so attention state can expire without
+touching document state. The default cave is
+`HELM_MULTIPLAYER_CAVE`, then `HELM_CHAT_ROOM`, then `main`; the default actor is
+`HELM_MULTIPLAYER_ACTOR`, then the normal chat/seat identity.
+
+```console
+$ helm multiplayer presence --cave helm --actor david --connection phone --state editing
+$ printf %s 'base64:opaque-update' | helm multiplayer publish board --stdin --cave helm --actor david
+$ helm multiplayer read board --cave helm --after 0 --json
+$ helm multiplayer peers --cave helm --json
+$ helm multiplayer leave --cave helm --actor david --connection phone
+```
+
+The default adapter stores both channels in tmpfs, but the interfaces are
+metaharness- and CRDT-agnostic. See [MULTIPLAYER.md](MULTIPLAYER.md).
+
 ### `helm launch [--seat S] [--home H] [--room R] [--no-install] [--] [claude args…]`
 The metaharness seam (meld-launch's capability): wires the full hook estate
 into the target home (idempotent), pre-writes the seat's roster row so
