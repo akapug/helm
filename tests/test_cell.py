@@ -23,7 +23,9 @@ ENV_KEYS = ("HELM_HOME", "HELM_CELL_BIN", "MELD_CELL_BIN", "HELM_NODE_URL",
             "HELM_CELL_PROFILE", "HELM_NODE_TOKEN", "HELM_NODE_PASSPHRASE",
             "HELM_ROSTER", "HELM_NODE_ANCHOR_FEE", "HELM_NODE_ANCHOR_TIMEOUT",
             "MELD_NODE_URL", "MELD_AGENT_PROFILE",
-            "MELD_NODE_TOKEN", "MELD_NODE_PASSPHRASE", "MELD_ROSTER")
+            "MELD_NODE_TOKEN", "MELD_NODE_PASSPHRASE", "MELD_ROSTER",
+            "DREGG_NODE_URL", "DREGG_PROFILE",
+            "DREGG_API_TOKEN", "DREGG_NODE_PASSPHRASE")
 
 DEAD = "http://127.0.0.1:1"   # nothing listens — fail-open, fast
 
@@ -197,10 +199,35 @@ class BinPathTest(CellBase):
         self.assertIn("a2a transport unavailable", err)
 
 
+class BuildEnvTest(CellBase):
+    def test_helm_maps_onto_meld_and_dregg_names(self):
+        # the dregg-native signer (dregg-client-sign) reads DREGG_*; the
+        # legacy meld-style bin reads MELD_* — one HELM_* feeds both
+        os.environ.update(HELM_NODE_URL="http://helm:1", HELM_CELL_PROFILE="p1",
+                          HELM_NODE_TOKEN="tok", HELM_NODE_PASSPHRASE="pw")
+        env = cell.build_env()
+        self.assertEqual(env["MELD_NODE_URL"], "http://helm:1")
+        self.assertEqual(env["DREGG_NODE_URL"], "http://helm:1")
+        self.assertEqual(env["MELD_AGENT_PROFILE"], "p1")
+        self.assertEqual(env["DREGG_PROFILE"], "p1")
+        self.assertEqual(env["MELD_NODE_TOKEN"], "tok")
+        self.assertEqual(env["DREGG_API_TOKEN"], "tok")
+        self.assertEqual(env["DREGG_NODE_PASSPHRASE"], "pw")
+
+    def test_absent_helm_leaves_direct_dregg_env_untouched(self):
+        # env2: no HELM_NODE_TOKEN set — a directly-exported DREGG_API_TOKEN
+        # survives; unset HELM vars never mint empty DREGG ones
+        os.environ["DREGG_API_TOKEN"] = "direct"
+        env = cell.build_env()
+        self.assertEqual(env["DREGG_API_TOKEN"], "direct")
+        self.assertNotIn("DREGG_NODE_PASSPHRASE", env)
+
+
 class A2ATransportTest(CellBase):
     STUB = ("#!/bin/sh\n"
             'echo "argv:$@" >> "$STUB_LOG"\n'
             'echo "MELD_NODE_URL=$MELD_NODE_URL" >> "$STUB_LOG"\n'
+            'echo "DREGG_NODE_URL=$DREGG_NODE_URL" >> "$STUB_LOG"\n'
             "exit 0\n")
 
     def write_stub(self):
@@ -225,6 +252,7 @@ class A2ATransportTest(CellBase):
             log = f.read()
         self.assertIn("argv:roster --json", log)
         self.assertIn("MELD_NODE_URL=http://helm:1", log)   # env2 mapping
+        self.assertIn("DREGG_NODE_URL=http://helm:1", log)  # dregg-native name
 
     def test_passthrough_degrades_without_binary(self):
         rc, _, err = self.run_cli(["send", "--to", CELL_HEX, "x"])

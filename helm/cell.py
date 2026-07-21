@@ -201,11 +201,19 @@ def verify_anchor(turn_hash, timeout=4):
 # OPTIONAL a2a transport (explicit opt-in, NEVER attestation, always degrades)
 # ---------------------------------------------------------------------------
 
+# HELM_* -> every name a configured signer bin reads: the dregg-native
+# dregg-client-sign (DREGG_*) and the legacy meld-style cell bin (MELD_*).
+# One pair per target so build_env stays a plain loop; a HELM var with two
+# targets simply appears twice.
 ENV_MAP = (
     ("HELM_NODE_URL", "MELD_NODE_URL"),
+    ("HELM_NODE_URL", "DREGG_NODE_URL"),
     ("HELM_CELL_PROFILE", "MELD_AGENT_PROFILE"),
+    ("HELM_CELL_PROFILE", "DREGG_PROFILE"),
     ("HELM_NODE_TOKEN", "MELD_NODE_TOKEN"),
+    ("HELM_NODE_TOKEN", "DREGG_API_TOKEN"),
     ("HELM_NODE_PASSPHRASE", "MELD_NODE_PASSPHRASE"),
+    ("HELM_NODE_PASSPHRASE", "DREGG_NODE_PASSPHRASE"),
     ("HELM_ROSTER", "MELD_ROSTER"),
 )
 
@@ -221,8 +229,9 @@ _USAGE = """usage: helm cell <verb> [args]
 
 def build_env():
     """Subprocess env for the OPTIONAL a2a transport: a copy of os.environ with
-    each set HELM_* mapped onto its MELD_* name (HELM wins; absent HELM leaves
-    a legacy MELD_* untouched — the env2 pattern)."""
+    each set HELM_* mapped onto its signer-facing names (legacy MELD_* and
+    dregg-native DREGG_*; HELM wins; absent HELM leaves a directly-set
+    MELD_*/DREGG_* untouched — the env2 pattern)."""
     env = dict(os.environ)
     for h, m in ENV_MAP:
         v = os.environ.get(h)

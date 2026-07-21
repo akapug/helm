@@ -213,6 +213,72 @@ class TransportTest(V2Base):
         self.assertEqual(chat._room_cell("me", ""), ("d" * 64, None, True))
 
 
+class DreggSignerBinTest(V2Base):
+    """The dregg-native signer (dregg-client-sign) as HELM_CELL_BIN: the
+    signing leg must drive its argv contract (join/send --profile --to
+    --topic <payload>) and its env contract (DREGG_NODE_URL/DREGG_API_TOKEN
+    aimed at the ROOM node), and parse its receipt JSON into the row. A FAKE
+    bin echoes the contract — the real bin and the real cave never run in
+    tests."""
+
+    JOIN = {"joined": True, "cell": "c" * 64, "public_key": "e" * 64,
+            "profile": "p1", "materialized": True}
+    SEND = {"sent": True, "turn_hash": "t" * 64, "receipt_hash": "r" * 64,
+            "chain_index": 9, "agent_cell": "c" * 64, "topic": "helm.chat",
+            "finality": "final", "consensus_final": True}
+
+    def fake_signer(self):
+        log = os.path.join(self.tmp, "signer.log")
+        path = os.path.join(self.tmp, "dregg-client-sign")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n"
+                    '{ echo "argv:$@"\n'
+                    '  echo "DREGG_NODE_URL=$DREGG_NODE_URL"\n'
+                    '  echo "DREGG_API_TOKEN=$DREGG_API_TOKEN"; } >> "%s"\n'
+                    'case "$1" in\n'
+                    "join) echo '%s' ;;\n"
+                    "send) echo '%s' ;;\n"
+                    "esac\n" % (log, json.dumps(self.JOIN), json.dumps(self.SEND)))
+        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+        os.environ["HELM_CELL_BIN"] = path
+        return log
+
+    def test_sign_send_drives_the_dregg_contract_into_the_row(self):
+        log = self.fake_signer()
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        chat._ensure_dir()
+        with open(chat._token_path(), "w") as f:
+            f.write("tok-abc")           # the RAM-side node token cache
+        m = chat.post("hello", who="a1", profile="p1", sign=True)
+        # the receipt parsed into the row: {sent,turn_hash,receipt_hash,chain_index}
+        self.assertEqual(m["turn"], "t" * 64)
+        self.assertEqual(m["receipt"], "r" * 64)
+        self.assertEqual(m["chain"], 9)
+        self.assertNotIn("[unsigned]", chat._fmt(m))
+        with open(log) as f:
+            body = f.read()
+        # argv contract: idempotent join, then the signed self-write send
+        self.assertIn("argv:join --profile p1", body)
+        self.assertIn("argv:send --profile p1 --to %s --topic %s %s"
+                      % ("c" * 64, chat.CHAT_TOPIC,
+                         chat.digest_payload("hello")), body)
+        # env contract: the signer is aimed at the ROOM node with its token
+        self.assertIn("DREGG_NODE_URL=http://127.0.0.1:1", body)
+        self.assertIn("DREGG_API_TOKEN=tok-abc", body)
+
+    def test_signer_missing_sent_falls_back_unsigned(self):
+        # a rc-0 line that never says sent:true is NOT a receipt — fail open
+        self.SEND = {"ok": True}
+        self.fake_signer()
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with mock.patch.object(chat, "_revive", return_value=None), \
+             mock.patch.object(chat, "_faucet"):
+            m = chat.post("hello", who="a1", sign=True)
+        self.assertNotIn("chain", m)
+        self.assertIn("[unsigned]", chat._fmt(m))
+        self.assertEqual(chat.read()[1], 1)   # the message never dies
+
+
 class ReactTest(V2Base):
     def test_react_by_ordinal_and_negative(self):
         chat.post("one", who="a1")

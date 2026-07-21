@@ -59,6 +59,7 @@ DEFAULT_DIR = "/dev/shm/helm-chat"
 SIZE_CAP = 2 * 1024 * 1024  # per-room rotation threshold — RAM etiquette
 POLL_S = 2.0                # --follow poll cadence (the web panel matches)
 CHAT_TAG = "chat:b2b:"      # algorithm-tagged digest, premise.py's pattern
+CHAT_TOPIC = "helm.chat"    # the signed turn's event topic on the room node
 
 
 def chat_dir():
@@ -193,9 +194,13 @@ def _node_token():
 
 
 def _env_extra(token):
-    env = {"MELD_NODE_URL": node_url() or ""}
+    """Aim the signer at the ROOM node (not the attest node): dregg-native
+    DREGG_* plus the legacy meld-style names — the seam drives either bin."""
+    u = node_url() or ""
+    env = {"MELD_NODE_URL": u, "DREGG_NODE_URL": u}
     if token:
         env["MELD_NODE_TOKEN"] = token
+        env["DREGG_API_TOKEN"] = token
     return env
 
 
@@ -298,7 +303,8 @@ def _sign_send(payload, profile):
     rc = out = err2 = None
     for attempt in (0, 1):
         rc, out, err2 = cell.run_bin(
-            ["send", "--profile", profile, "--to", hexid, payload],
+            ["send", "--profile", profile, "--to", hexid,
+             "--topic", CHAT_TOPIC, payload],
             timeout=30, env_extra=_env_extra(token))
         if rc is None:
             return None, err2
