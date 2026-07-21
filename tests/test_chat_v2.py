@@ -160,6 +160,37 @@ class TransportTest(V2Base):
         self.assertNotIn("chain", m)
         self.assertIn("[unsigned]", chat._fmt(m))
 
+    def test_unusable_signer_is_not_ready(self):
+        """Codex day-review #1: bin_ready must reject a non-executable file AND
+        a directory (os.path.exists would wrongly say yes) — a bogus
+        HELM_CELL_BIN can NEVER read 'signed' or fire the unlock lap."""
+        import tempfile
+        d = tempfile.mkdtemp()
+        try:
+            plain = os.path.join(d, "notabin")
+            with open(plain, "w") as f:
+                f.write("x")
+            os.chmod(plain, 0o600)                 # regular file, NOT executable
+            os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+            for bogus in (plain, d, os.path.join(d, "absent")):
+                os.environ["HELM_CELL_BIN"] = bogus
+                self.assertFalse(cellmod.bin_ready(), bogus)
+                # node UP + bogus signer must read "(no signer)", never "signed"
+                with mock.patch.object(chat, "node_head", return_value={"chain_index": 15}):
+                    self.assertEqual(chat.transport_status()["mode"],
+                                     "unsigned (no signer)")
+                with mock.patch.object(cellmod, "run_bin") as rb, \
+                     mock.patch.object(chat, "_revive") as rv, \
+                     mock.patch.object(chat, "node_head", return_value={"chain_index": 15}) as nh:
+                    info, err = chat._sign_send("payload", "p1")
+                self.assertIsNone(info)            # never signs
+                rb.assert_not_called()             # never launches the binary
+                rv.assert_not_called()             # never revives/unlocks
+        finally:
+            os.environ.pop("HELM_CELL_BIN", None)
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_transport_status_reports_the_signer(self):
         """A reachable node without a signer must never read "signed" —
         the exact lying status the day review caught live: node answering,
@@ -178,7 +209,8 @@ class TransportTest(V2Base):
         chat._ensure_dir()
         with open(chat.cells_path(), "w") as f:
             json.dump({"me": "d" * 64}, f)
-        self.assertEqual(chat._room_cell("me", ""), ("d" * 64, None))
+        # 3-tuple contract: (cell_hex, err, launched) — cache hit is success
+        self.assertEqual(chat._room_cell("me", ""), ("d" * 64, None, True))
 
 
 class ReactTest(V2Base):

@@ -238,14 +238,22 @@ def bin_path():
     return home.env("CELL_BIN") or None
 
 
+def _usable(b):
+    """A configured signer is real ONLY when it is a regular file AND
+    executable — a directory or a non-executable file (mode 0600, etc.) is NOT
+    a usable binary. os.path.exists() would say yes and let status claim
+    'signed' + let the signing leg burn an unlock lap; isfile + X_OK is the
+    minimum honest meaning of 'signer ready' (codex day-review #1)."""
+    return bool(b and os.path.isfile(b) and os.access(b, os.X_OK))
+
+
 def bin_ready():
-    """True only when the explicit HELM_CELL_BIN points at a real file — the
-    ONE signer-availability answer every signing leg and status surface asks
-    before claiming (or attempting) a signed turn. False must short-circuit:
-    no node probe, no revive, no unlock — a missing signer is a configuration
-    fact, not a fault to recover from."""
-    b = bin_path()
-    return bool(b and os.path.exists(b))
+    """True only when the explicit HELM_CELL_BIN points at a real, executable
+    file — the ONE signer-availability answer every signing leg and status
+    surface asks before claiming (or attempting) a signed turn. False must
+    short-circuit: no node probe, no revive, no unlock — a missing (or
+    unusable) signer is a configuration fact, not a fault to recover from."""
+    return _usable(bin_path())
 
 
 def roster_path():
@@ -258,7 +266,7 @@ def run_bin(args, timeout=90, env_extra=None):
     reason when no binary is configured (HELM_CELL_BIN unset) or launch fails.
     env_extra lays over the mapped env."""
     b = bin_path()
-    if not b or not os.path.exists(b):
+    if not _usable(b):
         return None, "", ("a2a transport unavailable — set HELM_CELL_BIN to a "
                           "cell binary (optional; helm attestation runs fully "
                           "without it)")
@@ -330,7 +338,7 @@ def _status(args):
               "offline; the node is only an optional anchor)" % url)
     print("helm cell: " + _roster_summary())
     b = bin_path()
-    if b and os.path.exists(b):
+    if _usable(b):
         print("helm cell: optional a2a binary " + b)
     else:
         print("helm cell: optional a2a transport OFF (no HELM_CELL_BIN) — "
@@ -353,7 +361,7 @@ def cmd_cell(args):
         print(_USAGE, file=sys.stderr)
         return 2
     b = bin_path()
-    if not b or not os.path.exists(b):
+    if not _usable(b):
         print("helm cell: a2a transport unavailable — set HELM_CELL_BIN to a "
               "cell binary (optional; attestation is native and never needs it)",
               file=sys.stderr)

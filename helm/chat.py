@@ -225,25 +225,30 @@ def _balance(cell_hex):
 def _room_cell(profile, token):
     """The profile's cell ON THE ROOM NODE: RAM-cache first, else one
     idempotent `join` (creates + faucet-funds on first use) aimed at the room
-    node via env_extra. (cell_hex, None) or (None, reason)."""
+    node via env_extra. Returns (cell_hex, None, True) on success, else
+    (None, reason, launched) — `launched` False ONLY when the signer binary
+    never ran (local launch failure), so the caller never revives over it."""
     from . import cell
     cache = pk.read_json(cells_path(), {}) or {}
     hexid = cache.get(profile)
     if hexid:
-        return hexid, None
+        return hexid, None, True
     rc, out, err = cell.run_bin(["join", "--profile", profile], timeout=30,
                                 env_extra=_env_extra(token))
     if rc is None:
-        return None, err
+        # LOCAL launch failure (binary missing/unusable/failed to exec) — NOT a
+        # node-state fault, so the caller must NOT revive/unlock over it.
+        return None, err, False
     if rc != 0:
-        return None, "join failed (rc %d): %s" % (rc, (err or out).strip()[-240:])
+        return None, ("join failed (rc %d): %s"
+                      % (rc, (err or out).strip()[-240:])), True
     info = cell._last_json(out)
     if not (info and info.get("cell")):
-        return None, "join printed no cell id"
+        return None, "join printed no cell id", True
     _ensure_dir()
     cache[profile] = info["cell"]
     pk.write_json(cells_path(), cache)
-    return info["cell"], None
+    return info["cell"], None, True
 
 
 def _sign_send(payload, profile):
@@ -259,10 +264,14 @@ def _sign_send(payload, profile):
         return None, ("no signer — HELM_CELL_BIN unset; posts ride the v1 "
                       "room unsigned")
     token = _node_token()
-    hexid, err = _room_cell(profile, token)
+    hexid, err, launched = _room_cell(profile, token)
     if err:
+        # A local signer-launch failure is not node state — decline unsigned,
+        # never fire the unlock/revive lap (day-review #1, codex B1 tail).
+        if not launched:
+            return None, err
         token = _revive() or token
-        hexid, err = _room_cell(profile, token)
+        hexid, err, launched = _room_cell(profile, token)
         if err:
             return None, err
     b = _balance(hexid)
