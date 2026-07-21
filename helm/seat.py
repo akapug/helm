@@ -82,7 +82,14 @@ DREGG_SIGNER_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin",
 # "first-party" (Anthropic-compatible endpoint, no proxy — future glm/deepseek:
 # only mode+base_url+key_env needed).
 FAMILIES = {
-    "codex": {"port": 8317, "model": "gpt-5.6-sol", "mode": "proxy"},
+    "codex": {"port": 8317, "model": "gpt-5.6-sol", "mode": "proxy",
+              # CC hardcodes a 200k window for any non-`claude-` model and never
+              # asks the proxy; gpt-5.6-sol's real window is 372k, so autocompact
+              # under-fires and the seat 400s past the real limit (unrecoverable
+              # in-band). CLAUDE_CODE_MAX_CONTEXT_TOKENS (launch_line) teaches CC
+              # the real window — shaved to 360k (seats request max_tokens=32k, CC
+              # reserves 20k). Small-window codex families (spark 128k) want 128000.
+              "max_context": 360000},
     # kimi rides the kimi.com CODING-plan endpoint (dual-wire; OpenAI wire at
     # /coding/v1 — live-verified 2026-07-20). A Moonshot PLATFORM key would
     # need base_url https://api.moonshot.ai/v1 instead; platform endpoints
@@ -91,6 +98,14 @@ FAMILIES = {
              "base_url": "https://api.kimi.com/coding/v1",
              "key_env": "KIMI_API_KEY", "provider": "moonshot"},
 }
+
+# CC's autocompact trigger = pct × (window − 20k). Against the CORRECT window it
+# otherwise fires with only a thin margin under a 32k-max_tokens turn; 78% lands
+# the trigger with real headroom (sol ≈ 265k, well under the ~340k reject point;
+# spark ≈ 84k, under 128k). Honored only for non-`claude-` model names — exactly
+# the proxy seats. Both env knobs verified in CC 2.1.216 (undocumented — re-verify
+# on CC upgrades: `strings` the binary for the names).
+AUTOCOMPACT_PCT_OVERRIDE = "78"
 
 _USAGE = """usage: helm seat <verb> [args]
   add <family> [--auth-from <path>]   mint the seat (translate cred read-only)
@@ -356,6 +371,14 @@ def launch_line(family, model=None, room=None, seat=None):
     seat = seat or family
     cfgdir = shlex.quote(os.path.join(_instance_dir(family, seat), "claude"))
     homing = (" HELM_CHAT_ROOM=%s" % shlex.quote(room)) if room else ""
+    # Teach CC the seat's real context window + a safe autocompact margin so a
+    # non-claude model never sails past its window into the unrecoverable 400
+    # (navigate-multimodel-cc-context / ctx-window-recovery-is-clear). Appended
+    # AFTER the signing env so HELM_CELL_BIN/PROFILE + DREGG_PROFILE stay
+    # byte-identical.
+    ctxenv = " CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=%s" % AUTOCOMPACT_PCT_OVERRIDE
+    if fam.get("max_context"):
+        ctxenv += " CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d" % fam["max_context"]
     return ("env -u ANTHROPIC_API_KEY"
             " ANTHROPIC_BASE_URL=http://127.0.0.1:%d"
             " ANTHROPIC_AUTH_TOKEN=%s"
@@ -364,12 +387,12 @@ def launch_line(family, model=None, room=None, seat=None):
             " HELM_CHAT_NAME=%s%s"
             " HELM_CELL_BIN=%s"
             " HELM_CELL_PROFILE=%s"
-            " DREGG_PROFILE=%s"
+            " DREGG_PROFILE=%s%s"
             " claude --dangerously-skip-permissions --model %s"
             % (fam["port"], _read_token(family) or "<seat-token-missing>",
                model, cfgdir, shlex.quote(seat), homing,
                shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(seat),
-               shlex.quote(seat), model))
+               shlex.quote(seat), ctxenv, model))
 
 
 def _seat_token(family, d):

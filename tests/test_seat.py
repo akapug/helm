@@ -406,6 +406,23 @@ class SeatTest(unittest.TestCase):
             "claude --dangerously-skip-permissions --model gpt-5.5",
             out.getvalue())
 
+    def test_launch_line_context_window(self):
+        """ctx-window fix: proxy seats mint CLAUDE_CODE_MAX_CONTEXT_TOKENS
+        (per-family real window, teaching CC past its hardcoded 200k) +
+        CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, so a non-claude seat compacts before
+        the unrecoverable 400. kimi (1M real) omits the max; signing env intact."""
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        line = seat.launch_line("codex")
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=360000", line)  # sol's real window
+        self.assertIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=78", line)
+        # ctxenv appends AFTER the signing env, which stays byte-identical
+        self.assertIn("DREGG_PROFILE=codex CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=78", line)
+        # kimi is a 1M-window model — CC's 200k default is safe, so no max minted
+        kline = seat.launch_line("kimi")
+        self.assertIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=78", kline)
+        self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", kline)
+
     def test_launch_line_room_homing(self):
         """Team-room homing (slice 3): --room bakes HELM_CHAT_ROOM into the
         line + launch.sh; no --room exports nothing (un-homed = main, the
