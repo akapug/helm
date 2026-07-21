@@ -31,6 +31,11 @@ def run(fn, args):
 class GcBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-gc-")
+        # Hermetic cwd: the work-worktrees stream reads the AMBIENT git repo
+        # (find_root walks up from cwd, no HELM_HOME seam) — a non-repo cwd
+        # isolates it so an empty estate stays empty regardless of live lanes.
+        self.cwd_prior = os.getcwd()
+        os.chdir(self.tmp)
         self.env_prior = {k: os.environ.get(k) for k in (
             "HELM_HOME", "HELM_CACHE_DIR", "MELD_CACHE_DIR", "HELM_ADOPTED_DIR")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
@@ -41,6 +46,7 @@ class GcBase(unittest.TestCase):
             os.makedirs(os.path.join(self.tmp, d))
 
     def tearDown(self):
+        os.chdir(self.cwd_prior)
         for k, v in self.env_prior.items():
             if v is None:
                 os.environ.pop(k, None)
