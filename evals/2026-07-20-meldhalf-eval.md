@@ -1,15 +1,27 @@
 # meldhalf lane eval — the delivery lane (2026-07-20)
 
-Branch `meldhalf/0.2`, 7 commits rebased onto main `3bd1342`. Design:
-`~/.helm/helm/prd/2026-07-20-meldhalf-design.md` (§11 = the codex adversarial
-round and how each ruling landed).
+Branch `meldhalf/0.2`, 10 commits rebased onto main `3bd1342`. Design:
+`~/.helm/helm/prd/2026-07-20-meldhalf-design.md` (§11 = both codex
+adversarial rounds and how each ruling landed).
 
 ## Gate
 
-`python3 -W error::ResourceWarning -m unittest discover -s tests` on the
-rebased branch: **904 tests, OK (7 pre-existing live-node skips), warning-
-clean.** 61 of those are this lane's (34 seats + 3 launch + 3 hooks-estate +
-1 chat row-integrity + the reworked chat/chat_v2 pins).
+`python3 -W error::ResourceWarning -m unittest discover -s tests` after the
+round-2 fixes: **909 tests, OK (7 pre-existing live-node skips), warning-
+clean.**
+
+## Round 2 (cross-family gate BLOCK → fixed, all three reproduced live)
+
+- **B1 seat-key collision:** codex's exact `api.a`/`api-a` sequence now
+  yields `dot1: delivers / dot2: empty / dash: delivers ITS row` through
+  `bin/helm` (was: dash None — silent loss). State paths key on slug +
+  blake2b8(casefolded seat).
+- **B2 copied-SID spoof:** `CLAUDE_SESSION_ID=sA release` without the lease
+  → refused rc 1 ("release needs the lease id (the grant's capability)");
+  with the printed lease → released rc 0. `--session` no longer exists.
+- **B3 matcher:** a Bash-pinned deliver group now fails status coverage and
+  install repairs it to the wildcard (or relocates ours past foreign
+  co-tenants) — three regressions pinned.
 
 ## Hot-path measurement (integrator note 2)
 
