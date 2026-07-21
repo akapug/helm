@@ -953,14 +953,15 @@ frames; this lane is called *delivery*.)
 - **`helm chat seats`** — the roster table: presence (fresh <2m / quiet <15m /
   absent, off the last tool boundary), pending deliveries, live claims. The
   web twin is the **seats** panel in the ledger tab (`GET /api/chat/roster`).
-- **`helm chat claim <resource> [--ttl N] [--session SID]` /
-  `release <resource> [--lease ID | --session SID]` / `claims`** — the
-  advisory TTL lease (meld claims, minus the cap-gate): refused while
-  another holder's lease is live, expiry is MONOTONIC, and the grant binds
-  `{session, lease nonce, fence}` — release/extend needs the lease id or the
-  granting session, never just a matching display name (the ABA/stale-holder
-  class). For short-lived same-host mutual exclusion — files, ports,
-  worktrees (the concurrent-lane collision class).
+- **`helm chat claim <resource> [--ttl N] [--lease ID]` /
+  `release <resource> --lease ID` / `claims`** — the advisory TTL lease
+  (meld claims, minus the cap-gate): refused while another holder's lease is
+  live; expiry is MONOTONIC. The printed **lease id is the capability** —
+  keep it: extend and release validate `{lease, holding seat, granting
+  session}` TOGETHER (session comes only from the ambient harness env, never
+  a flag — a roster-visible SID opens nothing). The nonce is never listed.
+  For short-lived same-host mutual exclusion — files, ports, worktrees (the
+  concurrent-lane collision class).
 
 **Trust domain, loudly:** seat names are DISPLAY LABELS and every mechanism
 above is advisory coordination between cooperating same-uid processes in a
@@ -974,8 +975,8 @@ in the design doc's codex-round section.)
 ```console
 $ helm chat post "@codex-seat xrev the meldhalf branch when free"
 $ helm chat seats                # who's live, what's pending, what's claimed
-$ helm chat claim worktree-main --ttl 1800 --session $CLAUDE_SESSION_ID
-$ helm chat release worktree-main --lease 5f3c9a2d41b0
+$ helm chat claim worktree-main --ttl 1800   # prints the lease id — keep it
+$ helm chat release worktree-main --lease 5f3c9a2d41b0e6f2
 ```
 
 ### `helm launch [--seat S] [--home H] [--room R] [--no-install] [--] [claude args…]`

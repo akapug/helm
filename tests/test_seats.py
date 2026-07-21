@@ -265,6 +265,21 @@ class DeliverTest(SeatsBase):
                           emit=mock.Mock(side_effect=RuntimeError("killed")))
         self.assertIn("precious", seats.deliver(seat="alice"))   # re-delivered
 
+    def test_slug_colliding_seats_never_share_state(self):
+        """Codex B1's exact reproduction: pk.slug('api.a') == pk.slug('api-a')
+        yet they are distinct address tokens — each must keep its own
+        cursor/seen state, neither may consume the other's rows."""
+        self.assertNotEqual(seats.cursor_path("main", "api.a"),
+                            seats.cursor_path("main", "api-a"))
+        self.assertNotEqual(seats.seen_path("api.a"), seats.seen_path("api-a"))
+        seats.join(seat="api.a", cwd="/tmp/p")
+        seats.join(seat="api-a", cwd="/tmp/p")
+        chat.post("@api.a first", who="owner")
+        chat.post("@api-a second", who="owner")
+        self.assertIn("@api.a first", seats.deliver(seat="api.a"))
+        self.assertIsNone(seats.deliver(seat="api.a"))   # advances ITS cursor only
+        self.assertIn("@api-a second", seats.deliver(seat="api-a"))
+
     def test_unknown_session_self_heals_roster(self):
         chat.post("noise", who="bob")
         self.assertIsNone(seats.deliver(session="brand-new-session"))
@@ -326,43 +341,76 @@ class WaitTest(SeatsBase):
 
 
 class ClaimsTest(SeatsBase):
-    def test_exclusion_session_extend_lease_release(self):
-        ok, msg, lease = seats.claim("worktree-main", "alice", session="sA", ttl=60)
+    def test_lease_is_the_capability_composite_binding(self):
+        ok, msg, lease = seats.claim("worktree-main", "alice", ttl=60, session="sA")
         self.assertTrue(ok)
         self.assertIn("fence 1", msg)
-        # another party — even under the SAME display name — is refused
-        ok, _msg, _l = seats.claim("worktree-main", "alice", session="sB", ttl=60)
+        # another party — even under the SAME display name/session — refused
+        ok, _m, _l = seats.claim("worktree-main", "alice", ttl=60, session="sB")
         self.assertFalse(ok)
-        ok, _msg, _l = seats.claim("worktree-main", "bob", session=None, ttl=60)
-        self.assertFalse(ok)
-        # the granting session extends; lease id is stable across the extend
-        ok, _msg, lease2 = seats.claim("worktree-main", "alice", session="sA", ttl=120)
+        # extend needs the FULL binding: lease + holder seat (+ session match)
+        ok, _m, _l = seats.claim("worktree-main", "alice", ttl=120, session="sA")
+        self.assertFalse(ok)                     # no lease — name+session ≠ enough
+        ok, _m, lease2 = seats.claim("worktree-main", "alice", ttl=120,
+                                     lease=lease, session="sA")
         self.assertTrue(ok)
-        self.assertEqual(lease, lease2)
-        # release needs the binding, not the name (C1-lite)
-        ok, msg = seats.release("worktree-main", "alice")            # bare name
+        self.assertEqual(lease, lease2)          # stable across the extend
+        # release: validated TOGETHER, never lease-OR-session
+        ok, msg = seats.release("worktree-main", "alice")             # bare name
         self.assertFalse(ok)
-        self.assertIn("lease id or the granting session", msg)
-        ok, _msg = seats.release("worktree-main", "eve", lease=lease)  # lease wins
+        self.assertIn("capability", msg)
+        ok, _m = seats.release("worktree-main", "eve", lease=lease)   # wrong seat
+        self.assertFalse(ok)
+        ok, _m = seats.release("worktree-main", "alice", lease=lease,
+                               session="sB")                          # wrong session
+        self.assertFalse(ok)
+        ok, _m = seats.release("worktree-main", "alice", lease=lease, session="sA")
         self.assertTrue(ok)
         self.assertEqual(seats.claims_list(), [])
+
+    def test_cli_cannot_assert_a_copied_session(self):
+        """Codex B2's exact reproduction, CLI-level: caller B copies A's
+        roster-visible SID; --session no longer exists and the ambient env
+        session opens nothing without the lease capability."""
+        with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sA"}):
+            rc, out, _ = self.cmd("claim", ["port:1", "--seat", "alice"])
+        self.assertEqual(rc, 0)
+        # B knows sA (roster/API) and even sets it as their ambient session
+        with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sA"}):
+            rc, _out, err = self.cmd("release", ["port:1", "--seat", "alice"])
+        self.assertEqual(rc, 1)
+        self.assertIn("capability", err)
+        # the old flag is dead: passing it changes nothing
+        rc, _out, err = self.cmd("release", ["port:1", "--seat", "alice",
+                                             "--session", "sA"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(seats.claims_list()), 1)   # still held
+        # the printed lease IS the capability
+        lease = out.split("lease ")[1].split(",")[0]
+        with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sA"}):
+            rc, _out, _e = self.cmd("release", ["port:1", "--seat", "alice",
+                                                "--lease", lease])
+        self.assertEqual(rc, 0)
 
     def test_aba_stale_holder_cannot_release_regrant(self):
         """H9 ABA: A's lease expires, B claims; stale A (same name, old
         lease) must not drop B's lease."""
-        _ok, _msg, lease_a = seats.claim("port-8900", "alice", session="sA", ttl=0)
-        ok, _msg, lease_b = seats.claim("port-8900", "alice", session="sB", ttl=60)
+        _ok, _m, lease_a = seats.claim("port-8900", "alice", ttl=0, session="sA")
+        ok, _m, lease_b = seats.claim("port-8900", "alice", ttl=60, session="sB")
         self.assertTrue(ok)                     # expired A swept, B granted
-        ok, _msg = seats.release("port-8900", "alice", session="sA", lease=lease_a)
-        self.assertFalse(ok)                    # stale binding refused
-        ok, _msg = seats.release("port-8900", "alice", session="sB")
+        ok, _m = seats.release("port-8900", "alice", lease=lease_a, session="sA")
+        self.assertFalse(ok)                    # stale nonce refused
+        ok, _m = seats.release("port-8900", "alice", lease=lease_b, session="sB")
         self.assertTrue(ok)
 
-    def test_fence_increments_per_grant(self):
-        _ok, m1, _l = seats.claim("r", "a", session="s1", ttl=0)
-        _ok, m2, _l = seats.claim("r", "b", session="s2", ttl=60)
+    def test_fence_increments_and_list_hides_binding_material(self):
+        _ok, m1, _l = seats.claim("r", "a", ttl=0, session="s1")
+        _ok, m2, _l = seats.claim("r", "b", ttl=60, session="s2")
         self.assertIn("fence 1", m1)
         self.assertIn("fence 2", m2)
+        row = seats.claims_list()[0]
+        self.assertNotIn("lease", row)       # the capability is never listed
+        self.assertNotIn("session", row)
 
     def test_release_unclaimed(self):
         ok, msg = seats.release("ghost", "alice", lease="deadbeef")
@@ -384,7 +432,7 @@ class RosterReportTest(SeatsBase):
         seats.join(seat="alice", cwd="/tmp/projx", session="s-a")
         chat.post("@alice one", who="bob")
         chat.post("@alice two", who="bob")
-        seats.claim("db-migrate", "alice", session="s-a", ttl=60)
+        seats.claim("db-migrate", "alice", ttl=60, session="s-a")
         rep = seats.roster_report("main")
         s = rep["seats"][0]
         self.assertEqual(s["seat"], "alice")
@@ -450,8 +498,7 @@ class ChatDispatchTest(SeatsBase):
     def test_chat_verbs_reach_seats(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = chat.cmd_chat(["claim", "res-1", "--seat", "alice",
-                                "--session", "sX"])
+            rc = chat.cmd_chat(["claim", "res-1", "--seat", "alice"])
         self.assertEqual(rc, 0)
         self.assertEqual(seats.claims_list()[0]["holder"], "alice")
 

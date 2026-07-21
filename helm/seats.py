@@ -185,8 +185,22 @@ def roster_path():
     return os.path.join(chat.chat_dir(), ".roster.json")
 
 
+def _seat_key(seat):
+    """The seat's STATE-FILE key: readable slug + a short hash of the
+    casefolded raw seat. pk.slug alone collides ('api.a' and 'api-a' both
+    slug to 'api-a'), and a shared cursor lets one seat silently CONSUME the
+    other's rows (codex B1 — loss, not a duplicate). Every per-seat state
+    path (cursor, cursor lock, seen) derives from this one key; case-only
+    variants fold together deliberately — case-insensitive @mentions cannot
+    address them apart anyway."""
+    import hashlib
+    h = hashlib.blake2b(str(seat).casefold().encode("utf-8"),
+                        digest_size=4).hexdigest()
+    return "%s-%s" % (pk.slug(seat), h)
+
+
 def seen_path(seat):
-    return os.path.join(chat.chat_dir(), ".seen." + pk.slug(seat))
+    return os.path.join(chat.chat_dir(), ".seen." + _seat_key(seat))
 
 
 def roster():
@@ -252,7 +266,7 @@ def seat_for_session(session):
 
 def cursor_path(room, seat):
     return os.path.join(chat.chat_dir(),
-                        "%s.cursor.%s" % (pk.slug(room), pk.slug(seat)))
+                        "%s.cursor.%s" % (pk.slug(room), _seat_key(seat)))
 
 
 def _cursor(room, seat):
@@ -439,66 +453,81 @@ def _sweep(c):
                                  and v.get("exp_mono", 0) > now)}
 
 
-def claim(resource, seat, session=None, ttl=DEFAULT_TTL):
-    """(ok, message, lease_id). The grant binds {seat-label, session, lease
-    nonce, fence}; renew requires the SAME SESSION (or the lease id via
-    release+reclaim) — a matching display string alone extends nothing
-    (codex C1/H9 ABA). Expiry is monotonic (tmpfs state dies with the boot,
-    wall time only displays). Check+sweep+write hold one flock."""
+def _binding_ok(row, seat, lease, session):
+    """The C1-lite composite check, validated TOGETHER (codex B2): the lease
+    nonce is THE capability (printed once, to the grantee, never listed),
+    the supplied seat must be the recorded holder, and when both the grant
+    and the caller carry a session they must agree. Never lease-OR-session:
+    a roster-visible session id alone must open nothing."""
+    if not lease or row.get("lease") != lease:
+        return False, "the lease id (the grant's capability)"
+    if seat != row.get("holder"):
+        return False, "the holding seat (%s)" % row.get("holder")
+    if row.get("session") and session and row["session"] != str(session):
+        return False, "the granting session"
+    return True, None
+
+
+def claim(resource, seat, ttl=DEFAULT_TTL, lease=None, session=None):
+    """(ok, message, lease_id). A fresh grant mints a random lease nonce +
+    an increasing fence and records the caller's ambient session (display /
+    extra binding — never an authorizer). EXTENDING a live lease requires
+    the full binding {lease, seat, session-if-recorded}; a display name or
+    a copied session id alone extends nothing (codex B2). Expiry is
+    monotonic (tmpfs state dies with the boot; wall time only displays).
+    Check+sweep+write hold one flock."""
     chat._ensure_dir()
     with _flocked(claims_path() + ".lock"):
         c = _sweep(pk.read_json(claims_path(), {}) or {})
         row = c.get(resource)
         if row:
-            same_session = session and row.get("session") == str(session)
-            if not same_session:
-                return False, "%s is held by %s for %ds more" % (
+            ok, needs = _binding_ok(row, seat, lease, session)
+            if not ok:
+                return False, "%s is held by %s for %ds more (extend needs %s)" % (
                     resource, row.get("holder"),
-                    int(row["exp_mono"] - _now_mono())), None
-            lease = row["lease"]        # the holder session extends its lease
-            fence = row["fence"]
+                    int(row["exp_mono"] - _now_mono()), needs), None
+            lease_id, fence = row["lease"], row["fence"]
         else:
-            lease = os.urandom(8).hex()
+            lease_id = os.urandom(8).hex()
             fence = int(c.get("_fence", 0)) + 1
             c["_fence"] = fence
         c[resource] = {"holder": seat, "session": str(session) if session else None,
-                       "lease": lease, "fence": fence,
+                       "lease": lease_id, "fence": fence,
                        "exp_mono": _now_mono() + ttl,
                        "exp_wall": time.time() + ttl, "ts": pk.now_ts()}
         pk.write_json(claims_path(), c)
         return True, "%s claimed by %s for %ds (lease %s, fence %d)" % (
-            resource, seat, ttl, lease, fence), lease
+            resource, seat, ttl, lease_id, fence), lease_id
 
 
-def release(resource, seat, session=None, lease=None):
-    """(ok, message). Holder-bound BY BINDING, not by display string: the
-    caller must present the lease id, or be the same session the lease was
-    granted to. A stale holder whose lease already expired-and-was-regranted
-    fails the binding check (the ABA case)."""
+def release(resource, seat, lease=None, session=None):
+    """(ok, message). Release demands the SAME composite binding as extend —
+    {lease capability, holding seat, session-if-recorded}. A stale holder
+    whose lease expired-and-was-regranted fails on the fresh nonce (ABA),
+    and a caller who copied a session id out of the roster fails on the
+    lease (codex B2's exact reproduction)."""
     with _flocked(claims_path() + ".lock"):
         c = _sweep(pk.read_json(claims_path(), {}) or {})
         row = c.get(resource)
         if not row:
             pk.write_json(claims_path(), c)
             return False, "%s is not claimed" % resource
-        bound = (lease and row.get("lease") == lease) or \
-                (session and row.get("session") == str(session))
-        if not bound:
-            return False, ("%s is held under lease %s… — release needs the "
-                           "lease id or the granting session, not a name"
-                           % (resource, str(row.get("lease"))[:6]))
+        ok, needs = _binding_ok(row, seat, lease, session)
+        if not ok:
+            return False, "%s stays held — release needs %s" % (resource, needs)
         del c[resource]
         pk.write_json(claims_path(), c)
         return True, "%s released" % resource
 
 
 def claims_list():
+    """The public table: holder/fence/remaining only — neither the lease
+    nonce (the capability) nor the bound session is ever published here."""
     with _flocked(claims_path() + ".lock"):
         c = _sweep(pk.read_json(claims_path(), {}) or {})
         pk.write_json(claims_path(), c) if c else None
     now = _now_mono()
     return [{"resource": r, "holder": v.get("holder"), "fence": v.get("fence"),
-             "session": v.get("session"),
              "remaining": int(v.get("exp_mono", now) - now)}
             for r, v in sorted(c.items()) if r != "_fence"]
 
@@ -631,23 +660,25 @@ def cmd(verb, args, room="main"):
     if verb == "claim":
         if not args:
             print("usage: helm chat claim <resource> [--ttl SECONDS] [--seat S] "
-                  "[--session SID]", file=sys.stderr)
+                  "[--lease ID to extend]   (keep the printed lease id — it is "
+                  "the release capability)", file=sys.stderr)
             return 2
+        # session comes ONLY from the ambient harness env — never a flag: a
+        # roster-visible SID must not be assertable through the CLI (codex B2)
         ttl = _flag(args, "--ttl")
         ok, msg, _lease = claim(
             args[0], _flag(args, "--seat") or derive_seat(None),
-            session=_flag(args, "--session") or _env_session(),
-            ttl=int(ttl) if ttl else DEFAULT_TTL)
+            ttl=int(ttl) if ttl else DEFAULT_TTL,
+            lease=_flag(args, "--lease"), session=_env_session())
         print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
     if verb == "release":
         if not args:
-            print("usage: helm chat release <resource> [--lease ID | "
-                  "--session SID] [--seat S]", file=sys.stderr)
+            print("usage: helm chat release <resource> --lease ID [--seat S]",
+                  file=sys.stderr)
             return 2
         ok, msg = release(args[0], _flag(args, "--seat") or derive_seat(None),
-                          session=_flag(args, "--session") or _env_session(),
-                          lease=_flag(args, "--lease"))
+                          lease=_flag(args, "--lease"), session=_env_session())
         print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
     if verb == "claims":
