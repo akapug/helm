@@ -670,12 +670,84 @@ def _api_physics_diff(qs):
 # `helm chat`. GET is an open read (loopback + same-origin only, like every
 # GET); POST rides the mutation bearer and drops the owner-unread marker so
 # the shipped reflex surfaces the message to every local agent next turn.
+#
+# The AGENT→OWNER direction (chat.mark_owner_unread is owner→agent only):
+# every poll also carries the owner-facing unread signal — rows past the
+# owner's last-read cursor, and the subset that @-mention an owner name
+# (seats.owner_names(), the delivery filter's owner rule). The cursor is a
+# web.py-owned marker in the room dir (<room>.owner-read); the chat view
+# advances it via POST /api/chat/read when the owner has actually SEEN the
+# room. Fail-open total: any surprise answers zeros — no badge, never an
+# error (a GUI-first owner on another tab must never lose the page to this).
+
+def _owner_read_path(room):
+    from . import chat, pk
+    return os.path.join(chat.chat_dir(), pk.slug(room) + ".owner-read")
+
+
+def _owner_cursor(room, rows):
+    """The owner's last-read position against the CURRENT rows. The stored
+    row id wins (rotation-proof — ids are chat._append's stable per-row law);
+    else the stored count while it still fits; else 0 (over-notify briefly,
+    self-heals on the next read-ack)."""
+    from . import pk
+    st = pk.read_json(_owner_read_path(room), None)
+    if not isinstance(st, dict):
+        return 0
+    rid = st.get("rid")
+    if rid:
+        for i in range(len(rows) - 1, -1, -1):
+            if rows[i].get("id") == rid:
+                return i + 1
+    n = st.get("n")
+    return n if isinstance(n, int) and 0 <= n <= len(rows) else 0
+
+
+def _owner_signal(room, rows):
+    """{owner_read, owner_unread, owner_mentions [, owner_mention_last,
+    owner_mention_preview]} — what landed past the owner's cursor and how
+    much of it addresses HIM. Mention matching mirrors seats.deliverable's
+    owner rule: seats.owner_names() as the name set, the same @-boundary
+    regex. The owner rails' own posts (origin web/tui, owner name) never
+    badge the owner; reactions never badge (noise law). owner_mention_last
+    is the newest unseen mention's identity — the client's notify-dedup key
+    (once per NEW mention decision, not per poll)."""
+    try:
+        from . import seats
+        names = seats.owner_names()
+        cur = _owner_cursor(room, rows)
+        out = {"owner_read": cur, "owner_unread": 0, "owner_mentions": 0}
+        rx = re.compile(r"(?<![A-Za-z0-9._-])@(?:%s)(?![A-Za-z0-9._-])"
+                        % "|".join(sorted(map(re.escape, names))),
+                        re.I) if names else None
+        last = None
+        for m in rows[cur:]:
+            text = m.get("text")
+            if not isinstance(text, str) or not text or m.get("react"):
+                continue
+            if (m.get("origin") in seats.OWNER_RAILS
+                    and str(m.get("from") or "").lower() in names):
+                continue
+            out["owner_unread"] += 1
+            if rx and rx.search(text):
+                out["owner_mentions"] += 1
+                last = m
+        if last is not None:
+            out["owner_mention_last"] = "%s|%s" % (last.get("ts") or "",
+                                                   last.get("from") or "")
+            out["owner_mention_preview"] = "%s: %s" % (
+                last.get("from") or "?", (last.get("text") or "")[:120])
+        return out
+    except Exception:
+        return {"owner_read": 0, "owner_unread": 0, "owner_mentions": 0}
+
 
 def _api_chat(qs):
     """Poll read: rows after ?since= (count already seen) + the new total +
     the transport truth (signed/unsigned + chain head — the panel's tick and
-    strip). The panel polls this every ~2s while open; since past the end
-    resets. Rows include reaction rows; the client aggregates."""
+    strip) + the owner-unread signal (_owner_signal — the nav badge on EVERY
+    tab). The panel polls this every ~2s; since past the end resets. Rows
+    include reaction rows; the client aggregates."""
     try:
         since = int(_q1(qs, "since", "0"))
     except ValueError:
@@ -683,11 +755,26 @@ def _api_chat(qs):
     try:
         from . import chat
         room = _q1(qs, "room", "main")
-        msgs, total = chat.read(room, since)
-        return {"room": room, "lines": msgs, "total": total,
-                "transport": chat.transport_status()}, 200
+        rows, total = chat.read(room)   # one read serves the slice AND the signal
+        out = {"room": room, "lines": rows[since if 0 <= since <= total else 0:],
+               "total": total, "transport": chat.transport_status()}
+        out.update(_owner_signal(room, rows))
+        return out, 200
     except Exception:
         return {"unavailable": True}, 200
+
+
+def _api_chat_read_post(payload):
+    """The owner's read-ack: the chat view is open and visible, everything
+    rendered — advance the owner-read cursor to the room's end. The mirror of
+    chat.mark_owner_unread's direction, owned HERE (chat.py stays the agents'
+    module). Count + newest row id, so rotation cannot strand it."""
+    from . import chat, pk
+    room = str(payload.get("room") or "main")
+    rows, total = chat.read(room)
+    pk.write_json(_owner_read_path(room),
+                  {"n": total, "rid": rows[-1].get("id") if rows else None})
+    return {"ok": True, "room": room, "owner_read": total}, 200
 
 
 def _chat_profile():
@@ -952,6 +1039,7 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
     "/api/configs/restore": _api_configs_restore_post,
     "/api/chat": _api_chat_post,
     "/api/chat/react": _api_chat_react,
+    "/api/chat/read": _api_chat_read_post,
 }
 
 
