@@ -266,7 +266,7 @@ def teacher_name():
     """HELM_ACTOR else the hook session else the login user — the events
     journal's actor resolution, so receipts and provenance agree."""
     import getpass
-    return os.environ.get("HELM_ACTOR") or os.environ.get("CLAUDE_SESSION_ID") \
+    return os.environ.get("HELM_ACTOR") or home.session_id() \
         or getpass.getuser()
 
 

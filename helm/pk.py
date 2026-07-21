@@ -102,8 +102,9 @@ def event(verb, target, summary, actor=None):
     store. The fire-ledger's HARD LAWS apply: O(1) (one stat + one append, never a read),
     5MB one-generation rotation (-> .1), FAIL-OPEN — journal trouble must never
     block or fail the write it describes. actor: explicit arg, else
-    $HELM_ACTOR, else $CLAUDE_SESSION_ID (the hook session), else 'cli'."""
+    $HELM_ACTOR, else the harness session id (home.session_id()), else 'cli'."""
     import json
+    from . import home            # local: pk stays free of a home import cycle
     try:
         path = events_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -114,7 +115,7 @@ def event(verb, target, summary, actor=None):
             pass  # no journal yet
         row = {"v": 1, "ts": now_ts(),
                "actor": actor or os.environ.get("HELM_ACTOR")
-               or os.environ.get("CLAUDE_SESSION_ID") or "cli",
+               or home.session_id() or "cli",
                "verb": str(verb), "target": str(target),
                "summary": str(summary)[:200]}
         with open(path, "a", encoding="utf-8") as f:

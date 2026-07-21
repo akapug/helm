@@ -21,7 +21,8 @@ os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 from helm import drain, home, pk, store  # noqa: E402
 
 TS = "2026-07-19T00:00:00Z"
-ENV_KEYS = ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_ACTOR", "CLAUDE_SESSION_ID")
+ENV_KEYS = ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_ACTOR",
+            "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID")
 
 
 class EventsBase(unittest.TestCase):

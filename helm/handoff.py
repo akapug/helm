@@ -365,7 +365,7 @@ def cmd_handoff(args):
             except Exception:
                 pass
             return 0
-        sid = session or os.environ.get("CLAUDE_SESSION_ID")
+        sid = session or home.session_id()
         path = check(sid, os.getcwd(), None)
         if path:
             print("helm handoff: contract satisfied — %s (%s old)"
@@ -388,7 +388,7 @@ def cmd_handoff(args):
             print("helm handoff: no registry project claims this cwd — pass "
                   "--project <name>", file=sys.stderr)
             return 1
-        sid = session or os.environ.get("CLAUDE_SESSION_ID")
+        sid = session or home.session_id()
         path, missing = write_entry(text, proj, sid)
         if missing:
             print("helm handoff: WARNING no %s section parsed — the contract "
@@ -437,7 +437,7 @@ def cmd_now(args):
             d = _hook(sys.stdin.read())
             sid = str(d.get("session_id") or "") or None
             cwd = str(d.get("cwd") or "") or cwd
-        sid = sid or session or os.environ.get("CLAUDE_SESSION_ID")
+        sid = sid or session or home.session_id()
         path = capture(sid, cwd)
         if hook:
             return 0  # a safety net is silent and never blocks
