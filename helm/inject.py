@@ -729,19 +729,22 @@ def _explain(text, project=None, session=None):
     if who:  # gather's exact atomic walk: the digest leads or drops whole
         w = sum(len(l) for l in who)
         if w > PINNED_BUDGET:
-            print("  - %s (over budget)" % WHO_ID)
+            print("  - %s (over budget) ← know-your-user" % WHO_ID)
         else:
             used = w
-            for l in who:
-                print("  + " + l)
+            for i, l in enumerate(who):
+                print("  + " + l + (" ← know-your-user" if i == 0 else ""))
     for e in pinned_entries:
         line = _entry_line(e)
         cut = cut or used + len(line) > PINNED_BUDGET  # greedy walk: first overflow ends the lane
+        # discovery attribution: every explain line names the ROOT it came
+        # from (adopted / helm-global / adopted-project / project) — the tag
+        # is explain-only decoration, never part of the budget arithmetic
         if cut:
-            print("  - %s (over budget)" % e["id"])
+            print("  - %s (over budget) ← %s" % (e["id"], e.get("root") or "?"))
         else:
             used += len(line)
-            print("  + " + line)
+            print("  + %s ← %s" % (line, e.get("root") or "?"))
     if jit_all:
         print("jit (%d hit%s, cap %d):" % (len(jit_all), "s"[:len(jit_all) != 1], JIT_CAP))
     rank = 0
@@ -750,17 +753,24 @@ def _explain(text, project=None, session=None):
         why = " ".join("%s=%.3f" % (p, 1.0 / df[p]) for p in matched)
         score = e["confidence"] * sum(1.0 / df[p] for p in matched)
         rec = seen["fired"].get(str(e["id"])) if seen else None
+        root = e.get("root") or "?"
         if _cooled(rec, turn, score):
-            print("  - %s (cooldown, fired %dt ago)" % (e["id"], turn - rec[0]))
+            print("  - %s (cooldown, fired %dt ago) ← %s"
+                  % (e["id"], turn - rec[0], root))
             continue
         mark, over = ("  + ", "") if rank < JIT_CAP else ("  - ", " (over cap)")
         rank += 1
-        print(mark + str(e["id"]) + " [matched: " + why + "] score %.3f" % score + over)
+        print(mark + str(e["id"]) + " [matched: " + why + "] score %.3f" % score
+              + over + " ← " + root)
     fired_reflex = reflex.fire(text, project=project, session=session, persist=False)
     if fired_reflex:
         print("reflex:")
     for e in fired_reflex:
-        print("  + %s [%s]: %s" % (e["id"], e.get("signal") or "prompt", e["steer"]))
+        p = e.get("path") or ""  # _global/reflexes vs a project's sibling dir
+        origin = "project" if p and not p.startswith(home.global_dir() + os.sep) \
+            else "helm-global"
+        print("  + %s [%s] ← %s: %s" % (e["id"], e.get("signal") or "prompt",
+                                        origin, e["steer"]))
     if not (wd or who or pinned_entries or jit_all or fired_reflex):
         print("silent turn — nothing fires (salience law)")
     cb = _active_compare()  # read-only status; nothing is queried in a dry look

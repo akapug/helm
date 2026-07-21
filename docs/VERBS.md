@@ -202,7 +202,10 @@ harness hook's full JSON on stdin instead (`prompt`/`cwd`/`session_id`),
 derives `--project` from the cwd (longest registry-path prefix, global-only
 fallback) and stamps the session onto the fire-ledger row; malformed JSON
 injects nothing, rc 0 (fail-open). `--explain` shows what would fire and why
-(plus the derived `[scope: …]`), writing no ledger row and mutating no state.
+(plus the derived `[scope: …]`), writing no ledger row and mutating no state;
+every line carries its discovery attribution — `← adopted | helm-global |
+adopted-project | project` (reflexes: `← helm-global | project`) — so a fired
+line traces to its file's home at a glance.
 
 With a session, the habituation guard extends to the JIT lane: a fired entry
 **cools down** for 15 turns of that session (state per session under

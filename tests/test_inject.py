@@ -331,6 +331,19 @@ class LedgerTest(InjectBase):
         self.assertIn("PREMISE pin-a: always truth", out)
         self.assertEqual(err, "")
 
+    def test_explain_names_the_root_per_line(self):
+        """Discovery attribution: every explain line says which STORE ROOT it
+        came from (adopted / helm-global / project) — the owner can trace a
+        fired line to its file's home at a glance."""
+        self.plant_pinned("pin-a", "always truth")
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        from helm import store
+        root = store.pinned()[0]["root"]
+        rc, out, _ = self.run_inject(["--explain"], stdin_text="tune the fluxcap")
+        self.assertEqual(rc, 0)
+        self.assertIn("+ PREMISE pin-a: always truth \u2190 %s" % root, out)
+        self.assertRegex(out, r"\+ jit-a \[matched: .*\] score [0-9.]+ \u2190 " + root)
+
     def test_explain_prints_why_and_writes_no_ledger(self):
         rc, out, _ = self.run_inject(["--explain"], stdin_text="nothing here")
         self.assertEqual(rc, 0)
