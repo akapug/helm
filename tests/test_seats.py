@@ -445,6 +445,146 @@ class WaitTest(SeatsBase):
         self.assertIn("newest", line)
 
 
+class MultiRoomTest(SeatsBase):
+    """Slice 5 (multi-room deliver) + its beacon half: an @mention or an
+    owner-rail post in ANY room must reach the seat — the owner's live
+    helm-dogfood '@opus-integrator …' post woke nothing because both the
+    beacon and the boundary lane were main-scoped (2026-07-21)."""
+
+    def test_mention_in_never_joined_room_wakes_the_beacon(self):
+        """THE bug's reproduction: seat x's only activity is in team-x, a
+        room it never joined — its `wait --follow` beacon must still stream
+        the mention, and the same session's boundary must not re-nudge."""
+        seats.join(session="s-x", seat="x", cwd="/tmp/p")
+        chat.post("@x cross-room ping", who="bob", room="team-x")
+        captured = []
+        line = seats.wait(seat="x", session="s-x", follow=True,
+                          timeout=0.15, poll=0.01, emit=captured.append)
+        self.assertIsNone(line)                # --follow returns only on timeout
+        self.assertEqual(len(captured), 1)
+        self.assertIn("cross-room ping", captured[0])
+        self.assertIn("#team-x", captured[0])  # the wake names the channel
+        # consumed on THIS session's per-room cursor — no double delivery
+        self.assertIsNone(seats.deliver_any(session="s-x", seat="x"))
+
+    def test_boundary_hook_delivers_cross_room(self):
+        seats.join(session="s-h", seat="hx", cwd="/tmp/p")
+        chat.post("@hx in the side channel", who="bob", room="side")
+        payload = json.dumps({"session_id": "s-h"}).encode()
+        rc, out = self.cmd_fd("deliver", ["--hook-json"], stdin=payload)
+        self.assertEqual(rc, 0)
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("in the side channel", ctx)
+        self.assertIn("#side", ctx)
+        rc, out = self.cmd_fd("deliver", ["--hook-json"], stdin=payload)
+        self.assertEqual(out, "")              # nothing left — no re-nudge
+
+    def test_owner_rail_post_in_side_room_delivers_without_mention(self):
+        seats.join(session="s-o", seat="oz", cwd="/tmp/p")
+        chat.post("all hands", who="david", origin="web", room="announce")
+        line = seats.deliver_any(session="s-o", seat="oz")
+        self.assertIn("david: all hands", line)
+        self.assertIn("#announce", line)
+
+    def test_primary_room_first_one_nudge_per_boundary_no_loss(self):
+        """Main outranks the side rooms, one row per boundary, and nothing
+        double-delivers or vanishes across the scan order."""
+        seats.join(session="s-p", seat="p", cwd="/tmp/p")
+        chat.post("@p in team", who="bob", room="team-x")
+        chat.post("@p in main", who="bob")
+        self.assertIn("in main", seats.deliver_any(session="s-p", seat="p"))
+        self.assertIn("in team", seats.deliver_any(session="s-p", seat="p"))
+        self.assertIsNone(seats.deliver_any(session="s-p", seat="p"))
+
+    def test_cross_room_waiting_pointer_names_the_room(self):
+        seats.join(session="s-w2", seat="w2", cwd="/tmp/p")
+        chat.post("@w2 one", who="bob", room="dog")
+        chat.post("@w2 two", who="bob", room="dog")
+        line = seats.deliver_any(session="s-w2", seat="w2")
+        self.assertIn("(+1 waiting", line)
+        self.assertIn("helm chat read --room dog", line)
+
+    def test_join_baselines_existing_rooms_pre_join_backlog_never_floods(self):
+        chat.post("@z ancient word", who="bob", room="dust")   # before z joins
+        seats.join(session="s-z", seat="z", cwd="/tmp/p")
+        self.assertIsNone(seats.deliver_any(session="s-z", seat="z"))
+        chat.post("@z fresh word", who="bob", room="dust")     # post-join news
+        self.assertIn("fresh word", seats.deliver_any(session="s-z", seat="z"))
+
+    def test_untracked_seat_never_backfills_foreign_history(self):
+        """A seat with no cursor anywhere (reaped / pre-install self-heal)
+        EOF-baselines every room — the backfill law is for TRACKED seats
+        meeting a room born after their join, never a backlog flood."""
+        chat.post("@ghost old word", who="bob", room="attic")
+        self.assertIsNone(seats.deliver_any(session="s-g", seat="ghost"))
+        chat.post("@ghost new word", who="bob", room="attic")
+        self.assertIn("new word", seats.deliver_any(session="s-g", seat="ghost"))
+
+    def test_follow_streams_matches_from_multiple_rooms(self):
+        seats.join(session="s-m", seat="m", cwd="/tmp/p")
+        chat.post("@m alpha", who="bob")                       # main
+        chat.post("@m beta", who="bob", room="team-x")
+        chat.post("chatter, no mention", who="bob", room="team-x")
+        captured = []
+        seats.wait(seat="m", session="s-m", follow=True, timeout=0.15,
+                   poll=0.01, emit=captured.append)
+        self.assertEqual(len(captured), 2)
+        both = " || ".join(captured)
+        self.assertIn("alpha", both)
+        self.assertIn("beta", both)
+        self.assertNotIn("chatter", both)                      # noise law holds
+
+    def test_conamed_sessions_fan_out_cross_room(self):
+        """Per (seat, room, session) cursors: BOTH co-named sessions see the
+        side-room mention, each exactly once."""
+        seats.join(session="s-one", seat="fab", cwd="/tmp/p")
+        seats.join(session="s-two", seat="fab", cwd="/tmp/p")
+        chat.post("@fab ship it", who="bob", room="team-fab")
+        self.assertIn("ship it", seats.deliver_any(session="s-one", seat="fab"))
+        self.assertIn("ship it", seats.deliver_any(session="s-two", seat="fab"))
+        self.assertIsNone(seats.deliver_any(session="s-one", seat="fab"))
+        self.assertIsNone(seats.deliver_any(session="s-two", seat="fab"))
+
+    def test_stop_guard_blocks_on_cross_room_pending(self):
+        seats.join(session="s-sg", seat="sg", cwd="/tmp/p")
+        chat.post("@sg review the team-x branch", who="bob", room="team-x")
+        rc, _o, err = self.cmd(
+            "stop-guard", ["--hook-json", "--seat", "sg"],
+            stdin=json.dumps({"session_id": "s-sg"}).encode())
+        self.assertEqual(rc, 2)
+        self.assertIn("undelivered", err)
+        self.assertIn("[#team-x]", err)               # the row names its room
+        self.assertIn("review the team-x branch", err)
+        # the gate never consumed it — the lane still delivers afterwards
+        self.assertIn("review the team-x branch",
+                      seats.deliver_any(session="s-sg", seat="sg"))
+
+    def test_roster_report_counts_cross_room_pending(self):
+        seats.join(session="s-rr", seat="rr", cwd="/tmp/p")
+        chat.post("@rr main one", who="bob")
+        chat.post("@rr dogfood two", who="bob", room="helm-dogfood")
+        rep = seats.roster_report("main")
+        s = [x for x in rep["seats"] if x["seat"] == "rr"][0]
+        self.assertEqual(s["pending"], 2)
+        # the report moved nothing — both rows still deliver, in scan order
+        self.assertIn("main one", seats.deliver_any(session="s-rr", seat="rr"))
+        self.assertIn("dogfood two", seats.deliver_any(session="s-rr", seat="rr"))
+
+    def test_scan_rooms_bounded_primary_first_newest_win(self):
+        chat.post("seed", who="bob")                           # main exists
+        n = seats.ROOM_SCAN_CAP + 4
+        now = time.time()
+        for i in range(n):
+            chat.post("x", who="bob", room="r%02d" % i)
+            p = chat.room_path("r%02d" % i)
+            os.utime(p, (now - 1000 + i, now - 1000 + i))      # r00 oldest
+        rooms = seats._scan_rooms("main")
+        self.assertEqual(rooms[0], "main")
+        self.assertEqual(len(rooms), seats.ROOM_SCAN_CAP)      # the bound
+        self.assertIn("r%02d" % (n - 1), rooms)                # newest kept
+        self.assertNotIn("r00", rooms)                         # oldest dropped
+
+
 class AutoNameTest(SeatsBase):
     """G-stable-names: an un-named join gets a MEANINGFUL stable auto-name
     (project+family, deduped) instead of opaque agent-<sid8> hex."""

@@ -73,6 +73,17 @@ rid to suppress the retained overlap (duplicates acceptable, loss is not).
 All cursor transitions serialize on `<room>.cursor.<seat>.lock`; rows are
 selected/committed by byte offset from ONE fstat'd fd, never by line count.
 Initialized at JOIN. Every hook-facing path is FAIL-OPEN TOTAL.
+
+MULTI-ROOM (slice 5 — the owner's live helm-dogfood '@opus-integrator' post
+woke nothing, 2026-07-21): the lane is not main-scoped. deliver_any (the
+PostToolUse hook) and the wait --follow beacon consider EVERY live room —
+primary first, then newest-activity rooms, ROOM_SCAN_CAP-bounded — with the
+same per (seat, room, session) cursor mechanics per room. A TRACKED seat
+meeting a cursor-less room BACKFILLS from offset 0 (a room born after its
+join is all post-join news — the mention that created the channel must
+deliver); an untracked seat keeps the EOF self-heal everywhere (pre-join
+backlog never floods). join baselines every existing room; stop-guard and
+the roster report read pending across the same bounded scan.
 """
 import getpass
 import json
@@ -88,7 +99,8 @@ MAX_BYTES = 200          # the delivery clip — meld's whisper frame budget
 PREVIEW_CHARS = 80       # roster panel preview
 FRESH_S, QUIET_S = 120, 900
 DEFAULT_TTL = 900        # claims lease default
-SCAN_CAP = 512 * 1024    # deliver never reads more than this per boundary
+SCAN_CAP = 512 * 1024    # deliver never reads more than this per room
+ROOM_SCAN_CAP = 16       # rooms per boundary/beacon pass — the multi-room bound
 OWNER_RAILS = ("web", "tui")  # server-side owner surfaces stamp these origins
 _BROADCAST = re.compile(r"(?<![A-Za-z0-9._-])@(all|fleet|everyone)(?![A-Za-z0-9._-])", re.I)
 
@@ -453,12 +465,16 @@ def _write_cursor(room, seat, dev, ino, off, rid, session=None):
                   {"dev": dev, "ino": ino, "off": off, "rid": rid})
 
 
-def _init_cursor(room, seat, session=None):
+def _init_cursor(room, seat, session=None, at_start=False):
     """Baseline at the CURRENT end of room — at JOIN time (codex H5.5), so
     everything posted after session start delivers at the first boundary.
     A fresh SESSION cursor inherits the seat-level baseline when one exists
     (pre-split installs tracked the seat file; those rows must not be
     skipped by an EOF re-baseline — loss is the one forbidden outcome).
+    at_start=True baselines at OFFSET 0 instead (multi-room: a room born
+    after the seat joined is all post-join news — the mention that created
+    the channel must deliver, not vanish under an EOF baseline), still
+    binding the room file's identity so rotation detection holds.
     -> True iff the baseline was inherited (already-tracked ground)."""
     if session:
         base = _cursor(room, seat)
@@ -468,8 +484,8 @@ def _init_cursor(room, seat, session=None):
             return True
     try:
         st = os.stat(chat.room_path(room))
-        _write_cursor(room, seat, st.st_dev, st.st_ino, st.st_size, None,
-                      session=session)
+        _write_cursor(room, seat, st.st_dev, st.st_ino,
+                      0 if at_start else st.st_size, None, session=session)
     except OSError:
         _write_cursor(room, seat, None, None, 0, None, session=session)
     return False
@@ -525,10 +541,52 @@ def _tail(room, cur):
     return st.st_dev, st.st_ino, base, entries
 
 
-def deliver(session=None, room="main", seat=None, emit=None, cwd=None):
-    """The tool-boundary nudge: at most ONE deliverable row, oldest first;
-    later matches stay PENDING (their count shows, their cursor ground is
-    not consumed — codex H6). Returns the label line or None.
+def _scan_rooms(primary="main"):
+    """Every room the delivery lane considers, bounded: the primary room
+    first (whether or not its file exists yet), then the other live rooms
+    (chat.list_rooms()) newest-activity-first up to ROOM_SCAN_CAP total —
+    under the cap the ACTIVE channels win, and each room's read is already
+    SCAN_CAP-bounded. Fail-open: an unlistable dir is just the primary."""
+    try:
+        names = chat.list_rooms()
+    except OSError:
+        names = []
+    prim = pk.slug(primary)
+    others = [n for n in names if n != prim]
+    if others:
+        def mtime(n):
+            try:
+                return os.stat(chat.room_path(n)).st_mtime
+            except OSError:
+                return 0.0
+        others.sort(key=mtime, reverse=True)
+    return [primary] + others[:ROOM_SCAN_CAP - 1]
+
+
+def _room_dirty(room, seat, session=None):
+    """Lock-free precheck: could `room` hold rows past the (seat, session)
+    cursor? A missing cursor is dirty (a room this seat has never looked
+    at). Otherwise ONE stat against the atomically-written cursor: same
+    file identity and size == off ⇒ clean. False positives are fine
+    (deliver re-checks under the lock); a false negative cannot happen —
+    an append grows the size, a rotation/replacement changes the inode.
+    This keeps the every-tool-call hot path at ~one stat per quiet room."""
+    cur = _cursor(room, seat, session) or _cursor(room, seat)
+    if cur is None:
+        return True
+    try:
+        st = os.stat(chat.room_path(room))
+    except OSError:
+        return False                        # no room file: nothing to deliver
+    return (st.st_dev, st.st_ino) != (cur.get("dev"), cur.get("ino")) \
+        or st.st_size != cur.get("off")
+
+
+def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
+            backfill=False):
+    """The tool-boundary nudge, ONE room: at most ONE deliverable row, oldest
+    first; later matches stay PENDING (their count shows, their cursor ground
+    is not consumed — codex H6). Returns the label line or None.
 
     At-least-once (codex H7): when `emit` is given it is called with the
     line BEFORE the cursor commits; emit must do its one unbuffered write.
@@ -536,7 +594,11 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None):
 
     Fan-out: the cursor is per (seat, session) — every co-named session sees
     the same @mention on its own boundary; consuming here never starves a
-    sibling session (at-most-once BETWEEN co-named sessions was the bug)."""
+    sibling session (at-most-once BETWEEN co-named sessions was the bug).
+
+    backfill=True (deliver_any's tracked-seat path) makes a MISSING cursor
+    baseline at offset 0 and scan THIS boundary — the multi-room law for a
+    room born after the seat joined; default keeps the EOF self-heal."""
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
     touch_seen(seat)                       # presence FIRST — a seat muted by the
     if (home.env("CHAT_DELIVER") or "").lower() in ("0", "off", "no"):
@@ -545,10 +607,10 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None):
     with _flocked(cursor_path(room, seat, session) + ".lock"):
         cur = _cursor(room, seat, session)
         if cur is None:
-            inherited = _init_cursor(room, seat, session)  # pre-install self-heal
+            inherited = _init_cursor(room, seat, session, at_start=backfill)
             if session and seat_for_session(session) is None:
                 write_roster(seat, session=session)
-            if not inherited:
+            if not inherited and not backfill:
                 return None       # fresh EOF baseline: backlog never floods
             cur = _cursor(room, seat, session)  # already-tracked ground —
             if cur is None:                     # deliver from it THIS boundary
@@ -571,15 +633,46 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None):
         i, row, end = hit
         waiting = sum(1 for r, _e in entries[i + 1:]
                       if r is not None and deliverable(r, seat))
-        line = "[helm chat → %s] %s: %s" % (
-            seat, row.get("from") or "?", _clip(_scrub(row.get("text") or "")))
+        where = "" if room == "main" else " #%s" % room   # name the channel —
+        line = "[helm chat%s → %s] %s: %s" % (            # the reply must land
+            where, seat, row.get("from") or "?",          # where the word came
+            _clip(_scrub(row.get("text") or "")))
         if waiting:
-            line += " (+%d waiting — helm chat read)" % waiting
+            line += " (+%d waiting — helm chat read%s)" % (
+                waiting, "" if room == "main" else " --room %s" % room)
         if emit is not None:
             emit(line)                  # output FIRST …
         _write_cursor(room, seat, dev, ino, end, row.get("id"),
                       session=session)  # … commit after
         return line
+
+
+def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main"):
+    """The MULTI-ROOM boundary nudge (slice 5 — what the PostToolUse hook and
+    the beacon actually call): one deliverable row per boundary from the
+    first room that has one — the primary room first, then the rest of
+    _scan_rooms' bounded, newest-activity-first list. An @mention in a
+    channel the seat never joined must wake it (the owner's helm-dogfood
+    '@opus-integrator' post, live 2026-07-21), so a TRACKED seat — it holds
+    a primary-room cursor — meeting a cursor-less room BACKFILLS from offset
+    0: a room born after its join is all post-join news. An UNtracked seat
+    (never joined / reaped / pre-install) keeps the EOF self-heal everywhere:
+    pre-join backlog never floods. Scanning a clean room advances only that
+    room's cursor; a hit STOPS the scan, so later rooms keep their pending
+    for the next boundary (one nudge per boundary — the budget stays flat).
+    Exceptions propagate exactly like deliver's (H7: an emit that died must
+    not commit); every caller already wraps fail-open."""
+    seat = seat or seat_for_session(session) or derive_seat(session, cwd)
+    touch_seen(seat)          # presence even when every room is quiet
+    tracked = (_cursor(room, seat, session) or _cursor(room, seat)) is not None
+    for r in _scan_rooms(room):
+        if not _room_dirty(r, seat, session):
+            continue
+        line = deliver(session=session, room=r, seat=seat, emit=emit, cwd=cwd,
+                       backfill=tracked and r != room)
+        if line:
+            return line
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -592,21 +685,24 @@ def join(session=None, cwd=None, seat=None, room="main"):
     idle-wake beacon as a mandatory FIRST action — a self-armed Monitor is the
     only thing that can wake an idle PTY agent (native-wake-only-agent-armed),
     so a SessionStart directive is the strongest enforcement available.
-    Idempotent per seat."""
+    Idempotent per seat. Baselines a cursor in EVERY live room (bounded by
+    _scan_rooms) so pre-join backlog never floods anywhere AND deliver_any
+    can read a later cursor-less room as born-after-join (backfill)."""
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
     write_roster(seat, session=session, cwd=cwd)
-    if _cursor(room, seat, session) is None:
-        with _flocked(cursor_path(room, seat, session) + ".lock"):
-            if _cursor(room, seat, session) is None:
-                _init_cursor(room, seat, session)
-    if session and _cursor(room, seat) is None:
-        # the seat-level baseline too: sessionless callers (bare CLI wait/
-        # deliver) must not start blind just because the join was hook-keyed
-        with _flocked(cursor_path(room, seat) + ".lock"):
-            if _cursor(room, seat) is None:
-                _init_cursor(room, seat)
+    for r in _scan_rooms(room):
+        if _cursor(r, seat, session) is None:
+            with _flocked(cursor_path(r, seat, session) + ".lock"):
+                if _cursor(r, seat, session) is None:
+                    _init_cursor(r, seat, session)
+        if session and _cursor(r, seat) is None:
+            # the seat-level baseline too: sessionless callers (bare CLI wait/
+            # deliver) must not start blind just because the join was hook-keyed
+            with _flocked(cursor_path(r, seat) + ".lock"):
+                if _cursor(r, seat) is None:
+                    _init_cursor(r, seat)
     line = ("[helm chat] you are seat '%s' in room %s — @%s and owner posts "
-            "reach you between tool calls; speak: helm chat post; catch up: "
+            "in ANY room reach you between tool calls; speak: helm chat post; catch up: "
             "helm chat read. MANDATORY FIRST ACTION: arm your inbox beacon so "
             "you wake on an @%s mention or an owner post even while idle — "
             "Monitor(command: \"helm chat wait --seat %s --follow\", "
@@ -638,7 +734,12 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
     reusing the delivery address filter (mentions of the seat + owner posts),
     and returns only on timeout (a persistent Monitor passes no timeout, so it
     runs forever). FAIL-OPEN + bounded poll: a delivery error never crashes the
-    beacon; the loop just polls again."""
+    beacon; the loop just polls again.
+
+    MULTI-ROOM: seat mode rides deliver_any — `room` is the PRIMARY room, and
+    a matching row in ANY live room (a channel the seat never joined included)
+    wakes the seat, per-room cursor per (seat, room, session) so the boundary
+    hook and the beacon never double-deliver. --any stays one room's tap."""
     poll = chat.POLL_S if poll is None else poll
     deadline = time.time() + timeout if timeout else None
     # the ambient session (CLI leg passes _env_session()) keys the SAME
@@ -664,9 +765,9 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
             since = total
         else:
             while True:                     # drain all currently-matching rows
-                try:
-                    line = deliver(session=session, room=room, seat=seat,
-                                   emit=stream)
+                try:                        # across EVERY room (multi-room)
+                    line = deliver_any(session=session, seat=seat,
+                                       emit=stream, room=room)
                 except Exception:
                     line = None             # fail-open: never crash the beacon
                 if not line:
@@ -704,16 +805,36 @@ def _stop_fp_path(room, seat, session=None):
     return "%s.%s" % (p, s8) if s8 else p
 
 
-def _pending_rows(room, seat, session=None):
+def _pending_rows(room, seat, session=None, backfill=False):
     """Deliverable rows past the (seat, session) cursor WITHOUT consuming
     them — roster_report's read pattern (the cursor never moves here; the
     stop-guard is a gate, not a delivery). Falls back to the seat-level
-    cursor when the session has none yet (pre-install sessions)."""
+    cursor when the session has none yet (pre-install sessions). backfill
+    mirrors deliver_any's tracked-seat law: a cursor-less room reads from
+    offset 0 — the gate and the lane must agree on what is pending."""
     cur = _cursor(room, seat, session) or _cursor(room, seat)
-    got = _tail(room, cur) if cur else None
+    if cur is None:
+        if not backfill:
+            return []
+        cur = {"off": 0}
+    got = _tail(room, cur)
     if not got:
         return []
     return [r for r, _e in got[3] if r is not None and deliverable(r, seat)]
+
+
+def _pending_all(room, seat, session=None):
+    """[(room, row)] pending across the bounded room scan, cursors untouched
+    — the stop-guard's and roster report's multi-room truth. Same tracked/
+    backfill rule as deliver_any, same _room_dirty fast path per room."""
+    tracked = (_cursor(room, seat, session) or _cursor(room, seat)) is not None
+    out = []
+    for r in _scan_rooms(room):
+        if not _room_dirty(r, seat, session):
+            continue
+        out.extend((r, row) for row in _pending_rows(
+            r, seat, session, backfill=tracked and r != room))
+    return out
 
 
 def _off(name):
@@ -742,11 +863,12 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
     blocks, warns, pending = [], [], []
 
     if not _off("STOP_GUARD_INBOX"):
-        pending = _pending_rows(room, seat, session)
+        pending = _pending_all(room, seat, session)   # EVERY room's inbox gates
         if pending:
             import hashlib
             fp = hashlib.blake2b(
-                "|".join(str(r.get("id") or chat.rkey(r)) for r in pending)
+                "|".join("%s:%s" % (rm, r.get("id") or chat.rkey(r))
+                         for rm, r in pending)
                 .encode("utf-8"), digest_size=16).hexdigest()
             fpp = _stop_fp_path(room, seat, session)
             try:
@@ -760,9 +882,10 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
                     pk.atomic_write(fpp, fp)
                 except OSError:
                     pass  # latch write failing must not kill the guard
-                lines = ["  %s: %s" % (r.get("from") or "?",
-                                       _clip(_scrub(r.get("text") or ""), 120))
-                         for r in pending[:5]]
+                lines = ["  %s%s: %s" % (
+                    "" if rm == room else "[#%s] " % rm, r.get("from") or "?",
+                    _clip(_scrub(r.get("text") or ""), 120))
+                         for rm, r in pending[:5]]
                 if len(pending) > 5:
                     lines.append("  ... %d more" % (len(pending) - 5))
                 blocks.append(
@@ -981,17 +1104,14 @@ def roster_report(room="main"):
     reap_roster()
     seats = []
     for seat, row in sorted(roster().items()):
-        # pending reads the row's newest session cursor (hook joins are
-        # session-keyed), falling back to the seat-level file (bare CLI).
-        cur = _cursor(room, seat, row.get("session")) or _cursor(room, seat)
-        pending, preview = 0, None
-        got = _tail(room, cur) if cur else None
-        if got:
-            rows = [r for r, _e in got[3] if r is not None]
-            hits = [r for r in rows if deliverable(r, seat)]
-            pending = len(hits)
-            if hits:
-                preview = _scrub(hits[-1].get("text") or "")[:PREVIEW_CHARS]
+        # pending is the MULTI-ROOM truth (the owner's panel must show a
+        # helm-dogfood mention, not just main), read off the row's newest
+        # session cursor (hook joins are session-keyed) with the seat-level
+        # fallback — cursors never move here.
+        hits = _pending_all(room, seat, session=row.get("session"))
+        pending, preview = len(hits), None
+        if hits:
+            preview = _scrub(hits[-1][1].get("text") or "")[:PREVIEW_CHARS]
         ls = last_seen(seat, row)
         seats.append({"seat": seat, "session": row.get("session"),
                       "project": row.get("project"), "cwd": row.get("cwd"),
@@ -1062,8 +1182,8 @@ def cmd(verb, args, room="main"):
                 d = _hook_stdin()
                 session, cwd = d.get("session_id"), d.get("cwd")
             emit = _hook_emit("PostToolUse") if "--hook-json" in args else print
-            deliver(session=session, room=room, seat=_flag(args, "--seat"),
-                    emit=emit, cwd=cwd)
+            deliver_any(session=session, room=room,   # every room, one nudge
+                        seat=_flag(args, "--seat"), emit=emit, cwd=cwd)
         except Exception:
             pass                    # fail-open: never hold a tool boundary
         return 0

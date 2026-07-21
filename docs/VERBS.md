@@ -1083,17 +1083,29 @@ frames; this lane is called *delivery*.)
   first, the rest collapse to `+N waiting`), 200-byte clip on a codepoint
   boundary, control-char scrub, labeled information-not-instruction. What
   delivers: `@seat` / `@all` mentions and owner posts (`HELM_CHAT_OWNER_NAMES`);
-  agent chatter without a mention never does (noise law). Every fire
+  agent chatter without a mention never does (noise law). **Multi-room**: the
+  boundary considers EVERY live channel — main first, then the
+  newest-activity rooms, bounded (16 rooms/pass, each read SCAN_CAP-capped) —
+  so an @mention in a room the seat never joined delivers, labeled with its
+  channel (`[helm chat #room → seat]`, `+N waiting — helm chat read --room R`).
+  A tracked seat meeting a room born after its join backfills from the
+  room's birth; an untracked seat EOF-baselines everywhere (pre-join backlog
+  never floods). Every fire
   refreshes the seat's roster `last_seen` — presence needs no daemon. The
-  hot path is one stat; `HELM_CHAT_DELIVER=0` kills the lane; fail-open
-  total. The owner-unread marker is untouched (only a real read consumes it).
+  hot path is ~one stat per quiet room; `HELM_CHAT_DELIVER=0` kills the lane;
+  fail-open total. The owner-unread marker is untouched (only a real read
+  consumes it).
 - **`helm chat wait [--seat S] [--any] [--follow] [--timeout N]`** — the
   beacon: block until the next word addressed to the seat (a delivery — it
   advances the cursor, so the hook never re-nudges), or any new row with
   `--any` (cursor untouched). **`--follow`** is the idle-wake mode the join
   directive arms: it never returns on a match — it streams EACH new matching
   row as one line (one line = one agent wake), reusing the delivery address
-  filter (seat mentions + owner posts), and returns only on `--timeout`. A
+  filter (seat mentions + owner posts), and returns only on `--timeout`. Seat
+  mode (single-shot and `--follow` both) watches **every room** — a mention
+  in a channel the seat never joined wakes it, per-room cursor per (seat,
+  room, session) so the beacon and the boundary hook never double-deliver
+  (`--any` stays one room's tap). A
   persistent Monitor armed on `wait --follow` is meld's SSE watcher, natively;
   fail-open + bounded poll, so a delivery hiccup never crashes the beacon.
 - **`helm chat stop-guard [--hook-json] [--seat S]`** — the IDLE GATE (Stop
@@ -1101,7 +1113,8 @@ frames; this lane is called *delivery*.)
   once, checks run inline, and ALL blocking messages surface in ONE exit-2
   (fix everything in one shot); WARN lines ride along without changing the
   exit. Checks: **BLOCK** on undelivered @mentions/owner rows past the seat's
-  cursor — listed compactly, once per pending-fingerprint (a re-stop on the
+  cursor in ANY room (side-room rows carry their `[#room]` tag) — listed
+  compactly, once per pending-fingerprint (a re-stop on the
   SAME rows passes; any new row re-arms — never an infinite block loop; the
   hook JSON's `stop_hook_active` flag is honored the same way); **BLOCK** on
   live claim leases held by the stopping session (release or finish — the
