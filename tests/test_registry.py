@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from helm import automap, home, pk, registry
+from helm import automap, harnesses, home, pk, registry
 
 EDGE = {"rel": "forked-from", "to": "beta", "note": "", "confirmed": True}
 
@@ -291,6 +291,90 @@ class TestProjections(RegistryBase):
         d = json.loads(buf.getvalue())
         self.assertEqual(len(d["rows"]), len(registry.projections()))
         self.assertEqual(d["squatters"], {"home": [], "cache": []})
+
+
+class SyncEndToEndTest(RegistryBase):
+    """The whole pipeline from disk: real claude/codex session files -> the
+    harness scanners -> automap canonicalization -> registry.sync -> a
+    materialized, correctly-typed project. Earlier sync tests inject synthetic
+    observations; this one lays the transcripts down and reads them back."""
+
+    def setUp(self):
+        super().setUp()
+        cache = self._dir("cache")
+        prev = os.environ.get("HELM_CACHE_DIR")
+        os.environ["HELM_CACHE_DIR"] = cache          # the codex sidecar lands here
+
+        def restore():
+            if prev is None:
+                os.environ.pop("HELM_CACHE_DIR", None)
+            else:
+                os.environ["HELM_CACHE_DIR"] = prev
+        self.addCleanup(restore)
+
+    def _claude_session(self, projects_root, slug, cwd):
+        d = os.path.join(projects_root, slug)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "sess.jsonl"), "w") as f:
+            f.write('{"cwd": "%s", "gitBranch": "main"}\n' % cwd)
+
+    def _codex_rollout(self, sessions_root, cwd):
+        d = os.path.join(sessions_root, "2026", "07", "20")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "rollout-2026-07-20T10-00-00-abcd.jsonl")
+        with open(p, "w") as f:
+            f.write('{"payload": {"cwd": "%s"}}\n' % cwd)
+
+    def _scan(self, projects_root, sessions_root):
+        return (harnesses.claude_observations(claude_root=projects_root)
+                + harnesses.codex_observations(roots=[sessions_root]))
+
+    def test_disk_scan_to_sync_materializes_the_project(self):
+        repo = self._repo("dev", "myproj")            # real dir + fake .git
+        projects_root = self._dir("claude", "projects")
+        sessions_root = self._dir("codex", "sessions")
+        self._claude_session(projects_root, "-tmp-dev-myproj", repo)
+        self._codex_rollout(sessions_root, repo)
+
+        obs = self._scan(projects_root, sessions_root)
+        # both harnesses observed the same cwd — two rows, one canonical root
+        self.assertEqual({o["harness"] for o in obs}, {"claude", "codex"})
+
+        reg, report = registry.sync(observations=obs)
+        proj = next((p for p in reg["projects"].values() if p["path"] == repo), None)
+        self.assertIsNotNone(proj, "the scanned project must register")
+        self.assertEqual(proj["kind"], "git")
+        self.assertIn(repo, proj["cwds"])
+        self.assertEqual(set(proj["sessions"]), {"claude", "codex"})
+        self.assertIn(proj["name"], report["new"])
+
+        # the codex sidecar was written by the real scan (the 6k-file fast path)
+        self.assertTrue(os.path.isfile(harnesses._codex_cache_path()))
+
+    def test_resync_is_additive_and_idempotent(self):
+        repo = self._repo("dev", "myproj")
+        projects_root = self._dir("claude", "projects")
+        sessions_root = self._dir("codex", "sessions")
+        self._claude_session(projects_root, "-tmp-dev-myproj", repo)
+        self._codex_rollout(sessions_root, repo)
+        obs = self._scan(projects_root, sessions_root)
+
+        reg1, _ = registry.sync(observations=obs)
+        n1 = len(reg1["projects"])
+        reg2, report2 = registry.sync(observations=self._scan(projects_root, sessions_root))
+        self.assertEqual(len(reg2["projects"]), n1)     # no duplicate project
+        name = next(p["name"] for p in reg2["projects"].values() if p["path"] == repo)
+        self.assertIn(name, report2["updated"])         # re-seen, not re-created
+
+    def test_second_scan_hits_the_codex_sidecar(self):
+        repo = self._repo("dev", "myproj")
+        sessions_root = self._dir("codex", "sessions")
+        self._codex_rollout(sessions_root, repo)
+        harnesses.codex_observations(roots=[sessions_root])   # populate the sidecar
+        with mock.patch.object(harnesses, "_sniff_cwd",
+                               side_effect=AssertionError("re-sniffed under sync")):
+            obs = harnesses.codex_observations(roots=[sessions_root])
+        self.assertEqual([o["cwd"] for o in obs], [repo])
 
 
 if __name__ == "__main__":
