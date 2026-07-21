@@ -475,6 +475,18 @@ def _seed_onboarding(cdir):
             for k in _ONBOARD_KEYS:
                 if k in r:
                     seed[k] = r[k]
+            # folder-trust is a SEPARATE per-project gate (a second wizard that
+            # also stalls a fresh seat): projects[<path>].hasTrustDialogAccepted.
+            # Copy just the trust flag for every worktree the ref already trusts,
+            # so a seat launched in one of them skips the trust dialog too. Only
+            # the trust flags — never the ref's session state/metrics.
+            trusted = {}
+            for path, pj in (r.get("projects") or {}).items():
+                if isinstance(pj, dict) and pj.get("hasTrustDialogAccepted"):
+                    trusted[path] = {"hasTrustDialogAccepted": True,
+                                     "projectOnboardingSeenCount": 1}
+            if trusted:
+                seed["projects"] = trusted
             break
     try:
         pk.write_json(dst, seed)

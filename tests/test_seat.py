@@ -458,7 +458,11 @@ class SeatTest(unittest.TestCase):
         with open(os.path.join(host, ".claude.json"), "w") as f:
             json.dump({"hasCompletedOnboarding": True,
                        "lastOnboardingVersion": "9.9.9", "theme": "light",
-                       "secretProjects": {"x": 1}}, f)
+                       "secretProjects": {"x": 1},
+                       "projects": {
+                           "/trusted/repo": {"hasTrustDialogAccepted": True,
+                                             "lastCost": 4.2, "lastSessionId": "s"},
+                           "/untrusted/repo": {"hasTrustDialogAccepted": False}}}, f)
         d = seat.seat_dir("codex")
         os.makedirs(d, exist_ok=True)
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
@@ -468,6 +472,10 @@ class SeatTest(unittest.TestCase):
         self.assertTrue(seeded["hasCompletedOnboarding"])
         self.assertEqual(seeded["lastOnboardingVersion"], "9.9.9")  # version copied
         self.assertNotIn("secretProjects", seeded)   # only onboarding keys, no host state
+        self.assertEqual(seeded["projects"]["/trusted/repo"],
+                         {"hasTrustDialogAccepted": True, "projectOnboardingSeenCount": 1})
+        self.assertNotIn("/untrusted/repo", seeded["projects"])   # only trusted paths
+        self.assertNotIn("lastCost", seeded["projects"]["/trusted/repo"])  # no session state
         with open(p, "w") as f:
             json.dump({"mine": True}, f)
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
