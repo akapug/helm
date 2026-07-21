@@ -383,11 +383,35 @@ def check_git():
              % _git_install_hint())]
 
 
+def check_metaharness(detect=None, which=None):
+    """The metaharness seam (helm/harness.py): which pane-op companion drives
+    `helm seat resume`. helm is metaharness-AGNOSTIC — none installed is a
+    WARN carrying the optional-companion recommendation (orca recommended,
+    herdr also supported), never a FAIL. detect/which are test seams."""
+    from . import harness
+    import shutil as _sh
+    detect = detect or harness.detect
+    which = which or _sh.which
+    try:
+        ad = detect()
+    except Exception as e:
+        return [(WARN, "metaharness detection failed (%s: %s)"
+                 % (e.__class__.__name__, e))]
+    if ad is None:
+        return [(WARN, harness.RECOMMENDATION)]
+    others = sorted(n for n, cls in harness.ADAPTERS.items()
+                    if n != ad.name and which(cls.bin))
+    return [(OK, "metaharness: %s (%s) — pane ops (seat resume) live%s"
+             % (ad.name, ad.path,
+                "; also present: " + ", ".join(others) if others else ""))]
+
+
 CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
           "check_projection_registry",
           "check_adopted_store", "check_know_your_user", "check_cv",
           "check_inject_coverage", "check_env", "check_physics_currency", "check_record",
-          "check_chat_node", "check_cred_families", "check_git")
+          "check_chat_node", "check_cred_families", "check_git",
+          "check_metaharness")
 
 
 def cmd_doctor(args):

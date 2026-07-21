@@ -468,7 +468,8 @@ class SeatTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
             seat._write_launch_assets("codex", d, workdir=self.tmp)
         p = os.path.join(d, "claude", ".claude.json")
-        seeded = json.load(open(p))
+        with open(p) as f:
+            seeded = json.load(f)
         self.assertTrue(seeded["hasCompletedOnboarding"])
         self.assertEqual(seeded["lastOnboardingVersion"], "9.9.9")  # version copied
         self.assertNotIn("secretProjects", seeded)   # only onboarding keys, no host state
@@ -481,13 +482,15 @@ class SeatTest(unittest.TestCase):
         self.assertEqual(seeded["projects"][os.path.realpath(self.tmp)],
                          {"hasTrustDialogAccepted": True, "projectOnboardingSeenCount": 1})
         # bypass acceptance lands in settings.json (CC 2.1.216), not .claude.json
-        st = json.load(open(os.path.join(d, "claude", "settings.json")))
+        with open(os.path.join(d, "claude", "settings.json")) as f:
+            st = json.load(f)
         self.assertTrue(st["skipDangerousModePermissionPrompt"])
         with open(p, "w") as f:
             json.dump({"mine": True}, f)
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
             seat._write_launch_assets("codex", d)
-        self.assertEqual(json.load(open(p)), {"mine": True})  # never clobbered
+        with open(p) as f:
+            self.assertEqual(json.load(f), {"mine": True})  # never clobbered
 
     def test_launch_line_room_homing(self):
         """Team-room homing (slice 3): --room bakes HELM_CHAT_ROOM into the

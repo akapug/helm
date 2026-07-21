@@ -58,6 +58,7 @@ import base64
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -113,6 +114,8 @@ _USAGE = """usage: helm seat <verb> [args]
                [--room R]             home the seat's chat in team room R
   up <family> | down <family>         start/stop the seat's local proxy
   launch <family> [--model M] [--room R]  print the exact launch line (never runs it)
+  resume <seat>                       relaunch the seat's pane via the metaharness
+                                      (freshest launch.sh + --resume/--continue)
   smoke <family>                      the 4-leg acceptance gate (prompt/tool/subagent/whisper)
   list | status                       seats, proxy liveness, cred expiry
   doctor                              binary + cred + seat health, read-only
@@ -876,6 +879,111 @@ def _smoke(family):
 
 
 # ---------------------------------------------------------------------------
+# resume — the resume-at-drain-point capability (rides the metaharness seam)
+# ---------------------------------------------------------------------------
+
+def _seat_family(seat_name):
+    """'codex' -> codex, 'codex-3' -> codex (slice-6 instances); unknown ->
+    (None, reason). A resume must never mint a seat that was never added."""
+    if seat_name in FAMILIES:
+        return seat_name, None
+    base, _, tail = seat_name.rpartition("-")
+    if base in FAMILIES and tail.isdigit():
+        return base, None
+    return None, ("unknown seat '%s' (families: %s; instances: <family>-N)"
+                  % (seat_name, ", ".join(sorted(FAMILIES))))
+
+
+_SESSION_JSONL = re.compile(r"^[0-9a-fA-F-]{36}\.jsonl$")
+
+
+def _newest_seat_session(instance_dir):
+    """(session_id, cwd) of the seat's newest claude session, from its OWN
+    isolated CLAUDE_CONFIG_DIR (<instance>/claude/projects/<slug>/<uuid>.jsonl);
+    (None, None) when the seat never ran. The id feeds `--resume <id>`, the
+    sniffed cwd re-homes the pane where the session actually worked. Only
+    uuid-named files count — a sidecar must fall through to --continue, never
+    resume the wrong transcript. (Every helm seat runs the `claude` binary —
+    codex seats are claude-over-proxy — so claude's resume flags are universal
+    here; a raw `codex resume` pane is not a helm seat.)"""
+    cands = []
+    for p in glob.glob(os.path.join(instance_dir, "claude", "projects",
+                                    "*", "*.jsonl")):
+        if not _SESSION_JSONL.match(os.path.basename(p)):
+            continue
+        try:
+            cands.append((os.path.getmtime(p), p))
+        except OSError:
+            pass
+    if not cands:
+        return None, None
+    p = max(cands)[1]
+    from . import harnesses
+    return os.path.basename(p)[:-len(".jsonl")], harnesses._sniff_cwd(p)
+
+
+def _room_from_launch(path):
+    """The seat's team-room homing, recovered from its current launch.sh —
+    the resume re-mint must not silently strip a --room the operator set."""
+    try:
+        with open(path) as f:
+            m = re.search(r"HELM_CHAT_ROOM=(\S+)", f.read())
+    except OSError:
+        return None
+    return shlex.split(m.group(1))[0] if m else None
+
+
+def _resume(seat_name, rest):
+    """seat resume <seat> — relaunch the seat's pane at its drain point via
+    the detected metaharness: the pane runs the seat's freshly re-minted
+    launch.sh (latest env/identity/hooks) with claude's own continuity flag
+    appended (--resume <id> when the seat's config dir names a session, else
+    --continue), so the SESSION survives while the environment refreshes.
+    TOKEN LAW: the pane command is the launch.sh PATH — the expanded launch
+    line (which carries the proxy token) never crosses the adapter seam."""
+    family, err = _seat_family(seat_name)
+    if err:
+        print("helm seat: " + err, file=sys.stderr)
+        return 2
+    d = _instance_dir(family, seat_name)
+    launch_sh = os.path.join(d, "launch.sh")
+    if not os.path.exists(launch_sh):
+        print("helm seat: no %s seat minted (%s missing) — `helm seat add %s` "
+              "then `helm seat launch %s` first"
+              % (seat_name, launch_sh, family, seat_name), file=sys.stderr)
+        return 1
+    # env refresh half of the contract: the relaunch rides the LATEST assets
+    # (identity vars, delivery hooks, context-window env), room preserved.
+    _write_launch_assets(family, d, _room_from_launch(launch_sh), seat_name)
+    sid, sess_cwd = _newest_seat_session(d)
+    command = "%s %s" % (shlex.quote(launch_sh),
+                         ("--resume " + shlex.quote(sid)) if sid else "--continue")
+    from . import harness
+    ad = harness.detect()
+    if ad is None:
+        print("helm seat: " + harness.RECOMMENDATION, file=sys.stderr)
+        print("  manual paste (env refreshed, session kept): " + command,
+              file=sys.stderr)
+        return 1
+    try:
+        for row in ad.list():
+            if row.get("title") == seat_name and row.get("handle"):
+                ad.stop(row["handle"])
+                print("  stopped stale %s pane %s" % (seat_name, row["handle"]))
+        handle = ad.spawn(command, title=seat_name,
+                          cwd=sess_cwd or os.getcwd())
+    except harness.HarnessError as e:
+        print("helm seat: %s resume via %s failed: %s"
+              % (seat_name, ad.name, e), file=sys.stderr)
+        return 1
+    print("helm seat: resumed %s via %s — pane %s, %s; env refreshed from %s"
+          % (seat_name, ad.name, handle,
+             ("session %s… (--resume)" % sid[:8]) if sid
+             else "--continue (newest session)", launch_sh))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # list / status / doctor
 # ---------------------------------------------------------------------------
 
@@ -966,7 +1074,7 @@ def _doctor(args):
 # ---------------------------------------------------------------------------
 
 def cmd_seat(args):
-    """seat add|up|down|launch|smoke|list|status|doctor — multimodel seats."""
+    """seat add|up|down|launch|resume|smoke|list|status|doctor — multimodel seats."""
     args = list(args)
     if not args:
         print(_USAGE, file=sys.stderr)
@@ -976,6 +1084,11 @@ def cmd_seat(args):
         return _status(rest)
     if verb == "doctor":
         return _doctor(rest)
+    if verb == "resume":
+        if not rest:
+            print("usage: helm seat resume <seat>", file=sys.stderr)
+            return 2
+        return _resume(rest[0], rest[1:])
     if verb in ("add", "up", "down", "launch", "smoke"):
         if not rest:
             print("usage: helm seat %s <family>" % verb, file=sys.stderr)
