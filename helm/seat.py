@@ -343,8 +343,26 @@ def _seat_token(family, d):
 
 def _write_launch_assets(family, d):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
-    identical for every mode."""
-    os.makedirs(os.path.join(d, "claude"), exist_ok=True)
+    identical for every mode, and refreshed by BOTH `add` and `launch` (a
+    stale launch.sh minted before HELM_CHAT_NAME existed is why the live
+    kimi seat was absent from the roster). The claude dir is born WIRED
+    (G-seatlaunch-installs): the delivery lane (deliver + join + stop-guard)
+    plus the beacon permit land here at creation through hooks.py's gated
+    merge-preserving write — a seat must never be born deaf. Install trouble
+    is loud (stderr) but never fatal: the seat still mints and the message
+    names the estate-wide repair."""
+    cdir = os.path.join(d, "claude")
+    os.makedirs(cdir, exist_ok=True)
+    from . import hooks
+    action, detail = hooks.install_home(cdir, specs=hooks.DELIVERY_SPECS)
+    if action == "fail":
+        print("helm seat: WARNING — %s delivery hooks not installed (%s); "
+              "`helm hooks install` closes it" % (family, detail),
+              file=sys.stderr)
+    elif action != "ok":
+        print("helm seat: %s claude dir wired for fleet delivery (%s: "
+              "deliver + join + stop-guard + beacon permit)" % (family, action),
+              file=sys.stderr)
     _write_private(os.path.join(d, "launch.sh"),
                    "#!/bin/sh\n# helm seat %s — minted by `helm seat add`; "
                    "regenerate with `helm seat launch %s`\nexec %s \"$@\"\n"
@@ -714,8 +732,15 @@ def cmd_seat(args):
         if fam is None:
             return 1
         model = rest[rest.index("--model") + 1] if "--model" in rest else None
+        # launch REFRESHES the assets first (G-seatlaunch-installs): delivery
+        # hooks + beacon permit + a launch.sh carrying the CURRENT identity
+        # shape — retrofitting a seat minted before either existed. stdout
+        # stays exactly the pasteable line; notes ride stderr.
+        _write_launch_assets(family, seat_dir(family))
         print(launch_line(family, model))
-        return 0
+        from . import hooks
+        hooks.surface_uncovered(out=sys.stderr)  # a running joined-late pane
+        return 0                                 # still needs its relaunch
     print("helm seat: unknown verb '%s'" % verb, file=sys.stderr)
     print(_USAGE, file=sys.stderr)
     return 2

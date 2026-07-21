@@ -58,9 +58,15 @@ correct embargo needs an expected-set freeze, a reveal state machine, salted
 commitments and batch-row reveal; the 0.3 spec is recorded in the design
 doc §11. No live consumer today, so: record, don't build.
 
-Cursor law (codex H5): `<room>.cursor.<seat>` holds {dev, ino, off, rid} —
-the room file's identity, the byte offset of the first unprocessed row, and
-the last processed row's stable id. Fast path = one stat (same inode, size
+Cursor law (codex H5): `<room>.cursor.<seat>[.<sid8>]` holds {dev, ino, off,
+rid} — the room file's identity, the byte offset of the first unprocessed
+row, and the last processed row's stable id. The cursor is PER (seat,
+session): two live sessions sharing one HELM_CHAT_NAME each hold their own
+cursor, so an @mention FANS OUT to all of them instead of being race-consumed
+by whichever boundary fires first (the live @mention-loss class). A caller
+with no session (bare CLI) rides the seat-level cursor; a fresh session
+cursor seeds from the seat-level one when it exists (upgrade continuity —
+rows tracked before the split are not skipped). Fast path = one stat (same inode, size
 == off ⇒ nothing new; a same-size REPLACEMENT changes the inode and is
 caught). Inode change or shrink ⇒ rotation/replacement: reset to 0 and use
 rid to suppress the retained overlap (duplicates acceptable, loss is not).
@@ -91,15 +97,67 @@ _BROADCAST = re.compile(r"(?<![A-Za-z0-9._-])@(all|fleet|everyone)(?![A-Za-z0-9.
 # identity + addressing
 # ---------------------------------------------------------------------------
 
-def derive_seat(session=None):
-    """$HELM_CHAT_NAME first (the launch seam sets it), else the session-
-    derived agent name — chat.whoname's law: a bare agent never gets the
-    operator's identity."""
+_FAMILIES = ("fable", "opus", "sonnet", "haiku", "kimi", "glm", "gpt",
+             "gemini", "deepseek", "qwen", "grok", "mistral", "llama")
+
+
+def _family():
+    """The ambient model family, best-effort: the model env first (seat
+    launches export CLAUDE_CODE_SUBAGENT_MODEL), else the harness. Display
+    material for the auto-name — never identity, never authorization."""
+    model = (os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
+             or os.environ.get("ANTHROPIC_MODEL") or "").lower()
+    for fam in _FAMILIES:
+        if fam in model:
+            return fam
+    if model:
+        tok = pk.slug(model).split("-")[0]
+        if tok:
+            return tok
+    if os.environ.get("CODEX_SESSION_ID"):
+        return "codex"
+    if os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CLAUDECODE"):
+        return "claude"
+    return "agent"
+
+
+def auto_name(session, cwd=None):
+    """G-stable-names: a MEANINGFUL stable auto-name for an un-named join —
+    <project>-<family> ('helm-fable'), deduped with -2/-3… when a DIFFERENT
+    session already holds the name. Stable: callers reach here only when the
+    roster has no row for this session, and the result is immediately
+    roster-bound (join / deliver self-heal), so the same session keeps
+    resolving to the same seat. Opaque agent-<sid8> hex (12/15 of the live
+    roster before this) is the last-resort floor only."""
+    sid = str(session)
+    proj = os.path.basename((cwd or "").rstrip(os.sep))
+    base = pk.slug("%s-%s" % (proj, _family())) if proj else _family()
+    r = roster()
+
+    def taken(name):
+        row = r.get(name)
+        return bool(row) and row.get("session") != sid \
+            and sid not in (row.get("sessions") or [])
+
+    if not taken(base):
+        return base
+    for i in range(2, 100):
+        cand = "%s-%d" % (base, i)
+        if not taken(cand):
+            return cand
+    return "agent-" + sid[:8]
+
+
+def derive_seat(session=None, cwd=None):
+    """$HELM_CHAT_NAME first (the launch seam sets it), else a MEANINGFUL
+    stable auto-name for the session (auto_name — project+family, deduped),
+    else chat.whoname's law: a bare agent never gets the operator's
+    identity."""
     name = home.env("CHAT_NAME")
     if name:
         return name
     if session:
-        return "agent-" + str(session)[:8]
+        return auto_name(session, cwd)
     return chat.whoname()
 
 
@@ -242,17 +300,25 @@ def last_seen(seat, row=None):
         return (row or {}).get("last_seen")
 
 
+SESSIONS_KEPT = 8   # co-named sessions remembered per roster row (addressing)
+
+
 def write_roster(seat, session=None, cwd=None):
-    """The one-time (join) roster write — keyed by seat, last-writer-wins
-    (two sessions under one HELM_CHAT_NAME share a row AND a cursor —
-    documented). Guarded by a lock anyway: joins are rare, losing a sibling
-    seat's row at join time is avoidable for one flock."""
+    """The one-time (join) roster write — keyed by seat. `session` is the
+    newest writer; every co-named session is ALSO kept in row["sessions"]
+    (newest last, capped) so seat_for_session resolves ALL of them and each
+    keeps its own delivery cursor (fan-out, never race-consume). Guarded by a
+    lock anyway: joins are rare, losing a sibling seat's row at join time is
+    avoidable for one flock."""
     chat._ensure_dir()
     with _flocked(roster_path() + ".lock"):
         r = roster()
         row = r.get(seat) or {}
         if session:
             row["session"] = str(session)
+            sess = [s for s in row.get("sessions") or [] if s != str(session)]
+            sess.append(str(session))
+            row["sessions"] = sess[-SESSIONS_KEPT:]
         if cwd:
             row["cwd"] = cwd
             row["project"] = os.path.basename(cwd.rstrip(os.sep)) or cwd
@@ -268,42 +334,136 @@ def write_roster(seat, session=None, cwd=None):
 def seat_for_session(session):
     if not session:
         return None
+    sid = str(session)
     for seat, row in roster().items():
-        if row.get("session") == str(session):
+        if row.get("session") == sid or sid in (row.get("sessions") or []):
             return seat
     return None
+
+
+def _resolve_seat(r, token):
+    """A roster key, else the seat whose session (or 8+-char prefix of one)
+    matches — how the owner names a live agent they only know by sid."""
+    if token in r:
+        return token
+    t = str(token or "")
+    if len(t) >= 8:
+        for seat, row in r.items():
+            sess = [row.get("session") or ""] + list(row.get("sessions") or [])
+            if any(s == t or s.startswith(t) for s in sess if s):
+                return seat
+    return None
+
+
+def _move_seat_state(old, new):
+    """Carry every state file from the old seat key to the new one — cursors
+    (+ per-session variants + locks), .seen, stop latches, every room. The
+    tracked delivery ground survives a rename; an EOF re-baseline would be
+    silent loss. Fail-open per file."""
+    ok, nk = _seat_key(old), _seat_key(new)
+    d = chat.chat_dir()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        for marker in (".cursor.", ".seen.", ".stopfp."):
+            tag = marker + ok
+            if tag in n:
+                try:
+                    os.replace(os.path.join(d, n),
+                               os.path.join(d, n.replace(tag, marker + nk)))
+                except OSError:
+                    pass
+                break
+
+
+def rename_seat(old, new):
+    """(ok, message). G-stable-names: bind a live agent to a memorable @name.
+    `old` is a roster seat name or a session id (full, or an 8+-char prefix).
+    Rebinds delivery: the roster row moves (so the hook's session_id resolves
+    to the new name) and every keyed state file moves with it. The seat's
+    HELM_CHAT_NAME env (if it launched with one) still names the OLD seat —
+    the message says so; a beacon armed on the old name must be re-armed."""
+    new = (new or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", new):
+        return False, ("new name %r must be 1-64 chars of [A-Za-z0-9._-] "
+                       "(what an @mention can address)" % new)
+    if new.lower() in owner_names() or _BROADCAST.search("@" + new):
+        return False, "%r is reserved (an owner/broadcast name)" % new
+    with _flocked(roster_path() + ".lock"):
+        r = roster()
+        seat = _resolve_seat(r, old)
+        if seat is None:
+            return False, ("no roster row matches %r (a seat name or an "
+                           "8+-char session prefix — helm chat seats --all)" % old)
+        if seat == new:
+            return True, "seat is already named %s" % new
+        if new in r:
+            return False, "seat name %r is taken (helm chat seats --all)" % new
+        r[new] = r.pop(seat)
+        pk.write_json(roster_path(), r)
+        _move_seat_state(seat, new)
+    return True, ("seat %s -> %s: @%s now delivers to it. If it armed a "
+                  "beacon on the old name, re-arm: Monitor(command: \"helm "
+                  "chat wait --seat %s --follow\", persistent: true). A seat "
+                  "launched with HELM_CHAT_NAME=%s re-registers the old name "
+                  "on its next session — relaunch to make the rename stick "
+                  "there." % (seat, new, new, new, seat))
 
 
 # ---------------------------------------------------------------------------
 # the cursor (codex H5) + the tail scan both deliver and the report use
 # ---------------------------------------------------------------------------
 
-def cursor_path(room, seat):
-    return os.path.join(chat.chat_dir(),
-                        "%s.cursor.%s" % (pk.slug(room), _seat_key(seat)))
+def _sid8(session):
+    """The session's cursor-key token — filename-safe, 8 chars, None-safe."""
+    return pk.slug(str(session))[:8] if session else None
 
 
-def _cursor(room, seat):
-    d = pk.read_json(cursor_path(room, seat), None)
+def cursor_path(room, seat, session=None):
+    """PER (seat, session) when a session is known — co-named sessions each
+    keep their own cursor (fan-out; the @mention-loss fix). Sessionless
+    callers (bare CLI) ride the seat-level file."""
+    p = os.path.join(chat.chat_dir(),
+                     "%s.cursor.%s" % (pk.slug(room), _seat_key(seat)))
+    s8 = _sid8(session)
+    return "%s.%s" % (p, s8) if s8 else p
+
+
+def _cursor(room, seat, session=None):
+    d = pk.read_json(cursor_path(room, seat, session), None)
     if isinstance(d, dict) and isinstance(d.get("off"), int):
         return d
     return None
 
 
-def _write_cursor(room, seat, dev, ino, off, rid):
+def _write_cursor(room, seat, dev, ino, off, rid, session=None):
     chat._ensure_dir()
-    pk.write_json(cursor_path(room, seat),
+    pk.write_json(cursor_path(room, seat, session),
                   {"dev": dev, "ino": ino, "off": off, "rid": rid})
 
 
-def _init_cursor(room, seat):
+def _init_cursor(room, seat, session=None):
     """Baseline at the CURRENT end of room — at JOIN time (codex H5.5), so
-    everything posted after session start delivers at the first boundary."""
+    everything posted after session start delivers at the first boundary.
+    A fresh SESSION cursor inherits the seat-level baseline when one exists
+    (pre-split installs tracked the seat file; those rows must not be
+    skipped by an EOF re-baseline — loss is the one forbidden outcome).
+    -> True iff the baseline was inherited (already-tracked ground)."""
+    if session:
+        base = _cursor(room, seat)
+        if base:
+            _write_cursor(room, seat, base.get("dev"), base.get("ino"),
+                          base["off"], base.get("rid"), session=session)
+            return True
     try:
         st = os.stat(chat.room_path(room))
-        _write_cursor(room, seat, st.st_dev, st.st_ino, st.st_size, None)
+        _write_cursor(room, seat, st.st_dev, st.st_ino, st.st_size, None,
+                      session=session)
     except OSError:
-        _write_cursor(room, seat, None, None, 0, None)
+        _write_cursor(room, seat, None, None, 0, None, session=session)
+    return False
 
 
 def _tail(room, cur):
@@ -356,25 +516,33 @@ def _tail(room, cur):
     return st.st_dev, st.st_ino, base, entries
 
 
-def deliver(session=None, room="main", seat=None, emit=None):
+def deliver(session=None, room="main", seat=None, emit=None, cwd=None):
     """The tool-boundary nudge: at most ONE deliverable row, oldest first;
     later matches stay PENDING (their count shows, their cursor ground is
     not consumed — codex H6). Returns the label line or None.
 
     At-least-once (codex H7): when `emit` is given it is called with the
     line BEFORE the cursor commits; emit must do its one unbuffered write.
-    A kill between emit and commit re-delivers next boundary."""
+    A kill between emit and commit re-delivers next boundary.
+
+    Fan-out: the cursor is per (seat, session) — every co-named session sees
+    the same @mention on its own boundary; consuming here never starves a
+    sibling session (at-most-once BETWEEN co-named sessions was the bug)."""
     if (home.env("CHAT_DELIVER") or "").lower() in ("0", "off", "no"):
         return None
-    seat = seat or seat_for_session(session) or derive_seat(session)
+    seat = seat or seat_for_session(session) or derive_seat(session, cwd)
     touch_seen(seat)
-    with _flocked(cursor_path(room, seat) + ".lock"):
-        cur = _cursor(room, seat)
+    with _flocked(cursor_path(room, seat, session) + ".lock"):
+        cur = _cursor(room, seat, session)
         if cur is None:
-            _init_cursor(room, seat)   # a pre-install session self-heals
+            inherited = _init_cursor(room, seat, session)  # pre-install self-heal
             if session and seat_for_session(session) is None:
                 write_roster(seat, session=session)
-            return None
+            if not inherited:
+                return None       # fresh EOF baseline: backlog never floods
+            cur = _cursor(room, seat, session)  # already-tracked ground —
+            if cur is None:                     # deliver from it THIS boundary
+                return None
         got = _tail(room, cur)
         if got is None:
             return None
@@ -387,7 +555,8 @@ def deliver(session=None, room="main", seat=None, emit=None):
                 break
             last_end, last_rid = end, (row or {}).get("id") or last_rid
         if hit is None:
-            _write_cursor(room, seat, dev, ino, last_end, last_rid)
+            _write_cursor(room, seat, dev, ino, last_end, last_rid,
+                          session=session)
             return None
         i, row, end = hit
         waiting = sum(1 for r, _e in entries[i + 1:]
@@ -398,7 +567,8 @@ def deliver(session=None, room="main", seat=None, emit=None):
             line += " (+%d waiting — helm chat read)" % waiting
         if emit is not None:
             emit(line)                  # output FIRST …
-        _write_cursor(room, seat, dev, ino, end, row.get("id"))  # … commit after
+        _write_cursor(room, seat, dev, ino, end, row.get("id"),
+                      session=session)  # … commit after
         return line
 
 
@@ -413,9 +583,15 @@ def join(session=None, cwd=None, seat=None, room="main"):
     only thing that can wake an idle PTY agent (native-wake-only-agent-armed),
     so a SessionStart directive is the strongest enforcement available.
     Idempotent per seat."""
-    seat = seat or seat_for_session(session) or derive_seat(session)
+    seat = seat or seat_for_session(session) or derive_seat(session, cwd)
     write_roster(seat, session=session, cwd=cwd)
-    if _cursor(room, seat) is None:
+    if _cursor(room, seat, session) is None:
+        with _flocked(cursor_path(room, seat, session) + ".lock"):
+            if _cursor(room, seat, session) is None:
+                _init_cursor(room, seat, session)
+    if session and _cursor(room, seat) is None:
+        # the seat-level baseline too: sessionless callers (bare CLI wait/
+        # deliver) must not start blind just because the join was hook-keyed
         with _flocked(cursor_path(room, seat) + ".lock"):
             if _cursor(room, seat) is None:
                 _init_cursor(room, seat)
@@ -440,7 +616,7 @@ def _emit_line(line):
 
 
 def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
-         emit=None, follow=False):
+         emit=None, follow=False, session=None):
     """Block until the next word arrives; returns the line or None on
     timeout. Seat mode IS a delivery (advances the cursor via deliver's
     at-least-once path); --any watches the room without touching cursors.
@@ -455,7 +631,10 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
     beacon; the loop just polls again."""
     poll = chat.POLL_S if poll is None else poll
     deadline = time.time() + timeout if timeout else None
-    seat = seat or derive_seat(None)
+    # the ambient session (CLI leg passes _env_session()) keys the SAME
+    # per-session cursor the boundary hook advances — one session, one
+    # cursor, whichever channel fires first; co-named siblings unaffected.
+    seat = seat or seat_for_session(session) or derive_seat(session)
     # single-shot keeps its contract: emit stays as passed (None ⇒ deliver
     # returns the line without emitting). --follow always needs a sink to stream
     # through, so it defaults to a PER-LINE-FLUSHED print: the beacon's reader
@@ -476,7 +655,8 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
         else:
             while True:                     # drain all currently-matching rows
                 try:
-                    line = deliver(room=room, seat=seat, emit=stream)
+                    line = deliver(session=session, room=room, seat=seat,
+                                   emit=stream)
                 except Exception:
                     line = None             # fail-open: never crash the beacon
                 if not line:
@@ -504,18 +684,22 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
 # SCAN_CAP), no network.
 # ---------------------------------------------------------------------------
 
-def _stop_fp_path(room, seat):
-    """The once-per-fingerprint latch — in the room dir, per seat (RAM-side,
-    dies with the boot like the rest of the lane's state)."""
-    return os.path.join(chat.chat_dir(),
-                        "%s.stopfp.%s" % (pk.slug(room), _seat_key(seat)))
+def _stop_fp_path(room, seat, session=None):
+    """The once-per-fingerprint latch — in the room dir, per (seat, session)
+    like the cursor it gates (RAM-side, dies with the boot like the rest of
+    the lane's state)."""
+    p = os.path.join(chat.chat_dir(),
+                     "%s.stopfp.%s" % (pk.slug(room), _seat_key(seat)))
+    s8 = _sid8(session)
+    return "%s.%s" % (p, s8) if s8 else p
 
 
-def _pending_rows(room, seat):
-    """Deliverable rows past the seat's cursor WITHOUT consuming them —
-    roster_report's read pattern (the cursor never moves here; the stop-guard
-    is a gate, not a delivery)."""
-    cur = _cursor(room, seat)
+def _pending_rows(room, seat, session=None):
+    """Deliverable rows past the (seat, session) cursor WITHOUT consuming
+    them — roster_report's read pattern (the cursor never moves here; the
+    stop-guard is a gate, not a delivery). Falls back to the seat-level
+    cursor when the session has none yet (pre-install sessions)."""
+    cur = _cursor(room, seat, session) or _cursor(room, seat)
     got = _tail(room, cur) if cur else None
     if not got:
         return []
@@ -548,13 +732,13 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
     blocks, warns, pending = [], [], []
 
     if not _off("STOP_GUARD_INBOX"):
-        pending = _pending_rows(room, seat)
+        pending = _pending_rows(room, seat, session)
         if pending:
             import hashlib
             fp = hashlib.blake2b(
                 "|".join(str(r.get("id") or chat.rkey(r)) for r in pending)
                 .encode("utf-8"), digest_size=16).hexdigest()
-            fpp = _stop_fp_path(room, seat)
+            fpp = _stop_fp_path(room, seat, session)
             try:
                 with open(fpp) as f:
                     last = f.read().strip()
@@ -725,12 +909,71 @@ def presence_of(ls):
     return "fresh" if age < FRESH_S else "quiet" if age < QUIET_S else "absent"
 
 
+REAP_S = 3600   # a roster row unseen this long is a throwaway — reap it
+
+
+def _unlink_seat_state(seat):
+    """Remove every state file keyed on the seat (cursors + locks +
+    per-session variants, .seen, stop latches) — the orphan tail a reaped
+    row would otherwise leave in the room dir forever. Fail-open per file."""
+    key = _seat_key(seat)
+    d = chat.chat_dir()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        if any((m + key) in n for m in (".cursor.", ".seen.", ".stopfp.")):
+            try:
+                os.remove(os.path.join(d, n))
+            except OSError:
+                pass
+
+
+def reap_roster(max_age=REAP_S, now=None):
+    """G-roster-reaper -> [reaped seats]. The roster only ever GREW — /tmp
+    throwaway sessions piled up as permanently-absent rows with orphan
+    cursor/seen/latch files. Drop rows unseen for max_age+ and unlink their
+    state. Presence truth is the .seen mtime: deliver touches it at every
+    boundary and an armed beacon's wait loop delivers, so a live-but-idle
+    seat stays fresh; a reaped seat that returns self-heals at its next
+    boundary (cursor re-baselines — acceptable for something absent an
+    hour). Lock-free probe first: the web panel polls the report every 3s
+    and must not churn the roster — only an actually-stale row takes the
+    flock (claims_list's exact pattern). Fail-open total."""
+    now = time.time() if now is None else now
+    cut = now - max_age
+    try:
+        r = roster()
+        if not any((last_seen(s, row) or 0) < cut for s, row in r.items()):
+            return []
+        victims = []
+        with _flocked(roster_path() + ".lock"):
+            r = roster()
+            for s in list(r):
+                if (last_seen(s, r[s]) or 0) < cut:
+                    del r[s]
+                    victims.append(s)
+            if victims:
+                pk.write_json(roster_path(), r)
+        for s in victims:
+            _unlink_seat_state(s)
+        return victims
+    except Exception:
+        return []
+
+
 def roster_report(room="main"):
-    """{"seats": [...], "claims": [...]} — read-only, fail-open by caller.
-    Pending is computed from each seat's cursor WITHOUT moving it."""
+    """{"seats": [...], "claims": [...]} — fail-open by caller. Pending is
+    computed from each seat's cursor WITHOUT moving it. One GC leg rides the
+    read (claims_list's precedent): rows absent past REAP_S are reaped here,
+    so every live surface (CLI table, web panel) keeps the roster clean."""
+    reap_roster()
     seats = []
     for seat, row in sorted(roster().items()):
-        cur = _cursor(room, seat)
+        # pending reads the row's newest session cursor (hook joins are
+        # session-keyed), falling back to the seat-level file (bare CLI).
+        cur = _cursor(room, seat, row.get("session")) or _cursor(room, seat)
         pending, preview = 0, None
         got = _tail(room, cur) if cur else None
         if got:
@@ -804,15 +1047,24 @@ def cmd(verb, args, room="main"):
         return 0
     if verb == "deliver":
         try:
-            session = None
+            session = cwd = None
             if "--hook-json" in args:
-                session = _hook_stdin().get("session_id")
+                d = _hook_stdin()
+                session, cwd = d.get("session_id"), d.get("cwd")
             emit = _hook_emit("PostToolUse") if "--hook-json" in args else print
             deliver(session=session, room=room, seat=_flag(args, "--seat"),
-                    emit=emit)
+                    emit=emit, cwd=cwd)
         except Exception:
             pass                    # fail-open: never hold a tool boundary
         return 0
+    if verb == "seat":
+        if args[:1] == ["rename"] and len(args) >= 3:
+            ok, msg = rename_seat(args[1], args[2])
+            print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
+            return 0 if ok else 1
+        print("usage: helm chat seat rename <sid|oldname> <newname>",
+              file=sys.stderr)
+        return 2
     if verb == "stop-guard":
         try:
             session, stop_active = None, False
@@ -843,7 +1095,7 @@ def cmd(verb, args, room="main"):
                     # pipe (the beacon-never-wakes bug). Only single-shot seat
                     # mode keeps print (deliver emits the one line + returns it).
                     emit=None if (follow or "--any" in args) else print,
-                    follow=follow)
+                    follow=follow, session=_env_session())
         if follow:               # --follow streams via emit; returns on timeout
             return 0
         if line is None:
@@ -853,15 +1105,24 @@ def cmd(verb, args, room="main"):
         return 0
     if verb == "seats":
         rep = roster_report(room)
-        if not rep["seats"]:
+        rows = rep["seats"]
+        hidden = 0
+        if "--all" not in args:      # absent rows hide by default (rows past
+            shown = [s for s in rows if s["presence"] != "absent"]
+            hidden = len(rows) - len(shown)          # REAP_S are already gone)
+            rows = shown
+        if not rows and not hidden:
             print("helm chat: no seats yet — sessions join on their next start "
                   "(helm hooks install wires it)")
             return 0
-        w = max(len(s["seat"]) for s in rep["seats"])
-        for s in rep["seats"]:
+        w = max([len(s["seat"]) for s in rows] or [0])
+        for s in rows:
             print("  %-*s  %-6s  pending %-3d %s" % (
                 w, s["seat"], s["presence"], s["pending"],
                 (s.get("project") or "")))
+        if hidden:
+            print("  (%d absent seat%s hidden — --all shows them; unseen "
+                  ">%dm reaps them)" % (hidden, "s"[:hidden != 1], REAP_S // 60))
         for c in rep["claims"]:
             print("  claim: %s -> %s (%ds left, fence %s)" % (
                 c["resource"], c["holder"], c["remaining"], c["fence"]))

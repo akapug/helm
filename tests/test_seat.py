@@ -29,12 +29,16 @@ class SeatTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-seat-")
         self._env = {k: os.environ.get(k) for k in
                      ("HELM_HOME", "MELD_HOME", "HELM_PROXY_BIN",
-                      "MELD_PROXY_BIN", "KIMI_API_KEY")}
+                      "MELD_PROXY_BIN", "KIMI_API_KEY", "HELM_PROC",
+                      "HELM_CHAT_DIR")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm-home")
         os.environ.pop("MELD_HOME", None)
         os.environ.pop("HELM_PROXY_BIN", None)
         os.environ.pop("MELD_PROXY_BIN", None)
         os.environ.pop("KIMI_API_KEY", None)  # hermetic: never the real key
+        # launch's retrofit surface scans /proc + the roster — keep both tmp
+        os.environ["HELM_PROC"] = os.path.join(self.tmp, "proc")
+        os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         self._codex_homes = seat.CODEX_HOMES
         seat.CODEX_HOMES = os.path.join(self.tmp, "codex-homes")
         os.makedirs(seat.CODEX_HOMES)
@@ -379,6 +383,60 @@ class SeatTest(unittest.TestCase):
             rc = seat.cmd_seat(["list"])
         self.assertEqual(rc, 0)
         self.assertIn("no seats yet", out.getvalue())
+
+
+class SeatBornWiredTest(unittest.TestCase):
+    """G-seatlaunch-installs: add/launch leave the seat's claude dir carrying
+    the delivery lane + beacon permit; launch refreshes stale assets.
+    Borrows SeatTest's setUp/helpers WITHOUT subclassing it (a subclass
+    would silently re-run the whole parent suite twice)."""
+
+    setUp = SeatTest.setUp
+    tearDown = SeatTest.tearDown
+    _plant = SeatTest._plant
+    _add = SeatTest._add
+
+    def _settings(self):
+        p = os.path.join(seat.seat_dir("codex"), "claude", "settings.json")
+        with open(p) as f:
+            return json.load(f)
+
+    def test_add_wires_delivery_lane_and_beacon_permit(self):
+        self._plant("home-a")
+        rc, _out, err = self._add()
+        self.assertEqual(rc, 0, err)
+        from helm import hooks
+        got = self._settings()
+        for s in hooks.DELIVERY_SPECS:
+            self.assertIn(hooks.spec_command(s),
+                          hooks._hook_cmds(got, s["event"]))
+        for rule in hooks.PERMIT_RULES:
+            self.assertIn(rule, got["permissions"]["allow"])
+        self.assertEqual(hooks._hook_cmds(got, "UserPromptSubmit"), [])
+
+    def test_launch_refreshes_hooks_and_identity_stdout_stays_pure(self):
+        """The live kimi shape: a seat minted before HELM_CHAT_NAME/hook
+        install existed — launch retrofits both; stdout is ONLY the line."""
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        d = seat.seat_dir("codex")
+        os.remove(os.path.join(d, "claude", "settings.json"))   # the dark seat
+        with open(os.path.join(d, "launch.sh"), "w") as f:
+            f.write("#!/bin/sh\n# stale — pre-identity\nexec claude\n")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["launch", "codex"])
+        self.assertEqual(rc, 0)
+        line = out.getvalue().strip()
+        self.assertTrue(line.startswith("env -u ANTHROPIC_API_KEY"), line)
+        self.assertNotIn("\n", line)                 # pasteable — one line
+        got = self._settings()                       # hooks are back
+        from helm import hooks
+        self.assertIn("chat join --hook-json",
+                      " ".join(hooks._hook_cmds(got, "SessionStart")))
+        with open(os.path.join(d, "launch.sh")) as f:
+            self.assertIn("HELM_CHAT_NAME=codex", f.read())   # identity restored
+        self.assertIn("wired for fleet delivery", err.getvalue())
 
 
 if __name__ == "__main__":

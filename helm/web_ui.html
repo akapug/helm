@@ -453,6 +453,8 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .lhead{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 .lhead .lidx{font-weight:700;font-variant-numeric:tabular-nums}
 .lhead .lage{margin-left:auto;color:var(--sub);font-size:var(--f1);white-space:nowrap;font-variant-numeric:tabular-nums}
+.seatrn{font-size:var(--f0);padding:1px 8px;border-radius:6px;background:none;border:1px solid var(--line);color:var(--mut);cursor:pointer}
+.seatrn:hover{border-color:var(--accent);color:var(--accent)}
 .lmeta{font-size:var(--f1);color:var(--mut);margin-top:2px;word-break:break-all}
 .lbadge{font-size:var(--f0);font-weight:700;padding:2px 7px;border-radius:5px;white-space:nowrap;background:color-mix(in srgb,var(--mut) 14%,transparent);color:var(--mut)}
 .lbadge.final{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
@@ -2479,6 +2481,7 @@ function rosterSeats(rep) {
     '<span class="mono copy" data-copy="' + esc(s.seat) + '" title="seat — click to copy">' + esc(s.seat) + '</span>' +
     '<span class="lbadge' + (s.presence === "fresh" ? " final" : s.presence === "quiet" ? " tent" : "") + '">' + esc(presenceLabel(s.presence)) + '</span>' +
     (s.pending ? '<span class="lbadge tent">' + s.pending + ' pending</span>' : '') +
+    '<button class="seatrn" data-seat="' + esc(s.seat) + '" title="rename this seat — @newname delivers to the same agent">rename</button>' +
     '<span class="lage">' + (s.last_seen ? lago(s.last_seen) : "—") + '</span></div>' +
     '<div class="lmeta">' + esc(s.project || "") +
     (s.preview ? ' · <span title="newest pending delivery">“' + esc(s.preview) + '”</span>' : '') + '</div></div>').join("");
@@ -2487,6 +2490,18 @@ function rosterSeats(rep) {
       esc(c.resource) + ' → <b>' + esc(c.holder || "?") + '</b> (' + c.remaining + 's left)').join(" · ") + '</div>';
   }
   $("#ledgerseats").innerHTML = html;
+  // the one seats-panel mutation: bind a live agent to a memorable @name
+  $("#ledgerseats").querySelectorAll(".seatrn").forEach(b => b.onclick = async () => {
+    const cur = b.dataset.seat;
+    const nn = (prompt('rename seat "' + cur + '" — the new @name (letters, digits, . _ -):', cur) || "").trim();
+    if (!nn || nn === cur) return;
+    try {
+      const r = await post("/api/chat/seat", {action: "rename", seat: cur, new: nn});
+      toast("seat renamed: " + cur + " → " + nn + " — @" + nn + " now delivers to it");
+      if (r && r.note && /beacon/.test(r.note)) console.log(r.note);
+      pollLedger();
+    } catch (e) { toast("rename refused: " + e.message); }
+  });
 }
 
 // The "message a seat" picker: same live roster feeds a <datalist> so a live

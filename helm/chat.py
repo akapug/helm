@@ -87,13 +87,21 @@ def whoname():
     agent CLI post that fell through to it impersonated the owner in the room
     (owner-flagged 2026-07-19). The operator's own surfaces name themselves
     explicitly (web posts as 'david'; `helm --human` sets HELM_CHAT_NAME), so a
-    bare CLI post is ALWAYS an agent — it gets an agent tag, never the login."""
+    bare CLI post is ALWAYS an agent — it gets an agent name, never the login.
+    A session already in the roster answers with its SEAT name (posts and
+    deliveries speak one name — the rename verb rebinds both); an unknown
+    session gets seats.auto_name's meaningful project+family name, and the
+    opaque agent-<sid8> hex survives only as the fail-open floor."""
     name = home.env("CHAT_NAME")
     if name:
         return name
     sid = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_SESSION_ID")
     if sid:
-        return "agent-" + sid[:8]
+        try:
+            from . import seats
+            return seats.seat_for_session(sid) or seats.auto_name(sid, os.getcwd())
+        except Exception:
+            return "agent-" + sid[:8]
     return "agent"
 
 
@@ -616,8 +624,8 @@ def _fmt_body(m):
 # CLI
 # ---------------------------------------------------------------------------
 
-SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "claim",
-              "release", "claims", "verdict", "reveal")
+SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "seat",
+              "claim", "release", "claims", "verdict", "reveal")
                                                # the delivery lane — seats.py
                                                # (verdict/reveal answer with
                                                # the 0.3 council deferral)
@@ -627,7 +635,8 @@ def cmd_chat(args):
     """chat post <text...> | read [--since N] [--follow] | rooms |
     react <n> <emoji> | log-flush | node up|down|status |
     join|deliver|stop-guard [--hook-json] | wait [--any] [--follow] [--seat S]
-    | seats | claim|release <resource> | claims  [--room R]"""
+    | seats [--all] | seat rename <sid|oldname> <newname>
+    | claim|release <resource> | claims  [--room R]"""
     args = list(args or [])
     room = "main"
     room_given = "--room" in args

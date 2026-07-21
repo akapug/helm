@@ -28,7 +28,10 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_STOP_GUARD", "HELM_STOP_GUARD_INBOX",
             "HELM_STOP_GUARD_CLAIMS", "HELM_STOP_GUARD_INDEX",
             "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
-            "CLAUDE_SESSION_ID", "CODEX_SESSION_ID")
+            "CLAUDE_SESSION_ID", "CODEX_SESSION_ID",
+            # auto_name reads the ambient model/harness marks — scrub them or
+            # a test run inside a live harness computes a different family
+            "CLAUDECODE", "CLAUDE_CODE_SUBAGENT_MODEL", "ANTHROPIC_MODEL")
 
 
 class SeatsBase(unittest.TestCase):
@@ -308,11 +311,60 @@ class DeliverTest(SeatsBase):
         self.assertIsNone(seats.deliver(seat="api.a"))   # advances ITS cursor only
         self.assertIn("@api-a second", seats.deliver(seat="api-a"))
 
-    def test_unknown_session_self_heals_roster(self):
+    def test_conamed_sessions_both_receive_the_mention(self):
+        """G-cursor-persession: two live sessions sharing one HELM_CHAT_NAME
+        must BOTH see an @mention (fan-out) — the seat-only cursor let
+        whichever boundary fired first race-consume it for the sibling."""
+        seats.join(session="s-one", seat="fable", cwd="/tmp/p")
+        seats.join(session="s-two", seat="fable", cwd="/tmp/p")
+        chat.post("@fable ship it", who="bob")
+        self.assertIn("ship it", seats.deliver(session="s-one", seat="fable"))
+        self.assertIn("ship it", seats.deliver(session="s-two", seat="fable"))
+        # each consumed its OWN cursor — no re-nudge, no cross-consume
+        self.assertIsNone(seats.deliver(session="s-one", seat="fable"))
+        self.assertIsNone(seats.deliver(session="s-two", seat="fable"))
+        # the roster row stays seat-keyed (one row) and resolves BOTH sessions
+        self.assertEqual(len([s for s in seats.roster() if s == "fable"]), 1)
+        self.assertEqual(seats.seat_for_session("s-one"), "fable")
+        self.assertEqual(seats.seat_for_session("s-two"), "fable")
+
+    def test_conamed_join_order_independent_of_hook_seat_resolution(self):
+        """The hook passes only session_id — the OLDER co-named session must
+        still resolve to the shared seat after a newer join overwrote
+        row['session'] (the sessions list is the addressing memory)."""
+        seats.join(session="s-old", seat="fable", cwd="/tmp/p")
+        seats.join(session="s-new", seat="fable", cwd="/tmp/p")
+        chat.post("@fable hello", who="bob")
+        # no --seat: exactly what the PostToolUse hook can supply
+        self.assertIn("hello", seats.deliver(session="s-old"))
+
+    def test_session_cursor_inherits_seat_baseline_on_upgrade(self):
+        """A pre-split install tracked the seat-level cursor; the first
+        session-keyed boundary must deliver from THAT baseline, not skip to
+        EOF (loss is the one forbidden outcome)."""
+        seats.join(seat="alice", cwd="/tmp/p")              # seat-level cursor
+        chat.post("@alice queued before upgrade", who="bob")
+        line = seats.deliver(session="s-later", seat="alice")
+        self.assertIn("queued before upgrade", line)
+
+    def test_wait_shares_the_sessions_cursor(self):
+        """An ambient-session wait must consume the SAME cursor as that
+        session's boundary hook — no double-nudge for one session."""
+        seats.join(session="s-w", seat="alice", cwd="/tmp/p")
+        chat.post("@alice once", who="bob")
+        line = seats.wait(seat="alice", session="s-w", timeout=1, poll=0.01)
+        self.assertIn("once", line)
+        self.assertIsNone(seats.deliver(session="s-w", seat="alice"))
+
+    def test_unknown_session_self_heals_roster_with_meaningful_name(self):
         chat.post("noise", who="bob")
-        self.assertIsNone(seats.deliver(session="brand-new-session"))
-        self.assertIn("agent-brand-ne", seats.roster())
-        chat.post("@agent-brand-ne go", who="bob")
+        self.assertIsNone(seats.deliver(session="brand-new-session",
+                                        cwd="/tmp/projx"))
+        # G-stable-names: the self-heal binds a project+family name, not hex
+        self.assertIn("projx-agent", seats.roster())
+        self.assertNotIn("agent-brand-ne", seats.roster())
+        chat.post("@projx-agent go", who="bob")
+        # a later cwd-less boundary still resolves the SAME seat (roster-bound)
         self.assertIn("go", seats.deliver(session="brand-new-session"))
 
     def test_deliver_hook_json_one_write_shape_and_fail_open(self):
@@ -389,6 +441,102 @@ class WaitTest(SeatsBase):
         finally:
             t.join()
         self.assertIn("newest", line)
+
+
+class AutoNameTest(SeatsBase):
+    """G-stable-names: an un-named join gets a MEANINGFUL stable auto-name
+    (project+family, deduped) instead of opaque agent-<sid8> hex."""
+
+    def test_unnamed_join_gets_meaningful_stable_deduped_name(self):
+        with mock.patch.dict(os.environ,
+                             {"CLAUDE_CODE_SUBAGENT_MODEL": "claude-fable-5"}):
+            seat, _ = seats.join(session="s-a1", cwd="/tmp/helm")
+            self.assertEqual(seat, "helm-fable")
+            again, _ = seats.join(session="s-a1", cwd="/tmp/helm")  # stable
+            self.assertEqual(again, "helm-fable")
+            other, _ = seats.join(session="s-a2", cwd="/tmp/helm")  # deduped
+            self.assertEqual(other, "helm-fable-2")
+        # both are ADDRESSABLE apart — no shared cursor, no cross-consume
+        chat.post("@helm-fable-2 only you", who="bob")
+        self.assertIsNone(seats.deliver(session="s-a1"))
+        self.assertIn("only you", seats.deliver(session="s-a2"))
+
+    def test_family_fallbacks(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SUBAGENT_MODEL": "kimi-k3"}):
+            self.assertEqual(seats._family(), "kimi")
+        with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": "x"}):
+            self.assertEqual(seats._family(), "codex")
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            self.assertEqual(seats._family(), "claude")
+        self.assertEqual(seats._family(), "agent")   # everything scrubbed
+
+    def test_explicit_chat_name_still_wins(self):
+        os.environ["HELM_CHAT_NAME"] = "codex"
+        self.assertEqual(seats.derive_seat("s-x", "/tmp/helm"), "codex")
+
+    def test_whoname_speaks_the_roster_seat(self):
+        """A joined session POSTS under its seat name — deliveries and posts
+        speak one name, and a rename rebinds both."""
+        seats.join(session="sess-w1", seat="wren", cwd="/tmp/p")
+        with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sess-w1"}):
+            self.assertEqual(chat.whoname(), "wren")
+
+
+class RenameTest(SeatsBase):
+    """helm chat seat rename — bind a live agent to a memorable @name."""
+
+    def test_rename_rebinds_delivery_and_keeps_tracked_ground(self):
+        seats.join(session="s-r1", seat="agent-3f2a", cwd="/tmp/p")
+        chat.post("noise", who="bob")
+        self.assertIsNone(seats.deliver(session="s-r1"))
+        off = seats._cursor("main", "agent-3f2a", "s-r1")["off"]
+        ok, msg = seats.rename_seat("agent-3f2a", "art3mis")
+        self.assertTrue(ok, msg)
+        self.assertIn("re-arm", msg)                       # beacon note
+        self.assertNotIn("agent-3f2a", seats.roster())
+        self.assertIn("art3mis", seats.roster())
+        # the cursor moved WITH the seat — no EOF re-baseline, no loss
+        self.assertEqual(seats._cursor("main", "art3mis", "s-r1")["off"], off)
+        chat.post("@art3mis go", who="bob")
+        self.assertIn("go", seats.deliver(session="s-r1"))  # hook path rebound
+        self.assertIsNone(seats.deliver(session="s-r1"))
+
+    def test_rename_by_session_prefix(self):
+        seats.join(session="sess-abcdef1234", seat="agent-xyz", cwd="/tmp/p")
+        ok, _msg = seats.rename_seat("sess-abc", "nice")
+        self.assertTrue(ok)
+        self.assertEqual(seats.seat_for_session("sess-abcdef1234"), "nice")
+
+    def test_rename_refusals(self):
+        seats.join(session="s-1", seat="a", cwd="/tmp/p")
+        seats.join(session="s-2", seat="b", cwd="/tmp/p")
+        for bad, why in (("b", "taken"), ("david", "reserved"),
+                         ("all", "reserved"), ("sp ace", "chars"),
+                         ("", "chars")):
+            ok, msg = seats.rename_seat("a", bad)
+            self.assertFalse(ok, "%s should refuse (%s): %s" % (bad, why, msg))
+        ok, msg = seats.rename_seat("ghost", "x")
+        self.assertFalse(ok)
+        self.assertIn("no roster row", msg)
+        ok, msg = seats.rename_seat("a", "a")          # no-op, not an error
+        self.assertTrue(ok)
+
+    def test_cli_and_web_rename(self):
+        seats.join(session="s-9", seat="blob", cwd="/tmp/p")
+        rc, _out, err = self.cmd("seat", ["rename", "blob", "buddy"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("buddy", seats.roster())
+        obj, code = web._api_chat_seat({"action": "rename",
+                                        "seat": "buddy", "new": "pal"})
+        self.assertEqual(code, 200, obj)
+        self.assertIn("pal", seats.roster())
+        obj, code = web._api_chat_seat({"action": "rename",
+                                        "seat": "ghost", "new": "x"})
+        self.assertEqual(code, 400)
+        obj, code = web._api_chat_seat({"action": "nuke", "seat": "pal"})
+        self.assertEqual(code, 400)
+        rc, _out, err = self.cmd("seat", ["rename"])   # usage
+        self.assertEqual(rc, 2)
 
 
 class StopGuardTest(SeatsBase):
@@ -619,7 +767,7 @@ class RosterReportTest(SeatsBase):
 
     def test_presence_tiers_from_seen_file(self):
         seats.write_roster("old-seat")
-        old = time.time() - 10_000
+        old = time.time() - 1000        # absent (>QUIET_S) but under REAP_S
         os.utime(seats.seen_path("old-seat"), (old, old))
         rep = seats.roster_report("main")
         self.assertEqual(rep["seats"][0]["presence"], "absent")
@@ -630,6 +778,59 @@ class RosterReportTest(SeatsBase):
         self.assertEqual(rc, 0)
         self.assertIn("alice", out)
         self.assertIn("fresh", out)
+
+
+class RosterReaperTest(SeatsBase):
+    """G-roster-reaper: the roster only ever grew — permanently-absent /tmp
+    throwaways piled up with orphan cursor/seen/latch files."""
+
+    def test_stale_row_and_orphan_state_reaped_fresh_survives(self):
+        seats.join(seat="fresh", session="s-f", cwd="/tmp/p")
+        seats.join(seat="stale", session="s-s", cwd="/tmp/p")
+        with open(seats._stop_fp_path("main", "stale", "s-s"), "w") as f:
+            f.write("fp")                       # a stop latch orphan too
+        old = time.time() - 2 * seats.REAP_S
+        os.utime(seats.seen_path("stale"), (old, old))
+        reaped = seats.reap_roster()
+        self.assertEqual(reaped, ["stale"])
+        self.assertNotIn("stale", seats.roster())
+        self.assertIn("fresh", seats.roster())          # fresh row survives
+        names = os.listdir(chat.chat_dir())
+        self.assertFalse([n for n in names
+                          if seats._seat_key("stale") in n])   # whole tail gone
+        self.assertTrue([n for n in names
+                         if seats._seat_key("fresh") in n])    # fresh state kept
+
+    def test_report_reaps_and_cli_hides_absent_behind_all(self):
+        seats.join(seat="live", session="s-l", cwd="/tmp/p")
+        seats.join(seat="gone", session="s-g", cwd="/tmp/p")
+        old = time.time() - 2 * seats.REAP_S
+        os.utime(seats.seen_path("gone"), (old, old))
+        rep = seats.roster_report("main")               # the report's GC leg
+        self.assertEqual([s["seat"] for s in rep["seats"]], ["live"])
+        # absent-but-not-yet-reap-age rows hide behind --all in the CLI
+        seats.write_roster("napping")
+        nap = time.time() - seats.QUIET_S - 60
+        os.utime(seats.seen_path("napping"), (nap, nap))
+        rc, out, _ = self.cmd("seats")
+        self.assertEqual(rc, 0)
+        self.assertIn("live", out)
+        self.assertNotIn("napping", out)
+        self.assertIn("hidden", out)
+        rc, out, _ = self.cmd("seats", ["--all"])
+        self.assertIn("napping", out)
+
+    def test_fresh_roster_poll_never_writes(self):
+        """The web panel polls the report every 3s — an all-fresh roster must
+        stay byte-identical (same inode, same mtime), never churn."""
+        seats.join(seat="alice", session="s-a", cwd="/tmp/p")
+        p = seats.roster_path()
+        before = os.stat(p)
+        for _ in range(3):
+            seats.roster_report("main")
+        after = os.stat(p)
+        self.assertEqual((before.st_ino, before.st_mtime_ns),
+                         (after.st_ino, after.st_mtime_ns))
 
 
 class RoomLockTest(SeatsBase):
