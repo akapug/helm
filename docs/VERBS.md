@@ -1113,4 +1113,9 @@ helm path):
 model family the full claude-code harness through a local wire proxy —
 `seat add|up|down|launch|smoke|list|status|doctor`) is wired into the
 dispatcher; see [MULTIMODEL_SEATS_ADDENDUM.md](MULTIMODEL_SEATS_ADDENDUM.md)
-while its live proving rounds finish.
+while its live proving rounds finish. Two family modes are live: `codex`
+(mode "proxy" — a subscription OAuth cred translated read-only into the
+proxy) and `kimi` (mode "proxy-key" — an API-key provider behind the same
+proxy via its openai-compatibility block; the key comes from `KIMI_API_KEY`
+or `--key-from <env-file>` at add time and is baked into the seat's 0600
+config, never printed).
