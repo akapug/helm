@@ -189,5 +189,22 @@ class CmdTest(ChatBase):
         self.assertIn("no rooms yet", out)
 
 
+class RowIntegrityTest(ChatBase):
+    def test_unicode_line_separator_never_tears_the_row(self):
+        """U+2028/U+2029 inside a message (a voice paste can carry them) must
+        not split the JSON row for readers — read() splits on exactly \\n,
+        never str.splitlines() (found by the delivery lane 2026-07-20)."""
+        chat.post("voice paste second visual line third", who="bob")
+        rows, total = chat.read("main")
+        self.assertEqual(total, 1)
+        self.assertIn(" ", rows[0]["text"])
+        chat.post("padding", who="bob")
+        p = chat.room_path("main")
+        chat._rotate(p, cap=1)   # force rotation through the same split law
+        rows, total = chat.read("main")
+        self.assertEqual(total, 1)
+        self.assertEqual(rows[0]["text"], "padding")
+
+
 if __name__ == "__main__":
     unittest.main()

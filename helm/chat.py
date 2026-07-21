@@ -334,8 +334,10 @@ def _rotate(path, cap=None):
             return False
     except OSError:
         return False
+    # split on exactly "\n" (the writer's terminator) — str.splitlines() also
+    # splits on U+2028/U+2029/\x85 INSIDE a message's text, tearing the JSON row
     with open(path, encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
+        lines = [x for x in f.read().split("\n") if x]
     pk.atomic_write(path, "".join(x + "\n" for x in lines[len(lines) // 2:]))
     return True
 
@@ -355,8 +357,10 @@ def read(room="main", since=0):
     rotated) resets to 0 so a poller re-syncs instead of starving;
     unparseable lines are skipped, never fatal."""
     try:
+        # exactly "\n", never splitlines() — a message carrying U+2028 (a voice
+        # paste can) must not tear its row for every reader (found 2026-07-20)
         with open(room_path(room), encoding="utf-8", errors="replace") as f:
-            raw = f.read().splitlines()
+            raw = [x for x in f.read().split("\n") if x]
     except OSError:
         return [], 0
     msgs = [m for m in map(_msg, raw) if m]
@@ -524,9 +528,16 @@ def _fmt_body(m):
 # CLI
 # ---------------------------------------------------------------------------
 
+SEAT_VERBS = ("join", "deliver", "wait", "seats", "claim", "release",
+              "claims", "verdict", "reveal")   # the delivery lane — seats.py
+
+
 def cmd_chat(args):
     """chat post <text...> | read [--since N] [--follow] | rooms |
-    react <n> <emoji> | log-flush | node up|down|status  [--room R]"""
+    react <n> <emoji> | log-flush | node up|down|status |
+    join|deliver [--hook-json] | wait [--any] | seats |
+    claim|release <resource> | claims | verdict <topic> <text> |
+    reveal <topic>  [--room R]"""
     args = list(args or [])
     room = "main"
     room_given = "--room" in args
@@ -541,6 +552,9 @@ def cmd_chat(args):
     if verb == "node":
         from . import chatnode
         return chatnode.cmd_node(args[1:])
+    if verb in SEAT_VERBS:
+        from . import seats
+        return seats.cmd(verb, args[1:], room)
     if verb == "post":
         text = " ".join(args[1:]).strip()
         if not text and not sys.stdin.isatty():
@@ -605,6 +619,6 @@ def cmd_chat(args):
             last = ("  last: " + _fmt(msgs[-1])) if msgs else ""
             print("  %s  %d msg%s%s%s" % (n, total, "s"[:total != 1], unread, last))
         return 0
-    print("helm chat: unknown subcommand '%s' "
-          "(post|read|rooms|react|log-flush|node)" % verb, file=sys.stderr)
+    print("helm chat: unknown subcommand '%s' (post|read|rooms|react|"
+          "log-flush|node|%s)" % (verb, "|".join(SEAT_VERBS)), file=sys.stderr)
     return 2
