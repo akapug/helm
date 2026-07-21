@@ -143,6 +143,27 @@ class JoinTest(SeatsBase):
         rc, out = self.cmd_fd("join", ["--hook-json"], stdin=b"not json{{")
         self.assertEqual(rc, 0)   # never raises, never shapes a session start
 
+    def test_join_line_mandates_arming_the_idle_wake_beacon(self):
+        _seat, line = seats.join(seat="codex", cwd="/tmp/p")
+        # a mandatory FIRST action, not a suggestion
+        self.assertIn("MANDATORY", line)
+        # the exact beacon-arm command carries the RESOLVED seat name + --follow
+        self.assertIn("helm chat wait --seat codex --follow", line)
+        self.assertIn("Monitor(", line)
+        self.assertIn("persistent: true", line)
+        # the honest enforcement note: nothing external can wake a PTY agent
+        self.assertIn("native-wake-only-agent-armed", line)
+
+    def test_seat_joins_roster_under_its_family_name(self):
+        # launch_line exports HELM_CHAT_NAME=<family>; the join hook keys the
+        # roster on it (derive_seat) — so @codex reaches the seat, not agent-xxxx
+        os.environ["HELM_CHAT_NAME"] = "codex"
+        os.environ["CLAUDE_SESSION_ID"] = "sess-abcdef12"
+        seat, _line = seats.join(cwd="/tmp/p")     # no explicit --seat
+        self.assertEqual(seat, "codex")
+        self.assertIn("codex", seats.roster())
+        self.assertNotIn("agent-sess-abc", " ".join(seats.roster()))
+
 
 class DeliverTest(SeatsBase):
     def seat_up(self, seat="alice"):
@@ -324,6 +345,29 @@ class WaitTest(SeatsBase):
         seats.join(seat="alice", cwd="/tmp/p")
         rc, _out, _err = self.cmd("wait", ["--seat", "alice", "--timeout", "0.05"])
         self.assertEqual(rc, 1)
+
+    def test_wait_follow_streams_every_match_and_never_exits_on_first(self):
+        seats.join(seat="alice", cwd="/tmp/p")     # baselines the cursor at join
+        chat.post("@alice one", who="bob")
+        chat.post("just agent noise", who="bob")   # non-matching — must be skipped
+        chat.post("@alice two", who="bob")
+        captured = []
+        line = seats.wait(seat="alice", follow=True, timeout=0.15, poll=0.01,
+                          emit=captured.append)
+        self.assertIsNone(line)                    # --follow returns only on timeout
+        self.assertEqual(len(captured), 2)         # BOTH matches — not just the first
+        self.assertIn("@alice one", captured[0])
+        self.assertIn("@alice two", captured[1])
+        self.assertFalse(any("agent noise" in c for c in captured))  # non-match not emitted
+
+    def test_wait_follow_non_matching_row_emits_nothing(self):
+        seats.join(seat="alice", cwd="/tmp/p")
+        chat.post("chatter with no mention", who="bob")
+        captured = []
+        line = seats.wait(seat="alice", follow=True, timeout=0.1, poll=0.01,
+                          emit=captured.append)
+        self.assertIsNone(line)
+        self.assertEqual(captured, [])
 
     def test_wait_any_sees_only_rows_after_arming(self):
         import threading

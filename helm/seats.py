@@ -20,10 +20,14 @@ owner rails stamped (origin web/tui); claim leases bind to {session, lease
 nonce, fence}, never to a matching display string.
 
 The legs:
-  * join    — SessionStart hook: roster row (RAM presence) + cursor
+  * join    — SessionStart hook: roster row (RAM presence, keyed on the seat's
+              HELM_CHAT_NAME so a seat joins as its family name) + cursor
               INITIALIZED HERE (a message posted between session start and
               the first tool boundary must deliver — codex H5.5) + the seat's
-              identity/protocol line as session context.
+              identity/protocol line as session context. That line DIRECTS the
+              agent to arm its idle-wake beacon (a persistent Monitor on
+              `helm chat wait --follow`) as a MANDATORY first action — the only
+              thing that wakes an idle PTY agent (native-wake-only-agent-armed).
   * deliver — PostToolUse hook: the tool-boundary nudge. At most ONE row per
               boundary, 200-byte clip, control-char scrub, information-not-
               instruction label. AT-LEAST-ONCE, NEVER AT-MOST-ONCE (codex
@@ -33,9 +37,12 @@ The legs:
               touches the seat's own `.seen` file (presence for free); the
               unchanged-room fast path never rewrites shared state.
   * wait    — the beacon: block until a row addressed to the seat lands
-              (Monitor arms it). NOTE (codex M11): this is busy-turn parity
-              plus an OPT-IN idle beacon — an idle session that never armed
-              a Monitor receives nothing; the join context line says to arm.
+              (Monitor arms it). --follow keeps the room open and streams EACH
+              new matching row as one line (one line = one agent wake), never
+              returning on a match. NOTE (codex M11): this is busy-turn parity
+              plus an idle beacon the join context line makes MANDATORY to arm —
+              nothing external can wake an idle PTY agent, so the self-armed
+              Monitor is the only path.
   * claims  — advisory TTL lease with session+nonce+fence binding and
               monotonic expiry (the worktree-collision class).
 
@@ -393,8 +400,12 @@ def deliver(session=None, room="main", seat=None, emit=None):
 # ---------------------------------------------------------------------------
 
 def join(session=None, cwd=None, seat=None, room="main"):
-    """The autojoin: roster row + cursor initialized HERE + the identity
-    line the hook injects as session context. Idempotent per seat."""
+    """The autojoin: roster row + cursor initialized HERE + the identity line
+    the hook injects as session context. The line DIRECTS the agent to arm its
+    idle-wake beacon as a mandatory FIRST action — a self-armed Monitor is the
+    only thing that can wake an idle PTY agent (native-wake-only-agent-armed),
+    so a SessionStart directive is the strongest enforcement available.
+    Idempotent per seat."""
     seat = seat or seat_for_session(session) or derive_seat(session)
     write_roster(seat, session=session, cwd=cwd)
     if _cursor(room, seat) is None:
@@ -403,32 +414,58 @@ def join(session=None, cwd=None, seat=None, room="main"):
                 _init_cursor(room, seat)
     line = ("[helm chat] you are seat '%s' in room %s — @%s and owner posts "
             "reach you between tool calls; speak: helm chat post; catch up: "
-            "helm chat read; idle? arm a Monitor on: helm chat wait --seat %s"
-            % (seat, room, seat, seat))
+            "helm chat read. MANDATORY FIRST ACTION: arm your inbox beacon so "
+            "you wake on an @%s mention or an owner post even while idle — "
+            "Monitor(command: \"helm chat wait --seat %s --follow\", "
+            "persistent: true). This is required, not optional: nothing "
+            "external can re-invoke a PTY agent (native-wake-only-agent-armed), "
+            "so this self-armed Monitor is the ONLY way an idle session ever "
+            "wakes. Arm it before anything else."
+            % (seat, room, seat, seat, seat))
     return seat, line
 
 
 def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
-         emit=None):
+         emit=None, follow=False):
     """Block until the next word arrives; returns the line or None on
     timeout. Seat mode IS a delivery (advances the cursor via deliver's
     at-least-once path); --any watches the room without touching cursors.
     Busy-turn parity comes from the PostToolUse hook; an IDLE seat gets
-    woken only if it armed a Monitor on this — opt-in by design (M11)."""
+    woken only if it armed a Monitor on this — opt-in by design (M11).
+
+    --follow (the idle-wake beacon) NEVER returns on a match: it streams EACH
+    new matching row as one emitted line — one Monitor line = one agent wake —
+    reusing the delivery address filter (mentions of the seat + owner posts),
+    and returns only on timeout (a persistent Monitor passes no timeout, so it
+    runs forever). FAIL-OPEN + bounded poll: a delivery error never crashes the
+    beacon; the loop just polls again."""
     poll = chat.POLL_S if poll is None else poll
     deadline = time.time() + timeout if timeout else None
     seat = seat or derive_seat(None)
+    # single-shot keeps its contract: emit stays as passed (None ⇒ deliver
+    # returns the line without emitting). --follow always needs a sink to stream
+    # through, so it defaults to print.
+    stream = emit or print if follow else emit
     since = chat.read(room)[1] if any_row else None
     while True:
         if any_row:
             rows, total = chat.read(room, since)  # read() self-heals since>total
             if rows:
-                return chat._fmt(rows[0])
+                if not follow:
+                    return chat._fmt(rows[0])
+                for m in rows:
+                    stream(chat._fmt(m))
             since = total
         else:
-            line = deliver(room=room, seat=seat, emit=emit)
-            if line:
-                return line
+            while True:                     # drain all currently-matching rows
+                try:
+                    line = deliver(room=room, seat=seat, emit=stream)
+                except Exception:
+                    line = None             # fail-open: never crash the beacon
+                if not line:
+                    break
+                if not follow:
+                    return line             # single-shot: first match wins
         if deadline and time.time() >= deadline:
             return None
         time.sleep(poll)
@@ -643,10 +680,14 @@ def cmd(verb, args, room="main"):
         return 0
     if verb == "wait":
         timeout = _flag(args, "--timeout")
+        follow = "--follow" in args
         line = wait(seat=_flag(args, "--seat"), room=room,
                     any_row="--any" in args,
                     timeout=float(timeout) if timeout else None,
-                    emit=None if "--any" in args else print)
+                    emit=None if "--any" in args and not follow else print,
+                    follow=follow)
+        if follow:               # --follow streams via emit; returns on timeout
+            return 0
         if line is None:
             return 1
         if "--any" in args:

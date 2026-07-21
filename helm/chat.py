@@ -625,7 +625,7 @@ SEAT_VERBS = ("join", "deliver", "wait", "seats", "claim", "release",
 def cmd_chat(args):
     """chat post <text...> | read [--since N] [--follow] | rooms |
     react <n> <emoji> | log-flush | node up|down|status |
-    join|deliver [--hook-json] | wait [--any] | seats |
+    join|deliver [--hook-json] | wait [--any] [--follow] [--seat S] | seats |
     claim|release <resource> | claims  [--room R]"""
     args = list(args or [])
     room = "main"
