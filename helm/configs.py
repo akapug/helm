@@ -89,6 +89,20 @@ def _real(p):
     return os.path.realpath(os.path.expanduser(p))
 
 
+def _is_seat_home(parent):
+    """True iff `parent` is a seat's isolated claude config dir —
+    <helm_home>/_global/seats/<family>/claude. Computed per call (env-honoring,
+    NOT the import-time glob) so a seat minted after import (`helm seat add`
+    wires its delivery hooks in the same process) is recognized by the write
+    gate. Same trust surface as the HOME_ROOTS glob that catches pre-existing
+    seats; creds beside it stay denied by name."""
+    from . import home
+    rp = _real(parent)
+    return (os.path.basename(rp) == "claude"
+            and os.path.dirname(os.path.dirname(rp))
+            == _real(os.path.join(home.global_dir(), "seats")))
+
+
 def _is_recognized_config(rp):
     """True iff rp is a RECOGNIZED config file — the single gate for both reading
     content and editing. Extension alone is NOT enough (a package.json, a random
@@ -106,7 +120,7 @@ def _is_recognized_config(rp):
     # home/user-scope: the recognized basename sits DIRECTLY in a home root
     if base in _HOME_FILES:
         parent = _real(os.path.dirname(rp))
-        if any(parent == _real(h) for h in HOME_ROOTS):
+        if any(parent == _real(h) for h in HOME_ROOTS) or _is_seat_home(parent):
             return True
         if base == ".claude.json" and parent == _real(HOME):  # the ~/.claude.json sibling
             return True
@@ -154,7 +168,8 @@ def classify_path(path):
         return typ, False, "credential/token store — never editable"
     if not _is_recognized_config(rp):
         return typ, False, "not a recognized config file"
-    if not _under(rp, CWD_ROOTS + HOME_ROOTS):
+    if not (_under(rp, CWD_ROOTS + HOME_ROOTS)
+            or _is_seat_home(os.path.dirname(rp))):
         return typ, False, "outside the allowlisted config roots"
     if _is_plugin_or_managed(rp):
         return typ, False, "plugin/managed-provided — read-only"
@@ -370,7 +385,9 @@ def read_file(path):
     typ, editable, reason = classify_path(rp)
     exists = os.path.isfile(rp)
     readable = (os.path.basename(rp) not in _DENY_FILES
-                and _is_recognized_config(rp) and _under(rp, CWD_ROOTS + HOME_ROOTS))
+                and _is_recognized_config(rp)
+                and (_under(rp, CWD_ROOTS + HOME_ROOTS)
+                     or _is_seat_home(os.path.dirname(rp))))
     if not readable:
         return {"path": rp, "type": typ, "editable": False,
                 "reason": reason or "not a recognized config file", "exists": exists,

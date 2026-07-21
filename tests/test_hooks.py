@@ -33,20 +33,26 @@ class HooksBase(unittest.TestCase):
         configs.HOME_ROOTS = [homes.DEFAULTS["claude"]]
         configs.BACKUP_DIR = j("backups")
         # HELM_HOME hermetic: seat_homes() globs <helm_home>/_global/seats — a
-        # tmp home keeps the live seats out of every hooks test.
-        self._helm_home_prior = os.environ.get("HELM_HOME")
+        # tmp home keeps the live seats out of every hooks test. HELM_PROC +
+        # HELM_CHAT_DIR hermetic too: the retrofit surface scans /proc and
+        # reads the roster — tests must never touch the live ones.
+        self._env_prior = {k: os.environ.get(k)
+                           for k in ("HELM_HOME", "HELM_PROC", "HELM_CHAT_DIR")}
         self.helm_home = j("helm-home")
         os.environ["HELM_HOME"] = self.helm_home
+        os.environ["HELM_PROC"] = j("proc")        # empty ⇒ no panes found
+        os.environ["HELM_CHAT_DIR"] = j("chat")
         self.seats_root = os.path.join(self.helm_home, "_global", "seats")
 
     def tearDown(self):
         for k, v in self._homes_orig.items():
             setattr(homes, k, v)
         configs.HOME_ROOTS, configs.BACKUP_DIR = self._cfg_orig
-        if self._helm_home_prior is None:
-            os.environ.pop("HELM_HOME", None)
-        else:
-            os.environ["HELM_HOME"] = self._helm_home_prior
+        for k, v in self._env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def mk_seat(self, family, settings=None):
@@ -539,6 +545,82 @@ class SeatCoverageTest(HooksBase):
         self.assertFalse(os.path.exists(os.path.join(
             self.seats_root, "codex", "claude", "settings.json")))
         self.assertEqual(hooks.seat_coverage(), (0, 1))
+
+
+class FreshSeatRecognitionTest(HooksBase):
+    def test_seat_dir_minted_after_import_accepted_by_gated_write(self):
+        """G-seatlaunch-installs' enabling fix: configs' HOME_ROOTS globs at
+        import — a seat minted afterwards (helm seat add, same process) must
+        STILL pass the write gate, or the born-wired install is refused."""
+        d = os.path.join(self.seats_root, "newfam", "claude")
+        os.makedirs(d)                      # deliberately NOT in HOME_ROOTS
+        action, detail = hooks.install_home(d, specs=hooks.DELIVERY_SPECS)
+        self.assertEqual(action, "add", detail)
+        got = self.read_settings(d)
+        self.assertIn("chat deliver --hook-json",
+                      " ".join(hooks._hook_cmds(got, "PostToolUse")))
+
+
+class UncoveredPanesTest(HooksBase):
+    """The retrofit surface: running claude PTYs whose named identity has no
+    live roster row — a joined-late idle pane can't self-heal; it must be
+    surfaced for relaunch (the live kimi case)."""
+
+    def mk_proc(self, pid, cmdline, env):
+        d = os.path.join(self.tmp, "proc", str(pid))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "cmdline"), "wb") as f:
+            f.write(b"\0".join(cmdline) + b"\0")
+        with open(os.path.join(d, "environ"), "wb") as f:
+            f.write(b"\0".join(env) + b"\0")
+        return os.path.join(self.tmp, "proc")
+
+    def test_uncovered_pane_surfaced_then_covered_when_roster_fresh(self):
+        proc = self.mk_proc(4242, [b"claude", b"--model", b"kimi-k3"],
+                            [b"HELM_CHAT_NAME=kimi", b"TERM=xterm"])
+        self.mk_proc(4243, [b"vim", b"notes.md"], [b"TERM=xterm"])  # not claude
+        panes = hooks.running_panes(proc)
+        self.assertEqual([(p["pid"], p["seat"]) for p in panes],
+                         [(4242, "kimi")])
+        rows = hooks.uncovered_panes(proc)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["seat"], "kimi")
+        self.assertIn("never joined", rows[0]["reason"])
+        out = io.StringIO()
+        hooks.surface_uncovered(out=out)     # HELM_PROC points at the fake tree
+        self.assertIn("kimi", out.getvalue())
+        self.assertIn("relaunch", out.getvalue())
+        from helm import seats
+        seats.write_roster("kimi")           # the seat joins (fresh .seen)
+        self.assertEqual(hooks.uncovered_panes(proc), [])
+
+    def test_seat_family_from_config_dir_and_stale_row(self):
+        cdir = os.path.join(self.seats_root, "kimi", "claude")
+        os.makedirs(cdir)
+        proc = self.mk_proc(7, [b"claude"],
+                            [b"CLAUDE_CONFIG_DIR=" + cdir.encode()])
+        panes = hooks.running_panes(proc)
+        self.assertEqual(panes[0]["family"], "kimi")   # named by its seat dir
+        from helm import seats
+        seats.write_roster("kimi")
+        old = os.path.getmtime(seats.seen_path("kimi")) - 2000
+        os.utime(seats.seen_path("kimi"), (old, old))
+        rows = hooks.uncovered_panes(proc)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("stale", rows[0]["reason"])
+
+    def test_unnamed_home_pane_not_judged_and_missing_proc_fail_open(self):
+        proc = self.mk_proc(9, [b"claude"], [b"TERM=xterm"])   # no name, no dir
+        self.assertEqual(hooks.uncovered_panes(proc), [])
+        self.assertEqual(hooks.running_panes(os.path.join(self.tmp, "nope")), [])
+
+    def test_install_surfaces_uncovered_panes(self):
+        self.mk_proc(4242, [b"claude"], [b"HELM_CHAT_NAME=kimi"])
+        self.mk_home("a-user-dev")
+        rc, out, _ = self.run_hooks(["install"])
+        self.assertEqual(rc, 0)
+        self.assertIn("NOT receiving fleet chat", out)
+        self.assertIn("kimi", out)
 
 
 if __name__ == "__main__":

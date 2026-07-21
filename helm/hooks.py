@@ -38,6 +38,7 @@ import os
 import shlex
 import shutil
 import sys
+import time
 
 from . import configs, home, homes
 
@@ -422,6 +423,97 @@ def seat_coverage():
     return (sum(1 for r in rows if all(r[n] for n in names)), len(rows))
 
 
+# ── the retrofit surface (G-seatlaunch-installs): a pane that launched
+# BEFORE its identity/hooks existed sits idle forever — no hook ever fires
+# in an idle PTY, so it can never self-heal into delivery (the live kimi
+# seat: running, absent from the roster, @kimi routing nowhere). The only
+# fix is a relaunch, so install/launch SURFACE the uncovered running panes.
+
+def running_panes(proc=None):
+    """[{pid, seat, config_dir, family}] for every live claude-harness PTY of
+    this uid: /proc scan — cmdline argv0/argv1 basename 'claude', environ
+    read for HELM_CHAT_NAME / CLAUDE_CONFIG_DIR (a seat config dir names its
+    family). Other-uid entries are unreadable and skipped; HELM_PROC
+    overrides the proc root (tests); fail-open []."""
+    proc = proc or home.env("PROC") or "/proc"
+    out = []
+    try:
+        pids = sorted(n for n in os.listdir(proc) if n.isdigit())
+    except OSError:
+        return out
+    sroot = os.path.realpath(os.path.join(home.global_dir(), "seats"))
+    for pid in pids:
+        base = os.path.join(proc, pid)
+        try:
+            with open(os.path.join(base, "cmdline"), "rb") as f:
+                argv = [a for a in f.read(65536).split(b"\0") if a]
+            words = [a.decode("utf-8", "replace") for a in argv[:2]]
+            if not any(os.path.basename(w) == "claude" for w in words):
+                continue
+            with open(os.path.join(base, "environ"), "rb") as f:
+                env = dict(kv.split(b"=", 1)
+                           for kv in f.read(1 << 20).split(b"\0") if b"=" in kv)
+        except OSError:
+            continue
+
+        def val(k):
+            v = env.get(k.encode())
+            return v.decode("utf-8", "replace") if v else None
+
+        cdir, family = val("CLAUDE_CONFIG_DIR"), None
+        if cdir:
+            real = os.path.realpath(cdir)
+            if os.path.dirname(os.path.dirname(real)) == sroot:
+                family = os.path.basename(os.path.dirname(real))
+        out.append({"pid": int(pid), "seat": val("HELM_CHAT_NAME") or
+                    val("MELD_CHAT_NAME"), "config_dir": cdir, "family": family})
+    return out
+
+
+def uncovered_panes(proc=None, quiet_s=900):
+    """Running claude PTYs whose NAMED chat identity is not live on the
+    roster (+reason) — covered = the pane's seat name (HELM_CHAT_NAME, else
+    its seat family) has a roster row seen within quiet_s. Un-named home
+    panes are NOT judged here: their auto-name binds via session id, which
+    a /proc scan cannot see — their coverage check is `helm hooks status`
+    (the hooks ARE the join path). Read-only; fail-open []."""
+    try:
+        from . import seats
+        panes = [p for p in running_panes(proc) if p["seat"] or p["family"]]
+        if not panes:
+            return []
+        now, r, out = time.time(), seats.roster(), []
+        for p in panes:
+            name = p["seat"] or p["family"]
+            row = r.get(name)
+            ls = seats.last_seen(name, row) if row else None
+            if row and ls and now - ls < quiet_s:
+                continue
+            p["reason"] = ("no roster row for '%s' — never joined" % name
+                           if not row else "roster row for '%s' is stale "
+                           "(%.0fm quiet)" % (name, (now - (ls or 0)) / 60))
+            out.append(p)
+        return out
+    except Exception:
+        return []
+
+
+def surface_uncovered(out=None):
+    """Print the uncovered running panes — called by `helm hooks install`
+    and `helm seat launch`: nothing external can wake an idle PTY agent, so
+    a relaunch (human/driver) is the only repair and SURFACING is the lever."""
+    rows = uncovered_panes()
+    if not rows:
+        return
+    out = out or sys.stdout
+    print("helm hooks: %d running pane(s) NOT receiving fleet chat — relaunch "
+          "them (an idle pane cannot self-heal into delivery):" % len(rows),
+          file=out)
+    for p in rows:
+        print("  pid %-7d %-14s %s" % (p["pid"], p["seat"] or p["family"] or "?",
+                                       p["reason"]), file=out)
+
+
 _CODEX_PENDING = ("codex: recipe pending — docs/HOOKS.md carries no mechanical "
                   "notify-hook shape yet; wire it by hand per that doc's codex section")
 
@@ -561,7 +653,8 @@ def cmd_hooks(args):
             if st:
                 print("helm hooks: %d of %d seats covered (fleet delivery)"
                       % (sc, st))
-        return 1 if failed else 0
+            surface_uncovered()   # settings fixed ≠ live panes fixed — a pane
+        return 1 if failed else 0  # launched pre-install still needs a relaunch
 
     print("helm hooks: unknown subverb %r" % verb, file=sys.stderr)
     print(_USAGE, file=sys.stderr)
