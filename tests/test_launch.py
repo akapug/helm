@@ -62,6 +62,18 @@ class LaunchTest(unittest.TestCase):
         self.assertNotIn("HELM_CHAT_ROOM",
                          launch.build_env({}, "alice", room="main"))
 
+    def test_build_env_strips_child_stamp(self):
+        """child-stamp-kills-seat-persistence: `helm launch` run from inside a
+        Claude session inherits the child stamp; the exec'd claude must start
+        top-level or its transcript persistence is silently off."""
+        from helm import seat
+        base = {"PATH": "/bin"}
+        base.update({v: "leaked" for v in seat.CHILD_STAMP_VARS})
+        env = launch.build_env(base, "alice")
+        for v in seat.CHILD_STAMP_VARS:
+            self.assertNotIn(v, env)
+        self.assertEqual(env["PATH"], "/bin")  # everything else rides through
+
     def test_stable_seat_sanitized(self):
         s = launch.stable_seat("/tmp/My Proj!x")
         self.assertNotIn(" ", s)

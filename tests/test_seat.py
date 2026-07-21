@@ -447,6 +447,60 @@ class SeatTest(unittest.TestCase):
         self.assertIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=78", kline)
         self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", kline)
 
+    # -- the child-stamp guard (child-stamp-kills-seat-persistence) ---------
+    def test_launch_line_strips_child_stamp(self):
+        """A pane minted by a daemon born inside a Claude session inherits
+        CLAUDE_CODE_CHILD_SESSION + the daemon's SID/bridge id — CC then runs
+        the seat as a subprocess child with transcript persistence silently
+        OFF. Every launch line unsets the trio BEFORE the first export, for
+        every family and instance; the pinned byte layout is untouched."""
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        for line in (seat.launch_line("codex"), seat.launch_line("kimi"),
+                     seat.launch_line("codex", seat="codex-2")):
+            for v in seat.CHILD_STAMP_VARS:
+                self.assertIn("-u " + v, line)
+                self.assertNotIn(v + "=", line)      # unset, never re-exported
+            # the unsets ride the env prefix, ahead of the first export
+            self.assertLess(line.index("-u CLAUDE_CODE_CHILD_SESSION"),
+                            line.index("ANTHROPIC_BASE_URL="))
+        # byte-layout pins survive: head, signing adjacency, tail
+        line = seat.launch_line("codex")
+        self.assertTrue(line.startswith("env -u ANTHROPIC_API_KEY "))
+        self.assertIn("DREGG_PROFILE=codex CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=78", line)
+        self.assertTrue(line.endswith(
+            "claude --dangerously-skip-permissions --model gpt-5.6-sol"))
+
+    def test_launch_sh_unsets_child_stamp_before_exec(self):
+        """The minted launch.sh strips the child-session stamp with an explicit
+        `unset` line ABOVE the exec (and the exec'd line carries the same -u
+        trio) — a seat pane starts top-level whatever env its spawner leaked.
+        Instances re-mint through the same _write_launch_assets: same guard."""
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        unset_line = "unset " + " ".join(seat.CHILD_STAMP_VARS)
+        inst = seat._instance_dir("codex", "codex-2")
+        seat._write_launch_assets("codex", inst, seat="codex-2")
+        for d in (seat.seat_dir("codex"), inst):
+            with open(os.path.join(d, "launch.sh")) as f:
+                sh = f.read()
+            self.assertIn(unset_line, sh)
+            self.assertLess(sh.index(unset_line), sh.index("exec "))
+            for v in seat.CHILD_STAMP_VARS:
+                self.assertIn("-u " + v, sh)          # belt: the exec line too
+                self.assertNotIn(v + "=", sh)
+
+    def test_seat_env_strips_child_stamp(self):
+        """smoke's subprocess env mirrors launch_line — the inherited stamp
+        must not ride into a smoke claude either."""
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        stamped = {v: "leaked" for v in seat.CHILD_STAMP_VARS}
+        with mock.patch.dict(os.environ, stamped):
+            env = seat._seat_env("codex", os.path.join(self.tmp, "smoke"))
+        for v in seat.CHILD_STAMP_VARS:
+            self.assertNotIn(v, env)
+
     def test_seat_gets_host_skills(self):
         """A seat's fresh config dir has no skills of its own, so seat agents
         couldn't /learn — _write_launch_assets shares the minting host's skills

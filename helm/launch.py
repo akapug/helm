@@ -57,8 +57,14 @@ def parse_args(args):
 
 def build_env(base, seat, home_path=None, room=None):
     """The child's env: stable chat identity, optional credential-home pin,
-    and an explicit non-main team room. Pure — tested without an exec."""
+    and an explicit non-main team room. Pure — tested without an exec.
+    The child-session stamp is stripped (seat.CHILD_STAMP_VARS): launched
+    from inside a Claude session, an inherited CLAUDE_CODE_CHILD_SESSION/
+    SID marks the child a subprocess and kills its transcript persistence."""
+    from . import seat as _seat
     env = dict(base)
+    for v in _seat.CHILD_STAMP_VARS:
+        env.pop(v, None)
     env["HELM_CHAT_NAME"] = seat
     if home_path:
         env[homes.ENV_VAR["claude"]] = home_path

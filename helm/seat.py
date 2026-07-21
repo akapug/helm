@@ -44,6 +44,12 @@ so ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY can never
 bleed from a proxied seat's shell into a Max-OAuth seat. Known integration
 points for the integrator: sessions.resume_command(), transcripts.make_cmd().
 
+THE CHILD-STAMP GUARD (same register, opposite direction): every minted
+launch strips CHILD_STAMP_VARS (CLAUDE_CODE_CHILD_SESSION + the inherited
+SID/bridge id) — a seat that inherits them runs as a subprocess child with
+transcript persistence silently OFF (bug-class
+child-stamp-kills-seat-persistence).
+
 HARD LAWS:
   - ANTHROPIC_API_KEY is never written anywhere by this module; launch lines
     actively unset it (env -u).
@@ -71,6 +77,17 @@ from . import home
 
 # The env triple that must never reach a Claude Max-OAuth seat.
 SCRUB_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+
+# The child-session stamp that must never reach a LAUNCHED seat: a pane minted
+# by a daemon that was itself started from inside a Claude session inherits
+# these, and CC then treats the seat as a subprocess child — transcript
+# persistence silently OFF, /branch broken, the session unrecoverable
+# (bug-class child-stamp-kills-seat-persistence; live-verified 2026-07-21:
+# every fleet seat carried the stamp + the daemon's inherited SID). Every mint
+# (launch_line, launch.sh, smoke env) strips the trio so a seat is born a true
+# top-level session.
+CHILD_STAMP_VARS = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+                    "CLAUDE_CODE_BRIDGE_SESSION_ID")
 
 CODEX_HOMES = os.path.join(os.path.expanduser("~"), ".codex-homes")
 PROXY_BIN_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin", "cli-proxy-api")
@@ -142,6 +159,13 @@ def scrub_prefix():
     """The printed-command form of the guard: an `env -u ...` prefix for
     pasteable claude commands minted for Claude seats."""
     return "env " + " ".join("-u " + v for v in SCRUB_VARS) + " "
+
+
+def child_stamp_unsets():
+    """The `-u VAR ...` run that strips the child-session stamp — composed
+    into every minted launch line (and, via launch_line, every launch.sh) so
+    a launched seat starts as a top-level session with real persistence."""
+    return " ".join("-u " + v for v in CHILD_STAMP_VARS)
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +392,11 @@ def _instance_dir(family, seat):
 
 def launch_line(family, model=None, room=None, seat=None):
     """The exact seat launch command. env -u ANTHROPIC_API_KEY is part of the
-    line: an inherited key must never ride into a proxied seat either.
+    line: an inherited key must never ride into a proxied seat either. The
+    child-stamp trio (CHILD_STAMP_VARS) is unset right beside it: a spawning
+    daemon born inside a Claude session stamps its panes CLAUDE_CODE_CHILD_
+    SESSION=1 (+ its own SID/bridge id), and CC then silently disables the
+    seat's transcript persistence — the seat must start top-level.
     HELM_CHAT_NAME=<seat> is the STABLE seat identity: the SessionStart join
     hook (seats.py derive_seat) keys the roster on it, so the seat joins as
     'codex'/'codex-2'/'kimi'/… instead of an ephemeral agent-<sid8> — and
@@ -402,7 +430,7 @@ def launch_line(family, model=None, room=None, seat=None):
     ctxenv = " CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=%s" % AUTOCOMPACT_PCT_OVERRIDE
     if fam.get("max_context"):
         ctxenv += " CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d" % fam["max_context"]
-    return ("env -u ANTHROPIC_API_KEY"
+    return ("env -u ANTHROPIC_API_KEY %s"
             " ANTHROPIC_BASE_URL=http://127.0.0.1:%d"
             " ANTHROPIC_AUTH_TOKEN=%s"
             " CLAUDE_CODE_SUBAGENT_MODEL=%s"
@@ -412,7 +440,8 @@ def launch_line(family, model=None, room=None, seat=None):
             " HELM_CELL_PROFILE=%s"
             " DREGG_PROFILE=%s%s"
             " claude --dangerously-skip-permissions --model %s"
-            % (fam["port"], _read_token(family) or "<seat-token-missing>",
+            % (child_stamp_unsets(),
+               fam["port"], _read_token(family) or "<seat-token-missing>",
                model, cfgdir, shlex.quote(seat), homing,
                shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(seat),
                shlex.quote(seat), ctxenv, model))
@@ -599,8 +628,13 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None):
     _seed_seat_settings(cdir)   # skip the bypass-permissions dialog (settings.json)
     _write_launch_sh(os.path.join(d, "launch.sh"),
                      "#!/bin/sh\n# helm seat %s — minted by `helm seat add`; "
-                     "regenerate with `helm seat launch %s`\nexec %s \"$@\"\n"
-                     % (seat, seat, launch_line(family, room=room, seat=seat)))
+                     "regenerate with `helm seat launch %s`\n"
+                     "# child-stamp guard: inherited from a daemon born inside "
+                     "a Claude session,\n# these mark the seat a subprocess "
+                     "child (persistence silently OFF) — strip.\n"
+                     "unset %s\nexec %s \"$@\"\n"
+                     % (seat, seat, " ".join(CHILD_STAMP_VARS),
+                        launch_line(family, room=room, seat=seat)))
 
 
 def _write_launch_sh(path, text):
@@ -852,9 +886,11 @@ def _seat_env(family, config_dir):
     """The proxied-seat subprocess env: scrubbed base (so a stray inherited
     ANTHROPIC_API_KEY can never ride along), then the seat's own proxy, chat,
     and dregg-signing identity. Mirrors launch_line so smoke cannot certify a
-    materially different process shape."""
+    materially different process shape — including the child-stamp strip."""
     fam = FAMILIES[family]
     env = scrub_env(os.environ)
+    for v in CHILD_STAMP_VARS:
+        env.pop(v, None)
     env.update({
         "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % fam["port"],
         "ANTHROPIC_AUTH_TOKEN": _read_token(family) or "",
