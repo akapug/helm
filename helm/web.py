@@ -723,6 +723,18 @@ def _api_chat_roster(qs):
         return {"seats": [], "claims": [], "unavailable": True}, 200
 
 
+def _api_chat_seat(payload):
+    """The seats panel's one mutation: bind a live agent to a memorable @name
+    (seats.rename_seat — roster row + delivery state move together). Bearer-
+    gated like every POST; refusals answer 400 with the CLI's own message."""
+    from . import seats
+    if payload.get("action") != "rename":
+        return {"error": "unknown action %r (rename)" % payload.get("action")}, 400
+    ok, msg = seats.rename_seat(str(payload.get("seat") or ""),
+                                str(payload.get("new") or ""))
+    return ({"ok": True, "note": msg} if ok else {"error": msg}), (200 if ok else 400)
+
+
 def _api_chat_react(payload):
     """The owner's click-to-react: target by ts+from (the row the panel
     holds). Signed like a post; rides the same transport."""
@@ -952,6 +964,7 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
     "/api/configs/restore": _api_configs_restore_post,
     "/api/chat": _api_chat_post,
     "/api/chat/react": _api_chat_react,
+    "/api/chat/seat": _api_chat_seat,
 }
 
 
