@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 
@@ -384,6 +385,94 @@ class SmokeTest(SeedBase):
             rc = reflex.cmd_reflex(["smoke"])
         self.assertEqual(rc, 0)
         self.assertIn("no recorded sessions", buf.getvalue())
+
+
+class CounterEndToEndTest(ReflexTest):
+    """The UNPLANTED path: real hook events through record.record() → real
+    counters.json → reflex.fire(session=) with NO planted counters dict.
+    Every signal kind (thrash/stalled/drift/stuck/generic counter) proven to
+    fire off the recorder itself — the live wiring, hermetically."""
+
+    def ev(self, sid, tool="Read", cmd=None, resp=None, failed=False):
+        e = {"session_id": sid, "tool_name": tool, "cwd": "/tmp/p",
+             "hook_event_name": "PostToolUseFailure" if failed else "PostToolUse"}
+        if cmd is not None:
+            e["tool_input"] = {"command": cmd}
+        if resp is not None:
+            e["tool_response"] = resp
+        return e
+
+    def test_thrash_latch_fire_clear_refire(self):
+        reflex.write({"id": "loop-thrash", "steer": "loop detected",
+                      "signal": "thrash", "threshold": "3", "latch": "true"})
+        sid = "e2e-thrash"
+        for _ in range(4):
+            record.record(self.ev(sid, tool="Bash", cmd="pytest -x tests"))
+        self.assertEqual(record.counters(sid).get("loop-streak"), 3)
+        fired = reflex.fire("", session=sid)
+        self.assertEqual([e["id"] for e in fired], ["loop-thrash"])
+        self.assertEqual(reflex.fire("", session=sid), [])   # latched: once/episode
+        record.record(self.ev(sid, tool="Bash", cmd="git status"))
+        self.assertEqual(record.counters(sid).get("loop-streak"), 0)
+        self.assertEqual(reflex.fire("", session=sid), [])   # inverse event…
+        self.assertEqual(reflex._load_latch(sid), {})        # …drops the latch
+        for _ in range(4):
+            record.record(self.ev(sid, tool="Bash", cmd="pytest -x tests"))
+        fired = reflex.fire("", session=sid)                 # re-armed episode
+        self.assertEqual([e["id"] for e in fired], ["loop-thrash"])
+
+    def test_stalled_fires_once_from_passive_streak(self):
+        reflex.write({"id": "stalled-driver", "steer": "you may be circling",
+                      "signal": "stalled", "threshold": "6", "latch": "true"})
+        sid = "e2e-stalled"
+        for _ in range(6):
+            record.record(self.ev(sid, tool="Read"))
+        self.assertEqual(record.counters(sid).get("passive-streak"), 6)
+        self.assertEqual(len(reflex.fire("", session=sid)), 1)
+        record.record(self.ev(sid, tool="Read"))             # streak deepens…
+        self.assertEqual(reflex.fire("", session=sid), [])   # …no escalate: quiet
+
+    def test_drift_fires_and_commit_clears(self):
+        reflex.write({"id": "uncommitted-drift", "steer": "checkpoint the slice",
+                      "signal": "drift", "threshold": "8", "latch": "true"})
+        sid = "e2e-drift"
+        with mock.patch.object(record, "_git_dirty", lambda wd: True):
+            record.record(self.ev(sid, tool="Edit"))
+            for _ in range(7):
+                record.record(self.ev(sid, tool="Read"))
+        self.assertEqual(record.counters(sid).get("dirty-streak"), 8)
+        self.assertEqual(len(reflex.fire("", session=sid)), 1)
+        record.record(self.ev(sid, tool="Bash", cmd="git commit -m checkpoint"))
+        self.assertEqual(record.counters(sid).get("dirty-streak"), 0)
+        self.assertEqual(reflex.fire("", session=sid), [])
+        self.assertEqual(reflex._load_latch(sid), {})        # commit = the clear
+
+    def test_stuck_escalates_as_the_streak_worsens(self):
+        reflex.write({"id": "stuck-commonsense", "steer": "stop retrying",
+                      "signal": "stuck", "threshold": "3", "escalate": "3",
+                      "latch": "true"})
+        sid = "e2e-stuck"
+        for _ in range(3):
+            record.record(self.ev(sid, tool="Bash", cmd="curl api",
+                                  resp="401 unauthorized"))
+        self.assertEqual(record.counters(sid).get("stuck-streak"), 3)
+        self.assertEqual(len(reflex.fire("", session=sid)), 1)
+        self.assertEqual(reflex.fire("", session=sid), [])   # latched at 3
+        for _ in range(3):
+            record.record(self.ev(sid, tool="Bash", cmd="curl api",
+                                  resp="401 unauthorized", failed=True))
+        self.assertEqual(record.counters(sid).get("stuck-streak"), 6)
+        self.assertEqual(len(reflex.fire("", session=sid)), 1)  # escalation re-fire
+
+    def test_generic_counter_is_level_triggered_without_latch(self):
+        reflex.write({"id": "warm-seat", "steer": "still reading",
+                      "signal": "counter", "counter": "passive-streak",
+                      "threshold": "2"})
+        sid = "e2e-generic"
+        record.record(self.ev(sid, tool="Read"))
+        record.record(self.ev(sid, tool="Read"))
+        self.assertEqual(len(reflex.fire("", session=sid)), 1)
+        self.assertEqual(len(reflex.fire("", session=sid)), 1)  # level, not edge
 
 
 if __name__ == "__main__":
