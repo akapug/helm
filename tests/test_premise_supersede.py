@@ -114,6 +114,16 @@ class SupersedeFlowTest(SupBase):
         self.assertIn("  attest_payload: " + premise.digest_payload("truth two"), new)
         self.assertNotIn("attest_supersedes_record", new)
         self.assertIn("  replaced_by: law-v2", self.entry_raw("law-v1"))
+        # the chain-start record commits op=create (no record to link), so the
+        # checker VERIFIES the new premise on BOTH paths (codex re-review catch)
+        self.assertEqual(premise.chain_records()[-1]["op"], "create")
+        rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-v2"])
+        self.assertEqual(rc, 0)
+        self.assertIn("native chain: VERIFIED", out)
+        rc, out, _ = self.run_verb(premise.cmd_premise_check,
+                                   ["--chain", "law-v2"])
+        self.assertNotEqual(rc, 1)   # v1 is unattested (absent=3) — never broken
+        self.assertIn("native chain VERIFIED", out)
 
     def test_refusals(self):
         self.capture_v1()

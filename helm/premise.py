@@ -688,7 +688,12 @@ def _supersede(old_id, parts, project):
         print("  note: '%s' was never attested — the chain starts here" % old["id"])
     digest = digest_payload(parts[1])
     profile = attest_profile()
-    info = record_attestation("supersede", parts[0], digest,
+    # A never-attested predecessor has no record to link: the NATIVE chain
+    # genuinely starts here, so the record commits op="create" (matching
+    # _record_expect's inference from the absent supersedes_record) — the
+    # STORE-level supersession link still lives in `supersedes` frontmatter.
+    info = record_attestation("supersede" if old_record else "create",
+                              parts[0], digest,
                               root=_root_label(_e, project), project=project,
                               ts=ts, attest_by=profile, supersedes=str(old["id"]),
                               supersedes_record=old_record)
@@ -997,15 +1002,24 @@ def _chain(pid, project):
         print("  %d. %s [%s] - %s"
               % (i + 1, c["id"], c["status"], c.get("statement") or ""))
         payload = _front(c, "attest_payload")
-        if not payload:
+        rec = _front(c, "attest_record")
+        if not payload and not rec:
             print("       unattested (no payload recorded)")
             absent = True
         else:
-            match = payload_digest(payload) == \
-                payload_digest(digest_payload(c.get("statement") or ""))
-            ok = ok and match
-            print("       digest %s %s" % ("MATCH" if match else "MISMATCH", payload))
-            rec = _front(c, "attest_record")
+            if payload:
+                match = payload_digest(payload) == \
+                    payload_digest(digest_payload(c.get("statement") or ""))
+                ok = ok and match
+                print("       digest %s %s"
+                      % ("MATCH" if match else "MISMATCH", payload))
+            else:
+                # A record pointer exists but its payload metadata is gone —
+                # present-but-DAMAGED proof (mirrors the plain path's exit 1),
+                # never the informational not-attested state.
+                ok = False
+                print("       digest MISSING — attest_record present but "
+                      "attest_payload stripped (damaged annotation)")
             if rec:
                 rok, detail = verify_record(rec, _record_expect(c, project))
                 ok = ok and rok
