@@ -211,6 +211,30 @@ class InjectLedgerTest(BriefBase):
         self.assertIn("inject: 4 turns · 25% silent · top j1 ×2, p1 ×2, r1 ×1",
                       brief.render(self.compose()))
 
+    def test_pinned_starvation_surfaced_only_when_real(self):
+        """The 6/11-never-fired class reaches the owner's brief: always-on
+        entries that never made an injection in the ledger window get one
+        line; a fully-fed pinned lane stays silent (empty-section law)."""
+        from helm import store
+        store.write_prior({"id": "p-hot", "statement": "fed", "confidence": "1.0",
+                           "pin": "true"})
+        store.write_prior({"id": "p-cold", "statement": "starved",
+                           "confidence": "1.0", "pin": "true"})
+        fresh = _iso(self.now - 600)
+        self.plant_ledger([{"v": 1, "ts": fresh,
+                            "fired": {"pinned": ["p-hot"], "jit": [], "reflex": []}}])
+        inj = self.compose()["inject"]
+        self.assertEqual(inj["starved"], ["p-cold"])
+        self.assertEqual(inj["always_n"], 2)
+        out = brief.render(self.compose())
+        self.assertIn("pinned starvation: 1 of 2 never fired: p-cold", out)
+        self.assertIn("helm store pinned --stats", out)
+        # feed the cold one -> the line disappears
+        self.plant_ledger([{"v": 1, "ts": fresh,
+                            "fired": {"pinned": ["p-cold"], "jit": [], "reflex": []}}])
+        out = brief.render(self.compose())
+        self.assertNotIn("pinned starvation", out)
+
 
 class SeatsTest(BriefBase):
     def test_cached_observations_freshest_wins_no_probe(self):

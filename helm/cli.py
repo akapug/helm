@@ -148,7 +148,7 @@ VERBS = {
 }
 
 _VERB_HELP = {
-    "brief": "brief [--hours N] [--json] — the operator's morning brief: sessions, knowledge delta, seats, owner gates (read-only, never probes)",
+    "brief": "brief [--hours N] [--json] — the operator's morning brief: sessions, knowledge delta (incl. pinned-starvation tail), seats, owner gates (read-only, never probes)",
     "projections": "projections [--json] — the projection registry: every derived store, its class, source + rebuild (laws 2+3's read surface; doctor enforces)",
     "store": "store list|get|add|resolve|confirm|demote|events|... — the one typed knowledge store",
     "index": "index cap [--budget-lines N] [--apply] — MEMORY.md budget actuator: demote link lines whose backing entry stays jit-resolvable (provably lossless); documented Stop-hook line `helm index cap --apply`",

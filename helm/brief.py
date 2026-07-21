@@ -145,9 +145,21 @@ def _inject_stats(cutoff):
                     for i in ids or ():
                         fired[str(i)] = fired.get(str(i), 0) + 1
     top = sorted(fired.items(), key=lambda kv: (-kv[1], kv[0]))[:TOP_FIRING]
+    starved, always_n = [], 0
+    try:
+        # pinned starvation, surfaced where the owner actually looks (the
+        # 6/11-never-fired class): store.pinned_stats walks the same ledger
+        # generations; ids that never made a single injection are the tail.
+        from . import store
+        s = store.pinned_stats()
+        if s["rows"]:
+            always_n = len(s["made"])
+            starved = sorted(i for i, c in s["made"].items() if c == 0)
+    except Exception:
+        pass  # fail-open: the brief never dies on a stats walk
     return {"turns": turns, "silent": silent,
             "silent_rate": round(silent / turns, 2) if turns else 0.0,
-            "top": top}
+            "top": top, "starved": starved, "always_n": always_n}
 
 
 # --------------------------------------------------------------- seat reality
@@ -290,6 +302,13 @@ def render(b):
             lines.append("  inject: %d turn%s · %d%% silent%s" % (
                 inj["turns"], "s"[:inj["turns"] != 1],
                 round(inj["silent_rate"] * 100), " · top " + top if top else ""))
+            if inj.get("starved"):
+                ids = ", ".join(inj["starved"][:4])
+                more = len(inj["starved"]) - 4
+                lines.append("  pinned starvation: %d of %d never fired%s — "
+                             "`helm store pinned --stats` (demote or reword)" % (
+                                 len(inj["starved"]), inj["always_n"],
+                                 ": " + ids + (" +%d" % more if more > 0 else "")))
     lines += ["", "SEATS"]
     if b["seats"]:
         for r in b["seats"][:MAX_SEATS]:
