@@ -466,7 +466,7 @@ class SeatTest(unittest.TestCase):
         d = seat.seat_dir("codex")
         os.makedirs(d, exist_ok=True)
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
-            seat._write_launch_assets("codex", d)
+            seat._write_launch_assets("codex", d, workdir=self.tmp)
         p = os.path.join(d, "claude", ".claude.json")
         seeded = json.load(open(p))
         self.assertTrue(seeded["hasCompletedOnboarding"])
@@ -476,6 +476,13 @@ class SeatTest(unittest.TestCase):
                          {"hasTrustDialogAccepted": True, "projectOnboardingSeenCount": 1})
         self.assertNotIn("/untrusted/repo", seeded["projects"])   # only trusted paths
         self.assertNotIn("lastCost", seeded["projects"]["/trusted/repo"])  # no session state
+        # the intended workdir's trust is SYNTHESIZED (exact-match key the dialog
+        # needs; no ref carries it — the codex-3 stall's root cause)
+        self.assertEqual(seeded["projects"][os.path.realpath(self.tmp)],
+                         {"hasTrustDialogAccepted": True, "projectOnboardingSeenCount": 1})
+        # bypass acceptance lands in settings.json (CC 2.1.216), not .claude.json
+        st = json.load(open(os.path.join(d, "claude", "settings.json")))
+        self.assertTrue(st["skipDangerousModePermissionPrompt"])
         with open(p, "w") as f:
             json.dump({"mine": True}, f)
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):

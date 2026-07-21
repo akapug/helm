@@ -457,13 +457,31 @@ def _onboarded_refs():
     return refs
 
 
-def _seed_onboarding(cdir):
+def _git_toplevel(path):
+    """The git root of path (read-only, best-effort) — the trust dialog keys on
+    the git-root realpath, so a seat's workdir trust must name it exactly."""
+    try:
+        import subprocess
+        r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return r.stdout.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _seed_onboarding(cdir, workdir=None):
     """A fresh seat config dir triggers CC's first-run wizard, which blocks the
     seat at an interactive prompt (proven 2026-07-21: codex-2 stalled at the
     theme picker, never joined chat). Seed <cdir>/.claude.json with the
     onboarding-complete flags so a launched seat boots straight to work. Never
     clobber a seat's own state; copy the flags from an onboarded sibling (version
-    match), else write a minimal complete marker. Best-effort, non-fatal."""
+    match), else write a minimal complete marker. Also UNCONDITIONALLY trusts the
+    seat's intended workdir (+ its git root) — the folder-trust dialog is an
+    exact-match on the git-root realpath and no ref config carries helm-trust
+    (root cause of the codex-3 trust stall), so it must be synthesized, not
+    copied. Best-effort, non-fatal."""
     from . import pk
     dst = os.path.join(cdir, ".claude.json")
     if os.path.exists(dst):
@@ -488,6 +506,15 @@ def _seed_onboarding(cdir):
             if trusted:
                 seed["projects"] = trusted
             break
+    # synthesize trust for the intended workdir (+ its git root) — exact-match
+    # keys the dialog needs; helm already made the stronger bypass call.
+    projects = seed.setdefault("projects", {})
+    wd = os.path.realpath(workdir or os.getcwd())
+    for p in {wd, _git_toplevel(wd)}:
+        if p:
+            projects.setdefault(os.path.realpath(p),
+                                {"hasTrustDialogAccepted": True,
+                                 "projectOnboardingSeenCount": 1})
     try:
         pk.write_json(dst, seed)
     except OSError as e:
@@ -495,7 +522,31 @@ def _seed_onboarding(cdir):
               "may stall at the first-run wizard" % (cdir, e), file=sys.stderr)
 
 
-def _write_launch_assets(family, d, room=None, seat=None):
+def _seed_seat_settings(cdir):
+    """CC 2.1.216 records bypass-permissions acceptance in settings.json
+    (skipDangerousModePermissionPrompt), NOT .claude.json — so a launched
+    --dangerously-skip-permissions seat stalls at the bypass warning without it
+    (proven 2026-07-21: codex-3). Merge it (+ a theme) into the settings.json
+    that hooks.install_home just wrote, preserving the delivery-lane hooks.
+    Best-effort, non-fatal."""
+    from . import pk
+    p = os.path.join(cdir, "settings.json")
+    s = pk.read_json(p, {}) or {}
+    changed = False
+    for k, v in (("skipDangerousModePermissionPrompt", True), ("theme", "auto")):
+        if s.get(k) != v:
+            s[k] = v
+            changed = True
+    if not changed:
+        return
+    try:
+        pk.write_json(p, s)
+    except OSError as e:
+        print("helm seat: bypass/theme not seeded in %s (%s); a launched seat "
+              "may stall at the bypass dialog" % (p, e), file=sys.stderr)
+
+
+def _write_launch_assets(family, d, room=None, seat=None, workdir=None):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
     identical for every mode, and refreshed by BOTH `add` and `launch` (a
     stale launch.sh minted before HELM_CHAT_NAME existed is why the live
@@ -511,7 +562,7 @@ def _write_launch_assets(family, d, room=None, seat=None):
     cdir = os.path.join(d, "claude")
     os.makedirs(cdir, exist_ok=True)
     _link_skills(cdir)       # seat agents get the host's /learn, /premise, /afk, …
-    _seed_onboarding(cdir)   # skip CC's first-run wizard so the seat boots to work
+    _seed_onboarding(cdir, workdir)   # skip the onboarding/trust wizards
     from . import hooks
     action, detail = hooks.install_home(cdir, specs=hooks.DELIVERY_SPECS)
     if action == "fail":
@@ -522,6 +573,7 @@ def _write_launch_assets(family, d, room=None, seat=None):
         print("helm seat: %s claude dir wired for fleet delivery (%s: "
               "deliver + join + stop-guard + beacon permit)" % (seat, action),
               file=sys.stderr)
+    _seed_seat_settings(cdir)   # skip the bypass-permissions dialog (settings.json)
     _write_private(os.path.join(d, "launch.sh"),
                    "#!/bin/sh\n# helm seat %s — minted by `helm seat add`; "
                    "regenerate with `helm seat launch %s`\nexec %s \"$@\"\n"
