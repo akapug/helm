@@ -11,6 +11,15 @@ Family table is data: "proxy" families (codex/OpenAI OAuth) need CLIProxyAPI;
 first-party-Anthropic-compatible families (kimi/glm/deepseek) need only a
 base-url + key and slot in without a proxy — same seat dir, same launch shape.
 
+FLEET DELIVERY + IDENTITY: a seat is a first-class chat member. launch_line
+exports HELM_CHAT_NAME=<family>, so the SessionStart join hook registers the
+seat in the roster under its family name ('codex'/'kimi'/…) — @codex / @kimi
+and owner posts then deliver to it between tool calls. The delivery hooks
+(deliver + join) live in the seat's claude/ config dir; `helm hooks install`
+wires them there (hooks.py's DELIVERY_SPECS) and `helm hooks status` reports
+seat coverage. A seat already running an old session must be relaunched (a
+fresh `helm seat launch`) to pick up the identity + hooks.
+
 Seat dir (~/.helm/_global/seats/<family>/, 0700):
   config.yaml   proxy config (0600 — carries the per-seat proxy token)
   auth/         proxy auth-dir with the TRANSLATED cred (0600). The proxy
@@ -302,7 +311,11 @@ def _config_yaml_key(port, token, provider, base_url, model, api_key):
 
 def launch_line(family, model=None):
     """The exact seat launch command. env -u ANTHROPIC_API_KEY is part of the
-    line: an inherited key must never ride into a proxied seat either."""
+    line: an inherited key must never ride into a proxied seat either.
+    HELM_CHAT_NAME=<family> is the STABLE seat identity: the SessionStart join
+    hook (seats.py derive_seat) keys the roster on it, so the seat joins as
+    'codex'/'kimi'/… instead of an ephemeral agent-<sid8> — and @codex / @kimi
+    fleet posts then deliver to it."""
     fam = FAMILIES[family]
     model = model or fam["model"]
     cfgdir = shlex.quote(os.path.join(seat_dir(family), "claude"))
@@ -311,9 +324,10 @@ def launch_line(family, model=None):
             " ANTHROPIC_AUTH_TOKEN=%s"
             " CLAUDE_CODE_SUBAGENT_MODEL=%s"
             " CLAUDE_CONFIG_DIR=%s"
+            " HELM_CHAT_NAME=%s"
             " claude --model %s"
             % (fam["port"], _read_token(family) or "<seat-token-missing>",
-               model, cfgdir, model))
+               model, cfgdir, shlex.quote(family), model))
 
 
 def _seat_token(family, d):
