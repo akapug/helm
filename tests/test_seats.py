@@ -623,6 +623,12 @@ class RoomAllowlistTest(SeatsBase):
         seats.write_roster("ta", session="s-a2")
         self.assertEqual(seats.roster()["ta"]["home_room"], "team-a")
 
+    def test_explicit_join_room_is_homed_and_slugged(self):
+        seats.join(session="s-exp", seat="ex", cwd="/tmp/p", room="Team A")
+        self.assertEqual(seats.roster()["ex"]["home_room"], "team-a")
+        self.assertIn("in team-a + main", seats.join(
+            session="s-exp2", seat="ex", cwd="/tmp/p", room="Team A")[1])
+
     def test_rejoin_with_new_room_rehomes(self):
         os.environ["HELM_CHAT_ROOM"] = "team-a"
         seats.join(session="s-a", seat="mv", cwd="/tmp/p")
@@ -692,6 +698,19 @@ class RoomAllowlistTest(SeatsBase):
         self.assertEqual(allrooms[0], "team-a")
         self.assertIn("team-b", allrooms)
         self.assertIn("team-c", allrooms)
+
+    def test_foreign_room_volume_cannot_starve_the_home_room(self):
+        os.environ["HELM_CHAT_ROOM"] = "team-a"
+        seats.join(session="s-cap", seat="cap", cwd="/tmp/p")
+        del os.environ["HELM_CHAT_ROOM"]
+        chat.post("home", who="bob", room="team-a")
+        chat.post("all hands", who="bob")
+        # Newer foreign rooms fill the global scan cap. Filtering only AFTER
+        # truncation would evict the older home room from its own seat's inbox.
+        for i in range(seats.ROOM_SCAN_CAP + 5):
+            chat.post("noise", who="bob", room="foreign-%02d" % i)
+        self.assertEqual(set(seats._scan_rooms("main", seat="cap")),
+                         {"main", "team-a"})
 
 
 class AutoNameTest(SeatsBase):

@@ -13,8 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from helm import launch, seats  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
-            "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
-            "MELD_CHAT_NODE_URL")
+            "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_ROOM",
+            "MELD_CHAT_ROOM", "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL")
 
 
 class LaunchTest(unittest.TestCase):
@@ -49,12 +49,18 @@ class LaunchTest(unittest.TestCase):
         self.assertFalse(opts["install"])
         self.assertEqual(rest, [])
 
-    def test_build_env_sets_seat_and_optional_home_pin(self):
+    def test_build_env_sets_seat_optional_home_and_explicit_room(self):
         env = launch.build_env({"PATH": "/bin"}, "alice")
         self.assertEqual(env["HELM_CHAT_NAME"], "alice")
         self.assertNotIn("CLAUDE_CONFIG_DIR", env)
-        env = launch.build_env({}, "alice", "/homes/h1")
+        self.assertNotIn("HELM_CHAT_ROOM", env)
+        env = launch.build_env({}, "alice", "/homes/h1", "team-a")
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/homes/h1")
+        self.assertEqual(env["HELM_CHAT_ROOM"], "team-a")
+        # The parser's implicit main default must not accidentally home every
+        # legacy launch; un-homed seats retain the all-room compatibility lane.
+        self.assertNotIn("HELM_CHAT_ROOM",
+                         launch.build_env({}, "alice", room="main"))
 
     def test_stable_seat_sanitized(self):
         s = launch.stable_seat("/tmp/My Proj!x")

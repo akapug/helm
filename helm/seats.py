@@ -331,6 +331,7 @@ def write_roster(seat, session=None, cwd=None, home_room=None):
     with _flocked(roster_path() + ".lock"):
         r = roster()
         row = r.get(seat) or {}
+        home_room = pk.slug(home_room) if home_room else None
         if home_room and home_room != row.get("home_room"):
             row["home_room"] = home_room
         if session:
@@ -571,6 +572,8 @@ def _scan_rooms(primary="main", seat=None):
     except OSError:
         names = []
     prim = pk.slug(primary)
+    if allow is not None:
+        names = [n for n in names if n in allow]
     others = [n for n in names if n != prim]
     if others:
         def mtime(n):
@@ -579,9 +582,7 @@ def _scan_rooms(primary="main", seat=None):
             except OSError:
                 return 0.0
         others.sort(key=mtime, reverse=True)
-    rooms = [primary] + others[:ROOM_SCAN_CAP - 1]
-    if allow is not None:
-        rooms = [r for r in rooms if r in allow]
+    rooms = ([primary] if allow is None or prim in allow else []) + others[:ROOM_SCAN_CAP - 1]
     return rooms
 
 
@@ -707,11 +708,16 @@ def join(session=None, cwd=None, seat=None, room="main"):
     idle-wake beacon as a mandatory FIRST action — a self-armed Monitor is the
     only thing that can wake an idle PTY agent (native-wake-only-agent-armed),
     so a SessionStart directive is the strongest enforcement available.
-    Idempotent per seat. Baselines a cursor in EVERY live room (bounded by
-    _scan_rooms) so pre-join backlog never floods anywhere AND deliver_any
-    can read a later cursor-less room as born-after-join (backfill)."""
+    Idempotent per seat. Baselines a cursor in every room `_scan_rooms` admits
+    (all live rooms for legacy un-homed seats; {home, main} for homed seats),
+    so pre-join backlog never floods and later admitted rooms can backfill."""
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
-    home_room = home.env("CHAT_ROOM")   # team-room homing (slice 3) recorded
+    # Hooks carry HELM_CHAT_ROOM; direct `helm chat join --room team-x` and
+    # `helm launch --room team-x` carry the explicit argument instead. The
+    # implicit main default stays un-homed for backward-compatible all-room
+    # delivery until an operator deliberately homes the seat.
+    home_room = home.env("CHAT_ROOM") or (room if room != "main" else None)
+    home_room = pk.slug(home_room) if home_room else None
     write_roster(seat, session=session, cwd=cwd, home_room=home_room)
     for r in _scan_rooms(room, seat=seat):
         if _cursor(r, seat, session) is None:
@@ -724,8 +730,10 @@ def join(session=None, cwd=None, seat=None, room="main"):
             with _flocked(cursor_path(r, seat) + ".lock"):
                 if _cursor(r, seat) is None:
                     _init_cursor(r, seat)
+    scope = ("in %s + main" % home_room if home_room and home_room != "main"
+             else "in main" if home_room else "in any room")
     line = ("[helm chat] you are seat '%s' in room %s — @%s and owner posts "
-            "in ANY room reach you between tool calls; speak: helm chat post; catch up: "
+            "%s reach you between tool calls; speak: helm chat post; catch up: "
             "helm chat read. MANDATORY FIRST ACTION: arm your inbox beacon so "
             "you wake on an @%s mention or an owner post even while idle — "
             "Monitor(command: \"helm chat wait --seat %s --follow\", "
@@ -733,7 +741,7 @@ def join(session=None, cwd=None, seat=None, room="main"):
             "external can re-invoke a PTY agent (native-wake-only-agent-armed), "
             "so this self-armed Monitor is the ONLY way an idle session ever "
             "wakes. Arm it before anything else."
-            % (seat, room, seat, seat, seat))
+            % (seat, room, seat, scope, seat, seat))
     return seat, line
 
 

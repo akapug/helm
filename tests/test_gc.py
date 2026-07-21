@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 
@@ -78,7 +79,11 @@ class GcBase(unittest.TestCase):
 
 class ScanTest(GcBase):
     def test_empty_estate_all_in_budget(self):
-        rc, out, _ = run(gc.cmd_gc, [])
+        # The suite itself may run inside a legitimately leased worktree. The
+        # temp HELM_HOME intentionally hides that real lease registry, so an
+        # unmocked host scan would misclassify the test runner as an orphan.
+        with mock.patch("helm.work.gc_orphans", return_value=[]):
+            rc, out, _ = run(gc.cmd_gc, [])
         self.assertEqual(rc, 0)
         self.assertIn("every stream in budget", out)
         self.assertIn("(%d declared)" % len(gc.POLICIES), out)

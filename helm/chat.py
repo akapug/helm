@@ -672,8 +672,8 @@ def cmd_chat(args):
     args = list(args or [])
     # HELM_CHAT_ROOM homes a seat in a team channel (slice 3): every no---room
     # verb — posts, reads, join, deliver, the hooks pass no --room — defaults
-    # to its room, while deliver_any still hears @mentions from every room.
-    # Unset ⇒ main: zero behavior change for the un-homed fleet.
+    # to its room. Homed delivery scans only {home, main}; un-homed seats retain
+    # the legacy all-room inbox. Unset ⇒ main for this one verb invocation.
     room = home.env("CHAT_ROOM") or "main"
     room_given = "--room" in args
     if room_given:

@@ -55,13 +55,15 @@ def parse_args(args):
     return opts, rest
 
 
-def build_env(base, seat, home_path=None):
-    """The child's env: the seat name on every chat surface; the home pin
-    when one was named. Pure — tested without an exec."""
+def build_env(base, seat, home_path=None, room=None):
+    """The child's env: stable chat identity, optional credential-home pin,
+    and an explicit non-main team room. Pure — tested without an exec."""
     env = dict(base)
     env["HELM_CHAT_NAME"] = seat
     if home_path:
         env[homes.ENV_VAR["claude"]] = home_path
+    if room and room != "main":
+        env["HELM_CHAT_ROOM"] = room
     return env
 
 
@@ -84,7 +86,7 @@ def cmd_launch(args):
                 print("helm launch: hook install failed in %s: %s"
                       % (name, detail), file=sys.stderr)
     seats.join(cwd=os.getcwd(), seat=seat, room=opts["room"])
-    env = build_env(os.environ, seat, home_path)
+    env = build_env(os.environ, seat, home_path, opts["room"])
     print("[helm launch] seat '%s'%s — exec claude" % (
         seat, (" home " + opts["home"]) if opts["home"] else ""), file=sys.stderr)
     try:
