@@ -1161,6 +1161,59 @@ default `<host>-<cwd-basename>`), then execs `claude` with the pass-through
 args. The fleet needs no wrapper (`helm hooks install` covers every home);
 launch adds the stable name and the per-home pin (`CLAUDE_CONFIG_DIR`).
 
+### `helm work claim|release|gc|list|install-guard`
+
+In-cave git coordination (design: `prd/2026-07-21-in-cave-git-coordination.md`
+— the maintainer's tree + the hotel front desk): the shared checkout is the
+**integrator's tree**; every other seat works in a private room
+`<repo>-wt/<lane>` on branch `lane/<lane>`. Every leg is a reuse — the lease
+IS `helm chat claim` (resource `worktree:<proj>:<lane>`, nonce = room key,
+4h TTL, the stop-guard already refuses a stop with the key in pocket), the
+registry IS `git worktree list --porcelain` ⋈ `.claims.json` computed at
+read time (ZERO new state files), and `git worktree lock --reason
+lease:<id8>` is the git-native do-not-disturb. `[--repo PATH] [--seat S]`
+everywhere; from inside a repo the root resolves itself.
+
+- **`helm work claim <lane> [--ttl N] [--lease ID]`** — check-in: lease
+  first (held by someone else = the existing refusal, pick another lane),
+  then the room (`worktree add -b lane/<lane>`; a registered room is reused,
+  a parked branch re-opens; `--lease` extends — idempotent re-entry). Prints
+  ONE machine line: `path<TAB>branch<TAB>lease<TAB>ttl` — keep the lease.
+- **`helm work release [<lane>] --lease ID [--park]`** — checkout at the
+  desk, **inspect the room before the key changes hands**: DIRTY refuses
+  with exactly two exits — commit and re-run, or `--park` (WIP-commit onto
+  the lane branch; nothing is ever discarded). The key surrender
+  (`seats.release`, composite binding) precedes removal, so a wrong lease
+  removes nothing. Merged branch tidied (`-d`); unmerged stays and the
+  integrator is told in the room. Lane infers from inside its own room.
+- **`helm work gc [--apply]`** — housekeeping, dry-run default (gc.py
+  culture). The verdict table: live lease → keep (guest in the room);
+  locked out-of-band → keep (do-not-disturb); lease-less + clean → remove
+  (+`branch -d` when merged; unmerged branch stays, report row); lease-less
+  + DIRTY → **rescue**: `wip: rescued` commit onto the lane's own branch,
+  then remove — lost-and-found, never the dumpster; no code path discards
+  uncommitted work. A stale `lease:` lock with no live lease falls through
+  to the sweep. `helm gc` carries a report-only `work-worktrees` row; this
+  verb is the actuator. After a reboot leases are gone (monotonic, tmpfs)
+  and the first sweep impounds dirty lease-less rooms — correct by
+  construction.
+- **`helm work list`** — the room board: lane, holder + remaining, dirty,
+  ahead/behind the base, lock, path (registry ⋈ claims, computed).
+- **`helm work install-guard [--apply]`** — the ONE deterministic rail: a
+  ~25-line `post-checkout` hook for the shared main checkout. `checkout -b`
+  at the tip (`flag=1 ∧ prev==new`) HEALS pointer-only back to main — the
+  branch survives, the message names `helm work claim <branch>`; a real
+  content switch is alert-only, never touched. Lane rooms are unguarded;
+  `HELM_WORK_INTEGRATOR=1` is the escape hatch. Prints by default;
+  `--apply` installs (the integrator's coordinated step) and refuses to
+  clobber a foreign hook.
+
+```console
+$ helm work claim webui            # path  branch  lease  ttl — keep the lease
+$ helm work release webui --lease 5f3c9a2d41b0e6f2      # dirty? --park saves it
+$ helm work gc                     # the verdict table, dry; --apply enforces
+```
+
 ## ops — health, evolution, the browser
 
 ### `helm brief [--hours N] [--json]`

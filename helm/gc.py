@@ -74,6 +74,13 @@ def _drains():
                  lambda n: n.startswith("drain-"))
 
 
+def _lane_orphans():
+    """Lease-less lane worktrees (work.py's join, fail-open []) — surfaced
+    here so `helm gc` reports them; `helm work gc --apply` is the actuator."""
+    from . import work
+    return work.gc_orphans()
+
+
 def _size(p):
     """Bytes at p, dirs walked. Fail-open 0."""
     try:
@@ -160,6 +167,10 @@ POLICIES = (
     {"stream": "drift-snapshots", "cls": "state", "act": "report", "count": 64,
      "find": lambda: _kids(_state(), lambda n: n.startswith("drift-snapshot")),
      "note": "live diff baselines, one per scope"},
+    {"stream": "work-worktrees", "cls": "state", "act": "report", "count": 0,
+     "find": _lane_orphans,
+     "note": "lease-less lane rooms — `helm work gc --apply` sweeps "
+             "(rescue-commits dirty work to its branch first; never discards)"},
     {"stream": "skills-trash", "cls": "archive", "act": "report", "age": 30,
      "find": lambda: _kids(_cache("skills-trash")),
      "note": "only copy of trashed skills (archive-not-delete law) — owner reaps"},
