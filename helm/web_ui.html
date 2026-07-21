@@ -488,7 +488,13 @@ details.cfgsec>summary:hover{color:var(--fg)}
 #seatform{display:flex;flex-wrap:wrap;gap:8px;padding:12px 14px}
 #seatform input{flex:1 1 100%;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 11px;font-size:var(--f2)}
 #seatform input:focus{border-color:var(--accent);outline:none}
-#seatform #seatkey{flex:0 1 46%}
+#seatform .seatpick{position:relative;flex:0 1 46%;min-width:0}
+#seatform .seatpick #seatkey{width:100%;height:100%}
+#seatlist{display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:25;max-height:240px;overflow-y:auto;padding:4px;background:var(--elev);border:1px solid var(--line2);border-radius:var(--r);box-shadow:var(--shadow)}
+#seatlist.show{display:block}
+.seatopt{display:block;width:100%;padding:7px 9px;border:0;border-radius:var(--r-sm);background:none;color:var(--fg);text-align:left;cursor:pointer;font-size:var(--f1)}
+.seatopt:hover,.seatopt.on{background:var(--accent-soft);color:var(--accent)}
+.seatopt .someta{display:block;color:var(--mut);font-size:var(--f0);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #seatmsg{flex:1 1 100%;font-size:var(--f1);color:var(--sub);min-height:1.1em;word-break:break-word}
 #seatmsg.ok{color:var(--ok)}#seatmsg.bad{color:var(--bad)}
 
@@ -655,8 +661,10 @@ details.cfgsec>summary:hover{color:var(--fg)}
       <div class="lcard">
         <h3>message a seat <span class="lsub" id="seatpickcount">rides the groupchat</span></h3>
         <form id="seatform" autocomplete="off">
-          <input id="seatkey" list="seatlist" placeholder="pick a live seat — or type @all / a name" maxlength="120" aria-label="seat name" title="live seats from the roster; free-type @all or a not-yet-joined seat">
-          <datalist id="seatlist"></datalist>
+          <div class="seatpick">
+            <input id="seatkey" placeholder="pick a live seat — or type @all / a name" maxlength="120" aria-label="seat name" title="live seats from the roster; free-type @all or a not-yet-joined seat" role="combobox" aria-autocomplete="list" aria-controls="seatlist" aria-expanded="false">
+            <div id="seatlist" role="listbox"></div>
+          </div>
           <input id="seatline" placeholder="one-line message…" maxlength="400" required aria-label="message">
           <button class="chip" id="seatsend" type="submit">send →</button>
           <div id="seatmsg">posts “@seat …” to chat — every local agent’s next turn surfaces it (the owner-unread reflex).</div>
@@ -2707,25 +2715,66 @@ function rosterSeats(rep) {
   });
 }
 
-// The "message a seat" picker: same live roster feeds a <datalist> so a live
-// seat is one click — value is the RAW seat (clean for the "@seat" post), the
-// label carries presence · project · pending. Ordered active→quiet→absent then
-// most-recently-seen, so the seat you'd reach for sits at the top. Free-typing
-// stays open (datalist), so @all / a not-yet-joined seat still works; an empty
-// roster degrades to a hint, never a dead control.
+// The "message a seat" picker is a real anchored popup rather than a browser
+// <datalist>: Chromium can place native datalist chrome against the page instead
+// of this narrow card. The popup lives inside .seatpick, so left/right/top are
+// always relative to the control. Free-typing @all / a future seat still works.
+let SEAT_CHOICES = [], SEAT_ACTIVE = -1;
+const seatGlyph = p => p === "fresh" ? "● " : p === "quiet" ? "◐ " : "○ ";
+function closeSeatPicker() {
+  const list = $("#seatlist"), key = $("#seatkey");
+  list.classList.remove("show");
+  key.setAttribute("aria-expanded", "false");
+  key.removeAttribute("aria-activedescendant");
+  SEAT_ACTIVE = -1;
+}
+function renderSeatPicker() {
+  const list = $("#seatlist"), key = $("#seatkey");
+  const q = key.value.trim().replace(/^@/, "").toLowerCase();
+  const shown = SEAT_CHOICES.filter(s => !q || [s.seat, s.project, presenceLabel(s.presence)].join(" ").toLowerCase().includes(q));
+  list.innerHTML = shown.map((s, i) =>
+    '<button type="button" class="seatopt" id="seatopt-' + i + '" role="option" data-seat="' + esc(s.seat) + '"><b>' +
+    esc(seatGlyph(s.presence) + s.seat) + '</b><span class="someta">' +
+    esc(presenceLabel(s.presence) + (s.project ? " · " + s.project : "") +
+      (s.pending ? " · " + s.pending + " pending" : "")) + '</span></button>').join("");
+  list.classList.toggle("show", shown.length > 0);
+  key.setAttribute("aria-expanded", shown.length ? "true" : "false");
+  SEAT_ACTIVE = -1;
+  list.querySelectorAll(".seatopt").forEach(b => b.onmousedown = ev => {
+    ev.preventDefault();
+    key.value = b.dataset.seat;
+    closeSeatPicker();
+    key.focus();
+  });
+}
 function seatPicker(rep) {
-  const seats = ((rep && rep.seats) || []).slice();
+  SEAT_CHOICES = ((rep && rep.seats) || []).slice();
   const rank = p => p === "fresh" ? 0 : p === "quiet" ? 1 : 2;
-  seats.sort((a, b) => rank(a.presence) - rank(b.presence) || (b.last_seen || 0) - (a.last_seen || 0));
-  const glyph = p => p === "fresh" ? "● " : p === "quiet" ? "◐ " : "○ ";
-  $("#seatlist").innerHTML = seats.map(s =>
-    '<option value="' + esc(s.seat) + '" label="' +
-    esc(glyph(s.presence) + presenceLabel(s.presence) + (s.project ? " · " + s.project : "") +
-      (s.pending ? " · " + s.pending + " pending" : "")) + '">').join("");
+  SEAT_CHOICES.sort((a, b) => rank(a.presence) - rank(b.presence) || (b.last_seen || 0) - (a.last_seen || 0));
+  if ($("#seatlist").classList.contains("show")) renderSeatPicker();
   const c = $("#seatpickcount");
-  if (c) c.textContent = seats.length
-    ? seats.length + (seats.length === 1 ? " live seat" : " live seats") + " · pick or type @all"
+  if (c) c.textContent = SEAT_CHOICES.length
+    ? SEAT_CHOICES.length + (SEAT_CHOICES.length === 1 ? " live seat" : " live seats") + " · pick or type @all"
     : "no seats joined yet · type @all or a seat";
+}
+function seatPickerKeydown(ev) {
+  if (ev.key === "Escape") { closeSeatPicker(); return; }
+  if (!["ArrowDown", "ArrowUp", "Enter"].includes(ev.key)) return;
+  const list = $("#seatlist"), key = $("#seatkey");
+  if (!list.classList.contains("show")) renderSeatPicker();
+  const opts = [...list.querySelectorAll(".seatopt")];
+  if (!opts.length) return;
+  if (ev.key === "Enter" && SEAT_ACTIVE < 0) return;
+  ev.preventDefault();
+  if (ev.key === "Enter") {
+    key.value = opts[SEAT_ACTIVE].dataset.seat;
+    closeSeatPicker();
+    return;
+  }
+  SEAT_ACTIVE = (SEAT_ACTIVE + (ev.key === "ArrowDown" ? 1 : -1) + opts.length) % opts.length;
+  opts.forEach((o, i) => o.classList.toggle("on", i === SEAT_ACTIVE));
+  key.setAttribute("aria-activedescendant", opts[SEAT_ACTIVE].id);
+  opts[SEAT_ACTIVE].scrollIntoView({block: "nearest"});
 }
 
 async function pollLedger() {
@@ -2755,12 +2804,14 @@ async function sendSeatMsg(ev) {
   const key = $("#seatkey").value.trim(), line = $("#seatline").value.trim(), m = $("#seatmsg");
   if (!line) return;
   const name = localStorage.getItem("helm.chatname") || "david";
-  const text = key ? "@" + key + " " + line : line;
+  const target = key && (key.startsWith("@") ? key : "@" + key);
+  const text = target ? target + " " + line : line;
+  closeSeatPicker();
   m.className = ""; m.textContent = "sending…";
   try { await post("/api/chat", {room: "main", text, name}); }
   catch (e) { m.className = "bad"; m.textContent = "✗ " + e.message; return; }
   m.className = "ok";
-  m.textContent = "✓ posted to chat" + (key ? " for @" + key : "") + " — surfaced to agents next turn";
+  m.textContent = "✓ posted to chat" + (target ? " for " + target : "") + " — surfaced to agents next turn";
   $("#seatline").value = "";
 }
 
@@ -2768,6 +2819,11 @@ function initLedger() {
   if (!LEDGER_TIMER) {
     LEDGER_TIMER = setInterval(pollLedger, 3000);
     $("#seatform").addEventListener("submit", sendSeatMsg);
+    const key = $("#seatkey");
+    key.addEventListener("focus", renderSeatPicker);
+    key.addEventListener("input", renderSeatPicker);
+    key.addEventListener("keydown", seatPickerKeydown);
+    key.addEventListener("blur", () => setTimeout(closeSeatPicker, 0));
   }
   pollLedger();
 }

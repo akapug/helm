@@ -105,6 +105,15 @@ class TestWeb(unittest.TestCase):
         self.assertIn("text/html", ctype)
         self.assertIn(b"helm", body)
 
+    def test_seat_picker_popup_is_anchored_to_its_control(self):
+        _, _, body = self.get("/")
+        ui = body.decode()
+        self.assertIn('#seatform .seatpick{position:relative', ui)
+        self.assertIn('#seatlist{display:none;position:absolute;top:calc(100% + 4px);left:0;right:0', ui)
+        self.assertIn('role="combobox" aria-autocomplete="list" aria-controls="seatlist"', ui)
+        self.assertNotIn('list="seatlist"', ui)
+        self.assertNotIn('<datalist id="seatlist"', ui)
+
     def test_registry_returns_synthetic_projects(self):
         status, ctype, body = self.get("/api/registry")
         self.assertEqual(status, 200)
