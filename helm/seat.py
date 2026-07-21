@@ -321,28 +321,40 @@ def _config_yaml_key(port, token, provider, base_url, model, api_key):
             % (port, token, provider, base_url, api_key, model, model))
 
 
-def launch_line(family, model=None, room=None):
+def _instance_dir(family, seat):
+    """An instance's isolated config root: seat != family (codex-2, codex-3…)
+    lives under instances/<seat>; instance 1 keeps the family dir (back-compat)."""
+    return os.path.join(seat_dir(family), "instances", seat) \
+        if seat and seat != family else seat_dir(family)
+
+
+def launch_line(family, model=None, room=None, seat=None):
     """The exact seat launch command. env -u ANTHROPIC_API_KEY is part of the
     line: an inherited key must never ride into a proxied seat either.
-    HELM_CHAT_NAME=<family> is the STABLE seat identity: the SessionStart join
+    HELM_CHAT_NAME=<seat> is the STABLE seat identity: the SessionStart join
     hook (seats.py derive_seat) keys the roster on it, so the seat joins as
-    'codex'/'kimi'/… instead of an ephemeral agent-<sid8> — and @codex / @kimi
-    fleet posts then deliver to it. HELM_CELL_PROFILE + DREGG_PROFILE bind both
-    helm's signing call and the dregg SDK fallback to that SAME family identity;
-    HELM_CELL_BIN selects the dregg-native client signer. A seat therefore never
-    inherits the owner's ambient profile. `room` (seat add/launch --room) adds
-    HELM_CHAT_ROOM=<room> — team-room homing (slice 3): the seat's chat
-    defaults (post/read/join/deliver) live in its team channel while the
-    multi-room deliver still hears @mentions from any room; no room ⇒ no
-    export, exactly today's main-homed fleet. --dangerously-skip-permissions is CANONICAL
-    for a fleet seat (owner-asked 2026-07-21): an agent pane exists to do work
-    unattended, and a per-tool permission prompt strands it silently (the owner
-    had to flip kimi/codex into auto-mode by hand). The beacon permit narrows
-    an interactive session; a launched seat skips wholesale — it never has a
+    'codex'/'codex-2'/'kimi'/… instead of an ephemeral agent-<sid8> — and
+    @codex / @codex-2 / @kimi fleet posts then deliver to it. HELM_CELL_PROFILE
+    + DREGG_PROFILE bind both helm's signing call and the dregg SDK fallback to
+    that SAME seat identity; HELM_CELL_BIN selects the dregg-native client
+    signer. A seat therefore never inherits the owner's ambient profile. `seat`
+    (slice 6 — N-per-credhome) defaults to the family name; when set it swaps
+    the three identity vars + the config dir (instances/<seat>) so N instances
+    of one family share the proxy/port/token/pool but never config/session
+    state. `room` (seat add/launch --room) adds HELM_CHAT_ROOM=<room> —
+    team-room homing (slice 3): the seat's chat defaults (post/read/join/
+    deliver) live in its team channel while the multi-room deliver still hears
+    @mentions from any room; no room ⇒ no export, exactly today's main-homed
+    fleet. --dangerously-skip-permissions is CANONICAL for a fleet seat
+    (owner-asked 2026-07-21): an agent pane exists to do work unattended, and
+    a per-tool permission prompt strands it silently (the owner had to flip
+    kimi/codex into auto-mode by hand). The beacon permit narrows an
+    interactive session; a launched seat skips wholesale — it never has a
     human at its keyboard to answer a prompt."""
     fam = FAMILIES[family]
     model = model or fam["model"]
-    cfgdir = shlex.quote(os.path.join(seat_dir(family), "claude"))
+    seat = seat or family
+    cfgdir = shlex.quote(os.path.join(_instance_dir(family, seat), "claude"))
     homing = (" HELM_CHAT_ROOM=%s" % shlex.quote(room)) if room else ""
     return ("env -u ANTHROPIC_API_KEY"
             " ANTHROPIC_BASE_URL=http://127.0.0.1:%d"
@@ -355,9 +367,9 @@ def launch_line(family, model=None, room=None):
             " DREGG_PROFILE=%s"
             " claude --dangerously-skip-permissions --model %s"
             % (fam["port"], _read_token(family) or "<seat-token-missing>",
-               model, cfgdir, shlex.quote(family), homing,
-               shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(family),
-               shlex.quote(family), model))
+               model, cfgdir, shlex.quote(seat), homing,
+               shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(seat),
+               shlex.quote(seat), model))
 
 
 def _seat_token(family, d):
@@ -371,7 +383,7 @@ def _seat_token(family, d):
     return token
 
 
-def _write_launch_assets(family, d, room=None):
+def _write_launch_assets(family, d, room=None, seat=None):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
     identical for every mode, and refreshed by BOTH `add` and `launch` (a
     stale launch.sh minted before HELM_CHAT_NAME existed is why the live
@@ -380,23 +392,26 @@ def _write_launch_assets(family, d, room=None):
     plus the beacon permit land here at creation through hooks.py's gated
     merge-preserving write — a seat must never be born deaf. Install trouble
     is loud (stderr) but never fatal: the seat still mints and the message
-    names the estate-wide repair."""
+    names the estate-wide repair. `seat` (slice 6) mints an INSTANCE's assets
+    (instances/<seat>/{claude,launch.sh}); the shared token/config.yaml stay
+    family-level and are NOT re-minted here."""
+    seat = seat or family
     cdir = os.path.join(d, "claude")
     os.makedirs(cdir, exist_ok=True)
     from . import hooks
     action, detail = hooks.install_home(cdir, specs=hooks.DELIVERY_SPECS)
     if action == "fail":
         print("helm seat: WARNING — %s delivery hooks not installed (%s); "
-              "`helm hooks install` closes it" % (family, detail),
+              "`helm hooks install` closes it" % (seat, detail),
               file=sys.stderr)
     elif action != "ok":
         print("helm seat: %s claude dir wired for fleet delivery (%s: "
-              "deliver + join + stop-guard + beacon permit)" % (family, action),
+              "deliver + join + stop-guard + beacon permit)" % (seat, action),
               file=sys.stderr)
     _write_private(os.path.join(d, "launch.sh"),
                    "#!/bin/sh\n# helm seat %s — minted by `helm seat add`; "
                    "regenerate with `helm seat launch %s`\nexec %s \"$@\"\n"
-                   % (family, family, launch_line(family, room=room)),
+                   % (seat, seat, launch_line(family, room=room, seat=seat)),
                    mode=0o700)
 
 
@@ -724,7 +739,22 @@ def _seat_row(family):
     live = "proxy UP pid %d port %d%s" % (pid, port, "" if _port_open(port) else
                                           " (port not answering!)") if pid \
         else "proxy down"
-    return "%-8s %-38s %s" % (family, live, cred)
+    row = "%-8s %-38s %s" % (family, live, cred)
+    if family == "codex":   # slice 6: live-instance / pooled-capacity suffix
+        try:
+            from . import codexhomes, seats as _seats
+            now = time.time()
+            live_n = 0
+            for s, r in _seats.roster().items():
+                if s == "codex" or s.startswith("codex-"):
+                    ls = _seats.last_seen(s, r)
+                    if ls and now - ls < _seats.QUIET_S:
+                        live_n += 1
+            row += "  [instances: %d live / cap %d]" % (
+                live_n, codexhomes.capacity()["total"])
+        except Exception:
+            pass
+    return row
 
 
 def _status(args):
@@ -800,12 +830,41 @@ def cmd_seat(args):
         if fam is None:
             return 1
         model = rest[rest.index("--model") + 1] if "--model" in rest else None
+        # slice 6 — N instances of one family share the proxy/port/token/pool:
+        # -i/--instance N -> seat codex-N (default 1 = today's exact line).
+        inst = 1
+        for flag in ("-i", "--instance"):
+            if flag in rest:
+                try:
+                    inst = int(rest[rest.index(flag) + 1])
+                except (ValueError, IndexError):
+                    print("helm seat: %s wants an integer" % flag, file=sys.stderr)
+                    return 2
+        seat = family if inst <= 1 else "%s-%d" % (family, inst)
+        # guards ride stderr (stdout stays the bare pasteable line), warn
+        # never refuse: over-capacity burns one pool faster (fall-through
+        # masks it) and a live same-named seat is a relaunch-vs-collision the
+        # operator calls (a crashed seat must not brick its slot).
+        if inst > 1:
+            from . import codexhomes, seats as _seats
+            cap = codexhomes.capacity()["total"]
+            if inst > cap:
+                print("helm seat: WARN — instance %d exceeds pooled fleet "
+                      "capacity %d (`helm codex capacity`); the pool falls "
+                      "through usage caps but %d concurrent seats burn it "
+                      "faster" % (inst, cap, inst), file=sys.stderr)
+            row = _seats.roster().get(seat)
+            ls = _seats.last_seen(seat, row) if row else None
+            if row and ls and time.time() - ls < _seats.QUIET_S:
+                print("helm seat: WARN — seat %r already live on the roster "
+                      "(last seen %.0fs ago) — relaunch or collision is your "
+                      "call" % (seat, time.time() - ls), file=sys.stderr)
         # launch REFRESHES the assets first (G-seatlaunch-installs): delivery
         # hooks + beacon permit + a launch.sh carrying the CURRENT identity
         # shape — retrofitting a seat minted before either existed. stdout
         # stays exactly the pasteable line; notes ride stderr.
-        _write_launch_assets(family, seat_dir(family), room)
-        print(launch_line(family, model, room))
+        _write_launch_assets(family, _instance_dir(family, seat), room, seat)
+        print(launch_line(family, model, room, seat))
         from . import hooks
         hooks.surface_uncovered(out=sys.stderr)  # a running joined-late pane
         return 0                                 # still needs its relaunch

@@ -867,6 +867,10 @@ Note: `helm seat add codex` replaces only the pooled file(s) carrying the
 SAME account it mints — the other pooled accounts survive a seat re-add
 (the usage-cap fall-through stays intact; it prints what it replaced).
 
+`capacity` is the one policy readout: per-pooled-cred `email tier seats` +
+the fleet total (what the POOL holds — an unpooled ultra contributes 0),
+plus the codex* seats live on the roster.
+
 ```console
 $ helm codex list
 helm codex: 4 codexhomes under ~/.codex-homes (2 pooled -> ~/.helm/_global/seats/codex/auth)
@@ -875,7 +879,27 @@ helm codex: 4 codexhomes under ~/.codex-homes (2 pooled -> ~/.helm/_global/seats
 $ helm codex pool team-example-com
 helm codex: pooled hey@simbi.com -> ~/.helm/_global/seats/codex/auth/codex-team-example-com.json (team, account 9c21be77…)
   the proxy hot-reloads its auth-dir — no restart needed
+$ helm codex capacity
+helm codex: fleet seat capacity 4 (what the POOL holds, ultra=3/cred via HELM_CODEX_ULTRA_SEATS, team=1)
+  cto@example.invalid      ultra  3 seats
+  hey@simbi.com                  team   1 seat
+  live codex seats: codex, codex-2
 ```
+
+**N codex per credhome (slice 6).** An ultra credhome (plan pro, 20x) drives
+N concurrent codex seats against the SAME proxy/pool — zero new proxies,
+ports, tokens, or creds (the proxy hot-reloads one auth-dir and falls
+through usage caps; requests are stateless). `helm seat launch codex -i N`
+prints the pasteable line for seat `codex-N` (`-i 1` = today's exact line):
+it swaps the three identity vars (`HELM_CHAT_NAME`/`HELM_CELL_PROFILE`/
+`DREGG_PROFILE`) and the config dir (`instances/codex-N/claude`, born-wired)
+so N instances share the proxy but never session/config state. Guards warn
+on stderr (stdout stays the bare line) when N exceeds pooled capacity and
+when the roster already shows a live `codex-N` — warn never refuses. Tier
+is the policy key: ultra = `HELM_CODEX_ULTRA_SEATS` (dflt 3), team/unknown =
+1. `helm seat status` shows `instances: k live / cap n` on the codex row.
+Pool writes are atomic (0600 tmp + rename) so the proxy's hot-reload never
+reads a half-written cred.
 
 ### `helm keepalive [--home NAME|PATH] [--early HOURS]`
 Roll idle claude homes' OAuth tokens forward before their refresh chains rot —

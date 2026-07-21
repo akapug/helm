@@ -54,6 +54,39 @@ def tier(plan):
     return PLAN_TIER.get(plan, plan or "?")
 
 
+# slice 6 — N-codex-per-credhome: tier IS the seat-count policy. An ultra
+# credhome (plan pro, 20x) drives N concurrent codex seats against the SAME
+# proxy/pool; a team credhome stays 1-each. HELM_CODEX_ULTRA_SEATS moves the
+# ultra count without a state file; unknown tier = 1 (safe).
+def _ultra_seats():
+    try:
+        return max(1, int(home.env("CODEX_ULTRA_SEATS") or 3))
+    except ValueError:
+        return 3
+
+
+def seat_capacity(t):
+    """Fleet seats a tier supports. ultra -> HELM_CODEX_ULTRA_SEATS (dflt 3);
+    team/unknown -> 1."""
+    return _ultra_seats() if t == "ultra" else 1
+
+
+def capacity():
+    """Fleet seat capacity = what the POOL holds, not what exists under
+    ~/.codex-homes (an unpooled ultra contributes 0). {creds: [{email, tier,
+    seats}], total} over every parseable, non-disabled pooled codex record.
+    Read by `helm codex capacity` and the `helm seat launch -i` guard."""
+    creds, total = [], 0
+    for r in codex_pooled():
+        if r.get("error") or r.get("disabled") or r.get("type") != "codex":
+            continue
+        t = r.get("tier") or "?"
+        n = seat_capacity(t)
+        creds.append({"email": r.get("email"), "tier": t, "seats": n})
+        total += n
+    return {"creds": creds, "total": total}
+
+
 def homes_root():
     """~/.codex-homes, HELM_CODEX_HOMES_DIR-overridable (tests, odd installs)."""
     return os.path.realpath(os.path.expanduser(
@@ -71,6 +104,28 @@ def _read_json(path):
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def _write_pool_atomic(dest, text):
+    """A pool write the proxy's hot-reload watcher can never catch half-made:
+    0600 tmp sibling + os.replace (atomic on the same fs) — O_TRUNC-in-place
+    (_write_private) lets the watcher read a truncated cred mid-write (slice
+    6, risk 2). Mode enforced from creation like _write_private."""
+    d = os.path.dirname(dest)
+    os.makedirs(d, exist_ok=True)
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".pool-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _identity(auth):
@@ -189,7 +244,7 @@ def codex_pool(name):
              if a == rec.get("account_id") and f != "codex-%s.json" % canonical]
     dest = os.path.join(pool_dir(), "codex-%s.json" % canonical)
     existed = os.path.exists(dest)
-    _write_private(dest, json.dumps(rec, indent=2) + "\n")
+    _write_pool_atomic(dest, json.dumps(rec, indent=2) + "\n")
     warn = None
     if exp is not None and exp <= time.time():
         warn = ("access token exp is past — the codex CLI autorefreshes, so run "
@@ -296,15 +351,34 @@ def _print_pooled():
     return 0
 
 
+def _print_capacity():
+    """The one policy readout: per-pooled-cred email/tier/seats + total fleet
+    capacity, plus the codex* seats LIVE on the roster (so over/under is
+    visible at a glance)."""
+    from . import seats as _s
+    cap = capacity()
+    print("helm codex: fleet seat capacity %d (what the POOL holds, ultra=%d/"
+          "cred via HELM_CODEX_ULTRA_SEATS, team=1)" % (cap["total"], _ultra_seats()))
+    for c in cap["creds"]:
+        print("  %-32s %-6s %d seat%s" % (
+            c["email"] or "-", c["tier"], c["seats"], "s"[:c["seats"] != 1]))
+    live = sorted(s for s in _s.roster() if s == "codex" or s.startswith("codex-"))
+    if live:
+        print("  live codex seats: %s" % ", ".join(live))
+    return 0
+
+
 def cmd_codex(args):
-    """codex [list] | pool <name> | unpool <name> | pooled — codexhome roster
-    (ultra/team) + proxy cred pooling (auth.json -> 0600 pool file)."""
+    """codex [list] | pool <name> | unpool <name> | pooled | capacity — codexhome
+    roster (ultra/team) + proxy cred pooling (auth.json -> 0600 pool file)."""
     args = list(args)
     verb, rest = (args[0], args[1:]) if args else ("list", [])
     if verb == "list":
         return _print_list()
     if verb == "pooled":
         return _print_pooled()
+    if verb == "capacity":
+        return _print_capacity()
     if verb == "pool":
         if not rest:
             print("usage: helm codex pool <name>", file=sys.stderr)

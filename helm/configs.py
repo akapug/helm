@@ -91,16 +91,24 @@ def _real(p):
 
 def _is_seat_home(parent):
     """True iff `parent` is a seat's isolated claude config dir —
-    <helm_home>/_global/seats/<family>/claude. Computed per call (env-honoring,
-    NOT the import-time glob) so a seat minted after import (`helm seat add`
-    wires its delivery hooks in the same process) is recognized by the write
-    gate. Same trust surface as the HOME_ROOTS glob that catches pre-existing
-    seats; creds beside it stay denied by name."""
+    <helm_home>/_global/seats/<family>/claude, OR (slice 6) an instance's
+    <helm_home>/_global/seats/<family>/instances/<seat>/claude. Computed per
+    call (env-honoring, NOT the import-time glob) so a seat minted after
+    import (`helm seat add` wires its delivery hooks in the same process) is
+    recognized by the write gate. Same trust surface as the HOME_ROOTS glob
+    that catches pre-existing seats; creds beside it stay denied by name."""
     from . import home
     rp = _real(parent)
-    return (os.path.basename(rp) == "claude"
-            and os.path.dirname(os.path.dirname(rp))
-            == _real(os.path.join(home.global_dir(), "seats")))
+    if os.path.basename(rp) != "claude":
+        return False
+    sroot = _real(os.path.join(home.global_dir(), "seats"))
+    up1 = os.path.dirname(rp)                             # <family> | <seat>
+    up2 = os.path.dirname(up1)                            # seats | instances
+    if up2 == sroot:
+        return True                                       # seats/<family>/claude
+    # instance: seats/<family>/instances/<seat>/claude
+    return (os.path.basename(up2) == "instances"
+            and os.path.dirname(os.path.dirname(up2)) == sroot)
 
 
 def _is_recognized_config(rp):
