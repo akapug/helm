@@ -448,6 +448,32 @@ class SeatTest(unittest.TestCase):
         self.assertFalse(os.path.islink(link))
         self.assertTrue(os.path.exists(os.path.join(link, "own.md")))
 
+    def test_seat_onboarding_seeded(self):
+        """A fresh seat config dir would trigger CC's first-run wizard and stall
+        the seat before it joins chat — _write_launch_assets seeds .claude.json
+        with the onboarding-complete flags (copied from an onboarded host, no
+        host state leaked); a seat's own .claude.json is never clobbered."""
+        host = os.path.join(self.tmp, "host2")
+        os.makedirs(host)
+        with open(os.path.join(host, ".claude.json"), "w") as f:
+            json.dump({"hasCompletedOnboarding": True,
+                       "lastOnboardingVersion": "9.9.9", "theme": "light",
+                       "secretProjects": {"x": 1}}, f)
+        d = seat.seat_dir("codex")
+        os.makedirs(d, exist_ok=True)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
+            seat._write_launch_assets("codex", d)
+        p = os.path.join(d, "claude", ".claude.json")
+        seeded = json.load(open(p))
+        self.assertTrue(seeded["hasCompletedOnboarding"])
+        self.assertEqual(seeded["lastOnboardingVersion"], "9.9.9")  # version copied
+        self.assertNotIn("secretProjects", seeded)   # only onboarding keys, no host state
+        with open(p, "w") as f:
+            json.dump({"mine": True}, f)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
+            seat._write_launch_assets("codex", d)
+        self.assertEqual(json.load(open(p)), {"mine": True})  # never clobbered
+
     def test_launch_line_room_homing(self):
         """Team-room homing (slice 3): --room bakes HELM_CHAT_ROOM into the
         line + launch.sh; no --room exports nothing (un-homed = main, the

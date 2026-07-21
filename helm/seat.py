@@ -435,6 +435,54 @@ def _link_skills(cdir):
               "see /learn until fixed" % (cdir, e), file=sys.stderr)
 
 
+# The onboarding state that, if absent, makes CC run its first-run wizard (theme
+# picker, bypass-permissions accept, tips) — which STALLS a launched seat at an
+# interactive prompt before it ever reaches the composer or runs SessionStart,
+# so it never joins chat. Copied (not invented) from an already-onboarded config
+# so lastOnboardingVersion matches the CC the host actually runs.
+_ONBOARD_KEYS = ("hasCompletedOnboarding", "lastOnboardingVersion", "theme",
+                 "numStartups", "tipsHistory", "bypassPermissionsModeAccepted",
+                 "hasAcknowledgedCostThreshold")
+
+
+def _onboarded_refs():
+    """Config files to borrow onboarding flags from, best first: the minting
+    host's own config (its CC version matches what a seat will run), then the
+    plain ~/.claude.json."""
+    refs = []
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    if base:
+        refs.append(os.path.join(base, ".claude.json"))
+    refs.append(os.path.join(os.path.expanduser("~"), ".claude.json"))
+    return refs
+
+
+def _seed_onboarding(cdir):
+    """A fresh seat config dir triggers CC's first-run wizard, which blocks the
+    seat at an interactive prompt (proven 2026-07-21: codex-2 stalled at the
+    theme picker, never joined chat). Seed <cdir>/.claude.json with the
+    onboarding-complete flags so a launched seat boots straight to work. Never
+    clobber a seat's own state; copy the flags from an onboarded sibling (version
+    match), else write a minimal complete marker. Best-effort, non-fatal."""
+    from . import pk
+    dst = os.path.join(cdir, ".claude.json")
+    if os.path.exists(dst):
+        return                       # the seat owns its state once it exists
+    seed = {"hasCompletedOnboarding": True, "theme": "dark"}
+    for ref in _onboarded_refs():
+        r = pk.read_json(ref, None)
+        if isinstance(r, dict) and r.get("hasCompletedOnboarding"):
+            for k in _ONBOARD_KEYS:
+                if k in r:
+                    seed[k] = r[k]
+            break
+    try:
+        pk.write_json(dst, seed)
+    except OSError as e:
+        print("helm seat: onboarding not seeded for %s (%s); a launched seat "
+              "may stall at the first-run wizard" % (cdir, e), file=sys.stderr)
+
+
 def _write_launch_assets(family, d, room=None, seat=None):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
     identical for every mode, and refreshed by BOTH `add` and `launch` (a
@@ -450,7 +498,8 @@ def _write_launch_assets(family, d, room=None, seat=None):
     seat = seat or family
     cdir = os.path.join(d, "claude")
     os.makedirs(cdir, exist_ok=True)
-    _link_skills(cdir)   # seat agents get the host's /learn, /premise, /afk, …
+    _link_skills(cdir)       # seat agents get the host's /learn, /premise, /afk, …
+    _seed_onboarding(cdir)   # skip CC's first-run wizard so the seat boots to work
     from . import hooks
     action, detail = hooks.install_home(cdir, specs=hooks.DELIVERY_SPECS)
     if action == "fail":
