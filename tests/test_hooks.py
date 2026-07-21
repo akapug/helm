@@ -219,7 +219,7 @@ class StatusTest(HooksBase):
 
 
 class DeliveryLaneTest(HooksBase):
-    def test_install_wires_all_three_events(self):
+    def test_install_wires_all_events(self):
         d = self.mk_home("a-user-dev")
         action, _ = hooks.install_home(d)
         self.assertEqual(action, "add")
@@ -230,7 +230,35 @@ class DeliveryLaneTest(HooksBase):
         # the events that take a matcher get the wildcard
         self.assertEqual(got["hooks"]["PostToolUse"][0]["matcher"], "*")
         self.assertEqual(got["hooks"]["SessionStart"][0]["matcher"], "*")
+        # the continuity lane fires on EVERY trigger — no matcher key at all
+        self.assertNotIn("matcher", got["hooks"]["PreCompact"][0])
+        self.assertNotIn("matcher", got["hooks"]["SessionEnd"][0])
         self.assertEqual(hooks.install_home(d), ("ok", "hook up to date"))
+
+    def test_continuity_specs_wire_handoff_check(self):
+        """PreCompact + SessionEnd both carry `handoff check --hook-json` — the
+        one command whose --hook-json path captures the now-snapshot AND nags."""
+        names = {s["name"]: s for s in hooks.SPECS}
+        for name, event in (("handoff-precompact", "PreCompact"),
+                            ("handoff-sessionend", "SessionEnd")):
+            spec = names[name]
+            self.assertEqual(spec["event"], event)
+            self.assertEqual(spec["args"], "handoff check --hook-json")
+            self.assertIsNone(spec["matcher"])
+            self.assertTrue(hooks.spec_command(spec).endswith(
+                "handoff check --hook-json || true"))
+
+    def test_status_reports_continuity_lane(self):
+        d = self.mk_home("a-user-dev")
+        hooks.install_home(d)
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertTrue(rows["a-user-dev"]["handoff-precompact"])
+        self.assertTrue(rows["a-user-dev"]["handoff-sessionend"])
+        self.assertFalse(rows["(default-claude)"]["handoff-precompact"])
+        rc, out, _ = self.run_hooks(["status"])
+        self.assertEqual(rc, 0)
+        self.assertIn("handoff", out)               # the column header
+        self.assertIn("continuity lane", out)       # the gap summary line
 
     def test_record_posttooluse_hook_coexists_untouched(self):
         rec = "timeout 10 /x/bin/helm record --hook-json || true"

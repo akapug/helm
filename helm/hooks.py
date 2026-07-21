@@ -32,10 +32,15 @@ TIMEOUT_S = 10  # inject is ~ms; 10s is the never-hold-a-turn ceiling
 
 # The hook estate — one spec per event helm wires. inject is the crown jewel
 # (per-turn context); deliver + join are the meld-half's delivery lane
-# (tool-boundary chat nudge + session autojoin — seats.py). Same laws for
-# every spec: merge-preserving, fail-open text, idempotent. `own` markers
-# identify OUR entry in a settings file (so record.py's PostToolUse hook and
-# any foreign entry are never touched); matcher rides events that take one.
+# (tool-boundary chat nudge + session autojoin — seats.py); handoff-precompact
+# + handoff-sessionend are the compaction-continuity contract (handoff.py's
+# `check --hook-json` rides both triggers — it captures the now-snapshot AND
+# nags when no handoff artifact exists, so the next window never starts blind).
+# Same laws for every spec: merge-preserving, fail-open text, idempotent. `own`
+# markers identify OUR entry in a settings file (so record.py's PostToolUse hook
+# and any foreign entry are never touched); matcher rides events that take one —
+# the continuity specs OMIT it (matcher=None) so they fire on EVERY compaction
+# and EVERY session end, never trigger-gated (the safety-net's whole point).
 SPECS = (
     {"name": "inject", "event": HOOK_EVENT, "args": "inject --hook-json",
      "timeout": TIMEOUT_S, "own": ("inject --hook-json", "helm inject"),
@@ -44,6 +49,12 @@ SPECS = (
      "timeout": 2, "own": ("chat deliver --hook-json",), "matcher": "*"},
     {"name": "join", "event": "SessionStart", "args": "chat join --hook-json",
      "timeout": 5, "own": ("chat join --hook-json",), "matcher": "*"},
+    {"name": "handoff-precompact", "event": "PreCompact",
+     "args": "handoff check --hook-json", "timeout": 5,
+     "own": ("handoff check --hook-json",), "matcher": None},
+    {"name": "handoff-sessionend", "event": "SessionEnd",
+     "args": "handoff check --hook-json", "timeout": 5,
+     "own": ("handoff check --hook-json",), "matcher": None},
 )
 
 
@@ -331,18 +342,18 @@ def cmd_hooks(args):
             print("helm hooks: no claude homes found")
             return 0
         print("helm hooks status (claude):")
-        print("  %-28s %-5s %-5s %-9s %-7s %s" % (
-            "home", "hook", "helm", "fail-open", "deliver", "join"))
-        def mark(r, k):
-            if not r["hook"]:
-                return "-"
-            return "ok" if r[k] else "NO"
+        print("  %-28s %-5s %-5s %-9s %-7s %-5s %s" % (
+            "home", "hook", "helm", "fail-open", "deliver", "join", "handoff"))
+        def hoff(r):  # the continuity lane is live only when BOTH triggers are
+            return r.get("handoff-precompact") and r.get("handoff-sessionend")
         for r in rows:
-            print("  %-28s %-5s %-5s %-9s %-7s %s" % (
+            print("  %-28s %-5s %-5s %-9s %-7s %-5s %s" % (
                 r["home"], "yes" if r["hook"] else "-",
-                mark(r, "resolvable"), mark(r, "fail_open"),
+                "ok" if r["hook"] and r["resolvable"] else ("NO" if r["hook"] else "-"),
+                "ok" if r["hook"] and r["fail_open"] else ("NO" if r["hook"] else "-"),
                 "yes" if r.get("deliver") else "-",
-                "yes" if r.get("join") else "-"))
+                "yes" if r.get("join") else "-",
+                "yes" if hoff(r) else "-"))
         n, m = coverage()
         line = "inject coverage: %d of %d claude homes" % (n, m)
         print(line if n == m else line + " — `helm hooks install` closes the gap")
@@ -350,6 +361,10 @@ def cmd_hooks(args):
         if d < m:
             print("delivery lane (chat deliver/join): %d of %d homes — "
                   "`helm hooks install` wires it" % (d, m))
+        c = sum(1 for r in rows if hoff(r))
+        if c < m:
+            print("continuity lane (handoff PreCompact/SessionEnd): %d of %d homes — "
+                  "`helm hooks install` wires it" % (c, m))
         print(_CODEX_PENDING)
         return 0
 

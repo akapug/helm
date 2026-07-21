@@ -28,6 +28,13 @@ each home's `settings.json`:
 | `UserPromptSubmit` | `helm inject --hook-json` (timeout 10) | the per-turn context lane (pinned + JIT + reflexes) |
 | `PostToolUse` (`*`) | `helm chat deliver --hook-json` (timeout 2) | the delivery lane: @mentions + owner posts nudge an agent BETWEEN tool calls (see VERBS.md, the delivery lane) |
 | `SessionStart` (`*`) | `helm chat join --hook-json` (timeout 5) | the autojoin: roster presence row + the seat's identity as session context |
+| `PreCompact` | `helm handoff check --hook-json` (timeout 5) | the continuity lane: capture the now-snapshot + nag when no handoff artifact exists, so the window that survives compaction never starts blind (see VERBS.md, the handoff contract) |
+| `SessionEnd` | `helm handoff check --hook-json` (timeout 5) | the same continuity check on the last exit a session gets — the safety net for a session that ends without ever compacting |
+
+The two continuity entries OMIT a matcher on purpose: they must fire on EVERY
+compaction and EVERY session end, never gated to one trigger. `helm handoff
+check --hook-json` is FAIL-OPEN TOTAL — rc 0 always, silent when the contract
+is satisfied, and it captures `_global/now.md` on the same trigger.
 
 Same laws for every entry: MERGE-preserving (existing hooks — `helm record`'s
 PostToolUse leg included — and settings keys are never clobbered), idempotent
@@ -35,7 +42,7 @@ PostToolUse leg included — and settings keys are never clobbered), idempotent
 atomic write, re-parsed after the write, backup restored on any failure).
 `--home NAME` narrows to one home; `helm doctor` reports
 `inject coverage: N of M claude homes` so a gap can't hide, and
-`helm hooks status` adds per-home `deliver`/`join` columns.
+`helm hooks status` adds per-home `deliver`/`join`/`handoff` columns.
 
 The generated command pipes the hook's FULL JSON to `helm inject --hook-json`,
 which extracts the prompt, derives `--project` from the hook's `cwd` (longest
