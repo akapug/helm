@@ -1096,6 +1096,60 @@ class WebRosterTest(SeatsBase):
         self.assertEqual(obj, {"seats": [], "claims": [], "unavailable": True})
 
 
+class RoomsSummarySeatsTest(SeatsBase):
+    """The sidebar's per-channel roster: web._rooms_summary folds each room's
+    present seats (recent posters + cursor-holders, presence-tagged) so the
+    owner sees WHO is in a channel, not just its name."""
+
+    def test_rooms_summary_lists_recent_posters_with_presence(self):
+        seats.join(seat="alice", cwd="/tmp/p")
+        chat.post("hello from alice", who="alice")
+        rooms = {r["room"]: r for r in web._rooms_summary()}
+        names = [s["seat"] for s in rooms["main"]["seats"]]
+        self.assertIn("alice", names)
+        st = next(s for s in rooms["main"]["seats"] if s["seat"] == "alice")
+        self.assertEqual(st["presence"], "fresh")
+
+    def test_rooms_summary_scopes_seats_to_their_room(self):
+        seats.join(seat="alice", cwd="/tmp/p")
+        seats.join(seat="bob", cwd="/tmp/p")
+        chat.post("alice in main", who="alice")
+        chat.post("bob in side", who="bob", room="side")
+        rooms = {r["room"]: r for r in web._rooms_summary()}
+        self.assertEqual([s["seat"] for s in rooms["main"]["seats"]], ["alice"])
+        self.assertEqual([s["seat"] for s in rooms["side"]["seats"]], ["bob"])
+
+    def test_rooms_summary_includes_consumer_who_never_posted(self):
+        seats.join(seat="quiet-seat", cwd="/tmp/p")
+        chat.post("@quiet-seat ping", who="someone-else")
+        seats.deliver(seat="quiet-seat")          # consumes -> cursor off > 0
+        rooms = {r["room"]: r for r in web._rooms_summary()}
+        names = [s["seat"] for s in rooms["main"]["seats"]]
+        self.assertIn("quiet-seat", names)
+
+    def test_rooms_summary_bare_baseline_is_not_presence(self):
+        # join baselines a cursor in EVERY room; a seat that never posted or
+        # consumed in a room must NOT show as present there (bob joined while
+        # only main existed -> holds a main baseline at off 0).
+        seats.join(seat="bob", cwd="/tmp/p")
+        chat.post("noise", who="someone-else")
+        rooms = {r["room"]: r for r in web._rooms_summary()}
+        names = [s["seat"] for s in rooms["main"]["seats"]]
+        self.assertNotIn("bob", names)
+
+    def test_rooms_summary_owner_rows_are_not_seats(self):
+        chat.post("owner words", who="david")   # owner rail, not a roster seat
+        rooms = {r["room"]: r for r in web._rooms_summary()}
+        names = [s["seat"] for s in rooms.get("main", {}).get("seats", [])]
+        self.assertNotIn("david", names)
+
+    def test_rooms_summary_fail_open_when_roster_breaks(self):
+        chat.post("x", who="alice")
+        with mock.patch.object(seats, "roster", side_effect=RuntimeError):
+            rooms = {r["room"]: r for r in web._rooms_summary()}
+        self.assertEqual(rooms["main"]["seats"], [])   # degraded, never fatal
+
+
 class ChatDispatchTest(SeatsBase):
     def test_chat_verbs_reach_seats(self):
         out = io.StringIO()

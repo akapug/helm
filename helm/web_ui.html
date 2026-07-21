@@ -420,12 +420,18 @@ details.cfgsec>summary:hover{color:var(--fg)}
 #chatrooms{flex:0 0 130px;display:flex;flex-direction:column;border-right:1px solid var(--line);padding:8px 6px;min-width:0}
 @media (max-width:560px){#chatrooms{flex-basis:92px}}
 #chatroomlist{flex:1;overflow-y:auto;overflow-x:hidden}
-.crm{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:8px;font-size:var(--f1);color:var(--mut);cursor:pointer}
+.crm{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:5px 8px;border-radius:8px;font-size:var(--f1);color:var(--mut);cursor:pointer}
 .crm:hover{background:var(--hover);color:var(--fg)}
 .crm.on{color:var(--accent);background:var(--accent-soft);font-weight:var(--w-med)}
 .crm .crname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .crm .crn{padding:0 6px;border-radius:var(--r-pill);font-size:var(--f0);font-weight:var(--w-bold);font-variant-numeric:tabular-nums;background:var(--line2);color:var(--fg)}
 .crm .crn.mention{background:var(--accent);color:var(--bg)}
+.crm .crseats{flex-basis:100%;display:flex;flex-wrap:wrap;gap:3px;margin-top:2px}
+.crm .crseat{font-size:var(--f0);color:var(--mut);display:flex;align-items:center;gap:3px;min-width:0}
+.crm .crseat i{width:6px;height:6px;border-radius:50%;background:var(--line2);flex:0 0 auto}
+.crm .crseat.fresh i{background:var(--ok,#3fb96b)}
+.crm .crseat.quiet i{background:var(--warn,#d9a13b)}
+.crm .crseat span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #chatnewroom{margin-top:6px;width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:5px 8px;font-size:var(--f1)}
 #chatnewroom:focus{border-color:var(--accent);outline:none}
 #chatmain{flex:1;display:flex;flex-direction:column;min-width:0}
@@ -2360,9 +2366,14 @@ function chatRooms(rooms) {
                     : a.room < b.room ? -1 : a.room > b.room ? 1 : 0);
   $("#chatroomlist").innerHTML = list.map(r => {
     const n = r.owner_unread | 0;
+    const seats = Array.isArray(r.seats) ? r.seats : [];
     return '<div class="crm' + (r.room === CHAT_ROOM ? " on" : "") +
       '" data-room="' + esc(r.room) + '"><span class="crname">' + esc(r.room) + "</span>" +
       (n ? '<span class="crn' + ((r.owner_mentions | 0) ? " mention" : "") + '">' + n + "</span>" : "") +
+      (seats.length ? '<span class="crseats">' + seats.map(s =>
+        '<span class="crseat ' + esc(s.presence || "") + '" title="' + esc(s.seat) +
+        " — " + esc(s.presence || "?") + '"><i></i><span>' + esc(s.seat) + "</span></span>"
+      ).join("") + "</span>" : "") +
       "</div>";
   }).join("");
 }

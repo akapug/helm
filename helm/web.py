@@ -742,13 +742,54 @@ def _owner_signal(room, rows):
         return {"owner_read": 0, "owner_unread": 0, "owner_mentions": 0}
 
 
+def _room_seats(room, rows, roster):
+    """The sidebar's per-channel roster: which seats are present in THIS
+    room, newest-activity first — [{seat, presence}]. 'Present' = the seat
+    POSTED here recently (the rows are already read for the owner signal —
+    reuse, no extra I/O) OR actually CONSUMED rows here (its room cursor
+    advanced past offset 0 — a bare join baseline is NOT presence: join
+    baselines every room, so every seat would otherwise look present
+    everywhere). Presence is the shared .seen beat (seats.last_seen /
+    presence_of), so a fresh poster shows 'fresh', an idle one 'quiet';
+    owner-rail rows are skipped (the owner is not a seat). Fail-open per
+    row; capped so a busy channel can't flood the sidebar."""
+    from . import seats as _s
+    seen, out = set(), []
+    for m in reversed(rows[-64:]):           # recent activity, newest first
+        frm = str(m.get("from") or "")
+        if not frm or m.get("react") or frm in seen or frm not in roster:
+            continue
+        seen.add(frm)
+        out.append({"seat": frm,
+                    "presence": _s.presence_of(_s.last_seen(frm, roster[frm]))})
+        if len(out) >= 6:
+            return out
+    for seat in sorted(roster):              # consumers who never posted
+        if len(out) >= 6:
+            break
+        if seat in seen:
+            continue
+        cur = _s._cursor(room, seat)
+        if not cur or not cur.get("off"):    # no cursor, or a bare baseline
+            continue
+        out.append({"seat": seat,
+                    "presence": _s.presence_of(_s.last_seen(seat, roster[seat]))})
+    return out
+
+
 def _rooms_summary():
     """The channel list for the web sidebar: one light row per room —
-    {room, total, last (ts), owner_unread, owner_mentions}. Folding the
+    {room, total, last (ts), owner_unread, owner_mentions, seats}. Folding the
     per-room owner signal here is what lets the nav badge SUM every channel,
     so a post in a NON-main room is never invisible to the owner (the real
-    single-room hole). A handful of small tmpfs reads; fail-open per room."""
-    from . import chat
+    single-room hole). seats = the per-channel roster (_room_seats) so the
+    sidebar shows who is present/active in each room, not just the room name.
+    A handful of small tmpfs reads; fail-open per room."""
+    from . import chat, seats as _s
+    try:
+        roster = _s.roster()
+    except Exception:
+        roster = {}
     out = []
     for room in chat.list_rooms():
         try:
@@ -757,7 +798,8 @@ def _rooms_summary():
             out.append({"room": room, "total": total,
                         "last": (rows[-1].get("ts") if rows else None),
                         "owner_unread": sig.get("owner_unread", 0),
-                        "owner_mentions": sig.get("owner_mentions", 0)})
+                        "owner_mentions": sig.get("owner_mentions", 0),
+                        "seats": _room_seats(room, rows, roster)})
         except Exception:
             continue
     return out
