@@ -899,9 +899,66 @@ def presence_of(ls):
     return "fresh" if age < FRESH_S else "quiet" if age < QUIET_S else "absent"
 
 
+REAP_S = 3600   # a roster row unseen this long is a throwaway — reap it
+
+
+def _unlink_seat_state(seat):
+    """Remove every state file keyed on the seat (cursors + locks +
+    per-session variants, .seen, stop latches) — the orphan tail a reaped
+    row would otherwise leave in the room dir forever. Fail-open per file."""
+    key = _seat_key(seat)
+    d = chat.chat_dir()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        if any((m + key) in n for m in (".cursor.", ".seen.", ".stopfp.")):
+            try:
+                os.remove(os.path.join(d, n))
+            except OSError:
+                pass
+
+
+def reap_roster(max_age=REAP_S, now=None):
+    """G-roster-reaper -> [reaped seats]. The roster only ever GREW — /tmp
+    throwaway sessions piled up as permanently-absent rows with orphan
+    cursor/seen/latch files. Drop rows unseen for max_age+ and unlink their
+    state. Presence truth is the .seen mtime: deliver touches it at every
+    boundary and an armed beacon's wait loop delivers, so a live-but-idle
+    seat stays fresh; a reaped seat that returns self-heals at its next
+    boundary (cursor re-baselines — acceptable for something absent an
+    hour). Lock-free probe first: the web panel polls the report every 3s
+    and must not churn the roster — only an actually-stale row takes the
+    flock (claims_list's exact pattern). Fail-open total."""
+    now = time.time() if now is None else now
+    cut = now - max_age
+    try:
+        r = roster()
+        if not any((last_seen(s, row) or 0) < cut for s, row in r.items()):
+            return []
+        victims = []
+        with _flocked(roster_path() + ".lock"):
+            r = roster()
+            for s in list(r):
+                if (last_seen(s, r[s]) or 0) < cut:
+                    del r[s]
+                    victims.append(s)
+            if victims:
+                pk.write_json(roster_path(), r)
+        for s in victims:
+            _unlink_seat_state(s)
+        return victims
+    except Exception:
+        return []
+
+
 def roster_report(room="main"):
-    """{"seats": [...], "claims": [...]} — read-only, fail-open by caller.
-    Pending is computed from each seat's cursor WITHOUT moving it."""
+    """{"seats": [...], "claims": [...]} — fail-open by caller. Pending is
+    computed from each seat's cursor WITHOUT moving it. One GC leg rides the
+    read (claims_list's precedent): rows absent past REAP_S are reaped here,
+    so every live surface (CLI table, web panel) keeps the roster clean."""
+    reap_roster()
     seats = []
     for seat, row in sorted(roster().items()):
         # pending reads the row's newest session cursor (hook joins are
@@ -1033,15 +1090,24 @@ def cmd(verb, args, room="main"):
         return 0
     if verb == "seats":
         rep = roster_report(room)
-        if not rep["seats"]:
+        rows = rep["seats"]
+        hidden = 0
+        if "--all" not in args:      # absent rows hide by default (rows past
+            shown = [s for s in rows if s["presence"] != "absent"]
+            hidden = len(rows) - len(shown)          # REAP_S are already gone)
+            rows = shown
+        if not rows and not hidden:
             print("helm chat: no seats yet — sessions join on their next start "
                   "(helm hooks install wires it)")
             return 0
-        w = max(len(s["seat"]) for s in rep["seats"])
-        for s in rep["seats"]:
+        w = max([len(s["seat"]) for s in rows] or [0])
+        for s in rows:
             print("  %-*s  %-6s  pending %-3d %s" % (
                 w, s["seat"], s["presence"], s["pending"],
                 (s.get("project") or "")))
+        if hidden:
+            print("  (%d absent seat%s hidden — --all shows them; unseen "
+                  ">%dm reaps them)" % (hidden, "s"[:hidden != 1], REAP_S // 60))
         for c in rep["claims"]:
             print("  claim: %s -> %s (%ds left, fence %s)" % (
                 c["resource"], c["holder"], c["remaining"], c["fence"]))

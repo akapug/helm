@@ -635,7 +635,7 @@ def cmd_chat(args):
     """chat post <text...> | read [--since N] [--follow] | rooms |
     react <n> <emoji> | log-flush | node up|down|status |
     join|deliver|stop-guard [--hook-json] | wait [--any] [--follow] [--seat S]
-    | seats | seat rename <sid|oldname> <newname>
+    | seats [--all] | seat rename <sid|oldname> <newname>
     | claim|release <resource> | claims  [--room R]"""
     args = list(args or [])
     room = "main"

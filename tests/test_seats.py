@@ -767,7 +767,7 @@ class RosterReportTest(SeatsBase):
 
     def test_presence_tiers_from_seen_file(self):
         seats.write_roster("old-seat")
-        old = time.time() - 10_000
+        old = time.time() - 1000        # absent (>QUIET_S) but under REAP_S
         os.utime(seats.seen_path("old-seat"), (old, old))
         rep = seats.roster_report("main")
         self.assertEqual(rep["seats"][0]["presence"], "absent")
@@ -778,6 +778,59 @@ class RosterReportTest(SeatsBase):
         self.assertEqual(rc, 0)
         self.assertIn("alice", out)
         self.assertIn("fresh", out)
+
+
+class RosterReaperTest(SeatsBase):
+    """G-roster-reaper: the roster only ever grew — permanently-absent /tmp
+    throwaways piled up with orphan cursor/seen/latch files."""
+
+    def test_stale_row_and_orphan_state_reaped_fresh_survives(self):
+        seats.join(seat="fresh", session="s-f", cwd="/tmp/p")
+        seats.join(seat="stale", session="s-s", cwd="/tmp/p")
+        with open(seats._stop_fp_path("main", "stale", "s-s"), "w") as f:
+            f.write("fp")                       # a stop latch orphan too
+        old = time.time() - 2 * seats.REAP_S
+        os.utime(seats.seen_path("stale"), (old, old))
+        reaped = seats.reap_roster()
+        self.assertEqual(reaped, ["stale"])
+        self.assertNotIn("stale", seats.roster())
+        self.assertIn("fresh", seats.roster())          # fresh row survives
+        names = os.listdir(chat.chat_dir())
+        self.assertFalse([n for n in names
+                          if seats._seat_key("stale") in n])   # whole tail gone
+        self.assertTrue([n for n in names
+                         if seats._seat_key("fresh") in n])    # fresh state kept
+
+    def test_report_reaps_and_cli_hides_absent_behind_all(self):
+        seats.join(seat="live", session="s-l", cwd="/tmp/p")
+        seats.join(seat="gone", session="s-g", cwd="/tmp/p")
+        old = time.time() - 2 * seats.REAP_S
+        os.utime(seats.seen_path("gone"), (old, old))
+        rep = seats.roster_report("main")               # the report's GC leg
+        self.assertEqual([s["seat"] for s in rep["seats"]], ["live"])
+        # absent-but-not-yet-reap-age rows hide behind --all in the CLI
+        seats.write_roster("napping")
+        nap = time.time() - seats.QUIET_S - 60
+        os.utime(seats.seen_path("napping"), (nap, nap))
+        rc, out, _ = self.cmd("seats")
+        self.assertEqual(rc, 0)
+        self.assertIn("live", out)
+        self.assertNotIn("napping", out)
+        self.assertIn("hidden", out)
+        rc, out, _ = self.cmd("seats", ["--all"])
+        self.assertIn("napping", out)
+
+    def test_fresh_roster_poll_never_writes(self):
+        """The web panel polls the report every 3s — an all-fresh roster must
+        stay byte-identical (same inode, same mtime), never churn."""
+        seats.join(seat="alice", session="s-a", cwd="/tmp/p")
+        p = seats.roster_path()
+        before = os.stat(p)
+        for _ in range(3):
+            seats.roster_report("main")
+        after = os.stat(p)
+        self.assertEqual((before.st_ino, before.st_mtime_ns),
+                         (after.st_ino, after.st_mtime_ns))
 
 
 class RoomLockTest(SeatsBase):
