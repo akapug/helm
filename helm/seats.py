@@ -432,6 +432,13 @@ def join(session=None, cwd=None, seat=None, room="main"):
     return seat, line
 
 
+def _emit_line(line):
+    """The --follow beacon sink: print + FLUSH. The reader is a Monitor pipe,
+    where bare print() block-buffers — an unflushed wake-line never reaches the
+    agent. flush per line = one emitted row, one immediate agent wake."""
+    print(line, flush=True)
+
+
 def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
          emit=None, follow=False):
     """Block until the next word arrives; returns the line or None on
@@ -451,8 +458,11 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
     seat = seat or derive_seat(None)
     # single-shot keeps its contract: emit stays as passed (None ⇒ deliver
     # returns the line without emitting). --follow always needs a sink to stream
-    # through, so it defaults to print.
-    stream = emit or print if follow else emit
+    # through, so it defaults to a PER-LINE-FLUSHED print: the beacon's reader
+    # is a Monitor (a PIPE), and bare print() is block-buffered to a pipe — the
+    # wake-line would sit unflushed and the agent would never wake (the beacon
+    # worked in a tty, dead through Monitor). flush=True = one line, one wake.
+    stream = emit or (_emit_line if follow else emit)
     since = chat.read(room)[1] if any_row else None
     while True:
         if any_row:
