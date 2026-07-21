@@ -191,7 +191,8 @@ footer .fmark{color:color-mix(in srgb,var(--accent) 70%,var(--sub))}
 
 /* ---------- chart card ---------- */
 #chartcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px 6px;position:relative;box-shadow:var(--shadow)}
-#zoomhint{position:absolute;right:16px;bottom:10px;font-size:var(--f0);color:var(--sub);pointer-events:none}
+/* a quiet caption UNDER the chart, not floating over its x-axis */
+#zoomhint{text-align:right;font-size:var(--f0);color:var(--sub);pointer-events:none;padding:2px 2px 0}
 #chartcard .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px}
 #chartcard .chead b{font-size:var(--f4)}
 .qtab{padding:5px 16px;border-radius:16px;border:1px solid var(--line);font-size:var(--f2);cursor:pointer;color:var(--mut);background:none;display:inline-block}
