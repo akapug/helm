@@ -218,6 +218,110 @@ class StatusTest(HooksBase):
         self.assertIn("codex: recipe pending", out)
 
 
+class DeliveryLaneTest(HooksBase):
+    def test_install_wires_all_three_events(self):
+        d = self.mk_home("a-user-dev")
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "add")
+        got = self.read_settings(d)
+        for spec in hooks.SPECS:
+            self.assertIn(hooks.spec_command(spec),
+                          hooks._hook_cmds(got, spec["event"]))
+        # the events that take a matcher get the wildcard
+        self.assertEqual(got["hooks"]["PostToolUse"][0]["matcher"], "*")
+        self.assertEqual(got["hooks"]["SessionStart"][0]["matcher"], "*")
+        self.assertEqual(hooks.install_home(d), ("ok", "hook up to date"))
+
+    def test_record_posttooluse_hook_coexists_untouched(self):
+        rec = "timeout 10 /x/bin/helm record --hook-json || true"
+        d = self.mk_home("a-user-dev", settings={
+            "hooks": {"PostToolUse": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": rec}]}]}})
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "add")
+        cmds = hooks._hook_cmds(self.read_settings(d), "PostToolUse")
+        self.assertIn(rec, cmds)   # record's leg survives byte-identical
+        self.assertEqual(len(cmds), 2)
+
+    def test_status_reports_delivery_lanes(self):
+        d = self.mk_home("a-user-dev")
+        hooks.install_home(d)
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertTrue(rows["a-user-dev"]["deliver"])
+        self.assertTrue(rows["a-user-dev"]["join"])
+        self.assertFalse(rows["(default-claude)"]["deliver"])
+
+    def test_wrong_matcher_on_exclusive_group_repaired_in_place(self):
+        """Codex B3's exact reproduction: the exact deliver command under a
+        Bash-pinned group misses most tool boundaries — status must call it
+        NOT live, and install must repair the matcher."""
+        deliver = next(s for s in hooks.SPECS if s["name"] == "deliver")
+        d = self.mk_home("a-user-dev", settings={
+            "hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": hooks.spec_command(deliver)}]}]}})
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertFalse(rows["a-user-dev"]["deliver"])   # stale ≠ coverage
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "update")
+        got = self.read_settings(d)
+        groups = got["hooks"]["PostToolUse"]
+        self.assertEqual(len(groups), 1)                  # repaired, not doubled
+        self.assertEqual(groups[0]["matcher"], "*")
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertTrue(rows["a-user-dev"]["deliver"])
+        self.assertEqual(hooks.install_home(d), ("ok", "hook up to date"))
+
+    def test_wrong_matcher_with_foreign_cotenant_relocates_ours_only(self):
+        deliver = next(s for s in hooks.SPECS if s["name"] == "deliver")
+        rec = "timeout 10 /x/bin/helm record --hook-json || true"
+        d = self.mk_home("a-user-dev", settings={
+            "hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": rec},
+                {"type": "command", "command": hooks.spec_command(deliver)}]}]}})
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "update")
+        groups = self.read_settings(d)["hooks"]["PostToolUse"]
+        bash = [g for g in groups if g.get("matcher") == "Bash"]
+        self.assertEqual(len(bash), 1)                    # foreign group survives…
+        self.assertEqual([h["command"] for h in bash[0]["hooks"]], [rec])
+        wild = [g for g in groups if g.get("matcher") == "*"]
+        self.assertTrue(any(hooks.spec_command(deliver) == h["command"]
+                            for g in wild for h in g["hooks"]))
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertTrue(rows["a-user-dev"]["deliver"])
+
+    def test_wrong_type_same_command_not_covered_until_repaired(self):
+        """Final gate delta: the exact command+matcher under a FOREIGN type
+        (type:'http') must not read as coverage — the harness would not run
+        it as a command hook. Install repairs the type; only then live."""
+        deliver = next(s for s in hooks.SPECS if s["name"] == "deliver")
+        d = self.mk_home("a-user-dev", settings={
+            "hooks": {"PostToolUse": [{"matcher": "*", "hooks": [
+                {"type": "http", "command": hooks.spec_command(deliver)}]}]}})
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertFalse(rows["a-user-dev"]["deliver"])
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "update")
+        got = self.read_settings(d)["hooks"]["PostToolUse"]
+        self.assertEqual(len(got), 1)                    # repaired in place
+        self.assertEqual(got[0]["hooks"][0]["type"], "command")
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertTrue(rows["a-user-dev"]["deliver"])
+
+    def test_missing_matcher_on_owned_delivery_group_repaired(self):
+        join = next(s for s in hooks.SPECS if s["name"] == "join")
+        d = self.mk_home("a-user-dev", settings={
+            "hooks": {"SessionStart": [{"hooks": [       # no matcher key at all
+                {"type": "command", "command": hooks.spec_command(join)}]}]}})
+        rows = {r["home"]: r for r in hooks.status_rows()}
+        self.assertFalse(rows["a-user-dev"]["join"])
+        action, _ = hooks.install_home(d)
+        self.assertEqual(action, "update")
+        got = self.read_settings(d)["hooks"]["SessionStart"]
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["matcher"], "*")
+
+
 class DoctorCoverageTest(HooksBase):
     def test_doctor_coverage_warn_then_ok(self):
         self.mk_home("a-user-dev")

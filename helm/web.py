@@ -705,9 +705,20 @@ def _api_chat_post(payload):
         return {"error": 'payload wants {"text": "..."} (non-empty)'}, 400
     room = str(payload.get("room") or "main")
     msg = chat.post(text.strip(), room, who=str(payload.get("name") or "david"),
-                    profile=_chat_profile())
+                    profile=_chat_profile(), origin="web")
     chat.mark_owner_unread(room)
     return {"ok": True, "msg": msg, "total": chat.read(room)[1]}, 200
+
+
+def _api_chat_roster(qs):
+    """The seats panel's read: roster presence + per-seat pending deliveries
+    + live claims (seats.py — the meld-half's M3 parity surface). Read-only,
+    fail-open: any surprise answers empty, never a 500."""
+    try:
+        from . import seats
+        return seats.roster_report(_q1(qs, "room", "main")), 200
+    except Exception:
+        return {"seats": [], "claims": [], "unavailable": True}, 200
 
 
 def _api_chat_react(payload):
@@ -923,6 +934,7 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/session": _api_session,
     "/api/cmd": _api_cmd,
     "/api/chat": _api_chat,
+    "/api/chat/roster": _api_chat_roster,
     "/api/ledger": _api_ledger,
     "/api/ledger/turn": _api_ledger_turn,
 }

@@ -54,6 +54,8 @@ overrides are in effect.
 | `HELM_CHAT_NODE_URL` | `http://127.0.0.1:8898` (after the node-state file's `url`) | the chat ROOM NODE — chat v2's signed transport. **Set-but-empty disables the signed transport entirely** (the hermetic-test/ops kill switch); the node migration repoints this at the team node | `MELD_CHAT_NODE_URL` |
 | `HELM_CHAT_NODE_BIN` | `dregg-cave-node` on `PATH`, else `~/.local/bin/dregg-cave-node` | `helm chat node up` — the room-node daemon binary | `MELD_CHAT_NODE_BIN` |
 | `HELM_CHAT_LOG` | on (`0`/`off`/`no` disables) | `helm chat log-flush` + the `helm --human` exit flush — the log-after leg's operator switch | `MELD_CHAT_LOG` |
+| `HELM_CHAT_OWNER_NAMES` | `david` + the unix login (csv override) | the delivery lane (`helm chat deliver`) — senders whose posts reach every seat at tool boundaries WITHOUT an @mention (the owner steers mid-flight) | — |
+| `HELM_CHAT_DELIVER` | on (`0`/`off`/`no` disables) | the delivery lane's kill switch — the PostToolUse nudge goes silent fleet-wide; the room, roster and inject lanes are untouched | — |
 
 ## accounts and quota
 

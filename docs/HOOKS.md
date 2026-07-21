@@ -20,12 +20,22 @@ $ helm hooks status             # per-home coverage table, read-only
 $ helm hooks install --dry      # the would-be diff per home, nothing written
 ```
 
-The installer merges one `UserPromptSubmit` entry into each home's
-`settings.json` — MERGE-preserving (existing hooks and settings keys are never
-clobbered), idempotent (re-install reports `ok`), on configs.py's safety rails
-(backup → validate → atomic write, re-parsed after the write, backup restored
-on any failure). `--home NAME` narrows to one home; `helm doctor` reports
-`inject coverage: N of M claude homes` so a gap can't hide.
+The installer merges the whole hook estate — three entries per home — into
+each home's `settings.json`:
+
+| event | command | what it carries |
+|---|---|---|
+| `UserPromptSubmit` | `helm inject --hook-json` (timeout 10) | the per-turn context lane (pinned + JIT + reflexes) |
+| `PostToolUse` (`*`) | `helm chat deliver --hook-json` (timeout 2) | the delivery lane: @mentions + owner posts nudge an agent BETWEEN tool calls (see VERBS.md, the delivery lane) |
+| `SessionStart` (`*`) | `helm chat join --hook-json` (timeout 5) | the autojoin: roster presence row + the seat's identity as session context |
+
+Same laws for every entry: MERGE-preserving (existing hooks — `helm record`'s
+PostToolUse leg included — and settings keys are never clobbered), idempotent
+(re-install reports `ok`), on configs.py's safety rails (backup → validate →
+atomic write, re-parsed after the write, backup restored on any failure).
+`--home NAME` narrows to one home; `helm doctor` reports
+`inject coverage: N of M claude homes` so a gap can't hide, and
+`helm hooks status` adds per-home `deliver`/`join` columns.
 
 The generated command pipes the hook's FULL JSON to `helm inject --hook-json`,
 which extracts the prompt, derives `--project` from the hook's `cwd` (longest

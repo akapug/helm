@@ -38,6 +38,7 @@ owner-chat-unread reflex fires on that marker every turn until a
 
 The owner's orca pane sidecar is exactly: helm chat read --follow
 """
+import contextlib
 import hashlib
 import json
 import os
@@ -45,7 +46,10 @@ import sys
 import time
 import unicodedata
 
-from . import cell, emoji, home, pk
+from . import home, pk
+# cell + emoji import lazily inside the paths that use them — the delivery
+# lane's PostToolUse hook rides this module on EVERY tool call fleet-wide,
+# and its fast path must pay interpreter+import cost for nothing it won't use.
 
 DEFAULT_DIR = "/dev/shm/helm-chat"
 SIZE_CAP = 2 * 1024 * 1024  # per-room rotation threshold — RAM etiquette
@@ -118,6 +122,7 @@ def _token_path():
 def node_head(url=None, timeout=1.5):
     """The chain head receipt: dict, {} for a live-but-empty chain, None when
     the node is down — post()'s cheap reachability probe doubles as data."""
+    from . import cell
     u = url or node_url()
     if not u:
         return None
@@ -191,12 +196,14 @@ def _faucet(cell_hex):
     """Top up one cell from the room node's faucet (balance must never kill a
     chat turn). Fail-open — the node rate-limits faucets to 1/min/cell; a 429
     just means the retry (or the unsigned fallback) tells the truth."""
+    from . import cell
     u = node_url()
     if u:
         cell.post_json(u + "/api/faucet", {"recipient": cell_hex, "amount": 10000})
 
 
 def _balance(cell_hex):
+    from . import cell
     u = node_url()
     info = cell.get_json(u + "/api/cell/" + cell_hex, timeout=2) if u else None
     return info.get("balance") if isinstance(info, dict) else None
@@ -206,6 +213,7 @@ def _room_cell(profile, token):
     """The profile's cell ON THE ROOM NODE: RAM-cache first, else one
     idempotent `join` (creates + faucet-funds on first use) aimed at the room
     node via env_extra. (cell_hex, None) or (None, reason)."""
+    from . import cell
     cache = pk.read_json(cells_path(), {}) or {}
     hexid = cache.get(profile)
     if hexid:
@@ -229,6 +237,7 @@ def _sign_send(payload, profile):
     """One signed self-write turn on the room node carrying `payload`.
     (send-info, None) or (None, reason). One recovery lap (revive + faucet)
     before giving up — then the caller falls back to unsigned, loudly tagged."""
+    from . import cell
     token = _node_token()
     hexid, err = _room_cell(profile, token)
     if err:
@@ -267,6 +276,7 @@ def _signed_row(row, payload_text, profile, sign):
             sign = bool(node_url()) and node_head() is not None
         if not sign:
             return row
+        from . import cell
         info, _err = _sign_send(digest_payload(payload_text),
                                 profile or cell.profile_name())
         if info:
@@ -277,22 +287,67 @@ def _signed_row(row, payload_text, profile, sign):
     return row
 
 
+@contextlib.contextmanager
+def _room_lock(room):
+    """The room's write lock: a STABLE `<room>.lock` sibling, flock'd for the
+    whole append+rotation window — every room writer (CLI, web POST, TUI,
+    hooks, log-independent) serializes here. Never the jsonl inode itself:
+    rotation replaces that inode, which would let a fresh opener bypass a
+    lock held on the old one (codex C4). Fail-open: a lock that cannot be
+    taken degrades to the unlocked v1 behavior rather than dropping the
+    message — the fallback law is drop the GUARANTEE, never the row."""
+    import fcntl                  # POSIX advisory lock (Linux fleet)
+    lf = None
+    try:
+        try:
+            lf = open(os.path.join(chat_dir(), pk.slug(room) + ".lock"), "a")
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            lf = None
+        yield
+    finally:
+        if lf is not None:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lf.close()
+
+
 def _append(row, room):
+    """ONE serialized write path for every room writer: id-stamp, append the
+    whole row in one write, flush, then rotate — all under the room lock.
+    The stable per-row id is what delivery cursors key on (codex H5); rows
+    predating it (or hand-written) simply have no id and never match one."""
+    row.setdefault("id", os.urandom(6).hex())
     path = room_path(room)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    _rotate(path)
+    with _room_lock(room):
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.flush()
+        _rotate(path)
     return row
 
 
-def post(text, room="main", who=None, profile=None, sign=None):
+def post(text, room="main", who=None, profile=None, sign=None, origin=None):
     """Append one message; returns it. v2: shortcodes expand, and when the
     room node answers the digest rides a signed self-write turn FIRST — the
     row carries {turn, receipt, chain}. Node down -> plain v1 row (rendered
-    with the [unsigned] tag). O(1) append; rotation only past the cap."""
+    with the [unsigned] tag). O(1) append; rotation only past the cap.
+
+    `origin` marks the WRITE RAIL, not the author: the server-side owner
+    surfaces stamp "web"/"tui" and ONLY those rows get the delivery lane's
+    owner-rule (a CLI post claiming an owner name delivers as an ordinary
+    mention). ADVISORY by design — the room dir is same-uid 0700 tmpfs, so
+    any local process could forge the field; what it defends against is the
+    real threat here: an agent (or a prompt-injected one) impersonating the
+    owner through legit tooling. Principal crypto stays dregg's."""
     _ensure_dir()
+    from . import emoji
     text = emoji.expand(text)
     row = {"ts": pk.now_ts(), "from": who or whoname(), "text": text}
+    if origin:
+        row["origin"] = origin
     return _append(_signed_row(row, text, profile, sign), room)
 
 
@@ -302,6 +357,7 @@ def react(target, code, room="main", who=None, profile=None, sign=None):
     `code` is a :shortcode: or a raw emoji. Returns (row, None) or
     (None, reason). Rides the same transport as a post."""
     e = (code or "").strip()
+    from . import emoji
     if not any(ord(c) > 127 for c in e):   # shortcode form -> expand it
         e = emoji.expand(e if e.startswith(":") else ":%s:" % e.strip(":"))
     if not e or len(e) > 8 or any(ord(c) < 128 for c in e):
@@ -334,8 +390,10 @@ def _rotate(path, cap=None):
             return False
     except OSError:
         return False
+    # split on exactly "\n" (the writer's terminator) — str.splitlines() also
+    # splits on U+2028/U+2029/\x85 INSIDE a message's text, tearing the JSON row
     with open(path, encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
+        lines = [x for x in f.read().split("\n") if x]
     pk.atomic_write(path, "".join(x + "\n" for x in lines[len(lines) // 2:]))
     return True
 
@@ -355,8 +413,10 @@ def read(room="main", since=0):
     rotated) resets to 0 so a poller re-syncs instead of starving;
     unparseable lines are skipped, never fatal."""
     try:
+        # exactly "\n", never splitlines() — a message carrying U+2028 (a voice
+        # paste can) must not tear its row for every reader (found 2026-07-20)
         with open(room_path(room), encoding="utf-8", errors="replace") as f:
-            raw = f.read().splitlines()
+            raw = [x for x in f.read().split("\n") if x]
     except OSError:
         return [], 0
     msgs = [m for m in map(_msg, raw) if m]
@@ -524,9 +584,17 @@ def _fmt_body(m):
 # CLI
 # ---------------------------------------------------------------------------
 
+SEAT_VERBS = ("join", "deliver", "wait", "seats", "claim", "release",
+              "claims", "verdict", "reveal")   # the delivery lane — seats.py
+                                               # (verdict/reveal answer with
+                                               # the 0.3 council deferral)
+
+
 def cmd_chat(args):
     """chat post <text...> | read [--since N] [--follow] | rooms |
-    react <n> <emoji> | log-flush | node up|down|status  [--room R]"""
+    react <n> <emoji> | log-flush | node up|down|status |
+    join|deliver [--hook-json] | wait [--any] | seats |
+    claim|release <resource> | claims  [--room R]"""
     args = list(args or [])
     room = "main"
     room_given = "--room" in args
@@ -541,6 +609,9 @@ def cmd_chat(args):
     if verb == "node":
         from . import chatnode
         return chatnode.cmd_node(args[1:])
+    if verb in SEAT_VERBS:
+        from . import seats
+        return seats.cmd(verb, args[1:], room)
     if verb == "post":
         text = " ".join(args[1:]).strip()
         if not text and not sys.stdin.isatty():
@@ -605,6 +676,6 @@ def cmd_chat(args):
             last = ("  last: " + _fmt(msgs[-1])) if msgs else ""
             print("  %s  %d msg%s%s%s" % (n, total, "s"[:total != 1], unread, last))
         return 0
-    print("helm chat: unknown subcommand '%s' "
-          "(post|read|rooms|react|log-flush|node)" % verb, file=sys.stderr)
+    print("helm chat: unknown subcommand '%s' (post|read|rooms|react|"
+          "log-flush|node|%s)" % (verb, "|".join(SEAT_VERBS)), file=sys.stderr)
     return 2

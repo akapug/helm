@@ -126,7 +126,7 @@ def _submit(m):
                               m["room"], who=operator_name())
         m["notice"] = err or ""
         return
-    chat.post(text, m["room"], who=operator_name())
+    chat.post(text, m["room"], who=operator_name(), origin="tui")
     chat.mark_owner_unread(m["room"])
     m["notice"] = ""
 

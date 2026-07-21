@@ -16,6 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from helm import cell as cellmod  # noqa: E402
 from helm import chat, chatnode, home  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
@@ -121,7 +122,7 @@ class TransportTest(V2Base):
             return outs.pop(0)
 
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
-        with mock.patch.object(chat.cell, "run_bin", side_effect=fake_run), \
+        with mock.patch.object(cellmod, "run_bin", side_effect=fake_run), \
              mock.patch.object(chat, "_revive", return_value="tok2") as rv, \
              mock.patch.object(chat, "_faucet") as fc:
             info, err = chat._sign_send("payload", "p1")
