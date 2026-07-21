@@ -40,7 +40,7 @@ zero herdr code). The MC skill deck itself ships per-skill `license: MIT`.
 open and adoption-friendly like MIT, plus the explicit patent grant and
 contributor patent-retaliation clause that make serious downstream adopters
 (and future multi-operator deployments) safe to build on it, plus tidy
-NOTICE mechanics for the lineage credit ATTRIBUTION.md already carries.
+NOTICE mechanics for the lineage credit docs/ATTRIBUTION.md already carries.
 MIT remains the simpler alternative if brevity outweighs the patent grant.
 AGPL is NOT recommended for helm: its network-copyleft would burden the
 exact audience (operators embedding helm in their own fleets) the product

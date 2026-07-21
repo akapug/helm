@@ -127,6 +127,7 @@ optional — each degrades to one informative line.
 [WEB](docs/WEB.md) — the browser surface, API, service unit ·
 [ATTESTATION](docs/ATTESTATION.md) — the ledger leg ·
 [EVOLUTION](docs/EVOLUTION.md) — the self-evolution loop ·
+[ATTRIBUTION](docs/ATTRIBUTION.md) — the predecessor lineage helm continues ·
 [CONTRIBUTING](CONTRIBUTING.md) — setup, tests, the laws new code obeys
 
 ## Status
