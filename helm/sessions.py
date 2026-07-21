@@ -7,6 +7,7 @@ sessions group under the helm-known project whose tree their cwd lives in, so
 the exact command, not a wrapper (it's just the harness's own CLI).
 """
 import os
+import sys
 import time
 
 from . import registry
@@ -65,6 +66,32 @@ def resume_command(row):
     return "cd %r && codex resume %s" % (cwd, row["i"])
 
 
+def resume_warnings(row):
+    """Why THIS resume might not do what you expect — the catalog-level signals
+    (make_cmd's provider-coupled preflight is the richer surface; this is the
+    same truth the one-paste `sessions resume` path can carry for free). Order:
+    a session that cannot resume at all first, then cwd caveats."""
+    warn = []
+    if row.get("xl"):
+        mb = (row.get("z") or 0) / 1e6
+        warn.append("OVERSIZED (~%.0fMB in ~%d lines): a single/few-message "
+                    "session whose content likely exceeds the 200k window and "
+                    "cannot compact — plain resume will fail (common for "
+                    "daily-memory/summarizer sessions)." % (mb, row.get("m") or 0))
+    elif row.get("syn"):
+        warn.append("REFERENCE session (daily-memory summarizer) — a "
+                    "read/training artifact, not a resumable work session.")
+    if row["h"] == "claude":
+        cwd = os.path.expanduser(row.get("cwd") or "")
+        if not cwd:
+            warn.append("no recorded cwd; claude resume is cwd-scoped — the "
+                        "command may not resolve.")
+        elif not os.path.isdir(cwd):
+            warn.append("recorded cwd no longer exists: %s (resume from another "
+                        "dir may fork a fresh session)." % cwd)
+    return warn
+
+
 def _age(mt):
     if not mt:
         return "?"
@@ -92,6 +119,10 @@ def cmd_sessions(args):
                 print("  %s  (%s, %s)" % (r["i"], r["h"], r.get("u", "?")))
             return 1
         print(resume_command(hits[0]))
+        # warnings ride stderr so `$(helm sessions resume <id>)` stays the pure
+        # command, while an interactive caller still sees why it might not resume
+        for w in resume_warnings(hits[0]):
+            print("  # " + w, file=sys.stderr)
         return 0
 
     project = None

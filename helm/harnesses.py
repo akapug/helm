@@ -25,6 +25,8 @@ import os
 import re
 import time
 
+from . import home
+
 _CWD_RE = re.compile(r'"cwd"\s*:\s*"([^"]+)"')
 
 # How much of a session file we read hunting for the cwd field. claude puts it
@@ -49,6 +51,44 @@ def _sniff_cwd(path):
 
 def _day(epoch):
     return time.strftime("%Y-%m-%d", time.localtime(epoch))
+
+
+# --- codex cwd sidecar ------------------------------------------------------
+# The codex scan globs ~6k rollout files and, without a cache, re-reads up to
+# 256KB of each on EVERY `helm sync` just to recover the cwd on line 1. A rollout
+# is append-only and its session_meta cwd is written once, so the sniff is
+# perfectly cacheable: {path: [int(mtime), size, cwd]} keyed on the stat
+# signature (cwd may be null — a negative result is cached too, so a cwd-less
+# file is never re-sniffed). A file whose (mtime,size) still matches skips the
+# read entirely; the sidecar is pruned to the paths seen this run, so vanished
+# sessions never accrete. FAIL-OPEN: any cache trouble degrades to a full sniff,
+# never an error.
+
+def _codex_cache_path():
+    base = home.env("CACHE_DIR") or os.path.join(os.path.expanduser("~"),
+                                                 ".cache", "helm")
+    return os.path.join(base, "codex-cwd-cache.json")
+
+
+def _load_codex_cache():
+    try:
+        with open(_codex_cache_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_codex_cache(cache):
+    try:
+        path = _codex_cache_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())  # unique per writer; atomic replace
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def claude_observations(claude_root=None):
@@ -86,27 +126,36 @@ def claude_observations(claude_root=None):
 
 
 def codex_observations(roots=None):
-    home = os.path.expanduser("~")
-    roots = roots or [os.path.join(home, ".codex", "sessions")] + \
-        sorted(glob.glob(os.path.join(home, ".codex-homes", "*", "sessions"))) + \
-        sorted(glob.glob(os.path.join(home, ".codex-homes", ".archive*", "*", "sessions")))
-    by_cwd = {}
+    hm = os.path.expanduser("~")
+    roots = roots or [os.path.join(hm, ".codex", "sessions")] + \
+        sorted(glob.glob(os.path.join(hm, ".codex-homes", "*", "sessions"))) + \
+        sorted(glob.glob(os.path.join(hm, ".codex-homes", ".archive*", "*", "sessions")))
+    prior = _load_codex_cache()
+    fresh, seen, by_cwd = {}, set(), {}
     for root in roots:
         if not os.path.isdir(root):
             continue
         for p in glob.iglob(os.path.join(root, "**", "rollout-*.jsonl"), recursive=True):
-            cwd = _sniff_cwd(p)
-            if not cwd:
-                continue
             try:
-                mt = os.path.getmtime(p)
+                st = os.stat(p)
             except OSError:
+                continue
+            key = (st.st_dev, st.st_ino)  # inode-dedupe symlinked/hardlinked dups
+            if key in seen:               # the same rollout under two roots
+                continue
+            seen.add(key)
+            sig = [int(st.st_mtime), st.st_size]
+            ent = prior.get(p)
+            cwd = ent[2] if ent and ent[:2] == sig else _sniff_cwd(p)
+            fresh[p] = [sig[0], sig[1], cwd]  # cache the sniff (cwd or null)
+            if not cwd:
                 continue
             o = by_cwd.setdefault(cwd, {"harness": "codex", "cwd": cwd, "sessions": 0,
                                         "last_seen": 0.0, "days": set(), "refs": []})
             o["sessions"] += 1
-            o["last_seen"] = max(o["last_seen"], mt)
-            o["days"].add(_day(mt))
+            o["last_seen"] = max(o["last_seen"], st.st_mtime)
+            o["days"].add(_day(st.st_mtime))
+    _save_codex_cache(fresh)
     return list(by_cwd.values())
 
 

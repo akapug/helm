@@ -46,10 +46,15 @@ TIMEOUT_S = 10  # inject is ~ms; 10s is the never-hold-a-turn ceiling
 
 # The hook estate — one spec per event helm wires. inject is the crown jewel
 # (per-turn context); deliver + join are the meld-half's delivery lane
-# (tool-boundary chat nudge + session autojoin — seats.py). Same laws for
-# every spec: merge-preserving, fail-open text, idempotent. `own` markers
-# identify OUR entry in a settings file (so record.py's PostToolUse hook and
-# any foreign entry are never touched); matcher rides events that take one.
+# (tool-boundary chat nudge + session autojoin — seats.py); handoff-precompact
+# + handoff-sessionend are the compaction-continuity contract (handoff.py's
+# `check --hook-json` rides both triggers — it captures the now-snapshot AND
+# nags when no handoff artifact exists, so the next window never starts blind).
+# Same laws for every spec: merge-preserving, fail-open text, idempotent. `own`
+# markers identify OUR entry in a settings file (so record.py's PostToolUse hook
+# and any foreign entry are never touched); matcher rides events that take one —
+# the continuity specs OMIT it (matcher=None) so they fire on EVERY compaction
+# and EVERY session end, never trigger-gated (the safety-net's whole point).
 SPECS = (
     {"name": "inject", "event": HOOK_EVENT, "args": "inject --hook-json",
      "timeout": TIMEOUT_S, "own": ("inject --hook-json", "helm inject"),
@@ -64,6 +69,13 @@ SPECS = (
     # Stop takes no matcher (like UserPromptSubmit).
     {"name": "stop-guard", "event": "Stop", "args": "chat stop-guard --hook-json",
      "timeout": 5, "own": ("chat stop-guard --hook-json",), "matcher": None},
+    # continuity: the compaction/session-end handoff contract (sessions lane).
+    {"name": "handoff-precompact", "event": "PreCompact",
+     "args": "handoff check --hook-json", "timeout": 5,
+     "own": ("handoff check --hook-json",), "matcher": None},
+    {"name": "handoff-sessionend", "event": "SessionEnd",
+     "args": "handoff check --hook-json", "timeout": 5,
+     "own": ("handoff check --hook-json",), "matcher": None},
 )
 
 # The delivery lane alone (deliver + join + stop-guard, no inject) — what a
@@ -404,18 +416,19 @@ def cmd_hooks(args):
             return 0
         print("helm hooks status (claude):")
         print("  %-28s %-5s %-5s %-9s %-7s %-5s %s" % (
-            "home", "hook", "helm", "fail-open", "deliver", "join", "stop"))
-        def mark(r, k):
-            if not r["hook"]:
-                return "-"
-            return "ok" if r[k] else "NO"
+            "home", "hook", "helm", "fail-open", "deliver", "join", "stop",
+            "handoff"))
+        def hoff(r):  # the continuity lane is live only when BOTH triggers are
+            return r.get("handoff-precompact") and r.get("handoff-sessionend")
         for r in rows:
-            print("  %-28s %-5s %-5s %-9s %-7s %-5s %s" % (
+            print("  %-28s %-5s %-5s %-9s %-7s %-5s %-5s %s" % (
                 r["home"], "yes" if r["hook"] else "-",
-                mark(r, "resolvable"), mark(r, "fail_open"),
+                "ok" if r["hook"] and r["resolvable"] else ("NO" if r["hook"] else "-"),
+                "ok" if r["hook"] and r["fail_open"] else ("NO" if r["hook"] else "-"),
                 "yes" if r.get("deliver") else "-",
                 "yes" if r.get("join") else "-",
-                "yes" if r.get("stop-guard") else "-"))
+                "yes" if r.get("stop-guard") else "-",
+                "yes" if hoff(r) else "-"))
         n, m = coverage()
         line = "inject coverage: %d of %d claude homes" % (n, m)
         print(line if n == m else line + " — `helm hooks install` closes the gap")
@@ -424,6 +437,10 @@ def cmd_hooks(args):
         if d < m:
             print("delivery lane (chat deliver/join/stop-guard): %d of %d homes"
                   " — `helm hooks install` wires it" % (d, m))
+        c = sum(1 for r in rows if hoff(r))
+        if c < m:
+            print("continuity lane (handoff PreCompact/SessionEnd): %d of %d homes — "
+                  "`helm hooks install` wires it" % (c, m))
         srows = seat_status_rows()
         if srows:
             print("seats (fleet delivery — chat deliver/join/stop-guard):")

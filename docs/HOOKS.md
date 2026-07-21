@@ -35,6 +35,13 @@ boundary + session start + idle gate.
 | `PostToolUse` (`*`) | `helm chat deliver --hook-json` (timeout 2) | the delivery lane: @mentions + owner posts nudge an agent BETWEEN tool calls (see VERBS.md, the delivery lane) |
 | `SessionStart` (`*`) | `helm chat join --hook-json` (timeout 5) | the autojoin: roster presence row + the seat's identity as session context (incl. the mandatory beacon-arm directive) |
 | `Stop` | `helm chat stop-guard --hook-json` (timeout 5) | the idle gate: BLOCKS a stop on undelivered mentions/owner rows (once per pending-fingerprint — never an infinite loop) or on claim leases held by the stopping session; WARNs to arm the beacon on a clean stop; silently runs `helm index cap --apply`. Kill: `HELM_STOP_GUARD=0`, per-check `HELM_STOP_GUARD_INBOX/CLAIMS/INDEX=0` |
+| `PreCompact` | `helm handoff check --hook-json` (timeout 5) | the continuity lane: capture the now-snapshot + nag when no handoff artifact exists, so the window that survives compaction never starts blind (see VERBS.md, the handoff contract) |
+| `SessionEnd` | `helm handoff check --hook-json` (timeout 5) | the same continuity check on the last exit a session gets — the safety net for a session that ends without ever compacting |
+
+The two continuity entries OMIT a matcher on purpose: they must fire on EVERY
+compaction and EVERY session end, never gated to one trigger. `helm handoff
+check --hook-json` is FAIL-OPEN TOTAL — rc 0 always, silent when the contract
+is satisfied, and it captures `_global/now.md` on the same trigger.
 
 **Seats are part of the estate.** A full `install` (no `--home` filter) also
 wires the **delivery lane** (`PostToolUse` deliver + `SessionStart` join +
@@ -53,8 +60,8 @@ clobbered), idempotent (re-install reports `ok`), on configs.py's safety rails
 (backup → validate → atomic write, re-parsed after the write, backup restored
 on any failure). `--home NAME` narrows to one home (and skips seats); `helm
 doctor` reports `inject coverage: N of M claude homes` so a gap can't hide, and
-`helm hooks status` adds per-home `deliver`/`join`/`stop` columns plus the
-seat block.
+`helm hooks status` adds per-home `deliver`/`join`/`stop`/`handoff` columns
+plus the seat block.
 
 The generated command pipes the hook's FULL JSON to `helm inject --hook-json`,
 which extracts the prompt, derives `--project` from the hook's `cwd` (longest
