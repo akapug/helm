@@ -471,10 +471,8 @@ def _bulk(name, description, mtype="project", body="the full body\nwith detail\n
             "  type: %s\n---\n\n%s" % (name[:-3], description, mtype, body))
 
 
-class UpgradeTest(unittest.TestCase):
-    """drain-v2 upgrade: typed-prefix files that fell back to episodic get real
-    typed frontmatter (prem-/prior- -> prior 0.9 jit; lex- -> lexicon), body
-    verbatim, archive-first net + receipt. The >=2-specific-keyword gate holds."""
+class HermeticMemBase(unittest.TestCase):
+    """Fresh HELM_HOME + intake dir per test — the upgrade/edge-case harness."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-upgrade-")
@@ -499,6 +497,12 @@ class UpgradeTest(unittest.TestCase):
 
     def _plan(self):
         return {a["src"]: a for a in drain.classify(self.mem)}
+
+
+class UpgradeTest(HermeticMemBase):
+    """drain-v2 upgrade: typed-prefix files that fell back to episodic get real
+    typed frontmatter (prem-/prior- -> prior 0.9 jit; lex- -> lexicon), body
+    verbatim, archive-first net + receipt. The >=2-specific-keyword gate holds."""
 
     def test_prem_bulk_upgrades_to_prior_at_0_9(self):
         self._w("prem-scrub-docs.md",
@@ -584,6 +588,105 @@ class UpgradeTest(unittest.TestCase):
         net = receipt["net"]
         self.assertTrue(os.path.isfile(os.path.join(net, "prem-scrub-docs.md")))
         self.assertTrue(os.path.isfile(os.path.join(net, "RECEIPT.json")))
+
+
+def _typed_prior(name, statement):
+    """A REAL typed prior (id + statement parse) — the curated entry the
+    conflict guards must never clobber."""
+    pid = name[len("prior-"):-3]
+    return ("---\nname: %s\ndescription: \"prior: %s\"\nmetadata:\n"
+            "  node_type: memory\n  type: prior\n  id: %s\n  statement: %s\n"
+            "  confidence: 0.8\n  status: live\n  keywords: curated\n"
+            "  source: human\n---\n\ncurated body\n"
+            % (name[:-3], pid, pid, statement))
+
+
+class RetypeEdgeCaseTest(HermeticMemBase):
+    """The conflict/collision guards around retype + upgrade: an existing
+    curated entry or a sibling action's destination downgrades to a surfaced
+    'conflict' — never a silent overwrite — and even a hand-crafted plan that
+    DOES overwrite must leave the old bytes recoverable in the net."""
+
+    def test_existing_dst_conflicts_and_apply_skips_it(self):
+        self._w("feedback-x.md", _mem_entry(
+            "feedback-x.md", "feedback", "the new opinion about x"))
+        self._w("prior-x.md", _typed_prior("prior-x.md", "the curated truth"))
+        act = self._plan()["feedback-x.md"]
+        self.assertEqual((act["op"], act["dst"]), ("conflict", "prior-x.md"))
+        self.assertIn("already exists", act["why"])
+        receipt = drain.apply(drain.classify(self.mem), self.mem)
+        self.assertNotIn("conflict", {a["op"] for a in receipt.get("actions", [])})
+        with open(os.path.join(self.mem, "prior-x.md")) as fh:
+            self.assertIn("the curated truth", fh.read())  # curated entry intact
+        self.assertTrue(os.path.isfile(os.path.join(self.mem, "feedback-x.md")))
+
+    def test_two_intake_files_same_dst_second_conflicts(self):
+        self._w("feedback-y.md", _mem_entry(
+            "feedback-y.md", "feedback", "first claimant of the y slug"))
+        self._w("feedback_y.md", _mem_entry(
+            "feedback_y.md", "feedback", "second claimant of the y slug"))
+        plan = self._plan()
+        self.assertEqual(plan["feedback-y.md"]["op"], "retype")
+        act = plan["feedback_y.md"]
+        self.assertEqual((act["op"], act["dst"]), ("conflict", "prior-y.md"))
+        self.assertIn("also feedback-y.md", act["why"])
+
+    def test_upgrade_rename_conflicts_with_existing_prior(self):
+        # slug differs from the literal twin (Old-Way -> old-way), so the
+        # sweep-dup branch misses and the upgrade collision guard must catch
+        self._w("prem-Old-Way.md", _bulk(
+            "prem-Old-Way.md", "deploys always batch at the slice boundary"))
+        self._w("prior-old-way.md", _typed_prior(
+            "prior-old-way.md", "the curated boundary rule"))
+        act = self._plan()["prem-Old-Way.md"]
+        self.assertEqual((act["op"], act["dst"]), ("conflict", "prior-old-way.md"))
+        self.assertIn("already exists", act["why"])
+
+    def test_upgrade_and_retype_collision_on_same_dst(self):
+        self._w("feedback-z.md", _mem_entry(
+            "feedback-z.md", "feedback", "the retype claimant of slug z"))
+        self._w("prem-z.md", _bulk(
+            "prem-z.md", "the bulk-upgrade claimant of exactly slug z"))
+        plan = self._plan()
+        self.assertEqual(plan["feedback-z.md"]["op"], "retype")
+        act = plan["prem-z.md"]
+        self.assertEqual((act["op"], act["dst"]), ("conflict", "prior-z.md"))
+        self.assertIn("also feedback-z.md", act["why"])
+
+    def test_handcrafted_overwrite_netted_under_overwritten_subdir(self):
+        # classify blocks the common case; a hand-crafted plan (or a race)
+        # that overwrites must net the old dst — under overwritten/, so a src
+        # literally named overwritten-<dst> can never collide with the label
+        self._w("overwritten-prior-b.md", _mem_entry(
+            "overwritten-prior-b.md", "feedback", "awkwardly named source"))
+        self._w("prior-b.md", _typed_prior("prior-b.md", "the about-to-be-replaced"))
+        plan = [{"op": "retype", "src": "overwritten-prior-b.md",
+                 "dst": "prior-b.md", "id": "b", "to_type": "prior",
+                 "statement": "awkwardly named source", "origin": ""}]
+        receipt = drain.apply(plan, self.mem)
+        net = receipt["net"]
+        self.assertTrue(os.path.isfile(os.path.join(net, "overwritten-prior-b.md")))
+        with open(os.path.join(net, "overwritten", "prior-b.md")) as fh:
+            self.assertIn("the about-to-be-replaced", fh.read())  # recoverable
+        with open(os.path.join(self.mem, "prior-b.md")) as fh:
+            self.assertIn("awkwardly named source", fh.read())    # new dst live
+
+    def test_retype_text_without_frontmatter_preserves_raw_as_body(self):
+        raw = "no frontmatter here\njust two lines of prose\n"
+        p = os.path.join(self.mem, "feedback-bare.md")
+        pk.atomic_write(p, raw)
+        act = {"op": "retype", "src": "feedback-bare.md", "dst": "prior-bare.md",
+               "id": "bare", "statement": "a bare note", "origin": "",
+               "to_type": "prior"}
+        text = drain._retype_text(p, act, pk.now_ts())
+        self.assertIn(raw, text)               # the whole raw survives as body
+        self.assertIn("type: prior", text)
+
+    def test_empty_description_typed_prefix_kept_with_reason(self):
+        self._w("prem-mute.md", _bulk("prem-mute.md", ""))
+        act = self._plan()["prem-mute.md"]
+        self.assertEqual(act["op"], "keep")
+        self.assertIn("no description to upgrade", act["why"])
 
 
 class ExpireCandidatesTest(unittest.TestCase):

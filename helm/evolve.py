@@ -24,15 +24,20 @@ the ledger, or the reflexes.
              dead-weight  live jit entries that NEVER fired (batched)
              silence      ~100% silent turns over a populated store
   reflex   which steers re-fire right after firing (steer not landing)?
+           which live reflexes have ZERO ledger fires (dead signal, batched)?
+  record   which tool-outcome tells recur across sessions (record.py's
+           counters — stuck/loop-thrash signatures worth a captured lesson)?
   whoami   is the know-your-user leg still empty?
 
 Behavior observers read the fire-ledger (inject's measurement spine, plus its
-.1 rotation) tolerating absence and garbage — no ledger, no claims. The
-ledger is read estate-wide (fire behavior is not scope-sliced); the store and
-reflex sets are resolved under the cycle's scope, and every minted command
-carries --project when scoped (the store-guard scope lesson). Behavior
-proposals are ranked by evidence strength and capped per cycle; the cycle
-output names its data window (over N turns since T).
+.1 rotation) tolerating absence and garbage — no ledger, no claims; the
+recorder observer reads reflex-state the same way (no counters, no claims).
+The ledger and the recorder state are read estate-wide (fire and tool behavior
+are not scope-sliced); the store and reflex sets are resolved under the
+cycle's scope, and every minted command carries --project when scoped (the
+store-guard scope lesson). Behavior proposals are ranked by evidence strength
+and capped per cycle; the cycle output names its data window (over N turns
+since T).
 
 Empty stores + steady beliefs + healthy home + quiet ledger -> one quiet line.
 """
@@ -47,6 +52,9 @@ SILENT_RATE = 0.95     # ~100% silent
 SILENT_MIN = 20        # total turns before a silent-rate means anything
 HABIT_GAP = 3          # a reflex re-fire within this many turns = steer ignored
 HABIT_MIN = 3          # ignored-steer episodes before proposing
+STUCK_STREAK_MIN = 3   # a session's stuck-streak floor (mentor's tell line)
+LOOP_STREAK_MIN = 3    # a session's loop-streak floor
+RECORD_SESS_MIN = 3    # sessions past a floor before a tell is a signature
 BEHAVIOR_CAP = 10      # behavior proposals per cycle, ranked by evidence strength
 
 
@@ -142,15 +150,19 @@ def _fire_props(rows, project=None):
 def _reflex_props(rows, project=None):
     """Habituation: a reflex re-firing within HABIT_GAP turns of firing means
     the steer didn't land. The ledger records FIRES, not heeds — proximity
-    re-fire is the only observable proxy, and the proposal says so."""
+    re-fire is the only observable proxy, and the proposal says so. Plus the
+    other failure pole: a live reflex with ZERO fires over a long window
+    (the loop above only sees reflexes that DO fire) — dead signal or simply
+    unprovoked, so the batched proposal asks for review, never auto-retires."""
     from . import reflex
     live = {pk.slug(str(e["id"])): e for e in reflex.load_all(project)}
-    last, episodes = {}, {}
+    last, episodes, ever = {}, {}, set()
     for i, r in enumerate(rows):
         for s in set(_fired(r, "reflex")):
             if s in last and i - last[s] <= HABIT_GAP:
                 episodes[s] = episodes.get(s, 0) + 1
             last[s] = i
+            ever.add(s)
     out = []
     for s, n in sorted(episodes.items()):
         e = live.get(s)
@@ -161,6 +173,53 @@ def _reflex_props(rows, project=None):
                     "landing (the ledger logs fires, not heeds); reword or retire"
                     % (e["id"], HABIT_GAP, n),
                     "helm reflex retire %s" % e["id"]))
+    if len(rows) >= DEADWEIGHT_MIN:
+        dead = sorted(str(e["id"]) for s, e in live.items() if s not in ever)
+        if dead:
+            names = ", ".join(dead[:6]) + (" (+%d more)" % (len(dead) - 6)
+                                           if len(dead) > 6 else "")
+            out.append((0.85 + 0.001 * len(dead), "reflex",
+                        "%d live reflex%s with zero ledger fires over %d turns: %s — "
+                        "dead signal or unprovoked; reword the pattern or retire"
+                        % (len(dead), "es" if len(dead) != 1 else "", len(rows), names),
+                        "helm reflex retire <id>"))
+    return out
+
+
+def _record_props(project=None):
+    """The recorder observer (behavior-evolve-observers leg c): every
+    session's LAST tool-outcome counters (record.py's reflex-state, read
+    estate-wide like the ledger — tool behavior is not scope-sliced) — a tell
+    crossing its floor in >= RECORD_SESS_MIN sessions is a recurring
+    signature worth ONE batched lesson proposal. Honesty: counters hold each
+    session's last recorded state only (a streak that resolved reads 0), so
+    this undercounts, never overcounts. No state, no claims; torn counters
+    read as quiet."""
+    from . import record
+    tells = (("stuck-streak", STUCK_STREAK_MIN, "stuck",
+              "repeated infra/auth failures"),
+             ("loop-streak", LOOP_STREAK_MIN, "loop-thrash",
+              "the same command re-run unchanged"))
+    hit = {name: 0 for _k, _f, name, _w in tells}
+    try:
+        sessions = record._sessions()
+    except Exception:
+        return []
+    for _key, path, _mt in sessions:
+        c = pk.read_json(path, {}) or {}
+        for k, floor, name, _why in tells:
+            if isinstance(c.get(k), int) and c[k] >= floor:
+                hit[name] += 1
+    out = []
+    for _k, floor, name, why in tells:
+        n = hit[name]
+        if n < RECORD_SESS_MIN:
+            continue
+        out.append((1.2 + 0.05 * n, "record",
+                    "%d sessions' last counters show a %s streak >= %d (%s) — "
+                    "a recurring signature; inspect the sessions and capture "
+                    "the fix as a lesson (helm coach)" % (n, name, floor, why),
+                    "helm record status"))
     return out
 
 
@@ -225,7 +284,7 @@ def cycle(project=None):
 
     rows = _ledger_rows()
     behavior = _drift_props(found, project) + _fire_props(rows, project) \
-        + _reflex_props(rows, project)
+        + _reflex_props(rows, project) + _record_props(project)
     behavior.sort(key=lambda p: (-p[0], p[2]))
     out.extend(p[1:] for p in behavior[:BEHAVIOR_CAP])
 

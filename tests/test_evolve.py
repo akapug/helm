@@ -5,7 +5,8 @@ the documented registry-sync write/scaffold — where the observers are mocked,
 NO write at all is permitted), the drift snapshot=False contract (evolve must
 never consume a pending drift report), the steady-state quiet line, and the
 BEHAVIOR observers (fire-ledger wallpaper/dead-weight/silence, drift-feed
-commands, reflex habituation) against planted ledger fixtures.
+commands, reflex habituation + dead-reflex, recorder stuck/loop signatures)
+against planted ledger and reflex-state fixtures.
 Hermetic: tmp HELM_HOME throughout."""
 import contextlib
 import io
@@ -21,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 
-from helm import drain, drift, evolve, home, inject, reflex, registry, store, whoami  # noqa: E402
+from helm import drain, drift, evolve, home, inject, pk, reflex, registry, store, whoami  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR")
 
@@ -402,6 +403,108 @@ class DriftFeedTest(BehaviorBase):
         props = self.drift_props()
         self.assertEqual(len(props), 2, "one belief -> one command, not three")
         self.assertIn("fell below auto-act", props[1][1])
+
+
+class DeadReflexTest(BehaviorBase):
+    def live(self, rid):
+        reflex.write({"id": rid, "steer": "steer-" + rid, "signal": "prompt",
+                      "pattern": "x", "stated_ts": TS})
+
+    def dead_props(self):
+        return [p for p in self.props() if "zero ledger fires" in p[1]]
+
+    def test_zero_fire_reflexes_batched_once(self):
+        self.live("ra")
+        self.live("rb")
+        self.live("rc")
+        self.plant([self.turn(reflexes=["ra"])] + [self.turn()] * 199)
+        dead = self.dead_props()
+        self.assertEqual(len(dead), 1, "dead reflexes must be ONE batched proposal")
+        area, what, verb = dead[0]
+        self.assertEqual((area, verb), ("reflex", "helm reflex retire <id>"))
+        self.assertIn("2 live reflexes with zero ledger fires over 200 turns: "
+                      "rb, rc", what)
+        self.assertNotIn("ra,", what)
+        self.assertIn("dead signal or unprovoked", what)
+
+    def test_thin_window_stays_quiet(self):
+        self.live("rb")
+        self.plant([self.turn()] * 199)
+        self.assertEqual(self.dead_props(), [])
+
+    def test_all_firing_estate_stays_quiet(self):
+        self.live("ra")
+        self.plant([self.turn(reflexes=["ra"])] + [self.turn()] * 199)
+        joined = " ".join(p[1] for p in self.props())
+        self.assertNotIn("zero ledger fires", joined)
+
+    def test_retired_reflex_not_proposed(self):
+        self.live("gone")
+        p = reflex.reflex_path("gone")  # retire via the status flip, hermetic
+        with open(p, encoding="utf-8") as f:
+            raw = f.read()
+        pk.atomic_write(p, raw.replace("status: live", "status: retired"))
+        self.plant([self.turn()] * 200)
+        self.assertEqual(self.dead_props(), [])
+
+
+class RecordCounterTest(BehaviorBase):
+    def counters(self, sid, **kw):
+        from helm import record
+        d = record.session_dir(sid)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "counters.json"), "w", encoding="utf-8") as f:
+            json.dump(dict({"v": 1}, **kw), f)
+
+    def record_props(self):
+        return [p for p in self.props() if p[0] == "record"]
+
+    def test_stuck_signature_across_sessions_proposes_once(self):
+        for i in range(3):
+            self.counters("s%d" % i, **{"stuck-streak": 3})
+        props = self.record_props()
+        self.assertEqual(len(props), 1)
+        _area, what, verb = props[0]
+        self.assertIn("3 sessions' last counters show a stuck streak >= 3", what)
+        self.assertIn("repeated infra/auth failures", what)
+        self.assertIn("helm coach", what)
+        self.assertEqual(verb, "helm record status")
+
+    def test_loop_thrash_signature(self):
+        for i in range(4):
+            self.counters("s%d" % i, **{"loop-streak": 5})
+        props = self.record_props()
+        self.assertEqual(len(props), 1)
+        self.assertIn("4 sessions' last counters show a loop-thrash streak >= 3",
+                      props[0][1])
+        self.assertIn("re-run unchanged", props[0][1])
+
+    def test_below_session_floor_stays_quiet(self):
+        for i in range(2):  # 2 sessions < RECORD_SESS_MIN, however deep the streak
+            self.counters("s%d" % i, **{"stuck-streak": 9})
+        self.assertEqual(self.record_props(), [])
+
+    def test_below_streak_floor_not_counted(self):
+        for i in range(4):
+            self.counters("s%d" % i, **{"stuck-streak": 2})
+        self.assertEqual(self.record_props(), [])
+
+    def test_resolved_streak_reads_zero_never_counted(self):
+        for i in range(3):
+            self.counters("s%d" % i, **{"stuck-streak": 0, "loop-streak": 0})
+        self.assertEqual(self.record_props(), [])
+
+    def test_absent_state_torn_and_alien_counters_no_claims(self):
+        self.assertEqual(self.record_props(), [])  # no reflex-state dir at all
+        from helm import record
+        d = record.session_dir("torn")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "counters.json"), "w", encoding="utf-8") as f:
+            f.write("{not json")
+        for i in range(2):  # alien-shaped values never count toward the floor
+            self.counters("a%d" % i, **{"stuck-streak": "9"})
+        self.counters("a2", **{"stuck-streak": True})  # bool is not a streak
+        self.assertEqual(self.record_props(), [])
 
 
 class CapRankWindowTest(BehaviorBase):
