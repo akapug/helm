@@ -665,6 +665,7 @@ SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "seat",
 def cmd_chat(args):
     """chat post <text...> | read [--since N] [--follow] | rooms |
     react <n> <emoji> | log-flush | node up|down|status |
+    meld invite|join|recv|say|status |
     join|deliver|stop-guard [--hook-json] | wait [--any] [--follow] [--seat S]
     | seats [--all] | seat rename <sid|oldname> <newname>
     | claim|release <resource> | claims  [--room R]"""
@@ -688,6 +689,9 @@ def cmd_chat(args):
     if verb == "node":
         from . import chatnode
         return chatnode.cmd_node(args[1:])
+    if verb == "meld":                  # the mindmeld preset — meld.py
+        from . import meld
+        return meld.cmd(args[1:])
     if verb in SEAT_VERBS:
         from . import seats
         return seats.cmd(verb, args[1:], room)
@@ -754,6 +758,6 @@ def cmd_chat(args):
             print("  %s  %d msg%s%s%s" % (n, total, "s"[:total != 1], unread, last))
         return 0
     print("helm chat: unknown subcommand '%s' (post|read|rooms|react|"
-          "log-flush|node|roster|%s)" % (verb, "|".join(SEAT_VERBS)),
+          "log-flush|node|meld|roster|%s)" % (verb, "|".join(SEAT_VERBS)),
           file=sys.stderr)
     return 2
