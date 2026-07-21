@@ -299,5 +299,147 @@ class CodexHomesTest(unittest.TestCase):
         self.assertIn("codex", cli._VERB_HELP)
 
 
+def _rollout(name, primary_pct, secondary_pct=0.0, reached=None,
+             resets_offset=18000, age_s=0):
+    """One fake rollout line the way the codex CLI appends it: an event_msg
+    whose payload carries rate_limits with primary/secondary windows."""
+    now = int(time.time())
+    rl = {"limit_id": "codex", "limit_name": None,
+          "primary": {"used_percent": primary_pct, "window_minutes": 300,
+                      "resets_at": now + resets_offset},
+          "secondary": {"used_percent": secondary_pct, "window_minutes": 10080,
+                        "resets_at": now + resets_offset * 10},
+          "credits": None, "individual_limit": None,
+          "plan_type": "pro", "rate_limit_reached_type": reached}
+    line = json.dumps({"timestamp": "2026-07-21T00:00:00.000Z",
+                       "type": "event_msg",
+                       "payload": {"type": "token_count", "info": {},
+                                   "rate_limits": rl}})
+    home = os.path.join(codexhomes.homes_root(), name)
+    d = os.path.join(home, "sessions", "2026", "07", "21")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "rollout-2026-07-21T00-00-00-%s.jsonl" % name)
+    with open(p, "w") as f:
+        f.write('{"type":"message","payload":{}}\n' + line + "\n")
+    if age_s:
+        old = time.time() - age_s
+        os.utime(p, (old, old))
+    return p
+
+
+class LaunchGateTest(CodexHomesTest):
+    """The `helm codex launch` cred-% gate (runbook fix #3): refuse-by-default
+    when no POOLED cred reads ok from its own rollout rate_limits; --force
+    overrides; a green gate delegates to the seat-launch mint."""
+
+    def setUp(self):
+        super().setUp()
+        from helm import seat
+        # the delegate path needs a minted codex seat (config.yaml + token)
+        os.makedirs(seat.seat_dir("codex"), exist_ok=True)
+        seat._write_private(os.path.join(seat.seat_dir("codex"), "config.yaml"),
+                            "port: 8317\n", mode=0o600)
+        seat._write_private(os.path.join(seat.seat_dir("codex"), "token"),
+                            "gate-test-token\n", mode=0o600)
+
+    # -- usage_gate classification -------------------------------------------
+    def test_gate_classifies_ok_near_exhausted(self):
+        self._plant("okhome", email="ok@x.test")
+        _rollout("okhome", 12.0, 40.0)
+        self._plant("nearhome", email="near@x.test")
+        _rollout("nearhome", 85.0)
+        self._plant("caphome", email="cap@x.test")
+        _rollout("caphome", 100.0)
+        rows = {g["name"]: g for g in codexhomes.usage_gate()}
+        self.assertEqual(rows["okhome"]["status"], "ok")
+        self.assertEqual(rows["nearhome"]["status"], "near")
+        self.assertEqual(rows["caphome"]["status"], "exhausted")
+
+    def test_gate_reached_type_is_exhausted(self):
+        self._plant("rhome", email="r@x.test")
+        _rollout("rhome", 40.0, reached="primary")
+        row = [g for g in codexhomes.usage_gate() if g["name"] == "rhome"][0]
+        self.assertEqual(row["status"], "exhausted")
+        self.assertEqual(row["reached"], "primary")
+
+    def test_gate_expired_window_not_binding(self):
+        self._plant("oldhome", email="old@x.test")
+        _rollout("oldhome", 99.0, resets_offset=-60)  # window already over
+        row = [g for g in codexhomes.usage_gate()
+               if g["name"] == "oldhome"][0]
+        self.assertEqual(row["status"], "ok")  # no live window binds
+        self.assertEqual(row["pct"], 0.0)
+
+    def test_gate_no_rollout_is_unknown(self):
+        self._plant("quiet", email="q@x.test")
+        row = [g for g in codexhomes.usage_gate()
+               if g["name"] == "quiet"][0]
+        self.assertEqual(row["status"], "unknown")
+
+    def test_gate_stale_rollout_is_unknown(self):
+        self._plant("stale", email="s@x.test")
+        _rollout("stale", 5.0, age_s=codexhomes.STALE_S + 120)
+        row = [g for g in codexhomes.usage_gate()
+               if g["name"] == "stale"][0]
+        self.assertEqual(row["status"], "unknown")
+        self.assertIn("stale", row["note"])
+
+    def test_gate_tolerates_truncated_tail_line(self):
+        """A tail cut mid-line (first partial line of the window) must not
+        kill the read — older whole lines in the same tail still parse."""
+        self._plant("cut", email="c@x.test")
+        p = _rollout("cut", 7.0)
+        with open(p, "a") as f:
+            f.write('{"type":"event_msg","payload":{"rate_limits":{"prim')
+        row = [g for g in codexhomes.usage_gate() if g["name"] == "cut"][0]
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["pct"], 7.0)
+
+    # -- launch verdict --------------------------------------------------------
+    def test_launch_refuses_when_all_pooled_not_ok(self):
+        self._plant("a", email="a@x.test")
+        _rollout("a", 95.0)                      # near
+        self._cmd("pool", "a")
+        self._plant("b", email="b@x.test")       # unknown, unpooled
+        rc, out, err = self._cmd("launch")
+        self.assertEqual(rc, 1)
+        self.assertIn("REFUSE", err)
+        self.assertIn("helm codex pool b", err)  # the concrete fix
+        self.assertNotIn("claude --dangerously", out)  # no mint happened
+
+    def test_launch_allows_with_one_ok_pooled_cred(self):
+        self._plant("good", email="g@x.test")
+        _rollout("good", 3.0)
+        self._cmd("pool", "good")
+        self._plant("bad", email="b@x.test")
+        _rollout("bad", 100.0)
+        self._cmd("pool", "bad")
+        rc, out, err = self._cmd("launch", "-i", "2")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("HELM_CHAT_NAME=codex-2", out)  # mint delegated
+        self.assertIn("gate", err)
+
+    def test_launch_force_overrides_refusal(self):
+        self._plant("a", email="a@x.test")       # unknown (no rollout)
+        self._cmd("pool", "a")
+        rc, out, err = self._cmd("launch", "--force")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("--force", err)
+        self.assertIn("claude --dangerously-skip-permissions", out)
+
+    def test_launch_bad_instance_flag_rc2(self):
+        rc, _, err = self._cmd("launch", "-i", "two")
+        self.assertEqual(rc, 2)
+        self.assertIn("integer", err)
+
+    def test_gate_output_no_secrets(self):
+        self._plant("a", email="a@x.test")
+        _rollout("a", 10.0)
+        self._cmd("pool", "a")
+        rc, out, err = self._cmd("launch")
+        self.assertEqual(rc, 0, err)
+        self._assert_no_secrets(out + err)
+
+
 if __name__ == "__main__":
     unittest.main()

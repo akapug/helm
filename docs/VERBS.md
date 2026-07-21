@@ -901,6 +901,31 @@ is the policy key: ultra = `HELM_CODEX_ULTRA_SEATS` (dflt 3), team/unknown =
 Pool writes are atomic (0600 tmp + rename) so the proxy's hot-reload never
 reads a half-written cred.
 
+**`helm codex launch [-i N] [--force]` — the cred-% gate.** `helm seat
+launch` warns but never refuses; the headroom discipline lives in this verb
+(runbook fix #3). Before minting, it reads each credhome's OWN rollout logs
+(`~/.codex-homes/<name>/sessions/**/rollout-*.jsonl`) for the newest
+`rate_limits` event the codex CLI appends per turn — the same feed the usage
+MCP forwards — and classifies every authed home: `ok` (freshest event <60m
+old and every un-expired window <80% used), `near` (≥80%), `exhausted`
+(100% or a `rate_limit_reached_type`), `unknown` (no rollout telemetry or a
+stale tail — stale/unread is NOT ok). The launch proceeds only while at
+least one POOLED cred reads `ok`; otherwise rc 1 with the concrete fix
+(`helm codex pool <best-unpooled>`, preferring an ok ultra) — pooling, not
+retrying. `--force` overrides (the gate advises, the operator decides; the
+warn is loud). A green gate delegates to the exact `helm seat launch codex`
+mint (`-i`/`--room`/`--model` pass through) — one mint path, the gate only
+guards entry to it.
+
+```console
+$ helm codex launch -i 3
+helm codex: launch gate (fresh = rollout tail <60m, near >= 80%)
+  ok      owner-example-invalid  owner@example.invalid  ultra  pooled  12% used
+  near    cto-example-invalid    cto@example.invalid     ultra  pooled  85% used
+  unknown team-example-com                hey@simbi.com                team   -       (rollout tail stale)
+env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL=http://127.0.0.1:8317 … HELM_CHAT_NAME=codex-3 …
+```
+
 ### `helm keepalive [--home NAME|PATH] [--early HOURS]`
 Roll idle claude homes' OAuth tokens forward before their refresh chains rot —
 the **one** credential-writing verb in helm, with every safety rule inherited:

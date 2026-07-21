@@ -47,6 +47,14 @@ from .seat import _jwt_claims, _write_private, seat_dir, translate_codex_auth
 
 PLAN_TIER = {"pro": "ultra", "team": "team"}
 
+# `helm codex launch` cred-% gate (runbook 2026-07-21 fix #3): the refuse
+# policy lives here, in numbers, so a launch never silently drains a capped
+# pool (fall-through masks per-cred burn until everyone 429s at once).
+NEAR_PCT = 80.0          # a pooled cred at/above this in ANY live window = near
+STALE_S = 3600           # rollout tail older than this = stale = UNKNOWN
+SCAN_ROLLOUTS = 3        # newest rollout files to tail per credhome
+TAIL_BYTES = 65536       # bytes tailed per rollout (the last rate_limits win)
+
 
 def tier(plan):
     """chatgpt_plan_type -> the fleet vocabulary (ultra/team); unknowns pass
@@ -295,6 +303,160 @@ def codex_pooled():
     return rows
 
 
+# ---------------------------------------------------------------- usage gate
+
+def _latest_rate_limits(real_home):
+    """Newest rate_limits event in a credhome's own rollout logs — the local
+    ground truth for headroom (the codex CLI appends one per turn; the usage
+    MCP's codex feed is just these, forwarded). Reads only the newest
+    SCAN_ROLLOUTS files' last TAIL_BYTES. Returns the rate_limits dict plus
+    {"file": path} for attribution, or None when the home has no recent
+    rollout telemetry at all (never-used / pre-rate_limits CLI = UNKNOWN)."""
+    root = os.path.join(real_home, "sessions")
+    try:
+        files = [os.path.join(dp, f) for dp, _dn, fn in os.walk(root)
+                 for f in fn if f.startswith("rollout-") and f.endswith(".jsonl")]
+    except OSError:
+        return None
+    files.sort(key=lambda p: os.path.basename(p), reverse=True)  # ts in name
+    for path in files[:SCAN_ROLLOUTS]:
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                if size > TAIL_BYTES:
+                    f.seek(-TAIL_BYTES, os.SEEK_END)
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in reversed(tail.splitlines()):
+            if "rate_limits" not in line:
+                continue
+            try:
+                ev = json.loads(line)
+                rl = ((ev.get("payload") or {}).get("rate_limits")
+                      if isinstance(ev, dict) else None)
+            except ValueError:
+                continue            # mid-line tail cut; older lines are whole
+            if isinstance(rl, dict) and isinstance(rl.get("primary"), dict):
+                rl["file"] = path
+                return rl
+    return None
+
+
+def usage_gate():
+    """The launch headroom verdict per credhome, from the homes' own rollout
+    rate_limits. Statuses: ok (freshest event fresh + every live window under
+    NEAR_PCT), near (>= NEAR_PCT or a reached-type recorded), exhausted
+    (a live window at 100%), unknown (no rollout telemetry or stale >
+    STALE_S — stale/unread = NOT ok, the runbook's core rule)."""
+    now = time.time()
+    rows = []
+    for h in codex_list():
+        if not h["authed"]:
+            continue
+        row = {"name": h["name"], "email": h["email"], "tier": h["tier"],
+               "pooled": h["pooled"], "account_id": h["account_id"],
+               "status": "unknown"}
+        rl = _latest_rate_limits(h["path"])
+        if rl:
+            age = now - os.path.getmtime(rl.pop("file"))
+            row["age_s"] = int(age)
+            if age > STALE_S:
+                row["status"] = "unknown"
+                row["note"] = "rollout tail stale (%dm > %dm)" % (
+                    age // 60, STALE_S // 60)
+            else:
+                worst, live = 0.0, False
+                for w in (rl.get("primary"), rl.get("secondary")):
+                    if not isinstance(w, dict):
+                        continue
+                    resets = w.get("resets_at")
+                    if isinstance(resets, (int, float)) and resets <= now:
+                        continue          # window over — no longer binding
+                    live = True
+                    pct = w.get("used_percent")
+                    if isinstance(pct, (int, float)):
+                        worst = max(worst, pct)
+                row["pct"] = worst
+                if rl.get("rate_limit_reached_type"):
+                    row["status"], row["reached"] = "exhausted", \
+                        rl["rate_limit_reached_type"]
+                elif not live:
+                    # a fresh event whose windows have ALL reset binds
+                    # nothing — the freshest reading there is = green
+                    row["status"] = "ok"
+                elif worst >= 100.0:
+                    row["status"] = "exhausted"
+                elif worst >= NEAR_PCT:
+                    row["status"] = "near"
+                else:
+                    row["status"] = "ok"
+        rows.append(row)
+    return rows
+
+
+def _suggest_pool(gate):
+    """The concrete fix: best unpooled credhome to `helm codex pool` next —
+    prefer an ok-status ultra, then any ok, then the top ultra regardless
+    (its reading is the likeliest to improve once the CLI refreshes it)."""
+    unpooled = [g for g in gate if not g["pooled"]]
+    for pred in (lambda g: g["status"] == "ok" and g["tier"] == "ultra",
+                 lambda g: g["status"] == "ok",
+                 lambda g: g["tier"] == "ultra"):
+        hits = [g for g in unpooled if pred(g)]
+        if hits:
+            return hits[0]
+    return None
+
+
+def launch_gate(inst=1, force=False, out=None):
+    """Refuse-by-default cred-% gate ahead of a codex seat launch (runbook
+    fix #3). Pooled rows near/exhausted/unknown are the problem classes; a
+    launch is allowed while at least one POOLED cred reads ok, otherwise
+    rc 1 with the concrete `helm codex pool <name>` fix on stderr (--force
+    overrides: the gate advises, the operator decides — same law as seat
+    launch's own warns). Prints the gate table; returns the rc."""
+    out = out or sys.stderr
+    gate = usage_gate()
+    pooled = [g for g in gate if g["pooled"]]
+    print("helm codex: launch gate (fresh = rollout tail <%dm, near >= %.0f%%)"
+          % (STALE_S // 60, NEAR_PCT), file=out)
+    for g in gate:
+        mark = "pooled" if g["pooled"] else "-"
+        extra = (" %.0f%% used" % g["pct"]) if g.get("pct") is not None else ""
+        if g.get("note"):
+            extra += " (%s)" % g["note"]
+        if g.get("reached"):
+            extra += " (reached %s)" % g["reached"]
+        print("  %-6s %-28s %-32s %-6s %-6s%s" % (
+            g["status"], g["name"], g["email"] or "-", g["tier"] or "?",
+            mark, extra), file=out)
+    ok_pool = [g for g in pooled if g["status"] == "ok"]
+    if ok_pool or force:
+        if not ok_pool:
+            print("helm codex: WARN — --force over a gate with no ok pooled "
+                  "cred; the pool may 429 under load", file=out)
+        return 0
+    fix = _suggest_pool(gate)
+    print("helm codex: REFUSE — no pooled cred reads ok "
+          "(near/exhausted/unknown); the fix is pooling, not retrying", file=out)
+    if fix:
+        print("  fix: helm codex pool %s   # %s, %s%s" % (
+            fix["name"], fix["email"] or "-", fix["tier"] or "?",
+            " (currently %s)" % fix["status"] if fix["status"] != "ok" else ""),
+            file=out)
+    print("  then re-run, or override: helm codex launch -i %d --force" % inst,
+          file=out)
+    return 1
+
+
+def _run_launch(rest):
+    """Delegate to the seat-launch mint (codex family): ONE mint path — the
+    gate only guards entry to it; -i/--room/--model pass straight through."""
+    from . import seat as _seat
+    return _seat.cmd_seat(["launch", "codex"] + list(rest))
+
+
 # ---------------------------------------------------------------- CLI leg
 
 def _short(account_id):
@@ -369,8 +531,10 @@ def _print_capacity():
 
 
 def cmd_codex(args):
-    """codex [list] | pool <name> | unpool <name> | pooled | capacity — codexhome
-    roster (ultra/team) + proxy cred pooling (auth.json -> 0600 pool file)."""
+    """codex [list] | pool <name> | unpool <name> | pooled | capacity | launch
+    [-i N] [--force] [--room R] [--model M] — codexhome roster (ultra/team) +
+    proxy cred pooling (auth.json -> 0600 pool file). launch = the cred-%
+    gate (runbook fix #3) ahead of the seat-launch mint."""
     args = list(args)
     verb, rest = (args[0], args[1:]) if args else ("list", [])
     if verb == "list":
@@ -379,6 +543,22 @@ def cmd_codex(args):
         return _print_pooled()
     if verb == "capacity":
         return _print_capacity()
+    if verb == "launch":
+        force = "--force" in rest
+        rest = [a for a in rest if a != "--force"]
+        inst = 1
+        for flag in ("-i", "--instance"):
+            if flag in rest:
+                try:
+                    inst = int(rest[rest.index(flag) + 1])
+                except (ValueError, IndexError):
+                    print("helm codex: %s wants an integer" % flag,
+                          file=sys.stderr)
+                    return 2
+        rc = launch_gate(inst=inst, force=force)
+        if rc:
+            return rc
+        return _run_launch(rest)
     if verb == "pool":
         if not rest:
             print("usage: helm codex pool <name>", file=sys.stderr)
