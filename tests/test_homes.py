@@ -40,15 +40,25 @@ class HomesTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # -- helpers -----------------------------------------------------------
-    def _plant_claude_home(self, name, email, authed=True):
+    def _plant_claude_home(self, name, email, authed=True, token=None):
         """A fake home: identity METADATA only (.claude.json oauthAccount) plus an
-        empty auth-file placeholder — never real token contents."""
+        empty auth-file placeholder — never real token contents. `token` plants a
+        FAKE refresh token for the shared-family (content-hash) tests."""
         d = os.path.join(homes.ROOTS["claude"], name)
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, ".claude.json"), "w") as f:
             json.dump({"oauthAccount": {"emailAddress": email}}, f)
         if authed:
-            open(os.path.join(d, ".credentials.json"), "w").close()
+            with open(os.path.join(d, ".credentials.json"), "w") as f:
+                if token:
+                    json.dump({"claudeAiOauth": {"refreshToken": token}}, f)
+        return d
+
+    def _plant_codex_home(self, name, token):
+        d = os.path.join(homes.ROOTS["codex"], name)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "auth.json"), "w") as f:
+            json.dump({"tokens": {"refresh_token": token}}, f)
         return d
 
     # -- canon: name folding ----------------------------------------------
@@ -192,6 +202,76 @@ class HomesTest(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["restored_to"], origin)
         self.assertFalse(os.path.exists(os.path.join(origin, homes.LEGACY_MARKER)))
+
+    # -- shared-family: the revocation-bomb content-hash audit ---------------
+    def test_shared_family_flags_byte_copies_never_distinct_logins(self):
+        tok = "fake-refresh-token-abc123"
+        self._plant_claude_home("copy-a", "a@x.com", token=tok)
+        self._plant_claude_home("copy-b", "b@y.com", token=tok)
+        self._plant_claude_home("solo-c", "c@z.com", token="a-different-family")
+        rows = {r["name"]: r for r in homes.homes_list()}
+        self.assertEqual(rows["copy-a"]["shared_family"], ["copy-b"])
+        self.assertEqual(rows["copy-b"]["shared_family"], ["copy-a"])
+        self.assertNotIn("shared_family", rows["solo-c"])
+        # verify surfaces it as a fix; verdict demoted
+        res = homes.home_verify("copy-a")
+        self.assertEqual(res["verdict"], "issues")
+        self.assertEqual(res["checks"]["shared_family"], ["copy-b"])
+        self.assertTrue(any("BYTE-COPIES" in f and "copy-b" in f for f in res["fixes"]))
+        # the hygiene flag is the loud one
+        self.assertIn("SHARED-FAMILY:copy-b", homes._hygiene_flags(rows["copy-a"]))
+
+    def test_shared_family_codex_and_cross_provider_isolation(self):
+        # same bytes on claude AND codex homes: families group PER PROVIDER —
+        # a cross-provider byte-coincidence must never merge
+        tok = "fake-codex-refresh-token"
+        self._plant_codex_home("cx-a", tok)
+        self._plant_codex_home("cx-b", tok)
+        self._plant_claude_home("cl-x", "x@x.com", token=tok)
+        rows = {r["name"]: r for r in homes.homes_list()}
+        self.assertEqual(rows["cx-a"]["shared_family"], ["cx-b"])
+        self.assertNotIn("shared_family", rows["cl-x"])
+
+    def test_token_bytes_never_surface_only_the_digest_prefix(self):
+        tok = "super-secret-refresh-token-value"
+        self._plant_claude_home("leak-a", "a@x.com", token=tok)
+        self._plant_claude_home("leak-b", "b@y.com", token=tok)
+        rows = [r for r in homes.homes_list() if not r["archived"]]
+        dumped = json.dumps(rows)
+        self.assertNotIn(tok, dumped)
+        fam = next(r["family"] for r in rows if r["name"] == "leak-a")
+        self.assertRegex(fam, r"^[0-9a-f]{10}$")
+        self.assertNotIn(tok, json.dumps(homes.home_verify("leak-a")))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            homes.cmd_homes([])
+        self.assertNotIn(tok, out.getvalue())
+        self.assertIn("SHARED-FAMILY", out.getvalue())
+
+    def test_doctor_check_cred_families(self):
+        from helm import doctor
+        # distinct families -> one OK line
+        self._plant_claude_home("ok-a", "a@x.com", token="family-one")
+        self._plant_claude_home("ok-b", "b@y.com", token="family-two")
+        res = doctor.check_cred_families()
+        self.assertEqual([lvl for lvl, _ in res], [doctor.OK])
+        self.assertIn("2 distinct across 2 authed homes", res[0][1])
+        # a byte-copy pair -> one FAIL per family group, not per home
+        self._plant_claude_home("bomb-a", "c@x.com", token="copied-family")
+        self._plant_claude_home("bomb-b", "d@y.com", token="copied-family")
+        res = doctor.check_cred_families()
+        fails = [m for lvl, m in res if lvl == doctor.FAIL]
+        self.assertEqual(len(fails), 1)
+        self.assertIn("bomb-a, bomb-b", fails[0])
+        self.assertIn("BYTE-COPIES", fails[0])
+        self.assertNotIn("copied-family", json.dumps(res))  # never the bytes
+
+    def test_doctor_check_cred_families_degrades_to_warn(self):
+        from helm import doctor
+        with mock.patch.object(homes, "homes_list", side_effect=OSError("boom")):
+            res = doctor.check_cred_families()
+        self.assertEqual(res[0][0], doctor.WARN)
+        self.assertIn("unavailable", res[0][1])
 
     # -- CLI leg smoke ------------------------------------------------------
     def test_cmd_homes_list_and_archives(self):

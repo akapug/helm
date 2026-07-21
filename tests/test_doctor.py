@@ -268,7 +268,9 @@ class TestCmdDoctor(DoctorBase):
         before = self.snapshot(self.tmp.name)
         with mock.patch.object(home, "adopted_memory_dir", lambda: adopted), \
                 mock.patch.object(doctor, "check_cv",
-                                  lambda: [(doctor.OK, "cv stub")]):
+                                  lambda: [(doctor.OK, "cv stub")]), \
+                mock.patch.object(doctor, "check_cred_families",
+                                  lambda: [(doctor.OK, "families stub")]):
             rc, out = self.run_doctor()
         self.assertEqual(rc, 1)  # the broken symlink FAIL
         self.assertIn("FAIL", out)
@@ -297,7 +299,9 @@ class TestCmdDoctor(DoctorBase):
                              "updated_at": "", "source": "fresh"})
         with mock.patch.object(home, "adopted_memory_dir", lambda: adopted), \
                 mock.patch.object(doctor, "check_cv",
-                                  lambda: [(doctor.OK, "cv stub")]):
+                                  lambda: [(doctor.OK, "cv stub")]), \
+                mock.patch.object(doctor, "check_cred_families",
+                                  lambda: [(doctor.OK, "families stub")]):
             rc, out = self.run_doctor()
         self.assertEqual(rc, 0)
         self.assertIn("0 fail", out)
@@ -345,6 +349,49 @@ class PhysicsCurrencyTest(unittest.TestCase):
             res = doctor.check_physics_currency()
         self.assertEqual(res[0][0], doctor.WARN)
         self.assertIn("UNKNOWN", res[0][1])
+
+    def test_git_present_is_ok(self):
+        import shutil as sh
+        with mock.patch.object(sh, "which", lambda t: "/usr/bin/git"):
+            res = doctor.check_git()
+        self.assertEqual(res, [(doctor.OK, "git on PATH (/usr/bin/git)")])
+
+    def test_git_absent_warns_with_distro_command_and_jj_note(self):
+        import shutil as sh
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix="os-release") as f:
+            f.write('NAME="Debian GNU/Linux"\nID=debian\n')
+            f.flush()
+            hint = doctor._git_install_hint(os_release=f.name, platform="linux")
+        self.assertEqual(hint, "sudo apt install git")
+        with mock.patch.object(sh, "which", lambda t: None), \
+                mock.patch.object(doctor, "_git_install_hint",
+                                  lambda: "sudo apt install git"):
+            res = doctor.check_git()
+        self.assertEqual(res[0][0], doctor.WARN)
+        self.assertIn("sudo apt install git", res[0][1])
+        self.assertIn("jj/jujutsu", res[0][1])
+        self.assertIn("degrade", res[0][1])
+
+    def test_git_install_hint_distro_table(self):
+        import tempfile
+        cases = (("ID=ubuntu\nID_LIKE=debian\n", "sudo apt install git"),
+                 ("ID=fedora\n", "sudo dnf install git"),
+                 ("ID=arch\n", "sudo pacman -S git"),
+                 ('ID="opensuse-tumbleweed"\nID_LIKE="suse"\n', "sudo zypper install git"),
+                 ("ID=alpine\n", "sudo apk add git"),
+                 ("ID=plan9\n", "install git via your distro's package manager"))
+        for text, want in cases:
+            with tempfile.NamedTemporaryFile("w") as f:
+                f.write(text)
+                f.flush()
+                self.assertEqual(doctor._git_install_hint(os_release=f.name,
+                                                          platform="linux"), want, text)
+        self.assertEqual(doctor._git_install_hint(platform="darwin"),
+                         "xcode-select --install")
+        self.assertEqual(doctor._git_install_hint(os_release="/no/such",
+                                                  platform="linux"),
+                         "install git via your distro's package manager")
 
     def test_authored_non_object_entry_fails_not_crashes(self):
         # a parseable file with a null entry must FAIL, never raise —

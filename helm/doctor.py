@@ -8,6 +8,7 @@ seam), no if-forest. Exit 0 unless a FAIL.
 """
 import os
 import re
+import sys
 
 from . import home, pk, registry, whoami
 
@@ -302,11 +303,87 @@ def check_record():
     return record.doctor_rows()
 
 
+def check_cred_families():
+    """Shared-family hygiene (the revocation bomb): byte-identical refresh
+    tokens across credential homes = copies of ONE token family — reuse
+    detection revokes all of them at once, and a fresh login per home is the
+    only fix. Content-hash comparison only (homes.py); token bytes never
+    surface anywhere."""
+    from . import homes
+    try:
+        rows = [r for r in homes.homes_list()
+                if r.get("authed") and not r.get("archived")]
+    except Exception as e:
+        return [(WARN, "cred-family audit unavailable (%s: %s)"
+                 % (e.__class__.__name__, e))]
+    if not rows:
+        return []
+    out, seen = [], set()
+    for r in rows:
+        fam = r.get("shared_family")
+        if not fam:
+            continue
+        group = (r["provider"], tuple(sorted([r["name"]] + fam)))
+        if group in seen:
+            continue
+        seen.add(group)
+        out.append((FAIL, "shared token family: %s homes [%s] hold BYTE-COPIES of "
+                          "one refresh token — reuse detection revokes ALL of them; "
+                          "fresh login per home (`helm homes verify` has the detail)"
+                    % (r["provider"], ", ".join(group[1]))))
+    if not out:
+        families = {(r["provider"], r["family"]) for r in rows if r.get("family")}
+        out.append((OK, "cred token families: %d distinct across %d authed homes — "
+                        "no byte-copies" % (len(families), len(rows))))
+    return out
+
+
+def _git_install_hint(os_release="/etc/os-release", platform=None):
+    """The exact git install command for this box — best-effort distro guess
+    from /etc/os-release (ID first, ID_LIKE folded in)."""
+    if (platform or sys.platform) == "darwin":
+        return "xcode-select --install"
+    try:
+        with open(os_release) as f:
+            text = f.read()
+    except OSError:
+        text = ""
+    ids = []
+    for line in text.splitlines():
+        if line.startswith(("ID=", "ID_LIKE=")):
+            ids += line.split("=", 1)[1].strip().strip('"').lower().split()
+    for key, cmd in (("debian", "sudo apt install git"),
+                     ("ubuntu", "sudo apt install git"),
+                     ("fedora", "sudo dnf install git"),
+                     ("rhel", "sudo dnf install git"),
+                     ("centos", "sudo dnf install git"),
+                     ("arch", "sudo pacman -S git"),
+                     ("suse", "sudo zypper install git"),
+                     ("alpine", "sudo apk add git")):
+        if any(key in i for i in ids):
+            return cmd
+    return "install git via your distro's package manager"
+
+
+def check_git():
+    """git presence — the substrate under sync's repo scan, capsule, and ship.
+    Absent = WARN with the exact install command for this distro (helm itself
+    still runs; those legs degrade)."""
+    import shutil as _sh
+    path = _sh.which("git")
+    if path:
+        return [(OK, "git on PATH (%s)" % path)]
+    return [(WARN, "git not found — sync's repo scan, capsule, and ship degrade; "
+                   "install: `%s` (jj/jujutsu is a git-compatible alternative "
+                   "on the radar — a future helm may accept either)"
+             % _git_install_hint())]
+
+
 CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
           "check_projection_registry",
           "check_adopted_store", "check_know_your_user", "check_cv",
           "check_inject_coverage", "check_env", "check_physics_currency", "check_record",
-          "check_chat_node")
+          "check_chat_node", "check_cred_families", "check_git")
 
 
 def cmd_doctor(args):

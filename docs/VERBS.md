@@ -753,6 +753,28 @@ credential state, reset window, and the use-it-or-lose-it weekly verdict.
 Degrades to a one-line notice on machines with no quota provider — sessions
 and resume still work.
 
+### `helm creds crosscheck [--json]`
+The local-session-scan SECOND SOURCE: sums per-record work
+(`output_tokens + cache_creation_input_tokens` — never raw cumulative input)
+from the local claude session JSONL into the same 5h / 7d / 7d-Fable windows
+the header probe reports, then cross-checks the two. Drift is a **health
+signal, reported never fatal**: header-active/scan-empty means the usage
+happened elsewhere (another machine, an incomplete store);
+scan-active/header-idle means a rolled window or accounting lag. Accounts
+group by the canonical `projects` store behind their homes — the shared store
+(every helm claude home symlinks onto `~/.claude/projects`) yields ONE
+commingled row that never masquerades as a per-account cross-check; only a
+truly isolated store cross-checks its one account. The header stays the
+decision-point read; the scan is observational.
+
+```console
+$ helm creds crosscheck
+helm creds crosscheck — local-session scan vs header truth (drift = a health signal, reported never fatal)
+  ~/.claude/projects  (SHARED by 4: you@example.com, ...)
+    scan:   5h 1.2M | 7d 45M | fable-7d 12M tokens over 1834 records (newest 2026-07-20T17:05Z)
+    commingled — 4 accounts share this store; not a per-account cross-check
+```
+
 ### `helm swap <home-or-account>`
 A seat ran dry mid-work: find its live sessions, pick the healthiest other
 account of the same provider, and print the exact resume-under-that-account
@@ -763,12 +785,55 @@ never an automatic mutation.
 $ helm swap you@example.com
 ```
 
+### `helm attribute [--by project|model|cred] [--since Nd|Nh] [--limit N] [--project P] [--json]`
+Historical token-effort attribution — the HR-capacity frame: how much effort
+(in tokens) has a project / model / cred consumed, so cred homing can follow
+need. A BOUNDED on-demand rollup over the session catalog (the bound is
+always printed — a scoped result never masquerades as a whole-corpus total).
+Effort = output + cache-creation tokens (claude) / output tokens (codex),
+**never** raw cumulative input. Cred attribution is a path-boundary match
+against `-homes/` dirs only: codex rollouts under `~/.codex-homes/<name>/`
+attribute cleanly; claude sessions live in the ONE shared store and stay
+**UNATTRIBUTED** rather than being guessed — that bucket is always visible,
+so a coverage gap never hides inside an attributed total.
+
+```console
+$ helm attribute --by cred --since 7d
+helm attribute — effort by cred, 143 sessions (last 7d, limit 200; measure: output + cache-creation tokens, never raw input)
+  UNATTRIBUTED             123.4M  118 sessions
+  codex:seat@example.com    12.1M  25 sessions
+```
+
+### `helm who [--json]`
+The pid→cred attribution table: every live claude/codex process with its
+cred home (`CLAUDE_CONFIG_DIR`/`CODEX_HOME` from `/proc`; the provider
+default only when the environ was READ and the key is genuinely absent — an
+unreadable environ is no evidence, so that row stays visible but unattributed,
+marked `environ-unreadable`), the account that home maps to, cwd, and the
+session it is running. A pid whose stat starttime changes mid-scan (pid reuse)
+is discarded. Codex session ids are exact (the rollout file is held open —
+the fd names it); claude ids are exact only when the home+cwd project dir
+holds a single live candidate, else newest-first candidates are listed.
+Subagent / helper processes are marked `child` (rotation targets the
+top-level session); two live processes on one session carry a loud `SHARED`
+marker — resume once, never twice. Reads `/proc` and transcript filenames
+only, never token contents. This is the missing link for a rotation executor: a rebalance names
+an account, `who` names the pids on it.
+
 ### `helm homes [prepare <claude|codex> <email> | verify [<name>] | archive <name> | restore <name> | migrate <name> | archives] [--provider claude|codex]`
 Credential-home lifecycle. Bare `helm homes` lists every home with identity,
 liveness, and duplicate flags. helm prepares directories and verifies
 structure; **you run every login** — helm never touches an auth flow.
 Archive/restore are directory moves (archive-not-delete); live-agent homes
 are refused.
+
+`verify` (and the list's hygiene column) includes the **shared-family** audit
+— the revocation bomb: byte-identical refresh tokens across homes mean copies
+of ONE token family, and the vendor's reuse detection revokes the whole
+family at once. Detection compares sha256 content hashes only (10-hex digest
+prefix); token bytes are never printed, logged, or persisted. The only fix is
+a fresh login per home — one home = one login = one token family. Doctor
+mirrors it as the `cred token families` row (byte-copies = FAIL).
 
 ```console
 $ helm homes prepare claude you@example.com
@@ -949,7 +1014,10 @@ SINCE YOU LEFT — 7 sessions, 4 projects
 ### `helm doctor`
 Read-only health report over the whole estate: home layout, registry,
 adoption, the adopted store, know-your-user, the recall index, env overrides
-in effect. Exit 1 only on FAILs.
+in effect, cred token families (the shared-family/revocation-bomb audit —
+content hashes only, byte-copies = FAIL), and git presence (absent = WARN
+with the exact per-distro install command; jj/jujutsu noted as a
+git-compatible alternative on the radar). Exit 1 only on FAILs.
 
 ### `helm evolve`
 One observe/propose cycle over the stores: what to drain, which beliefs need

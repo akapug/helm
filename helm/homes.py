@@ -9,9 +9,13 @@ THE CANON (CRED_AUTH_CANON, distilled — violating these bricks accounts):
     copied or moved between homes (revocation bomb): re-seating an identity is
     always a FRESH device login into the target home.
   * the HUMAN mints auth. These functions prepare homes and hand back the exact
-    login command; they never run a login, never read or write token CONTENTS.
+    login command; they never run a login, never write token contents.
     Verification reads non-secret identity metadata only (.claude.json
-    oauthAccount email; codex id_token email claim, decoded and discarded).
+    oauthAccount email; codex id_token email claim, decoded and discarded) —
+    with ONE bounded exception: the shared-family audit hashes refresh-token
+    bytes IN MEMORY (sha256) to detect byte-copies of a single token family
+    across homes (the revocation bomb). Only the 10-hex digest prefix
+    survives; token bytes are never printed, logged, or persisted.
   * canonical home name = the account email with every non-alphanumeric char
     folded to '-'  (david@x.com -> david-x-com). Aliases = symlinks.
   * claude homes: `projects` must SYMLINK to ~/.claude/projects (one shared
@@ -24,7 +28,7 @@ THE CANON (CRED_AUTH_CANON, distilled — violating these bricks accounts):
 Every public function returns a JSON-able dict (or list); errors are
 {"error": "..."} — loud, attributed, never an exception across the API edge.
 """
-import base64, glob, json, os, shlex, shutil, sys, time
+import base64, glob, hashlib, json, os, shlex, shutil, sys, time
 
 from .home import env as _env
 
@@ -82,6 +86,21 @@ def _codex_identity(home):
 
 
 _IDENTITY = {"claude": _claude_identity, "codex": _codex_identity}
+
+
+def _token_family(provider, home):
+    """10-hex sha256 prefix of the home's refresh token — the FAMILY
+    fingerprint. Content-equality grouping only: the bytes are read solely to
+    hash IN MEMORY; nothing but the digest prefix leaves this function."""
+    auth = _read_json(os.path.join(home, AUTH_FILE[provider])) or {}
+    if provider == "claude":
+        tok = (auth.get("claudeAiOauth") or {}).get("refreshToken")
+    else:
+        tokens = auth.get("tokens") or {}
+        tok = tokens.get("refresh_token") or tokens.get("refreshToken")
+    if not isinstance(tok, str) or not tok:
+        return None
+    return hashlib.sha256(tok.encode()).hexdigest()[:10]
 
 
 def _agent_procs():
@@ -142,6 +161,7 @@ def _home_row(provider, path, aliases, procs, default=False):
     return {"name": f"(default-{provider})" if default else os.path.basename(path),
             "provider": provider, "path": path, "default": default, "aliases": aliases,
             "authed": authed, "identity": identity, "canonical": canonical,
+            "family": _token_family(provider, real) if authed else None,
             "projects_link_ok": projects_link_ok, "live_pids": live, "archived": False}
 
 
@@ -215,6 +235,17 @@ def homes_list():
         if len(group) > 1:
             for r in group:
                 r["duplicate_identity"] = [o["name"] for o in group if o is not r]
+    # shared-family scan: byte-identical refresh tokens across DISTINCT homes =
+    # copies of ONE token family — the revocation bomb (reuse detection revokes
+    # the whole family at once). Keyed on CONTENT hashes; dir names are labels.
+    by_family = {}
+    for r in rows:
+        if r["authed"] and r.get("family"):
+            by_family.setdefault((r["provider"], r["family"]), []).append(r)
+    for group in by_family.values():
+        if len(group) > 1:
+            for r in group:
+                r["shared_family"] = [o["name"] for o in group if o is not r]
     return rows + broken + _archived_rows()
 
 
@@ -369,12 +400,18 @@ def home_verify(name, provider=None):
         fixes.append(f"identity {row['identity']} also lives in: {', '.join(named_dups)} — one "
                      "identity should hold ONE named home; the human picks a survivor and archives "
                      "the rest (`helm homes archive`) — NEVER copy credentials between homes")
+    fam = row.get("shared_family") or []
+    if fam:
+        fixes.append(f"BYTE-COPIES of one refresh-token family with: {', '.join(fam)} — "
+                     "reuse detection revokes the WHOLE family at once; a fresh login per "
+                     "home is the only fix (one home = one login = one token family)")
     verdict = "pending-login" if not row["authed"] else ("issues" if fixes else "ok")
     return {"home": row["name"], "provider": prov, "path": row["path"],
             "checks": {"authed": row["authed"], "identity": row["identity"],
                        "canonical": row["canonical"],
                        "projects_link_ok": row["projects_link_ok"],
-                       "duplicate_identity": dups, "live_pids": row["live_pids"]},
+                       "duplicate_identity": dups, "shared_family": fam,
+                       "live_pids": row["live_pids"]},
             "verdict": verdict, "fixes": fixes}
 
 
@@ -508,6 +545,9 @@ def _hygiene_flags(r):
         flags.append("shared-with-default (by design)")
     if named:
         flags.append("dup:" + ",".join(named))
+    fam = r.get("shared_family") or []
+    if fam:  # the revocation bomb — always the loudest flag
+        flags.append("SHARED-FAMILY:" + ",".join(fam))
     if r["live_pids"]:
         flags.append("live:" + ",".join(map(str, r["live_pids"])))
     return flags
