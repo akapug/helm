@@ -415,7 +415,7 @@ def cmd_hooks(args):
             print("helm hooks: no claude homes found")
             return 0
         print("helm hooks status (claude):")
-        print("  %-28s %-5s %-5s %-9s %-7s %-5s %s" % (
+        print("  %-28s %-5s %-5s %-9s %-7s %-5s %-5s %s" % (
             "home", "hook", "helm", "fail-open", "deliver", "join", "stop",
             "handoff"))
         def hoff(r):  # the continuity lane is live only when BOTH triggers are
