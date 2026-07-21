@@ -95,7 +95,7 @@ def whoname():
     name = home.env("CHAT_NAME")
     if name:
         return name
-    sid = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_SESSION_ID")
+    sid = home.session_id()
     if sid:
         try:
             from . import seats
@@ -648,6 +648,8 @@ def cmd_chat(args):
         room = args[i + 1]
         del args[i:i + 2]
     verb = args[0] if args else "read"
+    if verb == "roster":            # roster: a friendlier alias for `seats`
+        verb = "seats"
     if verb == "node":
         from . import chatnode
         return chatnode.cmd_node(args[1:])
@@ -719,5 +721,6 @@ def cmd_chat(args):
             print("  %s  %d msg%s%s%s" % (n, total, "s"[:total != 1], unread, last))
         return 0
     print("helm chat: unknown subcommand '%s' (post|read|rooms|react|"
-          "log-flush|node|%s)" % (verb, "|".join(SEAT_VERBS)), file=sys.stderr)
+          "log-flush|node|roster|%s)" % (verb, "|".join(SEAT_VERBS)),
+          file=sys.stderr)
     return 2

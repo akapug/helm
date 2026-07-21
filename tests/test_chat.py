@@ -189,6 +189,14 @@ class CmdTest(ChatBase):
         self.assertEqual(rc, 0)
         self.assertIn("no rooms yet", out)
 
+    def test_roster_aliases_seats(self):
+        """`helm chat roster` is a friendlier spelling of `seats` — it must
+        reach the same dispatch (rc 0), never the unknown-subcommand path
+        (owner asked for the alias 2026-07-21)."""
+        rc, _, err = self.run_cmd(["roster"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("unknown subcommand", err)
+
 
 class RowIntegrityTest(ChatBase):
     def test_unicode_line_separator_never_tears_the_row(self):
