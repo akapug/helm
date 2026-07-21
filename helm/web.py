@@ -924,6 +924,69 @@ def _api_ledger_turn(qs):
     return d, 200
 
 
+# ── ledger/native: the live LOCAL activity surface — local reads only ──
+# The cave turn-ledger above is the DURABLE dregg attestation and the
+# production target (premise dregg-primary-corrects-native-chain-
+# misunderstanding), but it advances only when a capture anchors or a cell
+# signs, and per-row cave-signing still needs a cell-adapter (premise
+# dregg-signer-needs-adapter-not-wire) — so it honestly sits still while the
+# fleet works. Until that adapter lands, the fleet's LIVE activity is LOCAL:
+# the blake2b attest-chain (premise.py — a tamper-evident COORDINATION
+# FALLBACK, honestly never a dregg proof), the events journal (append-only
+# mutation receipts, honestly NOT hash-chained), and the RAM room's
+# presence-chat pulse (honestly unsigned). This endpoint projects all three —
+# no node, no network, GET-only, and every leg fails open to an empty
+# section, never an error.
+
+NATIVE_ROWS = 30
+# One chain record projects to these keys — provenance the owner cross-checks
+# with `helm premise-check`; never the whole record (bounded payload).
+NATIVE_REC_KEYS = ("op", "premise_id", "root", "project", "ts", "attest_by",
+                   "rec_hash", "chain_index")
+
+
+def _native_chat_pulse():
+    """The fleet-liveness pulse off the RAM rooms: post count, newest row's
+    ts/from/room. Reaction rows count as activity (last_*) but not as msgs."""
+    from . import chat
+    out = {"rooms": 0, "msgs": 0, "last_ts": "", "last_from": "", "last_room": ""}
+    try:
+        for room in chat.list_rooms():
+            rows, total = chat.read(room)
+            if not total:
+                continue
+            out["rooms"] += 1
+            out["msgs"] += sum(1 for m in rows if not m.get("react"))
+            last = rows[-1]
+            if (last.get("ts") or "") > out["last_ts"]:
+                out.update(last_ts=last.get("ts") or "",
+                           last_from=last.get("from") or "", last_room=room)
+    except Exception:
+        pass  # a torn room reads as a quieter pulse, never an error
+    return out
+
+
+def _api_ledger_native(qs):
+    """Native attestation pulse: chain head + whole-chain verification + newest
+    records, newest receipts, chat pulse. verified is verify_chain() truth — a
+    tampered chain surfaces here as verified:false + detail, never hidden."""
+    from . import pk, premise
+    recs = premise.chain_records()
+    verified, detail = premise.verify_chain() if recs else (True, "")
+    head = recs[-1] if recs else {}
+    try:
+        events = pk.read_events(NATIVE_ROWS)[::-1]  # newest-first on the wire
+    except Exception:
+        events = []
+    return {"chain": {"count": len(recs), "verified": bool(verified),
+                      "detail": "" if verified else str(detail),
+                      "head_index": head.get("chain_index"),
+                      "head_hash": head.get("rec_hash", ""),
+                      "records": [{k: r.get(k) for k in NATIVE_REC_KEYS}
+                                  for r in recs[-NATIVE_ROWS:][::-1]]},
+            "events": events, "chat": _native_chat_pulse()}, 200
+
+
 # ── sessions surface: catalog / search / session / cmd / cwd / prune ──
 # ABSORBED contracts from sesh (server/sesh.py route handlers): same query
 # params + response shapes, thin wrappers over transcripts.py (which owns the
@@ -1061,6 +1124,7 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/chat/roster": _api_chat_roster,
     "/api/ledger": _api_ledger,
     "/api/ledger/turn": _api_ledger_turn,
+    "/api/ledger/native": _api_ledger_native,
 }
 
 POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token

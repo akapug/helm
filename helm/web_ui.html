@@ -454,6 +454,7 @@ details.cfgsec>summary:hover{color:var(--fg)}
 #ledgerstrip .offline{color:var(--warn)}
 #ledgersplit{display:grid;grid-template-columns:1fr;gap:14px;margin:14px 0 0;align-items:start}
 @media(min-width:860px){#ledgersplit{grid-template-columns:5fr 3fr}}
+.lmain{display:grid;gap:14px;align-content:start;min-width:0}
 .lcard{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
 .lcard>h3{margin:0;padding:10px 14px;border-bottom:1px solid var(--line);font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--sub);display:flex;gap:8px;align-items:baseline}
 .lcard>h3 .lsub{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:400;font-size:var(--f1)}
@@ -627,9 +628,19 @@ details.cfgsec>summary:hover{color:var(--fg)}
 <div class="view" id="view-ledger">
   <div id="ledgerstrip">connecting…</div>
   <div id="ledgersplit">
-    <div class="lcard">
-      <h3>turn ledger <span class="lsub">ingress + consensus finality</span></h3>
-      <div class="lrows" id="ledgerturns"><div class="empty">loading…</div></div>
+    <div class="lmain">
+      <div class="lcard">
+        <h3>live fleet activity <span class="lsub">local blake2b chain + journal receipts · coordination fallback while dregg signing is built — never cave-signed</span></h3>
+        <div class="llegend"><span><span class="lbadge final">chained</span> tamper-evident local record — not a dregg turn</span>
+          <span><span class="lbadge">receipt</span> journal row — append-only, not chained</span>
+          <span style="margin-left:auto" id="nativehead">…</span></div>
+        <div class="llegend" id="nativechat">chat pulse: …</div>
+        <div class="lrows" id="ledgernative"><div class="empty">loading…</div></div>
+      </div>
+      <div class="lcard">
+        <h3>cave turns <span class="lsub">the durable dregg attestation — production target · advances when a capture anchors or a cell signs (the signing adapter is the active build)</span></h3>
+        <div class="lrows" id="ledgerturns"><div class="empty">loading…</div></div>
+      </div>
     </div>
     <div class="lside">
       <div class="lcard">
@@ -2480,6 +2491,58 @@ const lago = t => {
   return s < 60 ? Math.round(s) + "s ago" : s < 3600 ? Math.round(s / 60) + "m ago"
     : s < 86400 ? Math.round(s / 3600) + "h ago" : Math.round(s / 86400) + "d ago";
 };
+const lagoIso = t => { const e = Date.parse(t || ""); return isNaN(e) ? "—" : lago(e / 1e3); };
+
+/* ── live fleet activity (/api/ledger/native — local reads only, independent
+   of the cave node): the local blake2b attest-chain records merge with the
+   events journal's receipts into one newest-first feed, each row badged for
+   exactly what it is — "chained" = tamper-evident LOCAL record (coordination
+   fallback tier — premise dregg-primary-corrects-native-chain-misunderstanding;
+   never a dregg turn), "receipt" = append-only journal row (NOT chained).
+   Nothing here ever claims cave-signed; the cave card below is the durable
+   dregg attestation and advances when signing/anchoring lands. */
+function nativeHead(c) {
+  const el = $("#nativehead");
+  if (!c.count) { el.innerHTML = 'chain empty — no attested captures yet on this host'; return; }
+  el.innerHTML = c.verified
+    ? 'chain head <b>#' + c.head_index + '</b> · <span class="lbadge final">verified ✓</span> ' + c.count + ' record(s)'
+    : '<span class="lbadge tent">⚠ chain breaks</span> ' + esc(c.detail || "");
+}
+
+function nativeChat(p) {
+  $("#nativechat").innerHTML = !p || !p.msgs
+    ? 'chat pulse: quiet — no RAM-room posts yet'
+    : 'chat pulse: <b>' + p.msgs + '</b> msg(s) · ' + p.rooms + ' room(s) · last ' +
+      lagoIso(p.last_ts) + ' (<b>' + esc(p.last_from) + '</b> in ' + esc(p.last_room) +
+      ') · RAM presence-chat, unsigned — text lives in the chat tab';
+}
+
+function nativeRows(d) {
+  const rows = (d.chain.records || []).map(r => ({ts: r.ts || "", rec: r}))
+    .concat((d.events || []).map(e => ({ts: e.ts || "", ev: e})));
+  rows.sort((a, b) => b.ts < a.ts ? -1 : b.ts > a.ts ? 1 : 0);
+  if (!rows.length) {
+    $("#ledgernative").innerHTML = '<div class="empty">no native activity yet — a capture lands here (<code>helm premise …</code> / any store write)</div>';
+    return;
+  }
+  $("#ledgernative").innerHTML = rows.slice(0, 30).map(x => {
+    if (x.rec) {
+      const r = x.rec;
+      return '<div class="lrow"><div class="lhead"><span class="lidx">#' + (r.chain_index ?? "?") + '</span>' +
+        '<span class="mono lhash copy" data-copy="' + esc(r.rec_hash || "") + '" title="native record hash — click to copy; verify with helm premise-check">' + lsh(r.rec_hash) + '</span>' +
+        '<span class="lbadge final">chained</span>' +
+        (r.op !== "create" ? '<span class="lbadge">' + esc(r.op || "") + '</span>' : '') +
+        '<span class="lage">' + lagoIso(r.ts) + '</span></div>' +
+        '<div class="lmeta">' + esc(r.premise_id || "") + ' · ' + esc(r.project || r.root || "") +
+        (r.attest_by ? ' · recorded by ' + esc(r.attest_by) + ' (provenance, not a signer)' : '') + '</div></div>';
+    }
+    const e = x.ev;
+    return '<div class="lrow"><div class="lhead"><span class="lbadge">receipt</span>' +
+      '<b>' + esc(e.verb || "") + '</b><span class="mono">' + esc(e.target || "") + '</span>' +
+      '<span class="lage">' + lagoIso(e.ts) + '</span></div>' +
+      '<div class="lmeta">' + esc(e.summary || "") + (e.actor ? ' · ' + esc(String(e.actor).slice(0, 12)) : '') + '</div></div>';
+  }).join("");
+}
 
 function ledgerStrip(d) {
   const el = $("#ledgerstrip");
@@ -2607,12 +2670,15 @@ async function pollLedger() {
   // ONE roster read feeds both the delivery-roster panel and the seat picker.
   try { const rep = await j("/api/chat/roster"); rosterSeats(rep); seatPicker(rep); }
   catch (e) { /* roster + picker fail quiet — the tab stays usable */ }
+  // The activity feed is LOCAL — it renders even when the cave node is down.
+  try { const n = await j("/api/ledger/native"); nativeHead(n.chain || {}); nativeChat(n.chat); nativeRows(n); }
+  catch (e) { /* activity card fails quiet — the cave projection still renders */ }
   let d;
   try { d = await j("/api/ledger"); }
   catch (e) { $("#ledgerstrip").innerHTML = '<span class="offline">helm isn’t answering — retrying quietly…</span>'; return; }
   ledgerStrip(d);
   if (d.offline) {
-    $("#ledgerturns").innerHTML = '<div class="empty">substrate offline — the ledger reappears when the node answers</div>';
+    $("#ledgerturns").innerHTML = '<div class="empty">cave node offline — the live activity feed above keeps flowing; cave turns reappear when the node answers</div>';
     $("#ledgercells").innerHTML = '<div class="empty">substrate offline</div>';
     return;
   }
