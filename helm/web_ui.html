@@ -629,17 +629,20 @@ details.cfgsec>summary:hover{color:var(--fg)}
   <div id="ledgerstrip">connecting…</div>
   <div id="ledgersplit">
     <div class="lmain">
-      <div class="lcard">
-        <h3>live fleet activity <span class="lsub">local blake2b chain + journal receipts · coordination fallback while dregg signing is built — never cave-signed</span></h3>
+      <div class="lcard" id="cavecard">
+        <h3>cave turn ledger <span class="lsub" id="cavesub">the durable dregg attestation — checking transport…</span></h3>
+        <div class="llegend"><span><span class="lbadge head">chat</span> a chat post’s digest, cave-signed</span>
+          <span><span class="lbadge head">attest</span> a premise anchor</span>
+          <span><span class="lbadge final">final</span> consensus certificate</span></div>
+        <div class="lrows" id="ledgerturns"><div class="empty">loading…</div></div>
+      </div>
+      <div class="lcard" id="nativecard">
+        <h3>live fleet activity <span class="lsub" id="nativesub">host-local telemetry — blake2b chain + journal receipts</span></h3>
         <div class="llegend"><span><span class="lbadge final">chained</span> tamper-evident local record — not a dregg turn</span>
           <span><span class="lbadge">receipt</span> journal row — append-only, not chained</span>
           <span style="margin-left:auto" id="nativehead">…</span></div>
         <div class="llegend" id="nativechat">chat pulse: …</div>
         <div class="lrows" id="ledgernative"><div class="empty">loading…</div></div>
-      </div>
-      <div class="lcard">
-        <h3>cave turns <span class="lsub">the durable dregg attestation — production target · advances when a capture anchors or a cell signs (the signing adapter is the active build)</span></h3>
-        <div class="lrows" id="ledgerturns"><div class="empty">loading…</div></div>
       </div>
     </div>
     <div class="lside">
@@ -2493,14 +2496,36 @@ const lago = t => {
 };
 const lagoIso = t => { const e = Date.parse(t || ""); return isNaN(e) ? "—" : lago(e / 1e3); };
 
+/* ── framing truth: LEDGER_SIGNED holds the last /api/ledger poll's chat-
+   transport mode (chat.transport_status() — "signed" needs a configured
+   signer AND a live cave). It keys the whole tab's honesty: signed => the
+   cave turn ledger is the PRIMARY card (owner posts + premise attestations
+   land there as real dregg turns) and the native card reads as host-local
+   telemetry; unsigned => the native card leads and keeps the coordination-
+   fallback framing. Never hardcoded — the labels follow the server's truth,
+   and nothing unsigned is ever presented as signed. */
+let LEDGER_SIGNED = null;
+function ledgerMode(tp) {
+  const signed = !!(tp && tp.mode === "signed");
+  if (signed === LEDGER_SIGNED) return;      // relabel + reorder only on change
+  LEDGER_SIGNED = signed;
+  $("#cavesub").textContent = signed
+    ? "LIVE — signing is on: chat posts + premise attestations land here as signed dregg turns"
+    : "the durable dregg attestation — signing is " + (tp && tp.mode ? "off (" + tp.mode + ")" : "unknown") + "; advances on premise anchors only";
+  $("#nativesub").textContent = signed
+    ? "host-local telemetry — blake2b chain + journal receipts, the fast RAM layer beside the cave"
+    : "local blake2b chain + journal receipts · the coordination record while cave signing is off — never cave-signed";
+  const cave = $("#cavecard"), native = $("#nativecard");
+  cave.parentNode.insertBefore(signed ? cave : native, signed ? native : cave);
+}
+
 /* ── live fleet activity (/api/ledger/native — local reads only, independent
    of the cave node): the local blake2b attest-chain records merge with the
    events journal's receipts into one newest-first feed, each row badged for
-   exactly what it is — "chained" = tamper-evident LOCAL record (coordination
-   fallback tier — premise dregg-primary-corrects-native-chain-misunderstanding;
-   never a dregg turn), "receipt" = append-only journal row (NOT chained).
-   Nothing here ever claims cave-signed; the cave card below is the durable
-   dregg attestation and advances when signing/anchoring lands. */
+   exactly what it is — "chained" = tamper-evident LOCAL record (never a
+   dregg turn), "receipt" = append-only journal row (NOT chained). Nothing
+   here ever claims cave-signed; the cave card is the durable dregg
+   attestation, live-signed when the transport says so (ledgerMode). */
 function nativeHead(c) {
   const el = $("#nativehead");
   if (!c.count) { el.innerHTML = 'chain empty — no attested captures yet on this host'; return; }
@@ -2510,11 +2535,17 @@ function nativeHead(c) {
 }
 
 function nativeChat(p) {
+  // The pulse is the fast RAM a2a lane. Honest per mode: agent posts stay
+  // unsigned until seat-signing lands; when the transport is signed, the
+  // owner-rail posts DO carry cave receipts (the chat tab tags the rest).
+  const tail = LEDGER_SIGNED
+    ? ') · RAM presence-chat, the fast a2a lane — signed posts carry cave receipts; agent posts unsigned until seat-signing lands'
+    : ') · RAM presence-chat, unsigned — text lives in the chat tab';
   $("#nativechat").innerHTML = !p || !p.msgs
     ? 'chat pulse: quiet — no RAM-room posts yet'
     : 'chat pulse: <b>' + p.msgs + '</b> msg(s) · ' + p.rooms + ' room(s) · last ' +
       lagoIso(p.last_ts) + ' (<b>' + esc(p.last_from) + '</b> in ' + esc(p.last_room) +
-      ') · RAM presence-chat, unsigned — text lives in the chat tab';
+      tail;
 }
 
 function nativeRows(d) {
@@ -2550,9 +2581,13 @@ function ledgerStrip(d) {
     el.innerHTML = '<span class="offline">substrate offline — node unreachable at <code>' + esc(d.node) + '</code>; retrying quietly…</span>';
     return;
   }
-  const s = d.status || {}, fin = s.latest_height ?? 0;
+  const s = d.status || {}, fin = s.latest_height ?? 0, tp = d.transport;
+  const sig = !tp ? ''
+    : tp.mode === "signed"
+      ? '<span title="chat transport truth (helm chat status): posts + attestations sign as cave turns">signing <span class="lbadge final">live · dregg-primary</span></span>'
+      : '<span title="chat transport truth (helm chat status)">signing <span class="lbadge tent">' + esc(tp.mode) + '</span></span>';
   el.innerHTML =
-    '<span><b>' + (s.healthy === true ? "healthy" : "degraded") + '</b></span>' +
+    '<span><b>' + (s.healthy === true ? "healthy" : "degraded") + '</b></span>' + sig +
     '<span title="turns accepted at ingress">ingress <b>' + esc(String(s.dag_height ?? "?")) + '</b></span>' +
     '<span title="consensus-finalized height">finalized <b>' + fin + '</b>' + (fin === 0 ? ' <span class="lbadge tent">tentative</span>' : '') + '</span>' +
     '<span>producer <b>' + esc(String(s.state_producer ?? "?")) + '</b>' + (s.lean_producer ? " ✓" : "") + '</span>' +
@@ -2574,14 +2609,31 @@ function ledgerBadges(t) {
   return b.join(" ");
 }
 
+// The about join (server-side): a turn helm can NAME — a chat post whose RAM
+// row carries this turn hash (topic helm.chat) or a premise anchor (topic
+// helm.attest). Named turns get a kind badge + a who-line, so the owner sees
+// "my post landed as turn #N" instead of a bare hash. Unlabeled turns render
+// exactly as before — helm never invents an identity for a turn it can't join.
 function ledgerTurns(turns) {
-  if (!turns || !turns.length) { $("#ledgerturns").innerHTML = '<div class="empty">no turns yet</div>'; return; }
-  $("#ledgerturns").innerHTML = turns.map(t =>
-    '<div class="lrow"><div class="lhead"><span class="lidx">#' + (t.chain_index ?? "?") + '</span>' +
-    '<span class="mono lhash copy" data-copy="' + esc(t.turn_hash || "") + '" title="turn hash — click to copy">' + lsh(t.turn_hash) + '</span> ' +
-    ledgerBadges(t) + '<span class="lage">' + lago(t.timestamp) + '</span></div>' +
-    '<div class="lmeta">agent <span class="mono">' + lsh(t.agent) + '</span> · receipt <span class="mono">' + lsh(t.receipt_hash) + '</span>' +
-    ' · ' + (t.action_count ?? 0) + ' action(s) · ' + (t.computrons_used ?? 0) + ' ⚙</div></div>').join("");
+  if (!turns || !turns.length) {
+    $("#ledgerturns").innerHTML = '<div class="empty">' + (LEDGER_SIGNED
+      ? 'no cave turns yet — the next chat post or premise capture lands one'
+      : 'no turns yet') + '</div>';
+    return;
+  }
+  $("#ledgerturns").innerHTML = turns.map(t => {
+    const ab = t.about;
+    const kind = ab ? '<span class="lbadge head">' + (ab.kind === "chat" ? "chat" : "attest") + '</span> ' : '';
+    const who = !ab ? '' : '<div class="lmeta">' + (ab.kind === "chat"
+      ? '<b>' + esc(ab.from || "?") + '</b> in #' + esc(ab.room || "main") +
+        (ab.text ? ' · “' + esc(ab.text) + '”' : '')
+      : 'premise <b>' + esc(ab.id || "?") + '</b> anchored') + '</div>';
+    return '<div class="lrow"><div class="lhead"><span class="lidx">#' + (t.chain_index ?? "?") + '</span>' +
+      '<span class="mono lhash copy" data-copy="' + esc(t.turn_hash || "") + '" title="turn hash — click to copy">' + lsh(t.turn_hash) + '</span> ' +
+      kind + ledgerBadges(t) + '<span class="lage">' + lago(t.timestamp) + '</span></div>' + who +
+      '<div class="lmeta">agent <span class="mono">' + lsh(t.agent) + '</span> · receipt <span class="mono">' + lsh(t.receipt_hash) + '</span>' +
+      ' · ' + (t.action_count ?? 0) + ' action(s) · ' + (t.computrons_used ?? 0) + ' ⚙</div></div>';
+  }).join("");
 }
 
 function seatState(ts) {
@@ -2677,8 +2729,9 @@ async function pollLedger() {
   try { d = await j("/api/ledger"); }
   catch (e) { $("#ledgerstrip").innerHTML = '<span class="offline">helm isn’t answering — retrying quietly…</span>'; return; }
   ledgerStrip(d);
+  ledgerMode(d.transport); // offline carries no transport → honest fallback framing
   if (d.offline) {
-    $("#ledgerturns").innerHTML = '<div class="empty">cave node offline — the live activity feed above keeps flowing; cave turns reappear when the node answers</div>';
+    $("#ledgerturns").innerHTML = '<div class="empty">cave node offline — the local activity feed keeps flowing; cave turns reappear when the node answers</div>';
     $("#ledgercells").innerHTML = '<div class="empty">substrate offline</div>';
     return;
   }

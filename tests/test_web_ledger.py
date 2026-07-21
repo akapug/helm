@@ -20,9 +20,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import web  # noqa: E402
 
-ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_NODE_URL", "MELD_NODE_URL")
+ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_NODE_URL", "MELD_NODE_URL",
+            "HELM_CHAT_DIR", "MELD_CHAT_DIR",
+            "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
+            "HELM_CELL_BIN", "MELD_CELL_BIN",
+            "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR")
 
 HEAD_HASH = "a" * 64
+ATTEST_TURN = "b" * 64        # chain #11's turn — the premise-anchor fixture
+UNJOINED_TURN = "9" * 64      # chain #10 — no local pointer names it
 ACTING_CELL = "c1" * 32
 IDLE_CELL = "d2" * 32
 
@@ -99,6 +105,13 @@ class LedgerBase(unittest.TestCase):
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = cls.tmp
         os.environ["HELM_NODE_URL"] = cls.node_url
+        # hermetic locality for the transport + about joins: the RAM room and
+        # the adopted store must never read this machine's real state, and the
+        # SET-BUT-EMPTY chat-node url is the documented signed-transport kill
+        # switch — a class that wants "signed" opts in explicitly.
+        os.environ["HELM_CHAT_DIR"] = os.path.join(cls.tmp, "chat-ram")
+        os.environ["HELM_ADOPTED_DIR"] = os.path.join(cls.tmp, "adopted")
+        os.environ["HELM_CHAT_NODE_URL"] = ""
         cls.srv = web.make_server(0)
         cls.port = cls.srv.server_address[1]
         cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
@@ -209,6 +222,88 @@ class TestWebLedger(LedgerBase):
         for path in ("/api/ledger", "/api/ledger/turn"):
             status, d = self.req(path, payload={"x": 1})
             self.assertEqual(status, 404, path)
+
+    def test_transport_truth_without_signer(self):
+        # no HELM_CELL_BIN + chat node disabled -> the honest "unsigned";
+        # nothing is ever labeled as a known post/anchor without local proof
+        _, d = self.req("/api/ledger")
+        self.assertEqual(d["transport"]["mode"], "unsigned")
+        self.assertFalse(d["transport"]["signer"])
+        for t in d["turns"]:
+            self.assertNotIn("about", t)
+
+
+class TestWebLedgerSigned(LedgerBase):
+    """dregg-primary signing LIVE: an explicit signer binary + a room node
+    that answers -> transport.mode is "signed", and every turn a LOCAL pointer
+    names carries its about label — the owner's chat post ({turn} on the RAM
+    row, topic helm.chat) and the premise anchor (attest_anchor_turn on the
+    store entry, topic helm.attest). A turn nothing local names stays
+    unlabeled — helm never invents an identity for it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = ThreadingHTTPServer(("127.0.0.1", 0), MockNode)
+        cls.node.daemon_threads = True
+        cls.node_url = "http://127.0.0.1:%d" % cls.node.server_address[1]
+        cls.node_thread = threading.Thread(target=cls.node.serve_forever,
+                                           daemon=True)
+        cls.node_thread.start()
+        super().setUpClass()
+        # the explicit signer: bin_ready's bar is a real executable FILE
+        fake = os.path.join(cls.tmp, "fake-cell-bin")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fake, 0o755)
+        os.environ["HELM_CELL_BIN"] = fake
+        os.environ["HELM_CHAT_NODE_URL"] = cls.node_url  # room node answers
+        # the owner's web post whose signed leg landed as the head turn
+        chat_d = os.environ["HELM_CHAT_DIR"]
+        os.makedirs(chat_d, exist_ok=True)
+        with open(os.path.join(chat_d, "main.jsonl"), "w") as f:
+            f.write(json.dumps({"ts": "2026-07-21T09:00:00", "from": "david",
+                                "text": "hello fleet", "origin": "web",
+                                "turn": HEAD_HASH, "receipt": "f" * 64,
+                                "chain": 12, "id": "aabbccddeeff"}) + "\n")
+        # a premise whose optional dregg anchor landed as turn #11
+        from helm import store
+        store.write_prior({"id": "anchored-prem",
+                           "statement": "signed-ledger fixture premise",
+                           "confidence": 1.0,
+                           "stated_ts": "2026-07-21T09:00:00",
+                           "attest_anchor_turn": ATTEST_TURN})
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        cls.node.shutdown()
+        cls.node.server_close()
+        cls.node_thread.join(timeout=5)
+
+    def _turns_by_hash(self):
+        status, d = self.req("/api/ledger")
+        self.assertEqual(status, 200)
+        return d, {t["turn_hash"]: t for t in d["turns"]}
+
+    def test_transport_reports_signed(self):
+        d, _ = self._turns_by_hash()
+        self.assertEqual(d["transport"]["mode"], "signed")
+        self.assertTrue(d["transport"]["signer"])
+
+    def test_chat_turn_carries_its_about_label(self):
+        _, by_hash = self._turns_by_hash()
+        ab = by_hash[HEAD_HASH]["about"]
+        self.assertEqual((ab["kind"], ab["from"], ab["room"], ab["text"]),
+                         ("chat", "david", "main", "hello fleet"))
+
+    def test_attest_turn_carries_its_about_label(self):
+        _, by_hash = self._turns_by_hash()
+        ab = by_hash[ATTEST_TURN]["about"]
+        self.assertEqual((ab["kind"], ab["id"]), ("attest", "anchored-prem"))
+
+    def test_unjoinable_turn_stays_unlabeled(self):
+        _, by_hash = self._turns_by_hash()
+        self.assertNotIn("about", by_hash[UNJOINED_TURN])
 
 
 class TestWebLedgerOffline(LedgerBase):

@@ -869,6 +869,15 @@ def _api_chat_react(payload):
 # node is OPTIONAL — down/absent answers {"offline": true} at 200 and the tab
 # shows "substrate offline", never an error page. The tab's ONE write (message
 # a seat) rides the EXISTING /api/chat POST — no new mutation surface.
+#
+# Since dregg-primary signing went LIVE (chat's signed leg + the premise
+# anchor), a cave turn is often something the OWNER can recognize: his web
+# post (topic helm.chat — the RAM row keeps {turn}) or a premise attestation
+# (topic helm.attest — the entry keeps attest_anchor_turn). _turn_about joins
+# those local pointers back onto the receipt window so the tab can SHOW "your
+# post landed as turn #N" instead of a bare hash; `transport` carries
+# chat.transport_status()'s truth so the UI foregrounds the cave feed only
+# when signing really is live — never a hardcoded claim.
 
 LEDGER_TURNS = 40
 LEDGER_STATUS_KEYS = ("healthy", "dag_height", "latest_height", "block_count",
@@ -877,8 +886,53 @@ LEDGER_STATUS_KEYS = ("healthy", "dag_height", "latest_height", "block_count",
 _TURN_HASH = re.compile(r"[0-9a-f]{64}")
 
 
+def _turn_about():
+    """turn_hash -> what helm KNOWS landed as that cave turn — the owner-
+    legible join. Chat rows that signed carry {turn} (the row's chat:b2b
+    digest rode a self-write turn, topic helm.chat); store entries carry
+    attest_anchor_turn (the premise anchor, topic helm.attest; legacy
+    attest_turn reads too). Local reads only; each leg fails open to fewer
+    labels, never an error. An unlabeled turn is simply not-ours-to-name."""
+    out = {}
+    try:
+        from . import store
+        for e in store.load_all(include_retired=True):
+            for k in ("attest_anchor_turn", "attest_turn"):
+                t = e.get(k)
+                if t:
+                    out[t] = {"kind": "attest", "id": e.get("id"),
+                              "type": e.get("type")}
+    except Exception:
+        pass
+    try:
+        from . import chat
+        for room in chat.list_rooms():
+            rows, _total = chat.read(room)
+            for m in rows:
+                t = m.get("turn")
+                if t:
+                    out[t] = {"kind": "chat", "from": m.get("from"), "room": room,
+                              "text": str(m.get("text") or m.get("react") or "")[:80]}
+    except Exception:
+        pass
+    return out
+
+
+def _chat_transport():
+    """chat.transport_status() with the endpoint's degrade law: any surprise
+    answers None (the UI reads missing as unknown and keeps the honest
+    fallback framing — never an implied 'signed')."""
+    try:
+        from . import chat
+        return chat.transport_status()
+    except Exception:
+        return None
+
+
 def _api_ledger(qs):
-    """Aggregate: node status subset + newest signed turns (bounded) + cells
+    """Aggregate: node status subset + newest signed turns (bounded, each
+    labeled via _turn_about when a local pointer names it) + the chat
+    transport truth (signed/unsigned — what the tab's framing keys on) + cells
     with per-seat last-activity derived from the receipt window (receipt.agent
     joins cell.id 1:1 — cells with no turn in the window honestly carry None)."""
     from . import cell
@@ -890,6 +944,11 @@ def _api_ledger(qs):
     turns = sorted((r for r in (receipts or []) if isinstance(r, dict)),
                    key=lambda r: r.get("chain_index", 0),
                    reverse=True)[:LEDGER_TURNS]
+    about = _turn_about()
+    for r in turns:
+        a = about.get(r.get("turn_hash"))
+        if a:
+            r["about"] = a
     last_ts, seen = {}, {}
     for r in turns:
         a, ts = r.get("agent"), r.get("timestamp")
@@ -907,6 +966,7 @@ def _api_ledger(qs):
                              -(c.get("last_turn_ts") or 0), c.get("id") or ""))
     return {"node": url,
             "status": {k: (status or {}).get(k) for k in LEDGER_STATUS_KEYS},
+            "transport": _chat_transport(),
             "turns": turns, "cells": rows}, 200
 
 
@@ -924,19 +984,19 @@ def _api_ledger_turn(qs):
     return d, 200
 
 
-# ── ledger/native: the live LOCAL activity surface — local reads only ──
-# The cave turn-ledger above is the DURABLE dregg attestation and the
-# production target (premise dregg-primary-corrects-native-chain-
-# misunderstanding), but it advances only when a capture anchors or a cell
-# signs, and per-row cave-signing still needs a cell-adapter (premise
-# dregg-signer-needs-adapter-not-wire) — so it honestly sits still while the
-# fleet works. Until that adapter lands, the fleet's LIVE activity is LOCAL:
-# the blake2b attest-chain (premise.py — a tamper-evident COORDINATION
-# FALLBACK, honestly never a dregg proof), the events journal (append-only
-# mutation receipts, honestly NOT hash-chained), and the RAM room's
-# presence-chat pulse (honestly unsigned). This endpoint projects all three —
-# no node, no network, GET-only, and every leg fails open to an empty
-# section, never an error.
+# ── ledger/native: the host-local telemetry surface — local reads only ──
+# The cave turn-ledger above is the DURABLE dregg attestation and, now that
+# dregg-primary signing is live (owner posts + premise anchors land as real
+# cave turns — premise dregg-primary-corrects-native-chain-misunderstanding),
+# the PRIMARY evidence. This card is the complementary HOST-LOCAL layer: the
+# blake2b attest-chain (premise.py — a tamper-evident local record, honestly
+# never a dregg proof), the events journal (append-only mutation receipts,
+# honestly NOT hash-chained), and the RAM room's presence-chat pulse (the
+# fast a2a lane — agent posts honestly unsigned until seat-signing lands;
+# signed rows carry their cave receipt in the chat tab). When no signer is
+# configured (HELM_CELL_BIN unset) this layer IS the coordination fallback
+# and the UI says so. This endpoint projects all three — no node, no network,
+# GET-only, and every leg fails open to an empty section, never an error.
 
 NATIVE_ROWS = 30
 # One chain record projects to these keys — provenance the owner cross-checks
