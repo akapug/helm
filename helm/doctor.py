@@ -8,6 +8,7 @@ seam), no if-forest. Exit 0 unless a FAIL.
 """
 import os
 import re
+import sys
 
 from . import home, pk, registry, whoami
 
@@ -337,11 +338,52 @@ def check_cred_families():
     return out
 
 
+def _git_install_hint(os_release="/etc/os-release", platform=None):
+    """The exact git install command for this box — best-effort distro guess
+    from /etc/os-release (ID first, ID_LIKE folded in)."""
+    if (platform or sys.platform) == "darwin":
+        return "xcode-select --install"
+    try:
+        with open(os_release) as f:
+            text = f.read()
+    except OSError:
+        text = ""
+    ids = []
+    for line in text.splitlines():
+        if line.startswith(("ID=", "ID_LIKE=")):
+            ids += line.split("=", 1)[1].strip().strip('"').lower().split()
+    for key, cmd in (("debian", "sudo apt install git"),
+                     ("ubuntu", "sudo apt install git"),
+                     ("fedora", "sudo dnf install git"),
+                     ("rhel", "sudo dnf install git"),
+                     ("centos", "sudo dnf install git"),
+                     ("arch", "sudo pacman -S git"),
+                     ("suse", "sudo zypper install git"),
+                     ("alpine", "sudo apk add git")):
+        if any(key in i for i in ids):
+            return cmd
+    return "install git via your distro's package manager"
+
+
+def check_git():
+    """git presence — the substrate under sync's repo scan, capsule, and ship.
+    Absent = WARN with the exact install command for this distro (helm itself
+    still runs; those legs degrade)."""
+    import shutil as _sh
+    path = _sh.which("git")
+    if path:
+        return [(OK, "git on PATH (%s)" % path)]
+    return [(WARN, "git not found — sync's repo scan, capsule, and ship degrade; "
+                   "install: `%s` (jj/jujutsu is a git-compatible alternative "
+                   "on the radar — a future helm may accept either)"
+             % _git_install_hint())]
+
+
 CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
           "check_projection_registry",
           "check_adopted_store", "check_know_your_user", "check_cv",
           "check_inject_coverage", "check_env", "check_physics_currency", "check_record",
-          "check_chat_node", "check_cred_families")
+          "check_chat_node", "check_cred_families", "check_git")
 
 
 def cmd_doctor(args):
