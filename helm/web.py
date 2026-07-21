@@ -705,7 +705,7 @@ def _api_chat_post(payload):
         return {"error": 'payload wants {"text": "..."} (non-empty)'}, 400
     room = str(payload.get("room") or "main")
     msg = chat.post(text.strip(), room, who=str(payload.get("name") or "david"),
-                    profile=_chat_profile())
+                    profile=_chat_profile(), origin="web")
     chat.mark_owner_unread(room)
     return {"ok": True, "msg": msg, "total": chat.read(room)[1]}, 200
 

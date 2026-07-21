@@ -63,7 +63,8 @@ class RoomTest(ChatBase):
         self.assertEqual(total, 2)
         self.assertEqual([m["text"] for m in msgs], ["first", "second"])
         for m in msgs:
-            self.assertEqual(sorted(m), ["from", "text", "ts"])
+            self.assertEqual(sorted(m), ["from", "id", "text", "ts"])
+            self.assertEqual(len(m["id"]), 12)   # the stable per-row id (H5)
         tail, total = chat.read(since=1)
         self.assertEqual(total, 2)
         self.assertEqual([m["text"] for m in tail], ["second"])
