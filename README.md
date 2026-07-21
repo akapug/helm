@@ -60,6 +60,16 @@ The pillars:
   registry carries those edges and renders the family tree, including
   read-only external nodes, plus a ranked (read-only) "safe to archive and
   why" report.
+- **The fleet room** — `helm chat`: the human-included groupchat in RAM,
+  owner in the room. The delivery lane reaches an agent mid-turn, between
+  tool calls (`@seat` mentions and owner posts), with roster presence
+  (`helm chat seats`), advisory claim leases, and `helm launch` to start a
+  session already seated.
+- **Corpus + attribution** — `helm corpus` archives every harness's raw
+  transcripts into a dated append-only archive (your training corpus,
+  copy-only, incremental); `helm attribute` rolls up token effort by
+  project/model/cred, and `helm who` maps live pids to the credentials
+  they're burning.
 
 ## Principles
 
@@ -111,7 +121,8 @@ isn't) seeing. Quota, recall, and the attestation substrate are all
 optional — each degrades to one informative line.
 
 - **Command reference** — every verb with syntax and examples:
-  [docs/VERBS.md](docs/VERBS.md)
+  [docs/VERBS.md](docs/VERBS.md). That file is the authoritative verb
+  surface; the pillars above are a sample, not the list.
 - **Environment** — every `HELM_*` variable (all optional):
   [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md). `HELM_HOME` overrides the
   default `~/.helm`; legacy `MELD_*`/`SESH_*` spellings are accepted as
