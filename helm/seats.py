@@ -45,6 +45,13 @@ The legs:
               Monitor is the only path.
   * claims  — advisory TTL lease with session+nonce+fence binding and
               monotonic expiry (the worktree-collision class).
+  * stop-guard — Stop hook: the IDLE GATE (buildr/mc arbiter capability,
+              helm-native). BLOCKS a stop while undelivered mentions/owner
+              rows sit past the seat's cursor (once per pending-fingerprint —
+              never an infinite loop) or while THIS session holds a live
+              claim lease; WARNs (never blocks) on a clean stop to arm the
+              beacon; silently runs `helm index cap --apply`. Fail-open
+              total; HELM_STOP_GUARD=0 kills it.
 
 Council (embargoed verdicts) is DEFERRED to 0.3 — the codex round showed a
 correct embargo needs an expected-set freeze, a reveal state machine, salted
@@ -472,6 +479,124 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
 
 
 # ---------------------------------------------------------------------------
+# stop-guard (Stop hook) — the idle gate. buildr/mc capability, helm-native:
+# an agent must not idle past its inbox or walk away holding a lease. Arbiter
+# shape (buildr-stop-arbiter law): resolve posture ONCE, inline checks against
+# it, surface ALL blocking messages in ONE exit-2 (fix everything in one
+# shot); WARN lines ride along without changing the exit. Block-once-per-
+# pending-fingerprint (guard-stop-inbox-beacon law): the FIRST stop on a given
+# pending-row set blocks and points; a re-stop on the SAME rows passes —
+# never an infinite block loop — and any new row re-arms the block. The hook
+# JSON's stop_hook_active flag (the harness's own already-continuing signal)
+# is honored the same way. FAIL-OPEN TOTAL: a broken guard must never wedge
+# the fleet (cmd wraps everything; kill-switch HELM_STOP_GUARD=0, per-check
+# HELM_STOP_GUARD_INBOX/CLAIMS/INDEX=0). Bounded reads (the cursor tail's
+# SCAN_CAP), no network.
+# ---------------------------------------------------------------------------
+
+def _stop_fp_path(room, seat):
+    """The once-per-fingerprint latch — in the room dir, per seat (RAM-side,
+    dies with the boot like the rest of the lane's state)."""
+    return os.path.join(chat.chat_dir(),
+                        "%s.stopfp.%s" % (pk.slug(room), _seat_key(seat)))
+
+
+def _pending_rows(room, seat):
+    """Deliverable rows past the seat's cursor WITHOUT consuming them —
+    roster_report's read pattern (the cursor never moves here; the stop-guard
+    is a gate, not a delivery)."""
+    cur = _cursor(room, seat)
+    got = _tail(room, cur) if cur else None
+    if not got:
+        return []
+    return [r for r, _e in got[3] if r is not None and deliverable(r, seat)]
+
+
+def _off(name):
+    return (home.env(name) or "").lower() in ("0", "off", "no")
+
+
+def stop_guard(session=None, room="main", seat=None, stop_active=False):
+    """-> (blocks, warns) for one Stop event. Posture resolved once (seat via
+    the roster's session mapping, else the derived seat); checks are inline:
+      (a) BLOCK — undelivered @mentions/owner rows past the seat's cursor,
+          once per pending-fingerprint (blake2b of the pending row ids,
+          latched in the room dir); a re-stop on the SAME rows passes.
+      (b) BLOCK — live claim leases held by THIS session (session-bound: no
+          session in the hook JSON ⇒ no claims check — a display name alone
+          must never gate a stop).
+      (c) WARN — clean stop: one line reminding to arm the idle-wake beacon.
+      (d) silent mechanical — `helm index cap --apply` best-effort in-process
+          (the documented Stop line, docs/VERBS.md): never blocks, never
+          prints; HELM_STOP_GUARD_INDEX=0 disables.
+    stop_active (the hook JSON's stop_hook_active) short-circuits everything:
+    the harness is already continuing off a stop hook — blocking again is the
+    infinite-loop shape both reference guards exist to prevent."""
+    if _off("STOP_GUARD") or stop_active:
+        return [], []
+    seat = seat or seat_for_session(session) or derive_seat(session)
+    blocks, warns, pending = [], [], []
+
+    if not _off("STOP_GUARD_INBOX"):
+        pending = _pending_rows(room, seat)
+        if pending:
+            import hashlib
+            fp = hashlib.blake2b(
+                "|".join(str(r.get("id") or chat.rkey(r)) for r in pending)
+                .encode("utf-8"), digest_size=16).hexdigest()
+            fpp = _stop_fp_path(room, seat)
+            try:
+                with open(fpp) as f:
+                    last = f.read().strip()
+            except OSError:
+                last = None
+            if last != fp:
+                try:
+                    chat._ensure_dir()
+                    pk.atomic_write(fpp, fp)
+                except OSError:
+                    pass  # latch write failing must not kill the guard
+                lines = ["  %s: %s" % (r.get("from") or "?",
+                                       _clip(_scrub(r.get("text") or ""), 120))
+                         for r in pending[:5]]
+                if len(pending) > 5:
+                    lines.append("  ... %d more" % (len(pending) - 5))
+                blocks.append(
+                    "[helm stop-guard] %d undelivered message(s) for seat "
+                    "'%s':\n%s\naddress these before stopping (helm chat "
+                    "read). This blocks once per pending set — a re-stop on "
+                    "the same rows passes." % (len(pending), seat,
+                                               "\n".join(lines)))
+
+    if session and not _off("STOP_GUARD_CLAIMS"):
+        c = _sweep(pk.read_json(claims_path(), {}) or {})
+        now = _now_mono()
+        held = ["%s (%ds left)" % (r, int(v.get("exp_mono", now) - now))
+                for r, v in sorted(c.items())
+                if r != "_fence" and isinstance(v, dict)
+                and v.get("session") == str(session)]
+        if held:
+            blocks.append(
+                "[helm stop-guard] live claim lease(s) held by this session: "
+                "%s — release them (helm chat release <resource> --lease "
+                "<id>) or finish the work before stopping." % ", ".join(held))
+
+    if not blocks and not pending:   # genuinely clean — a latched-pass (rows
+        warns.append(                # still pending, already pointed at) stays
+            "[helm stop-guard] inbox clean. If you intend to idle-wait, arm "
+            "the beacon first: Monitor(command: \"helm chat wait --seat %s "
+            "--follow\", persistent: true)" % seat)  # silent, never "clean"
+
+    if not _off("STOP_GUARD_INDEX"):
+        try:  # the documented Stop line — silent, best-effort, never a gate
+            from . import store
+            store.index_cap(apply=True)
+        except Exception:
+            pass
+    return blocks, warns
+
+
+# ---------------------------------------------------------------------------
 # claims — the advisory TTL lease (codex C1-lite + H9 hardening)
 # ---------------------------------------------------------------------------
 
@@ -677,6 +802,24 @@ def cmd(verb, args, room="main"):
                     emit=emit)
         except Exception:
             pass                    # fail-open: never hold a tool boundary
+        return 0
+    if verb == "stop-guard":
+        try:
+            session, stop_active = None, False
+            if "--hook-json" in args:
+                d = _hook_stdin()
+                session = d.get("session_id")
+                stop_active = bool(d.get("stop_hook_active"))
+            blocks, warns = stop_guard(session=session, room=room,
+                                       seat=_flag(args, "--seat"),
+                                       stop_active=stop_active)
+        except Exception:
+            return 0                # FAIL-OPEN TOTAL: never wedge a stop
+        for w in warns:             # WARN rides along, never changes the exit
+            print(w, file=sys.stderr)
+        if blocks:                  # ALL blockers in ONE exit-2 (one-shot fix)
+            print("\n".join(blocks), file=sys.stderr)
+            return 2
         return 0
     if verb == "wait":
         timeout = _flag(args, "--timeout")

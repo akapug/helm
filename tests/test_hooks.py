@@ -273,6 +273,7 @@ class DeliveryLaneTest(HooksBase):
         rows = {r["home"]: r for r in hooks.status_rows()}
         self.assertTrue(rows["a-user-dev"]["deliver"])
         self.assertTrue(rows["a-user-dev"]["join"])
+        self.assertTrue(rows["a-user-dev"]["stop-guard"])   # the idle gate
         self.assertFalse(rows["(default-claude)"]["deliver"])
 
     def test_wrong_matcher_on_exclusive_group_repaired_in_place(self):
@@ -370,7 +371,7 @@ class SeatCoverageTest(HooksBase):
         self.assertEqual(set(found), {"codex", "kimi"})
         self.assertEqual(found["codex"], os.path.realpath(c))
 
-    def test_install_wires_both_delivery_hooks_without_dropping_foreign(self):
+    def test_install_wires_delivery_lane_without_dropping_foreign(self):
         foreign = "echo seat-local-hook"          # a pre-existing foreign hook
         d = self.mk_seat("codex", settings={
             "model": "gpt-5.6-sol",
@@ -378,17 +379,20 @@ class SeatCoverageTest(HooksBase):
                 {"type": "command", "command": foreign}]}]}})
         deliver = next(s for s in hooks.SPECS if s["name"] == "deliver")
         join = next(s for s in hooks.SPECS if s["name"] == "join")
+        stop = next(s for s in hooks.SPECS if s["name"] == "stop-guard")
         action, _ = hooks.install_home(d, specs=hooks.DELIVERY_SPECS)
         self.assertEqual(action, "add")
         got = self.read_settings(d)
         # the seat's own settings + foreign hook survive byte-identical
         self.assertEqual(got["model"], "gpt-5.6-sol")
         self.assertEqual(got["hooks"]["PreToolUse"][0]["hooks"][0]["command"], foreign)
-        # BOTH delivery hooks are present under the right events + matcher
+        # the WHOLE delivery lane is present under the right events + matcher
         self.assertIn(hooks.spec_command(deliver), hooks._hook_cmds(got, "PostToolUse"))
         self.assertIn(hooks.spec_command(join), hooks._hook_cmds(got, "SessionStart"))
+        self.assertIn(hooks.spec_command(stop), hooks._hook_cmds(got, "Stop"))
         self.assertEqual(got["hooks"]["PostToolUse"][-1]["matcher"], "*")
         self.assertEqual(got["hooks"]["SessionStart"][-1]["matcher"], "*")
+        self.assertNotIn("matcher", got["hooks"]["Stop"][-1])  # Stop takes none
         # inject is NOT a seat concern — the delivery lane only
         self.assertEqual(hooks._hook_cmds(got, "UserPromptSubmit"), [])
         # idempotent: a second install detects up-to-date, writes nothing new
@@ -401,12 +405,14 @@ class SeatCoverageTest(HooksBase):
         hooks.install_home(covered, specs=hooks.DELIVERY_SPECS)
         self.mk_seat("kimi")                       # bare — no delivery hooks
         rows = {r["seat"]: r for r in hooks.seat_status_rows()}
-        self.assertTrue(rows["codex"]["deliver"] and rows["codex"]["join"])
+        self.assertTrue(rows["codex"]["deliver"] and rows["codex"]["join"]
+                        and rows["codex"]["stop-guard"])
         self.assertFalse(rows["kimi"]["deliver"])
         self.assertEqual(hooks.seat_coverage(), (1, 2))
         rc, out, _ = self.run_hooks(["status"])
         self.assertEqual(rc, 0)
         self.assertIn("seats (fleet delivery", out)
+        self.assertIn("stop", out)              # the Stop column is surfaced
         self.assertIn("seat delivery: 1 of 2 seats", out)
 
     def test_full_install_covers_every_seat_and_reports(self):

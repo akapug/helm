@@ -25,21 +25,24 @@ $ helm hooks status             # per-home + per-seat coverage table, read-only
 $ helm hooks install --dry      # the would-be diff per home/seat, nothing written
 ```
 
-The installer merges the whole hook estate — three entries per home — into
-each home's `settings.json`:
+The installer merges the whole hook estate — four entries per home — into
+each home's `settings.json`. Together they close the loop: turn start + tool
+boundary + session start + idle gate.
 
 | event | command | what it carries |
 |---|---|---|
 | `UserPromptSubmit` | `helm inject --hook-json` (timeout 10) | the per-turn context lane (pinned + JIT + reflexes) |
 | `PostToolUse` (`*`) | `helm chat deliver --hook-json` (timeout 2) | the delivery lane: @mentions + owner posts nudge an agent BETWEEN tool calls (see VERBS.md, the delivery lane) |
-| `SessionStart` (`*`) | `helm chat join --hook-json` (timeout 5) | the autojoin: roster presence row + the seat's identity as session context |
+| `SessionStart` (`*`) | `helm chat join --hook-json` (timeout 5) | the autojoin: roster presence row + the seat's identity as session context (incl. the mandatory beacon-arm directive) |
+| `Stop` | `helm chat stop-guard --hook-json` (timeout 5) | the idle gate: BLOCKS a stop on undelivered mentions/owner rows (once per pending-fingerprint — never an infinite loop) or on claim leases held by the stopping session; WARNs to arm the beacon on a clean stop; silently runs `helm index cap --apply`. Kill: `HELM_STOP_GUARD=0`, per-check `HELM_STOP_GUARD_INBOX/CLAIMS/INDEX=0` |
 
 **Seats are part of the estate.** A full `install` (no `--home` filter) also
-wires the **delivery lane** (`PostToolUse` deliver + `SessionStart` join —
-**not** inject) into every multimodel seat's isolated `CLAUDE_CONFIG_DIR`
-(`<helm_home>/_global/seats/<family>/claude`), so a launched codex/kimi/… seat
-receives `@<family>` and owner posts under its family name (`seat launch`
-exports `HELM_CHAT_NAME=<family>`; a seat's own settings are never touched).
+wires the **delivery lane** (`PostToolUse` deliver + `SessionStart` join +
+`Stop` stop-guard — **not** inject) into every multimodel seat's isolated
+`CLAUDE_CONFIG_DIR` (`<helm_home>/_global/seats/<family>/claude`), so a
+launched codex/kimi/… seat receives `@<family>` and owner posts under its
+family name (`seat launch` exports `HELM_CHAT_NAME=<family>`; a seat's own
+settings are never touched) and cannot idle past its inbox.
 `helm hooks status` prints a `seats (fleet delivery)` block plus
 `seat delivery: N of M seats`, and `helm hooks install` reports
 `N of M seats covered (fleet delivery)`.
@@ -50,7 +53,8 @@ clobbered), idempotent (re-install reports `ok`), on configs.py's safety rails
 (backup → validate → atomic write, re-parsed after the write, backup restored
 on any failure). `--home NAME` narrows to one home (and skips seats); `helm
 doctor` reports `inject coverage: N of M claude homes` so a gap can't hide, and
-`helm hooks status` adds per-home `deliver`/`join` columns plus the seat block.
+`helm hooks status` adds per-home `deliver`/`join`/`stop` columns plus the
+seat block.
 
 The generated command pipes the hook's FULL JSON to `helm inject --hook-json`,
 which extracts the prompt, derives `--project` from the hook's `cwd` (longest

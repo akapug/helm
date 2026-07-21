@@ -616,8 +616,9 @@ def _fmt_body(m):
 # CLI
 # ---------------------------------------------------------------------------
 
-SEAT_VERBS = ("join", "deliver", "wait", "seats", "claim", "release",
-              "claims", "verdict", "reveal")   # the delivery lane — seats.py
+SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "claim",
+              "release", "claims", "verdict", "reveal")
+                                               # the delivery lane — seats.py
                                                # (verdict/reveal answer with
                                                # the 0.3 council deferral)
 
@@ -625,8 +626,8 @@ SEAT_VERBS = ("join", "deliver", "wait", "seats", "claim", "release",
 def cmd_chat(args):
     """chat post <text...> | read [--since N] [--follow] | rooms |
     react <n> <emoji> | log-flush | node up|down|status |
-    join|deliver [--hook-json] | wait [--any] [--follow] [--seat S] | seats |
-    claim|release <resource> | claims  [--room R]"""
+    join|deliver|stop-guard [--hook-json] | wait [--any] [--follow] [--seat S]
+    | seats | claim|release <resource> | claims  [--room R]"""
     args = list(args or [])
     room = "main"
     room_given = "--room" in args

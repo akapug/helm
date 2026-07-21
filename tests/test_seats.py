@@ -25,6 +25,9 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
             "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG",
             "HELM_CHAT_OWNER_NAMES", "HELM_CHAT_DELIVER",
+            "HELM_STOP_GUARD", "HELM_STOP_GUARD_INBOX",
+            "HELM_STOP_GUARD_CLAIMS", "HELM_STOP_GUARD_INDEX",
+            "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
             "CLAUDE_SESSION_ID", "CODEX_SESSION_ID")
 
 
@@ -38,6 +41,10 @@ class SeatsBase(unittest.TestCase):
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""
         os.environ["HELM_CHAT_OWNER_NAMES"] = "david"
+        # hermetic by law: the stop-guard's silent index-cap leg targets the
+        # adopted claude memory dir — point it at tmp so no test can ever
+        # touch the live MEMORY.md.
+        os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
 
     def tearDown(self):
         for k, v in self.env_prior.items():
@@ -382,6 +389,102 @@ class WaitTest(SeatsBase):
         finally:
             t.join()
         self.assertIn("newest", line)
+
+
+class StopGuardTest(SeatsBase):
+    """The idle gate (buildr/mc arbiter port). Hermetic: room + claims in tmp,
+    HELM_ADOPTED_DIR in tmp so the silent index-cap leg can never touch a live
+    MEMORY.md."""
+
+    def guard(self, payload=None, args=()):
+        stdin = json.dumps(payload).encode() if isinstance(payload, dict) else payload
+        return self.cmd("stop-guard", ["--hook-json", *args], stdin=stdin or b"{}")
+
+    def test_pending_mention_blocks_once_listing_the_row(self):
+        seats.join(seat="alice", cwd="/tmp/p")
+        chat.post("@alice review the branch", who="bob")
+        rc, _out, err = self.guard({"session_id": "s-1"}, args=["--seat", "alice"])
+        self.assertEqual(rc, 2)
+        self.assertIn("undelivered", err)
+        self.assertIn("bob: @alice review the branch", err)   # listed compactly
+        self.assertIn("address these before stopping", err)
+        self.assertIn("helm chat read", err)
+        # the guard is a gate, not a delivery: the cursor never moved, the
+        # tool-boundary lane still delivers the row afterwards
+        self.assertIn("review the branch", seats.deliver(seat="alice"))
+
+    def test_same_fingerprint_second_stop_passes(self):
+        seats.join(seat="alice", cwd="/tmp/p")
+        chat.post("@alice go", who="bob")
+        rc, _o, _e = self.guard(args=["--seat", "alice"])
+        self.assertEqual(rc, 2)                    # first stop on this set blocks
+        rc, _o, err = self.guard(args=["--seat", "alice"])
+        self.assertEqual(rc, 0, err)               # same rows: pass — never a loop
+        self.assertNotIn("inbox clean", err)       # latched ≠ clean — no false warn
+
+    def test_new_row_after_a_passed_stop_blocks_again(self):
+        seats.join(seat="alice", cwd="/tmp/p")
+        chat.post("@alice one", who="bob")
+        self.assertEqual(self.guard(args=["--seat", "alice"])[0], 2)
+        self.assertEqual(self.guard(args=["--seat", "alice"])[0], 0)  # latched
+        chat.post("@alice two", who="bob")         # NEW pending set
+        rc, _o, err = self.guard(args=["--seat", "alice"])
+        self.assertEqual(rc, 2)
+        self.assertIn("@alice two", err)
+
+    def test_held_lease_blocks_naming_the_resource(self):
+        ok, _m, _l = seats.claim("worktree-main", "alice", ttl=60, session="s-9")
+        self.assertTrue(ok)
+        rc, _o, err = self.guard({"session_id": "s-9"})
+        self.assertEqual(rc, 2)
+        self.assertIn("worktree-main", err)
+        self.assertIn("release", err)
+        # a DIFFERENT session holds nothing — no claims block
+        rc, _o, err = self.guard({"session_id": "s-other"})
+        self.assertEqual(rc, 0, err)
+
+    def test_both_blockers_surface_in_one_exit_2(self):
+        seats.join(session="s-9", seat="alice", cwd="/tmp/p")
+        chat.post("@alice pending", who="bob")
+        seats.claim("worktree-main", "alice", ttl=60, session="s-9")
+        rc, _o, err = self.guard({"session_id": "s-9"}, args=["--seat", "alice"])
+        self.assertEqual(rc, 2)
+        self.assertIn("undelivered", err)          # the whole picture in ONE shot
+        self.assertIn("worktree-main", err)
+
+    def test_clean_stop_passes_with_beacon_warn(self):
+        seats.join(seat="bob", cwd="/tmp/p")
+        rc, _o, err = self.guard(args=["--seat", "bob"])
+        self.assertEqual(rc, 0)
+        self.assertIn("helm chat wait --seat bob --follow", err)  # the arm line
+        self.assertIn("Monitor", err)
+
+    def test_kill_switches(self):
+        seats.join(seat="alice", cwd="/tmp/p")
+        chat.post("@alice pending", who="bob")
+        os.environ["HELM_STOP_GUARD"] = "0"
+        rc, _o, err = self.guard(args=["--seat", "alice"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")                  # off = silent, always
+        os.environ.pop("HELM_STOP_GUARD")
+        os.environ["HELM_STOP_GUARD_INBOX"] = "0"  # per-check off
+        rc, _o, _e = self.guard(args=["--seat", "alice"])
+        self.assertEqual(rc, 0)
+        os.environ.pop("HELM_STOP_GUARD_INBOX")
+        seats.claim("worktree-x", "alice", ttl=60, session="s-9")
+        os.environ["HELM_STOP_GUARD_CLAIMS"] = "0"
+        rc, _o, _e = self.guard({"session_id": "s-9"})
+        self.assertEqual(rc, 0)
+
+    def test_stop_hook_active_never_reblocks(self):
+        seats.join(seat="alice", cwd="/tmp/p")
+        chat.post("@alice pending", who="bob")
+        rc, _o, err = self.guard({"stop_hook_active": True}, args=["--seat", "alice"])
+        self.assertEqual(rc, 0, err)               # the harness is already continuing
+
+    def test_garbage_stdin_fails_open(self):
+        rc, _o, _e = self.guard(b"not json{{")
+        self.assertEqual(rc, 0)
 
 
 class ClaimsTest(SeatsBase):

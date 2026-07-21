@@ -336,8 +336,10 @@ oldest `last_updated` first, until under the line budget (60 default). It
 backing; sequencing is the point). Demoted lines archive to a drain-style net +
 receipt; **dry-run by default**; on `--apply` MEMORY.md is re-read fresh and
 atomically rewritten so a concurrent native append survives. The self-firing
-half is one documented **Stop-hook line** — `helm index cap --apply` — so the
-write path structurally cannot exceed budget.
+half is the **Stop hook**: `helm chat stop-guard` runs `index cap --apply`
+in-process as its silent mechanical leg (best-effort, never blocks, never
+prints; `HELM_STOP_GUARD_INDEX=0` disables) — so the write path structurally
+cannot exceed budget on any home `helm hooks install` covers.
 
 ```console
 $ helm index cap
@@ -869,24 +871,27 @@ $ helm configs edit ~/.claude/settings.json < settings.json
 The self-closing installer for the per-turn inject wiring **and the
 fleet-delivery lane**. `install` merges the `UserPromptSubmit` → `helm inject
 --hook-json` hook plus the delivery lane (`PostToolUse` → `chat deliver`,
-`SessionStart` → `chat join`) into every claude home's `settings.json` (the
-default `~/.claude` included) — MERGE-preserving, idempotent (an up-to-date
-entry reports `ok`), on the configs safety rails (backup → validate → atomic
-write, backup restored on any failure). The generated command is fail-open by
-construction (`timeout` + `|| true` — a broken helm never blocks a turn).
-`--dry` prints the would-be diff per home; `--home NAME` narrows to one.
+`SessionStart` → `chat join`, `Stop` → `chat stop-guard` — the idle gate) into
+every claude home's `settings.json` (the default `~/.claude` included) —
+MERGE-preserving, idempotent (an up-to-date entry reports `ok`), on the
+configs safety rails (backup → validate → atomic write, backup restored on any
+failure). The generated command is fail-open by construction (`timeout` +
+`|| true` — a broken helm never blocks a turn). `--dry` prints the would-be
+diff per home; `--home NAME` narrows to one. The four entries close the loop:
+turn start + tool boundary + session start + idle gate.
 
 **Seats are covered too.** A full `install` (no `--home` filter) ALSO wires the
-delivery lane (deliver + join, **not** inject) into every multimodel seat's
-isolated `CLAUDE_CONFIG_DIR` (`<helm_home>/_global/seats/<family>/claude`), so a
-launched codex/kimi/… seat receives `@<family>` and owner posts under its family
-name — same merge-preserving laws, a seat's own settings (theme, model,
+delivery lane (deliver + join + stop-guard, **not** inject) into every
+multimodel seat's isolated `CLAUDE_CONFIG_DIR`
+(`<helm_home>/_global/seats/<family>/claude`), so a launched codex/kimi/… seat
+receives `@<family>` and owner posts under its family name and cannot idle past
+them — same merge-preserving laws, a seat's own settings (theme, model,
 permissions, any foreign hook) untouched. `status` shows a `seats (fleet
 delivery)` block and a `seat delivery: N of M seats` line beside the per-home
-coverage table (hook present / helm resolvable / fail-open intact), mirrored by
-doctor's `inject coverage: N of M claude homes` line. Codex-harness NOTIFY hooks
-are reported as recipe-pending until [HOOKS.md](HOOKS.md) carries a mechanical
-shape.
+coverage table (hook present / helm resolvable / fail-open intact, plus the
+`deliver`/`join`/`stop` lane columns), mirrored by doctor's `inject coverage: N
+of M claude homes` line. Codex-harness NOTIFY hooks are reported as
+recipe-pending until [HOOKS.md](HOOKS.md) carries a mechanical shape.
 
 ```console
 $ helm hooks install
@@ -1045,6 +1050,23 @@ frames; this lane is called *delivery*.)
   filter (seat mentions + owner posts), and returns only on `--timeout`. A
   persistent Monitor armed on `wait --follow` is meld's SSE watcher, natively;
   fail-open + bounded poll, so a delivery hiccup never crashes the beacon.
+- **`helm chat stop-guard [--hook-json] [--seat S]`** — the IDLE GATE (Stop
+  hook; the buildr/mc stop-arbiter capability, helm-native). Posture resolves
+  once, checks run inline, and ALL blocking messages surface in ONE exit-2
+  (fix everything in one shot); WARN lines ride along without changing the
+  exit. Checks: **BLOCK** on undelivered @mentions/owner rows past the seat's
+  cursor — listed compactly, once per pending-fingerprint (a re-stop on the
+  SAME rows passes; any new row re-arms — never an infinite block loop; the
+  hook JSON's `stop_hook_active` flag is honored the same way); **BLOCK** on
+  live claim leases held by the stopping session (release or finish — the
+  resources are named); **WARN** on a clean stop with the beacon-arm line
+  (the Monitor command with the resolved seat); plus the silent mechanical
+  leg — `helm index cap --apply`, best-effort, never blocks, never prints.
+  FAIL-OPEN TOTAL (a broken guard must never wedge the fleet); kill-switch
+  `HELM_STOP_GUARD=0`, per-check `HELM_STOP_GUARD_INBOX/CLAIMS/INDEX=0`;
+  bounded reads; no network. With inject (turn start), deliver (tool
+  boundary) and join (session start) this completes the loop: an agent
+  cannot idle past its inbox.
 - **`helm chat seats`** — the roster table: presence (fresh <2m / quiet <15m /
   absent, off the last tool boundary), pending deliveries, live claims. The
   web twin is the **seats** panel in the ledger tab (`GET /api/chat/roster`).

@@ -8,10 +8,13 @@ from the turn's cwd). Hand-wiring one home at a time was the adoption gap;
 The estate is TWO surfaces: the claude credential homes (~/.claude-homes/*,
 ~/.claude) get the full spec set (inject + the delivery lane); the multimodel
 SEAT config dirs (<helm_home>/_global/seats/<family>/claude — seat.py's
-isolated CLAUDE_CONFIG_DIRs) get the DELIVERY LANE (deliver + join) so a
-launched codex/kimi/… seat receives fleet chat under its family name (seat.py
-exports HELM_CHAT_NAME=<family> on launch; seats.py derive_seat keys the
-roster on it). `install` covers both; `status` reports coverage for both.
+isolated CLAUDE_CONFIG_DIRs) get the DELIVERY LANE (deliver + join +
+stop-guard) so a launched codex/kimi/… seat receives fleet chat under its
+family name (seat.py exports HELM_CHAT_NAME=<family> on launch; seats.py
+derive_seat keys the roster on it) and cannot idle past it. The full loop:
+inject (turn start) + deliver (tool boundary) + join (session start) +
+stop-guard (idle gate). `install` covers both surfaces; `status` reports
+coverage for both.
 
 Laws:
   * MERGE-preserving: existing settings keys and foreign hook entries are
@@ -55,13 +58,21 @@ SPECS = (
      "timeout": 2, "own": ("chat deliver --hook-json",), "matcher": "*"},
     {"name": "join", "event": "SessionStart", "args": "chat join --hook-json",
      "timeout": 5, "own": ("chat join --hook-json",), "matcher": "*"},
+    # stop-guard: the IDLE GATE (buildr/mc arbiter capability). Blocks a stop
+    # on undelivered mentions/held leases (once per pending-fingerprint),
+    # warns to arm the beacon on a clean stop, silently runs the index cap.
+    # Stop takes no matcher (like UserPromptSubmit).
+    {"name": "stop-guard", "event": "Stop", "args": "chat stop-guard --hook-json",
+     "timeout": 5, "own": ("chat stop-guard --hook-json",), "matcher": None},
 )
 
-# The delivery lane alone (deliver + join, no inject) — what a SEAT's isolated
-# CLAUDE_CONFIG_DIR receives so @<family> and owner posts reach it. inject (the
-# per-turn context brief) stays a home concern; a seat joins the roster under
-# its family name via HELM_CHAT_NAME (seat.py launch_line).
-DELIVERY_SPECS = tuple(s for s in SPECS if s["name"] in ("deliver", "join"))
+# The delivery lane alone (deliver + join + stop-guard, no inject) — what a
+# SEAT's isolated CLAUDE_CONFIG_DIR receives so @<family> and owner posts
+# reach it AND it cannot idle past them. inject (the per-turn context brief)
+# stays a home concern; a seat joins the roster under its family name via
+# HELM_CHAT_NAME (seat.py launch_line).
+DELIVERY_SPECS = tuple(s for s in SPECS
+                       if s["name"] in ("deliver", "join", "stop-guard"))
 
 
 def helm_bin():
@@ -333,9 +344,9 @@ def coverage():
 
 def seat_status_rows():
     """Per-seat delivery-lane coverage: does the seat's claude/settings.json
-    carry the deliver + join hooks (exact command + matcher validated, never
-    marker presence — same _lane_live law as homes)? Read-only. inject is not
-    a seat concern, so it is not reported here."""
+    carry the deliver + join + stop-guard hooks (exact command + matcher + type
+    validated, never marker presence — same _lane_live law as homes)? Read-only.
+    inject is not a seat concern, so it is not reported here."""
     rows = []
     for name, path in seat_homes():
         settings = {}
@@ -350,10 +361,11 @@ def seat_status_rows():
 
 
 def seat_coverage():
-    """(covered, total) seats — covered = both delivery hooks (deliver + join)
-    live in the seat's claude config dir."""
+    """(covered, total) seats — covered = the whole delivery lane (deliver +
+    join + stop-guard) live in the seat's claude config dir."""
     rows = seat_status_rows()
-    return (sum(1 for r in rows if r["deliver"] and r["join"]), len(rows))
+    names = [s["name"] for s in DELIVERY_SPECS]
+    return (sum(1 for r in rows if all(r[n] for n in names)), len(rows))
 
 
 _CODEX_PENDING = ("codex: recipe pending — docs/HOOKS.md carries no mechanical "
@@ -391,33 +403,36 @@ def cmd_hooks(args):
             print("helm hooks: no claude homes found")
             return 0
         print("helm hooks status (claude):")
-        print("  %-28s %-5s %-5s %-9s %-7s %s" % (
-            "home", "hook", "helm", "fail-open", "deliver", "join"))
+        print("  %-28s %-5s %-5s %-9s %-7s %-5s %s" % (
+            "home", "hook", "helm", "fail-open", "deliver", "join", "stop"))
         def mark(r, k):
             if not r["hook"]:
                 return "-"
             return "ok" if r[k] else "NO"
         for r in rows:
-            print("  %-28s %-5s %-5s %-9s %-7s %s" % (
+            print("  %-28s %-5s %-5s %-9s %-7s %-5s %s" % (
                 r["home"], "yes" if r["hook"] else "-",
                 mark(r, "resolvable"), mark(r, "fail_open"),
                 "yes" if r.get("deliver") else "-",
-                "yes" if r.get("join") else "-"))
+                "yes" if r.get("join") else "-",
+                "yes" if r.get("stop-guard") else "-"))
         n, m = coverage()
         line = "inject coverage: %d of %d claude homes" % (n, m)
         print(line if n == m else line + " — `helm hooks install` closes the gap")
-        d = sum(1 for r in rows if r.get("deliver") and r.get("join"))
+        lanes = [s["name"] for s in DELIVERY_SPECS]
+        d = sum(1 for r in rows if all(r.get(k) for k in lanes))
         if d < m:
-            print("delivery lane (chat deliver/join): %d of %d homes — "
-                  "`helm hooks install` wires it" % (d, m))
+            print("delivery lane (chat deliver/join/stop-guard): %d of %d homes"
+                  " — `helm hooks install` wires it" % (d, m))
         srows = seat_status_rows()
         if srows:
-            print("seats (fleet delivery — chat deliver/join):")
-            print("  %-28s %-8s %s" % ("seat", "deliver", "join"))
+            print("seats (fleet delivery — chat deliver/join/stop-guard):")
+            print("  %-28s %-8s %-5s %s" % ("seat", "deliver", "join", "stop"))
             for r in srows:
-                print("  %-28s %-8s %s" % (
+                print("  %-28s %-8s %-5s %s" % (
                     r["seat"], "yes" if r["deliver"] else "NO",
-                    "yes" if r["join"] else "NO"))
+                    "yes" if r["join"] else "NO",
+                    "yes" if r["stop-guard"] else "NO"))
             sc, st = seat_coverage()
             sline = "seat delivery: %d of %d seats" % (sc, st)
             print(sline if sc == st else sline + " — `helm hooks install` wires it")
@@ -463,11 +478,11 @@ def cmd_hooks(args):
                 print("  %-28s %-6s %s" % (name, action, detail))
         for name, path in targets:
             _apply(name, path, SPECS)
-        # seats get the delivery lane (deliver + join) — only on a full install;
-        # a --home-narrowed run stays scoped to that one home.
+        # seats get the delivery lane (deliver + join + stop-guard) — only on
+        # a full install; a --home-narrowed run stays scoped to that one home.
         seats = seat_homes() if home_name is None else []
         if seats:
-            print("helm hooks: seats (fleet delivery — deliver + join):")
+            print("helm hooks: seats (fleet delivery — deliver + join + stop-guard):")
             for name, path in seats:
                 _apply(name, path, DELIVERY_SPECS)
         if not dry:
