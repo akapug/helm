@@ -35,13 +35,15 @@ notice -> name -> layer -> build -> adopt -> verify
 | fire: dead-weight | fire-ledger | live jit entries with ZERO fires over ≥200 turns → ONE batched dormancy-review proposal, never per-entry spam |
 | fire: silence | fire-ledger + store | ≥95% silent turns (min 20) over a populated store → `helm hooks status` (injection may be dark) |
 | reflex | fire-ledger reflex lane | a reflex re-firing within 3 turns of firing, ≥3 episodes → steer not landing; reword or retire. Honesty: the ledger logs fires, not heeds — proximity re-fire is the only proxy, and the proposal says so |
+| reflex: dead | fire-ledger reflex lane | live reflexes with ZERO fires over ≥200 turns → ONE batched review proposal (dead signal or simply unprovoked — never auto-retired) |
+| record | reflex-state counters (record.py) | a tool-outcome tell — stuck-streak ≥3 or loop-streak ≥3 — recurring across ≥3 sessions → inspect (`helm record status`) and capture the fix as a lesson (`helm coach`). Honesty: counters hold each session's LAST state (a resolved streak reads 0), so this undercounts, never overcounts |
 | whoami | profile + notes | the five-minute interview |
 
 Behavior proposals are ranked by evidence strength, capped at 10 per cycle,
 and the cycle output names its data window ("over N turns since T"). The
-ledger observers tolerate absence and garbage (no ledger, no claims) and read
-the ledger estate-wide — fire behavior is not scope-sliced, but the store and
-reflex sets resolve under the cycle's scope.
+ledger and recorder observers tolerate absence and garbage (no ledger/state,
+no claims) and read estate-wide — fire and tool behavior are not
+scope-sliced, but the store and reflex sets resolve under the cycle's scope.
 
 ## The anti-rulesurf gate (constitutional)
 
