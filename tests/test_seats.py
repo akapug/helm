@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import chat, home, pk, seats, web  # noqa: E402
+from helm import chat, home, pk, record, seats, web  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -28,6 +28,7 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_OWNER_NAMES", "HELM_CHAT_DELIVER",
             "HELM_STOP_GUARD", "HELM_STOP_GUARD_INBOX",
             "HELM_STOP_GUARD_CLAIMS", "HELM_STOP_GUARD_INDEX",
+            "HELM_STOP_GUARD_WHISPER",
             "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
             "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID",
             # auto_name reads the ambient model/harness marks — scrub them or
@@ -860,6 +861,128 @@ class StopGuardTest(SeatsBase):
     def test_garbage_stdin_fails_open(self):
         rc, _o, _e = self.guard(b"not json{{")
         self.assertEqual(rc, 0)
+
+
+class StopWhisperTest(SeatsBase):
+    """The contextual continuation lane (stop-whisper slice 1): one budgeted
+    nudge at turn-stop off live signals (record.py counters + the latched
+    pending set), once per (signal, level) fingerprint, fail-closed to
+    nothing. Hermetic: counters planted in the tmp HELM_HOME's reflex-state."""
+
+    def guard(self, payload=None, args=()):
+        stdin = json.dumps(payload).encode() if isinstance(payload, dict) else payload
+        return self.cmd("stop-guard", ["--hook-json", *args], stdin=stdin or b"{}")
+
+    def plant(self, sid, **counters):
+        pk.write_json(os.path.join(record.session_dir(sid), "counters.json"),
+                      counters)
+
+    def test_stuck_session_soft_holds_once_with_pull_pointer(self):
+        seats.join(session="s-w1", seat="wisp", cwd="/tmp/p")
+        self.plant("s-w1", **{"stuck-streak": 3})
+        rc, _o, err = self.guard({"session_id": "s-w1"}, args=["--seat", "wisp"])
+        self.assertEqual(rc, 2)
+        self.assertIn("[helm stop-whisper]", err)
+        self.assertIn("wedged", err)
+        self.assertIn("helm reflex smoke --session s-w1", err)  # pull-depth pointer
+        # same state on the next stop: latched — passes (never an infinite hold)
+        rc, _o, err = self.guard({"session_id": "s-w1"}, args=["--seat", "wisp"])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("stop-whisper", err)
+
+    def test_worsening_streak_refires_next_bucket(self):
+        seats.join(session="s-w2", seat="wisp", cwd="/tmp/p")
+        self.plant("s-w2", **{"stuck-streak": 3})
+        self.assertEqual(self.guard({"session_id": "s-w2"})[0], 2)
+        self.assertEqual(self.guard({"session_id": "s-w2"})[0], 0)  # latched
+        self.plant("s-w2", **{"stuck-streak": 6})   # next escalate bucket
+        rc, _o, err = self.guard({"session_id": "s-w2"})
+        self.assertEqual(rc, 2)
+        self.assertIn("6 repeated", err)
+
+    def test_dirty_streak_banks_the_slice(self):
+        seats.join(session="s-w3", seat="wisp", cwd="/tmp/p")
+        self.plant("s-w3", **{"dirty-streak": 8})
+        rc, _o, err = self.guard({"session_id": "s-w3"})
+        self.assertEqual(rc, 2)
+        self.assertIn("bank the green slice", err)
+        self.assertIn("git status", err)            # pull-depth pointer
+
+    def age_room_rows(self, room="main", secs=3600):
+        """Rewrite a room log's row timestamps `secs` into the past — the
+        stale-unlanded precondition (a fresh set never whispers: echo≠context)."""
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - secs))
+        p = os.path.join(chat.chat_dir(), room + ".jsonl")
+        rows = [json.loads(l) for l in open(p)]
+        with open(p, "w") as f:
+            for r in rows:
+                r["ts"] = old
+                f.write(json.dumps(r) + "\n")
+
+    def test_unlanded_pending_reminds_once_after_inbox_latch(self):
+        seats.join(seat="wisp", cwd="/tmp/p")
+        chat.post("@wisp land the fix", who="david")
+        rc, _o, err = self.guard(args=["--seat", "wisp"])
+        self.assertEqual(rc, 2)                      # stop 1: the inbox block
+        self.assertIn("undelivered", err)
+        self.assertNotIn("stop-whisper", err)        # never doubled on one stop
+        rc, _o, err = self.guard(args=["--seat", "wisp"])
+        self.assertEqual(rc, 0, err)                 # stop 2, rows FRESH: latched
+        self.age_room_rows()                         # …the set sits unlanded >10m
+        rc, _o, err = self.guard(args=["--seat", "wisp"])
+        self.assertEqual(rc, 2)                      # stop 3: the unlanded whisper
+        self.assertIn("unlanded >10m", err)
+        self.assertIn("helm chat read", err)
+        rc, _o, err = self.guard(args=["--seat", "wisp"])
+        self.assertEqual(rc, 0, err)                 # stop 4: silence
+
+    def test_one_whisper_even_with_multiple_live_signals(self):
+        seats.join(session="s-w5", seat="wisp", cwd="/tmp/p")
+        self.plant("s-w5", **{"stuck-streak": 3, "dirty-streak": 9})
+        rc, _o, err = self.guard({"session_id": "s-w5"})
+        self.assertEqual(rc, 2)
+        self.assertEqual(err.count("[helm stop-whisper]"), 1)
+        self.assertIn("wedged", err)                 # salience: stuck wins
+        self.assertNotIn("bank the green", err)
+        # next stop: stuck latched, dirty (still live) takes the slot
+        rc, _o, err = self.guard({"session_id": "s-w5"})
+        self.assertEqual(rc, 2)
+        self.assertIn("bank the green", err)
+
+    def test_budget_cap_holds(self):
+        seats.join(session="s-w6" + "x" * 40, seat="wisp", cwd="/tmp/p")
+        self.plant("s-w6" + "x" * 40, **{"stuck-streak": 3})
+        rc, _o, err = self.guard({"session_id": "s-w6" + "x" * 40})
+        self.assertEqual(rc, 2)
+        line = next(l for l in err.splitlines() if "stop-whisper" in l)
+        self.assertLessEqual(len(line), seats.STOP_WHISPER_CAP)
+
+    def test_kill_switch_and_fail_closed(self):
+        seats.join(session="s-w7", seat="wisp", cwd="/tmp/p")
+        self.plant("s-w7", **{"stuck-streak": 5})
+        os.environ["HELM_STOP_GUARD_WHISPER"] = "0"
+        rc, _o, err = self.guard({"session_id": "s-w7"})
+        self.assertEqual(rc, 0, err)                 # off = silent
+        os.environ.pop("HELM_STOP_GUARD_WHISPER")
+        # garbled counters: fail-closed to nothing, never a raise
+        p = os.path.join(record.session_dir("s-w8"), "counters.json")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write("not json{{")
+        rc, _o, err = self.guard({"session_id": "s-w8"})
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("stop-whisper", err)
+
+    def test_ledger_row_ids_only(self):
+        seats.join(session="s-w9", seat="wisp", cwd="/tmp/p")
+        self.plant("s-w9", **{"dirty-streak": 8})
+        self.assertEqual(self.guard({"session_id": "s-w9"})[0], 2)
+        lp = os.path.join(home.global_dir(), ".state", "stop-whisper-ledger.jsonl")
+        rows = [json.loads(l) for l in open(lp)]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "dirty:1")
+        self.assertEqual(rows[0]["session"], "s-w9")
+        self.assertNotIn("text", rows[0])            # ids only, never content
 
 
 class ClaimsTest(SeatsBase):

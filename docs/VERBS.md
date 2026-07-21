@@ -1167,11 +1167,22 @@ frames; this lane is called *delivery*.)
   SAME rows passes; any new row re-arms — never an infinite block loop; the
   hook JSON's `stop_hook_active` flag is honored the same way); **BLOCK** on
   live claim leases held by the stopping session (release or finish — the
-  resources are named); **WARN** on a clean stop with the beacon-arm line
-  (the Monitor command with the resolved seat); plus the silent mechanical
-  leg — `helm index cap --apply`, best-effort, never blocks, never prints.
+  resources are named); **WHISPER** — the contextual continuation lane
+  (stop-whisper): ONE budgeted line (240B) from the live signals — stuck
+  session (`stuck-streak`≥3: surface the blocker), unlanded owner/mention
+  rows aged >10m past their inbox block (land or route them), uncommitted
+  drift (`dirty-streak`≥8: bank the green slice) — highest salience wins,
+  each line ends in a pull-depth pointer; fires once per (signal, level)
+  fingerprint as a soft hold (a re-stop on the same state passes; a
+  worsening streak or new row set re-arms), rides an existing block when
+  one fired; measurable via `_global/.state/stop-whisper-ledger.jsonl`
+  (ids only); fail-CLOSED to nothing; **WARN** on a clean stop with the
+  beacon-arm line (the Monitor command with the resolved seat); plus the
+  silent mechanical leg — `helm index cap --apply`, best-effort, never
+  blocks, never prints.
   FAIL-OPEN TOTAL (a broken guard must never wedge the fleet); kill-switch
-  `HELM_STOP_GUARD=0`, per-check `HELM_STOP_GUARD_INBOX/CLAIMS/INDEX=0`;
+  `HELM_STOP_GUARD=0`, per-check
+  `HELM_STOP_GUARD_INBOX/CLAIMS/WHISPER/INDEX=0`;
   bounded reads; no network. With inject (turn start), deliver (tool
   boundary) and join (session start) this completes the loop: an agent
   cannot idle past its inbox.
@@ -1212,6 +1223,61 @@ $ helm chat post "@codex-seat xrev the meldhalf branch when free"
 $ helm chat seats                # who's live, what's pending, what's claimed
 $ helm chat claim worktree-main --ttl 1800   # prints the lease id — keep it
 $ helm chat release worktree-main --lease 5f3c9a2d41b0e6f2
+```
+
+### `helm chat meld` — the mindmeld preset
+
+Hyper-speed a2a real-time convergence (premise meld-discipline): both parties
+reply FAST with what they ALREADY know; a fork that needs research is NOT a
+meld — it falls to async. The preset is THIN by law (one-comms-primitive): a
+meld is a fresh room (`meld-<epoch>-<slug>`) plus a bounded synchronous read
+discipline over it — no new transport, no daemon; the room IS the artifact,
+visible live in `helm chat rooms` and the web channel list like any room.
+Protocol lineage: mc-meld.sh / the MC mindmeld skill (epoch fencing, floor
+markers, bounds-as-behavior — the scars are kept, the channel is helm's).
+
+- **`meld invite <peer> <topic...>`** — the verb owns the wake atomically
+  (premise a2a-wake-foolproof-layers): seeds the problem statement (ending
+  `[HOLD]`, discipline line included) into the fresh room, then posts the
+  `@peer` invite with the protocol head FIRST — room + join command inside
+  the first 200 bytes, so the delivery clip can never eat the join
+  instruction (buildr #115). The invite is a durable row: a tracked peer's
+  delivery lane backfills the newborn room from offset 0, so it lands at the
+  peer's next tool boundary (busy) or beacon fire (idle) — never lost, only
+  delayed.
+- **`meld join <room>`** — parses epoch + convener from the seed, posts the
+  control-only `READY` **@convener** (the wake-back: a READY that lands
+  silently strands GO forever). The seeded problem is the joiner's first
+  recv chunk.
+- **`meld recv <room> [--timeout S]`** — the blocking marker-aware read
+  (default 90 s): returns the next PEER chunk carrying a real floor marker;
+  skips own/unattributable rows fail-closed, stale epochs (a reused room
+  never replays a dead meld), READY/GO control echoes, markerless chatter.
+  Bounds are BEHAVIOR: exchange cap (5) or timeout → exit 3 with the
+  fall-to-async instruction printed; `[ABORT]` → exit 4, fail-loud.
+- **`meld say <room> --marker YIELD|HOLD|DONE|ABORT <text...>`** — one
+  bounded chunk, content + floor marker in the one text field. `[YIELD]`
+  hands the floor, `[HOLD]` more coming, `[DONE]` leaves, `[ABORT]` kills.
+  DONE/ABORT @mention the peer (act-moments — the closing must land);
+  YIELD/HOLD stay mention-free, so a meld never floods the peer's delivery
+  cursor with stale nudges (both parties sit inside recv, polling the room
+  at 0.5 s).
+- **`meld status`** — this seat's live melds (role, status, exchanges/cap).
+
+LATENCY-PURE (premise comms-presets-optimize-their-novel-purity): every meld
+post rides the v1 RAM append unsigned (`sign=False`) — no signing leg, no
+node round-trip, no disk write mid-meld; the out-of-band log-flush stays the
+durable record. State is RAM, keyed room × ACTOR (two seats share one chat
+dir — the mc-meld host-global-state clobber, refuted in its live dogfood, is
+structural here). v1 is 2-party; 3+ minds use a plain room + discipline, or
+council when independence is the point (a council is never a meld). Env:
+`HELM_MELD_CAP`, `HELM_MELD_RECV_TIMEOUT_S`.
+
+```console
+$ helm chat meld invite kimi-b "converge the reflex naming"   # → room + next
+$ helm chat meld recv meld-1784663842-converge-the-reflex-nami           # READY → GO
+$ helm chat meld say  meld-1784663842-converge-the-reflex-nami --marker YIELD "propose: …"
+$ helm chat meld say  meld-1784663842-converge-the-reflex-nami --marker DONE "state: converged; next: I land it"
 ```
 
 ### `helm launch [--seat S] [--home H] [--room R] [--no-install] [--] [claude args…]`

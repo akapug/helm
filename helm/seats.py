@@ -795,14 +795,26 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
 # SCAN_CAP), no network.
 # ---------------------------------------------------------------------------
 
-def _stop_fp_path(room, seat, session=None):
+def _stop_fp_path(room, seat, session=None, kind="stopfp"):
     """The once-per-fingerprint latch — in the room dir, per (seat, session)
     like the cursor it gates (RAM-side, dies with the boot like the rest of
-    the lane's state)."""
+    the lane's state). kind names the latch lane: stopfp (the inbox block),
+    stopwhisper (the contextual-continuation lane's fired-set)."""
     p = os.path.join(chat.chat_dir(),
-                     "%s.stopfp.%s" % (pk.slug(room), _seat_key(seat)))
+                     "%s.%s.%s" % (pk.slug(room), kind, _seat_key(seat)))
     s8 = _sid8(session)
     return "%s.%s" % (p, s8) if s8 else p
+
+
+def _rows_fp(pending):
+    """The pending-set fingerprint — blake2b over (room, row-id), the ONE
+    identity both the inbox block and the stop-whisper's unlanded leg latch
+    on (they must agree on what 'the same rows' means)."""
+    import hashlib
+    return hashlib.blake2b(
+        "|".join("%s:%s" % (rm, r.get("id") or chat.rkey(r))
+                 for rm, r in pending).encode("utf-8"),
+        digest_size=16).hexdigest()
 
 
 def _pending_rows(room, seat, session=None, backfill=False):
@@ -841,6 +853,115 @@ def _off(name):
     return (home.env(name) or "").lower() in ("0", "off", "no")
 
 
+# ── stop-whisper: the CONTEXTUAL continuation lane ─────────────────────────
+# Lineage: per-toolcall-whispers-are-the-goal (contextual injection is the END
+# GOAL; the cure for slop is BUDGETS — bytes caps, contextual gating,
+# fail-closed-to-nothing — never removal) + the mc work-arbiter's hold-once-
+# per-fingerprint-then-release + reflex.py's counter thresholds (field-tested
+# 3/8) and salience law. A Stop hook's only agent-visible channel is the
+# block reason (exit 2 stderr), so a whisper IS a soft hold: it fires ONCE
+# per (signal, level) fingerprint with the right continuation, and the very
+# next stop on the same state passes — never an infinite hold, never
+# wallpaper. ONE budgeted line per stop (STOP_WHISPER_CAP), highest-salience
+# unlatched signal wins, each line ends in a pull-depth pointer (tiny nudge,
+# depth on demand — contextual-routing-preserves-lightness).
+
+STOP_WHISPER_CAP = 240   # one line's byte budget (inject.py WHISPER_CAP kin)
+_WHISPER_FIRED_CAP = 20  # fired-set entries kept per (seat, session) latch
+
+STUCK_AT = 3    # reflex.py stuck-commonsense threshold (re-fires per bucket)
+DIRTY_AT = 8    # reflex.py uncommitted-drift threshold
+PENDING_STALE_S = 600  # unlanded rows must have AGED to whisper — a fresh set
+                       # was just pointed at by the inbox block (echo ≠ context)
+
+
+def _whisper_candidates(session, pending, inbox_blocked):
+    """[(fp, line)] of LIVE whisper signals, salience-ordered. Signals are
+    cheap local reads only (reflex law): the session's record.py counters +
+    the pending rows the guard already computed. Each fp carries a LEVEL
+    bucket so a worsening streak re-fires (reflex escalate law) and a new
+    pending set re-arms."""
+    out = []
+    c = {}
+    if session:
+        try:
+            from . import record
+            got = record.counters(session)
+            c = got if isinstance(got, dict) else {}
+        except Exception:
+            c = {}
+
+    def n(k):
+        try:
+            return int(c.get(k) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    stuck, dirty = n("stuck-streak"), n("dirty-streak")
+    if stuck >= STUCK_AT:
+        out.append(("stuck:%d" % (stuck // STUCK_AT),
+                    "stopping while wedged — %d repeated infra/auth failures "
+                    "this session; surface the blocker or check creds before "
+                    "idling (pull: helm reflex smoke --session %s)"
+                    % (stuck, session)))
+    if pending and not inbox_blocked:
+        try:  # STALE rows only — reflex._fresh fails open to fresh, which
+            from . import reflex  # fails the whisper CLOSED (silence) here
+            stale = [(rm, r) for rm, r in pending
+                     if not reflex._fresh(r.get("ts"), PENDING_STALE_S)]
+        except Exception:
+            stale = []
+        if stale:
+            out.append(("pending:" + _rows_fp(stale),
+                        "%d owner/mention row(s) unlanded >%dm (pointed-at "
+                        "once, no longer re-blocking) — land or explicitly "
+                        "route them (pull: helm chat read)"
+                        % (len(stale), PENDING_STALE_S // 60)))
+    if dirty >= DIRTY_AT:
+        out.append(("dirty:%d" % (dirty // DIRTY_AT),
+                    "%d dirtying ops with no commit at stop — bank the green "
+                    "slice before idling; hot context is fuel (pull: git "
+                    "status, then commit)" % dirty))
+    return out
+
+
+def _stop_whisper(session, room, seat, pending, inbox_blocked):
+    """ONE budgeted contextual continuation for this stop, or None. The
+    highest-salience signal whose (signal, level) fingerprint has NOT fired
+    for this (seat, session) wins; firing latches it (fired-set JSON, capped)
+    and appends one measurability row to the stop-whisper ledger (ids only,
+    never text — the fire-ledger law). FAIL-CLOSED TO NOTHING: any state or
+    ledger trouble yields silence, never a raise, never a louder lane."""
+    cands = _whisper_candidates(session, pending, inbox_blocked)
+    if not cands:
+        return None
+    path = _stop_fp_path(room, seat, session, kind="stopwhisper")
+    d = pk.read_json(path, {}) or {}
+    fired = [str(x) for x in d.get("fired") or []] if isinstance(d, dict) else []
+    hit = next(((fp, line) for fp, line in cands if fp not in fired), None)
+    if not hit:
+        return None
+    fp, line = hit
+    try:
+        chat._ensure_dir()
+        pk.write_json(path, {"v": 1, "ts": pk.now_ts(),
+                             "fired": (fired + [fp])[-_WHISPER_FIRED_CAP:]})
+    except Exception:
+        return None   # an unlatchable whisper would repeat forever — stay silent
+    try:  # measurability rides the fire (fail-open; ids only)
+        from . import inject
+        inject._append_jsonl(
+            os.path.join(home.global_dir(), ".state", "stop-whisper-ledger.jsonl"),
+            {"v": 1, "ts": pk.now_ts(), "id": fp, "seat": seat,
+             **({"session": str(session)} if session else {})},
+            inject.LEDGER_MAX)
+    except Exception:
+        pass
+    return _clip("[helm stop-whisper] " + line +
+                 " This holds once per state — a re-stop passes.",
+                 STOP_WHISPER_CAP)
+
+
 def stop_guard(session=None, room="main", seat=None, stop_active=False):
     """-> (blocks, warns) for one Stop event. Posture resolved once (seat via
     the roster's session mapping, else the derived seat); checks are inline:
@@ -850,8 +971,13 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
       (b) BLOCK — live claim leases held by THIS session (session-bound: no
           session in the hook JSON ⇒ no claims check — a display name alone
           must never gate a stop).
-      (c) WARN — clean stop: one line reminding to arm the idle-wake beacon.
-      (d) silent mechanical — `helm index cap --apply` best-effort in-process
+      (c) WHISPER — the contextual continuation lane (_stop_whisper): ONE
+          budgeted nudge from the live signals (stuck/dirty counters, the
+          latched-but-unlanded pending set), once per (signal, level)
+          fingerprint, riding an existing block or soft-holding alone;
+          HELM_STOP_GUARD_WHISPER=0 disables; fail-closed to nothing.
+      (d) WARN — clean stop: one line reminding to arm the idle-wake beacon.
+      (e) silent mechanical — `helm index cap --apply` best-effort in-process
           (the documented Stop line, docs/VERBS.md): never blocks, never
           prints; HELM_STOP_GUARD_INDEX=0 disables.
     stop_active (the hook JSON's stop_hook_active) short-circuits everything:
@@ -861,15 +987,12 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
         return [], []
     seat = seat or seat_for_session(session) or derive_seat(session)
     blocks, warns, pending = [], [], []
+    inbox_blocked = False
 
     if not _off("STOP_GUARD_INBOX"):
         pending = _pending_all(room, seat, session)   # EVERY room's inbox gates
         if pending:
-            import hashlib
-            fp = hashlib.blake2b(
-                "|".join("%s:%s" % (rm, r.get("id") or chat.rkey(r))
-                         for rm, r in pending)
-                .encode("utf-8"), digest_size=16).hexdigest()
+            fp = _rows_fp(pending)
             fpp = _stop_fp_path(room, seat, session)
             try:
                 with open(fpp) as f:
@@ -894,6 +1017,7 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
                     "read). This blocks once per pending set — a re-stop on "
                     "the same rows passes." % (len(pending), seat,
                                                "\n".join(lines)))
+                inbox_blocked = True
 
     if session and not _off("STOP_GUARD_CLAIMS"):
         c = _sweep(pk.read_json(claims_path(), {}) or {})
@@ -907,6 +1031,14 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
                 "[helm stop-guard] live claim lease(s) held by this session: "
                 "%s — release them (helm chat release <resource> --lease "
                 "<id>) or finish the work before stopping." % ", ".join(held))
+
+    if not _off("STOP_GUARD_WHISPER"):
+        try:  # fail-closed to NOTHING: whisper trouble = silence, never louder
+            w = _stop_whisper(session, room, seat, pending, inbox_blocked)
+        except Exception:
+            w = None
+        if w:
+            blocks.append(w)   # rides an existing block, or IS the soft hold
 
     if not blocks and not pending:   # genuinely clean — a latched-pass (rows
         warns.append(                # still pending, already pointed at) stays
