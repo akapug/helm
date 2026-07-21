@@ -742,11 +742,33 @@ def _owner_signal(room, rows):
         return {"owner_read": 0, "owner_unread": 0, "owner_mentions": 0}
 
 
+def _rooms_summary():
+    """The channel list for the web sidebar: one light row per room —
+    {room, total, last (ts), owner_unread, owner_mentions}. Folding the
+    per-room owner signal here is what lets the nav badge SUM every channel,
+    so a post in a NON-main room is never invisible to the owner (the real
+    single-room hole). A handful of small tmpfs reads; fail-open per room."""
+    from . import chat
+    out = []
+    for room in chat.list_rooms():
+        try:
+            rows, total = chat.read(room)
+            sig = _owner_signal(room, rows)
+            out.append({"room": room, "total": total,
+                        "last": (rows[-1].get("ts") if rows else None),
+                        "owner_unread": sig.get("owner_unread", 0),
+                        "owner_mentions": sig.get("owner_mentions", 0)})
+        except Exception:
+            continue
+    return out
+
+
 def _api_chat(qs):
     """Poll read: rows after ?since= (count already seen) + the new total +
     the transport truth (signed/unsigned + chain head — the panel's tick and
     strip) + the owner-unread signal (_owner_signal — the nav badge on EVERY
-    tab). The panel polls this every ~2s; since past the end resets. Rows
+    tab) + `rooms` (the channel sidebar list, cross-room unread for the summed
+    badge). The panel polls this every ~2s; since past the end resets. Rows
     include reaction rows; the client aggregates."""
     try:
         since = int(_q1(qs, "since", "0"))
@@ -757,7 +779,8 @@ def _api_chat(qs):
         room = _q1(qs, "room", "main")
         rows, total = chat.read(room)   # one read serves the slice AND the signal
         out = {"room": room, "lines": rows[since if 0 <= since <= total else 0:],
-               "total": total, "transport": chat.transport_status()}
+               "total": total, "transport": chat.transport_status(),
+               "rooms": _rooms_summary()}
         out.update(_owner_signal(room, rows))
         return out, 200
     except Exception:

@@ -169,6 +169,13 @@ class CmdTest(ChatBase):
         self.assertIn("main  1 msg", out)
         self.assertIn("ops  1 msg [owner-unread]", out)
 
+    def test_list_rooms_is_the_one_sorted_source(self):
+        self.assertEqual(chat.list_rooms(), [])          # none until a post
+        chat.post("hi", who="a1")                        # -> main
+        chat.post("ops", room="ops", who="a2")
+        chat.post("zeta", room="zeta", who="a3")
+        self.assertEqual(chat.list_rooms(), ["main", "ops", "zeta"])  # sorted
+
     def test_room_flag_scopes_post_and_read(self):
         self.assertEqual(self.run_cmd(["post", "sidebar", "--room", "ops"])[0], 0)
         self.assertEqual(chat.read("main"), ([], 0))

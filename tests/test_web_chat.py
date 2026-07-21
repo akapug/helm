@@ -82,6 +82,21 @@ class TestWebChat(unittest.TestCase):
                          {"mode": "unsigned", "url": None, "head": None,
                           "signer": False})
 
+    def test_rooms_sidebar_lists_channels_with_cross_room_signal(self):
+        """slice-1: /api/chat carries `rooms` (the channel sidebar) with a
+        per-room owner signal, so a mention in a NON-current room is visible
+        for the summed badge — the fix for the single-room-invisible hole."""
+        from helm import chat
+        self.req("/api/chat", {"text": "hello main"})            # owner in main
+        chat.post("@david urgent", room="team-fe", who="codex")  # agent elsewhere
+        status, d = self.req("/api/chat")                        # viewing main
+        self.assertEqual(status, 200)
+        rooms = {r["room"]: r for r in d["rooms"]}
+        self.assertIn("main", rooms)
+        self.assertIn("team-fe", rooms)
+        self.assertEqual(rooms["main"]["total"], 1)
+        self.assertGreaterEqual(rooms["team-fe"]["owner_mentions"], 1)
+
     def test_react_endpoint_roundtrip(self):
         self.req("/api/chat", {"text": "ship it"})
         status, d = self.req("/api/chat?since=0")

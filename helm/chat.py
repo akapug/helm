@@ -70,6 +70,16 @@ def room_path(room="main"):
     return os.path.join(chat_dir(), pk.slug(room) + ".jsonl")
 
 
+def list_rooms():
+    """Every room that has a RAM file, sorted (the '<room>.jsonl' basenames).
+    One source for the CLI `rooms` verb, log-flush's all-rooms default, and the
+    web channel list — a room is born the first time anything posts to it."""
+    d = chat_dir()
+    if not os.path.isdir(d):
+        return []
+    return sorted(n[:-6] for n in os.listdir(d) if n.endswith(".jsonl"))
+
+
 def marker_path(room="main"):
     return os.path.join(chat_dir(), pk.slug(room) + ".owner-unread")
 
@@ -587,10 +597,8 @@ def log_flush(rooms=None):
     appended."""
     if log_disabled():
         return -1
-    d = chat_dir()
     if rooms is None:
-        rooms = sorted(n[:-6] for n in os.listdir(d)
-                       if n.endswith(".jsonl")) if os.path.isdir(d) else []
+        rooms = list_rooms()
     state = pk.read_json(_flush_state_path(), {}) or {}
     lines = []
     appended = 0
@@ -724,9 +732,7 @@ def cmd_chat(args):
             n, "s"[:n != 1], journal_dir()))
         return 0
     if verb == "rooms":
-        d = chat_dir()
-        names = sorted(n[:-6] for n in os.listdir(d)
-                       if n.endswith(".jsonl")) if os.path.isdir(d) else []
+        names = list_rooms()
         if not names:
             print("helm chat: no rooms yet — helm chat post <text> starts main")
             return 0
