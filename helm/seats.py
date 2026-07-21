@@ -522,10 +522,20 @@ def release(resource, seat, lease=None, session=None):
 
 def claims_list():
     """The public table: holder/fence/remaining only — neither the lease
-    nonce (the capability) nor the bound session is ever published here."""
-    with _flocked(claims_path() + ".lock"):
-        c = _sweep(pk.read_json(claims_path(), {}) or {})
-        pk.write_json(claims_path(), c) if c else None
+    nonce (the capability) nor the bound session is ever published here.
+    A poll is a TRUE read: no lock, no write — write_json is atomic
+    (tmp + os.replace) so a lockless read never sees a torn file. Only
+    when a row actually expired does the GC leg take the flock, re-read,
+    and persist the sweep — a watched roster (web polls every 3s) must
+    never churn .claims.json or contend with real claim/release traffic."""
+    raw = pk.read_json(claims_path(), {}) or {}
+    c = _sweep(raw)
+    if len(c) != len(raw):  # sweep only ever drops rows
+        with _flocked(claims_path() + ".lock"):
+            raw = pk.read_json(claims_path(), {}) or {}
+            c = _sweep(raw)
+            if len(c) != len(raw):
+                pk.write_json(claims_path(), c)
     now = _now_mono()
     return [{"resource": r, "holder": v.get("holder"), "fence": v.get("fence"),
              "remaining": int(v.get("exp_mono", now) - now)}

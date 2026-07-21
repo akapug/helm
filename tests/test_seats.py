@@ -417,6 +417,33 @@ class ClaimsTest(SeatsBase):
         self.assertFalse(ok)
         self.assertIn("not claimed", msg)
 
+    def test_list_poll_with_live_claims_never_writes(self):
+        """Day-review #4: the roster GET polls claims_list every 3s — a
+        read with every claim live must leave .claims.json byte-for-byte
+        alone (same inode, same mtime), not rewrite it under the lock."""
+        seats.claim("db-migrate", "alice", ttl=60, session="sA")
+        p = seats.claims_path()
+        before = os.stat(p)
+        for _ in range(3):
+            self.assertEqual(len(seats.claims_list()), 1)
+        after = os.stat(p)
+        self.assertEqual((before.st_ino, before.st_mtime_ns),
+                         (after.st_ino, after.st_mtime_ns))
+
+    def test_list_persists_only_an_actual_expiry_sweep(self):
+        """The GC leg still works: a row that really expired is dropped
+        from the listing AND from disk — one write, then reads go quiet."""
+        seats.claim("keep", "bob", ttl=60, session="sB")
+        seats.claim("gone", "alice", ttl=0, session="sA")   # expired at birth
+        rows = seats.claims_list()
+        self.assertEqual([r["resource"] for r in rows], ["keep"])
+        on_disk = pk.read_json(seats.claims_path(), {})
+        self.assertNotIn("gone", on_disk)                   # sweep persisted
+        before = os.stat(seats.claims_path())
+        seats.claims_list()                                 # next poll: pure read
+        self.assertEqual(os.stat(seats.claims_path()).st_mtime_ns,
+                         before.st_mtime_ns)
+
 
 class CouncilDeferredTest(SeatsBase):
     def test_council_verbs_point_at_the_deferral(self):
