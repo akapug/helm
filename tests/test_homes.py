@@ -273,6 +273,120 @@ class HomesTest(unittest.TestCase):
         self.assertEqual(res[0][0], doctor.WARN)
         self.assertIn("unavailable", res[0][1])
 
+    # -- identity readers: metadata only, malformed input degrades to None --
+    def _plant_codex_identity(self, name, id_token=None, nested=True):
+        d = os.path.join(homes.ROOTS["codex"], name)
+        os.makedirs(d, exist_ok=True)
+        auth = {}
+        if id_token is not None:
+            auth = {"tokens": {"id_token": id_token}} if nested else {"id_token": id_token}
+        with open(os.path.join(d, "auth.json"), "w") as f:
+            json.dump(auth, f)
+        return d
+
+    def _jwt(self, claims):
+        import base64
+        seg = lambda o: base64.urlsafe_b64encode(
+            json.dumps(o).encode()).decode().rstrip("=")
+        return seg({"alg": "none"}) + "." + seg(claims) + ".sig"
+
+    def test_codex_identity_reads_email_claim_nested_and_flat(self):
+        tok = self._jwt({"email": "cx@user.dev", "sub": "x"})
+        self._plant_codex_identity("nested-cx", tok, nested=True)
+        self._plant_codex_identity("flat-cx", tok, nested=False)
+        rows = {r["name"]: r for r in homes.homes_list()}
+        self.assertEqual(rows["nested-cx"]["identity"], "cx@user.dev")
+        self.assertEqual(rows["flat-cx"]["identity"], "cx@user.dev")
+
+    def test_codex_identity_malformed_degrades_to_none_never_raises(self):
+        for name, tok in (("garbage", "not-a-jwt"),
+                          ("bad-b64", "a.!!!.c"),
+                          ("no-email", self._jwt({"sub": "x"})),
+                          ("empty-email", self._jwt({"email": ""})),
+                          ("non-dict-claims", "a." + __import__("base64").urlsafe_b64encode(b"[1,2]").decode() + ".c")):
+            self._plant_codex_identity(name, tok)
+        rows = {r["name"]: r for r in homes.homes_list()}
+        for name in ("garbage", "bad-b64", "no-email", "empty-email", "non-dict-claims"):
+            self.assertIsNone(rows[name]["identity"], name)
+
+    def test_claude_identity_requires_string_email(self):
+        d = os.path.join(homes.ROOTS["claude"], "bad-ident")
+        os.makedirs(d)
+        with open(os.path.join(d, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {"emailAddress": 42}}, f)
+        open(os.path.join(d, ".credentials.json"), "w").close()
+        row = next(r for r in homes.homes_list() if r["name"] == "bad-ident")
+        self.assertIsNone(row["identity"])
+
+    # -- duplicate identity: named-vs-named only demands a survivor ---------
+    def test_duplicate_named_homes_flag_and_verify_demands_survivor(self):
+        self._plant_claude_home("dup-one", "same@user.dev")
+        self._plant_claude_home("dup-two", "same@user.dev")
+        rows = {r["name"]: r for r in homes.homes_list()}
+        self.assertEqual(sorted(rows["dup-one"]["duplicate_identity"]), ["dup-two"])
+        self.assertEqual(sorted(rows["dup-two"]["duplicate_identity"]), ["dup-one"])
+        res = homes.home_verify("dup-one")
+        self.assertEqual(res["verdict"], "issues")
+        self.assertTrue(any("picks a survivor" in f and "dup-two" in f
+                            for f in res["fixes"]))
+        self.assertIn("dup:dup-two", homes._hygiene_flags(rows["dup-one"]))
+        # and home_create refuses a THIRD seat for the same identity
+        res = homes.home_create("claude", "same@user.dev")
+        self.assertIn("already seated", res["error"])
+
+    def test_unauthed_homes_never_join_dup_scan(self):
+        # no auth file => no identity claim counts: three empty homes with the
+        # same PLANTED .claude.json email but no credentials must not flag
+        for n in ("ua-1", "ua-2"):
+            self._plant_claude_home(n, "same@user.dev", authed=False)
+        rows = homes.homes_list()
+        for r in rows:
+            self.assertNotIn("duplicate_identity", r)
+
+    # -- prepare: an existing home holding a DIFFERENT identity refuses -----
+    def test_prepare_refuses_home_holding_another_identity(self):
+        self._plant_claude_home("taken-user-dev", "taken@user.dev", authed=True)
+        res = homes.home_create("claude", "other@user.dev")
+        # the canonical name for other@user.dev is free — the collision is on
+        # a DIFFERENT email folding to an occupied dir
+        self.assertNotIn("error", res)
+        # now the real case: dir for the email exists and holds someone else
+        d = os.path.join(homes.ROOTS["claude"], "clash-user-dev")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {"emailAddress": "squatter@elsewhere.io"}}, f)
+        res = homes.home_create("claude", "clash@user.dev")
+        self.assertIn("already holds squatter@elsewhere.io", res["error"])
+
+    # -- _resolve: name, alias, path; ambiguity demands a provider ----------
+    def test_resolve_by_alias_and_path(self):
+        d = self._plant_claude_home("real-user-dev", "real@user.dev")
+        os.symlink(d, os.path.join(homes.ROOTS["claude"], "shortcut"))
+        row, err = homes._resolve("shortcut")
+        self.assertIsNone(err)
+        self.assertEqual(row["name"], "real-user-dev")
+        row2, err2 = homes._resolve(d)  # by absolute path
+        self.assertIsNone(err2)
+        self.assertEqual(row2["name"], "real-user-dev")
+
+    def test_resolve_same_name_two_providers_is_ambiguous(self):
+        self._plant_claude_home("twin", "a@x.com")
+        self._plant_codex_home("twin", "tok")
+        row, err = homes._resolve("twin")
+        self.assertIsNone(row)
+        self.assertIn("ambiguous", err["error"])
+        row, err = homes._resolve("twin", "codex")
+        self.assertIsNone(err)
+        self.assertEqual(row["provider"], "codex")
+
+    def test_resolve_unknown_and_empty_names(self):
+        _, err = homes._resolve("ghost")
+        self.assertIn("unknown home", err["error"])
+        _, err = homes._resolve("   ")
+        self.assertIn("need a home name", err["error"])
+        _, err = homes._resolve("x", "not-a-provider")
+        self.assertIn("unknown provider", err["error"])
+
     # -- CLI leg smoke ------------------------------------------------------
     def test_cmd_homes_list_and_archives(self):
         self._plant_claude_home("wrong-name", "real@person.io")
