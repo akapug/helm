@@ -6,10 +6,10 @@
 <style>
 /* palette: the sesh/builders.dev warm token family — helm is dark-first, light derived in-family.
    data-theme overrides (after the media query, so the toggle wins both ways) ported from sesh. */
-:root{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--hl:#2a231a;--ok:#7eb8a2;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
-@media (prefers-color-scheme:light){:root{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--hl:#efe7d8;--ok:#3e8a6e;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}}
-:root[data-theme=dark]{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--hl:#2a231a;--ok:#7eb8a2;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
-:root[data-theme=light]{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--hl:#efe7d8;--ok:#3e8a6e;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}
+:root{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--hl:#2a231a;--ok:#7ecb8b;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
+@media (prefers-color-scheme:light){:root{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--hl:#efe7d8;--ok:#2f9e57;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}}
+:root[data-theme=dark]{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--hl:#2a231a;--ok:#7ecb8b;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
+:root[data-theme=light]{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--hl:#efe7d8;--ok:#2f9e57;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}
 /* ---------- design tokens: ONE type scale + radii, so the whole UI reads as
    one system. Six steps (was ~30 ad-hoc sizes); three weights; tabular numerals
    are the default so every column of numbers aligns (Tufte: strict alignment).
@@ -28,8 +28,8 @@
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:var(--f2)/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-variant-numeric:var(--num)}
-/* a whisper of accent at the very top edge — not a 340px dead band */
-body::before{content:"";position:fixed;inset:0 0 auto;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.5;pointer-events:none;z-index:40}
+/* brand accent lives ON the nav's top edge (contained) — the old full-screen
+   fixed hairline painted over the tray + drawer (z-conflict); this cannot. */
 .wrap{max-width:1180px;margin:0 auto;padding:0 clamp(14px,3vw,36px);position:relative}
 code,.mono{font-family:var(--mono);font-size:.9em}
 code{background:var(--code);color:var(--codefg);padding:1px 5px;border-radius:var(--r-sm)}
@@ -39,7 +39,7 @@ button{font:inherit}
    A stable single row: brand · tabs · (flexible spacer) · stats · theme · tray.
    The spacer is the only flexible cell, so the stats + controls stay pinned
    right and never wrap into the tray button (a baseline-screenshot bug). */
-#nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:10px;padding:9px clamp(14px,3vw,36px);background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+#nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:10px;padding:9px clamp(14px,3vw,36px);background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);border-top:2px solid var(--accent);border-bottom:1px solid var(--line)}
 #nav .brand{display:flex;align-items:center;gap:8px;font-size:var(--f4);font-weight:var(--w-bold);letter-spacing:-.03em;margin-right:4px}
 #nav .brand .mark{width:24px;height:24px;border-radius:var(--r-sm);background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 50%,var(--claude)));display:grid;place-items:center;font-size:15px;color:var(--bg)}
 .navtab{padding:6px 14px;border-radius:var(--r-pill);border:1px solid transparent;cursor:pointer;font-weight:var(--w-med);font-size:var(--f2);color:var(--mut);background:none}
@@ -53,6 +53,11 @@ button{font:inherit}
 #nav .stats .stat span{font-size:var(--f0);color:var(--sub);text-transform:uppercase;letter-spacing:.04em}
 #nav .icon{width:32px;height:32px;display:grid;place-items:center;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--card);color:var(--mut);cursor:pointer;font-size:var(--f2);flex:none}
 #nav .icon:hover{color:var(--fg);border-color:var(--line2)}
+/* narrow screens (orca mobile is the primary touch surface — this is graceful
+   degrade, not a mobile nav system): wrap the tabs and drop the spacer + stats
+   so the theme/tray controls never slide off-screen. Placed after the base
+   #nav rules so it wins on source order at matching specificity. */
+@media (max-width:680px){#nav{flex-wrap:wrap;gap:8px 10px}#nav .spacer,#nav .stats{display:none}}
 
 /* ---------- views ---------- */
 .view{display:none}.view.on{display:block}
@@ -130,9 +135,12 @@ header{padding:18px 0 4px}
 
 /* ---------- project cards ---------- */
 #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin:14px 0 0;padding:0}
-.card{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:13px 15px 12px;cursor:pointer;box-shadow:var(--shadow);transition:border-color .12s,background .12s;animation:rise .35s ease both;min-width:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:13px 15px 12px;cursor:pointer;box-shadow:var(--shadow);transition:border-color .12s,background .12s;min-width:0}
 .card:hover{border-color:var(--line2);background:var(--hover)}
 .card.open{grid-column:1/-1;border-color:color-mix(in srgb,var(--accent) 55%,var(--line));cursor:default}
+/* entry animation only on the first populate (#grid.fresh), never on filter
+   re-render — the field used to strobe on every keystroke */
+#grid.fresh .card{animation:rise .35s ease both}
 @keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
 .trow{display:flex;align-items:baseline;gap:9px;min-width:0}
 .dot{width:9px;height:9px;border-radius:50%;flex:none;align-self:center;background:var(--sub)}
@@ -181,13 +189,16 @@ footer .fmark{color:color-mix(in srgb,var(--accent) 70%,var(--sub))}
    scale of items differing only by their signal (Tufte: colour as data).
    Long detail is truncated with the full text on hover-title. */
 #attn{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0 0;min-height:1.6em}
-.attn{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 12px;border-radius:var(--r-pill);border:1px solid var(--line);background:var(--card);font-size:var(--f1);color:var(--mut);max-width:34ch;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.attn{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 12px;border-radius:var(--r-pill);border:1px solid var(--line);background:var(--card);font-size:var(--f1);color:var(--mut);max-width:34ch;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;cursor:pointer}
 .attn b{color:var(--fg);font-weight:var(--w-med)}
 .attn::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--sub);flex:none}
 .attn.ok::before{background:var(--ok)}
 .attn.warn::before{background:var(--warn)}
 .attn.bad::before{background:var(--bad)}
 .attn.next{border-style:dashed}.attn.next::before{background:var(--accent)}
+/* tap-to-reveal detail — the hover title is desktop-only; this works on touch */
+#attndetail{display:none;margin:8px 0 0;padding:8px 12px;background:var(--card);border:1px solid var(--line);border-radius:var(--r);font-size:var(--f1);color:var(--mut)}
+#attndetail.show{display:block}
 
 /* ---------- chart card ---------- */
 #chartcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px 6px;position:relative;box-shadow:var(--shadow)}
@@ -198,16 +209,18 @@ footer .fmark{color:color-mix(in srgb,var(--accent) 70%,var(--sub))}
 .qtab{padding:5px 16px;border-radius:16px;border:1px solid var(--line);font-size:var(--f2);cursor:pointer;color:var(--mut);background:none;display:inline-block}
 .qtab.on{border-color:var(--accent);color:var(--accent);font-weight:700}
 #qsub{margin-left:auto;font-size:var(--f1);color:var(--mut)}
-#chart{width:100%;height:auto;display:block;cursor:crosshair}
+#chart{width:100%;height:auto;min-height:300px;display:block;cursor:crosshair}
+#chart text{font-variant-numeric:tabular-nums}  /* % labels stop jittering as values change */
 #tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:var(--f1) ui-monospace,Menlo,monospace;display:none;z-index:5;box-shadow:0 3px 14px rgba(0,0,0,.18);white-space:nowrap}
 #tip .tt{color:var(--mut)}
 
 /* ---------- account table ---------- */
 #acctcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 14px;box-shadow:var(--shadow)}
 .afilter{display:flex;gap:6px;margin:2px 0 8px;align-items:center}
-#view-quota .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:var(--f2);cursor:pointer;transition:border-color .12s,background .12s}
-#view-quota .chip:hover{background:var(--hover);border-color:var(--line2)}
-#view-quota .chip.on{border-color:var(--accent);color:var(--accent);font-weight:600;background:var(--accent-soft)}
+/* ONE chip rule for every view (was copy-pasted 7×) */
+.chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:var(--r);padding:7px 12px;font-size:var(--f2);cursor:pointer;transition:border-color .12s,background .12s}
+.chip:hover{background:var(--hover);border-color:var(--line2)}
+.chip.on{border-color:var(--accent);color:var(--accent);font-weight:var(--w-med);background:var(--accent-soft)}
 /* Account table: one number per window with a slim inline bar for at-a-glance
    comparison (the redundant leading battery column and the per-cell battery
    SVGs are gone). Fixed cell padding + one baseline => even row rhythm; the
@@ -282,9 +295,6 @@ table.accts tbody tr:hover td{background:color-mix(in srgb,var(--hl) 55%,transpa
 #view-sessions input[type=search]:focus{border-color:var(--accent);outline:none}
 #view-sessions #scope{max-width:190px;flex:0 1 190px;min-width:120px}
 #view-sessions select{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 11px;font-size:var(--f2);cursor:pointer}
-#view-sessions .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:var(--f2);cursor:pointer;transition:border-color .12s,background .12s}
-#view-sessions .chip:hover{background:var(--hover);border-color:var(--line2)}
-#view-sessions .chip.on{border-color:var(--accent);color:var(--accent);font-weight:600;background:var(--accent-soft)}
 #resumeAs{display:flex;gap:6px;align-items:center;font-size:var(--f1);color:var(--mut);flex-wrap:wrap}
 .rachip{border:1px solid var(--line);border-radius:16px;padding:4px 12px;cursor:pointer;background:var(--card);font-size:var(--f1)}
 .rachip b{font-weight:700}
@@ -319,7 +329,6 @@ mark{background:var(--accent);color:var(--bg);border-radius:2px;padding:0 1px}
 #trayClose{margin-left:auto;background:none;border:none;font-size:var(--f4);cursor:pointer;color:var(--mut)}
 #trayClose:hover{color:var(--bad)}
 #tray input{background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font-size:var(--f1)}
-#tray .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 11px;font-size:var(--f1);cursor:pointer}
 .seat{border-top:1px solid var(--line);padding:10px 0;font-size:var(--f1)}
 .seat .t{font-weight:600}
 .seat .m{color:var(--mut);font-size:var(--f1);margin:2px 0}
@@ -339,9 +348,7 @@ mark{background:var(--accent);color:var(--bg);border-radius:2px;padding:0 1px}
 #dhead .acts{float:right;display:flex;gap:6px}
 #dhead .acts button{border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:8px;padding:6px 11px;font-size:var(--f1);cursor:pointer}
 #dhead .acts button:hover{border-color:var(--accent);color:var(--accent)}
-#dhead .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 11px;font-size:var(--f1);cursor:pointer}
 #dbody{flex:1;overflow-y:auto;padding:12px 18px}
-#dbody .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 12px;font-size:var(--f1);cursor:pointer}
 .dmsg{margin:0 0 16px;font-size:var(--f2)}
 .dmsg .role{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-bottom:2px}
 .dmsg.r-user .role{color:var(--claude)}.dmsg.r-assistant .role{color:var(--codex)}.dmsg.r-tool .role,.dmsg.r-system .role{color:var(--mut)}
@@ -359,9 +366,6 @@ mark{background:var(--accent);color:var(--bg);border-radius:2px;padding:0 1px}
 #cwdedit input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:var(--r-sm);padding:6px 10px;font:var(--f1) var(--mono)}
 
 /* ================= configs view (CSS ported from sesh, on helm's variables) ================= */
-#view-configs .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 12px;font-size:var(--f2);cursor:pointer;transition:border-color .12s,background .12s}
-#view-configs .chip:hover{background:var(--hover);border-color:var(--line2)}
-#view-configs .chip.on{border-color:var(--accent);color:var(--accent);font-weight:600;background:var(--accent-soft)}
 #cfgbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0 12px}
 #cfgFilter{flex:1;min-width:200px;padding:7px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:var(--f2)}
 #cfgFilter:focus{border-color:var(--accent);outline:none}
@@ -426,8 +430,6 @@ details.cfgsec>summary:hover{color:var(--fg)}
 #chatname{flex:0 1 110px;min-width:70px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 10px;font-size:var(--f2)}
 #chattext{flex:1 1 200px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 12px;font-size:var(--f3)}
 #chattext:focus,#chatname:focus{border-color:var(--accent);outline:none}
-#chatbar .chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:7px 14px;font-size:var(--f2);cursor:pointer}
-#chatbar .chip:hover{border-color:var(--accent);color:var(--accent)}
 
 /* ================= ledger view (the turn ledger + seat activity, on helm's variables) ================= */
 #ledgerstrip{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;margin:14px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);font-size:var(--f1);color:var(--mut);font-variant-numeric:tabular-nums}
@@ -514,12 +516,13 @@ details.cfgsec>summary:hover{color:var(--fg)}
 
 <div class="view" id="view-quota">
   <div id="attn"></div>
+  <div id="attndetail"></div>
   <div id="chartcard">
     <div class="chead"><b>quota</b>
       <span id="qtabs"><span class="qtab on" data-w="7d">weekly</span><span class="qtab" data-w="5h">session</span></span>
       <span id="qsub">remaining % · history + projection to reset</span>
     </div>
-    <svg id="chart" viewBox="0 0 1400 430" preserveAspectRatio="none"></svg>
+    <svg id="chart" viewBox="0 0 1400 430"></svg>
     <div id="tip"></div>
     <div id="zoomhint">scroll = zoom · drag = pan · double-click = reset</div>
   </div>
@@ -655,11 +658,12 @@ const STORE_ORDER = ["premise", "prior", "lexicon", "heuristic", "reference", "e
 
 let projects = [], showRetired = false;
 
+/* one unit per magnitude so the column stays tabular (was today/1d/13d/9w/2mo,
+   ragged widths that defeated tabular-nums). null stays "never" — a state,
+   not a duration. */
 function age(epoch) {
   if (!epoch) return "never";
   const d = (Date.now() / 1000 - epoch) / 86400;
-  if (d < 1) return "today";
-  if (d < 2) return "1d";
   if (d < 14) return Math.floor(d) + "d";
   if (d < 70) return Math.floor(d / 7) + "w";
   return Math.floor(d / 30) + "mo";
@@ -870,11 +874,15 @@ function card(p, i) {
     '<div class="detail">' + detail(p) + "</div></article>";
 }
 
+let _gridAnimated = false;
 function render() {
   const q = $("#q").value.trim().toLowerCase();
   const hit = p => !q || [p.name, p.path, ...Object.keys(p.sessions || {})].join(" ").toLowerCase().includes(q);
   const vis = projects.filter(p => (showRetired || !p.retired) && hit(p));
-  $("#grid").innerHTML = vis.map(card).join("");
+  const grid = $("#grid");
+  grid.classList.toggle("fresh", !_gridAnimated);  // animate the first paint only
+  _gridAnimated = true;
+  grid.innerHTML = vis.map(card).join("");
   const retired = projects.filter(p => p.retired).length;
   $("#togRetired").textContent = "retired · " + retired;
   $("#togRetired").classList.toggle("avail", retired > 0);
@@ -949,11 +957,14 @@ load();
 let CREDS = [], HIST = [], ALLOC = {}, SDATA = [], SEL = {anthropic: null, codex: null};
 let QWIN = "7d", AFILTER = "all", EMPH = null, QINIT = false;
 const short = (n, l = 26) => n.length > l ? n.slice(0, l - 1) + "…" : n;
+/* single-unit reset ETA (was "1h05m" compound → ragged quota cells) */
 function fmtIn(ms) {
   const s = (ms - Date.now()) / 1e3;
   if (s <= 0) return "now";
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-  return h > 48 ? Math.round(h / 24) + "d" : h > 0 ? h + "h" + String(m).padStart(2, "0") + "m" : m + "m";
+  const h = s / 3600;
+  if (h > 48) return Math.round(h / 24) + "d";
+  if (h >= 1) return Math.round(h) + "h";
+  return Math.round(s / 60) + "m";
 }
 const PALETTE = ["#c9772e", "#3f7d54", "#5470c6", "#b4442e", "#8a5fc0", "#2f8f8f", "#b58a2e", "#c05f8c", "#6b8e23", "#7a5c3e"];
 const ROSTER = () => new Set(CREDS.map(c => c.name));
@@ -1051,9 +1062,11 @@ function strandAtReset(acct) {
   return Math.max(0, Math.round(pts[pts.length - 1][1] + slope * (S.reset - now)));
 }
 /* One pill per signal class, uniform shape; the leading dot carries the colour.
-   Detail lives in the title so the pill width stays bounded and the row aligns. */
+   Detail rides both the hover title (desktop) AND data-detail (tap-to-reveal on
+   touch — Orca mobile has no hover), surfaced in #attndetail below the row. */
 function attnPill(cls, label, title) {
-  return `<span class="attn ${cls}"${title ? ` title="${esc(title)}"` : ""}>${esc(label)}</span>`;
+  const t = title ? ` title="${esc(title)}" data-detail="${esc(title)}"` : "";
+  return `<span class="attn ${cls}"${t}>${esc(label)}</span>`;
 }
 function renderAttn() {
   const bits = [];
@@ -1074,7 +1087,17 @@ function renderAttn() {
   const next = Object.entries(ALLOC).filter(([m, v]) => v && v.pick).map(([m, v]) => `${m} → ${short(v.pick.account, 18)} (${v.pick.headroom_pct}%)`);
   if (next.length) bits.push(attnPill("next", "next: " + short(next[0], 26), "recommended account per model — " + next.join(" · ")));
   $("#attn").innerHTML = bits.join("");
+  $("#attndetail").classList.remove("show");  // collapse stale detail on re-render
 }
+/* tap a pill (touch has no hover) → reveal its detail below the row; tap again
+   or tap another pill to swap. Delegated so it survives every re-render. */
+$("#attn").addEventListener("click", e => {
+  const pill = e.target.closest(".attn"); const box = $("#attndetail");
+  if (!pill || !pill.dataset.detail) { box.classList.remove("show"); return; }
+  const same = box.classList.contains("show") && box.dataset.for === pill.dataset.detail;
+  box.textContent = pill.dataset.detail; box.dataset.for = pill.dataset.detail;
+  box.classList.toggle("show", !same);
+});
 
 /* ================= chart ================= */
 const LBL_NICE = {"5h": "session", "7d": "weekly"};
@@ -1118,12 +1141,12 @@ function renderChart() {
   let s = `<line x1="${PL}" y1="${y(0)}" x2="${PL + IW}" y2="${y(0)}" stroke="var(--line)"/>`
     + `<line x1="${PL}" y1="${y(50)}" x2="${PL + IW}" y2="${y(50)}" stroke="var(--line)" stroke-dasharray="2,5"/>`
     + `<line x1="${PL}" y1="${y(100)}" x2="${PL + IW}" y2="${y(100)}" stroke="var(--line)"/>`
-    + `<text x="2" y="${y(100) + 4}" font-size="12" fill="var(--mut)">100</text>`
-    + `<text x="2" y="${y(50) + 4}" font-size="12" fill="var(--mut)">50</text>`
-    + `<text x="2" y="${y(0) + 4}" font-size="12" fill="var(--mut)">0</text>`
+    + `<text x="2" y="${y(100) + 4}" font-size="12" fill="var(--mut)">100%</text>`
+    + `<text x="2" y="${y(50) + 4}" font-size="12" fill="var(--mut)">50%</text>`
+    + `<text x="2" y="${y(0) + 4}" font-size="12" fill="var(--mut)">0%</text>`
+    // one mark for "now": the line + label (the shaded future-rect was a third redundant mark)
     + (now >= t0 && now <= t1 ? `<line x1="${x(now)}" y1="${PT}" x2="${x(now)}" y2="${PT + IH}" stroke="var(--mut)" stroke-width="1"/>`
-    + `<text x="${x(now)}" y="${H - 8}" font-size="11" fill="var(--mut)" text-anchor="middle">now</text>`
-    + `<rect x="${x(now)}" y="${PT}" width="${Math.max(0, PL + IW - x(now))}" height="${IH}" fill="var(--mut)" opacity="0.05"/>` : "");
+    + `<text x="${x(now)}" y="${H - 8}" font-size="11" fill="var(--mut)" text-anchor="middle">now</text>` : "");
   const span = t1 - t0;
   const tickStep = span <= 10 * 3600e3 ? 3600e3 : span <= 36 * 3600e3 ? 3 * 3600e3 : span <= 5 * 24 * 3600e3 ? 12 * 3600e3 : 24 * 3600e3;
   for (let t = Math.ceil(t0 / tickStep) * tickStep; t < Math.min(now, t1); t += tickStep) {
