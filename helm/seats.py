@@ -837,7 +837,12 @@ def cmd(verb, args, room="main"):
         line = wait(seat=_flag(args, "--seat"), room=room,
                     any_row="--any" in args,
                     timeout=float(timeout) if timeout else None,
-                    emit=None if "--any" in args and not follow else print,
+                    # --follow (beacon) + --any-watch must use wait()'s FLUSHED
+                    # sink (_emit_line) — passing bare print here overrode it and
+                    # block-buffered every wake-line into oblivion on a Monitor
+                    # pipe (the beacon-never-wakes bug). Only single-shot seat
+                    # mode keeps print (deliver emits the one line + returns it).
+                    emit=None if (follow or "--any" in args) else print,
                     follow=follow)
         if follow:               # --follow streams via emit; returns on timeout
             return 0
