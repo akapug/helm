@@ -613,7 +613,9 @@ def _flatten(obj, prefix=""):
         for k, v in sorted(obj.items()):
             out.update(_flatten(v, "%s.%s" % (prefix, k) if prefix else str(k)))
     elif isinstance(obj, list):
-        if all(isinstance(x, (str, int, float, bool, type(None))) for x in obj):
+        if not obj:
+            pass  # [] == absent section: never a diff leaf (empty-vs-empty noise)
+        elif all(isinstance(x, (str, int, float, bool, type(None))) for x in obj):
             out[prefix] = obj
         else:
             for i, v in enumerate(obj):
