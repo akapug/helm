@@ -959,6 +959,100 @@ class DMTest(SeatsBase):
         self.assertEqual(chat.list_rooms(), [])
 
 
+class ProjectHomingTest(SeatsBase):
+    """Multi-PROJECT homing (owner canon main-room-topology): a seat with no
+    explicit HELM_CHAT_ROOM/--room derives its home from the join cwd's git
+    project (common-dir parent basename — worktree-agnostic); explicit wins;
+    a project-less cwd stays un-homed; rehome_seat is the deliberate move."""
+
+    def _repo(self, name="proj-alpha"):
+        import subprocess
+        repo = os.path.join(self.tmp, name)
+        os.makedirs(repo, exist_ok=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True,
+                       capture_output=True)
+        return repo
+
+    def test_derives_home_from_git_project(self):
+        repo = self._repo()
+        seats.join(session="s-1", seat="pa", cwd=repo)
+        self.assertEqual(seats.roster()["pa"]["home_room"], "proj-alpha")
+
+    def test_subdir_derives_the_repo_project_not_the_subdir(self):
+        repo = self._repo()
+        sub = os.path.join(repo, "apps", "web")
+        os.makedirs(sub)
+        seats.join(session="s-2", seat="pb", cwd=sub)
+        # project identity is the repo, never the cwd basename ('web')
+        self.assertEqual(seats.roster()["pb"]["home_room"], "proj-alpha")
+
+    def test_worktree_derives_the_main_repo_project(self):
+        repo = self._repo()
+        import subprocess
+        wt = os.path.join(self.tmp, "proj-alpha-wt-lane")
+        subprocess.run(["git", "-C", repo, "worktree", "add", "-q", wt],
+                       check=True, capture_output=True)
+        seats.join(session="s-3", seat="pc", cwd=wt)
+        self.assertEqual(seats.roster()["pc"]["home_room"], "proj-alpha")
+
+    def test_project_less_cwd_stays_unhomed(self):
+        seats.join(session="s-4", seat="pd", cwd=self.tmp)  # tmp not a repo
+        self.assertIsNone(seats.roster()["pd"].get("home_room"))
+
+    def test_explicit_room_beats_derivation(self):
+        repo = self._repo()
+        seats.join(session="s-5", seat="pe", cwd=repo, room="team-x")
+        self.assertEqual(seats.roster()["pe"]["home_room"], "team-x")
+        # HELM_CHAT_ROOM (the launch seam) also wins
+        os.environ["HELM_CHAT_ROOM"] = "team-y"
+        seats.join(session="s-6", seat="pf", cwd=repo)
+        self.assertEqual(seats.roster()["pf"]["home_room"], "team-y")
+
+    def test_derived_home_does_not_rehome_on_later_join(self):
+        repo = self._repo()
+        seats.join(session="s-7", seat="pg", cwd=repo)
+        self.assertEqual(seats.roster()["pg"]["home_room"], "proj-alpha")
+        # a project-less re-join (derive → None) never strips the home
+        seats.join(session="s-7b", seat="pg", cwd=self.tmp)
+        self.assertEqual(seats.roster()["pg"]["home_room"], "proj-alpha")
+
+    def test_repo_named_main_stays_unhomed(self):
+        repo = self._repo(name="main")
+        seats.join(session="s-8", seat="ph", cwd=repo)
+        self.assertIsNone(seats.roster()["ph"].get("home_room"))
+
+    def test_homed_project_seat_isolated_from_sibling_project(self):
+        ra, rb = self._repo("proj-a"), self._repo("proj-b")
+        seats.join(session="s-a", seat="sea", cwd=ra)   # homed #proj-a
+        chat.post("@sea proj-b mention", who="bob", room="proj-b")
+        chat.post("owner in proj-b", who="david", origin="web", room="proj-b")
+        self.assertIsNone(seats.deliver_any(session="s-a", seat="sea"))
+        chat.post("@sea proj-a word", who="bob", room="proj-a")
+        self.assertIn("proj-a word", seats.deliver_any(session="s-a", seat="sea"))
+
+    def test_rehome_seat_deliberate_move_and_clear(self):
+        repo = self._repo()
+        seats.join(session="s-9", seat="pi", cwd=repo)
+        self.assertEqual(seats.roster()["pi"]["home_room"], "proj-alpha")
+        ok, msg = seats.rehome_seat("pi", "team-z")
+        self.assertTrue(ok, msg)
+        self.assertEqual(seats.roster()["pi"]["home_room"], "team-z")
+        # isolation follows the new home immediately (no relaunch)
+        chat.post("@pi proj-a traffic", who="bob", room="proj-a")
+        self.assertIsNone(seats.deliver_any(session="s-9", seat="pi"))
+        chat.post("@pi team-z word", who="bob", room="team-z")
+        self.assertIn("team-z word", seats.deliver_any(session="s-9", seat="pi"))
+        # clear back to un-homed
+        ok, msg = seats.rehome_seat("pi", "main")
+        self.assertTrue(ok, msg)
+        self.assertIsNone(seats.roster()["pi"].get("home_room"))
+
+    def test_rehome_unknown_seat_refused(self):
+        ok, msg = seats.rehome_seat("ghost", "team-z")
+        self.assertFalse(ok)
+        self.assertIn("no roster row", msg)
+
+
 class AutoNameTest(SeatsBase):
     """G-stable-names: an un-named join gets a MEANINGFUL stable auto-name
     (project+family, deduped) instead of opaque agent-<sid8> hex."""

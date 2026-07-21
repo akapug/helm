@@ -198,6 +198,43 @@ def derive_seat(session=None, cwd=None):
     return chat.whoname()
 
 
+def _git_project(cwd):
+    """The canonical PROJECT name for a cwd: the git common-dir's parent
+    basename — worktree-agnostic (a lane worktree's common dir points back
+    at the main repo, so every helm session, checkout or worktree, derives
+    'helm'; automap.py's precedent). None when cwd is not in a work tree.
+    Read-only, fail-open; runs once per join (SessionStart), never on the
+    per-tool-call delivery hot path. NOT the roster's `project` field —
+    that's the cwd basename (a display label; a session in repo/apps/web
+    records 'web'), and homing to a subdir room would split the project."""
+    try:
+        import subprocess
+        r = subprocess.run(["git", "-C", cwd or ".", "rev-parse",
+                            "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            parent = os.path.dirname(r.stdout.strip().rstrip(os.sep))
+            return os.path.basename(parent) or None
+    except Exception:
+        pass
+    return None
+
+
+def derive_home_room(cwd):
+    """The seat's DEFAULT home room, derived from project context (owner
+    canon main-room-topology-owner-plus-meta-coordinator): the project the
+    seat works in — a helm-repo session homes to #helm, a goodtimes session
+    to #goodtimes-platform. None when the project is undiscoverable (a truly
+    project-less seat stays un-homed = all-rooms back-compat) or is 'main'
+    (a repo literally named main — homing there is the un-homed default
+    anyway). An explicit HELM_CHAT_ROOM / --room always wins (callers check
+    those first); a re-home is only ever the DELIBERATE rehome_seat move."""
+    proj = _git_project(cwd)
+    if not proj or proj == "main":
+        return None
+    return pk.slug(proj) or None
+
+
 def owner_names():
     """Display names the owner rails post under. HELM_CHAT_OWNER_NAMES csv
     overrides; default = 'david' (the web surface's name) + the unix login."""
@@ -539,6 +576,44 @@ def mutes(seat):
     return sorted((roster().get(seat) or {}).get("mute") or [])
 
 
+def rehome_seat(token, room):
+    """(ok, message). The DELIBERATE home-room move (multi-project isolation):
+    set a seat's roster home_room — the operator's explicit re-home (the only
+    path that changes an EXISTING seat's home, since a cwd-derived join never
+    silently re-homes). `room` is slugged; 'main'/'none'/'-' clears the home
+    (back to all-rooms un-homed). Takes effect on the seat's next delivery
+    scan — no relaunch needed (the allowlist reads the roster each time)."""
+    room = (room or "").strip().lower()
+    clear = room in ("", "main", "none", "-", "all")
+    home_room = None if clear else pk.slug(room)
+    with _flocked(roster_path() + ".lock"):
+        r = roster()
+        seat = _resolve_seat(r, token)
+        if seat is None:
+            return False, ("no roster row matches %r (a seat name or an "
+                           "8+-char session prefix — helm chat seats --all)"
+                           % token)
+        row = r.get(seat) or {}
+        old = row.get("home_room")
+        if clear:
+            if not old:
+                return True, "seat %s is already un-homed (all rooms)" % seat
+            row.pop("home_room", None)
+            r[seat] = row
+            pk.write_json(roster_path(), r)
+            return True, ("seat %s re-homed %s -> un-homed (all rooms); "
+                          "takes effect on its next delivery scan"
+                          % (seat, old))
+        if home_room == old:
+            return True, "seat %s is already homed to #%s" % (seat, home_room)
+        row["home_room"] = home_room
+        r[seat] = row
+        pk.write_json(roster_path(), r)
+    return True, ("seat %s re-homed %s -> #%s; delivery is now { #%s, #main } "
+                  "— takes effect on its next delivery scan (no relaunch)"
+                  % (seat, old or "un-homed", home_room, home_room))
+
+
 # ---------------------------------------------------------------------------
 # the cursor (codex H5) + the tail scan both deliver and the report use
 # ---------------------------------------------------------------------------
@@ -867,12 +942,18 @@ def join(session=None, cwd=None, seat=None, room="main"):
     (all live rooms for legacy un-homed seats; {home, main} for homed seats),
     so pre-join backlog never floods and later admitted rooms can backfill."""
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
-    # Hooks carry HELM_CHAT_ROOM; direct `helm chat join --room team-x` and
-    # `helm launch --room team-x` carry the explicit argument instead. The
-    # implicit main default stays un-homed for backward-compatible all-room
-    # delivery until an operator deliberately homes the seat.
+    # Homing precedence (multi-project isolation): an explicit HELM_CHAT_ROOM
+    # (the launch seam) or a non-main --room (deliberate) WINS; absent both,
+    # the home DERIVES from the join cwd's git project (a helm-repo seat →
+    # #helm) so project channels are the default and #main stays the owner's
+    # all-hands; a project-less cwd leaves the seat un-homed (all-rooms
+    # back-compat). A once-homed seat is NEVER silently re-homed by a later
+    # cwd-only join (write_roster re-homes only on an explicit home_room).
     home_room = home.env("CHAT_ROOM") or (room if room != "main" else None)
-    home_room = pk.slug(home_room) if home_room else None
+    if home_room:
+        home_room = pk.slug(home_room)
+    else:
+        home_room = derive_home_room(cwd)
     write_roster(seat, session=session, cwd=cwd, home_room=home_room)
     lane = dm_lane(seat)
     for r in _scan_rooms(room, seat=seat):
@@ -1705,9 +1786,13 @@ def cmd(verb, args, room="main"):
             ok, msg = set_mute(who, args[0], on=sub == "mute")
             print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
             return 0 if ok else 1
+        if args[:1] == ["rehome"] and len(args) >= 3:
+            ok, msg = rehome_seat(args[1], args[2])
+            print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
+            return 0 if ok else 1
         print("usage: helm chat seat rename <sid|oldname> <newname> | "
-              "seat mute|unmute <room> [--seat S] | seat mutes [--seat S]",
-              file=sys.stderr)
+              "seat mute|unmute <room> [--seat S] | seat mutes [--seat S] | "
+              "rehome <sid|name> <room|main|none>", file=sys.stderr)
         return 2
     if verb == "stop-guard":
         try:
