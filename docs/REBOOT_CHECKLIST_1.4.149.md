@@ -181,25 +181,36 @@ home** — credentials, config, and session history fully isolated per account:
   provides the guarantee helm's credhomes were built for (isolated per-account
   creds + sessions pinned to their creating account).
 
-### What is STILL open — the only thing the live test must decide
+### RESOLVED by ground truth — no live test needed
 
-**orca isolates per-ACCOUNT; helm isolates per-SEAT.** Two helm seats on the SAME
-account (e.g. `codex` and `codex-2`, both on the ultra) would share that
-account's single orca home. So:
+The earlier framing here asked whether two helm SEATS sharing one ACCOUNT would
+collide in one shared orca home. Measured on this host, that question is moot:
 
-* **E7 (the deciding test):** launch two seats under ONE account against one
-  shared home. Do their sessions coexist cleanly — separate session records, no
-  cross-resume, no violation of the single-open law — or do they collide?
-  * If they COEXIST → helm can drop per-seat pinning and defer credhoming to
-    orca entirely (one cred pool, `helm session port --cred` targeting
-    `~/.config/orca/claude-accounts/<uuid>/auth`).
-  * If they COLLIDE → helm keeps per-seat pinning as sub-account isolation, and
-    orca owns the per-account layer beneath it.
+* **codex / kimi seats hold NO credentials.** Their `CLAUDE_CONFIG_DIR`
+  (`seats/codex/claude`, `seats/codex/instances/codex-2/claude`, …) is a SESSION
+  dir; the actual credential lives in the local CLIProxyAPI auth dir
+  (`ANTHROPIC_BASE_URL=127.0.0.1:8317`). codex, codex-2 and codex-3 are three
+  seats on ONE codex account, and their dirs exist to keep SESSIONS apart, not
+  creds. Orca's credhoming — any version — neither helps nor hurts them.
+* **For claude-direct sessions the credhome IS the account store, and multiple
+  sessions already share one home cleanly.** Proven live, not theorised:
+  `opus-integrator` and `helm-claude` both ran for hours against
+  `~/.claude-homes/cto-example` — two sessions, one account, one home, zero
+  collisions.
+
+**Therefore:** orca rc.2's per-ACCOUNT isolation is SUFFICIENT — there is no
+sub-account isolation requirement to satisfy. helm can defer credhoming for
+claude-direct sessions to orca rc.2+, while proxy seats keep their own session
+dirs regardless (they were never cred homes).
+
+### What is STILL open
+
 * **E8:** does a `/login` INSIDE an orca-managed pane still overwrite that
   account's home in place (leaving a home named for A holding B)? If yes, the
   `credhome-name-account-drift` class survives rc.2 and `helm cred`
-  (backup + identity-from-content + heal) remains necessary regardless.
+  (backup + identity-from-content + heal) remains necessary regardless of who
+  owns the home. This is the one row worth running live.
 
 *Owner feedback loop: the orca team explicitly asked for feedback from exactly
-this multi-account power-user case. E7/E8 results — plus the measured `/login`
-drift — are the feedback worth sending back.*
+this multi-account power-user case. The measured `/login` drift and the
+proxy-seat decoupling above are the feedback worth sending back.*
