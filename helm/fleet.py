@@ -10,17 +10,32 @@ QUESTIONS GET ANSWERED BY RUNNING THIS VERB, never from memory, and answers
 given to anyone (owner included) quote its output.
 
 ONE TRUTH OWNER: this verb never re-derives what another module already
-proves. SID truth is helm/session.py's WHOLE census (_proc_claude_rows: the
-procStart-bound pid record, fail-closed --resume argv, who attribution, cwd
-candidate set, and the final generation recheck) — fleet consumes those rows
-verbatim and only composes them with its own display probes. The census also
-exports each row's bracketed cwd and canonical trusted config root, so fleet
-never re-derives a config home either. Consumed WHOLE means the census is
-also the ONLY row source: no second /proc comm scan may resurrect a pid the
-census rejected (its generation recheck failed — no coherent facts exist for
-it), and a census cwd=None is never patched with a later unbracketed
-/proc/<pid>/cwd read, because that would compose two process generations
-into one row and could join a pane across them.
+proves. SID truth is helm/session.py's WHOLE census (_proc_claude_census:
+the procStart-bound pid record, fail-closed --resume argv, who attribution,
+cwd candidate set, and the final generation recheck) — fleet consumes those
+rows verbatim and only composes them with its own display probes. The census
+also exports each row's bracketed cwd, canonical trusted config root,
+bracket generation (start) and bracketed WHOLE environ, so fleet never
+re-derives a config home and never re-opens a proc environ file: seat, deck
+and stamp facts come from the same coherent read the census proved, never
+from a later moment a reused pid could answer. Consumed WHOLE means the
+census is also the ONLY row source: no second /proc comm scan may resurrect
+a pid the census rejected (its generation recheck failed — no coherent facts
+exist for it), and a census cwd=None is never patched with a later
+unbracketed /proc/<pid>/cwd read, because that would compose two process
+generations into one row and could join a pane across them. And it is
+consumed WITH its completeness channel: a failed /proc enumeration surfaces
+as census_failed — the verb prints estate-UNKNOWN and exits 1, never
+certifying an empty estate it never read — and a failed who scan marks every
+sub-declared/resume row sid-UNKNOWN instead of letting the vanished rung
+read as a proven blank.
+
+The one display probe that DOES re-read /proc after the census — the
+daemon/host ppid walk — is only composed in after a FINAL generation
+recheck (_generation_intact: live starttime == the row's bracketed start),
+run after all display probes: a pid reused between census and walk must
+never combine the old row's sid/home/cwd with the new process's ancestry,
+so a failed recheck kills daemon/pane to UNKNOWN.
 
 One row per census (same-uid live claude) process:
   pid, seat (HELM_CHAT_NAME or roster reverse-lookup), sid (census identity
@@ -37,7 +52,8 @@ UNKNOWN, never an absence fact (premise failed-probe-not-absence): HEADLESS is
 a PROVEN verdict (a fully-parsed ppid walk that reached init, touching no pid
 the daemon scan left unproven); an unparsable hop, exhausted walk, stale or
 unprovable daemon evidence, failed daemon scan, unreadable environ/cwd,
-untrusted config root, failed roster, or failed/misshapen terminal list
+untrusted config root, failed roster, failed/misshapen terminal list, failed
+who scan, or failed final generation recheck
 renders host/columns as '?' and marks the row UNKNOWN. The verb is read-only
 and safe to run at any moment.
 """
@@ -59,23 +75,26 @@ _FAILED_PROBE_REASONS = {"environ-unreadable", "record-unreadable",
                          "record-replaced"}
 
 
-def _environ(pid):
-    """Full environ dict, or None when the probe FAILED. None is not {}:
-    an unreadable environ must surface as UNKNOWN, never as unset-vars."""
-    try:
-        with open("/proc/%d/environ" % pid, "rb") as f:
-            return dict(kv.split("=", 1) for kv in
-                        f.read().decode("utf-8", "replace").split("\0")
-                        if "=" in kv)
-    except OSError:
-        return None
-
-
 def _census():
-    """{pid: row} straight from session._proc_claude_rows() — the ONE sid
-    truth owner (record/argv/who/cwd rungs, generation recheck, canonical
-    config root). Fleet never re-derives any of it."""
-    return {r["pid"]: r for r in session._proc_claude_rows()}
+    """({pid: row}, census_failed, who_failed) straight from
+    session._proc_claude_census() — the ONE sid truth owner (record/argv/who/
+    cwd rungs, generation recheck, canonical config root, bracketed environ).
+    Fleet never re-derives any of it. census_failed means the /proc
+    enumeration itself failed: the empty table is a FAILED PROBE, not a
+    proven-empty estate. who_failed means the who rung was never probed."""
+    c = session._proc_claude_census()
+    return ({r["pid"]: r for r in c["rows"]}, c["listing_failed"],
+            c["who_failed"])
+
+
+def _generation_intact(pid, start):
+    """The census generation still owns the pid NOW. Run AFTER the row's
+    display probes: the census row was proven coherent at return time, but
+    the host walk re-reads /proc later — if the pid was reused in between,
+    those reads describe a DIFFERENT process and must not be composed onto
+    the census facts. start=None never verifies (an unbracketed row cannot
+    be re-proven)."""
+    return start is not None and session._proc_start(pid) == start
 
 
 def _cmdline_argv(pid):
@@ -254,21 +273,25 @@ def rows():
     roster, roster_err = _roster()
     stamp_keys = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
                   "CLAUDE_CODE_BRIDGE_SESSION_ID")
-    census = _census()
+    census, census_failed, who_failed = _census()
     live = session.live_sids(list(census.values()))
     tilde = lambda p: p.replace(os.path.expanduser("~"), "~")  # noqa: E731
     out, raw_cwds = [], {}
     for pid in sorted(census):  # the census is the ONLY row source
-        env = _environ(pid)
-        env_unknown = env is None  # failed probe, NOT an empty environment
         sr = census[pid]
+        # the census's BRACKETED environ, verbatim — never a live re-read
+        # that a pid reused since the census could answer
+        env = sr["environ"]
+        env_unknown = env is None  # failed probe, NOT an empty environment
         sid = sr["session"]
         sid_src = _SID_SRC.get(sr["identity"])
         candidates = list(sr["possible_sessions"])
         # a census row can itself be a failed probe: unresolved because the
-        # record/environ READ failed, not because evidence proved a blank
-        sid_unknown = (
-            sid is None and sr.get("declared_reason") in _FAILED_PROBE_REASONS)
+        # record/environ READ failed — or because the who rung was never
+        # probed at all — not because evidence proved a blank
+        sid_unknown = sid is None and (
+            sr.get("declared_reason") in _FAILED_PROBE_REASONS
+            or (who_failed and not sr.get("child")))
         double_open = bool(sid) and len(live.get(sid) or ()) > 1
         seat, seat_src = _seat_for(pid, env, roster, roster_err)
         deck = (env or {}).get("HELM_SKILL_DECK", "")
@@ -316,15 +339,32 @@ def rows():
             r["pane"] = _pane_for(raw_cwds[r["pid"]], terminals, shared)
             if terms_failed:
                 r["unknown"] = True  # pane truth unavailable = failed probe
-    return out, sorted(daemons)
+    # FINAL generation recheck, AFTER every display probe: the host walk
+    # re-read /proc later than the census bracket. If the pid's generation
+    # changed in between, those fresh reads describe a DIFFERENT process
+    # (PID reuse) — their conclusions (daemon, proven HEADLESS, pane) must
+    # die UNKNOWN, never be composed onto the census facts. Env facts need
+    # no recheck: they come from the census's own bracket.
+    for r in out:
+        if _generation_intact(r["pid"], census[r["pid"]]["start"]):
+            continue
+        r["daemon"], r["daemon_state"], r["pane"] = None, "unknown", None
+        r["unknown"] = True
+    return out, sorted(daemons), census_failed
 
 
 def cmd_fleet(args):
     """fleet [--json] — every live claude process, composition truth."""
-    table, daemons = rows()
+    table, daemons, census_failed = rows()
     if "--json" in args:
-        print(json.dumps({"rows": table, "daemons": daemons}, indent=2))
-        return 0
+        print(json.dumps({"rows": table, "daemons": daemons,
+                          "census_failed": census_failed}, indent=2))
+        return 1 if census_failed else 0
+    if census_failed:
+        print("helm fleet — CENSUS FAILED: /proc could not be enumerated. "
+              "The estate is UNKNOWN, not empty — zero rows is a failed "
+              "probe, never proven absence.")
+        return 1
     print("helm fleet — %d live claude process(es), %d orca daemon(s)"
           % (len(table), len(daemons)))
     for r in table:

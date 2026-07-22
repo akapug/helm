@@ -221,6 +221,18 @@ def _selected_environ(raw):
     return out
 
 
+def _full_environ(raw):
+    """The bracketed environ, decoded WHOLE, or None when the bracketed read
+    failed. Exported on census rows so consumers (fleet's seat/deck/stamp
+    columns) read env facts from the SAME process generation the census
+    proved coherent, instead of re-opening /proc/<pid>/environ at a later
+    moment a reused pid could answer."""
+    if raw is None:
+        return None
+    return dict(kv.split("=", 1) for kv in
+                raw.decode("utf-8", "replace").split("\0") if "=" in kv)
+
+
 def _proc_snapshot(pid):
     """One same-uid Claude process, bracketed before later record/who reads.
     Optional environ/cwd failures keep a visible UNKNOWN-capable row."""
@@ -405,26 +417,40 @@ def _sid_from_session_file(pid, config_dir, home_dir=None, uid=None,
     return _session_record(pid, config_dir, home_dir, uid, proc_start)[0]
 
 
-def _proc_claude_rows():
-    """Every same-uid live Claude process. Resolution ladder, strongest first:
+def _proc_claude_census():
+    """Every same-uid live Claude process, PLUS the completeness of the two
+    GLOBAL probes the table rests on. Resolution ladder, strongest first:
     procStart-bound pid record -> unambiguous full ``--resume`` UUID -> exact
     ``helm who`` attribution -> cwd candidate set. Every per-pid read is
-    bracketed; one bad record only demotes its own rung."""
-    snapshots = []
+    bracketed; one bad record only demotes its own rung.
+
+    ``listing_failed`` True means the /proc enumeration itself failed: zero
+    rows because nothing was READ, not because nothing runs — a consumer must
+    render estate-UNKNOWN, never certify an empty estate. ``who_failed`` True
+    means the who rung was never probed: an unresolved non-child row may only
+    look unresolved because its strongest remaining rung silently vanished —
+    a failed probe, not a proven blank.
+
+    Each row also exports its bracket: ``start`` (the pid generation every
+    fact was proven against — a consumer making LATER /proc reads must
+    re-prove it before composing them in) and ``environ`` (the bracketed
+    environ, whole, so env facts never need a second unbracketed read)."""
+    snapshots, listing_failed = [], False
     try:
         pids = sorted((int(p) for p in os.listdir(PROC) if p.isdigit()))
     except OSError:
-        pids = []
+        pids, listing_failed = [], True
     for pid in pids:
         snap = _proc_snapshot(pid)
         if snap:
             snapshots.append(snap)
+    who_failed = False
     try:
         from . import who
         who_rows = {r["pid"]: r for r in who.scan(accounts=[])
                     if r.get("provider") == "anthropic" and not r.get("child")}
     except (OSError, ValueError):
-        who_rows = {}
+        who_rows, who_failed = {}, True
     cwd_candidates = {}
     rows = []
     for snap in snapshots:
@@ -461,10 +487,13 @@ def _proc_claude_rows():
             "declared": declared,
             "declared_reason": reason,
             # exported composition context (consumed by helm/fleet.py so it can
-            # CALL this census instead of re-deriving it): the bracketed cwd and
-            # the canonical trusted config root (None = config-untrusted).
+            # CALL this census instead of re-deriving it): the bracketed cwd,
+            # the canonical trusted config root (None = config-untrusted), the
+            # bracket generation, and the bracketed whole environ.
             "cwd": snap["cwd"],
             "root": root,
+            "start": snap["start"],
+            "environ": _full_environ(snap["environ"]),
             "identity": ("declared" if declared else "resume" if resume
                          else "who" if attributed else "unknown"),
             "session": session_id,
@@ -473,7 +502,15 @@ def _proc_claude_rows():
             "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
             "force": env.get(FORCE_VAR) == "1",
         })
-    return rows
+    return {"rows": rows, "listing_failed": listing_failed,
+            "who_failed": who_failed}
+
+
+def _proc_claude_rows():
+    """The census rows alone — the holder/liveness callers' shape. A consumer
+    that must not turn a failed GLOBAL probe into proven absence (helm fleet)
+    calls _proc_claude_census() and honors its completeness bits instead."""
+    return _proc_claude_census()["rows"]
 
 
 def live_sids(rows=None):

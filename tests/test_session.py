@@ -986,9 +986,11 @@ class ProcCensusTest(unittest.TestCase):
                 "cmdline": raw, "environ": environ, "argv": argv + [""],
                 "env": {"HOME": os.path.expanduser("~")}, "cwd": cwd}
 
-    def rows(self, snapshots, records, who_rows=None, candidates=None,
-             matches=True):
+    def census(self, snapshots, records, who_rows=None, candidates=None,
+               matches=True, who_fail=False):
         by_pid = {s["pid"]: s for s in snapshots}
+        who_scan = (mock.Mock(side_effect=OSError) if who_fail
+                    else mock.Mock(return_value=who_rows or []))
         with mock.patch.object(session.os, "listdir",
                                return_value=[str(p) for p in by_pid]), \
              mock.patch.object(session, "_proc_snapshot",
@@ -996,10 +998,13 @@ class ProcCensusTest(unittest.TestCase):
              mock.patch.object(session, "_session_record",
                                side_effect=lambda p, *_: records[p]), \
              mock.patch.object(session, "_proc_matches", return_value=matches), \
-             mock.patch.object(who, "scan", return_value=who_rows or []), \
+             mock.patch.object(who, "scan", who_scan), \
              mock.patch.object(session, "_cwd_session_ids",
                                return_value=candidates or []):
-            return session._proc_claude_rows()
+            return session._proc_claude_census()
+
+    def rows(self, *a, **kw):
+        return self.census(*a, **kw)["rows"]
 
     def test_declared_outranks_resume_and_exposes_independent_double_open(self):
         snaps = [self.snap(41), self.snap(42)]
@@ -1060,6 +1065,51 @@ class ProcCensusTest(unittest.TestCase):
         rows = self.rows([self.snap()],
                          {41: (self.NEW, "record-ok", "/cfg")}, matches=False)
         self.assertEqual(rows, [])
+
+    def test_failed_proc_listing_is_census_failed_not_empty_estate(self):
+        # codex-2 fleet round-3 finding 2, exact probe: an OSError from the
+        # /proc enumeration must surface as listing_failed — zero rows
+        # because nothing was READ, never a proven-empty estate
+        with mock.patch.object(session.os, "listdir",
+                               mock.Mock(side_effect=OSError)), \
+             mock.patch.object(who, "scan", return_value=[]):
+            c = session._proc_claude_census()
+            compat = session._proc_claude_rows()
+        self.assertEqual((c["rows"], c["listing_failed"], c["who_failed"]),
+                         ([], True, False))
+        # the compat wrapper keeps the bare-rows shape for holder callers
+        self.assertEqual(compat, [])
+
+    def test_who_scan_failure_is_flagged_never_silently_unattributed(self):
+        # the OTHER global census probe: a dead who scan means the who rung
+        # was never probed — the flag must rise so consumers stop reading
+        # sub-declared/resume rows as proven blanks
+        snap = self.snap(argv=["claude", "--continue"])
+        record = {41: (None, "record-missing", "/cfg")}
+        c = self.census([snap], record, who_fail=True)
+        self.assertTrue(c["who_failed"])
+        self.assertFalse(c["listing_failed"])
+        self.assertEqual(c["rows"][0]["identity"], "unknown")
+        # healthy counterpart: a probed who scan keeps the flag down
+        c = self.census([snap], record)
+        self.assertEqual((c["listing_failed"], c["who_failed"]),
+                         (False, False))
+
+    def test_rows_export_the_bracket_generation_and_whole_environ(self):
+        # codex-2 fleet round-3 finding 1: each row carries its bracket —
+        # start (the generation every fact was proven against) and the
+        # bracketed environ, whole — so consumers never make a second,
+        # unbracketed /proc read for env facts
+        row = self.rows([self.snap()],
+                        {41: (self.NEW, "record-ok", "/cfg")})[0]
+        self.assertEqual(row["start"], "410")
+        self.assertEqual(row["environ"], {"HOME": os.path.expanduser("~")})
+        # a failed bracketed environ read exports None, never {}
+        snap = self.snap()
+        snap["environ"] = snap["env"] = None
+        row = self.rows([snap], {41: (self.NEW, "record-ok", "/cfg")})[0]
+        self.assertIsNone(row["environ"])
+        self.assertEqual(row["declared_reason"], "environ-unreadable")
 
 
 if __name__ == "__main__":

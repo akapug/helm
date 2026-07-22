@@ -25,36 +25,47 @@ SID_B = "87654321-4321-4321-4321-cba987654321"
 
 
 def srow(pid, sid=None, identity="unknown", root=None, cwd="/w",
-         possible=(), reason="record-missing"):
-    """One session._proc_claude_rows() row as the census actually shapes it."""
+         possible=(), reason="record-missing", start="g1", environ=()):
+    """One session census row as the census actually shapes it."""
     return {"pid": pid, "resume": sid if identity == "resume" else None,
             "declared": sid if identity == "declared" else None,
             "declared_reason": "record-ok" if identity == "declared"
                                else reason,
             "cwd": cwd, "root": root, "identity": identity, "session": sid,
             "possible_sessions": list(possible), "child": False,
-            "ancestor_sid8": "", "force": False}
+            "ancestor_sid8": "", "force": False,
+            "start": start,
+            "environ": None if environ is None else dict(environ)}
 
 
 class FleetRowsTest(unittest.TestCase):
     def _wire(self, envs, census=(), daemons=(), daemons_failed=False,
-              daemon_for=None, roster=({}, False), terminals=([], False)):
-        census = {r["pid"]: r for r in census}
+              daemon_for=None, roster=({}, False), terminals=([], False),
+              census_failed=False, who_failed=False, generation=None):
+        merged = []
+        for r in census:
+            r = dict(r)
+            # envs is keyed by pid; None = the bracketed environ read failed
+            r["environ"] = envs.get(r["pid"], r.get("environ"))
+            merged.append(r)
+        census = {r["pid"]: r for r in merged}
         daemons = dict(daemons)
         daemon_for = daemon_for or (
             lambda pid, ds, unproven: (("daemon", sorted(ds)[0]) if ds
                                        else ("headless", None)))
+        generation = generation or (lambda pid, start: True)
         return [
-            mock.patch.object(fleet, "_census", lambda: census),
+            mock.patch.object(fleet, "_census",
+                              lambda: (census, census_failed, who_failed)),
             mock.patch.object(fleet, "_daemon_pids",
                               lambda: (daemons, set(), daemons_failed)),
-            mock.patch.object(fleet, "_environ", lambda pid: envs.get(pid)),
             mock.patch.object(fleet, "_daemon_for", daemon_for),
             mock.patch.object(fleet, "_roster", lambda: roster),
             mock.patch.object(fleet, "_orca_terminals", lambda: terminals),
+            mock.patch.object(fleet, "_generation_intact", generation),
         ]
 
-    def _rows(self, *a, **kw):
+    def _rows_full(self, *a, **kw):
         ps = self._wire(*a, **kw)
         for p in ps:
             p.start()
@@ -64,18 +75,25 @@ class FleetRowsTest(unittest.TestCase):
             for p in ps:
                 p.stop()
 
-    def _render(self, *a, **kw):
+    def _rows(self, *a, **kw):
+        table, daemons, _failed = self._rows_full(*a, **kw)
+        return table, daemons
+
+    def _render_rc(self, *a, args=(), **kw):
         buf = io.StringIO()
         ps = self._wire(*a, **kw)
         for p in ps:
             p.start()
         try:
             with contextlib.redirect_stdout(buf):
-                fleet.cmd_fleet([])
+                rc = fleet.cmd_fleet(list(args))
         finally:
             for p in ps:
                 p.stop()
-        return buf.getvalue()
+        return buf.getvalue(), rc
+
+    def _render(self, *a, **kw):
+        return self._render_rc(*a, **kw)[0]
 
     def test_stamps_and_deck_are_read_from_the_live_env(self):
         envs = {10: {"HELM_CHAT_NAME": "a-seat",
@@ -93,14 +111,20 @@ class FleetRowsTest(unittest.TestCase):
 
     def test_every_column_is_probed_never_cached(self):
         # the verb exists BECAUSE cached mental models rot: rows() must call
-        # the live probes on every invocation
-        calls = {"n": 0}
+        # the live probes (census included) on every invocation
+        calls = {"census": 0, "daemons": 0}
+        rows_ = [srow(1), srow(2)]
 
-        def envs(pid):
-            calls["n"] += 1
-            return {}
-        ps = self._wire({1: {}, 2: {}}, [srow(1), srow(2)])
-        ps[2] = mock.patch.object(fleet, "_environ", envs)
+        def census():
+            calls["census"] += 1
+            return {r["pid"]: r for r in rows_}, False, False
+
+        def daemon_pids():
+            calls["daemons"] += 1
+            return {}, set(), False
+        ps = self._wire({1: {}, 2: {}}, rows_)
+        ps[0] = mock.patch.object(fleet, "_census", census)
+        ps[1] = mock.patch.object(fleet, "_daemon_pids", daemon_pids)
         for p in ps:
             p.start()
         try:
@@ -109,7 +133,7 @@ class FleetRowsTest(unittest.TestCase):
         finally:
             for p in ps:
                 p.stop()
-        self.assertEqual(calls["n"], 4)
+        self.assertEqual(calls, {"census": 2, "daemons": 2})
 
     def test_unreadable_environ_is_unknown_not_absence(self):
         # env=None is a FAILED probe: home/deck show ?, stamps unproven, the
@@ -154,11 +178,13 @@ class SidDelegationTest(FleetRowsTest):
     consumed whole — record, argv, who, cwd-candidate rungs AND the final
     generation recheck — never a fleet-side splice of private helpers."""
 
-    def test_census_calls_proc_claude_rows_verbatim(self):
+    def test_census_calls_the_whole_census_verbatim(self):
         rows = [srow(7, SID_A, "declared", root="/r")]
-        with mock.patch.object(session, "_proc_claude_rows",
-                               return_value=rows) as prc:
-            self.assertEqual(fleet._census(), {7: rows[0]})
+        with mock.patch.object(
+                session, "_proc_claude_census",
+                return_value={"rows": rows, "listing_failed": False,
+                              "who_failed": False}) as prc:
+            self.assertEqual(fleet._census(), ({7: rows[0]}, False, False))
         prc.assert_called_once_with()
 
     def test_fleet_source_rederives_no_sid_or_config_parsing(self):
@@ -170,7 +196,13 @@ class SidDelegationTest(FleetRowsTest):
         for banned in ("_proc_snapshot", "_session_record", "_resume_sid",
                        "_sid_for", "_sids_for", "argv~ancestor",
                        "_config_root", "CLAUDE_CONFIG_DIR",
-                       "_claude_pids", "glob", "readlink"):
+                       "_claude_pids", "glob", "readlink",
+                       # round-3 finding 1: env facts come from the census
+                       # bracket — fleet never re-opens a proc environ file
+                       "proc/%d/environ", "_environ(",
+                       # round-3 finding 2: the completeness-blind rows-only
+                       # shape is not fleet's entry point
+                       "_proc_claude_rows"):
             self.assertNotIn(banned, src, banned)
 
     def test_every_census_identity_maps_to_its_source_label(self):
@@ -456,6 +488,163 @@ class UnknownPlumbingTest(FleetRowsTest):
                                             cwd=None)])
         self.assertEqual(rows[0]["cwd"], "?")
         self.assertTrue(rows[0]["unknown"])
+
+
+class GenerationBracketTest(FleetRowsTest):
+    """codex-2 round-3 finding 1: a census row is only coherent for ITS
+    process generation. Env facts come from the census's bracketed environ
+    (never a later live re-read), and the host walk's fresh /proc reads are
+    only composed in when a FINAL recheck proves the same generation still
+    owns the pid — run after all display probes."""
+
+    def test_seat_deck_stamps_come_from_the_census_bracket(self):
+        # our OWN pid: if fleet still re-read the live proc environ it would
+        # get THIS process's real environment, not the bracketed marker
+        pid = os.getpid()
+        census = [srow(pid, SID_A, "declared", root="/r")]
+        envs = {pid: {"HELM_CHAT_NAME": "bracketed-seat",
+                      "CLAUDE_CODE_SESSION_ID": "x",
+                      "HELM_SKILL_DECK": "/x/helm-skills"}}
+        rows, _ = self._rows(envs, census)
+        r = rows[0]
+        self.assertEqual((r["seat"], r["seat_src"], r["stamps"], r["deck"]),
+                         ("bracketed-seat", "env", 1, "helm"))
+        self.assertFalse(r["unknown"])
+
+    def test_reused_pid_display_probes_are_discarded_not_composed(self):
+        # the review's exact probe: old canonical row (sid/home/cwd) + a
+        # reused pid answering the walk as proven-HEADLESS with a new seat.
+        # The failed recheck must kill the host claim to UNKNOWN — never
+        # compose old census facts with the new process's ancestry
+        census = [srow(7, SID_A, "declared", root="/r", start="g-old")]
+        wire = dict(daemon_for=lambda pid, ds, unp: ("headless", None),
+                    generation=lambda pid, start: False)
+        rows, _ = self._rows({7: {"HELM_CHAT_NAME": "old-seat"}}, census,
+                             **wire)
+        r = rows[0]
+        self.assertEqual((r["daemon_state"], r["daemon"], r["pane"]),
+                         ("unknown", None, None))
+        self.assertTrue(r["unknown"])
+        out = self._render({7: {"HELM_CHAT_NAME": "old-seat"}}, census,
+                           **wire)
+        self.assertIn("host=?", out)
+        self.assertNotIn("HEADLESS", out)
+        self.assertIn("UNKNOWN columns", out)
+
+    def test_failed_recheck_also_kills_a_daemon_pane_claim(self):
+        census = [srow(7, SID_A, "declared", root="/r", cwd="/w/a")]
+        terms = [{"handle": "term_1", "worktreePath": "/w/a"}]
+        rows, _ = self._rows({7: {}}, census, daemons={99: "1"},
+                             terminals=(terms, False),
+                             generation=lambda pid, start: False)
+        r = rows[0]
+        self.assertEqual((r["daemon_state"], r["daemon"], r["pane"]),
+                         ("unknown", None, None))
+        self.assertTrue(r["unknown"])
+
+    def test_intact_generation_keeps_the_proven_host(self):
+        # affirmative counterpart, and the recheck receives the row's OWN
+        # exported bracket generation
+        seen = []
+        census = [srow(7, SID_A, "declared", root="/r", start="g-live")]
+        rows, _ = self._rows({7: {}}, census, daemons={99: "1"},
+                             generation=lambda pid, start: (
+                                 seen.append((pid, start)) or True))
+        self.assertEqual(seen, [(7, "g-live")])
+        self.assertEqual(rows[0]["daemon"], 99)
+        self.assertFalse(rows[0]["unknown"])
+
+    def test_recheck_runs_after_every_display_probe(self):
+        order = []
+        census = {7: srow(7, SID_A, "declared", root="/r", cwd="/w/a")}
+
+        def daemon_for(pid, ds, unp):
+            order.append("walk")
+            return "daemon", 99
+
+        def terminals():
+            order.append("terminals")
+            return [{"handle": "t", "worktreePath": "/w/a"}], False
+
+        def generation(pid, start):
+            order.append("recheck")
+            return True
+        with mock.patch.object(fleet, "_census",
+                               lambda: (census, False, False)), \
+             mock.patch.object(fleet, "_daemon_pids",
+                               lambda: ({99: "1"}, set(), False)), \
+             mock.patch.object(fleet, "_daemon_for", daemon_for), \
+             mock.patch.object(fleet, "_roster", lambda: ({}, False)), \
+             mock.patch.object(fleet, "_orca_terminals", terminals), \
+             mock.patch.object(fleet, "_generation_intact", generation):
+            fleet.rows()
+        self.assertEqual(order, ["walk", "terminals", "recheck"])
+
+    def test_generation_intact_is_a_real_starttime_recheck(self):
+        # the REAL probe: our own live pid verifies against its true
+        # starttime, and NOTHING else — wrong bracket, missing bracket, and
+        # a nonexistent pid all refuse
+        pid = os.getpid()
+        start = session._proc_start(pid)
+        self.assertIsNotNone(start)
+        self.assertTrue(fleet._generation_intact(pid, start))
+        self.assertFalse(fleet._generation_intact(pid, "999"))
+        self.assertFalse(fleet._generation_intact(pid, None))
+        self.assertFalse(fleet._generation_intact(2 ** 22 + 12345, start))
+
+
+class CensusCompletenessTest(FleetRowsTest):
+    """codex-2 round-3 finding 2: the sole-source census carries a
+    completeness channel. A failed /proc enumeration is estate-UNKNOWN
+    (exit 1), never a certified-empty fleet; a failed who scan marks every
+    sub-declared/resume row sid-UNKNOWN."""
+
+    def test_census_failure_cannot_certify_an_empty_estate(self):
+        table, daemons, failed = self._rows_full({}, (), census_failed=True)
+        self.assertEqual(table, [])
+        self.assertTrue(failed)
+        out, rc = self._render_rc({}, (), census_failed=True)
+        self.assertEqual(rc, 1)
+        self.assertIn("CENSUS FAILED", out)
+        self.assertIn("UNKNOWN, not empty", out)
+        self.assertNotIn("0 live claude process(es)", out)
+
+    def test_census_failure_reaches_json_consumers(self):
+        out, rc = self._render_rc({}, (), census_failed=True,
+                                  args=("--json",))
+        self.assertEqual(rc, 1)
+        self.assertTrue(json.loads(out)["census_failed"])
+        # and a healthy run still certifies the affirmative bit
+        out, rc = self._render_rc({}, (), args=("--json",))
+        self.assertEqual(rc, 0)
+        self.assertFalse(json.loads(out)["census_failed"])
+
+    def test_successful_empty_census_is_a_fact(self):
+        out, rc = self._render_rc({}, ())
+        self.assertEqual(rc, 0)
+        self.assertIn("0 live claude process(es)", out)
+
+    def test_who_scan_failure_marks_sub_who_rows_sid_unknown(self):
+        # declared/resume rows outrank the who rung and stay proven; rows
+        # whose ladder bottomed out BELOW them may only look unresolved
+        # because the who probe vanished — UNKNOWN, not a proven blank
+        census = [srow(1, SID_A, "declared", root="/r"),
+                  srow(2, SID_B, "resume", root="/r"),
+                  srow(3, possible=[SID_A], root="/r"),
+                  srow(4, root="/r")]
+        child = srow(5, root="/r")
+        child["child"] = True  # who is suppressed for children by design
+        envs = {p: {} for p in (1, 2, 3, 4, 5)}
+        rows, _ = self._rows(envs, census + [child], who_failed=True)
+        by = {r["pid"]: r for r in rows}
+        self.assertFalse(by[1]["unknown"])
+        self.assertFalse(by[2]["unknown"])
+        self.assertTrue(by[3]["unknown"])
+        self.assertTrue(by[4]["unknown"])
+        self.assertFalse(by[5]["unknown"])
+        # the healthy counterpart: same rows, probed who, no taint
+        rows, _ = self._rows(envs, census + [child])
+        self.assertFalse(any(r["unknown"] for r in rows))
 
 
 class SidParserTest(unittest.TestCase):
