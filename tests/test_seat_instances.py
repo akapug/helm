@@ -69,12 +69,14 @@ class LaunchLineInstanceTest(Slice6Base):
         self.assertIn("HELM_CELL_PROFILE=codex-2", line)
         self.assertIn("DREGG_PROFILE=codex-2", line)
         self.assertIn("instances/codex-2/claude", line)
-        # same family port + token as the default line (one proxy, one pool)
+        # per-instance proxies: an instance gets its OWN port (family base + N),
+        # NOT the shared family port — one instance's restart/429-stall never
+        # takes a sibling down. The OAuth pool stays family-level.
         base = seat.launch_line("codex")
-        for shared in ("127.0.0.1:%d" % seat.FAMILIES["codex"]["port"],
-                       "ANTHROPIC_AUTH_TOKEN"):
-            self.assertIn(shared, line)
-            self.assertIn(shared, base)
+        fam_port = seat.FAMILIES["codex"]["port"]
+        self.assertIn("127.0.0.1:%d" % (fam_port + 2), line)      # codex-2
+        self.assertIn("127.0.0.1:%d" % fam_port, base)            # instance 1
+        self.assertNotIn("127.0.0.1:%d " % fam_port, line)
 
     def test_default_line_byte_identical_to_pre_slice_shape(self):
         # instance 1 (and no -i) = today's exact behavior, back-compat
@@ -186,6 +188,68 @@ class AtomicPoolWriteTest(Slice6Base):
         leftovers = [n for n in os.listdir(codexhomes.pool_dir())
                      if n.startswith(".pool-")]
         self.assertEqual(leftovers, [])
+
+
+class PerInstanceProxyTest(Slice6Base):
+    """The proxy-FATE layer: each instance gets its own port/config/token/log
+    (restart blast-radius + shared-fate 429 + log attribution), while the OAuth
+    pool stays family-level (no quota multiplication)."""
+
+    def test_instance_port_derivation(self):
+        base = seat.FAMILIES["codex"]["port"]
+        self.assertEqual(seat._instance_port("codex"), base)            # inst 1
+        self.assertEqual(seat._instance_port("codex", "codex"), base)
+        self.assertEqual(seat._instance_port("codex", "codex-2"), base + 2)
+        self.assertEqual(seat._instance_port("codex", "codex-3"), base + 3)
+        self.assertEqual(seat._instance_port("codex", "codex-10"), base + 10)
+
+    def test_proxy_home_resolution(self):
+        self.assertEqual(seat._proxy_home("codex"), seat.seat_dir("codex"))
+        self.assertEqual(seat._proxy_home("codex", "codex"),
+                         seat.seat_dir("codex"))
+        self.assertTrue(seat._proxy_home("codex", "codex-2")
+                        .endswith(os.path.join("codex", "instances", "codex-2")))
+
+    def test_mint_instance_proxy_writes_own_config_and_token(self):
+        seat._mint_instance_proxy("codex", "codex-2")
+        home = seat._proxy_home("codex", "codex-2")
+        cfg = open(os.path.join(home, "config.yaml")).read()
+        self.assertIn("port: %d" % seat._instance_port("codex", "codex-2"), cfg)
+        # auth-dir points at the FAMILY pool — same OAuth account, no quota xN
+        self.assertIn(os.path.join(seat.seat_dir("codex"), "auth"), cfg)
+        tok = open(os.path.join(home, "token")).read().strip()
+        self.assertTrue(tok)
+        self.assertNotEqual(tok, "test-token")     # instance token, not family
+        # idempotent: re-mint keeps the same token (a live line stays valid)
+        seat._mint_instance_proxy("codex", "codex-2")
+        self.assertEqual(open(os.path.join(home, "token")).read().strip(), tok)
+
+    def test_instance_token_isolated_from_family(self):
+        seat._mint_instance_proxy("codex", "codex-2")
+        itok = seat._read_token("codex", "codex-2")
+        ftok = seat._read_token("codex")           # family
+        self.assertEqual(ftok, "test-token")
+        self.assertNotEqual(itok, ftok)
+        # an UNMINTED instance falls back to the family token (back-compat)
+        self.assertEqual(seat._read_token("codex", "codex-9"), "test-token")
+
+    def test_minted_instances_enumeration(self):
+        self.assertEqual(seat._minted_instances("codex"), [])
+        seat._mint_instance_proxy("codex", "codex-3")
+        seat._mint_instance_proxy("codex", "codex-2")
+        self.assertEqual(seat._minted_instances("codex"),
+                         ["codex-2", "codex-3"])    # numeric, not lexical
+
+    def test_up_refuses_an_unminted_instance(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["up", "codex-2"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no per-instance proxy", err.getvalue())
+
+    def test_split_seat(self):
+        self.assertEqual(seat._split_seat("codex"), ("codex", "codex"))
+        self.assertEqual(seat._split_seat("codex-3"), ("codex", "codex-3"))
 
 
 if __name__ == "__main__":

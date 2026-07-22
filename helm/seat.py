@@ -278,10 +278,36 @@ def _recorded_pid_alive(rec):
     return actual == expected
 
 
-def _running_pid(family):
+def _proxy_home(family, seat=None):
+    """The dir that owns a seat's proxy fate (config.yaml/token/proxy.pid/
+    proxy.log). Instance 1 (seat == family) keeps the family dir — back-compat,
+    the live 8317 proxy is undisrupted. Instances N≥2 get instances/<seat>/ so
+    one instance's proxy restart/429-stall/log never touches a sibling's."""
+    seat = seat or family
+    return seat_dir(family) if seat == family else _instance_dir(family, seat)
+
+
+def _instance_port(family, seat=None):
+    """A seat's OWN proxy port. Instance 1 keeps fam["port"] (8317 for codex —
+    the port every minted launch.sh already points at). Instances N≥2 derive
+    deterministically from the numeric seat suffix (codex-2 -> port+2), so the
+    mapping needs no allocation state and never collides with a sibling. The
+    codex block sits at 8317 + the kimi block at 8318, so codex-N lands at
+    8317+N — clear of both for any realistic N."""
+    seat = seat or family
+    base = FAMILIES[family]["port"]
+    if seat == family:
+        return base
+    m = re.match(r"^%s-(\d+)$" % re.escape(family), seat)
+    if m:
+        return base + int(m.group(1))
+    return base  # a non-numeric seat name shares the family port (instance 1)
+
+
+def _running_pid(family, seat=None):
     """The live proxy pid from the seat's pidfile, else None."""
     try:
-        with open(os.path.join(seat_dir(family), "proxy.pid")) as f:
+        with open(os.path.join(_proxy_home(family, seat), "proxy.pid")) as f:
             pid = int(f.read().strip())
     except (OSError, ValueError):
         return None
@@ -296,12 +322,19 @@ def _port_open(port, timeout=0.5):
         return False
 
 
-def _read_token(family):
-    try:
-        with open(os.path.join(seat_dir(family), "token")) as f:
-            return f.read().strip()
-    except OSError:
-        return None
+def _read_token(family, seat=None):
+    """The seat's proxy token. Instances mint their own; an instance minted
+    before per-instance proxies (or mid-migration) falls back to the family
+    token so its launch line stays valid."""
+    for d in (_proxy_home(family, seat), seat_dir(family)):
+        try:
+            with open(os.path.join(d, "token")) as f:
+                tok = f.read().strip()
+            if tok:
+                return tok
+        except OSError:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -461,9 +494,13 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     that SAME seat identity; HELM_CELL_BIN selects the dregg-native client
     signer. A seat therefore never inherits the owner's ambient profile. `seat`
     (slice 6 — N-per-credhome) defaults to the family name; when set it swaps
-    the three identity vars + the config dir (instances/<seat>) so N instances
-    of one family share the proxy/port/token/pool but never config/session
-    state. `room` adds HELM_CHAT_ROOM=<room>; a project-derived default also
+    the three identity vars + the config dir (instances/<seat>). Instances
+    share ONLY the family OAuth cred pool (same account — no quota
+    multiplication); everything else is per-instance: config/session state AND,
+    since per-instance proxies, the proxy fate itself — each instance gets its
+    own port/config/token/log (`_mint_instance_proxy`), so one instance's
+    restart or 429-stall never takes a sibling down. `room` adds
+    HELM_CHAT_ROOM=<room>; a project-derived default also
     carries HELM_CHAT_ROOM_SOURCE=derived so later SessionStart joins cannot
     undo an operator rehome/clear. The command clears inherited room/source
     first, making explicit --room and project-less un-homed launches stable.
@@ -481,6 +518,8 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     fam = FAMILIES[family]
     model = model or fam["model"]
     seat = seat or family
+    port = _instance_port(family, seat)
+    token = _read_token(family, seat)
     cfgdir = shlex.quote(os.path.join(_instance_dir(family, seat), "claude"))
     homing = (" HELM_CHAT_ROOM=%s" % shlex.quote(room)) if room else ""
     if room and room_source:
@@ -508,7 +547,7 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
             " DREGG_PROFILE=%s%s"
             " claude --dangerously-skip-permissions --model %s"
             % (child_stamp_unsets(),
-               fam["port"], _read_token(family) or "<seat-token-missing>",
+               port, token or "<seat-token-missing>",
                pin, cfgdir, shlex.quote(seat), homing,
                shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(seat),
                shlex.quote(seat), ctxenv, model))
@@ -712,6 +751,44 @@ def _mint_probe_agents(cdir, family):
     return probes
 
 
+def _mint_instance_proxy(family, seat):
+    """Give an INSTANCE its own proxy fate: config.yaml + token under
+    instances/<seat>/, so `helm seat up <seat>` starts a proxy only this
+    instance uses. Idempotent (an existing instance token is kept so a live
+    launch line stays valid). The OAuth cred pool stays FAMILY-level — the
+    instance config's auth-dir points at the family's auth/, so per-instance
+    proxies add NO upstream quota (same account, N local listeners). Only
+    proxy (OAuth) families have a pool to point at; proxy-key families bake
+    their key into ONE family config and are out of scope here. -> the
+    instance proxy-home dir."""
+    home_dir = _proxy_home(family, seat)
+    os.makedirs(home_dir, mode=0o700, exist_ok=True)
+    os.chmod(home_dir, 0o700)
+    fam = FAMILIES[family]
+    token = _seat_token_per(home_dir)         # instance-scoped, stable
+    if fam["mode"] == "proxy":
+        auth_dir = os.path.join(seat_dir(family), "auth")   # the SHARED pool
+        _write_private(os.path.join(home_dir, "config.yaml"),
+                       _config_yaml(_instance_port(family, seat), auth_dir, token))
+    return home_dir
+
+
+def _seat_token_per(d):
+    """Read-or-mint a proxy token in an explicit dir (instance-scoped twin of
+    the family-level _seat_token)."""
+    try:
+        with open(os.path.join(d, "token")) as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    import secrets
+    tok = secrets.token_hex(32)
+    _write_private(os.path.join(d, "token"), tok + "\n")
+    return tok
+
+
 def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
                          room_source=None, multi=False):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
@@ -723,8 +800,9 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
     merge-preserving write — a seat must never be born deaf. Install trouble
     is loud (stderr) but never fatal: the seat still mints and the message
     names the estate-wide repair. `seat` (slice 6) mints an INSTANCE's assets
-    (instances/<seat>/{claude,launch.sh}); the shared token/config.yaml stay
-    family-level and are NOT re-minted here."""
+    (instances/<seat>/{claude,launch.sh}). The instance's PROXY assets
+    (config.yaml/token) are minted separately by `_mint_instance_proxy` at
+    launch — this function stays proxy-agnostic."""
     seat = seat or family
     cdir = os.path.join(d, "claude")
     os.makedirs(cdir, exist_ok=True)
@@ -947,14 +1025,23 @@ def _require_seat(family):
     return FAMILIES[family]
 
 
-def _up(family, quiet=False):
+def _up(family, quiet=False, seat=None):
     fam = _require_seat(family)
     if fam is None:
         return 1
-    pid = _running_pid(family)
+    seat = seat or family
+    # an instance proxy must have its own minted config before it can come up
+    cfgd = _proxy_home(family, seat)
+    if seat != family and not os.path.exists(os.path.join(cfgd, "config.yaml")):
+        print("helm seat: no per-instance proxy for %s yet — `helm seat launch "
+              "%s -i %s` mints it" % (seat, family, seat.rsplit("-", 1)[-1]),
+              file=sys.stderr)
+        return 1
+    port = _instance_port(family, seat)
+    pid = _running_pid(family, seat)
     if pid:
         print("helm seat: %s proxy already running (pid %d, port %d) — "
-              "`helm seat down %s` first" % (family, pid, fam["port"], family),
+              "`helm seat down %s` first" % (seat, pid, port, seat),
               file=sys.stderr)
         return 1
     b = _proxy_bin()
@@ -963,42 +1050,42 @@ def _up(family, quiet=False):
               "PATH all empty) — run `helm seat doctor`" % PROXY_BIN_DEFAULT,
               file=sys.stderr)
         return 1
-    d = seat_dir(family)
-    log = open(os.path.join(d, "proxy.log"), "ab")
+    log = open(os.path.join(cfgd, "proxy.log"), "ab")
     try:
-        p = subprocess.Popen([b, "-config", os.path.join(d, "config.yaml")],
+        p = subprocess.Popen([b, "-config", os.path.join(cfgd, "config.yaml")],
                              stdout=log, stderr=log, start_new_session=True)
     except OSError as exc:
         print("helm seat: proxy failed to launch: %s" % exc, file=sys.stderr)
         return 1
     finally:
         log.close()
-    _write_private(os.path.join(d, "proxy.pid"), "%d\n" % p.pid)
+    _write_private(os.path.join(cfgd, "proxy.pid"), "%d\n" % p.pid)
     for _ in range(30):  # up to ~6s for the port to open
-        if p.poll() is not None or _port_open(fam["port"]):
+        if p.poll() is not None or _port_open(port):
             break
         time.sleep(0.2)
     if p.poll() is not None:
-        os.remove(os.path.join(d, "proxy.pid"))
+        os.remove(os.path.join(cfgd, "proxy.pid"))
         print("helm seat: proxy exited rc %s — tail %s"
-              % (p.returncode, os.path.join(d, "proxy.log")), file=sys.stderr)
+              % (p.returncode, os.path.join(cfgd, "proxy.log")), file=sys.stderr)
         return 1
     if not quiet:
         print("helm seat: %s proxy up — 127.0.0.1:%d (pid %d)"
-              % (family, fam["port"], p.pid))
+              % (seat, port, p.pid))
     return 0
 
 
-def _down(family):
+def _down(family, seat=None):
     fam = _require_seat(family)
     if fam is None:
         return 1
-    pid = _running_pid(family)
-    pidfile = os.path.join(seat_dir(family), "proxy.pid")
+    seat = seat or family
+    pid = _running_pid(family, seat)
+    pidfile = os.path.join(_proxy_home(family, seat), "proxy.pid")
     if not pid:
         if os.path.exists(pidfile):
             os.remove(pidfile)  # stale
-        print("helm seat: %s proxy not running" % family)
+        print("helm seat: %s proxy not running" % seat)
         return 0
     os.kill(pid, signal.SIGTERM)
     for _ in range(15):
@@ -1008,7 +1095,7 @@ def _down(family):
     if _pid_alive(pid):
         os.kill(pid, signal.SIGKILL)
     os.remove(pidfile)
-    print("helm seat: %s proxy stopped (pid %d)" % (family, pid))
+    print("helm seat: %s proxy stopped (pid %d)" % (seat, pid))
     return 0
 
 
@@ -1031,7 +1118,7 @@ def _seat_env(family, config_dir, multi=False):
         env.pop(v, None)
     env.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
     env.update({
-        "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % fam["port"],
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % _instance_port(family),
         "ANTHROPIC_AUTH_TOKEN": _read_token(family) or "",
         "CLAUDE_CONFIG_DIR": config_dir,
         "HELM_CHAT_NAME": family,
@@ -1169,6 +1256,16 @@ def _seat_family(seat_name):
         return base, None
     return None, ("unknown seat '%s' (families: %s; instances: <family>-N)"
                   % (seat_name, ", ".join(sorted(FAMILIES))))
+
+
+def _split_seat(seat_name):
+    """'codex' -> ('codex', 'codex'), 'codex-3' -> ('codex', 'codex-3'): the
+    family (which FAMILIES entry / cred pool) beside the full seat identity
+    (whose proxy/config/session). Falls back to (seat_name, seat_name) so a
+    bare family name is instance 1."""
+    fam, _ = _seat_family(seat_name)
+    fam = fam or seat_name
+    return fam, seat_name
 
 
 _SESSION_JSONL = re.compile(r"^[0-9a-fA-F-]{36}\.jsonl$")
@@ -1743,6 +1840,21 @@ def _where(seat_name, rest):
 # list / status / doctor
 # ---------------------------------------------------------------------------
 
+def _minted_instances(family):
+    """[seat] every instance with its OWN minted proxy (config.yaml under
+    instances/<seat>/) — the per-instance-proxy fleet, sorted numerically so
+    codex-2 precedes codex-10."""
+    root = os.path.join(seat_dir(family), "instances")
+    out = []
+    for name in (os.listdir(root) if os.path.isdir(root) else []):
+        if os.path.exists(os.path.join(root, name, "config.yaml")):
+            out.append(name)
+    def _key(s):
+        m = re.match(r"^%s-(\d+)$" % re.escape(family), s)
+        return (0, int(m.group(1))) if m else (1, s)
+    return sorted(out, key=_key)
+
+
 def _seat_row(family):
     d = seat_dir(family)
     fam = FAMILIES.get(family) or {}
@@ -1765,11 +1877,19 @@ def _seat_row(family):
         if len(creds) > 1:
             cred += " (+%d more pooled)" % (len(creds) - 1)
     pid = _running_pid(family)
-    port = fam.get("port")
+    port = _instance_port(family)
     live = "proxy UP pid %d port %d%s" % (pid, port, "" if _port_open(port) else
                                           " (port not answering!)") if pid \
         else "proxy down"
     row = "%-8s %-38s %s" % (family, live, cred)
+    # per-instance proxies: each minted instance reports its OWN proxy fate
+    for inst in _minted_instances(family):
+        ipid = _running_pid(family, inst)
+        iport = _instance_port(family, inst)
+        ilive = "proxy UP pid %d port %d%s" % (
+            ipid, iport, "" if _port_open(iport) else " (port not answering!)") \
+            if ipid else "proxy down"
+        row += "\n  %-6s %-38s" % (inst, ilive)
     if family == "codex":   # slice 6: live-instance / pooled-capacity suffix
         try:
             from . import codexhomes, seats as _seats
@@ -1889,18 +2009,21 @@ def cmd_seat(args):
         if verb == "add":
             return _add(
                 family, rest[1:], room=room, room_source=room_source)
-        if verb == "up":
-            return _up(family)
-        if verb == "down":
-            return _down(family)
+        if verb in ("up", "down"):
+            # `helm seat up codex-3` targets instance codex-3's OWN proxy;
+            # `helm seat up codex` targets the family (instance-1) proxy.
+            fam_name, seat_name = _split_seat(family)
+            fn = _up if verb == "up" else _down
+            return fn(fam_name, seat=seat_name)
         if verb == "smoke":
             return _smoke(family, multi=multi)
         fam = _require_seat(family)
         if fam is None:
             return 1
         model = rest[rest.index("--model") + 1] if "--model" in rest else None
-        # slice 6 — N instances of one family share the proxy/port/token/pool:
-        # -i/--instance N -> seat codex-N (default 1 = today's exact line).
+        # slice 6 — N instances of one family share the OAuth cred POOL but each
+        # gets its own proxy fate: -i/--instance N -> seat codex-N on its own
+        # port (default 1 = the family proxy, today's exact line).
         inst = 1
         for flag in ("-i", "--instance"):
             if flag in rest:
@@ -1935,6 +2058,15 @@ def cmd_seat(args):
         _write_launch_assets(
             family, _instance_dir(family, seat), room, seat,
             room_source=room_source, multi=multi)
+        if seat != family:
+            # per-instance proxies: this instance gets its OWN port/config/
+            # token/log, so one instance's restart/429-stall never takes a
+            # sibling down (the shared-8317 blast-radius). OAuth pool stays
+            # family-level — no quota multiplication.
+            _mint_instance_proxy(family, seat)
+            print("helm seat: %s gets its own proxy — `helm seat up %s` "
+                  "(127.0.0.1:%d) before launching"
+                  % (seat, seat, _instance_port(family, seat)), file=sys.stderr)
         print(launch_line(
             family, model, room, seat, room_source=room_source, multi=multi))
         from . import hooks
