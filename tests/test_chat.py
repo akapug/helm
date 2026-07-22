@@ -267,5 +267,70 @@ class RowIntegrityTest(ChatBase):
         self.assertEqual(rows[0]["text"], "padding")
 
 
+class PostUnknownFlagTest(ChatBase):
+    """post REFUSES an unrecognised LEADING flag instead of publishing it —
+    and ONLY leading flags: the body is prose and may talk about flags freely.
+    All three xrev findings on the first cut are pinned here: whole-body
+    scanning made flag-prose unsendable, single-dash flags still broadcast,
+    and the tests sat after the __main__ guard where direct unittest
+    execution never discovered them (this class now precedes it)."""
+
+    def _post(self, *args):
+        import contextlib
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = chat.cmd_chat(["post"] + list(args))
+        return rc, err.getvalue()
+
+    def _rows(self, room="main"):
+        return chat.read(room)[0]
+
+    def test_a_misremembered_addressing_flag_is_refused_not_posted(self):
+        rc, err = self._post("--to", "codex-orch", "hello")
+        self.assertEqual(rc, 2)
+        self.assertIn("--to", err)
+        self.assertEqual(self._rows(), [])
+
+    def test_single_dash_flags_are_refused_too(self):
+        # xrev: startswith("--") left `-h` and `-x` broadcasting
+        for flag in ("-h", "-x"):
+            rc, _ = self._post(flag)
+            self.assertEqual(rc, 2, flag)
+        self.assertEqual(self._rows(), [])
+
+    def test_help_gets_usage_not_a_broadcast(self):
+        rc, err = self._post("--help")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+        self.assertEqual(self._rows(), [])
+
+    def test_prose_about_flags_is_sendable(self):
+        # xrev: the first cut scanned the WHOLE body, so ordinary dev chat
+        # about CLI flags was unsendable outside stdin
+        rc, _ = self._post("--seat", "tester", "please", "use", "--force", "carefully")
+        self.assertEqual(rc, 0)
+        self.assertIn("--force", self._rows()[0]["text"])
+
+    def test_double_dash_delimiter_sends_a_flag_shaped_body(self):
+        rc, _ = self._post("--seat", "tester", "--", "--to", "is", "not", "a", "flag")
+        self.assertEqual(rc, 0)
+        self.assertTrue(self._rows()[0]["text"].startswith("--to"))
+
+    def test_prose_dash_starters_are_body_not_flags(self):
+        # "-" bullets and "->" arrows are not flag-shaped
+        rc, _ = self._post("--seat", "tester", "->", "see", "the", "board")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_the_refusal_names_the_real_addressing_flag(self):
+        _, err = self._post("--to", "someone", "hi")
+        self.assertIn("--dm", err)
+
+    def test_a_plain_message_still_posts(self):
+        rc, _ = self._post("--seat", "tester", "an ordinary message")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self._rows()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
