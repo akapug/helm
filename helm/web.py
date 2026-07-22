@@ -157,7 +157,8 @@ def _api_configs_tree(qs):
         cwds = [r["cwd"] for r in _transcripts().get_catalog()["rows"] if r.get("cwd")]
     except Exception:
         pass  # no catalog on this machine — the scanned roots still answer
-    return configs.tree(_q1(qs, "root") or None, extra_cwds=cwds), 200
+    out = configs.tree(_q1(qs, "root") or None, extra_cwds=cwds)
+    return out, (400 if out.get("error") else 200)
 
 
 def _api_configs_homes():
@@ -192,10 +193,13 @@ def _api_configs_backups():
 
 
 def _api_configs_file_post(payload):
-    """Save one config file: backup → validate → atomic write (configs.py)."""
+    """Save one config file against the revision the editor actually opened."""
     from . import configs
-    out = configs.write_file(payload.get("path") or "", payload.get("content") or "")
-    return out, (400 if "error" in out else 200)
+    if not isinstance(payload.get("revision"), str):
+        return {"error": "revision is required; reload before saving", "code": "revision"}, 400
+    out = configs.write_file(payload.get("path") or "", payload.get("content") or "",
+                             expected_revision=payload["revision"])
+    return out, (409 if out.get("code") == "conflict" else 400 if "error" in out else 200)
 
 
 def _api_configs_entry_post(payload):

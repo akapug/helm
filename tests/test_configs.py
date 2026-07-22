@@ -101,8 +101,9 @@ class ConfigsModelTest(unittest.TestCase):
         with open(os.path.join(outside, "settings.json"), "w") as f:
             json.dump({"env": {"SECRET_NAME": "x"}}, f)
         r = configs.resolve(outside, _PROJ, "claude")
-        self.assertEqual(sorted(r), ["error"])
+        self.assertEqual(r["code"], "refused")
         self.assertIn("not a recognized cred home", r["error"])
+        self.assertNotIn(outside, r["error"])
         # the CLI surfaces the refusal as an error exit
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(
@@ -281,6 +282,97 @@ class ConfigsWebTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(_BETA), "a rejected POST must not act")
         status, d = self.post("/api/skills/nope", {"path": _BETA})
         self.assertEqual(status, 404)
+
+
+class HomeSubdirConfigTest(unittest.TestCase):
+    """The owner reported the configs UI was 'mostly uneditable'. Measured: of
+    500 files under the config homes, 457 were unrecognized — but nearly all
+    of those SHOULD be (credential stores, .bak copies, runtime state, plugin
+    metadata). What was left was declarative human-authored config living ONE
+    LEVEL DOWN in a home, which the gate had no pattern for."""
+
+    def setUp(self):
+        for d in ("commands", "rules"):
+            os.makedirs(os.path.join(_HOMEDIR, d), exist_ok=True)
+
+    def path(self, rel):
+        p = os.path.join(_HOMEDIR, rel)
+        with open(p, "w") as f:
+            f.write("body\n")
+        return os.path.realpath(p)
+
+    def test_commands_and_rules_are_now_recognized(self):
+        self.assertTrue(configs._is_recognized_config(self.path("commands/afk.md")))
+        self.assertTrue(configs._is_recognized_config(self.path("rules/default.rules")))
+
+    def test_classify_path_reports_them_editable_end_to_end(self):
+        """The gate is one layer; what the UI actually consumes is
+        classify_path's (type, editable, reason). Assert THAT, or the fix is
+        proven only where nobody reads it."""
+        for rel, want in (("commands/afk.md", "md"),
+                          ("rules/default.rules", "text")):
+            typ, editable, why = configs.classify_path(self.path(rel))
+            self.assertTrue(editable, "%s not editable: %s" % (rel, why))
+            self.assertEqual(typ, want, rel)
+
+    def test_read_file_actually_serves_the_content(self):
+        """Recognized must mean READABLE too — the gate governs both."""
+        p = self.path("commands/afk.md")
+        got = configs.read_file(p)
+        # read_file always CARRIES an 'error' key; success is error IS None.
+        self.assertIsNone(got.get("error"), got)
+        self.assertIn("body", got.get("content", ""))
+        self.assertTrue(got.get("editable"))
+        self.assertEqual(got.get("reason"), "ok")
+
+    def test_a_round_trip_edit_lands_and_is_backed_up(self):
+        """backup -> validate -> atomic, on the newly-recognized shape."""
+        p = self.path("commands/afk.md")
+        res = configs.write_file(p, "# edited by the owner\n")
+        self.assertNotIn("error", res, res)
+        with open(p) as f:
+            self.assertEqual(f.read(), "# edited by the owner\n")
+
+    def test_the_subdir_must_sit_in_a_REAL_home_root(self):
+        """A commands/foo.md anywhere else on disk must still fail the gate —
+        the pattern is not a licence to read arbitrary markdown."""
+        stray = os.path.join(_TMP, "not-a-home", "commands")
+        os.makedirs(stray, exist_ok=True)
+        p = os.path.join(stray, "afk.md")
+        with open(p, "w") as f:
+            f.write("x\n")
+        self.assertFalse(configs._is_recognized_config(os.path.realpath(p)))
+
+    def test_only_the_named_shapes_qualify(self):
+        """commands/*.md and rules/*.rules — not every file dropped in them."""
+        self.assertFalse(configs._is_recognized_config(self.path("commands/run.sh")))
+        self.assertFalse(configs._is_recognized_config(self.path("rules/notes.md")))
+
+    def test_executables_in_a_home_stay_UNEDITABLE(self):
+        """A security boundary, not an oversight: the web UI writes the file
+        and the next hook invocation RUNS it as the owner. A JSON config can
+        only misconfigure; a .sh hook can do anything."""
+        for rel in ("statusline.sh", "buildr-codex-hook.py"):
+            p = os.path.join(_HOMEDIR, rel)
+            with open(p, "w") as f:
+                f.write("#!/bin/sh\necho hi\n")
+            self.assertFalse(configs._is_recognized_config(os.path.realpath(p)),
+                             "%s must NOT be editable through the config layer" % rel)
+
+    def test_credential_stores_still_denied_under_the_new_pattern(self):
+        """The deny list outranks every recognizer, including this one."""
+        d = os.path.join(_HOMEDIR, "commands")
+        os.makedirs(d, exist_ok=True)
+        for name in (".credentials.json", "auth.json"):
+            p = os.path.join(d, name)
+            with open(p, "w") as f:
+                f.write("{}")
+            self.assertFalse(configs._is_recognized_config(os.path.realpath(p)))
+
+    def test_a_rules_file_validates_as_text_not_other(self):
+        self.assertEqual(configs._ext_type("/x/rules/default.rules"), "text")
+        ok, err = configs._validate("text", "anything at all\n")
+        self.assertTrue(ok, err)
 
 
 if __name__ == "__main__":

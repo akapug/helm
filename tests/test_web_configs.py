@@ -48,6 +48,10 @@ class TestWebConfigs(unittest.TestCase):
             f.write("# live-session cwd\n")
         with open(os.path.join(cls.homedir, "settings.json"), "w") as f:
             json.dump({"model": "opus"}, f)
+        os.makedirs(os.path.join(cls.homedir, "commands"))
+        cls.command = os.path.join(cls.homedir, "commands", "owner.md")
+        with open(cls.command, "w") as f:
+            f.write("# owner command\n")
         # repoint the frozen module roots (import-order-proof) + backups
         cls._cfg = {k: getattr(configs, k) for k in
                     ("CWD_ROOTS", "HOME_ROOTS", "BACKUP_DIR")}
@@ -98,6 +102,12 @@ class TestWebConfigs(unittest.TestCase):
             self._tree_nodes(c, acc)
         return acc
 
+    def revision(self, path):
+        q = urllib.parse.urlencode({"path": path})
+        status, data = self.req("/api/configs/file?" + q)
+        self.assertEqual(status, 200, data)
+        return data["revision"]
+
     # -- GET /api/configs/tree ---------------------------------------------
     def test_tree_shape_and_catalog_cwd_fold(self):
         status, d = self.req("/api/configs/tree")
@@ -117,6 +127,10 @@ class TestWebConfigs(unittest.TestCase):
                 self.assertIn(key, f)
         # the stubbed catalog cwd is folded in even without a scan hit ancestor
         self.assertIn(os.path.realpath(self.sess_cwd), by_path)
+        status, denied = self.req("/api/configs/tree?root=/etc")
+        self.assertEqual(status, 400)
+        self.assertEqual(denied["code"], "refused")
+        self.assertNotIn("/etc", denied["error"])
 
     # -- GET /api/configs/homes --------------------------------------------
     def test_homes_lists_home_scope_files(self):
@@ -126,7 +140,9 @@ class TestWebConfigs(unittest.TestCase):
         hm = next((h for h in d if h["path"] == self.homedir), None)
         self.assertIsNotNone(hm, "planted home must appear")
         self.assertEqual(hm["provider"], "claude")
-        self.assertIn("settings.json", {f["rel"] for f in hm["files"]})
+        rels = {f["rel"] for f in hm["files"]}
+        self.assertIn("settings.json", rels)
+        self.assertIn("commands/owner.md", rels)
 
     # -- GET /api/configs/file ---------------------------------------------
     def test_file_get_content_and_refusals(self):
@@ -168,7 +184,8 @@ class TestWebConfigs(unittest.TestCase):
 
     def test_file_post_writes_with_backup_then_restores(self):
         status, d = self.req("/api/configs/file",
-                             {"path": self.claudemd, "content": "# edited v2\n"})
+                             {"path": self.claudemd, "content": "# edited v2\n",
+                              "revision": self.revision(self.claudemd)})
         self.assertEqual(status, 200, d)
         self.assertTrue(d["ok"])
         self.assertTrue(d["backup"].startswith(configs.BACKUP_DIR))
@@ -186,13 +203,30 @@ class TestWebConfigs(unittest.TestCase):
         with open(self.claudemd) as f:
             self.assertIn("planted memory", f.read())
 
+    def test_file_post_requires_revision_and_returns_conflict(self):
+        status, d = self.req("/api/configs/file",
+                             {"path": self.command, "content": "# blind overwrite\n"})
+        self.assertEqual(status, 400)
+        self.assertEqual(d["code"], "revision")
+        rev = self.revision(self.command)
+        with open(self.command, "w") as f:
+            f.write("# concurrent owner edit\n")
+        status, d = self.req("/api/configs/file",
+                             {"path": self.command, "content": "# stale UI edit\n",
+                              "revision": rev})
+        self.assertEqual(status, 409, d)
+        self.assertEqual(d["code"], "conflict")
+        with open(self.command) as f:
+            self.assertEqual(f.read(), "# concurrent owner edit\n")
+
     def test_file_post_refuses_bad_paths_and_bad_json(self):
         status, d = self.req("/api/configs/file",
                              {"path": "/etc/passwd", "content": "x"})
         self.assertEqual(status, 400)
         self.assertIn("error", d)
         status, d = self.req("/api/configs/file",
-                             {"path": self.mcpjson, "content": "{not json"})
+                             {"path": self.mcpjson, "content": "{not json",
+                              "revision": self.revision(self.mcpjson)})
         self.assertEqual(status, 400)
         self.assertIn("invalid JSON", d["error"])
         with open(self.mcpjson) as f:

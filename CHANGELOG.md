@@ -229,8 +229,10 @@ its first day.
   (the git era a session ended on).
 - Accounts: live quota scorecard, rollover rescue (`swap`), credential-home
   lifecycle with identity verification and reversible archives.
-- Configs: every config across every home and project, the load cascade
-  resolved per seat, and a safe editor (backup → validate → atomic).
+- Configs: every config across every home and project, including owner-authored
+  commands and Codex rules, the load cascade resolved per seat, and a
+  revision-aware atomic editor with exact backup, fsync, conflict rollback, and
+  symlink/device/escape refusal.
 - The web app: four views (home / quota / sessions / configs) in one
   self-contained page — charts, transcript drawer, team tray, config editor —
   with a per-process mutation token on every write.

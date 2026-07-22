@@ -16,10 +16,14 @@ Two halves:
 
 Stdlib only. Never reads or writes credential/token contents (config files only).
 """
+import ctypes
+import errno
 import glob
+import hashlib
 import json
 import os
-import shutil
+import secrets
+import stat
 import time
 
 try:
@@ -83,10 +87,152 @@ import re
 # even though they are JSON under a home root (the review's #2/#5 root cause).
 _DENY_FILES = {".credentials.json", "auth.json"}
 _RULE_RE = re.compile(r"/\.claude/rules/[^/]+\.md$")
+# DECLARATIVE config that lives one level down inside a config home, not
+# directly in it. The owner's report was "poking around my configs UI proves
+# it, but mostly they are uneditable from there" — measured: of 500 files
+# under the config homes, 457 were unrecognized, and the great majority of
+# those SHOULD be (48 credential stores, 108 .bak copies, 104 runtime state
+# files like history.jsonl / goals_1.sqlite / *-snapshot.json, 32 plugin
+# metadata blobs). Stripping those left exactly two categories of real
+# human-authored config that the gate simply had no pattern for:
+#   commands/<name>.md   — the owner's own slash commands
+#   rules/<name>.rules   — codex rule files
+# Both are declarative, validatable, and carry the same trust surface as
+# CLAUDE.md, which has always been editable here.
+_HOME_SUBDIRS = {
+    "commands": (".md", "md", "claude", "command"),
+    "rules": (".rules", "text", "codex", "rule"),
+}
+_HOME_SUBDIR_RE = re.compile(r"/(commands/[^/]+\.md|rules/[^/]+\.rules)$")
+_MAX_CONFIG_BYTES = 1_000_000
+_MISSING_REVISION = "missing"
+
+# Linux gives us an atomic exchange primitive. It is what lets the writer inspect
+# the exact inode displaced by the save and exchange it back if another process
+# replaced or changed the file in the final check-to-rename window.
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
+if _RENAMEAT2 is not None:
+    _RENAMEAT2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                           ctypes.c_char_p, ctypes.c_uint)
+    _RENAMEAT2.restype = ctypes.c_int
+
+# DELIBERATELY STILL EXCLUDED — this is a security boundary, not an oversight.
+# The remaining 23 unrecognized-but-config-shaped files are EXECUTABLES:
+# <home>/*.py and <home>/*.sh hook and statusline scripts. Making those
+# editable would turn the config editor into a remote-code-execution surface —
+# the web UI writes them, the next hook invocation runs them as the owner. A
+# JSON/MD/TOML config can only misconfigure; a .sh hook can do anything. Edit
+# those with a real editor, where the act of doing so is explicit.
 
 
 def _real(p):
     return os.path.realpath(os.path.expanduser(p))
+
+
+def _error(code, message):
+    """A class-only failure safe to return through HTTP/CLI.
+
+    OSError strings and refused caller paths are intentionally not reflected:
+    either can disclose an unrelated path from outside the owner config surface.
+    """
+    return {"error": message, "code": code}
+
+
+def _absolute(path):
+    if not isinstance(path, str) or not path or "\0" in path:
+        return None
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _candidate(path):
+    """Resolve the parent, never the leaf.
+
+    realpath(path) silently turns a symlink file into its target and loses the
+    fact that the owner selected an alias. Keeping the leaf unresolved lets
+    lstat/open(O_NOFOLLOW)/fstat reject aliases and devices explicitly.
+    """
+    ap = _absolute(path)
+    if ap is None:
+        return None
+    return os.path.join(_real(os.path.dirname(ap)), os.path.basename(ap))
+
+
+def _path_below(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _root_match(path):
+    """Return the canonical allowlisted root matching the caller's lexical path.
+
+    Both the lexical and resolved-parent paths must remain in the same root.
+    This denies /tmp/alias -> ~/.claude escapes while still supporting a root
+    which is itself configured as a symlink. Symlink components below a root
+    are denied; discovery emits canonical paths, so aliases never become a
+    second identity for one file.
+    """
+    ap, rp = _absolute(path), _candidate(path)
+    if ap is None or rp is None:
+        return None
+    roots = list(CWD_ROOTS) + list(HOME_ROOTS) + [_HELM_HOME]
+    for root in roots:
+        raw, real = _absolute(root), _real(root)
+        if raw is None:
+            continue
+        base = raw if _path_below(ap, raw) else real if _path_below(ap, real) else None
+        if base is None or not _path_below(rp, real):
+            continue
+        rel = os.path.relpath(ap, base)
+        cur = base
+        for part in rel.split(os.sep)[:-1]:
+            if part in ("", "."):
+                continue
+            cur = os.path.join(cur, part)
+            try:
+                if stat.S_ISLNK(os.lstat(cur).st_mode):
+                    return None
+            except FileNotFoundError:
+                break
+            except OSError:
+                return None
+        return real
+    holder = _home_holder(rp)
+    if _is_seat_home(holder):
+        real = _real(holder)
+        if _path_below(ap, real) and _path_below(rp, real):
+            cur = real
+            for part in os.path.relpath(ap, real).split(os.sep)[:-1]:
+                if part in ("", "."):
+                    continue
+                cur = os.path.join(cur, part)
+                try:
+                    if stat.S_ISLNK(os.lstat(cur).st_mode):
+                        return None
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    return None
+            return real
+    return None
+
+
+def _lstat_regular(path):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return False
+    return st if stat.S_ISREG(st.st_mode) else False
+
+
+def _home_holder(path):
+    parent = os.path.dirname(path)
+    if os.path.basename(parent) in _HOME_SUBDIRS:
+        return os.path.dirname(parent)
+    return parent
 
 
 def _is_seat_home(parent):
@@ -125,6 +271,14 @@ def _is_recognized_config(rp):
         return True
     if _RULE_RE.search(rp):
         return True
+    # home-scope DECLARATIVE config one level down (commands/, rules/): the
+    # subdir must sit directly in a recognized home root, so a stray
+    # commands/foo.md anywhere else on disk still fails the gate.
+    m = _HOME_SUBDIR_RE.search(rp)
+    if m:
+        holder = _real(os.path.dirname(os.path.dirname(rp)))
+        if any(holder == _real(h) for h in HOME_ROOTS) or _is_seat_home(holder):
+            return True
     # home/user-scope: the recognized basename sits DIRECTLY in a home root
     if base in _HOME_FILES:
         parent = _real(os.path.dirname(rp))
@@ -147,6 +301,10 @@ def _ext_type(path):
         return "toml"
     if base.endswith(".md"):
         return "md"
+    if base.endswith(".rules"):
+        # No parser to validate against, so it rides the text path — but it
+        # IS recognized, which is what makes it editable at all.
+        return "text"
     return "other"
 
 
@@ -157,7 +315,7 @@ def _under(path, roots):
 
 def _is_plugin_or_managed(path):
     rp = _real(path)
-    if any(rp.startswith(_real(m)) for m in MANAGED_DIRS):
+    if any(_path_below(rp, _real(m)) for m in MANAGED_DIRS):
         return True
     # plugin-provided config lives under a home's plugins/ tree — read-only here.
     # Match the actual plugins install dir, not any directory merely NAMED 'plugins'
@@ -166,21 +324,36 @@ def _is_plugin_or_managed(path):
 
 
 def classify_path(path):
-    """(type, editable, reason). editable iff a RECOGNIZED config file (by filename/
-    rel-path, not just extension) under an allowlisted root, not a credential store,
-    not plugin/managed. Non-existent files are still editable (create-if-absent) as
-    long as the parent (or its parent) exists."""
-    rp = _real(path)
-    typ = _ext_type(rp)
+    """(type, editable, reason) for one leaf without following that leaf.
+
+    Existing entries must be regular, owner-writable files. Missing recognized
+    leaves may be created only below a real allowlisted parent (or one direct
+    config subdirectory below it). All callers share this classification gate.
+    """
+    rp = _candidate(path)
+    typ = _ext_type(rp or "")
+    if rp is None:
+        return typ, False, "invalid path"
     if os.path.basename(rp) in _DENY_FILES:
         return typ, False, "credential/token store — never editable"
     if not _is_recognized_config(rp):
         return typ, False, "not a recognized config file"
-    if not (_under(rp, CWD_ROOTS + HOME_ROOTS)
-            or _is_seat_home(os.path.dirname(rp))):
+    if _root_match(path) is None:
+        return typ, False, "outside the allowlisted config roots"
+    holder = _home_holder(rp)
+    if not (_under(rp, CWD_ROOTS + HOME_ROOTS) or _is_seat_home(holder)):
         return typ, False, "outside the allowlisted config roots"
     if _is_plugin_or_managed(rp):
         return typ, False, "plugin/managed-provided — read-only"
+    st = _lstat_regular(rp)
+    if st is False:
+        return typ, False, "not a regular file"
+    if st is not None:
+        if st.st_size > _MAX_CONFIG_BYTES:
+            return typ, False, "file exceeds the editor size limit"
+        if not (st.st_mode & stat.S_IWUSR):
+            return typ, False, "owner read-only"
+        return typ, True, "ok"
     parent = os.path.dirname(rp)
     if not os.path.isdir(parent) and not os.path.isdir(os.path.dirname(parent)):
         return typ, False, "parent directory does not exist"
@@ -194,25 +367,36 @@ def _project_files_at(cwd):
     out = []
     for rel, (typ, harness, kind) in _PROJECT_FILES.items():
         p = os.path.join(cwd, rel)
-        if os.path.isfile(p):
+        if _lstat_regular(p):
             _, editable, reason = classify_path(p)
             out.append({"rel": rel, "path": p, "type": typ, "harness": harness,
                         "kind": kind, "editable": editable, "reason": reason})
-    # .claude/rules/*.md and .claude/{skills,commands,agents}/ counts
-    rules = sorted(glob.glob(os.path.join(cwd, ".claude", "rules", "*.md")))
+    # .claude/rules/*.md and .claude/{skills,commands,agents}/ counts. Never
+    # follow file or directory aliases: a symlink must not import an unrelated
+    # tree into the owner config surface.
+    rd = os.path.join(cwd, ".claude", "rules")
+    try:
+        rules = sorted(e.path for e in os.scandir(rd)
+                       if not e.name.startswith(".") and e.name.endswith(".md")
+                       and e.is_file(follow_symlinks=False))
+    except OSError:
+        rules = []
     for r in rules:
         _, editable, reason = classify_path(r)
         out.append({"rel": os.path.relpath(r, cwd), "path": r, "type": "md",
                     "harness": "claude", "kind": "rule", "editable": editable, "reason": reason})
     for kind in ("skills", "commands", "agents"):
         d = os.path.join(cwd, ".claude", kind)
-        if os.path.isdir(d):
-            names = [e for e in sorted(os.listdir(d)) if not e.startswith(".")]
-            if names:
-                out.append({"rel": f".claude/{kind}/", "path": d, "type": "dir",
-                            "harness": "claude", "kind": kind, "editable": False,
-                            "reason": "directory — manage entries individually",
-                            "entries": names})
+        try:
+            names = sorted(e.name for e in os.scandir(d)
+                           if not e.name.startswith(".") and not e.is_symlink())
+        except OSError:
+            names = []
+        if names:
+            out.append({"rel": f".claude/{kind}/", "path": d, "type": "dir",
+                        "harness": "claude", "kind": kind, "editable": False,
+                        "reason": "directory — manage entries individually",
+                        "entries": names})
     return out
 
 
@@ -221,19 +405,13 @@ def _find_config_dirs(root, maxdepth=6):
     root = _real(root)
     hits = set()
     root_depth = root.rstrip("/").count("/")
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, _ in os.walk(root):
         depth = dirpath.rstrip("/").count("/") - root_depth
         if depth >= maxdepth:
             dirnames[:] = []
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".worktree")]
-        names = set(filenames)
-        if names & {".mcp.json", "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"}:
+        if _project_files_at(dirpath):
             hits.add(dirpath)
-        if ".claude" in dirnames and os.path.isdir(os.path.join(dirpath, ".claude")):
-            cd = os.path.join(dirpath, ".claude")
-            if any(os.path.exists(os.path.join(cd, x)) for x in
-                   ("settings.json", "settings.local.json", "CLAUDE.md", "rules")):
-                hits.add(dirpath)
     return hits
 
 
@@ -241,7 +419,21 @@ def tree(root=None, extra_cwds=None):
     """A nested cwd tree (under root) of directories that hold project configs, each
     node carrying its config files. extra_cwds (e.g. live session cwds) are folded in
     so a cwd with configs is shown even outside the scanned root."""
-    roots = [_real(r) for r in ([root] if root else CWD_ROOTS)]
+    requested = [root] if root else CWD_ROOTS
+    if root:
+        probe = os.path.join(root, ".helm-config-root-probe")
+        rr = _real(root)
+        if _root_match(probe) is None or not _under(rr, CWD_ROOTS):
+            return {"roots": [], "count": 0, "config_roots": [],
+                    "home_roots": HOME_ROOTS,
+                    "error": "scan root is outside the allowlisted config roots",
+                    "code": "refused"}
+    roots, seen_roots = [], set()
+    for r in requested:
+        rr = _real(r)
+        if rr not in seen_roots:
+            roots.append(rr)
+            seen_roots.add(rr)
     cfg_dirs = set()
     for r in roots:
         if os.path.isdir(r):
@@ -289,29 +481,54 @@ def tree(root=None, extra_cwds=None):
 
 
 def homes_configs():
-    """Home/user-scope config files that exist, per home dir — the top of the cascade."""
-    out = []
-    for h in HOME_ROOTS:
-        if not os.path.isdir(h):
+    """Home/user-scope files, including direct commands and rules.
+
+    Canonical-home dedup makes symlink aliases one deterministic identity. The
+    first HOME_ROOTS occurrence wins precedence, matching the resolver's input
+    order. Only visible direct regular children of commands/ and rules/ enter
+    the surface; nested/generated state, devices and aliases do not.
+    """
+    out, seen, seen_files = [], set(), set()
+    for precedence, raw in enumerate(HOME_ROOTS):
+        h = _real(raw)
+        if h in seen or not os.path.isdir(h):
             continue
+        seen.add(h)
         files = []
+
+        def add(rel, p, typ, harness, kind):
+            cp = _candidate(p)
+            if cp is None or cp in seen_files or not _lstat_regular(p):
+                return
+            seen_files.add(cp)
+            _, editable, reason = classify_path(cp)
+            files.append({"rel": rel, "path": cp, "type": typ, "harness": harness,
+                          "kind": kind, "editable": editable, "reason": reason})
+
         for rel, (typ, harness, kind) in _HOME_FILES.items():
-            p = os.path.join(h, rel)
-            if os.path.isfile(p):
-                _, editable, reason = classify_path(p)
-                files.append({"rel": rel, "path": p, "type": typ, "harness": harness,
-                              "kind": kind, "editable": editable, "reason": reason})
+            add(rel, os.path.join(h, rel), typ, harness, kind)
+        for subdir, (suffix, typ, harness, kind) in _HOME_SUBDIRS.items():
+            d = os.path.join(h, subdir)
+            if os.path.islink(d):
+                continue
+            try:
+                entries = sorted((e for e in os.scandir(d)), key=lambda e: e.name)
+            except OSError:
+                entries = []
+            for e in entries:
+                if e.name.startswith(".") or not e.name.endswith(suffix) \
+                        or not e.is_file(follow_symlinks=False):
+                    continue
+                add(f"{subdir}/{e.name}", os.path.join(d, e.name), typ, harness, kind)
         # sibling default state file: ~/.claude.json for the ~/.claude home
         if os.path.basename(h) == ".claude":
             sib = os.path.join(os.path.dirname(h), ".claude.json")
-            if os.path.isfile(sib):
-                _, editable, reason = classify_path(sib)
-                files.append({"rel": "../.claude.json", "path": sib, "type": "json",
-                              "harness": "claude", "kind": "state", "editable": editable,
-                              "reason": reason})
+            add("../.claude.json", sib, "json", "claude", "state")
         if files:
-            out.append({"home": os.path.basename(h), "path": h,
-                        "provider": "codex" if "codex" in h else "claude", "files": files})
+            out.append({"id": hashlib.sha256(os.fsencode(h)).hexdigest()[:16],
+                        "home": os.path.basename(h), "path": h,
+                        "provider": "codex" if "codex" in h else "claude",
+                        "precedence": precedence, "files": files})
     return out
 
 
@@ -375,40 +592,176 @@ def resolve(home_path, cwd, harness):
     (root→…→cwd + the home/user layer). The home must be a recognized cred
     home (allowlist, same posture as read_file) — never an arbitrary dir."""
     if not _allowed_home(home_path):
-        return {"error": "home %r is not a recognized cred home "
-                         "(~/.claude, ~/.codex, ~/.claude-homes/*, ~/.codex-homes/*)"
-                         % home_path}
+        return {"error": "home is not a recognized cred home", "code": "refused"}
     return _annotate_mcp_shadows(physics.physics_report(home_path, cwd or None, harness))
 
 
 # ── read / edit (safety-first) ────────────────────────────────────────────────
 
+class _ConfigIOError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _stat_identity(st):
+    return st.st_dev, st.st_ino
+
+
+def _revision(st, data):
+    """Opaque edit identity stable across our own atomic rename."""
+    h = hashlib.sha256()
+    h.update(("%d:%d:%d:%d:%d:%d:%d:" % (
+        st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns,
+        stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)).encode())
+    h.update(data)
+    return h.hexdigest()
+
+
+def _same_displaced_snapshot(a, b):
+    """Compare the inode exchanged out of place with the pre-save snapshot.
+
+    rename/exchange itself updates ctime on Linux, so ctime cannot participate
+    here. Identity, bytes, mtime, ownership and mode still catch replacement,
+    content changes and metadata changes in the final race window.
+    """
+    sa, sb = a["stat"], b["stat"]
+    return (a["data"] == b["data"] and _stat_identity(sa) == _stat_identity(sb)
+            and sa.st_size == sb.st_size and sa.st_mtime_ns == sb.st_mtime_ns
+            and stat.S_IMODE(sa.st_mode) == stat.S_IMODE(sb.st_mode)
+            and sa.st_uid == sb.st_uid and sa.st_gid == sb.st_gid)
+
+
+def _snapshot_at(dirfd, name):
+    """Open one regular leaf without following it and return a stable snapshot."""
+    try:
+        before = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise _ConfigIOError("io", "config file could not be inspected")
+    if not stat.S_ISREG(before.st_mode):
+        raise _ConfigIOError("not-regular", "config entry is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=dirfd)
+    except OSError:
+        raise _ConfigIOError("open", "config file could not be opened safely")
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or _stat_identity(opened) != _stat_identity(before):
+            raise _ConfigIOError("conflict", "config file changed concurrently")
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, min(65536, _MAX_CONFIG_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _MAX_CONFIG_BYTES:
+                raise _ConfigIOError("too-large", "config file exceeds the editor size limit")
+        after = os.fstat(fd)
+        stable = (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns,
+                  _stat_identity(opened))
+        if stable != (after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+                      _stat_identity(after)):
+            raise _ConfigIOError("conflict", "config file changed concurrently")
+        data = b"".join(chunks)
+        return {"data": data, "stat": after, "revision": _revision(after, data)}
+    finally:
+        os.close(fd)
+
+
+def _snapshot(path):
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) \
+        | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dfd = os.open(parent, flags)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise _ConfigIOError("parent", "config parent could not be opened safely")
+    try:
+        return _snapshot_at(dfd, name)
+    finally:
+        os.close(dfd)
+
+
+def _decode(data):
+    encoding = "utf-8-sig" if data.startswith(b"\xef\xbb\xbf") else "utf-8"
+    try:
+        return data.decode(encoding), encoding
+    except UnicodeDecodeError:
+        raise _ConfigIOError("encoding", "config file is not valid UTF-8")
+
+
+def _newline_style(content):
+    crlf = content.count("\r\n")
+    rest = content.replace("\r\n", "")
+    kinds = sum(bool(n) for n in (crlf, rest.count("\n"), rest.count("\r")))
+    if kinds > 1:
+        return "mixed"
+    if crlf:
+        return "crlf"
+    if "\n" in rest:
+        return "lf"
+    if "\r" in rest:
+        return "cr"
+    return "none"
+
+
+def _encode(content, encoding, newline):
+    if newline == "mixed":
+        raise _ConfigIOError("newline", "mixed newline styles are read-only")
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    if newline == "crlf":
+        normalized = normalized.replace("\n", "\r\n")
+    elif newline == "cr":
+        normalized = normalized.replace("\n", "\r")
+    return normalized.encode(encoding)
+
+
+def _readable(path, rp):
+    holder = _home_holder(rp)
+    return (os.path.basename(rp) not in _DENY_FILES
+            and _is_recognized_config(rp)
+            and _root_match(path) is not None
+            and (_under(rp, CWD_ROOTS + HOME_ROOTS) or _is_seat_home(holder)))
+
+
 def read_file(path):
-    """Raw content + type + editability of one RECOGNIZED config file. Content is
-    served ONLY for a recognized config under an allowlisted root — never an
-    arbitrary file (the review's #1: an ungated read returned /etc/passwd,
-    ~/.aws/…, credential stores). A plugin/managed recognized config is readable
-    (view-only) but not editable."""
-    rp = _real(path)
-    typ, editable, reason = classify_path(rp)
-    exists = os.path.isfile(rp)
-    readable = (os.path.basename(rp) not in _DENY_FILES
-                and _is_recognized_config(rp)
-                and (_under(rp, CWD_ROOTS + HOME_ROOTS)
-                     or _is_seat_home(os.path.dirname(rp))))
-    if not readable:
+    """Content plus an opaque revision for one safely-opened config file."""
+    rp = _candidate(path)
+    typ, editable, reason = classify_path(path)
+    if rp is None or not _readable(path, rp):
+        return {"path": "", "type": typ, "editable": False, "reason": reason,
+                "exists": False, "content": "", "revision": None,
+                **_error("refused", "only recognized config files are readable")}
+    st = _lstat_regular(rp)
+    exists = st is not None and st is not False
+    if st is False:
         return {"path": rp, "type": typ, "editable": False,
-                "reason": reason or "not a recognized config file", "exists": exists,
-                "content": "", "error": "refused: only recognized config files are readable"}
-    content, err = "", None
-    if exists:
-        try:
-            with open(rp, encoding="utf-8", errors="replace") as f:
-                content = f.read(1_000_000)  # 1MB cap — config files are small
-        except OSError as e:
-            err = str(e)
+                "reason": "not a regular file", "exists": True, "content": "",
+                "revision": None, **_error("not-regular", "config entry is not a regular file")}
+    if not exists:
+        return {"path": rp, "type": typ, "editable": editable, "reason": reason,
+                "exists": False, "content": "", "revision": _MISSING_REVISION,
+                "encoding": "utf-8", "newline": "none", "error": None}
+    try:
+        snap = _snapshot(rp)
+        content, encoding = _decode(snap["data"])
+    except _ConfigIOError as e:
+        return {"path": rp, "type": typ, "editable": False, "reason": e.message,
+                "exists": True, "content": "", "revision": None,
+                **_error(e.code, e.message)}
+    newline = _newline_style(content)
+    if newline == "mixed":
+        editable, reason = False, "mixed newline styles are read-only"
     return {"path": rp, "type": typ, "editable": editable, "reason": reason,
-            "exists": exists, "content": content, "error": err}
+            "exists": True, "content": content, "revision": snap["revision"],
+            "encoding": encoding, "newline": newline, "error": None}
 
 
 def _validate(typ, content):
@@ -417,107 +770,260 @@ def _validate(typ, content):
         try:
             json.loads(content)
         except ValueError as e:
-            return False, f"invalid JSON: {e}"
+            return False, f"invalid JSON at line {getattr(e, 'lineno', '?')} column {getattr(e, 'colno', '?')}"
     elif typ == "toml":
         if tomllib is None:
             return True, "toml not validated (python < 3.11)"
         try:
             tomllib.loads(content)
         except Exception as e:
-            return False, f"invalid TOML: {e.__class__.__name__}: {e}"
+            return False, f"invalid TOML ({e.__class__.__name__})"
     return True, None
 
 
-def _backup(rp):
-    """Copy the current file to the backup dir with a sidecar recording its origin;
-    return the backup path (or None if the file does not exist yet — a create has
-    nothing to back up). The sidecar (not the filename) carries the orig path, so
-    restore never has to reverse a fragile path-encoding, and the ns suffix makes
-    same-second backups of one file distinct."""
-    if not os.path.isfile(rp):
-        return None
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + f"-{time.time_ns() % 1_000_000_000:09d}"
-    tag = os.path.basename(rp)
-    dest = os.path.join(BACKUP_DIR, f"{stamp}__{tag}")
-    shutil.copy2(rp, dest)
-    with open(dest + ".orig", "w") as f:
-        json.dump({"orig": rp, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, f)
-    return dest
+def _write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError(errno.EIO, "short write")
+        view = view[n:]
 
 
-def write_file(path, content):
-    """Backup → validate → atomic write. Refuses non-recognized / plugin / managed /
-    out-of-root paths. Returns {ok, backup, note} or {error}."""
-    rp = _real(path)
-    typ, editable, reason = classify_path(rp)
-    if not editable:
-        return {"error": f"refused: {reason} ({rp})"}
+def _backup_snapshot(rp, snap, encoding, newline):
+    """Durably record the exact bytes about to be displaced."""
+    try:
+        os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+        os.chmod(BACKUP_DIR, 0o700)
+        dfd = os.open(BACKUP_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                      | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise _ConfigIOError("backup", "config backup could not be created")
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) \
+        + f"-{time.time_ns() % 1_000_000_000:09d}"
+    tag = hashlib.sha256(os.fsencode(rp)).hexdigest()[:20]
+    name = f"{stamp}__{tag}"
+    meta = json.dumps({"orig": rp, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                       "encoding": encoding, "newline": newline}, ensure_ascii=False).encode()
+    made = []
+    try:
+        for leaf, data in ((name, snap["data"]), (name + ".orig", meta)):
+            fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=dfd)
+            try:
+                os.fchmod(fd, 0o600)
+                _write_all(fd, data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            made.append(leaf)
+        os.fsync(dfd)
+        return os.path.join(BACKUP_DIR, name)
+    except OSError:
+        for leaf in made:
+            try:
+                os.unlink(leaf, dir_fd=dfd)
+            except OSError:
+                pass
+        raise _ConfigIOError("backup", "config backup could not be created")
+    finally:
+        os.close(dfd)
+
+
+def _renameat2(dfd, old, new, flags):
+    if _RENAMEAT2 is None:
+        raise OSError(errno.ENOTSUP, "renameat2 unavailable")
+    if _RENAMEAT2(dfd, os.fsencode(old), dfd, os.fsencode(new), flags) != 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+
+
+def _remove_quiet(dfd, name):
+    try:
+        os.unlink(name, dir_fd=dfd)
+    except OSError:
+        pass
+
+
+def _write_file_impl(path, content, expected_revision=None, encoding_override=None,
+                     newline_override=None):
+    """Validated, conflict-detecting, durable atomic edit of one regular file.
+
+    Existing saves use renameat2(RENAME_EXCHANGE): the displaced inode remains
+    staged until its identity and bytes match the editor revision and the parent
+    directory is fsynced. Any mismatch or durability failure exchanges it back.
+    Creates use an atomic no-clobber hard link. No arbitrary path is opened by
+    name before the shared recognition/containment/lstat gate accepts it.
+    """
+    rp = _candidate(path)
+    typ, editable, reason = classify_path(path)
+    if rp is None or not editable:
+        return _error("refused", "refused: " + reason)
+    if not isinstance(content, str):
+        return _error("content", "refused: content must be text")
     ok, verr = _validate(typ, content)
     if not ok:
-        return {"error": f"refused: {verr} — no change written"}
-    parent = os.path.dirname(rp)
+        return _error("validation", f"refused: {verr} — no change written")
+    parent, name = os.path.dirname(rp), os.path.basename(rp)
     created_parent = False
     if not os.path.isdir(parent):
+        if expected_revision not in (None, _MISSING_REVISION):
+            return _error("conflict", "config file changed concurrently; reload before saving")
+        if os.path.basename(parent) not in (".claude", "commands", "rules"):
+            return _error("parent", "config parent does not exist")
         try:
-            os.makedirs(parent, exist_ok=True)
+            os.mkdir(parent, 0o700)
             created_parent = True
-        except OSError as e:
-            return {"error": f"could not create parent dir: {e}"}
-    backup = _backup(rp)
-    existed = os.path.isfile(rp)
-    # an EXISTING file keeps its exact mode — replacing a 0600 settings.json
-    # with a 0644 inode widened cred-home files to other local users
-    # (codex-seat review HIGH, 2026-07-19). New files: owner-only for anything
-    # in a cred home; 0644 only for ordinary project-tree configs.
-    if existed:
-        mode = os.stat(rp).st_mode & 0o777
-    elif os.path.basename(rp) in (".claude.json", ".credentials.json") \
-            or "/.claude" in rp or "/.codex" in rp:
-        mode = 0o600
-    else:
-        mode = 0o644
-    tmp = f"{rp}.helm-tmp.{os.getpid()}"
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-        os.fchmod(fd, mode)  # exact — os.open's mode arg is umask-masked
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())  # durable before the rename (no zero-length inode on power loss)
-        os.replace(tmp, rp)
-    except OSError as e:
-        try:
-            os.unlink(tmp)
         except OSError:
-            pass
-        return {"error": f"write failed: {e}"}
-    note = ("created" if not existed else "updated") + (f" ({verr})" if verr else "")
+            return _error("parent", "config parent could not be created safely")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) \
+        | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dfd = os.open(parent, flags)
+    except OSError:
+        return _error("parent", "config parent could not be opened safely")
+    tmp = f".helm-config-{os.getpid()}-{secrets.token_hex(8)}"
+    backup = None
+    try:
+        try:
+            current = _snapshot_at(dfd, name)
+        except _ConfigIOError as e:
+            return _error(e.code, e.message)
+        current_revision = current["revision"] if current else _MISSING_REVISION
+        if expected_revision is not None and expected_revision != current_revision:
+            return _error("conflict", "config file changed concurrently; reload before saving")
+        if current:
+            try:
+                current_content, current_encoding = _decode(current["data"])
+            except _ConfigIOError as e:
+                return _error(e.code, e.message)
+            current_newline = _newline_style(current_content)
+        else:
+            current_encoding, current_newline = "utf-8", "lf"
+        encoding = encoding_override or current_encoding
+        newline = newline_override or current_newline
+        try:
+            data = _encode(content, encoding, newline)
+        except (_ConfigIOError, UnicodeEncodeError) as e:
+            code = e.code if isinstance(e, _ConfigIOError) else "encoding"
+            message = e.message if isinstance(e, _ConfigIOError) else "content cannot use the original encoding"
+            return _error(code, message)
+        if len(data) > _MAX_CONFIG_BYTES:
+            return _error("too-large", "config content exceeds the editor size limit")
+        if current:
+            try:
+                backup = _backup_snapshot(rp, current, current_encoding, current_newline)
+            except _ConfigIOError as e:
+                return _error(e.code, e.message)
+            mode = stat.S_IMODE(current["stat"].st_mode)
+            uid, gid = current["stat"].st_uid, current["stat"].st_gid
+        else:
+            holder = _home_holder(rp)
+            mode = 0o600 if (_under(rp, HOME_ROOTS) or _is_seat_home(holder)) else 0o644
+            uid, gid = os.geteuid(), os.getegid()
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_CLOEXEC", 0), mode, dir_fd=dfd)
+            try:
+                os.fchown(fd, uid, gid)
+                os.fchmod(fd, mode)
+                _write_all(fd, data)
+                os.fsync(fd)
+                staged_stat = os.fstat(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            _remove_quiet(dfd, tmp)
+            return _error("stage", "config update could not be staged safely")
+        if current:
+            try:
+                _renameat2(dfd, tmp, name, _RENAME_EXCHANGE)
+            except OSError:
+                _remove_quiet(dfd, tmp)
+                return _error("atomic", "atomic config exchange is unavailable")
+            try:
+                displaced = _snapshot_at(dfd, tmp)
+                if displaced is None or not _same_displaced_snapshot(displaced, current):
+                    raise _ConfigIOError("conflict", "config file changed concurrently; reload before saving")
+                os.fsync(dfd)
+            except (_ConfigIOError, OSError) as e:
+                try:
+                    _renameat2(dfd, tmp, name, _RENAME_EXCHANGE)
+                    os.fsync(dfd)
+                except OSError:
+                    return _error("rollback", "config update failed and rollback could not be confirmed")
+                _remove_quiet(dfd, tmp)
+                if isinstance(e, _ConfigIOError):
+                    return _error(e.code, e.message)
+                return _error("durability", "config update was rolled back after a durability failure")
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                try:
+                    _renameat2(dfd, tmp, name, _RENAME_EXCHANGE)
+                    os.fsync(dfd)
+                except OSError:
+                    return _error("rollback", "config cleanup failed and rollback could not be confirmed")
+                _remove_quiet(dfd, tmp)
+                return _error("cleanup", "config update was rolled back after cleanup failed")
+            try:
+                os.fsync(dfd)
+            except OSError:
+                pass  # target rename was already durably fsynced; only temp cleanup may replay
+        else:
+            try:
+                os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+                os.fsync(dfd)
+            except FileExistsError:
+                _remove_quiet(dfd, tmp)
+                return _error("conflict", "config file appeared concurrently; reload before saving")
+            except OSError:
+                _remove_quiet(dfd, tmp)
+                return _error("atomic", "config create could not be committed atomically")
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                try:
+                    os.unlink(name, dir_fd=dfd)
+                    os.fsync(dfd)
+                except OSError:
+                    return _error("rollback", "config create failed and rollback could not be confirmed")
+                _remove_quiet(dfd, tmp)
+                return _error("cleanup", "config create was rolled back after cleanup failed")
+            try:
+                os.fsync(dfd)
+            except OSError:
+                pass  # the linked target was already durably fsynced
+    finally:
+        os.close(dfd)
+    note = ("created" if current is None else "updated") + (f" ({verr})" if verr else "")
     return {"ok": True, "path": rp, "backup": backup, "created_parent": created_parent,
-            "note": note}
+            "revision": _revision(staged_stat, data), "note": note}
+
+
+def write_file(path, content, expected_revision=None):
+    """Public writer contract; private format overrides are restore-only."""
+    return _write_file_impl(path, content, expected_revision=expected_revision)
 
 
 # ── structured entry ops (safer than raw-file editing for common toggles) ─────
 
 def entry_op(action, path, kind, name, value=None):
-    """Add / remove / toggle one MCP server (claude .mcp.json or .claude.json
-    mcpServers) or one hook — structured, so the common case never hand-edits JSON.
-    action: add|remove|enable|disable. Returns write_file's result."""
-    rp = _real(path)
-    typ, editable, reason = classify_path(rp)
+    """Add/remove one MCP entry against the exact safely-read revision."""
+    typ, editable, reason = classify_path(path)
     if not editable:
-        return {"error": f"refused: {reason}"}
+        return _error("refused", "refused: " + reason)
     if typ != "json":
-        return {"error": "structured entry ops apply to JSON config files only"}
-    data = {}
-    if os.path.isfile(rp):
-        try:
-            with open(rp, encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError) as e:
-            return {"error": f"cannot parse {rp}: {e}"}
+        return _error("type", "structured entry ops apply to JSON config files only")
+    got = read_file(path)
+    if got.get("error"):
+        return _error(got.get("code") or "read", got["error"])
+    try:
+        data = json.loads(got["content"]) if got["exists"] else {}
+    except ValueError as e:
+        return _error("validation", f"cannot parse config JSON: {e}")
     if not isinstance(data, dict):
-        return {"error": "config root is not a JSON object"}
+        return _error("shape", "config root is not a JSON object")
     if kind == "mcp":
         servers = data.setdefault("mcpServers", {})
         if not isinstance(servers, dict):
@@ -532,18 +1038,34 @@ def entry_op(action, path, kind, name, value=None):
             return {"error": f"unsupported action {action!r} for mcp"}
     else:
         return {"error": f"unsupported kind {kind!r} (mcp only, for now)"}
-    return write_file(rp, json.dumps(data, indent=2) + "\n")
+    return write_file(path, json.dumps(data, indent=2) + "\n",
+                      expected_revision=got["revision"])
 
 
 # ── backups / undo ────────────────────────────────────────────────────────────
 
-def _backup_orig(bp):
-    """The original path a backup came from (from its sidecar)."""
+def _backup_meta(bp):
+    """Validated sidecar for one regular backup leaf."""
     try:
-        with open(bp + ".orig") as f:
-            return json.load(f).get("orig")
-    except (OSError, ValueError):
+        if not _lstat_regular(bp):
+            return None
+        snap = _snapshot(bp + ".orig")
+        if snap is None:
+            return None
+        raw, _ = _decode(snap["data"])
+        data = json.loads(raw)
+        orig = data.get("orig")
+        rp = _candidate(orig)
+        if rp is None or not _readable(orig, rp):
+            return None
+        return data
+    except (OSError, ValueError, TypeError, _ConfigIOError):
         return None
+
+
+def _backup_orig(bp):
+    meta = _backup_meta(bp)
+    return meta.get("orig") if meta else None
 
 
 def list_backups():
@@ -553,31 +1075,39 @@ def list_backups():
             if b.endswith(".orig"):
                 continue
             bp = os.path.join(BACKUP_DIR, b)
-            if not os.path.isfile(bp):
+            st = _lstat_regular(bp)
+            meta = _backup_meta(bp)
+            if not st or not meta:
                 continue
-            st = os.stat(bp)
-            out.append({"backup": bp, "orig": _backup_orig(bp) or "(unknown)",
-                        "size": st.st_size,
-                        "at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))})
+            out.append({"backup": bp, "orig": meta["orig"], "size": st.st_size,
+                        "at": meta.get("at") or time.strftime(
+                            "%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))})
     except OSError:
         pass
     return out
 
 
 def restore(backup):
-    """Restore a backup to its original path (validated + re-backed-up first)."""
-    bp = _real(backup)
-    if not (bp.startswith(_real(BACKUP_DIR) + os.sep) and os.path.isfile(bp)):
-        return {"error": "unknown backup"}
-    orig = _backup_orig(bp)
-    if not orig:
-        return {"error": "backup has no recorded origin path"}
+    """Restore exact backup text/newline encoding through the normal write gate."""
+    ap = _absolute(backup)
+    root = _real(BACKUP_DIR)
+    if ap is None or not _path_below(ap, root) or _candidate(ap) != ap:
+        return _error("backup", "unknown backup")
+    meta = _backup_meta(ap)
+    if not meta:
+        return _error("backup", "unknown backup")
     try:
-        with open(bp, encoding="utf-8") as f:
-            content = f.read()
-    except OSError as e:
-        return {"error": f"cannot read backup: {e}"}
-    return write_file(orig, content)
+        snap = _snapshot(ap)
+        if snap is None:
+            raise _ConfigIOError("backup", "backup disappeared concurrently")
+        content, detected = _decode(snap["data"])
+    except _ConfigIOError as e:
+        return _error(e.code, "backup could not be read safely")
+    encoding = meta.get("encoding") if meta.get("encoding") in ("utf-8", "utf-8-sig") else detected
+    newline = meta.get("newline") if meta.get("newline") in ("none", "lf", "crlf", "cr") \
+        else _newline_style(content)
+    return _write_file_impl(meta["orig"], content, encoding_override=encoding,
+                            newline_override=newline)
 
 
 # ── CLI (read-only surface over the same model) ───────────────────────────────
