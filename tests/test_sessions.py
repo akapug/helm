@@ -516,3 +516,79 @@ class ResumeKickTest(unittest.TestCase):
         # confidently narrating context that was never persisted
         self.assertIn("never persisted", sessions.RESUME_KICK)
         self.assertIn("say so plainly", sessions.RESUME_KICK)
+
+
+class AdversarialIdentityTest(unittest.TestCase):
+    """The two classes codex-3's read-only pass confirmed uncovered: a recycled
+    pid wearing a stale record, and equal-authority binding conflicts."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        import json
+        h = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(h, "sessions"))
+        with open(os.path.join(h, "sessions", "4242.json"), "w") as f:
+            json.dump({"pid": 4242, "sessionId": "sid-r", "procStart": "111"}, f)
+        self.home = h
+        import glob as _glob
+        _real = _glob.glob
+        # the argv rung scans the REAL /proc — silence it, or the test host's
+        # own live claude panes leak into every assertion
+        self.p = [mock.patch.object(sessions, "cred_homes", lambda: [h]),
+                  mock.patch.object(sessions, "BINDINGS",
+                                    os.path.join(self.tmp, "b.tsv")),
+                  mock.patch.object(sessions.glob, "glob",
+                                    side_effect=lambda pat: []
+                                    if "cmdline" in pat else _real(pat))]
+        for p in self.p:
+            p.start()
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+
+    def test_a_recycled_pid_is_never_claimed_as_the_session(self):
+        # /proc/4242 exists (some unrelated process wears the number) but it is
+        # not claude, or not the recorded incarnation — the record is STALE
+        with mock.patch.object(sessions, "_pid_is_claude", return_value=False) as g:
+            self.assertEqual(sessions.live_sids(), {})
+        g.assert_called_with(4242, "111")
+
+    def test_a_proven_incarnation_is_claimed(self):
+        with mock.patch.object(sessions, "_pid_is_claude", return_value=True):
+            self.assertEqual(sessions.live_sids(), {"sid-r": 4242})
+
+    def test_rung0_cannot_latch_a_recycled_pids_home(self):
+        # the xrev repro: stale record -> live `sleep` pid -> its unrelated
+        # CLAUDE_CONFIG_DIR read as environ TRUTH and latched. With the pid
+        # gate closed, rung 0 never fires and nothing is latched.
+        with mock.patch.object(sessions, "_pid_is_claude", return_value=False), \
+             mock.patch.object(sessions, "proc_home",
+                               return_value="/tmp/unrelated") as ph:
+            self.assertIsNone(sessions.credhome_for("sid-r"))
+            ph.assert_not_called()
+        self.assertEqual(sessions._bindings(), {})
+
+    def test_procstart_mismatch_rejects_the_incarnation(self):
+        # real /proc probe: our own test process exists and IS python, not
+        # claude — comm gate refuses regardless of start time
+        self.assertFalse(sessions._pid_is_claude(os.getpid()))
+        self.assertFalse(sessions._pid_is_claude(os.getpid(), "999"))
+
+    def test_equal_authority_conflict_keeps_the_first_claim(self):
+        self.assertTrue(sessions.record_binding("s", "/h/A", "environ"))
+        self.assertFalse(sessions.record_binding("s", "/h/B", "environ"))
+        self.assertEqual(sessions._bindings()["s"], ("/h/A", "environ"))
+
+    def test_equal_authority_replay_order_cannot_flip_the_answer(self):
+        # even if an older writer APPENDED a conflicting equal-authority row,
+        # replay keeps the first claim — the answer is order-stable
+        os.makedirs(os.path.dirname(sessions.BINDINGS), exist_ok=True)
+        with open(sessions.BINDINGS, "w") as f:
+            f.write("s\t/h/A\tenviron\ns\t/h/B\tenviron\n")
+        self.assertEqual(sessions._bindings()["s"], ("/h/A", "environ"))
+
+    def test_strictly_better_still_corrects(self):
+        self.assertTrue(sessions.record_binding("s2", "/h/weak", "session-env"))
+        self.assertTrue(sessions.record_binding("s2", "/h/strong", "environ"))
+        self.assertEqual(sessions._bindings()["s2"], ("/h/strong", "environ"))

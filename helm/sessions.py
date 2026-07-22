@@ -115,7 +115,11 @@ def _bindings():
                 sid, home = parts[0], parts[1]
                 src = parts[2] if len(parts) > 2 else "session-env"
                 prev = out.get(sid)
-                if prev is None or AUTHORITY.get(src, 0) >= AUTHORITY.get(prev[1], 0):
+                # STRICTLY greater wins; an equal-authority later row never
+                # overwrites (same-source conflicts must not flip the answer by
+                # scan/append order — first claim at a tier holds until a
+                # genuinely better tier speaks)
+                if prev is None or AUTHORITY.get(src, 0) > AUTHORITY.get(prev[1], 0):
                     out[sid] = (home, src)
     except OSError:
         pass
@@ -129,9 +133,14 @@ def record_binding(sid, home, source="session-env"):
     if not sid or not home:
         return False
     prev = _bindings().get(sid)
-    if prev and (prev == (home, source)
-                 or AUTHORITY.get(source, 0) < AUTHORITY.get(prev[1], 0)):
-        return False
+    if prev:
+        if prev == (home, source):
+            return False                      # idempotent re-record
+        if AUTHORITY.get(source, 0) <= AUTHORITY.get(prev[1], 0):
+            # equal authority with a DIFFERENT home is a CONFLICT, not an
+            # update — refuse, keep the first claim (xrev: >= here let
+            # environ-B silently overwrite environ-A)
+            return False
     try:
         os.makedirs(os.path.dirname(BINDINGS), exist_ok=True)
         with open(BINDINGS, "a") as f:
@@ -191,6 +200,33 @@ def latch_live():
     return n
 
 
+def _pid_is_claude(pid, want_start=None):
+    """True only when /proc/<pid> is a LIVE claude process, and — when the
+    record carries procStart — the SAME incarnation of it.
+
+    Mere pid existence proves nothing: pids recycle, and a stale
+    sessions/<pid>.json can point at whatever now wears the number (xrev repro:
+    a `sleep` with a hostile CLAUDE_CONFIG_DIR in its environ was claimed as a
+    live session, its unrelated home was then read as rung-0 environ TRUTH and
+    latched — a silent wrong-account resume, the exact failure this lane
+    exists to prevent). comm answers WHAT the pid is; procStart (stat field
+    22, position 19 after the comm split) answers WHICH incarnation."""
+    try:
+        with open("/proc/%d/comm" % pid, "rb") as f:
+            if f.read().strip() != b"claude":
+                return False
+    except OSError:
+        return False
+    if not want_start:
+        return True
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as f:
+            fields = f.read().decode("utf-8", "replace").rpartition(")")[2].split()
+        return fields[19] == str(want_start)
+    except (OSError, IndexError):
+        return False
+
+
 def live_sids():
     """{sid: pid} for every session a pane is CURRENTLY holding open.
 
@@ -211,7 +247,8 @@ def live_sids():
                 pid = int(rec.get("pid") or 0)
             except (OSError, ValueError, TypeError):
                 continue
-            if pid and rec.get("sessionId") and os.path.isdir("/proc/%d" % pid):
+            if pid and rec.get("sessionId") and \
+                    _pid_is_claude(pid, rec.get("procStart")):
                 out[rec["sessionId"]] = pid
     # SECOND RUNG, different failure mode. The pid-keyed record is the better
     # signal but it is not universal: panes launched by a claude older than the
