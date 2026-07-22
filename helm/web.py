@@ -746,10 +746,10 @@ def _room_seats(room, rows, roster):
     """The sidebar's per-channel roster: which seats are present in THIS
     room, newest-activity first — [{seat, presence}]. 'Present' = the seat
     POSTED here recently (the rows are already read for the owner signal —
-    reuse, no extra I/O) OR actually CONSUMED rows here (its room cursor
-    advanced past offset 0 — a bare join baseline is NOT presence: join
-    baselines every room, so every seat would otherwise look present
-    everywhere). Presence is the shared .seen beat (seats.last_seen /
+    reuse, no extra I/O) OR actually CONSUMED rows here (its room cursor has
+    `active=true`; a bare EOF join baseline is NOT presence, or every seat
+    would otherwise look present everywhere). Presence is the shared .seen
+    beat (seats.last_seen /
     presence_of), so a fresh poster shows 'fresh', an idle one 'quiet';
     owner-rail rows are skipped (the owner is not a seat). Fail-open per
     row; capped so a busy channel can't flood the sidebar."""
@@ -757,7 +757,8 @@ def _room_seats(room, rows, roster):
     seen, out = set(), []
     for m in reversed(rows[-64:]):           # recent activity, newest first
         frm = str(m.get("from") or "")
-        if not frm or m.get("react") or frm in seen or frm not in roster:
+        if not frm or m.get("react") or frm in seen or frm not in roster \
+                or not _s.room_in_scope(room, roster[frm]):
             continue
         seen.add(frm)
         out.append({"seat": frm,
@@ -767,10 +768,9 @@ def _room_seats(room, rows, roster):
     for seat in sorted(roster):              # consumers who never posted
         if len(out) >= 6:
             break
-        if seat in seen:
+        if seat in seen or not _s.room_in_scope(room, roster[seat]):
             continue
-        cur = _s._cursor(room, seat)
-        if not cur or not cur.get("off"):    # no cursor, or a bare baseline
+        if not _s.room_active(room, seat):  # bare EOF baselines are not presence
             continue
         out.append({"seat": seat,
                     "presence": _s.presence_of(_s.last_seen(seat, roster[seat]))})

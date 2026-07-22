@@ -31,7 +31,9 @@ class SeatTest(unittest.TestCase):
         self._env = {k: os.environ.get(k) for k in
                      ("HELM_HOME", "MELD_HOME", "HELM_PROXY_BIN",
                       "MELD_PROXY_BIN", "KIMI_API_KEY", "HELM_PROC",
-                      "HELM_CHAT_DIR", "HELM_CODEX_HOMES_DIR",
+                      "HELM_CHAT_DIR", "HELM_CHAT_ROOM",
+                      "HELM_CHAT_ROOM_SOURCE", "MELD_CHAT_ROOM",
+                      "MELD_CHAT_ROOM_SOURCE", "HELM_CODEX_HOMES_DIR",
                       "MELD_CODEX_HOMES_DIR")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm-home")
         os.environ.pop("MELD_HOME", None)
@@ -40,6 +42,9 @@ class SeatTest(unittest.TestCase):
         os.environ.pop("HELM_PROXY_BIN", None)
         os.environ.pop("MELD_PROXY_BIN", None)
         os.environ.pop("KIMI_API_KEY", None)  # hermetic: never the real key
+        for key in ("HELM_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
+                    "MELD_CHAT_ROOM", "MELD_CHAT_ROOM_SOURCE"):
+            os.environ.pop(key, None)
         # launch's retrofit surface scans /proc + the roster — keep both tmp
         os.environ["HELM_PROC"] = os.path.join(self.tmp, "proc")
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
@@ -575,14 +580,19 @@ class SeatTest(unittest.TestCase):
             self.assertEqual(json.load(f), {"mine": True})  # never clobbered
 
     def test_launch_line_room_homing(self):
-        """Team-room homing (slice 3): --room bakes HELM_CHAT_ROOM into the
-        line + launch.sh; no --room exports nothing (un-homed = main, the
-        whole fleet today) — and the identity + signing env stay intact."""
+        """Seat presets clear ambient homing, then bake either an explicit room
+        or a project-derived room with truthful provenance into launch.sh."""
         self._plant("home-a")
         self.assertEqual(self._add()[0], 0)
-        self.assertNotIn("HELM_CHAT_ROOM", seat.launch_line("codex"))
+        bare = seat.launch_line("codex")
+        self.assertNotIn("HELM_CHAT_ROOM=", bare)
+        self.assertIn("-u HELM_CHAT_ROOM", bare)
+        self.assertIn("-u MELD_CHAT_ROOM", bare)
+        self.assertIn("-u HELM_CHAT_ROOM_SOURCE", bare)
+        self.assertIn("-u MELD_CHAT_ROOM_SOURCE", bare)
         line = seat.launch_line("codex", room="team-x")
         self.assertIn("HELM_CHAT_ROOM=team-x", line)
+        self.assertNotIn("HELM_CHAT_ROOM_SOURCE=", line)
         self.assertIn("HELM_CHAT_NAME=codex", line)          # identity intact
         self.assertIn("HELM_CELL_BIN=" + seat.DREGG_SIGNER_DEFAULT, line)
         self.assertIn("HELM_CELL_PROFILE=codex", line)       # signing intact
@@ -593,11 +603,38 @@ class SeatTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("HELM_CHAT_ROOM=team-x", out.getvalue())
         with open(os.path.join(seat.seat_dir("codex"), "launch.sh")) as f:
-            self.assertIn("HELM_CHAT_ROOM=team-x", f.read())  # preset carries it
+            preset = f.read()
+        self.assertIn("HELM_CHAT_ROOM=team-x", preset)
+        self.assertNotIn("HELM_CHAT_ROOM_SOURCE=", preset)
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with mock.patch.object(seat, "_resolve_homing",
+                               return_value=("helm", "derived")), \
+                contextlib.redirect_stdout(out):
             self.assertEqual(seat.cmd_seat(["launch", "codex"]), 0)
-        self.assertNotIn("HELM_CHAT_ROOM", out.getvalue())    # default un-homed
+        self.assertIn("HELM_CHAT_ROOM=helm", out.getvalue())
+        self.assertIn("HELM_CHAT_ROOM_SOURCE=derived", out.getvalue())
+        with open(os.path.join(seat.seat_dir("codex"), "launch.sh")) as f:
+            preset = f.read()
+        self.assertIn("HELM_CHAT_ROOM_SOURCE=derived", preset)
+
+    def test_homing_resolution_precedence_and_source(self):
+        with mock.patch.dict(os.environ, {
+                "HELM_CHAT_ROOM": "project-a",
+                "HELM_CHAT_ROOM_SOURCE": "derived"}):
+            self.assertEqual(seat._resolve_homing(), ("project-a", "derived"))
+            self.assertEqual(seat._resolve_homing("main"), ("main", None))
+        with mock.patch.dict(os.environ, {
+                "MELD_CHAT_ROOM": "legacy-project",
+                "MELD_CHAT_ROOM_SOURCE": "derived"}):
+            self.assertEqual(seat._resolve_homing(),
+                             ("legacy-project", "derived"))
+        with mock.patch.dict(os.environ, {
+                "HELM_CHAT_ROOM": "explicit-new",
+                "MELD_CHAT_ROOM_SOURCE": "derived"}):
+            self.assertEqual(seat._resolve_homing(),
+                             ("explicit-new", None))
+        with mock.patch("helm.seats.derive_home_room", return_value="helm"):
+            self.assertEqual(seat._resolve_homing(), ("helm", "derived"))
 
     def test_seat_subprocess_env_overrides_ambient_owner_signer_identity(self):
         self._plant("home-a")

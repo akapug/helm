@@ -19,7 +19,7 @@ import re
 import socket
 import sys
 
-from . import homes, hooks, seats
+from . import home, homes, hooks, seats
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -34,7 +34,7 @@ def stable_seat(cwd=None):
 def parse_args(args):
     """-> (opts dict, claude_args). Everything after `--` (or the first
     unknown token) passes through verbatim."""
-    opts = {"seat": None, "home": None, "room": "main", "install": True}
+    opts = {"seat": None, "home": None, "room": None, "install": True}
     rest, i = [], 0
     args = list(args or [])
     while i < len(args):
@@ -55,9 +55,9 @@ def parse_args(args):
     return opts, rest
 
 
-def build_env(base, seat, home_path=None, room=None):
+def build_env(base, seat, home_path=None, room=None, room_source=None):
     """The child's env: stable chat identity, optional credential-home pin,
-    and an explicit non-main team room. Pure — tested without an exec.
+    and an explicit or derived project room. Pure — tested without an exec.
     The child-session stamp is stripped (seat.CHILD_STAMP_VARS): launched
     from inside a Claude session, an inherited CLAUDE_CODE_CHILD_SESSION/
     SID marks the child a subprocess and kills its transcript persistence."""
@@ -68,8 +68,13 @@ def build_env(base, seat, home_path=None, room=None):
     env["HELM_CHAT_NAME"] = seat
     if home_path:
         env[homes.ENV_VAR["claude"]] = home_path
-    if room and room != "main":
+    for name in ("HELM_CHAT_ROOM", "MELD_CHAT_ROOM",
+                 "HELM_CHAT_ROOM_SOURCE", "MELD_CHAT_ROOM_SOURCE"):
+        env.pop(name, None)
+    if room:
         env["HELM_CHAT_ROOM"] = room
+        if room_source:
+            env["HELM_CHAT_ROOM_SOURCE"] = room_source
     return env
 
 
@@ -84,6 +89,11 @@ def cmd_launch(args):
             return 1
         home_path = targets[0][1]
     seat = opts["seat"] or os.environ.get("HELM_CHAT_NAME") or stable_seat()
+    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
+    room = opts["room"] or env_room or seats.derive_home_room(os.getcwd())
+    room_source = ("derived" if room and opts["room"] is None
+                   and (not env_room or env_source == "derived") else None)
+    room_explicit = opts["room"] is not None or bool(env_room and not room_source)
     if opts["install"]:
         for name, path in ([(opts["home"], home_path)] if home_path
                            else hooks.claude_homes()):
@@ -91,8 +101,9 @@ def cmd_launch(args):
             if action == "fail":
                 print("helm launch: hook install failed in %s: %s"
                       % (name, detail), file=sys.stderr)
-    seats.join(cwd=os.getcwd(), seat=seat, room=opts["room"])
-    env = build_env(os.environ, seat, home_path, opts["room"])
+    seats.join(cwd=os.getcwd(), seat=seat, room=room or "main",
+               room_explicit=room_explicit, room_source=room_source)
+    env = build_env(os.environ, seat, home_path, room, room_source)
     print("[helm launch] seat '%s'%s — exec claude" % (
         seat, (" home " + opts["home"]) if opts["home"] else ""), file=sys.stderr)
     try:

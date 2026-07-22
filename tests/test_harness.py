@@ -397,6 +397,18 @@ class SeatResumeTest(unittest.TestCase):
         rc, out, err, wla = self._resume(["codex"], FakeAdapter())
         self.assertEqual(rc, 0, err)
         self.assertEqual(wla.call_args[0], ("codex", d, "team-z", "codex"))
+        self.assertIsNone(wla.call_args.kwargs["room_source"])
+
+    def test_resume_preserves_derived_room_provenance(self):
+        d, launch = self._mint()
+        with open(launch, "w") as f:
+            f.write("#!/bin/sh\nexec env HELM_CHAT_ROOM='project room' "
+                    "HELM_CHAT_ROOM_SOURCE=derived claude \"$@\"\n")
+        rc, out, err, wla = self._resume(["codex"], FakeAdapter())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(wla.call_args[0],
+                         ("codex", d, "project room", "codex"))
+        self.assertEqual(wla.call_args.kwargs["room_source"], "derived")
 
     def test_resume_command_never_carries_the_seat_token(self):
         """TOKEN LAW: the pane command is the launch.sh PATH — the expanded

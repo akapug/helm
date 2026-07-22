@@ -59,8 +59,9 @@ commitments and batch-row reveal; the 0.3 spec is recorded in the design
 doc §11. No live consumer today, so: record, don't build.
 
 Cursor law (codex H5): `<room>.cursor.<seat>[.<sid8>]` holds {dev, ino, off,
-rid} — the room file's identity, the byte offset of the first unprocessed
-row, and the last processed row's stable id. The cursor is PER (seat,
+rid, active} — the room file's identity, the byte offset of the first
+unprocessed row, the last processed row's stable id, and whether the seat
+actually consumed room traffic (an EOF join baseline is not presence). The cursor is PER (seat,
 session): two live sessions sharing one HELM_CHAT_NAME each hold their own
 cursor, so an @mention FANS OUT to all of them instead of being race-consumed
 by whichever boundary fires first (the live @mention-loss class). A caller
@@ -109,6 +110,7 @@ team.a and team-a are different lanes by key). Delivery/beacon/stop-guard
 pick the lane up first in the room scan; nobody else ever scans it.
 """
 import getpass
+import glob
 import json
 import os
 import re
@@ -198,41 +200,96 @@ def derive_seat(session=None, cwd=None):
     return chat.whoname()
 
 
-def _git_project(cwd):
-    """The canonical PROJECT name for a cwd: the git common-dir's parent
-    basename — worktree-agnostic (a lane worktree's common dir points back
-    at the main repo, so every helm session, checkout or worktree, derives
-    'helm'; automap.py's precedent). None when cwd is not in a work tree.
-    Read-only, fail-open; runs once per join (SessionStart), never on the
-    per-tool-call delivery hot path. NOT the roster's `project` field —
-    that's the cwd basename (a display label; a session in repo/apps/web
-    records 'web'), and homing to a subdir room would split the project."""
+def _git_root(cwd):
+    """The canonical checkout root, including normal worktrees + submodules.
+    Bare repos and odd non-worktree layouts are not project contexts."""
     try:
         import subprocess
-        r = subprocess.run(["git", "-C", cwd or ".", "rev-parse",
-                            "--path-format=absolute", "--git-common-dir"],
-                           capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            parent = os.path.dirname(r.stdout.strip().rstrip(os.sep))
-            return os.path.basename(parent) or None
+        inside = subprocess.run(
+            ["git", "-C", cwd or ".", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return None
+        common = subprocess.run(
+            ["git", "-C", cwd or ".", "rev-parse", "--path-format=absolute",
+             "--git-common-dir"], capture_output=True, text=True, timeout=5)
+        if common.returncode != 0:
+            return None
+        path = common.stdout.strip().rstrip(os.sep)
+        if os.path.basename(path) == ".git":
+            return os.path.dirname(path)
+        bare = subprocess.run(
+            ["git", "--git-dir", path, "rev-parse", "--is-bare-repository"],
+            capture_output=True, text=True, timeout=5)
+        if bare.returncode == 0 and bare.stdout.strip() == "true":
+            # Every worktree attached to one bare common-dir shares this root.
+            return path
+        # A submodule's common dir is <super>/.git/modules/<name>; its own
+        # top-level remains the identity root. Odd non-bare git-dir layouts do
+        # too; bare repositories without a worktree were rejected above.
+        top = subprocess.run(
+            ["git", "-C", cwd or ".", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5)
+        return top.stdout.strip() if top.returncode == 0 else None
     except Exception:
-        pass
-    return None
+        return None
+
+
+def _fingerprinted_project(label, root):
+    """A readable label plus canonical-path fingerprint that survives pk.slug's
+    60-char cap. Used for every unregistered root and only those registered names
+    whose normalized room label collides with another distinct registered path."""
+    import hashlib
+    real = os.path.realpath(root).rstrip(os.sep)
+    fingerprint = hashlib.blake2b(
+        real.encode("utf-8"), digest_size=8).hexdigest()
+    base = pk.slug(label)[:60 - len(fingerprint) - 1]
+    return "%s-%s" % (base, fingerprint)
+
+
+def _path_project(root):
+    """Stable fallback identity for an unregistered checkout, independent of
+    scanner state. Registry adoption remains the deliberate human-naming seam."""
+    real = os.path.realpath(root).rstrip(os.sep)
+    return _fingerprinted_project(os.path.basename(real), real)
+
+
+def _git_project(cwd):
+    """The canonical HELM project name for a cwd, worktree-agnostic and
+    collision-safe. Registry identity wins; every unregistered checkout gets a
+    deterministic path-fingerprinted fallback independent of scanner knowledge."""
+    root = _git_root(cwd)
+    if not root:
+        return None
+    try:
+        from . import registry
+        projects = registry.load().get("projects") or {}
+        real = os.path.realpath(root)
+        paths = {
+            name: os.path.realpath(row.get("path"))
+            for name, row in projects.items() if row.get("path")
+        }
+        for name, path in paths.items():
+            if path != real:
+                continue
+            room = pk.slug(name)
+            collision = any(
+                other_path != real and pk.slug(other) == room
+                for other, other_path in paths.items()
+            )
+            return _fingerprinted_project(name, real) if collision else name
+        return _path_project(real)
+    except Exception:
+        return _path_project(root) or None
 
 
 def derive_home_room(cwd):
-    """The seat's DEFAULT home room, derived from project context (owner
-    canon main-room-topology-owner-plus-meta-coordinator): the project the
-    seat works in — a helm-repo session homes to #helm, a goodtimes session
-    to #goodtimes-platform. None when the project is undiscoverable (a truly
-    project-less seat stays un-homed = all-rooms back-compat) or is 'main'
-    (a repo literally named main — homing there is the un-homed default
-    anyway). An explicit HELM_CHAT_ROOM / --room always wins (callers check
-    those first); a re-home is only ever the DELIBERATE rehome_seat move."""
+    """The seat's DEFAULT project room. Explicit env/CLI rooms are resolved by
+    join before this fallback. Project-less seats stay un-homed (legacy all-room
+    behavior); any identity that normalizes to reserved #main stays un-homed."""
     proj = _git_project(cwd)
-    if not proj or proj == "main":
-        return None
-    return pk.slug(proj) or None
+    room = pk.slug(proj) if proj else None
+    return None if not room or room == "main" else room
 
 
 def owner_names():
@@ -420,23 +477,54 @@ def last_seen(seat, row=None):
 SESSIONS_KEPT = 8   # co-named sessions remembered per roster row (addressing)
 
 
-def write_roster(seat, session=None, cwd=None, home_room=None):
+def write_roster(seat, session=None, cwd=None, home_room=None,
+                 home_room_source=None):
     """The one-time (join) roster write — keyed by seat. `session` is the
     newest writer; every co-named session is ALSO kept in row["sessions"]
     (newest last, capped) so seat_for_session resolves ALL of them and each
-    keeps its own delivery cursor (fan-out, never race-consume). Guarded by a
-    lock anyway: joins are rare, losing a sibling seat's row at join time is
-    avoidable for one flock. home_room (multi-team isolation, G1): the seat's
-    team room from HELM_CHAT_ROOM — recorded once at join; a later re-join
-    carrying a DIFFERENT room re-homes (the operator's deliberate move); a
-    sessionless/auto roster write (home_room None) NEVER strips it."""
+    keeps its own delivery cursor (fan-out, never race-consume). home_room_source
+    is `explicit` or `derived`: explicit joins may deliberately move a seat;
+    derived joins follow a seat across projects only while its prior home was
+    also derived; they never undo an explicit/operator home or clear."""
     chat._ensure_dir()
     with _flocked(roster_path() + ".lock"):
         r = roster()
         row = r.get(seat) or {}
         home_room = pk.slug(home_room) if home_room else None
-        if home_room and home_room != row.get("home_room"):
+        if home_room_source == "explicit":
+            old = row.get("home_room")
+            if home_room != old:
+                newly_admitted = _rooms_to_baseline(old, home_room)
+                _baseline_rooms(seat, row, newly_admitted)
+                if old and home_room == "main" and not newly_admitted:
+                    _backfill_missing_room_cursors(
+                        "main", seat, row.get("sessions") or [])
+            if home_room:
+                row["home_room"] = home_room
+            else:
+                row.pop("home_room", None)
+            row["home_room_source"] = "explicit"
+        elif home_room_source == "derived" and home_room:
+            old, source = row.get("home_room"), row.get("home_room_source")
+            if source == "derived" and home_room != old:
+                _baseline_rooms(
+                    seat, row, _rooms_to_baseline(old, home_room))
+                row["home_room"] = home_room
+            elif not old and not source:
+                _baseline_rooms(
+                    seat, row, _rooms_to_baseline(old, home_room))
+                row["home_room"] = home_room
+            if row.get("home_room") == home_room \
+                    and source in (None, "derived"):
+                row["home_room_source"] = "derived"
+        elif home_room and home_room != row.get("home_room"):
+            # Back-compat for the old direct write_roster(..., home_room=) seam:
+            # a supplied room was always an explicit operator/launch choice.
+            old = row.get("home_room")
+            _baseline_rooms(
+                seat, row, _rooms_to_baseline(old, home_room))
             row["home_room"] = home_room
+            row["home_room_source"] = "explicit"
         if session:
             row["session"] = str(session)
             sess = [s for s in row.get("sessions") or [] if s != str(session)]
@@ -576,13 +664,54 @@ def mutes(seat):
     return sorted((roster().get(seat) or {}).get("mute") or [])
 
 
+def _allowed_rooms(home_room):
+    """Current live rooms admitted by one home choice (used only to compute a
+    rehome delta; the delivery chokepoint remains _scan_rooms)."""
+    try:
+        rooms = set(chat.list_rooms()) | {"main"}
+    except OSError:
+        rooms = {"main"}
+    return {home_room, "main"} if home_room else rooms
+
+
+def room_in_scope(room, row):
+    """Whether `room` belongs to a roster row's CURRENT delivery scope.
+    Un-homed rows retain all-room legacy scope; a home admits only itself + main.
+    Cursor activity is historical, so web presence must intersect it with this."""
+    home_room = (row or {}).get("home_room")
+    return not home_room or pk.slug(room) in {home_room, "main"}
+
+
+def _rooms_to_baseline(old, new):
+    """Rooms whose pre-transition history must be skipped. A destination home
+    is always re-baselined, even when the old un-homed scope could theoretically
+    see it; clearing to all rooms baselines only newly admitted foreign rooms."""
+    if new and new != old:
+        # A homed seat already admits #main. Narrowing that scope to explicit
+        # main must preserve pending main traffic; every other destination is
+        # newly admitted (including legacy un-homed -> homed, which rebases a
+        # potentially stale all-room cursor by design).
+        return set() if old and new == "main" else {new}
+    return _allowed_rooms(new) - _allowed_rooms(old)
+
+
+def _baseline_rooms(seat, row, rooms):
+    """Baseline newly admitted rooms at their current EOF for the seat and all
+    remembered sessions. Rehome changes scope, never replays pre-admission
+    history or traffic accumulated while the seat was away."""
+    sessions = [s for s in ([row.get("session")] + list(row.get("sessions") or []))
+                if s]
+    for room in rooms:
+        _baseline_room_cursors(room, seat, sessions)
+
+
 def rehome_seat(token, room):
     """(ok, message). The DELIBERATE home-room move (multi-project isolation):
     set a seat's roster home_room — the operator's explicit re-home (the only
-    path that changes an EXISTING seat's home, since a cwd-derived join never
-    silently re-homes). `room` is slugged; 'main'/'none'/'-' clears the home
-    (back to all-rooms un-homed). Takes effect on the seat's next delivery
-    scan — no relaunch needed (the allowlist reads the roster each time)."""
+    path that changes an EXISTING seat's home unless a later join carries its
+    own explicit room). `room` is slugged; 'main'/'none'/'-' clears the home
+    (back to all-rooms un-homed). Newly admitted rooms baseline at current EOF,
+    so pre-rehome history never wakes, delivers, or stop-gates the seat."""
     room = (room or "").strip().lower()
     clear = room in ("", "main", "none", "-", "all")
     home_room = None if clear else pk.slug(room)
@@ -595,20 +724,25 @@ def rehome_seat(token, room):
                            % token)
         row = r.get(seat) or {}
         old = row.get("home_room")
-        if clear:
-            if not old:
-                return True, "seat %s is already un-homed (all rooms)" % seat
-            row.pop("home_room", None)
-            r[seat] = row
-            pk.write_json(roster_path(), r)
-            return True, ("seat %s re-homed %s -> un-homed (all rooms); "
-                          "takes effect on its next delivery scan"
-                          % (seat, old))
-        if home_room == old:
+        if clear and not old and row.get("home_room_source") == "operator":
+            return True, "seat %s is already un-homed (all rooms)" % seat
+        if not clear and home_room == old \
+                and row.get("home_room_source") == "operator":
             return True, "seat %s is already homed to #%s" % (seat, home_room)
-        row["home_room"] = home_room
+        new_home = None if clear else home_room
+        newly_admitted = _rooms_to_baseline(old, new_home)
+        _baseline_rooms(seat, row, newly_admitted)
+        if clear:
+            row.pop("home_room", None)
+        else:
+            row["home_room"] = home_room
+        row["home_room_source"] = "operator"
         r[seat] = row
         pk.write_json(roster_path(), r)
+        if clear:
+            return True, ("seat %s re-homed %s -> un-homed (all rooms); "
+                          "takes effect on its next delivery scan"
+                          % (seat, old or "un-homed"))
     return True, ("seat %s re-homed %s -> #%s; delivery is now { #%s, #main } "
                   "— takes effect on its next delivery scan (no relaunch)"
                   % (seat, old or "un-homed", home_room, home_room))
@@ -640,10 +774,95 @@ def _cursor(room, seat, session=None):
     return None
 
 
-def _write_cursor(room, seat, dev, ino, off, rid, session=None):
+def _write_cursor(room, seat, dev, ino, off, rid, session=None, active=False,
+                  skip=None):
     chat._ensure_dir()
-    pk.write_json(cursor_path(room, seat, session),
-                  {"dev": dev, "ino": ino, "off": off, "rid": rid})
+    row = {"dev": dev, "ino": ino, "off": off, "rid": rid,
+           "active": bool(active)}
+    if skip:
+        row["skip"] = skip
+    pk.write_json(cursor_path(room, seat, session), row)
+
+
+def _baseline_state(room, at_start=False):
+    """Room identity + offset + final complete row id for a safe baseline.
+    Keeping the row id lets inode replacement suppress already-baselined rows."""
+    try:
+        with open(chat.room_path(room), "rb") as f:
+            st = os.fstat(f.fileno())
+            if at_start or not st.st_size:
+                return st.st_dev, st.st_ino, 0 if at_start else st.st_size, None
+            start = max(0, st.st_size - SCAN_CAP)
+            f.seek(start)
+            data = f.read()
+        chunks = data.split(b"\n")
+        if data and not data.endswith(b"\n"):
+            chunks.pop()
+        if start and chunks:
+            chunks.pop(0)
+        rid = None
+        for chunk in reversed(chunks):
+            if not chunk:
+                continue
+            try:
+                row = json.loads(chunk.decode("utf-8", errors="replace"))
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("id"):
+                rid = row["id"]
+                break
+        return st.st_dev, st.st_ino, st.st_size, rid
+    except OSError:
+        return None, None, 0, None
+
+
+def _write_cursor_path(path, state, active=False):
+    dev, ino, off, rid = state
+    pk.write_json(path, {"dev": dev, "ino": ino, "off": off, "rid": rid,
+                         "active": bool(active)})
+
+
+def _cursor_paths(room, seat, sessions=()):
+    """Seat-level plus every known/on-disk session cursor for one room."""
+    base = cursor_path(room, seat)
+    paths = {base}
+    paths.update(cursor_path(room, seat, s) for s in sessions)
+    paths.update(p for p in glob.glob(base + ".*") if not p.endswith(".lock"))
+    return paths
+
+
+def room_active(room, seat):
+    """Whether any cursor for this seat actually consumed traffic in `room`.
+    Normal hook delivery advances a session cursor, not the seat baseline, so
+    presence must aggregate every on-disk cursor just like rehome safety does."""
+    for path in _cursor_paths(room, seat):
+        cur = pk.read_json(path, None)
+        if isinstance(cur, dict) and cur.get("active"):
+            return True
+    return False
+
+
+def _backfill_missing_room_cursors(room, seat, sessions=()):
+    """Start missing cursors at zero when a room was already logically admitted
+    but did not exist at the seat's join. Seat-level first, so session cursors
+    inherit the same post-join ground instead of EOF-dropping pending traffic."""
+    for session in [None] + list(sessions):
+        if _cursor(room, seat, session) is not None:
+            continue
+        path = cursor_path(room, seat, session)
+        with _flocked(path + ".lock"):
+            if _cursor(room, seat, session) is None:
+                _init_cursor(room, seat, session, at_start=True)
+
+
+def _baseline_room_cursors(room, seat, sessions=()):
+    """Baseline seat-level, remembered, and every on-disk session cursor.
+    The roster keeps only eight session ids for addressing; cursor safety may
+    not inherit that cap because an older still-live session can return later."""
+    state = _baseline_state(room)
+    for path in _cursor_paths(room, seat, sessions):
+        with _flocked(path + ".lock"):
+            _write_cursor_path(path, state)
 
 
 def _init_cursor(room, seat, session=None, at_start=False):
@@ -656,33 +875,33 @@ def _init_cursor(room, seat, session=None, at_start=False):
     after the seat joined is all post-join news — the mention that created
     the channel must deliver, not vanish under an EOF baseline), still
     binding the room file's identity so rotation detection holds.
+    `active` distinguishes a bare EOF join from actual room consumption.
     -> True iff the baseline was inherited (already-tracked ground)."""
     if session:
         base = _cursor(room, seat)
         if base:
             _write_cursor(room, seat, base.get("dev"), base.get("ino"),
-                          base["off"], base.get("rid"), session=session)
+                          base["off"], base.get("rid"), session=session,
+                          active=base.get("active"), skip=base.get("skip"))
             return True
-    try:
-        st = os.stat(chat.room_path(room))
-        _write_cursor(room, seat, st.st_dev, st.st_ino,
-                      0 if at_start else st.st_size, None, session=session)
-    except OSError:
-        _write_cursor(room, seat, None, None, 0, None, session=session)
+    state = _baseline_state(room, at_start=at_start)
+    _write_cursor(room, seat, *state, session=session)
     return False
 
 
 def _tail(room, cur):
-    """Read complete rows from the cursor position onward, byte-accurately,
-    off ONE fstat'd fd. -> (dev, ino, base_off, entries) or None when there
-    is nothing to read. entries = [(row_dict|None, end_off)] for every
-    COMPLETE line (unparseable → row None); a trailing partial line (writer
-    mid-append) is never consumed. On rotation/replacement (inode change or
-    shrink) the scan restarts at 0 and everything up to AND INCLUDING the
-    cursor's last row id — if still present — is trimmed here, with base_off
-    moved past it, so the caller can never commit a cursor BEFORE rows it
-    already processed (duplicate suppression; duplicates beyond that are
-    accepted by law — loss is not)."""
+    """Read one bounded window of complete rows from ONE fstat'd fd.
+    -> (dev, ino, base_off, entries, ground_rid, skip_rid), or None when
+    there is nothing to read. entries = [(row_dict|None, end_off)] for every
+    COMPLETE line; a trailing partial line is never consumed.
+
+    Rotation/replacement restarts at zero and suppresses everything through
+    the cursor's last row id. That id can sit beyond the first SCAN_CAP window
+    in a legitimately rotated room, so `skip` persists the suppression search
+    across boundaries: old rows are parked, never emitted. If a complete pass
+    reaches EOF without the id, the replacement did not retain it; reset once
+    to zero and accept duplicate replay on the next boundary (loss is the one
+    forbidden outcome)."""
     path = chat.room_path(room)
     try:
         f = open(path, "rb")
@@ -690,11 +909,13 @@ def _tail(room, cur):
         return None
     with f:
         st = os.fstat(f.fileno())
-        off, suppress = cur.get("off", 0), None
+        off, suppress = cur.get("off", 0), cur.get("skip")
         if (st.st_dev, st.st_ino) != (cur.get("dev"), cur.get("ino")) \
                 or st.st_size < off:
             off, suppress = 0, cur.get("rid")   # rotation / replacement
         elif st.st_size == off:
+            if suppress:
+                return st.st_dev, st.st_ino, 0, [], None, None
             return None                          # genuinely nothing new
         f.seek(off)
         data = f.read(SCAN_CAP)
@@ -713,13 +934,23 @@ def _tail(room, cur):
         if chunk:
             entries.append((row, end))
         pos = end
-    base = off
+    base, ground = off, cur.get("rid")
     if suppress is not None:
         for i, (row, end) in enumerate(entries):
             if row is not None and row.get("id") == suppress:
-                base, entries = end, entries[i + 1:]
+                base, entries, ground = end, entries[i + 1:], suppress
+                suppress = None
                 break
-    return st.st_dev, st.st_ino, base, entries
+        if suppress is not None:
+            complete_eof = off + len(data) == st.st_size \
+                and (not data or data.endswith(b"\n"))
+            if complete_eof:
+                if off == 0:
+                    return st.st_dev, st.st_ino, 0, entries, None, None
+                return st.st_dev, st.st_ino, 0, [], None, None
+            base = entries[-1][1] if entries else off
+            return st.st_dev, st.st_ino, base, [], ground, suppress
+    return st.st_dev, st.st_ino, base, entries, ground, None
 
 
 def dm_lane(seat):
@@ -814,18 +1045,22 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
     backfill=True (deliver_any's tracked-seat path) makes a MISSING cursor
     baseline at offset 0 and scan THIS boundary — the multi-room law for a
     room born after the seat joined; default keeps the EOF self-heal."""
-    seat = seat or seat_for_session(session) or derive_seat(session, cwd)
+    known = seat_for_session(session)
+    seat = seat or known or derive_seat(session, cwd)
     touch_seen(seat)                       # presence FIRST — a seat muted by the
     if (home.env("CHAT_DELIVER") or "").lower() in ("0", "off", "no"):
         return None                        # kill-switch below is still ALIVE:
                                            # keep its row fresh so it isn't reaped
     sc = scope if scope is not None else seat_scope(seat)
+    # Global order is roster -> cursor: rehome/join baseline cursors while the
+    # roster lock is held. Register an unknown session BEFORE taking its cursor
+    # lock, otherwise delivery and rehome can each wait forever on the other.
+    if session and known is None and _cursor(room, seat, session) is None:
+        write_roster(seat, session=session)
     with _flocked(cursor_path(room, seat, session) + ".lock"):
         cur = _cursor(room, seat, session)
         if cur is None:
             inherited = _init_cursor(room, seat, session, at_start=backfill)
-            if session and seat_for_session(session) is None:
-                write_roster(seat, session=session)
             if not inherited and not backfill:
                 return None       # fresh EOF baseline: backlog never floods
             cur = _cursor(room, seat, session)  # already-tracked ground —
@@ -834,17 +1069,18 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
         got = _tail(room, cur)
         if got is None:
             return None
-        dev, ino, base, entries = got
+        dev, ino, base, entries, last_rid, skip = got
         hit = None
-        last_end, last_rid = base, cur.get("rid")
+        last_end = base
         for i, (row, end) in enumerate(entries):
             if row is not None and deliverable(row, seat, room, sc):
                 hit = (i, row, end)
                 break
             last_end, last_rid = end, (row or {}).get("id") or last_rid
         if hit is None:
-            _write_cursor(room, seat, dev, ino, last_end, last_rid,
-                          session=session)
+            _write_cursor(
+                room, seat, dev, ino, last_end, last_rid, session=session,
+                active=cur.get("active") or bool(entries), skip=skip)
             return None
         i, row, end = hit
         waiting = sum(1 for r, _e in entries[i + 1:]
@@ -862,7 +1098,7 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
         if emit is not None:
             emit(line)                  # output FIRST …
         _write_cursor(room, seat, dev, ino, end, row.get("id"),
-                      session=session)  # … commit after
+                      session=session, active=True)  # … commit after
         return line
 
 
@@ -932,7 +1168,8 @@ def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None):
 # join (SessionStart) + wait (the beacon)
 # ---------------------------------------------------------------------------
 
-def join(session=None, cwd=None, seat=None, room="main"):
+def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
+         room_source=None):
     """The autojoin: roster row + cursor initialized HERE + the identity line
     the hook injects as session context. The line DIRECTS the agent to arm its
     idle-wake beacon as a mandatory FIRST action — a self-armed Monitor is the
@@ -942,19 +1179,24 @@ def join(session=None, cwd=None, seat=None, room="main"):
     (all live rooms for legacy un-homed seats; {home, main} for homed seats),
     so pre-join backlog never floods and later admitted rooms can backfill."""
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
-    # Homing precedence (multi-project isolation): an explicit HELM_CHAT_ROOM
-    # (the launch seam) or a non-main --room (deliberate) WINS; absent both,
-    # the home DERIVES from the join cwd's git project (a helm-repo seat →
-    # #helm) so project channels are the default and #main stays the owner's
-    # all-hands; a project-less cwd leaves the seat un-homed (all-rooms
-    # back-compat). A once-homed seat is NEVER silently re-homed by a later
-    # cwd-only join (write_roster re-homes only on an explicit home_room).
-    home_room = home.env("CHAT_ROOM") or (room if room != "main" else None)
-    if home_room:
-        home_room = pk.slug(home_room)
+    # Homing precedence: an explicit CLI room beats the environment; the env
+    # beats derivation. Direct callers' non-main `room` remains explicit for
+    # back-compat. A derived join fills only a never-homed row, so SessionStart
+    # cannot silently undo an operator rehome/clear or move a co-named seat.
+    direct_room = room_explicit or room != "main"
+    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
+    if room_source == "derived":
+        home_room, source = pk.slug(room), "derived"
+    elif direct_room:
+        home_room, source = pk.slug(room), "explicit"
+    elif env_room:
+        home_room = pk.slug(env_room)
+        source = "derived" if env_source == "derived" else "explicit"
     else:
-        home_room = derive_home_room(cwd)
-    write_roster(seat, session=session, cwd=cwd, home_room=home_room)
+        home_room, source = derive_home_room(cwd), "derived"
+    row = write_roster(seat, session=session, cwd=cwd, home_room=home_room,
+                       home_room_source=source)
+    effective_home = row.get("home_room")
     lane = dm_lane(seat)
     for r in _scan_rooms(room, seat=seat):
         # the seat's DM lane baselines at offset 0 — every row in it is
@@ -972,8 +1214,9 @@ def join(session=None, cwd=None, seat=None, room="main"):
                 if _cursor(r, seat) is None:
                     _init_cursor(r, seat, at_start=at0)
     scope = ("; everything in your home room %s also wakes you (mute/filter it "
-             "if noisy)" % home_room if home_room and home_room != "main"
-             else "")
+             "if noisy)" % effective_home
+             if effective_home and effective_home != "main" else "")
+    display_room = effective_home or room
     line = ("[helm chat] you are seat '%s' in room %s — @%s mentions and DMs "
             "(from ANY room) reach you between tool calls%s; owner posts do NOT "
             "wake you unless they @mention you or land in your home room; "
@@ -985,7 +1228,7 @@ def join(session=None, cwd=None, seat=None, room="main"):
             "external can re-invoke a PTY agent (native-wake-only-agent-armed), "
             "so this self-armed Monitor is the ONLY way an idle session ever "
             "wakes. Arm it before anything else."
-            % (seat, room, seat, scope, seat, seat))
+            % (seat, display_room, seat, scope, seat, seat))
     return seat, line
 
 
@@ -1677,6 +1920,8 @@ def roster_report(room="main"):
         ls = last_seen(seat, row)
         seats.append({"seat": seat, "session": row.get("session"),
                       "project": row.get("project"), "cwd": row.get("cwd"),
+                      "home_room": row.get("home_room"),
+                      "home_room_source": row.get("home_room_source"),
                       "last_seen": ls, "presence": presence_of(ls),
                       "pending": pending, "preview": preview})
     return {"room": room, "seats": seats, "claims": claims_list()}
@@ -1719,7 +1964,7 @@ def _hook_emit(event):
     return emit
 
 
-def cmd(verb, args, room="main"):
+def cmd(verb, args, room="main", room_explicit=False, room_source=None):
     """The seats subverbs, reached through `helm chat <verb>`."""
     args = list(args or [])
     if verb == "join":
@@ -1729,7 +1974,9 @@ def cmd(verb, args, room="main"):
                 d = _hook_stdin()
                 session, cwd = d.get("session_id"), d.get("cwd")
             seat, line = join(session=session, cwd=cwd or os.getcwd(),
-                              seat=_flag(args, "--seat"), room=room)
+                              seat=_flag(args, "--seat"), room=room,
+                              room_explicit=room_explicit,
+                              room_source=room_source)
             if "--hook-json" in args:
                 _hook_emit("SessionStart")(line)
             else:
@@ -1846,9 +2093,12 @@ def cmd(verb, args, room="main"):
             return 0
         w = max([len(s["seat"]) for s in rows] or [0])
         for s in rows:
-            print("  %-*s  %-6s  pending %-3d %s" % (
+            scope = "#" + s["home_room"] if s.get("home_room") else "all"
+            source = " (%s)" % s["home_room_source"] \
+                if s.get("home_room_source") else ""
+            print("  %-*s  %-6s  pending %-3d %s · home %s%s" % (
                 w, s["seat"], s["presence"], s["pending"],
-                (s.get("project") or "")))
+                (s.get("project") or ""), scope, source))
         if hidden:
             print("  (%d absent seat%s hidden — --all shows them; unseen "
                   ">%dm reaps them)" % (hidden, "s"[:hidden != 1], REAP_S // 60))

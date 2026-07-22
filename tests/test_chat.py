@@ -21,7 +21,8 @@ from helm import chat, home, reflex  # noqa: E402
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
             "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG",
-            "HELM_CHAT_ROOM", "MELD_CHAT_ROOM")
+            "HELM_CHAT_ROOM", "MELD_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
+            "MELD_CHAT_ROOM_SOURCE")
 
 
 class ChatBase(unittest.TestCase):
@@ -200,6 +201,31 @@ class CmdTest(ChatBase):
         chat.mark_owner_unread("team-x")                 # a homed read consumes
         self.assertEqual(self.run_cmd(["read"])[0], 0)   # its OWN room's marker
         self.assertFalse(os.path.exists(chat.marker_path("team-x")))
+
+    def test_join_dispatch_preserves_explicit_room_provenance(self):
+        os.environ["HELM_CHAT_ROOM"] = "project-a"
+        with mock.patch("helm.seats.cmd", return_value=0) as cmd:
+            self.assertEqual(chat.cmd_chat(["join", "--room", "main"]), 0)
+        cmd.assert_called_once_with(
+            "join", [], "main", room_explicit=True, room_source=None)
+
+    def test_join_dispatch_preserves_derived_environment_provenance(self):
+        os.environ["HELM_CHAT_ROOM"] = "project-a"
+        os.environ["HELM_CHAT_ROOM_SOURCE"] = "derived"
+        with mock.patch("helm.seats.cmd", return_value=0) as cmd:
+            self.assertEqual(chat.cmd_chat(["join"]), 0)
+        cmd.assert_called_once_with(
+            "join", [], "project-a", room_explicit=False,
+            room_source="derived")
+
+    def test_preferred_room_does_not_inherit_legacy_source(self):
+        os.environ["HELM_CHAT_ROOM"] = "explicit-new"
+        os.environ["MELD_CHAT_ROOM_SOURCE"] = "derived"
+        with mock.patch("helm.seats.cmd", return_value=0) as cmd:
+            self.assertEqual(chat.cmd_chat(["join"]), 0)
+        cmd.assert_called_once_with(
+            "join", [], "explicit-new", room_explicit=False,
+            room_source=None)
 
     def test_empty_read_and_bad_args(self):
         rc, out, _ = self.run_cmd(["read"])

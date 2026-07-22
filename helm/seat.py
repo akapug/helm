@@ -140,7 +140,7 @@ AUTOCOMPACT_PCT_OVERRIDE = "78"
 _USAGE = """usage: helm seat <verb> [args]
   add <family> [--auth-from <path>]   mint the seat (translate cred read-only)
                [--key-from <path>]    proxy-key families: .env-style key file
-               [--room R]             home the seat's chat in team room R
+               [--room R]             override the project-derived chat room
   up <family> | down <family>         start/stop the seat's local proxy
   launch <family> [--model M] [--room R] [--multi]  print the exact launch line (never runs it)
                                       --multi: mixed-model fleet — DROP the
@@ -404,7 +404,8 @@ def _instance_dir(family, seat):
         if seat and seat != family else seat_dir(family)
 
 
-def launch_line(family, model=None, room=None, seat=None, multi=False):
+def launch_line(family, model=None, room=None, seat=None, room_source=None,
+                multi=False):
     """The exact seat launch command. env -u ANTHROPIC_API_KEY is part of the
     line: an inherited key must never ride into a proxied seat either. The
     child-stamp trio (CHILD_STAMP_VARS) is unset right beside it: a spawning
@@ -421,11 +422,11 @@ def launch_line(family, model=None, room=None, seat=None, multi=False):
     (slice 6 — N-per-credhome) defaults to the family name; when set it swaps
     the three identity vars + the config dir (instances/<seat>) so N instances
     of one family share the proxy/port/token/pool but never config/session
-    state. `room` (seat add/launch --room) adds HELM_CHAT_ROOM=<room> —
-    team-room homing (slice 3): the seat's chat defaults (post/read/join/
-    deliver) live in its team channel while the multi-room deliver still hears
-    @mentions from any room; no room ⇒ no export, exactly today's main-homed
-    fleet. --dangerously-skip-permissions is CANONICAL for a fleet seat
+    state. `room` adds HELM_CHAT_ROOM=<room>; a project-derived default also
+    carries HELM_CHAT_ROOM_SOURCE=derived so later SessionStart joins cannot
+    undo an operator rehome/clear. The command clears inherited room/source
+    first, making explicit --room and project-less un-homed launches stable.
+    --dangerously-skip-permissions is CANONICAL for a fleet seat
     (owner-asked 2026-07-21): an agent pane exists to do work unattended, and
     a per-tool permission prompt strands it silently (the owner had to flip
     kimi/codex into auto-mode by hand). The beacon permit narrows an
@@ -441,6 +442,8 @@ def launch_line(family, model=None, room=None, seat=None, multi=False):
     seat = seat or family
     cfgdir = shlex.quote(os.path.join(_instance_dir(family, seat), "claude"))
     homing = (" HELM_CHAT_ROOM=%s" % shlex.quote(room)) if room else ""
+    if room and room_source:
+        homing += " HELM_CHAT_ROOM_SOURCE=%s" % shlex.quote(room_source)
     # Teach CC the seat's real context window + a safe autocompact margin so a
     # non-claude model never sails past its window into the unrecoverable 400
     # (navigate-multimodel-cc-context / ctx-window-recovery-is-clear). Appended
@@ -451,7 +454,9 @@ def launch_line(family, model=None, room=None, seat=None, multi=False):
         ctxenv += " CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d" % fam["max_context"]
     # --multi: no pin (frontmatter routes per-subagent); default: today's line.
     pin = "" if multi else " CLAUDE_CODE_SUBAGENT_MODEL=%s" % model
-    return ("env -u ANTHROPIC_API_KEY %s"
+    return ("env -u ANTHROPIC_API_KEY %s -u HELM_CHAT_ROOM"
+            " -u MELD_CHAT_ROOM -u HELM_CHAT_ROOM_SOURCE"
+            " -u MELD_CHAT_ROOM_SOURCE"
             " ANTHROPIC_BASE_URL=http://127.0.0.1:%d"
             " ANTHROPIC_AUTH_TOKEN=%s"
             "%s"
@@ -667,7 +672,7 @@ def _mint_probe_agents(cdir, family):
 
 
 def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
-                         multi=False):
+                         room_source=None, multi=False):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
     identical for every mode, and refreshed by BOTH `add` and `launch` (a
     stale launch.sh minted before HELM_CHAT_NAME existed is why the live
@@ -705,7 +710,8 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
                      "child (persistence silently OFF) — strip.\n"
                      "unset %s\nexec %s \"$@\"\n"
                      % (seat, seat, " ".join(CHILD_STAMP_VARS),
-                        launch_line(family, room=room, seat=seat, multi=multi)))
+                        launch_line(family, room=room, seat=seat,
+                                    room_source=room_source, multi=multi)))
 
 
 def _write_launch_sh(path, text):
@@ -750,7 +756,22 @@ def _env_file_value(path, key):
     return None
 
 
-def _add_proxy_key(family, fam, args, room=None):
+def _resolve_homing(explicit_room=None):
+    """(room, source) for seat add/launch. CLI wins, then the inherited
+    launch seam, then the current git project. Only a derived choice carries
+    the marker; explicit choices clear any inherited derived provenance."""
+    if explicit_room is not None:
+        return explicit_room, None
+    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
+    if env_room:
+        source = "derived" if env_source == "derived" else None
+        return env_room, source
+    from . import seats
+    room = seats.derive_home_room(os.getcwd())
+    return room, "derived" if room else None
+
+
+def _add_proxy_key(family, fam, args, room=None, room_source=None):
     """mode "proxy-key": an API-key provider behind the same local proxy via
     its openai-compatibility block. No OAuth, no auth-dir. Key source order:
     $<key_env>, then --key-from <.env-style file>. The key is baked into the
@@ -777,7 +798,7 @@ def _add_proxy_key(family, fam, args, room=None):
     _write_private(os.path.join(d, "config.yaml"),
                    _config_yaml_key(fam["port"], token, fam["provider"],
                                     base_url, fam["model"], api_key))
-    _write_launch_assets(family, d, room)
+    _write_launch_assets(family, d, room, room_source=room_source)
     print("helm seat: %s seat minted at %s" % (family, d))
     print("  outbound %s key baked into config.yaml (0600 — value never "
           "printed); provider %s -> %s" % (key_env, fam["provider"], base_url))
@@ -786,7 +807,7 @@ def _add_proxy_key(family, fam, args, room=None):
     return 0
 
 
-def _add(family, args, room=None):
+def _add(family, args, room=None, room_source=None):
     fam = FAMILIES.get(family)
     if fam is None:
         print("helm seat: family '%s' not yet wired (have: %s). First-party "
@@ -795,7 +816,8 @@ def _add(family, args, room=None):
               file=sys.stderr)
         return 2
     if fam["mode"] == "proxy-key":
-        return _add_proxy_key(family, fam, args, room)
+        return _add_proxy_key(
+            family, fam, args, room, room_source=room_source)
     if fam["mode"] != "proxy":
         print("helm seat: family '%s' mode '%s' not yet wired — proxyless add "
               "not implemented" % (family, fam["mode"]), file=sys.stderr)
@@ -851,7 +873,7 @@ def _add(family, args, room=None):
     token = _seat_token(family, d)
     _write_private(os.path.join(d, "config.yaml"),
                    _config_yaml(fam["port"], auth_dir, token))
-    _write_launch_assets(family, d, room)
+    _write_launch_assets(family, d, room, room_source=room_source)
 
     print("helm seat: %s seat minted at %s" % (family, d))
     print("  cred %s (%s) from %s (read-only), access token valid until %s"
@@ -1136,15 +1158,24 @@ def _newest_seat_session(instance_dir):
     return os.path.basename(p)[:-len(".jsonl")], harnesses._sniff_cwd(p)
 
 
-def _room_from_launch(path):
-    """The seat's team-room homing, recovered from its current launch.sh —
-    the resume re-mint must not silently strip a --room the operator set."""
+def _homing_from_launch(path):
+    """The seat's room + provenance recovered from launch.sh. Shell-aware
+    tokenization preserves quoted values and ignores the generated comments;
+    resume must not silently turn a derived default into an explicit home."""
     try:
         with open(path) as f:
-            m = re.search(r"HELM_CHAT_ROOM=(\S+)", f.read())
-    except OSError:
-        return None
-    return shlex.split(m.group(1))[0] if m else None
+            tokens = shlex.split(f.read(), comments=True)
+    except (OSError, ValueError):
+        return None, None
+    values = {}
+    for token in tokens:
+        for name in ("HELM_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE"):
+            prefix = name + "="
+            if token.startswith(prefix):
+                values[name] = token[len(prefix):]
+    source = values.get("HELM_CHAT_ROOM_SOURCE")
+    return values.get("HELM_CHAT_ROOM"), \
+        source if source == "derived" else None
 
 
 def _multi_from_launch(path):
@@ -1182,7 +1213,7 @@ def _resume(seat_name, rest):
               "then `helm seat launch %s` first"
               % (seat_name, launch_sh, family, seat_name), file=sys.stderr)
         return 1
-    room = _room_from_launch(launch_sh)
+    room, room_source = _homing_from_launch(launch_sh)
     multi = _multi_from_launch(launch_sh)
     sid, sess_cwd = _newest_seat_session(d)
     command = "%s %s" % (shlex.quote(launch_sh),
@@ -1205,7 +1236,8 @@ def _resume(seat_name, rest):
                 print("  stopped stale %s pane %s" % (seat_name, row["handle"]))
         # env refresh half of the contract: the relaunch rides the LATEST
         # assets (identity vars, delivery hooks, context env), room preserved.
-        _write_launch_assets(family, d, room, seat_name, multi=multi)
+        _write_launch_assets(
+            family, d, room, seat_name, room_source=room_source, multi=multi)
         handle = ad.spawn(command, title=seat_name,
                           cwd=sess_cwd or os.getcwd())
     except harness.HarnessError as e:
@@ -1339,14 +1371,24 @@ def cmd_seat(args):
             print("usage: helm seat %s <family>" % verb, file=sys.stderr)
             return 2
         family = rest[0]
-        # --room homes the seat in a team channel (default main — un-homed):
-        # add/launch bake HELM_CHAT_ROOM=<room> into the line + launch.sh
-        room = rest[rest.index("--room") + 1] if "--room" in rest else None
         # --multi (launch/smoke): the mixed-model fleet shape — no subagent
         # pin, probe agents minted, smoke grows the fan-out leg.
         multi = "--multi" in rest
+        # add/launch are self-contained presets: explicit --room wins, then
+        # inherited launch homing, then the current git project's default.
+        explicit_room = None
+        if "--room" in rest:
+            try:
+                explicit_room = rest[rest.index("--room") + 1]
+            except IndexError:
+                print("helm seat: --room wants a value", file=sys.stderr)
+                return 2
+        room, room_source = (None, None)
+        if verb in ("add", "launch"):
+            room, room_source = _resolve_homing(explicit_room)
         if verb == "add":
-            return _add(family, rest[1:], room=room)
+            return _add(
+                family, rest[1:], room=room, room_source=room_source)
         if verb == "up":
             return _up(family)
         if verb == "down":
@@ -1390,9 +1432,11 @@ def cmd_seat(args):
         # hooks + beacon permit + a launch.sh carrying the CURRENT identity
         # shape — retrofitting a seat minted before either existed. stdout
         # stays exactly the pasteable line; notes ride stderr.
-        _write_launch_assets(family, _instance_dir(family, seat), room, seat,
-                             multi=multi)
-        print(launch_line(family, model, room, seat, multi=multi))
+        _write_launch_assets(
+            family, _instance_dir(family, seat), room, seat,
+            room_source=room_source, multi=multi)
+        print(launch_line(
+            family, model, room, seat, room_source=room_source, multi=multi))
         from . import hooks
         hooks.surface_uncovered(out=sys.stderr)  # a running joined-late pane
         return 0                                 # still needs its relaunch

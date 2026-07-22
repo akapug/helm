@@ -1232,8 +1232,9 @@ frames; this lane is called *delivery*.)
   boundary) and join (session start) this completes the loop: an agent
   cannot idle past its inbox.
 - **`helm chat seats [--all]`** — the roster table: presence (fresh <2m /
-  quiet <15m / absent, off the last tool boundary), pending deliveries, live
-  claims. Absent rows hide by default (`--all` shows them), and rows unseen
+  quiet <15m / absent, off the last tool boundary), pending deliveries, each
+  seat's active home + provenance (`#helm (derived)`, `#team (operator)`, or
+  `all`), and live claims. Absent rows hide by default (`--all` shows them), and rows unseen
   **>1h are REAPED** together with their orphan cursor/seen/latch files (the
   reaper rides every report read — the roster no longer only grows). The
   web twin is the **seats** panel in the ledger tab (`GET /api/chat/roster`).
@@ -1257,10 +1258,17 @@ frames; this lane is called *delivery*.)
   `POST /api/chat/dm`, only `@all` still posts to `#main`.
 - **`helm chat seat mute <room>` / `seat unmute <room>` / `seat mutes`
   `[--seat S]`** — the seat's own beacon filter: a muted room stops
-  surfacing home-room chatter / `@all` / owner posts at that seat; a direct
-  `@seat` mention or a DM ALWAYS still surfaces (mute tunes noise, never
-  direct address). Roster-stored; boundary, beacon, stop-guard and the
-  roster report all read the same truth.
+  surfacing home-room chatter / `@all` at that seat; a direct `@seat` mention
+  or a DM ALWAYS still surfaces (mute tunes noise, never direct address).
+  Roster-stored; boundary, beacon, stop-guard and the roster report all read
+  the same truth.
+- **`helm chat seat rehome <sid|name> <room|main|none>`** — deliberately move
+  an existing seat's inbox scope without relaunching it. A room admits exactly
+  `{home, main}` for home-room chatter and broadcasts while direct mentions and
+  DMs remain cross-room; `main`/`none` clears the home back to the legacy
+  all-room scope. Newly admitted rooms baseline at current EOF, so destination
+  history and traffic accumulated while the seat was away never replay. The
+  operator choice survives later project-derived SessionStart joins.
 - **`helm chat claim <resource> [--ttl N] [--lease ID]` /
   `release <resource> --lease ID` / `claims`** — the advisory TTL lease
   (meld claims, minus the cap-gate): refused while another holder's lease is
@@ -1370,8 +1378,16 @@ into the target home (idempotent), pre-writes the seat's roster row so
 teammates can address it before the first tool call, exports
 `HELM_CHAT_NAME=<seat>` (a STABLE addressable identity across sessions —
 default `<host>-<cwd-basename>`), then execs `claude` with the pass-through
-args. The fleet needs no wrapper (`helm hooks install` covers every home);
-launch adds the stable name and the per-home pin (`CLAUDE_CONFIG_DIR`).
+args. With no explicit `--room`/`HELM_CHAT_ROOM`, a git checkout derives its
+canonical Helm project room (worktrees resolve to their main checkout; registry
+identity wins, with a canonical-path fingerprint only when two registry labels
+normalize to the same room; an unregistered checkout always gets a stable basename +
+path fingerprint rather than claiming an unsafe global basename). The child exports
+that room plus
+`HELM_CHAT_ROOM_SOURCE=derived`; explicit `--room` wins, including explicit
+`main`, and project-less launches remain un-homed. The fleet needs no wrapper
+(`helm hooks install` covers every home); launch adds the stable name and the
+per-home pin (`CLAUDE_CONFIG_DIR`).
 
 ### `helm work claim|release|gc|list|install-guard`
 
@@ -1655,6 +1671,12 @@ config dir; `helm hooks install` wires it there and `helm hooks status` reports
 seat coverage (see `helm hooks`). A seat already running an OLD session must be
 relaunched with a fresh `helm seat launch` to pick up the identity, signer, and
 delivery hooks — a live session's environment/settings are fixed at start.
+
+`seat add` and `seat launch` also derive the current project room by default;
+`--room` and an inherited explicit `HELM_CHAT_ROOM` win. Generated `launch.sh`
+presets preserve `HELM_CHAT_ROOM_SOURCE=derived` across `helm seat resume`, so a
+refresh cannot turn a project default into an explicit room and undo a later
+operator rehome/clear. Resume also preserves the seat's `--multi` shape.
 
 ### `helm router [up|run|down|status|line|probes]` + `helm seat launch|smoke --multi`
 

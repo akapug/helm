@@ -2684,6 +2684,8 @@ function ledgerCells(cells) {
 // to the owner-facing word ("active"/"quiet"/"absent") — same word the seat
 // picker and the cave-cells legend use, so the whole tab speaks one dialect.
 const presenceLabel = p => p === "fresh" ? "active" : p;
+const seatHome = s => 'home ' + (s.home_room ? '#' + esc(s.home_room) : 'all rooms') +
+  (s.home_room_source ? ' (' + esc(s.home_room_source) + ')' : '');
 
 function rosterSeats(rep) {
   const seats = (rep && rep.seats) || [], claims = (rep && rep.claims) || [];
@@ -2699,8 +2701,9 @@ function rosterSeats(rep) {
     (s.pending ? '<span class="lbadge tent">' + s.pending + ' pending</span>' : '') +
     '<button class="seatrn" data-seat="' + esc(s.seat) + '" title="rename this seat — @newname delivers to the same agent">rename</button>' +
     '<span class="lage">' + (s.last_seen ? lago(s.last_seen) : "—") + '</span></div>' +
-    '<div class="lmeta">' + esc(s.project || "") +
-    (s.preview ? ' · <span title="newest pending delivery">“' + esc(s.preview) + '”</span>' : '') + '</div></div>').join("");
+    '<div class="lmeta">' + [s.project ? esc(s.project) : '', seatHome(s),
+      s.preview ? '<span title="newest pending delivery">“' + esc(s.preview) + '”</span>' : '']
+      .filter(Boolean).join(' · ') + '</div></div>').join("");
   if (claims.length) {
     html += '<div class="lmeta" style="margin-top:6px">claims: ' + claims.map(c =>
       esc(c.resource) + ' → <b>' + esc(c.holder || "?") + '</b> (' + c.remaining + 's left)').join(" · ") + '</div>';

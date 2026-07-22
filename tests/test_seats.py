@@ -24,7 +24,8 @@ from helm import chat, home, pk, record, seats, web  # noqa: E402
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
             "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG",
-            "HELM_CHAT_ROOM", "MELD_CHAT_ROOM",
+            "HELM_CHAT_ROOM", "MELD_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
+            "MELD_CHAT_ROOM_SOURCE",
             "HELM_CHAT_OWNER_NAMES", "HELM_CHAT_DELIVER",
             "HELM_STOP_GUARD", "HELM_STOP_GUARD_INBOX",
             "HELM_STOP_GUARD_CLAIMS", "HELM_STOP_GUARD_INDEX",
@@ -262,6 +263,92 @@ class DeliverTest(SeatsBase):
         self.assertIsNone(seats.deliver(seat="alice"))   # rid suppression
         chat.post("@alice two", who="bob")
         self.assertIn("two", seats.deliver(seat="alice"))
+
+    def test_join_baseline_rid_suppresses_replay_after_inode_replacement(self):
+        chat.post("@alice stale before join", who="bob")
+        self.seat_up()
+        cur = seats._cursor("main", "alice")
+        self.assertTrue(cur["rid"])
+        p = chat.room_path("main")
+        with open(p, encoding="utf-8") as f:
+            content = f.read()
+        os.remove(p)
+        pk.atomic_write(p, content)
+        self.assertIsNone(seats.deliver(seat="alice"))
+        chat.post("@alice fresh after replacement", who="bob")
+        self.assertIn("fresh after replacement", seats.deliver(seat="alice"))
+
+    def test_large_rotation_suppresses_prejoin_rows_beyond_first_scan(self):
+        """A retained baseline RID can lie beyond SCAN_CAP after the native
+        keep-newest-half rotation. Suppression must span bounded scans rather
+        than exposing the first window's pre-join mentions."""
+        chat._ensure_dir()
+        p = chat.room_path("main")
+        with open(p, "w", encoding="utf-8") as f:
+            for i in range(1000):
+                row = {"ts": "t", "from": "bob", "id": "r%06d" % i,
+                       "text": "@alice STALE-PRE-JOIN %04d %s" %
+                               (i, "x" * 2100)}
+                f.write(json.dumps(row) + "\n")
+        cap = os.path.getsize(p)
+        self.seat_up()
+        self.assertEqual(seats._cursor("main", "alice")["rid"], "r000999")
+        with mock.patch.object(chat, "SIZE_CAP", cap):
+            chat.post("@alice FRESH-AFTER-ROTATION", who="bob")
+        self.assertGreater(os.path.getsize(p), seats.SCAN_CAP)
+        delivered = [seats.deliver(seat="alice") for _ in range(5)]
+        text = "\n".join(x for x in delivered if x)
+        self.assertNotIn("STALE-PRE-JOIN", text)
+        self.assertIn("FRESH-AFTER-ROTATION", text)
+
+    def test_unknown_session_delivery_obeys_roster_then_cursor_lock_order(self):
+        """Force the former cycle: delivery reaches unknown-session roster
+        registration while rehome holds the roster lock and baselines cursors.
+        Both operations must complete rather than roster<->cursor deadlocking."""
+        import threading
+        self.seat_up()
+        write_entered = threading.Event()
+        baseline_entered = threading.Event()
+        real_write = seats.write_roster
+        real_baseline = seats._baseline_room_cursors
+        errors, results = [], []
+
+        def gated_write(*args, **kwargs):
+            write_entered.set()
+            if not baseline_entered.wait(2):
+                errors.append("rehome never reached cursor baselining")
+            return real_write(*args, **kwargs)
+
+        def gated_baseline(room, *args, **kwargs):
+            if room == "new-room":
+                baseline_entered.set()
+            return real_baseline(room, *args, **kwargs)
+
+        def run(fn):
+            try:
+                results.append(fn())
+            except Exception as e:
+                errors.append(repr(e))
+
+        with mock.patch.object(seats, "write_roster", side_effect=gated_write), \
+                mock.patch.object(seats, "_baseline_room_cursors",
+                                  side_effect=gated_baseline):
+            delivery = threading.Thread(
+                target=run, args=(lambda: seats.deliver(
+                    session="s-new", seat="alice", room="new-room"),),
+                daemon=True)
+            delivery.start()
+            self.assertTrue(write_entered.wait(1))
+            rehome = threading.Thread(
+                target=run, args=(lambda: seats.rehome_seat(
+                    "alice", "new-room"),), daemon=True)
+            rehome.start()
+            delivery.join(3)
+            rehome.join(3)
+        self.assertFalse(delivery.is_alive(), "delivery deadlocked")
+        self.assertFalse(rehome.is_alive(), "rehome deadlocked")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
 
     def test_same_size_replacement_detected(self):
         """A replacement of EQUAL size must not hide behind a size check —
@@ -971,12 +1058,16 @@ class ProjectHomingTest(SeatsBase):
         os.makedirs(repo, exist_ok=True)
         subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True,
                        capture_output=True)
+        state = pk.read_json(home.registry_path(), {"projects": {}})
+        state.setdefault("projects", {})[os.path.basename(repo)] = {"path": repo}
+        pk.write_json(home.registry_path(), state)
         return repo
 
     def test_derives_home_from_git_project(self):
         repo = self._repo()
-        seats.join(session="s-1", seat="pa", cwd=repo)
+        _seat, line = seats.join(session="s-1", seat="pa", cwd=repo)
         self.assertEqual(seats.roster()["pa"]["home_room"], "proj-alpha")
+        self.assertIn("in room proj-alpha", line)
 
     def test_subdir_derives_the_repo_project_not_the_subdir(self):
         repo = self._repo()
@@ -999,6 +1090,20 @@ class ProjectHomingTest(SeatsBase):
         seats.join(session="s-4", seat="pd", cwd=self.tmp)  # tmp not a repo
         self.assertIsNone(seats.roster()["pd"].get("home_room"))
 
+    def test_first_derived_home_baselines_backlog_for_legacy_unhomed_row(self):
+        repo = self._repo("proj-later")
+        seats.join(session="s-old", seat="legacy", cwd=self.tmp)
+        chat.post("@legacy stale", who="bob", room="proj-later")
+        seats.join(session="s-new", seat="legacy", cwd=repo)
+        row = seats.roster()["legacy"]
+        self.assertEqual(row["home_room"], "proj-later")
+        self.assertEqual(row["home_room_source"], "derived")
+        self.assertIsNone(seats.deliver_any(session="s-old", seat="legacy"))
+        self.assertIsNone(seats.deliver_any(session="s-new", seat="legacy"))
+        chat.post("@legacy fresh", who="bob", room="proj-later")
+        self.assertIn("fresh", seats.deliver_any(
+            session="s-new", seat="legacy"))
+
     def test_explicit_room_beats_derivation(self):
         repo = self._repo()
         seats.join(session="s-5", seat="pe", cwd=repo, room="team-x")
@@ -1015,6 +1120,20 @@ class ProjectHomingTest(SeatsBase):
         # a project-less re-join (derive → None) never strips the home
         seats.join(session="s-7b", seat="pg", cwd=self.tmp)
         self.assertEqual(seats.roster()["pg"]["home_room"], "proj-alpha")
+
+    def test_derived_home_moves_with_same_seat_between_projects(self):
+        ra, rb = self._repo("proj-a"), self._repo("proj-b")
+        seats.join(session="s-move-a", seat="mover", cwd=ra)
+        chat.post("@mover stale-b", who="bob", room="proj-b")
+        seats.join(session="s-move-b", seat="mover", cwd=rb)
+        row = seats.roster()["mover"]
+        self.assertEqual(row["home_room"], "proj-b")
+        self.assertEqual(row["home_room_source"], "derived")
+        self.assertIsNone(seats.deliver_any(session="s-move-a", seat="mover"))
+        self.assertIsNone(seats.deliver_any(session="s-move-b", seat="mover"))
+        chat.post("@mover fresh-b", who="bob", room="proj-b")
+        self.assertIn("fresh-b", seats.deliver_any(
+            session="s-move-b", seat="mover"))
 
     def test_repo_named_main_stays_unhomed(self):
         repo = self._repo(name="main")
@@ -1046,6 +1165,242 @@ class ProjectHomingTest(SeatsBase):
         ok, msg = seats.rehome_seat("pi", "main")
         self.assertTrue(ok, msg)
         self.assertIsNone(seats.roster()["pi"].get("home_room"))
+
+    def test_explicit_main_beats_environment_and_derivation(self):
+        repo = self._repo()
+        os.environ["HELM_CHAT_ROOM"] = "team-y"
+        seats.join(session="s-main", seat="pm", cwd=repo, room="main",
+                   room_explicit=True)
+        row = seats.roster()["pm"]
+        self.assertEqual(row["home_room"], "main")
+        self.assertEqual(row["home_room_source"], "explicit")
+        self.assertEqual(seats._scan_rooms("main", seat="pm"), ["main"])
+        chat.post("foreign", who="bob", room="team-y")
+        self.assertEqual(seats._scan_rooms("main", seat="pm"), ["main"])
+
+    def test_explicit_main_preserves_pending_main_delivery(self):
+        seats.join(session="s-old", seat="main-move", cwd=self.tmp,
+                   room="team-a")
+        chat.post("@main-move must survive", who="bob", room="main")
+        pending = seats._pending_all("team-a", "main-move", "s-old")
+        self.assertEqual([row["text"] for _room, row in pending],
+                         ["@main-move must survive"])
+        seats.join(session="s-new", seat="main-move", cwd=self.tmp,
+                   room="main", room_explicit=True)
+        self.assertIn("must survive", seats.deliver_any(
+            session="s-old", seat="main-move", room="main"))
+        self.assertIn("must survive", seats.deliver_any(
+            session="s-new", seat="main-move", room="main"))
+
+    def test_preferred_explicit_env_room_ignores_legacy_derived_source(self):
+        seats.write_roster("mixed")
+        self.assertTrue(seats.rehome_seat("mixed", "operator-home")[0])
+        os.environ["HELM_CHAT_ROOM"] = "explicit-new"
+        os.environ["MELD_CHAT_ROOM_SOURCE"] = "derived"
+        seats.join(session="s-mixed", seat="mixed", cwd=self.tmp)
+        row = seats.roster()["mixed"]
+        self.assertEqual(row["home_room"], "explicit-new")
+        self.assertEqual(row["home_room_source"], "explicit")
+
+    def test_operator_rehome_and_clear_survive_derived_session_start(self):
+        repo = self._repo()
+        seats.join(session="s-op", seat="po", cwd=repo)
+        self.assertTrue(seats.rehome_seat("po", "team-z")[0])
+        os.environ["HELM_CHAT_ROOM"] = "proj-alpha"
+        os.environ["HELM_CHAT_ROOM_SOURCE"] = "derived"
+        seats.join(session="s-op2", seat="po", cwd=repo)
+        self.assertEqual(seats.roster()["po"]["home_room"], "team-z")
+        self.assertEqual(seats.roster()["po"]["home_room_source"], "operator")
+        self.assertTrue(seats.rehome_seat("po", "main")[0])
+        seats.join(session="s-op3", seat="po", cwd=repo)
+        row = seats.roster()["po"]
+        self.assertIsNone(row.get("home_room"))
+        self.assertEqual(row["home_room_source"], "operator")
+
+    def test_rehome_baselines_destination_backlog(self):
+        ra, rb = self._repo("proj-a"), self._repo("proj-b")
+        seats.join(session="s-back", seat="back", cwd=ra)
+        chat.post("@back stale", who="bob", room="proj-b")
+        self.assertTrue(seats.rehome_seat("back", "proj-b")[0])
+        self.assertIsNone(seats.deliver_any(session="s-back", seat="back"))
+        chat.post("@back fresh", who="bob", room="proj-b")
+        self.assertIn("fresh", seats.deliver_any(session="s-back", seat="back"))
+
+    def test_unhomed_to_homed_rehome_baselines_destination_backlog(self):
+        seats.join(session="s-open", seat="open", cwd=self.tmp)
+        chat.post("@open stale", who="bob", room="proj-b")
+        self.assertTrue(seats.rehome_seat("open", "proj-b")[0])
+        self.assertIsNone(seats.deliver_any(session="s-open", seat="open"))
+        chat.post("@open fresh", who="bob", room="proj-b")
+        self.assertIn("fresh", seats.deliver_any(
+            session="s-open", seat="open"))
+
+    def test_rehome_baselines_cursor_for_session_older_than_roster_cap(self):
+        ra = self._repo("proj-a")
+        seats.join(session="s-0", seat="many", cwd=ra)
+        seats._init_cursor("proj-b", "many", "s-0", at_start=True)
+        for i in range(1, seats.SESSIONS_KEPT + 2):
+            seats.join(session="s-%d" % i, seat="many", cwd=ra)
+        self.assertNotIn("s-0", seats.roster()["many"]["sessions"])
+        chat.post("@many stale", who="bob", room="proj-b")
+        self.assertTrue(seats.rehome_seat("many", "proj-b")[0])
+        self.assertIsNone(seats.deliver_any(session="s-0", seat="many"))
+
+    def test_returning_home_does_not_replay_traffic_while_away(self):
+        ra, rb = self._repo("proj-a"), self._repo("proj-b")
+        seats.join(session="s-return", seat="return", cwd=ra)
+        self.assertTrue(seats.rehome_seat("return", "proj-b")[0])
+        chat.post("@return stale-a", who="bob", room="proj-a")
+        self.assertTrue(seats.rehome_seat("return", "proj-a")[0])
+        self.assertIsNone(seats.deliver_any(session="s-return", seat="return"))
+        chat.post("@return fresh-a", who="bob", room="proj-a")
+        self.assertIn("fresh-a", seats.deliver_any(
+            session="s-return", seat="return"))
+
+    def test_explicit_rejoin_baselines_previously_left_room(self):
+        ra, rb = self._repo("proj-a"), self._repo("proj-b")
+        seats.join(session="s-exp-a", seat="pex", cwd=ra)
+        seats.join(session="s-exp-b", seat="pex", cwd=rb, room="proj-b")
+        chat.post("@pex stale-a", who="bob", room="proj-a")
+        seats.join(session="s-exp-c", seat="pex", cwd=ra, room="proj-a")
+        self.assertIsNone(seats.deliver_any(session="s-exp-a", seat="pex"))
+        self.assertIsNone(seats.deliver_any(session="s-exp-b", seat="pex"))
+        self.assertIsNone(seats.deliver_any(session="s-exp-c", seat="pex"))
+
+    def test_registry_identity_disambiguates_same_basename_repos(self):
+        a = self._repo(os.path.join("org-a", "cv"))
+        b = self._repo(os.path.join("org-b", "cv"))
+        projects = {"akapug-cv": {"path": a}, "emberian-cv": {"path": b}}
+        with mock.patch("helm.registry.load", return_value={"projects": projects}):
+            self.assertEqual(seats.derive_home_room(a), "akapug-cv")
+            self.assertEqual(seats.derive_home_room(b), "emberian-cv")
+
+    def test_registered_names_colliding_after_slug_are_fingerprinted(self):
+        paths = [self._repo("registered-a"), self._repo("registered-b")]
+        cases = [
+            ("MV", "mv"),
+            ("punct.name", "punct-name"),
+            ("x" * 60 + "a", "x" * 60 + "b"),
+        ]
+        for left, right in cases:
+            projects = {left: {"path": paths[0]}, right: {"path": paths[1]}}
+            with mock.patch("helm.registry.load",
+                            return_value={"projects": projects}):
+                rooms = [seats.derive_home_room(path) for path in paths]
+            self.assertNotEqual(*rooms)
+            self.assertTrue(all(len(room) <= 60 for room in rooms))
+
+    def test_unregistered_same_path_shape_is_fingerprinted_stably(self):
+        import subprocess
+        roots = [tempfile.mkdtemp(prefix="helm-unregistered-a-"),
+                 tempfile.mkdtemp(prefix="helm-unregistered-b-")]
+        for root in roots:
+            self.addCleanup(shutil.rmtree, root, True)
+        a = os.path.join(roots[0], "tree-a", "org", "cv")
+        b = os.path.join(roots[1], "tree-b", "org", "cv")
+        for repo in (a, b):
+            os.makedirs(repo)
+            subprocess.run(["git", "init", "-q", "-b", "main", repo],
+                           check=True, capture_output=True)
+        empty = mock.patch("helm.registry.load", return_value={"projects": {}})
+        with empty:
+            unknown = seats.derive_home_room(a), seats.derive_home_room(b)
+        with mock.patch("helm.registry.load", return_value={"projects": {}}), \
+                mock.patch("helm.automap.scan_repos",
+                           return_value={a: "cv", b: "org-cv"}):
+            scanner_known = seats.derive_home_room(a), seats.derive_home_room(b)
+        self.assertNotEqual(*unknown)
+        self.assertEqual(scanner_known, unknown)
+        self.assertTrue(all(name.startswith("cv-") for name in unknown))
+
+    def test_pathless_registry_entry_cannot_claim_current_repo(self):
+        repo = self._repo("actual-repo")
+        old = os.getcwd()
+        try:
+            os.chdir(repo)
+            with mock.patch("helm.registry.load", return_value={
+                    "projects": {"pathless-anchor": {"path": ""}}}):
+                room = seats.derive_home_room(repo)
+        finally:
+            os.chdir(old)
+        self.assertEqual(room, pk.slug(seats._path_project(repo)))
+        self.assertNotEqual(room, "pathless-anchor")
+
+    def test_long_unregistered_basename_preserves_fingerprint_suffix(self):
+        import subprocess
+        base = "r" * 70
+        repos = [os.path.join(self.tmp, parent, base) for parent in ("a", "b")]
+        for repo in repos:
+            os.makedirs(repo)
+            subprocess.run(["git", "init", "-q", "-b", "main", repo],
+                           check=True, capture_output=True)
+        with mock.patch("helm.registry.load", return_value={"projects": {}}):
+            rooms = [seats.derive_home_room(repo) for repo in repos]
+        self.assertNotEqual(*rooms)
+        self.assertTrue(all(len(room) <= 60 for room in rooms))
+        self.assertEqual(rooms,
+                         [pk.slug(seats._path_project(repo)) for repo in repos])
+
+    def test_project_name_normalizing_to_main_stays_unhomed(self):
+        repo = self._repo("Main.")
+        seats.join(session="s-normal-main", seat="pn", cwd=repo)
+        self.assertIsNone(seats.roster()["pn"].get("home_room"))
+
+    def test_submodule_uses_its_own_checkout_root(self):
+        import subprocess
+        source = self._repo("module-source")
+        with open(os.path.join(source, "README"), "w") as f:
+            f.write("module\n")
+        subprocess.run(["git", "-C", source, "add", "README"], check=True)
+        subprocess.run(["git", "-C", source, "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "commit", "-qm",
+                        "init"], check=True)
+        parent = self._repo("parent")
+        subprocess.run(["git", "-c", "protocol.file.allow=always", "-C", parent,
+                        "submodule", "add", "-q", source, "modules/child"],
+                       check=True, capture_output=True)
+        child = os.path.join(parent, "modules", "child")
+        self.assertEqual(seats._git_root(child), child)
+        self.assertEqual(seats.derive_home_room(child),
+                         pk.slug(seats._path_project(child)))
+
+    def test_bare_repo_is_projectless(self):
+        import subprocess
+        bare = os.path.join(self.tmp, "bare.git")
+        subprocess.run(["git", "init", "--bare", "-q", bare], check=True)
+        self.assertIsNone(seats._git_root(bare))
+        self.assertIsNone(seats.derive_home_room(bare))
+
+    def test_worktrees_from_one_bare_common_repo_share_identity(self):
+        import subprocess
+        source = self._repo("source")
+        with open(os.path.join(source, "README"), "w") as f:
+            f.write("seed\n")
+        subprocess.run(["git", "-C", source, "add", "README"], check=True)
+        subprocess.run(["git", "-C", source, "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "commit", "-qm",
+                        "seed"], check=True)
+        bare = os.path.join(self.tmp, "common.git")
+        subprocess.run(["git", "clone", "--bare", "-q", source, bare], check=True)
+        wa, wb = os.path.join(self.tmp, "wa"), os.path.join(self.tmp, "wb")
+        subprocess.run(["git", "--git-dir", bare, "worktree", "add", "-q",
+                        wa, "main"], check=True)
+        subprocess.run(["git", "--git-dir", bare, "worktree", "add", "-q",
+                        "-b", "lane", wb, "main"], check=True)
+        self.assertEqual(seats._git_root(wa), bare)
+        self.assertEqual(seats._git_root(wb), bare)
+        self.assertEqual(seats.derive_home_room(wa),
+                         seats.derive_home_room(wb))
+
+    def test_roster_report_and_cli_show_active_home(self):
+        repo = self._repo()
+        seats.join(session="s-report", seat="report", cwd=repo)
+        row = seats.roster_report()["seats"][0]
+        self.assertEqual(row["home_room"], "proj-alpha")
+        self.assertEqual(row["home_room_source"], "derived")
+        rc, out, err = self.cmd("seats", ("--all",))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("home #proj-alpha (derived)", out)
 
     def test_rehome_unknown_seat_refused(self):
         ok, msg = seats.rehome_seat("ghost", "team-z")
@@ -1842,20 +2197,37 @@ class RoomsSummarySeatsTest(SeatsBase):
         self.assertEqual([s["seat"] for s in rooms["main"]["seats"]], ["alice"])
         self.assertEqual([s["seat"] for s in rooms["side"]["seats"]], ["bob"])
 
-    def test_rooms_summary_includes_consumer_who_never_posted(self):
-        seats.join(seat="quiet-seat", cwd="/tmp/p")
+    def test_rooms_summary_includes_session_consumer_who_never_posted(self):
+        seats.join(session="s-quiet", seat="quiet-seat", cwd="/tmp/p")
         chat.post("@quiet-seat ping", who="someone-else")
-        seats.deliver(seat="quiet-seat")          # consumes -> cursor off > 0
+        seats.deliver(session="s-quiet", seat="quiet-seat")
+        self.assertFalse(seats._cursor("main", "quiet-seat")["active"])
+        self.assertTrue(seats._cursor(
+            "main", "quiet-seat", "s-quiet")["active"])
         rooms = {r["room"]: r for r in web._rooms_summary()}
         names = [s["seat"] for s in rooms["main"]["seats"]]
         self.assertIn("quiet-seat", names)
 
-    def test_rooms_summary_bare_baseline_is_not_presence(self):
-        # join baselines a cursor in EVERY room; a seat that never posted or
-        # consumed in a room must NOT show as present there (bob joined while
-        # only main existed -> holds a main baseline at off 0).
-        seats.join(seat="bob", cwd="/tmp/p")
+    def test_rooms_summary_hides_old_room_activity_after_rehome(self):
+        seats.join(session="session-old", seat="mover", cwd="/tmp/p",
+                   room="old-room", room_explicit=True)
+        chat.post("mover spoke before rehome", who="mover", room="old-room")
+        chat.post("@mover establish old-room consumption", who="bob",
+                  room="old-room")
+        seats.deliver(session="session-old", seat="mover", room="old-room")
+        self.assertTrue(seats.room_active("old-room", "mover"))
+        self.assertTrue(seats.rehome_seat("mover", "new-room")[0])
+        rooms = {r["room"]: r for r in web._rooms_summary()}
+        names = [s["seat"] for s in rooms["old-room"]["seats"]]
+        self.assertNotIn("mover", names)
+
+    def test_rooms_summary_nonzero_eof_baseline_is_not_presence(self):
+        # Joining after room traffic creates a nonzero EOF cursor. Offset alone
+        # must not imply presence: bob has neither posted nor consumed here.
         chat.post("noise", who="someone-else")
+        seats.join(seat="bob", cwd="/tmp/p")
+        self.assertGreater(seats._cursor("main", "bob")["off"], 0)
+        self.assertFalse(seats._cursor("main", "bob")["active"])
         rooms = {r["room"]: r for r in web._rooms_summary()}
         names = [s["seat"] for s in rooms["main"]["seats"]]
         self.assertNotIn("bob", names)

@@ -34,6 +34,16 @@ def env(name, default=None):
     return default if v is None else v
 
 
+def env_pair(name, companion):
+    """A value plus metadata selected atomically from one env namespace.
+    A preferred HELM value must never inherit stale MELD provenance."""
+    value = os.environ.get("HELM_" + name)
+    if value is not None:
+        return value, os.environ.get("HELM_" + companion)
+    value = os.environ.get("MELD_" + name)
+    return value, os.environ.get("MELD_" + companion)
+
+
 # The harness session-id vars, in resolution order. CLAUDE_CODE_SESSION_ID is
 # the REAL var Claude Code exports; CLAUDE_SESSION_ID is the legacy/hook-injected
 # alias (the SessionStart join hook passes session_id explicitly, so it worked

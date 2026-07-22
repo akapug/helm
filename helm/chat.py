@@ -762,8 +762,11 @@ def cmd_chat(args):
     # verb — posts, reads, join, deliver, the hooks pass no --room — defaults
     # to its room. Homed delivery scans only {home, main}; un-homed seats retain
     # the legacy all-room inbox. Unset ⇒ main for this one verb invocation.
-    room = home.env("CHAT_ROOM") or "main"
+    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
+    room = env_room or "main"
     room_given = "--room" in args
+    room_source = "derived" \
+        if not room_given and env_source == "derived" else None
     if room_given:
         i = args.index("--room")
         if i + 1 >= len(args):
@@ -782,7 +785,9 @@ def cmd_chat(args):
         return meld.cmd(args[1:])
     if verb in SEAT_VERBS:
         from . import seats
-        return seats.cmd(verb, args[1:], room)
+        return seats.cmd(
+            verb, args[1:], room, room_explicit=room_given,
+            room_source=room_source)
     if verb == "post":
         seat = _seat_flag(args)
         to = None
