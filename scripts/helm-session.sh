@@ -86,12 +86,12 @@ run_copy() { # <verb> <id> <apply> <cv-args...>
 # exit 8 unless <project_dir> is a dedicated (linked) worktree, never the shared/main checkout.
 assert_isolated_worktree() {
   local pd="$1"
-  [ -d "$pd" ] || { echo "helm-session: PROJECT_DIR '$pd' is not a directory — create the expert's worktree first (git worktree add)" >&2; exit 8; }
+  [ -d "$pd" ] || { echo "helm-session: PROJECT_DIR '$pd' is not a directory — mint the expert's room first: helm work claim <role>-home (lease + guard rails), then pass its returned path" >&2; exit 8; }
   local gd; gd="$(git -C "$pd" rev-parse --git-dir 2>/dev/null)" \
     || { echo "helm-session: PROJECT_DIR '$pd' is not inside a git repo — an expert home must be a dedicated worktree of this repo" >&2; exit 8; }
   case "$gd" in
     *"/worktrees/"*) : ;;  # a LINKED worktree — its .remember is isolated from the shared buffer
-    *) echo "helm-session: REFUSING — PROJECT_DIR '$pd' is the SHARED/main checkout, not a dedicated worktree; its .remember IS the shared main-session buffer (the poison). Spawn the expert in its own 'git worktree add' home." >&2; exit 8 ;;
+    *) echo "helm-session: REFUSING — PROJECT_DIR '$pd' is the SHARED/main checkout, not a dedicated worktree; its .remember IS the shared main-session buffer (the poison). Mint the expert its own room: helm work claim <role>-home, then pass its returned path." >&2; exit 8 ;;
   esac
 }
 
