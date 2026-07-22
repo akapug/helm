@@ -312,12 +312,15 @@ def _mention_re(seat):
 
 
 def seat_scope(seat, r=None):
-    """The seat's beacon tuning, one roster read: {"home": room-or-None,
-    "mute": set}. Computed ONCE per scan pass and threaded down — the poll
-    path stays ~one stat per quiet room."""
+    """The seat's beacon tuning + roster admission, one roster read. Computed
+    ONCE per scan pass and threaded down — the poll path stays ~one stat per
+    quiet room. `tracked` cannot depend only on the primary cursor: the primary
+    room may not have existed when an otherwise-joined seat entered."""
     row = ((r if r is not None else roster()).get(seat) or {}) if seat else {}
     return {"home": row.get("home_room"),
-            "mute": {pk.slug(x) for x in row.get("mute") or []}}
+            "mute": {pk.slug(x) for x in row.get("mute") or []},
+            "tracked": bool(row.get("joined") or row.get("session")
+                            or row.get("sessions"))}
 
 
 def deliverable(m, seat, room="main", scope=None):
@@ -586,8 +589,9 @@ def _move_seat_state(old, new):
         names = os.listdir(d)
     except OSError:
         return
+    markers = (".cursor.", ".seen.", ".stopfp.", ".scan.")
     for n in names:
-        if any(marker + ok in n for marker in (".cursor.", ".seen.", ".stopfp.")):
+        if any(marker + ok in n for marker in markers):
             try:
                 # replace EVERY key occurrence: a dm-lane cursor carries the
                 # key twice (dm-<key>.cursor.<key>…) and both must move —
@@ -962,23 +966,50 @@ def dm_lane(seat):
     return chat.DM_PREFIX + _seat_key(seat)
 
 
-def _scan_rooms(primary="main", seat=None, scope=None):
-    """Every room the delivery lane considers, bounded: the seat's private
-    DM lane first when it exists (a 1:1 word outranks room traffic), then
-    the primary room (whether or not its file exists yet), then the other
-    live rooms (chat.list_rooms()) newest-activity-first up to ROOM_SCAN_CAP
-    — under the cap the ACTIVE channels win, and each room's read is already
-    SCAN_CAP-bounded. Fail-open: an unlistable dir is just the primary.
+def scan_path(seat, session=None):
+    """Per-seat/session overflow-ring position for eventual room coverage."""
+    p = os.path.join(chat.chat_dir(), ".scan." + _seat_key(seat))
+    s8 = _sid8(session)
+    return "%s.%s" % (p, s8) if s8 else p
+
+
+def _fair_room_slice(names, seat, session, size):
+    """A bounded round-robin slice. Stable lexical order plus a persisted
+    index guarantees every overflow room eventually receives a scan slot;
+    newest-only slicing permanently starved older direct mentions."""
+    ring = sorted(names)
+    if not ring or size <= 0:
+        return []
+    path = scan_path(seat, session)
+    try:
+        with _flocked(path + ".lock"):
+            state = pk.read_json(path, {}) or {}
+            start = state.get("next", 0)
+            start = start if isinstance(start, int) else 0
+            start %= len(ring)
+            count = min(size, len(ring))
+            out = [ring[(start + i) % len(ring)] for i in range(count)]
+            pk.write_json(path, {"next": (start + count) % len(ring)})
+            return out
+    except OSError:
+        return ring[:size]
+
+
+def _scan_rooms(primary="main", seat=None, scope=None, session=None,
+                fair=False, bounded=True):
+    """Rooms considered by one delivery/gate pass. The seat's private DM lane,
+    primary room, home room, and main are pinned first. Foreign rooms use a
+    ROOM_SCAN_CAP-bounded overflow budget on hot paths; when that budget
+    overflows, a persisted round-robin position gives every room eventual
+    coverage instead of permanently selecting the same newest slice. Join is
+    the one-time `bounded=False` caller so every existing room receives an EOF
+    admission baseline and pre-join backlog can never emerge in a later slice.
 
     The scan is deliberately scope-BLIND (premise beacon-scope-mentions-
-    plus-home-room-owner-posts-not-all superseded the G1-G3 homing
-    allowlist): an @mention anywhere must surface, so every room is scanned
-    and deliverable() applies the per-row scope — a muted or foreign room's
-    non-mention rows just advance that room's cursor quietly. DM lanes other
-    than the seat's own are invisible here (list_rooms never shows them).
-    The seat's HOME room and main are PINNED into the scan when they exist:
-    foreign-room volume must never evict the seat's own channel or the
-    owner's all-hands from the bounded window (the starvation class)."""
+    plus-home-room-owner-posts-not-all superseded the G1-G3 homing allowlist):
+    an @mention anywhere must eventually surface, while deliverable() applies
+    per-row scope. DM lanes other than the seat's own stay invisible because
+    list_rooms() omits them. Fail-open: an unlistable dir is just the pins."""
     rooms = []
     if seat:
         lane = dm_lane(seat)
@@ -1003,14 +1034,20 @@ def _scan_rooms(primary="main", seat=None, scope=None):
     except OSError:
         names = []
     others = [n for n in names if n not in seen]
-    if others:
+    if not bounded:
+        return rooms + sorted(others)
+    size = ROOM_SCAN_CAP - 1
+    if fair and seat and len(others) > size:
+        others = _fair_room_slice(others, seat, session, size)
+    else:
         def mtime(n):
             try:
                 return os.stat(chat.room_path(n)).st_mtime
             except OSError:
                 return 0.0
         others.sort(key=mtime, reverse=True)
-    return rooms + others[:ROOM_SCAN_CAP - 1]
+        others = others[:size]
+    return rooms + others
 
 
 def _room_dirty(room, seat, session=None):
@@ -1123,9 +1160,11 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main"):
     not commit); every caller already wraps fail-open."""
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
     touch_seen(seat)          # presence even when every room is quiet
-    tracked = (_cursor(room, seat, session) or _cursor(room, seat)) is not None
     sc = seat_scope(seat)     # ONE roster read for the whole pass
-    for r in _scan_rooms(room, seat=seat, scope=sc):
+    tracked = sc["tracked"] \
+        or (_cursor(room, seat, session) or _cursor(room, seat)) is not None
+    for r in _scan_rooms(
+            room, seat=seat, scope=sc, session=session, fair=True):
         if not _room_dirty(r, seat, session):
             continue
         # the DM lane ALWAYS backfills from 0 — every row in it is addressed
@@ -1202,7 +1241,8 @@ def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
                        home_room_source=source)
     effective_home = row.get("home_room")
     lane = dm_lane(seat)
-    for r in _scan_rooms(room, seat=seat):
+    for r in _scan_rooms(
+            room, seat=seat, session=session, bounded=False):
         # the seat's DM lane baselines at offset 0 — every row in it is
         # addressed to THIS seat by construction, so a DM sent before the
         # join must deliver, never vanish under an EOF baseline
@@ -1365,10 +1405,12 @@ def _pending_all(room, seat, session=None):
     — the stop-guard's and roster report's multi-room truth. Same tracked/
     backfill rule as deliver_any, same _room_dirty fast path per room, same
     one-roster-read scope."""
-    tracked = (_cursor(room, seat, session) or _cursor(room, seat)) is not None
     sc = seat_scope(seat)
+    tracked = sc["tracked"] \
+        or (_cursor(room, seat, session) or _cursor(room, seat)) is not None
     out = []
-    for r in _scan_rooms(room, seat=seat, scope=sc):
+    for r in _scan_rooms(
+            room, seat=seat, scope=sc, session=session, fair=True):
         if not _room_dirty(r, seat, session):
             continue
         out.extend((r, row) for row in _pending_rows(
@@ -1864,8 +1906,9 @@ def _unlink_seat_state(seat):
         names = os.listdir(d)
     except OSError:
         return
+    markers = (".cursor.", ".seen.", ".stopfp.", ".scan.")
     for n in names:
-        if any((m + key) in n for m in (".cursor.", ".seen.", ".stopfp.")):
+        if any((m + key) in n for m in markers):
             try:
                 os.remove(os.path.join(d, n))
             except OSError:

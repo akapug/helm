@@ -830,6 +830,38 @@ class RoomAllowlistTest(SeatsBase):
         got = [seats.deliver_any(session="s-cap", seat="cap") for _ in range(3)]
         self.assertIn("word for the team", "\n".join(g for g in got if g))
 
+    def test_overflow_ring_eventually_reaches_old_foreign_mention(self):
+        seats.join(session="s-fair", seat="fair", cwd="/tmp/p",
+                   room="home")
+        chat.post("@fair stranded-direct", who="bob", room="old-direct")
+        for i in range(seats.ROOM_SCAN_CAP + 8):
+            chat.post("newer noise", who="bob", room="newer-%02d" % i)
+        got = [seats.deliver_any(session="s-fair", seat="fair")
+               for _ in range(4)]
+        self.assertIn("stranded-direct", "\n".join(x for x in got if x))
+
+    def test_overflow_ring_eventually_exposes_pending_to_stop_guard(self):
+        seats.join(session="s-gate", seat="gate", cwd="/tmp/p",
+                   room="home")
+        chat.post("@gate stranded-pending", who="bob", room="old-pending")
+        for i in range(seats.ROOM_SCAN_CAP + 8):
+            chat.post("newer noise", who="bob", room="gate-newer-%02d" % i)
+        pending = []
+        for _ in range(4):
+            pending.extend(seats._pending_all("main", "gate", "s-gate"))
+            if pending:
+                break
+        self.assertIn("stranded-pending",
+                      "\n".join(row["text"] for _room, row in pending))
+
+    def test_join_baselines_every_room_beyond_hot_scan_cap(self):
+        for i in range(seats.ROOM_SCAN_CAP + 8):
+            chat.post("@late stale prejoin", who="bob", room="pre-%02d" % i)
+        seats.join(session="s-late", seat="late", cwd="/tmp/p")
+        got = [seats.deliver_any(session="s-late", seat="late")
+               for _ in range(4)]
+        self.assertEqual(got, [None] * 4)
+
 
 class BeaconScopeTest(SeatsBase):
     """Premise beacon-scope-mentions-plus-home-room-owner-posts-not-all:
