@@ -207,21 +207,32 @@ def state(sid):
 def capture(event, sid, tool, tin, resp):
     """Mirror one todo/task tool event. Returns the new state dict, or None
     when the event carried nothing usable (prior state untouched). FAIL-CLOSED
-    is the CALLER's contract too — record() swallows everything."""
-    prior = state(sid)
-    old = [i for i in (prior.get("items") or []) if isinstance(i, dict)]
-    if tool == TODO_TOOL or "todos" in tin:
-        items = _items(tin.get("todos"))
-        if items is None:
-            return None
-    else:
-        items = _apply_task(old, tool, tin, resp)
-    st = {"v": 1, "ts": int(time.time()), "src": tool, "items": items}
-    if prior.get("post"):
-        st["post"] = prior["post"]
-    pk.write_json(state_path(sid), st)
-    _maybe_post(sid, st, digest(old), digest(items))
-    return st
+    is the CALLER's contract too — record() swallows everything.
+
+    One session can emit parallel tool events. Atomic replace prevents a torn
+    file but does NOT serialize read/modify/write: without this per-session
+    flock, every writer could read the same pre-post ledger and each append a
+    chat row. Hold the lock through the rate-cap reservation + append; unrelated
+    sessions remain fully parallel, and process death releases the lock."""
+    path = state_path(sid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".lock", "a+") as lock:
+        import fcntl
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        prior = state(sid)
+        old = [i for i in (prior.get("items") or []) if isinstance(i, dict)]
+        if tool == TODO_TOOL or "todos" in tin:
+            items = _items(tin.get("todos"))
+            if items is None:
+                return None
+        else:
+            items = _apply_task(old, tool, tin, resp)
+        st = {"v": 1, "ts": int(time.time()), "src": tool, "items": items}
+        if prior.get("post"):
+            st["post"] = prior["post"]
+        pk.write_json(path, st)
+        _maybe_post(sid, st, digest(old), digest(items))
+        return st
 
 
 def post_enabled():

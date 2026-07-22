@@ -18,6 +18,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -257,6 +258,33 @@ class TransitionPostTest(TodosBase):
         rows = self.room()
         self.assertEqual(len(rows), 1, rows)
         self.assertIn("task one", rows[0]["text"])
+
+    def test_concurrent_burst_yields_at_most_one_post(self):
+        """Atomic replace prevents torn JSON but does not serialize the cap:
+        parallel TaskUpdates used to all read the same pre-post ledger and
+        append 2-5 rows. The per-session flock makes the decision atomic."""
+        for n in range(8):
+            sid, seat = "race-%d" % n, "seat-%d" % n
+            self.seat(seat, sid)
+            record.record(self.ev(
+                tool="TaskCreate", sid=sid, tin={"subject": "race task"},
+                resp="Task #%d created successfully" % (n + 1)))
+            barrier = threading.Barrier(16)
+
+            def update(i):
+                barrier.wait()
+                record.record(self.ev(
+                    tool="TaskUpdate", sid=sid,
+                    tin={"taskId": str(n + 1), "status": "in_progress",
+                         "subject": "race task %02d" % i}))
+
+            workers = [threading.Thread(target=update, args=(i,))
+                       for i in range(16)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+            self.assertEqual(len(self.room()), n + 1)
 
     def test_no_post_when_nothing_materially_changed(self):
         self.seat()
