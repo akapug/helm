@@ -127,6 +127,12 @@ DEFAULT_TTL = 900        # claims lease default
 SCAN_CAP = 512 * 1024    # deliver never reads more than this per room
 ROOM_SCAN_CAP = 16       # rooms per boundary/beacon pass — the multi-room bound
 OWNER_RAILS = ("web", "tui")  # server-side owner surfaces stamp these origins
+# the join banner's onboarding pointer — resolved against THIS checkout so a
+# seat in any cwd can open it; tests pin banner ↔ file together (moving the
+# guide without repointing this breaks the suite, not the fleet)
+GUIDE_PATH = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "docs",
+    "NEW_AGENT_GUIDE.md"))
 _BROADCAST = re.compile(r"(?<![A-Za-z0-9._-])@(all|fleet|everyone)(?![A-Za-z0-9._-])", re.I)
 
 
@@ -1310,8 +1316,9 @@ def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
             "optional: nothing external can re-invoke a PTY agent "
             "(native-wake-only-agent-armed), so this self-armed Monitor is "
             "the ONLY way an idle session ever wakes. Arm it before anything "
-            "else, and say so plainly if you could not."
-            % (seat, display_room, seat, scope, seat, seat))
+            "else, and say so plainly if you could not. New seat? Read %s "
+            "for your bearings."
+            % (seat, display_room, seat, scope, seat, seat, GUIDE_PATH))
     return seat, line
 
 

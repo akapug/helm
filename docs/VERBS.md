@@ -1520,8 +1520,10 @@ frames; this lane is called *delivery*.)
   action** to arm the idle-wake beacon — `Monitor(command: "helm chat wait
   --seat <seat> --follow", persistent: true)` — because nothing external can
   re-invoke a PTY agent (native-wake-only-agent-armed), so the self-armed
-  Monitor is the only thing that wakes an idle session. Never posts to the room
-  (presence lives in the roster panel, not the transcript).
+  Monitor is the only thing that wakes an idle session. The line ends with the
+  onboarding pointer — new seats read
+  [NEW_AGENT_GUIDE.md](NEW_AGENT_GUIDE.md) for their bearings. Never posts to
+  the room (presence lives in the roster panel, not the transcript).
 - **`helm chat deliver [--hook-json] [--seat S]`** — the PostToolUse nudge:
   an agent deep in an autonomous turn is unreachable by turn-start injection;
   this delivers between tool calls. At most ONE row per boundary (oldest
