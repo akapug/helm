@@ -666,6 +666,46 @@ $ helm sessions resume 3f2a
 cd ~/dev/myproject && claude --resume 3f2a9c81-...
 ```
 
+## session — the session substrate (wraps cv, owns the policy)
+
+### `helm session ls | doctor-panes`
+Every live claude pane with a **persistence column**: a pane stamped
+`CLAUDE_CODE_CHILD_SESSION=1` without `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`
+is **MEMORY-ONLY** (transcript persistence silently off — a death loses it).
+Also flags DOUBLE-OPEN sids (law 1 violations). This is how the fleet sees the
+child-stamp trap before it bites.
+
+### `helm session doctor <sid> | checkpoint <sid> [--window N] | rescue <pid|sid>`
+`doctor` classifies a session (normal / forked / compacted / bridged-child /
+maxed-at-wall) + the live-pane state. `checkpoint` mints a NEW resumable id
+(`cv prune --thinking`, original untouched) so a maxed/forked session becomes
+branchable. `rescue` is the full pipeline for a memory-only pane: harvest
+side-channels first, then print the incantation.
+
+### `helm session port --cred <home> <sid> | resume <sid> [--launch]`
+Cred-switch resume PREP (`port`: verifies the target home's projects/trust,
+prints the `CLAUDE_CONFIG_DIR=… claude --resume` line) and the single-open-
+guarded resume. TWO LAWS enforced by every verb: (1) never two live copies of
+one session — a live pid holding the sid means close-first, never the
+incantation; (2) prepare + print, never launch — only `resume --launch`
+spawns, and only after law 1. Every printed line bakes
+`CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` + unsets the child-stamp trio, so a
+paste into a stamped pane can't re-trap.
+
+### `helm session experts [--register <sid> --domain D [--note N]] [--refresh <sid>] | helm session ask <domain> <q…>`
+The expertise layer (expert-sessions-beat-fresh-research): a durable O(1)
+registry (sid → domain → last-refreshed) and the query ladder — registry hit →
+transcript search (cv) → resume-live (print-don't-launch, with a mandatory
+RE-GROUND step: the expert re-verifies its facts against the current substrate
+before answering — expertise goes stale like everything else).
+
+```console
+$ helm session ls
+$ helm session rescue 622078
+$ helm session experts --register 96416633 --domain helm-orchestration
+$ helm session ask helm-orchestration what is the integration order
+```
+
 ### `helm search <text> [--scope P] [--refs]`
 Content search inside transcripts (full-text via the recall index when
 present, scoped grep otherwise), work-vs-synthetic classified. `--refs`
