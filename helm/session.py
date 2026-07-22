@@ -253,20 +253,24 @@ def _proc_snapshot(pid):
 
 
 def _resume_sid(argv):
-    """One unambiguous full UUID from argv. Bare/trailing ``--resume``, a flag
-    consumed as its value, prefixes, and conflicting repeats are UNKNOWN — a
-    false holder is worse than falling through to another rung."""
+    """One unambiguous full UUID from argv. FAIL-CLOSED over every ``--resume``
+    occurrence: a bare/trailing ``--resume``, a flag consumed as its value, a
+    prefix or otherwise invalid value, and conflicting repeats each poison the
+    WHOLE parse — a valid occurrence beside an invalid one is contradictory
+    evidence, not a majority vote. A false holder is worse than falling
+    through to another rung."""
     found = []
     for i, arg in enumerate(argv):
-        value = None
-        if arg == "--resume" and i + 1 < len(argv):
-            value = argv[i + 1]
+        if arg == "--resume":
+            value = argv[i + 1] if i + 1 < len(argv) else None
         elif arg.startswith("--resume="):
             value = arg.split("=", 1)[1]
-        if isinstance(value, str) and _SID_RE.fullmatch(value):
-            found.append(value)
-    unique = sorted(set(found))
-    return unique[0] if len(unique) == 1 else None
+        else:
+            continue
+        if not (isinstance(value, str) and _SID_RE.fullmatch(value)):
+            return None
+        found.append(value)
+    return found[0] if len(set(found)) == 1 else None
 
 
 def _safe_owned_dir(value, uid):
@@ -456,6 +460,11 @@ def _proc_claude_rows():
             "resume": resume,
             "declared": declared,
             "declared_reason": reason,
+            # exported composition context (consumed by helm/fleet.py so it can
+            # CALL this census instead of re-deriving it): the bracketed cwd and
+            # the canonical trusted config root (None = config-untrusted).
+            "cwd": snap["cwd"],
+            "root": root,
             "identity": ("declared" if declared else "resume" if resume
                          else "who" if attributed else "unknown"),
             "session": session_id,

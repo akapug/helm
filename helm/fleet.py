@@ -10,32 +10,48 @@ QUESTIONS GET ANSWERED BY RUNNING THIS VERB, never from memory, and answers
 given to anyone (owner included) quote its output.
 
 ONE TRUTH OWNER: this verb never re-derives what another module already
-proves. SID resolution is helm/session.py's (procStart-bound pid record via
-_proc_snapshot/_session_record, then its fail-closed _resume_sid argv parse);
-fleet only composes those answers into rows.
+proves. SID truth is helm/session.py's WHOLE census (_proc_claude_rows: the
+procStart-bound pid record, fail-closed --resume argv, who attribution, cwd
+candidate set, and the final generation recheck) — fleet consumes those rows
+verbatim and only composes them with its own display probes. The census also
+exports each row's bracketed cwd and canonical trusted config root, so fleet
+never re-derives a config home either.
 
 One row per live claude process:
-  pid, seat (HELM_CHAT_NAME or roster reverse-lookup), sid (authoritative
-  pid-record first), home (environ truth), daemon (ppid-walk to an orca
-  daemon; NONE = headless/invisible-to-owner), pane (orca terminal handle
-  when the join is unambiguous; '?' when un-mappable — never guessed),
-  stamps (child-session trio count), deck (MC = stale MC skill-deck env,
-  helm = repointed, - = unset).
+  pid, seat (HELM_CHAT_NAME or roster reverse-lookup), sid (census identity
+  ladder; a sid proven live in MULTIPLE pids is flagged DOUBLE-OPEN — that is
+  what a second holder proves, never that this process is a fork), home
+  (session's canonical config root; '?' when untrusted/unproven), daemon
+  (ppid-walk to an orca daemon whose incarnation is re-proven at match time),
+  pane (orca terminal handle when the join is unambiguous; '?' otherwise —
+  never guessed), stamps (child-session trio count), deck (MC = stale MC
+  skill-deck env, helm = repointed, - = unset).
 
 Every column comes from a live probe; nothing is cached. A FAILED probe is
-UNKNOWN, never an absence fact (premise failed-probe-not-absence): unreadable
-environ renders home/deck/seat as '?', marks the row UNKNOWN, and the footer
-counts such rows. The verb is read-only and safe to run at any moment.
+UNKNOWN, never an absence fact (premise failed-probe-not-absence): HEADLESS is
+a PROVEN verdict (a fully-parsed ppid walk that reached init); an unparsable
+hop, exhausted walk, stale daemon evidence, failed daemon scan, unreadable
+environ/cwd, missing census row, or failed terminal list renders host/columns
+as '?' and marks the row UNKNOWN. The verb is read-only and safe to run at
+any moment.
 """
 import glob
 import json
 import os
 import subprocess
-import sys
 
 from . import session
 
 _DAEMON_ENTRY = "daemon-entry.js"
+# the runtimes that actually execute the orca daemon script (orca-ide is the
+# packaged electron binary; node/electron cover dev shapes)
+_ORCA_RUNTIMES = {"orca-ide", "orca", "electron", "node"}
+_SID_SRC = {"declared": "record", "resume": "argv", "who": "who"}
+# census reasons that mean the record/environ PROBE failed (vs an affirmative
+# fact like record-missing/record-stale): an unresolved sid under one of these
+# is UNKNOWN, not a proven blank
+_FAILED_PROBE_REASONS = {"environ-unreadable", "record-unreadable",
+                         "record-replaced"}
 
 
 def _environ(pid):
@@ -63,31 +79,63 @@ def _claude_pids():
     return sorted(out)
 
 
+def _census():
+    """{pid: row} straight from session._proc_claude_rows() — the ONE sid
+    truth owner (record/argv/who/cwd rungs, generation recheck, canonical
+    config root). Fleet never re-derives any of it."""
+    return {r["pid"]: r for r in session._proc_claude_rows()}
+
+
+def _cmdline_argv(pid):
+    """NUL-split argv, or None when the probe failed (never [] — a failed
+    read must not look like an empty command line)."""
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            return f.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        return None
+
+
 def _is_daemon_argv(argv):
-    """daemon-entry.js as an EXACT argv element (cmdline split on NUL), by
-    itself or as the last path component — never a substring of the raw
-    cmdline, so `tail -f daemon-entry.js.log`, `not-daemon-entry.js`, and
-    flag-embedded lookalikes are not daemons. Flag-shaped elements never
-    match: a path passed as a --flag=value is an argument, not the script."""
-    for a in argv:
-        if a == _DAEMON_ENTRY:
-            return True
-        if not a.startswith("-") and os.path.basename(a) == _DAEMON_ENTRY:
-            return True
+    """The ACTUAL orca daemon argv shape, nothing looser: a known orca/JS
+    runtime (argv[0] basename) whose SCRIPT argument — the first non-flag
+    element after argv[0] — is daemon-entry.js, or the script executed
+    directly. `cat /tmp/daemon-entry.js`, `python worker.py daemon-entry.js`,
+    substring lookalikes, and flag-embedded paths are NOT daemons."""
+    argv0 = os.path.basename(argv[0]) if argv and argv[0] else ""
+    if argv0 == _DAEMON_ENTRY:
+        return True
+    if argv0 not in _ORCA_RUNTIMES:
+        return False
+    for a in argv[1:]:
+        if not a or a.startswith("-"):
+            continue
+        return os.path.basename(a) == _DAEMON_ENTRY
     return False
 
 
 def _daemon_pids():
-    out = set()
-    for entry in glob.glob("/proc/[0-9]*/cmdline"):
-        try:
-            with open(entry, "rb") as f:
-                argv = f.read().decode("utf-8", "replace").split("\0")
-            if _is_daemon_argv(argv):
-                out.add(int(entry.split("/")[2]))
-        except (OSError, ValueError):
+    """({pid: starttime}, scan_failed). Every daemon pid is BRACKETED with
+    its starttime (session._proc_start, the canonical field-22 reader) so a
+    later membership hit can re-prove the same incarnation instead of
+    trusting a bare number across PID reuse. scan_failed=True means the /proc
+    listing itself failed — daemon truth is then UNKNOWN for every row."""
+    out = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return {}, True
+    for name in names:
+        if not name.isdigit():
             continue
-    return out
+        pid = int(name)
+        argv = _cmdline_argv(pid)
+        if argv is None or not _is_daemon_argv(argv):
+            continue
+        start = session._proc_start(pid)
+        if start:
+            out[pid] = start
+    return out, False
 
 
 def _stat_ppid(pid):
@@ -112,32 +160,44 @@ def _stat_ppid(pid):
 
 
 def _daemon_for(pid, daemons):
-    """Nearest orca-daemon ancestor via a bracketed ppid walk: every hop is a
-    validated /proc/<pid>/stat parse; a single unparsable hop ends the walk
-    (None = cannot prove a daemon host, not proof of headlessness)."""
+    """('daemon', pid) | ('headless', None) | ('unknown', None).
+
+    HEADLESS is only PROVEN by a fully-parsed ppid walk that reached init.
+    A daemon hit is only PROVEN by re-reading the candidate at match time:
+    its argv must still be daemon-shaped AND its live starttime must equal
+    the one bracketed at scan time — stale set membership across PID reuse
+    is contradictory evidence, not a host. Any unparsable hop, exhausted
+    depth, or failed recheck is UNKNOWN (cannot prove), never an absence."""
     cur = pid
     for _ in range(12):
         ppid = _stat_ppid(cur)
-        if ppid is None or ppid <= 1:
-            return None
+        if ppid is None:
+            return "unknown", None
+        if ppid <= 1:
+            return "headless", None
         if ppid in daemons:
-            return ppid
+            argv = _cmdline_argv(ppid)
+            if (argv is not None and _is_daemon_argv(argv)
+                    and session._proc_start(ppid) == daemons[ppid]):
+                return "daemon", ppid
+            return "unknown", None
         cur = ppid
-    return None
+    return "unknown", None
 
 
 def _orca_terminals():
-    """`orca terminal list --json`, best-effort. [] on ANY failure — pane
-    mapping then degrades to '?', never to a guessed handle."""
+    """(terminals, failed). `orca terminal list --json`; a non-zero exit or
+    any exception is failed=True — pane truth is then UNKNOWN for hosted
+    rows, never silently identical to 'no terminals exist'."""
     try:
         p = subprocess.run(["orca", "terminal", "list", "--json"],
                            capture_output=True, text=True, timeout=10)
         if p.returncode != 0:
-            return []
+            return [], True
         terms = (json.loads(p.stdout).get("result") or {}).get("terminals")
-        return [t for t in terms or [] if isinstance(t, dict)]
+        return [t for t in terms or [] if isinstance(t, dict)], False
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return []
+        return [], True
 
 
 def _pane_for(cwd, terminals, shared_cwds):
@@ -151,47 +211,6 @@ def _pane_for(cwd, terminals, shared_cwds):
     hits = [t.get("handle") for t in terminals
             if t.get("worktreePath") == cwd and t.get("handle")]
     return hits[0] if len(hits) == 1 else None
-
-
-def _sid_for(pid, snap, declared, record_pids):
-    """SID for one process, ANSWERED BY helm/session.py (the one truth owner,
-    never re-derived here):
-      rung 1 — `declared`, session._session_record's procStart+uid+schema-
-        guarded pid record (validated against /proc stat field 22);
-      rung 2 — session._resume_sid over the bracketed snapshot argv
-        (fail-closed: bare/trailing --resume, a flag consumed as the value,
-        --resume= forms, and conflicting repeats all resolve to None).
-    An argv sid is 'argv~ancestor' ONLY when a DIFFERENT live pid's record
-    already owns that sid — then this process provably forked and argv names
-    the ancestor. A direct resume with no competing record holder is plain
-    'argv': a resume is not an ancestor claim by itself."""
-    if declared:
-        return declared, "record"
-    if snap is None:
-        return None, None
-    resume = session._resume_sid(snap["argv"])
-    if resume:
-        holder = record_pids.get(resume)
-        return resume, ("argv~ancestor" if holder not in (None, pid)
-                        else "argv")
-    return None, None
-
-
-def _sids_for(pids):
-    """{pid: (sid, src)} for the census, via session.py's bracketed snapshot
-    (uid + procStart + re-read guards) and record reader. Records resolve in
-    a first pass so the ancestor test can see every proven holder."""
-    snaps = {p: session._proc_snapshot(p) for p in pids}
-    declared = {}
-    for p, snap in snaps.items():
-        if snap and snap["environ"] is not None:
-            env = snap["env"] or {}
-            declared[p] = session._session_record(
-                p, env.get("CLAUDE_CONFIG_DIR"), env.get("HOME"),
-                snap["uid"], snap["start"])[0]
-    record_pids = {sid: p for p, sid in declared.items() if sid}
-    return {p: _sid_for(p, snaps[p], declared.get(p), record_pids)
-            for p in pids}
 
 
 def _roster():
@@ -217,44 +236,62 @@ def _seat_for(pid, env, roster, roster_err):
 
 
 def rows():
-    daemons = _daemon_pids()
+    daemons, daemons_failed = _daemon_pids()
     roster, roster_err = _roster()
     stamp_keys = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
                   "CLAUDE_CODE_BRIDGE_SESSION_ID")
-    pids = _claude_pids()
-    sids = _sids_for(pids)
+    census = _census()
+    live = session.live_sids(list(census.values()))
+    pids = sorted(set(_claude_pids()) | set(census))
     tilde = lambda p: p.replace(os.path.expanduser("~"), "~")  # noqa: E731
     out, raw_cwds = [], {}
     for pid in pids:
         env = _environ(pid)
-        unknown = env is None  # failed probe, NOT an empty environment
-        sid, sid_src = sids.get(pid, (None, None))
+        env_unknown = env is None  # failed probe, NOT an empty environment
+        sr = census.get(pid)
+        sid = sr["session"] if sr else None
+        sid_src = _SID_SRC.get(sr["identity"]) if sr else None
+        candidates = list(sr["possible_sessions"]) if sr else []
+        # a census row can itself be a failed probe: unresolved because the
+        # record/environ READ failed, not because evidence proved a blank
+        sid_unknown = sr is None or (
+            sid is None and sr.get("declared_reason") in _FAILED_PROBE_REASONS)
+        double_open = bool(sid) and len(live.get(sid) or ()) > 1
         seat, seat_src = _seat_for(pid, env, roster, roster_err)
         deck = (env or {}).get("HELM_SKILL_DECK", "")
-        try:
-            cwd = os.readlink("/proc/%d/cwd" % pid)
-        except OSError:
-            cwd = None
+        cwd = sr["cwd"] if sr else None  # the census's BRACKETED cwd first
+        if cwd is None:
+            try:
+                cwd = os.readlink("/proc/%d/cwd" % pid)
+            except OSError:
+                cwd = None
         raw_cwds[pid] = cwd
+        if daemons_failed:
+            daemon_state, daemon = "unknown", None
+        else:
+            daemon_state, daemon = _daemon_for(pid, daemons)
+        root = sr["root"] if sr else None
         out.append({
             "pid": pid,
             "seat": seat, "seat_src": seat_src,
             "sid": sid, "sid_src": sid_src,
-            "unknown": unknown,
-            "home": "?" if unknown else
-                    tilde(env.get("CLAUDE_CONFIG_DIR") or "~/.claude"),
+            "candidates": candidates,
+            "double_open": double_open,
+            "unknown": (env_unknown or sid_unknown or cwd is None
+                        or daemon_state == "unknown"),
+            "home": tilde(root) if root else "?",
             "cwd": tilde(cwd) if cwd else "?",
-            "daemon": _daemon_for(pid, daemons),
+            "daemon": daemon, "daemon_state": daemon_state,
             "pane": None,
-            "stamps": None if unknown else
+            "stamps": None if env_unknown else
                       sum(1 for k in stamp_keys if k in env),
-            "deck": "?" if unknown else
+            "deck": "?" if env_unknown else
                     ("MC" if "mission-control" in deck or "/.mc/" in deck
                      else "helm" if deck else "-"),
         })
-    hosted = [r for r in out if r["daemon"]]
+    hosted = [r for r in out if r["daemon_state"] == "daemon"]
     if hosted:
-        terminals = _orca_terminals()
+        terminals, terms_failed = _orca_terminals()
         counts = {}
         for r in hosted:
             c = raw_cwds[r["pid"]]
@@ -262,6 +299,8 @@ def rows():
         shared = {c for c, n in counts.items() if c and n > 1}
         for r in hosted:
             r["pane"] = _pane_for(raw_cwds[r["pid"]], terminals, shared)
+            if terms_failed:
+                r["unknown"] = True  # pane truth unavailable = failed probe
     return out, sorted(daemons)
 
 
@@ -275,10 +314,20 @@ def cmd_fleet(args):
           % (len(table), len(daemons)))
     for r in table:
         sid8 = (r["sid"] or "?")[:8]
-        tag = "" if r["sid_src"] == "record" else (
-            " (%s)" % r["sid_src"] if r["sid_src"] else " (UNRESOLVED)")
+        if r["sid_src"] in ("argv", "who"):
+            tag = " (%s)" % r["sid_src"]
+        elif r["sid_src"] == "record":
+            tag = ""
+        elif r["candidates"]:
+            tag = " (%d cwd-candidate(s))" % len(r["candidates"])
+        else:
+            tag = " (UNRESOLVED)"
+        if r["double_open"]:
+            tag += " DOUBLE-OPEN"
         host = ("daemon %d pane=%s" % (r["daemon"], r["pane"] or "?")
-                if r["daemon"] else "HEADLESS/no-pane")
+                if r["daemon_state"] == "daemon" else
+                "HEADLESS/no-pane" if r["daemon_state"] == "headless"
+                else "host=?")
         seat = r["seat"] or ("?" if r["unknown"] else "(no seat)")
         stamps = "?" if r["stamps"] is None else str(r["stamps"])
         print("  pid %-8d %-18s sid=%s%s%s"
@@ -286,7 +335,7 @@ def cmd_fleet(args):
                  " UNKNOWN" if r["unknown"] else ""))
         print("       %-13s stamps=%s deck=%-5s home=%s cwd=%s"
               % (host, stamps, r["deck"], r["home"], r["cwd"]))
-    ghosts = [r for r in table if not r["daemon"]]
+    ghosts = [r for r in table if r["daemon_state"] == "headless"]
     if ghosts:
         print("  ⚠ %d process(es) have NO orca pane — the owner cannot see or "
               "type at them" % len(ghosts))
@@ -295,4 +344,8 @@ def cmd_fleet(args):
     if unknowns:
         print("  ? %d row(s) carry UNKNOWN columns — failed probes, not "
               "absence; verify by hand before acting" % len(unknowns))
+    doubles = sorted({r["sid"] for r in table if r["double_open"]})
+    if doubles:
+        print("  ‼ %d sid(s) are live in MULTIPLE pids (DOUBLE-OPEN) — "
+              "resolve before resuming or injecting" % len(doubles))
     return 0
