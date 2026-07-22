@@ -108,6 +108,17 @@ mkdir -p "$tmp/plain"
 [ "$(run resurrect sess123 --project-dir "$tmp/plain" --apply)" = 8 ] || fail "resurrect into a non-git dir -> exit 8"
 [ "$(run resurrect sess123 --project-dir "$tmp/nope" --apply)" = 8 ] || fail "resurrect into a missing dir -> exit 8"
 
+# 7b. exit-8 diagnostics steer to the HELM lifecycle (`helm work claim`), never raw `git worktree add` —
+#     these refusals are exactly where a user lands when the guard fires, so docs and diagnostics must agree
+#     (sessions/SKILL.md: mint rooms via `helm work claim <lane>`, lease + guard rails).
+grep -q 'helm work claim' "$tmp/err" || fail "missing-dir refusal must steer to 'helm work claim'"
+run resurrect sess123 --project-dir "$GITROOT" --apply >/dev/null
+grep -q 'helm work claim' "$tmp/err" || fail "shared-checkout refusal must steer to 'helm work claim'"
+if grep -q 'worktree add' "$tmp/err"; then fail "shared-checkout refusal must NOT suggest raw 'git worktree add'"; fi
+if grep -vE '^[[:space:]]*#' "$SUT" | grep -q 'worktree add'; then
+  fail "helm-session.sh must carry NO raw 'git worktree add' guidance (helm work claim is the lifecycle)"
+fi
+
 # 8. resurrect into a real linked worktree: dry-run announces the defuse; --apply pre-creates .remember +
 #    emits the CLAUDE_PROJECT_DIR resume line (the working isolation lever, NOT REMEMBER_DIR).
 rc="$(rrun resurrect sess123 --project-dir "$WTREE")"

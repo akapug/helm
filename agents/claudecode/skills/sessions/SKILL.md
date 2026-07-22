@@ -4,7 +4,7 @@ description: Use when an agent needs to MOVE, COPY, REHOME, or CROSS-HARNESS-POR
 license: MIT
 metadata:
   author: helm
-  version: "1.0.0"
+  version: "1.0.1"
 ---
 
 # Sessions (RSH)
@@ -32,15 +32,16 @@ that makes it possible. This skill is the safe front door: `scripts/helm-session
 scripts/helm-session.sh rehome <id> --to-dir "$PWD"
 scripts/helm-session.sh rehome <id> --to-dir "$PWD" --apply
 
-# clone a session for a parallel lane (e.g. a worktree) — an independent copy
-scripts/helm-session.sh clone <id> --to-dir ../myrepo-worktrees/lane-b --apply
+# clone a session for a parallel lane — an independent copy into the lane's room
+# (lane rooms come from `helm work claim <lane>` → ../helm-wt/<lane>)
+scripts/helm-session.sh clone <id> --to-dir ../helm-wt/<lane> --apply
 
 # cross-harness port (claude -> codex, etc.)
 scripts/helm-session.sh port-harness <id> --to codex --apply
 
 # resurrect an expert into its OWN worktree (isolated .remember channel) — dry-run, then apply
-scripts/helm-session.sh resurrect <id> --project-dir ../helm-worktrees/<role>-home
-scripts/helm-session.sh resurrect <id> --project-dir ../helm-worktrees/<role>-home --apply
+scripts/helm-session.sh resurrect <id> --project-dir ../helm-wt/<role>-home
+scripts/helm-session.sh resurrect <id> --project-dir ../helm-wt/<role>-home --apply
 
 # read a session (no writes)
 scripts/helm-session.sh export <id> --format md
@@ -63,7 +64,11 @@ git **worktree** used as both `--cwd` and `CLAUDE_PROJECT_DIR` (real project che
 
 `resurrect` enforces this so it can't be skipped:
 - **Worktree mandatory (fail-loud).** `--project-dir` must be a *linked* worktree, never the shared/main
-  checkout — refused with exit 8.
+  checkout — refused with exit 8. The guard checks the git-dir (`git rev-parse --git-dir` of a linked
+  worktree lives under `<main>/.git/worktrees/`), so any linked worktree passes regardless of where its
+  directory sits — verified live against `../helm-wt/deck-fix` (accepted) and the main checkout (refused).
+  Mint the room with `helm work claim <lane>` (helm's worktree lifecycle: lease + guard rails), not raw
+  `git worktree add`.
 - **Pre-create the isolated `.remember`** on `--apply` — defuses `bootstrap-dirs.sh`'s one-shot migration
   that would otherwise `mv`-STEAL the shared buffer into the new dir.
 - **Channel-verify gate** (exit 9): a linked worktree's `.remember` is isolated by construction (exit 8),
@@ -87,11 +92,21 @@ git **worktree** used as both `--cwd` and `CLAUDE_PROJECT_DIR` (real project che
    into each lane's cwd. Both resume the same history without stepping on each other.
 3. **Cross-harness port** — move work between claude/codex/grok: `port-harness <id> --to <harness>`.
 4. **Resurrect an expert** — bring a domain-expert session in as a live team member with context
-   preserved: `resurrect <id> --project-dir ../helm-worktrees/<role>-home`.
+   preserved: claim the room (`helm work claim <role>-home`), then
+   `resurrect <id> --project-dir ../helm-wt/<role>-home`.
    Dry-run to confirm the carried context + resume line, then `--apply` and resume with the emitted
    `CLAUDE_PROJECT_DIR=<worktree>` so the expert gets its OWN isolated `.remember` channel (see "Expert
    channel isolation" above — history: a Mission Control shared-checkout resurrect once poisoned an expert
    with the primary session's buffer; that is exactly what the exit-8/exit-9 rails now prevent).
+
+## Scope: default harness roots ONLY (helm seat homes are NOT covered)
+
+cv discovers sessions from the default harness roots (`~/.claude`, `~/.codex`, …) and does NOT read
+`CLAUDE_CONFIG_DIR` — verified live 2026-07-22: with a seat's config dir exported, `cv ls` still lists
+only default-root sessions, and `cv show`/`helm-session.sh export` on a session living under a helm
+per-seat home (`~/.helm/_global/seats/<family>/instances/<n>/claude`) returns nothing. Until cv (or the
+wrapper) grows source-root plumbing, this skill moves/copies/rehomes DEFAULT-ROOT sessions only — do not
+claim it on helm seat-home sessions; that gap is real and open.
 
 ## Safety notes / when NOT to use
 

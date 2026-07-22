@@ -4,7 +4,7 @@ description: Use when the owner invokes /afk, declares they are away, asks for a
 license: MIT
 metadata:
   author: helm
-  version: "1.1.0"
+  version: "1.1.1"
 ---
 
 # /afk - Away Posture
@@ -20,12 +20,16 @@ contract behind it.
 
 ## Helm Substrate
 
-- `/afk soft|hard|off|status` is the away-state front door: the owner (or a
-  trusted state change) declares the posture, and this skill is the contract
-  behind it.
+- `/afk` loads this skill — instructions for the CURRENT turn. Helm has no
+  `afk` verb, no persistent away-state store, and no status reader: posture is
+  declared by the owner's words (in the turn or a `helm chat` row) and lifted
+  the same way. The declaration itself is the state; do not claim or invent a
+  stateful `/afk status`-style API.
 - Away posture, when wired mechanically, rides the reflex layer's marker-file
-  signal (`helm reflex add <id> <steer> --signal marker --marker <path>` —
-  a reflex fires while the flag path exists). One sentinel, one reader.
+  signal (`helm reflex add <id> | <steer> --signal marker-file --marker <path>`
+  — the reflex fires while the flag path exists; `owner-chat-unread` is the
+  live example of the pattern). One sentinel, one reader: the marker file is
+  the single away flag, written/removed only on the owner's word.
 - `decision-spirit` is the primary guide while away. Use its fast path before
   every load-bearing call.
 - Coordination uses `helm chat` only. Do not create a second away sentinel,
@@ -46,13 +50,11 @@ contract behind it.
 
 ## Activation Workflow
 
-1. Declare or inspect posture through the front door:
-
-```
-/afk soft "owner away - autonomous run"
-/afk hard "A2A only"
-/afk status
-```
+1. Take posture from the owner's declaration ("/afk", "afk hard — A2A only",
+   "autonomous overnight"). Restate the mode you heard in your ack, and when
+   the run is long, record it durably — a `helm chat` row, plus the reflex
+   marker file if one is wired. There is no posture CLI to query; later turns
+   and resumed seats recover posture from those records.
 
 2. Load `decision-spirit` and answer the fast path before each load-bearing
    call:
@@ -109,13 +111,8 @@ Before ending an AFK turn, check:
 ## Lift Workflow
 
 Lift only when the owner explicitly returns or a trusted state change says they
-are present:
-
-```
-/afk off
-# or
-/afk lift
-```
+are present — their own message saying they are back, or removal of the wired
+marker file. An incoming message by itself is not proof of return.
 
 After lifting, drop the AFK posture immediately: chat can become direct again,
 but `helm chat` remains the durable path for team handoffs.
