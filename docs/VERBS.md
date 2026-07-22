@@ -707,7 +707,7 @@ directly — same front door, no per-harness lane.
 
 ## sessions — every harness, one catalog
 
-### `helm sessions [<project>] [--limit N] [--all] | helm sessions resume <sid>`
+### `helm sessions [<project>] [--limit N] [--all] | helm sessions resume <sid> [--go] [--title T] [--skip-permissions] [--force]`
 Every local session across every harness, newest first, grouped by real
 project (decoded from inside transcripts, never from directory slugs).
 `resume <sid>` prints the exact resume command — the harness's own CLI, no
@@ -717,7 +717,35 @@ wrapper. `--all` includes synthetic (pruned-copy) sessions.
 $ helm sessions myproject
 $ helm sessions resume 3f2a
 cd ~/dev/myproject && claude --resume 3f2a9c81-...
+$ helm sessions resume 3f2a --go          # actually open it in a pane
+helm sessions: resumed 3f2a1b9c via orca — pane term_aae27b65…
+  cred: /home/owner/.claude-homes/team-example-com
+  cwd : /home/owner/dev/akapug/harvester
 ```
+
+`resume` prints the exact command; `--go` runs it. The command PINS
+`CLAUDE_CONFIG_DIR` to the home that owns the session — without the pin it does
+not fail on the wrong account, it silently succeeds on it, because every OAuth
+credhome symlinks `projects/` into one shared directory so the transcript
+resolves from anywhere. Ownership comes from `<home>/session-env/<sid>`, latched
+into `~/.helm/_global/session-creds.tsv` on first lookup because claude prunes
+that directory (≈91% of sessions touched in the last 2 days resolve, ≈18% past
+30 days — the latch freezes coverage instead of letting it decay).
+
+`--go` REFUSES rather than opening a pane that cannot work:
+
+* the session is already open in another pid (two panes on one sessionId
+  interleave their writes and each loses turns) — `--force` overrides
+* the home has not accepted the trust dialog for that cwd — the prompt renders
+  into an alternate screen buffer the adapter cannot read, so the pane looks
+  blank and healthy forever; `--skip-permissions` passes
+  `--dangerously-skip-permissions`
+* the session is OVERSIZED or a REFERENCE transcript
+
+The default account (`~/.claude`) is deliberately left UNPINNED: it is where
+claude stores state when `CLAUDE_CONFIG_DIR` is unset, and pinning it makes
+claude look for the onboarding marker in the wrong place and open the first-run
+wizard.
 
 ## session — the session substrate (wraps cv, owns the policy)
 

@@ -4,6 +4,7 @@ and the resume-warning surface. Hermetic: the catalog and the registry are both
 stubbed, so no real transcript scan or ~/.helm read ever happens."""
 import io
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -228,3 +229,224 @@ class CmdSessionsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CredHomeTest(unittest.TestCase):
+    """sid -> owning credential home. Hermetic: a fake ~/.claude-homes tree with
+    the same shape as the real one (short-name symlink beside each real home,
+    projects/ symlinked into the shared dir) so the aliasing and the
+    path-says-nothing property are both exercised, never assumed."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.shared = os.path.join(self.tmp, ".claude", "projects")
+        os.makedirs(self.shared)
+        self.homes = os.path.join(self.tmp, ".claude-homes")
+        for real, alias in (("acct-one-com", "one"), ("acct-two-com", "two")):
+            h = os.path.join(self.homes, real)
+            os.makedirs(os.path.join(h, "session-env"))
+            os.makedirs(os.path.join(h, "sessions"))
+            os.symlink(self.shared, os.path.join(h, "projects"))
+            os.symlink(h, os.path.join(self.homes, alias))
+        self.bindings = os.path.join(self.tmp, "bindings.tsv")
+        self.p = [
+            mock.patch.object(sessions, "BINDINGS", self.bindings),
+            mock.patch.object(sessions, "DEFAULT_HOME",
+                              os.path.join(self.tmp, ".claude")),
+            mock.patch.object(sessions, "cred_homes", lambda: [
+                os.path.realpath(os.path.join(self.tmp, ".claude")),
+                os.path.join(self.homes, "acct-one-com"),
+                os.path.join(self.homes, "acct-two-com")]),
+        ]
+        for p in self.p:
+            p.start()
+        os.makedirs(os.path.join(self.tmp, ".claude", "session-env"), exist_ok=True)
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+
+    def _env(self, home, sid):
+        open(os.path.join(self.homes, home, "session-env", sid), "w").close()
+
+    def test_resolves_the_home_that_ran_it(self):
+        self._env("acct-two-com", "sid-a")
+        self.assertTrue(sessions.credhome_for("sid-a").endswith("acct-two-com"))
+
+    def test_unknown_session_is_none_not_a_guess(self):
+        # a wrong home silently resumes on the wrong account, so None (which
+        # makes the caller say UNPINNED) is the only safe answer
+        self.assertIsNone(sessions.credhome_for("never-ran"))
+
+    def test_alias_symlink_does_not_double_count_an_account(self):
+        # cred_homes must dereference: 2 real homes behind 4 names
+        with mock.patch.object(sessions, "cred_homes",
+                               sessions.__dict__["cred_homes"]):
+            with mock.patch.object(os.path, "expanduser",
+                                   lambda p: p.replace("~", self.tmp)):
+                got = sessions.cred_homes()
+        reals = [g for g in got if ".claude-homes" in g]
+        self.assertEqual(sorted(os.path.basename(g) for g in reals),
+                         ["acct-one-com", "acct-two-com"])
+
+    def test_named_home_beats_the_default_catch_all(self):
+        # ~/.claude accumulates entries for sessions owned by a named home;
+        # preferring it would mis-attribute them to the default account
+        self._env("acct-one-com", "sid-b")
+        open(os.path.join(self.tmp, ".claude", "session-env", "sid-b"), "w").close()
+        self.assertTrue(sessions.credhome_for("sid-b").endswith("acct-one-com"))
+
+    def test_lookup_latches_so_the_answer_survives_pruning(self):
+        self._env("acct-one-com", "sid-c")
+        self.assertTrue(sessions.credhome_for("sid-c").endswith("acct-one-com"))
+        os.remove(os.path.join(self.homes, "acct-one-com", "session-env", "sid-c"))
+        # session-env is gone (claude prunes it); the frozen binding still answers
+        self.assertTrue(sessions.credhome_for("sid-c").endswith("acct-one-com"))
+
+    def test_latch_live_uses_the_authoritative_pid_record(self):
+        import json
+        rec = {"pid": 4242, "sessionId": "sid-live"}
+        with open(os.path.join(self.homes, "acct-two-com", "sessions", "4242.json"), "w") as f:
+            json.dump(rec, f)
+        self.assertEqual(sessions.latch_live(), 1)
+        self.assertTrue(sessions.credhome_for("sid-live").endswith("acct-two-com"))
+        self.assertEqual(sessions.latch_live(), 0)   # idempotent, no duplicate rows
+
+    def test_binding_write_failure_never_breaks_the_read(self):
+        self._env("acct-one-com", "sid-d")
+        with mock.patch.object(sessions, "BINDINGS", "/proc/nope/cannot-write.tsv"):
+            self.assertTrue(sessions.credhome_for("sid-d").endswith("acct-one-com"))
+
+
+class ResumePinTest(unittest.TestCase):
+    """The resume line must PIN the account. Without the pin it does not fail on
+    the wrong cred — it silently succeeds on it, because the shared projects/
+    symlink resolves the transcript from any home."""
+
+    def test_command_pins_the_owning_home(self):
+        with mock.patch.object(sessions, "credhome_for", return_value="/h/acct"):
+            cmd = sessions.resume_command(_row("uuid-9", h="claude", cwd="/p"))
+        self.assertIn("CLAUDE_CONFIG_DIR=/h/acct", cmd)
+        self.assertIn("--resume uuid-9", cmd)
+
+    def test_unresolved_home_leaves_the_line_unpinned_not_wrong(self):
+        with mock.patch.object(sessions, "credhome_for", return_value=None):
+            cmd = sessions.resume_command(_row("uuid-8", h="claude", cwd="/p"))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", cmd)
+
+    def test_codex_rows_are_untouched(self):
+        with mock.patch.object(sessions, "credhome_for", return_value="/h/acct"):
+            cmd = sessions.resume_command(_row("uuid-7", h="codex", cwd="/p"))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", cmd)
+        self.assertIn("codex resume uuid-7", cmd)
+
+    def test_minted_script_hides_the_line_behind_a_path(self):
+        # TOKEN LAW: a pane command is visible in adapter listings and logs
+        d = tempfile.mkdtemp()
+        with mock.patch.object(sessions, "RESUME_DIR", d), \
+             mock.patch.object(sessions, "credhome_for", return_value="/h/acct"):
+            p = sessions.mint_resume_script(_row("uuid-6", h="claude", cwd="/p"))
+        self.assertTrue(os.access(p, os.X_OK))
+        self.assertIn("CLAUDE_CONFIG_DIR=/h/acct", open(p).read())
+
+
+class MintedScriptTest(unittest.TestCase):
+    """The minted script is the whole delivery. It is not exercised by any unit
+    that only inspects strings, so these tests assert the SHELL SEMANTICS —
+    every bug found here was found by running it, not by reading it."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.p = [mock.patch.object(sessions, "RESUME_DIR", self.d),
+                  mock.patch.object(sessions, "credhome_for", return_value="/h/acct")]
+        for p in self.p:
+            p.start()
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+
+    def test_exec_never_binds_to_the_cd(self):
+        # REGRESSION: the script was once `exec cd X && claude …`. exec binds to
+        # cd — a shell BUILTIN — so the exec fails, the && chain never runs, the
+        # pane dies on arrival, and spawn still returns a handle. A resume that
+        # reports success and delivers nothing.
+        body = open(sessions.mint_resume_script(
+            _row("uuid-5", h="claude", cwd="/tmp"))).read()
+        self.assertNotIn("exec cd", body)
+        execs = [l for l in body.splitlines() if l.startswith("exec ")]
+        self.assertEqual(len(execs), 1)
+        self.assertTrue(execs[0].startswith("exec env "))
+
+    def test_script_is_valid_posix_sh(self):
+        import subprocess
+        p = sessions.mint_resume_script(_row("uuid-4", h="claude", cwd="/tmp"))
+        r = subprocess.run(["sh", "-n", p], capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+
+    def test_a_vanished_cwd_fails_loud_instead_of_forking(self):
+        # claude resume is cwd-scoped: from the wrong directory it does not
+        # error, it starts a FRESH session. Silently falling back to $PWD would
+        # look like a resume and lose the history, so the cd must be fatal.
+        import subprocess
+        p = sessions.mint_resume_script(
+            _row("uuid-3", h="claude", cwd="/definitely/not/here"))
+        r = subprocess.run(["sh", p], capture_output=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(b"cwd is gone", r.stderr)
+
+    def test_cwd_with_spaces_survives_quoting(self):
+        import subprocess
+        d = os.path.join(self.d, "a dir; echo pwned")
+        os.makedirs(d)
+        p = sessions.mint_resume_script(_row("uuid-2", h="claude", cwd=d))
+        self.assertEqual(subprocess.run(["sh", "-n", p], capture_output=True).returncode, 0)
+        self.assertIn(shlex.quote(d), open(p).read())
+
+
+class PreflightTest(unittest.TestCase):
+    """The two ways a resume reports success and delivers nothing. Both were
+    found by RUNNING it — neither is visible to a test that only reads strings."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _home(self, name, projects):
+        import json
+        h = os.path.join(self.tmp, name)
+        os.makedirs(h)
+        with open(os.path.join(h, ".claude.json"), "w") as f:
+            json.dump({"projects": projects}, f)
+        return h
+
+    def test_default_home_is_never_pinned(self):
+        # pinning CLAUDE_CONFIG_DIR=~/.claude sends claude looking for the
+        # onboarding marker at ~/.claude/.claude.json (a stub) instead of
+        # ~/.claude.json, and it opens the FIRST-RUN WIZARD instead of the session
+        with mock.patch.object(sessions, "DEFAULT_HOME", os.path.join(self.tmp, "d")):
+            os.makedirs(os.path.join(self.tmp, "d"))
+            self.assertFalse(sessions.is_pinnable(os.path.join(self.tmp, "d")))
+            self.assertTrue(sessions.is_pinnable(os.path.join(self.tmp, "named")))
+        self.assertFalse(sessions.is_pinnable(None))
+
+    def test_untrusted_cwd_is_detected_before_spawning(self):
+        h = self._home("acct", {"/w": {"hasTrustDialogAccepted": False}})
+        self.assertEqual(sessions.trust_blocked(_row("s", cwd="/w"), h), h)
+
+    def test_trusted_cwd_is_not_blocked(self):
+        h = self._home("acct", {"/w": {"hasTrustDialogAccepted": True}})
+        self.assertIsNone(sessions.trust_blocked(_row("s", cwd="/w"), h))
+
+    def test_unknown_cwd_is_not_blocked(self):
+        # a directory claude has never seen prompts on FIRST use, but we have no
+        # recorded evidence either way — refusing on absence would block every
+        # genuinely-new resume, so absence is not treated as a denial
+        h = self._home("acct", {})
+        self.assertIsNone(sessions.trust_blocked(_row("s", cwd="/w"), h))
+
+    def test_skip_permissions_reaches_the_script(self):
+        with mock.patch.object(sessions, "credhome_for", return_value="/h/a"):
+            plain = sessions.resume_exec(_row("s", cwd="/w"))
+            skip = sessions.resume_exec(_row("s", cwd="/w"), skip_permissions=True)
+        self.assertNotIn("--dangerously-skip-permissions", plain)
+        self.assertIn("--dangerously-skip-permissions", skip)
