@@ -1200,8 +1200,14 @@ frames; this lane is called *delivery*.)
   not yet `reported` — open or done-but-unreported — named one at a time with
   its `helm asks report` pointer; fp carries the row's status, so open→done
   re-fires once), stuck
-  session (`stuck-streak`≥3: surface the blocker), unlanded owner/mention
-  rows aged >10m past their inbox block (land or route them), uncommitted
+  session (`stuck-streak`≥3: surface the blocker), a RED gate (record.py's
+  command-log shows a test-runner whose LATEST run exited nonzero — fix or
+  surface before stopping; a green rerun silences it), unlanded owner/mention
+  rows aged >10m past their inbox block (land or route them), UNVERIFIED
+  edits (code files edited, tree dirty, NO test/gate ran this session — run
+  the gate; doc-only sessions never arm it), UNBANKED green (edits landed,
+  every latest gate run green, tree still dirty — commit is the named next
+  step), uncommitted
   drift (`dirty-streak`≥8: bank the green slice) — highest salience wins,
   each line ends in a pull-depth pointer; fires once per (signal, level)
   fingerprint as a soft hold (a re-stop on the same state passes; a

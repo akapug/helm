@@ -2,6 +2,17 @@
 
 ## Unreleased (0.2)
 
+- Stop-whisper slice 2 — the verify-grounding rungs: the contextual
+  continuation ladder gains three signals read from record.py's own logs
+  (one bounded read, fail-closed): a RED gate (a test-runner's latest run
+  exited nonzero — stopping on a known-red gate is the premature stop the
+  lane exists for; a green rerun silences it), UNVERIFIED edits (code files
+  edited, tree dirty, no gate ever ran — doc-only sessions never arm it),
+  and UNBANKED green (every latest gate run green, tree still dirty —
+  commit is the named next step). Same laws as slice 1: one 240B line per
+  stop, once-per-fingerprint latch, salience order, kill-switch,
+  fail-closed to silence.
+
 - Multi-model in ONE claude-code process (the proven per-agent-frontmatter
   mechanism): `helm router` — a stdlib-only transparent router at
   ANTHROPIC_BASE_URL that forwards `claude-*` requests VERBATIM to

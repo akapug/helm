@@ -1091,6 +1091,160 @@ class StopWhisperTest(SeatsBase):
         self.assertNotIn("text", rows[0])            # ids only, never content
 
 
+class StopWhisperVerifyRungsTest(SeatsBase):
+    """Slice 2 — the verify-grounding rungs: red-gate (RUN-but-not-GREEN),
+    unverified (code edits, no gate ever ran), unbanked-green (gate green,
+    tree dirty — commit is the clear next step). Hermetic: record.py's
+    command-log/edit-targets planted in the tmp HELM_HOME's reflex-state.
+    Each fires ONLY on its real condition, once per fingerprint, inside the
+    byte cap, fail-closed, kill-switched."""
+
+    def guard(self, sid, args=()):
+        return self.cmd("stop-guard", ["--hook-json", *args],
+                        stdin=json.dumps({"session_id": sid}).encode())
+
+    def plant(self, sid, **counters):
+        pk.write_json(os.path.join(record.session_dir(sid), "counters.json"),
+                      counters)
+
+    def plant_runs(self, sid, *rows, mode="w"):
+        p = os.path.join(record.session_dir(sid), "command-log.jsonl")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, mode) as f:
+            for i, r in enumerate(rows):
+                f.write(json.dumps({"ts": int(time.time()) + i, **r}) + "\n")
+
+    def plant_edits(self, sid, *names):
+        p = os.path.join(record.session_dir(sid), "edit-targets.log")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write("".join(n + "\n" for n in names))
+
+    def test_red_gate_fires_once_then_rearms_on_a_new_red_run(self):
+        seats.join(session="s-r1", seat="wisp", cwd="/tmp/p")
+        self.plant_runs("s-r1", {"token": "pytest", "exit": 1, "digest": "aaa"})
+        rc, _o, err = self.guard("s-r1")
+        self.assertEqual(rc, 2)
+        self.assertIn("gate ran RED", err)
+        self.assertIn("pytest", err)
+        self.assertIn("exited 1", err)
+        rc, _o, err = self.guard("s-r1")
+        self.assertEqual(rc, 0, err)                 # same red state: latched
+        self.plant_runs("s-r1", {"token": "pytest", "exit": 1, "digest": "bbb"},
+                        mode="a")                    # a NEW red run re-arms once
+        rc, _o, err = self.guard("s-r1")
+        self.assertEqual(rc, 2)
+        self.assertIn("gate ran RED", err)
+
+    def test_green_rerun_silences_the_red_gate(self):
+        seats.join(session="s-r2", seat="wisp", cwd="/tmp/p")
+        self.plant_runs("s-r2", {"token": "pytest", "exit": 1, "digest": "aaa"},
+                        {"token": "pytest", "exit": 0, "digest": "ccc"})
+        rc, _o, err = self.guard("s-r2")
+        self.assertEqual(rc, 0, err)                 # latest per token is green
+        self.assertNotIn("stop-whisper", err)
+
+    def test_interrupted_run_is_no_verdict_never_red(self):
+        seats.join(session="s-r3", seat="wisp", cwd="/tmp/p")
+        self.plant_runs("s-r3", {"token": "pytest", "exit": -1, "digest": "aaa"})
+        rc, _o, err = self.guard("s-r3")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("stop-whisper", err)
+
+    def test_unverified_code_edits_fire_docs_only_never(self):
+        seats.join(session="s-u1", seat="wisp", cwd="/tmp/p")
+        self.plant("s-u1", **{"last-dirty": 1})
+        self.plant_edits("s-u1", "seats.py", "record.py")
+        rc, _o, err = self.guard("s-u1")
+        self.assertEqual(rc, 2)
+        self.assertIn("NO test/gate run", err)
+        self.assertIn("git diff --stat", err)        # pull-depth pointer
+        rc, _o, err = self.guard("s-u1")
+        self.assertEqual(rc, 0, err)                 # latched per edit bucket
+        # docs-only session: the verify rungs stay silent (specificity law)
+        seats.join(session="s-u2", seat="wisp2", cwd="/tmp/p")
+        self.plant("s-u2", **{"last-dirty": 1})
+        self.plant_edits("s-u2", "MEMORY.md", "NOTES.txt")
+        rc, _o, err = self.guard("s-u2")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("stop-whisper", err)
+
+    def test_unverified_needs_a_dirty_tree(self):
+        seats.join(session="s-u3", seat="wisp", cwd="/tmp/p")
+        self.plant_edits("s-u3", "seats.py")         # edits banked, tree clean
+        rc, _o, err = self.guard("s-u3")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("stop-whisper", err)
+
+    def test_unbanked_green_names_the_commit_step(self):
+        seats.join(session="s-b1", seat="wisp", cwd="/tmp/p")
+        self.plant("s-b1", **{"last-dirty": 1})
+        self.plant_edits("s-b1", "seats.py")
+        self.plant_runs("s-b1", {"token": "pytest", "exit": 0, "digest": "ggg"})
+        rc, _o, err = self.guard("s-b1")
+        self.assertEqual(rc, 2)
+        self.assertIn("gate GREEN", err)
+        self.assertIn("git add -A && git commit", err)
+        rc, _o, err = self.guard("s-b1")
+        self.assertEqual(rc, 0, err)                 # latched per green state
+        self.plant_runs("s-b1", {"token": "pytest", "exit": 0, "digest": "hhh"},
+                        mode="a")                    # a NEW proven-green re-arms
+        self.assertEqual(self.guard("s-b1")[0], 2)
+
+    def test_red_gate_owns_the_stop_over_unbanked(self):
+        seats.join(session="s-b2", seat="wisp", cwd="/tmp/p")
+        self.plant("s-b2", **{"last-dirty": 1})
+        self.plant_edits("s-b2", "seats.py")
+        self.plant_runs("s-b2", {"token": "vitest", "exit": 0, "digest": "ggg"},
+                        {"token": "pytest", "exit": 2, "digest": "rrr"})
+        rc, _o, err = self.guard("s-b2")
+        self.assertEqual(rc, 2)
+        self.assertEqual(err.count("[helm stop-whisper]"), 1)  # one line per stop
+        self.assertIn("gate ran RED", err)           # salience: red wins
+        self.assertNotIn("gate GREEN", err)
+        rc, _o, err = self.guard("s-b2")
+        self.assertEqual(rc, 0, err)                 # unbanked NEVER claims green
+        self.assertNotIn("gate GREEN", err)          # while a red gate stands
+
+    def test_byte_cap_holds_with_a_maximal_token(self):
+        seats.join(session="s-c1", seat="wisp", cwd="/tmp/p")
+        self.plant_runs("s-c1", {"token": "t" * 80, "exit": 1, "digest": "aaa"})
+        rc, _o, err = self.guard("s-c1")
+        self.assertEqual(rc, 2)
+        line = next(l for l in err.splitlines() if "stop-whisper" in l)
+        self.assertLessEqual(len(line.encode()), seats.STOP_WHISPER_CAP)
+
+    def test_kill_switch_and_fail_closed_on_garbled_logs(self):
+        seats.join(session="s-k1", seat="wisp", cwd="/tmp/p")
+        self.plant_runs("s-k1", {"token": "pytest", "exit": 1, "digest": "aaa"})
+        os.environ["HELM_STOP_GUARD_WHISPER"] = "0"
+        rc, _o, err = self.guard("s-k1")
+        self.assertEqual(rc, 0, err)                 # off = silent
+        os.environ.pop("HELM_STOP_GUARD_WHISPER")
+        # garbled command-log + edit-targets: silence, never a raise
+        seats.join(session="s-k2", seat="wisp2", cwd="/tmp/p")
+        self.plant("s-k2", **{"last-dirty": 1})
+        sd = record.session_dir("s-k2")
+        os.makedirs(sd, exist_ok=True)
+        with open(os.path.join(sd, "command-log.jsonl"), "w") as f:
+            f.write("not json{{\n")
+        with open(os.path.join(sd, "edit-targets.log"), "wb") as f:
+            f.write(b"\xff\xfe broken\n")
+        rc, _o, err = self.guard("s-k2")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("stop-whisper", err)
+
+    def test_ledger_rows_stay_ids_only(self):
+        seats.join(session="s-l1", seat="wisp", cwd="/tmp/p")
+        self.plant_runs("s-l1", {"token": "pytest", "exit": 1, "digest": "abc"})
+        self.assertEqual(self.guard("s-l1")[0], 2)
+        lp = os.path.join(home.global_dir(), ".state", "stop-whisper-ledger.jsonl")
+        with open(lp) as f:
+            rows = [json.loads(l) for l in f]
+        self.assertEqual(rows[0]["id"], "redgate:abc:1")
+        self.assertNotIn("text", rows[0])
+
+
 class ClaimsTest(SeatsBase):
     def test_lease_is_the_capability_composite_binding(self):
         ok, msg, lease = seats.claim("worktree-main", "alice", ttl=60, session="sA")

@@ -904,6 +904,13 @@ STUCK_AT = 3    # reflex.py stuck-commonsense threshold (re-fires per bucket)
 DIRTY_AT = 8    # reflex.py uncommitted-drift threshold
 PENDING_STALE_S = 600  # unlanded rows must have AGED to whisper — a fresh set
                        # was just pointed at by the inbox block (echo ≠ context)
+RUNNER_TAIL_ROWS = 40  # bounded command-log lookback (newest rows win)
+
+# Code-ish edit targets only — a doc-only session must never arm the verify
+# rungs (specificity law: a whisper that fires on prose edits is wallpaper).
+_CODE_EDIT_RE = re.compile(
+    r"\.(py|pyi|ts|tsx|js|jsx|mjs|cjs|rs|go|rb|sh|bash|zsh|c|h|cc|cpp|hpp"
+    r"|java|kt|kts|swift|php|pl|lua|sql|proto|toml|yaml|yml|json)$", re.I)
 
 
 def _ask_candidate():
@@ -929,12 +936,106 @@ def _ask_candidate():
         return None
 
 
+def _runner_latest(session):
+    """{token: row} — the LATEST recorded run per test-runner token from the
+    session's command-log tail (record.py's verify-grounding log: REAL exit
+    codes, token + digest, never raw command lines). One bounded read
+    (RUNNER_TAIL_ROWS newest rows; the log itself rotates at 1MB). {} on any
+    trouble or no session — which fails every gate rung CLOSED to silence."""
+    if not session:
+        return {}
+    try:
+        from . import record
+        p = os.path.join(record.session_dir(session), "command-log.jsonl")
+        with open(p, encoding="utf-8") as f:
+            tail = f.readlines()[-RUNNER_TAIL_ROWS:]
+    except Exception:
+        return {}
+    latest = {}
+    for ln in tail:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("token"):
+            latest[str(r["token"])] = r
+    return latest
+
+
+def _edited_code(session):
+    """Basenames of CODE-ish files this session actually edited (record.py's
+    edit-targets log — real landed edits, failed ones never appended). A
+    doc-only session returns [] and never arms the verify rungs. [] on any
+    trouble = fail-closed."""
+    if not session:
+        return []
+    try:
+        from . import record
+        p = os.path.join(record.session_dir(session), "edit-targets.log")
+        with open(p, encoding="utf-8") as f:
+            names = [ln.strip() for ln in f]
+    except Exception:
+        return []
+    return [n for n in names if n and _CODE_EDIT_RE.search(n)]
+
+
+def _gate_candidate(latest):
+    """The RED-GATE rung: a test/gate RAN this session and its LATEST run is
+    NOT green (exit > 0; -1 = interrupted, no verdict, never red). Stopping
+    on a known-red gate is exactly the premature stop this lane exists to
+    catch. fp = digest:exit — the same red state whispers once; a NEW red
+    run (new digest or exit) re-arms; a green rerun silences it for good."""
+    red = [r for r in latest.values()
+           if isinstance(r.get("exit"), int) and r["exit"] > 0]
+    if not red:
+        return None
+    r = max(red, key=lambda x: x.get("ts") or 0)
+    return ("redgate:%s:%s" % (r.get("digest"), r["exit"]),
+            "gate ran RED — `%s` exited %s with no green rerun since; fix or "
+            "surface it before stopping (pull: rerun that gate)"
+            % (_clip(_scrub(str(r.get("token") or "?")), 40), r["exit"]))
+
+
+def _unverified_candidate(dirty, edits, latest):
+    """The UNVERIFIED rung: code edits landed, tree still dirty, and NO
+    test/gate ran this session at all — `compiles` ≠ done; stopping here is
+    stopping before the work was ever proven. Level bucket escalates per
+    DIRTY_AT further edits (reflex escalate law), so one whisper per stretch,
+    never wallpaper."""
+    if not (dirty and edits) or latest:
+        return None
+    return ("unverified:%d" % (len(edits) // DIRTY_AT),
+            "%d code edit(s) landed with NO test/gate run this session — run "
+            "the gate before stopping (pull: git diff --stat, then the suite)"
+            % len(edits))
+
+
+def _unbanked_candidate(dirty, edits, latest):
+    """The UNBANKED-GREEN rung: edits landed, EVERY latest gate run is green,
+    tree still dirty — the next step is unambiguous: commit. The sharper,
+    earlier cousin of the dirty-streak rung (no eight-op wait when the state
+    already reads 'proven green, unbanked'). fp = the newest green digest:
+    each newly-proven green state whispers once."""
+    if not (dirty and edits and latest):
+        return None
+    if any(not (isinstance(r.get("exit"), int) and r["exit"] == 0)
+           for r in latest.values()):
+        return None   # a red/no-verdict gate stands — the red rung owns this stop
+    g = max(latest.values(), key=lambda x: x.get("ts") or 0)
+    return ("unbanked:%s" % g.get("digest"),
+            "gate GREEN (`%s`) but the tree is dirty — bank the proven slice "
+            "(pull: git add -A && git commit)"
+            % _clip(_scrub(str(g.get("token") or "?")), 40))
+
+
 def _whisper_candidates(session, pending, inbox_blocked):
-    """[(fp, line)] of LIVE whisper signals, salience-ordered. Signals are
-    cheap local reads only (reflex law): the session's record.py counters +
-    the pending rows the guard already computed. Each fp carries a LEVEL
-    bucket so a worsening streak re-fires (reflex escalate law) and a new
-    pending set re-arms."""
+    """[(fp, line)] of LIVE whisper signals, salience-ordered: owner-ask >
+    stuck > red-gate > stale-pending > unverified > unbanked-green > dirty.
+    Signals are cheap local reads only (reflex law): the session's record.py
+    counters + verify-grounding logs (command-log/edit-targets) + the pending
+    rows the guard already computed. Each fp carries a LEVEL bucket so a
+    worsening streak re-fires (reflex escalate law) and a new pending set,
+    red run, or green state re-arms."""
     out = []
     ask = _ask_candidate()   # owner-ask rung: unsurfaced owner debt outranks all
     if ask:
@@ -961,6 +1062,15 @@ def _whisper_candidates(session, pending, inbox_blocked):
                     "this session; surface the blocker or check creds before "
                     "idling (pull: helm reflex smoke --session %s)"
                     % (stuck, session)))
+    # the verify-grounding rungs (slice 2): one bounded read of record.py's
+    # command-log + edit-targets — red gate > (…pending…) > unverified >
+    # unbanked-green, each mutually exclusive by construction.
+    latest = _runner_latest(session)
+    edits = _edited_code(session)
+    dirty_now = bool(c.get("last-dirty"))
+    gate = _gate_candidate(latest)
+    if gate:
+        out.append(gate)
     if pending and not inbox_blocked:
         try:  # STALE rows only — reflex._fresh fails open to fresh, which
             from . import reflex  # fails the whisper CLOSED (silence) here
@@ -974,6 +1084,12 @@ def _whisper_candidates(session, pending, inbox_blocked):
                         "once, no longer re-blocking) — land or explicitly "
                         "route them (pull: helm chat read)"
                         % (len(stale), PENDING_STALE_S // 60)))
+    uv = _unverified_candidate(dirty_now, edits, latest)
+    if uv:
+        out.append(uv)
+    ub = _unbanked_candidate(dirty_now, edits, latest)
+    if ub:
+        out.append(ub)
     if dirty >= DIRTY_AT:
         out.append(("dirty:%d" % (dirty // DIRTY_AT),
                     "%d dirtying ops with no commit at stop — bank the green "
@@ -1030,7 +1146,8 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
           must never gate a stop).
       (c) WHISPER — the contextual continuation lane (_stop_whisper): ONE
           budgeted nudge from the live signals (stuck/dirty counters, the
-          latched-but-unlanded pending set), once per (signal, level)
+          verify-grounding rungs — red gate, unverified edits, unbanked
+          green — and the latched-but-unlanded pending set), once per (signal, level)
           fingerprint, riding an existing block or soft-holding alone;
           HELM_STOP_GUARD_WHISPER=0 disables; fail-closed to nothing.
       (d) WARN — clean stop: one line reminding to arm the idle-wake beacon.
