@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -1016,6 +1017,100 @@ class LexiconPipeContractTest(StoreBase):
         self.assertEqual(rc, 2)
         self.assertIn("keywords,csv", err)
         self.assertEqual(store.load_all(types=("lexicon",)), [])
+
+    def test_redefine_preserves_keywords_domain_kind(self):
+        # a bare definition sharpen (the coach landing verb's 2-field form)
+        # must MERGE, not rebuild — the redefine regression of the very
+        # incident the closed contract fixed (review: symptom vocabulary died)
+        self.add("lexicon", "fleet-truth | census ground truth | coinage | "
+                 "fleet state, stale, still up | helm-ops",
+                 "--source", "coinage-capture")
+        rc, _, err = self.add("lexicon",
+                              "fleet-truth | census ground truth, sharpened")
+        self.assertEqual((rc, err), (0, ""))
+        e = self.one(store.load_all(types=("lexicon",)), "fleet-truth")
+        self.assertEqual(e["definition"], "census ground truth, sharpened")
+        self.assertEqual((e["kind"], e["keywords"], e["domain"]),
+                         ("coinage", "fleet state, stale, still up", "helm-ops"))
+        with open(e["path"]) as f:
+            self.assertIn("  source: coinage-capture", f.read())  # source survives
+        self.assertEqual([x["id"] for x in
+                          store.resolve_prompt("fleet state seems stale")],
+                         ["fleet-truth"])
+
+    def test_redefine_explicit_fields_still_override(self):
+        self.add("lexicon", "fleet-truth | truth | coinage | oldword | ops")
+        self.add("lexicon", "fleet-truth | truth | bug-class | newword | dev")
+        e = self.one(store.load_all(types=("lexicon",)), "fleet-truth")
+        self.assertEqual((e["kind"], e["keywords"], e["domain"]),
+                         ("bug-class", "newword", "dev"))
+        self.assertEqual([x["id"] for x in store.resolve_prompt("newword here")],
+                         ["fleet-truth"])
+        self.assertEqual(store.resolve_prompt("oldword here"), [])
+
+    def test_project_redefine_preserves_keywords(self):
+        # the merge follows the scoped-filename law: a project redefine reads
+        # the PROJECT file, never global's
+        self.add("lexicon", "pterm | pdef | phrase | projword", "--project", "p1")
+        self.add("lexicon", "pterm | pdef sharpened", "--project", "p1")
+        e = self.one(store.load_all(project="p1", types=("lexicon",)), "pterm")
+        self.assertEqual((e["definition"], e["keywords"]),
+                         ("pdef sharpened", "projword"))
+
+    def test_legacy_csv_kind_migrates_on_redefine(self):
+        # a legacy mis-file (keywords CSV under kind:) redefined via the verb:
+        # the rescued vocabulary lands in the real keywords field and kind
+        # normalizes to phrase — the rewrite is the migration moment
+        d = self.global_dir("lexicon")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "lex-fleet-truth.md"), "w") as f:
+            f.write("---\nname: lex-fleet-truth\n"
+                    'description: "lexicon: fleet-truth = census ground truth"\n'
+                    "metadata:\n  node_type: memory\n  type: lexicon\n"
+                    "  term: fleet-truth\n  scope: global\n"
+                    "  kind: fleet state, stale, still up\n"
+                    "  definition: census ground truth\n---\n")
+        rc, _, err = self.add("lexicon",
+                              "fleet-truth | census ground truth, sharpened")
+        self.assertEqual((rc, err), (0, ""))
+        e = self.one(store.load_all(types=("lexicon",)), "fleet-truth")
+        self.assertEqual((e["kind"], e["keywords"]),
+                         ("phrase", "fleet state, stale, still up"))
+        with open(e["path"]) as f:
+            raw = f.read()
+        self.assertIn("  keywords: fleet state, stale, still up", raw)
+        self.assertIn("  kind: phrase", raw)
+        self.assertEqual([x["id"] for x in
+                          store.resolve_prompt("fleet state seems stale")],
+                         ["fleet-truth"])
+
+
+class AtomicWriteRaceTest(unittest.TestCase):
+    """pk.atomic_write must not lose a concurrent same-path writer: with a
+    SHARED tmp name (path + '.tmp'), the first os.replace steals the second
+    writer's tmp and the second's replace dies FileNotFoundError — a silent
+    lost write (adversarial review, pre-existing pk seam)."""
+
+    def test_interleaved_same_path_writers_both_land(self):
+        tmp = tempfile.mkdtemp(prefix="helm-test-aw-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = os.path.join(tmp, "entry.md")
+        real, fired = os.replace, []
+
+        def interleave(src, dst):
+            if not fired:  # a second full writer (its own thread, as live)
+                fired.append(1)  # runs between the first's write and replace
+                t = threading.Thread(target=pk.atomic_write,
+                                     args=(target, "second\n"))
+                t.start()
+                t.join()
+            return real(src, dst)
+
+        with mock.patch.object(pk.os, "replace", side_effect=interleave):
+            pk.atomic_write(target, "first\n")  # old code: FileNotFoundError
+        with open(target) as f:
+            self.assertEqual(f.read(), "first\n")  # last replace wins, no loss
+        self.assertEqual(os.listdir(tmp), ["entry.md"])  # no orphaned tmp
 
 
 class AdoptProjectMemdirsTest(StoreBase):

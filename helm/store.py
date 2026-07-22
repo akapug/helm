@@ -320,9 +320,12 @@ def _parse_lexicon(path):
     kind = (e.get("kind") or "").strip()
     if not kw and "," in kind:
         kw = kind
+        kind = "phrase"  # the CSV was never a taxonomy slug — any rewrite
+        # (redefine/confirm/supersede) now persists the migrated shape instead
+        # of carrying the mis-file forever
     e.update({"type": "lexicon", "id": e["term"], "statement": e["definition"],
               "confidence": 1.0, "class": "lexicon", "load_class": "jit",
-              "status": status, "keywords": kw,
+              "status": status, "keywords": kw, "kind": kind,
               "domain": (e.get("domain") or "").strip(), "pinned": False})
     return e
 
@@ -714,16 +717,21 @@ def write_prior(e, root_dir=None, path=None):
     return path
 
 
+def _lexicon_path(term, scope, root_dir=None):
+    """The mc term_path law: global -> lex-<term>.md; narrower authored scope
+    prefixes lex-<scope-slug>--<term>.md so a project define never clobbers
+    global."""
+    name = "lex-" + _slug(term) + ".md" if scope == "global" \
+        else "lex-" + _slug(scope) + "--" + _slug(term) + ".md"
+    return os.path.join(root_dir or _default_dir("lexicon"), name)
+
+
 def write_lexicon(e, root_dir=None, path=None):
-    """Write a lex-*.md (mc lexicon._write_term shape). Filename follows the mc
-    term_path law: global -> lex-<term>.md; narrower authored scope prefixes
-    lex-<scope-slug>--<term>.md so a project define never clobbers global."""
+    """Write a lex-*.md (mc lexicon._write_term shape)."""
     term = e.get("term") or str(e.get("id") or "")
     scope = e.get("term_scope") or "global"
     if path is None:
-        name = "lex-" + _slug(term) + ".md" if scope == "global" \
-            else "lex-" + _slug(scope) + "--" + _slug(term) + ".md"
-        path = os.path.join(root_dir or _default_dir("lexicon"), name)
+        path = _lexicon_path(term, scope, root_dir)
     d = (e.get("definition") or e.get("statement") or "").replace('"', "'")
     body = [
         "---",
@@ -1497,7 +1505,7 @@ def cmd_store(args):
             # the pipe contract is closed: a field the store will not keep is
             # REFUSED, never silently filed under the wrong key (the live
             # incident: a keywords CSV in field 3 died as kind:)
-            kind = parts[2] if len(parts) > 2 and parts[2] else "phrase"
+            kind = parts[2] if len(parts) > 2 and parts[2] else ""
             if "," in kind or len(parts) > 5:
                 print("helm store add: lexicon is <term> | <definition> "
                       "[| kind [| keywords,csv [| domain]]] — kind is ONE "
@@ -1506,13 +1514,22 @@ def cmd_store(args):
                 return 2
             scope = ("project:" + project) if project else "global"
             status = STATUS_CANDIDATE if candidate else STATUS_LIVE
-            e = {"term": parts[0], "definition": parts[1], "kind": kind,
-                 "keywords": parts[3] if len(parts) > 3 else "",
-                 "domain": parts[4] if len(parts) > 4 else "",
+            # redefine MERGES, never strips: an absent optional field keeps the
+            # existing entry's value — the coach landing verb's bare 2-field
+            # sharpen must not destroy the symptom vocabulary this closed
+            # contract exists to protect (the incident class, via a legal verb)
+            path = _lexicon_path(parts[0], scope, _default_dir("lexicon", project))
+            prev = _parse_lexicon(path) or {}
+            e = {"term": parts[0], "definition": parts[1],
+                 "kind": kind or prev.get("kind") or "phrase",
+                 "keywords": parts[3] if len(parts) > 3 else prev.get("keywords", ""),
+                 "domain": parts[4] if len(parts) > 4 else prev.get("domain", ""),
+                 "examples": prev.get("examples") or [],
                  "term_scope": scope, "status": status,
-                 "source": source or ("inferred" if candidate else "define"),
-                 "updated_ts": ts, "hits": "0"}
-            p = write_lexicon(e, root_dir=_default_dir("lexicon", project))
+                 "source": source or prev.get("source")
+                 or ("inferred" if candidate else "define"),
+                 "updated_ts": ts, "hits": prev.get("hits") or "0"}
+            p = write_lexicon(e, path=path)
             pk.event("store.add", parts[0],
                      ("lexicon candidate — " if candidate else "lexicon — ") + parts[1])
             if candidate:
