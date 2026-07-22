@@ -13,6 +13,7 @@ import shutil
 import stat
 import tempfile
 import unittest
+from unittest import mock
 
 from helm import configs
 
@@ -198,6 +199,17 @@ class ConfigsModelInternalsTest(unittest.TestCase):
                              or ".venv" in h for h in hits))
         self.assertNotIn(os.path.realpath(deep), hits)
 
+    def test_tree_refuses_outside_and_symlink_scan_roots(self):
+        outside = os.path.join(self.tmp, "outside-tree")
+        self._write(os.path.join(outside, "CLAUDE.md"), "# unrelated\n")
+        denied = configs.tree(outside)
+        self.assertEqual(denied["code"], "refused")
+        self.assertEqual(denied["roots"], [])
+        alias = os.path.join(self.cwdroot, "tree-alias")
+        os.symlink(outside, alias)
+        denied = configs.tree(alias)
+        self.assertEqual(denied["code"], "refused")
+
     def test_project_files_at_includes_dir_entries_and_rules(self):
         proj = os.path.join(self.cwdroot, "p")
         self._write(os.path.join(proj, "CLAUDE.md"), "# p")
@@ -224,6 +236,192 @@ class ConfigsModelInternalsTest(unittest.TestCase):
         res = configs.write_file(p, "{}")
         self.assertNotIn("error", res)
         self.assertTrue(res["created_parent"])
+
+    # -- command/rule discovery + adversarial file shapes --------------------
+    def test_home_subdirs_are_enumerated_deduped_and_filtered(self):
+        command = self._write(os.path.join(self.home, "commands", "sp ace-☃.md"), "# hi\n")
+        rule = self._write(os.path.join(self.home, "rules", "owner.rules"), "allow\n", 0o400)
+        self._write(os.path.join(self.home, "commands", ".hidden.md"), "secret\n")
+        self._write(os.path.join(self.home, "commands", "state.json"), '{"token":"no"}')
+        outside = self._write(os.path.join(self.tmp, "outside.md"), "outside\n")
+        os.symlink(outside, os.path.join(self.home, "commands", "alias.md"))
+        os.mkfifo(os.path.join(self.home, "rules", "device.rules"))
+        alias = os.path.join(self.tmp, "home-alias")
+        os.symlink(self.home, alias)
+        rule_alias_home = os.path.join(self.tmp, "rule-alias-home")
+        os.makedirs(rule_alias_home)
+        os.symlink(os.path.join(self.home, "rules"), os.path.join(rule_alias_home, "rules"))
+        configs.HOME_ROOTS = [self.home, alias, rule_alias_home]
+
+        out = configs.homes_configs()
+        self.assertEqual(len(out), 1, out)
+        self.assertEqual(out[0]["path"], os.path.realpath(self.home))
+        self.assertIn("id", out[0])
+        rels = {f["rel"]: f for f in out[0]["files"]}
+        self.assertIn("commands/sp ace-☃.md", rels)
+        self.assertTrue(rels["commands/sp ace-☃.md"]["editable"])
+        self.assertIn("rules/owner.rules", rels)
+        self.assertFalse(rels["rules/owner.rules"]["editable"])
+        self.assertIn("owner read-only", rels["rules/owner.rules"]["reason"])
+        self.assertNotIn("commands/.hidden.md", rels)
+        self.assertNotIn("commands/state.json", rels)
+        self.assertNotIn("commands/alias.md", rels)
+        self.assertNotIn("rules/device.rules", rels)
+        self.assertEqual(rels["commands/sp ace-☃.md"]["path"], command)
+        self.assertEqual(rels["rules/owner.rules"]["path"], rule)
+
+    def test_non_utf8_large_symlink_directory_and_fifo_are_safe(self):
+        bad = os.path.join(self.home, "commands", "bad.md")
+        os.makedirs(os.path.dirname(bad), exist_ok=True)
+        with open(bad, "wb") as f:
+            f.write(b"\xff\xfe")
+        got = configs.read_file(bad)
+        self.assertEqual(got["code"], "encoding")
+        self.assertEqual(got["content"], "")
+
+        large = os.path.join(self.home, "commands", "large.md")
+        with open(large, "wb") as f:
+            f.truncate(configs._MAX_CONFIG_BYTES + 1)
+        _, editable, reason = configs.classify_path(large)
+        self.assertFalse(editable)
+        self.assertIn("size limit", reason)
+        self.assertEqual(configs.read_file(large)["code"], "too-large")
+
+        outside = self._write(os.path.join(self.tmp, "outside-secret.md"), "do not leak\n")
+        os.makedirs(os.path.join(self.home, "rules"), exist_ok=True)
+        link = os.path.join(self.home, "commands", "link.md")
+        os.symlink(outside, link)
+        for p in (link, os.path.join(self.home, "commands", "dir.md"),
+                  os.path.join(self.home, "rules", "pipe.rules")):
+            if p.endswith("dir.md"):
+                os.mkdir(p)
+            elif p.endswith("pipe.rules"):
+                os.mkfifo(p)
+            res = configs.write_file(p, "replacement\n")
+            self.assertEqual(res["code"], "refused", (p, res))
+        with open(outside) as f:
+            self.assertEqual(f.read(), "do not leak\n")
+
+    def test_parent_symlink_escape_is_denied_without_path_leak(self):
+        outside = os.path.join(self.tmp, "outside-home")
+        os.makedirs(os.path.join(outside, "commands"))
+        alias = os.path.join(self.home, "alias")
+        os.symlink(outside, alias)
+        p = os.path.join(alias, "commands", "escape.md")
+        res = configs.write_file(p, "x\n")
+        self.assertEqual(res["code"], "refused")
+        self.assertNotIn(p, res["error"])
+        denied = configs.read_file("/etc/unique-owner-secret")
+        self.assertEqual(denied["path"], "")
+        self.assertNotIn("/etc/unique-owner-secret", denied["error"])
+
+    def test_stale_deleted_renamed_and_replaced_files_conflict(self):
+        p = self._write(os.path.join(self.home, "commands", "race.md"), "one\n")
+        rev = configs.read_file(p)["revision"]
+        with open(p, "w") as f:
+            f.write("external\n")
+        res = configs.write_file(p, "mine\n", expected_revision=rev)
+        self.assertEqual(res["code"], "conflict")
+        with open(p) as f:
+            self.assertEqual(f.read(), "external\n")
+
+        rev = configs.read_file(p)["revision"]
+        renamed = p + ".old"
+        os.rename(p, renamed)
+        res = configs.write_file(p, "mine\n", expected_revision=rev)
+        self.assertEqual(res["code"], "conflict")
+        self.assertFalse(os.path.exists(p), "a stale save must not recreate a renamed file")
+        os.rename(renamed, p)
+
+        rev = configs.read_file(p)["revision"]
+        os.unlink(p)
+        res = configs.write_file(p, "mine\n", expected_revision=rev)
+        self.assertEqual(res["code"], "conflict")
+        self.assertFalse(os.path.exists(p), "a stale save must not recreate a deleted file")
+
+        d = os.path.join(self.home, "commands")
+        p = self._write(os.path.join(d, "parent-race.md"), "before\n")
+        rev = configs.read_file(p)["revision"]
+        moved = d + ".moved"
+        os.rename(d, moved)
+        res = configs.write_file(p, "mine\n", expected_revision=rev)
+        self.assertEqual(res["code"], "conflict")
+        self.assertFalse(os.path.exists(d), "a stale save must not recreate a renamed parent")
+
+    def test_write_preserves_bom_crlf_mode_and_ownership(self):
+        p = os.path.join(self.home, "commands", "windows.md")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(b"\xef\xbb\xbfline one\r\nline two\r\n")
+        os.chmod(p, 0o640)
+        before = os.stat(p)
+        got = configs.read_file(p)
+        self.assertEqual((got["encoding"], got["newline"]), ("utf-8-sig", "crlf"))
+        res = configs.write_file(p, "changed\nagain\n", expected_revision=got["revision"])
+        self.assertNotIn("error", res, res)
+        after = os.stat(p)
+        self.assertEqual(stat.S_IMODE(after.st_mode), 0o640)
+        self.assertEqual((after.st_uid, after.st_gid), (before.st_uid, before.st_gid))
+        with open(p, "rb") as f:
+            self.assertEqual(f.read(), b"\xef\xbb\xbfchanged\r\nagain\r\n")
+        second = configs.write_file(p, "second\n", expected_revision=res["revision"])
+        self.assertNotIn("error", second, second)
+        restored = configs.restore(res["backup"])
+        self.assertNotIn("error", restored, restored)
+        with open(p, "rb") as f:
+            self.assertEqual(f.read(), b"\xef\xbb\xbfline one\r\nline two\r\n")
+
+    def test_final_exchange_race_is_detected_and_external_file_wins(self):
+        p = self._write(os.path.join(self.home, "commands", "exchange.md"), "before\n")
+        got = configs.read_file(p)
+        real_rename = configs._renameat2
+        fired = False
+
+        def race(dfd, old, new, flags):
+            nonlocal fired
+            if flags == configs._RENAME_EXCHANGE and not fired:
+                fired = True
+                leaf = ".external-replacement"
+                fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dfd)
+                os.write(fd, b"external\n")
+                os.close(fd)
+                os.replace(leaf, new, src_dir_fd=dfd, dst_dir_fd=dfd)
+            return real_rename(dfd, old, new, flags)
+
+        with mock.patch.object(configs, "_renameat2", race):
+            res = configs.write_file(p, "mine\n", expected_revision=got["revision"])
+        self.assertEqual(res["code"], "conflict", res)
+        with open(p) as f:
+            self.assertEqual(f.read(), "external\n")
+
+    def test_post_exchange_fsync_failure_rolls_back(self):
+        p = self._write(os.path.join(self.home, "commands", "rollback.md"), "before\n")
+        got = configs.read_file(p)
+        real_rename, real_fsync = configs._renameat2, os.fsync
+        armed = failed = False
+        parent_id = (os.stat(os.path.dirname(p)).st_dev, os.stat(os.path.dirname(p)).st_ino)
+
+        def rename(dfd, old, new, flags):
+            nonlocal armed
+            out = real_rename(dfd, old, new, flags)
+            if flags == configs._RENAME_EXCHANGE and not armed:
+                armed = True
+            return out
+
+        def fsync(fd):
+            nonlocal failed
+            st = os.fstat(fd)
+            if armed and not failed and stat.S_ISDIR(st.st_mode) \
+                    and (st.st_dev, st.st_ino) == parent_id:
+                failed = True
+                raise OSError("injected durability failure")
+            return real_fsync(fd)
+
+        with mock.patch.object(configs, "_renameat2", rename), mock.patch("os.fsync", fsync):
+            res = configs.write_file(p, "mine\n", expected_revision=got["revision"])
+        self.assertEqual(res["code"], "durability", res)
+        with open(p) as f:
+            self.assertEqual(f.read(), "before\n")
 
     # -- entry_op edge shapes -------------------------------------------------
     def test_entry_op_rejects_non_object_root_and_bad_kinds(self):

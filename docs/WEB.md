@@ -55,7 +55,7 @@ Plain reads (no parameters):
 | `/api/whoami` | operator profile + notes summary |
 | `/api/sessions` | newest sessions across every harness, project-lensed |
 | `/api/configs` | the config-file list model (home/user scope + project tree) |
-| `/api/configs/homes` | config files grouped per credential home |
+| `/api/configs/homes` | config files grouped per credential home, including owner-authored `commands/*.md` and Codex `rules/*.rules` with symlink aliases deduplicated |
 | `/api/configs/backups` | the config-backup list, newest first |
 | `/api/skills` | the skills census, dupes-flagged, with real dir paths |
 | `/api/status` | quota provider presence + account counts |
@@ -87,8 +87,9 @@ Parameterized reads:
 
 ## POST endpoints
 
-All demand the bearer token; all return `400` with an `error` field on a bad
-request. These are the **only** mutations the browser can make:
+All demand the bearer token; bad requests return `400` with a class-only
+`error`/`code`, while a stale config save returns `409 conflict`. These are the
+**only** mutations the browser can make:
 
 | endpoint | payload | effect |
 |---|---|---|
@@ -97,7 +98,7 @@ request. These are the **only** mutations the browser can make:
 | `/api/homes` | `{"action": "create"\|"verify"\|"archive"\|"unarchive"\|"migrate", "name"/"provider"/"email": ...}` | credential-home lifecycle — directory moves only; logins stay human |
 | `/api/cwd` | `{"sid": ..., "cwd": <abs path or null>}` | re-home a session's cwd (metadata, never identity); `null` resets |
 | `/api/prune` | `{"sid": ..., "preset": "lean", "dry": true\|false, "tokens": N}` | derive a smaller still-resumable copy; the original is untouched |
-| `/api/configs/file` | `{"path": ..., "content": ...}` | save a recognized config file: backup → validate → atomic write |
+| `/api/configs/file` | `{"path": ..., "content": ..., "revision": ...}` | save the regular file revision the editor opened: validated backup, same-directory atomic exchange, fsync, conflict detection, rollback; symlinks/devices/escapes are refused |
 | `/api/configs/entry` | `{"action": ..., "path": ..., "kind": ..., "name": ..., "value": ...}` | structured entry op (add/remove an MCP server) — never hand-edits JSON |
 | `/api/configs/restore` | `{"backup": <backup path>}` | restore a backup over its origin (validated, re-backed-up first) |
 | `/api/chat` | `{"text": ..., "room": "main", "name": "david", "reply_to": <parent row id, optional>}` | the owner's chat post (`reply_to` threads it under that row and, when signed, binds the parent into the digest — it never changes who the message wakes): shortcodes expand, the digest rides a signed turn when the room node answers (server-side, as the server's `HELM_CELL_PROFILE`, default `david`), append to the RAM room + drop the `owner-unread` marker the shipped reflex fires on until an agent's `helm chat read` consumes it |

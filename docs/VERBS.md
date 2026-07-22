@@ -1036,12 +1036,16 @@ logged to `~/.cache/helm/keepalive-log.jsonl`; token values appear nowhere.
 
 ### `helm configs [list | show <path> | cascade <cwd> [--harness claude|codex] [--home DIR] | edit <path> | backups | restore <backup-path>]`
 The config model over every claude/codex home and project tree — MCPs, hooks,
-skills, rules, memory files, settings. `list` groups every discovered config
-file by scope; `show` prints one recognized file; `cascade` resolves what a
-seat launched at `<cwd>` actually loads. `edit` (new content on stdin) is the
-safety-first writer: backup → validate → atomic rename, recognized files under
-allowlisted roots only — a bad write must never brick an agent's launch.
-`restore` puts a backup back (validated, and re-backed-up first).
+skills, rules, memory files, settings, owner-authored `commands/*.md`, and
+Codex `rules/*.rules`. `list` groups every discovered config file by scope and
+deduplicates canonical symlink aliases; `show` prints one recognized regular
+file; `cascade` resolves what a seat launched at `<cwd>` actually loads. `edit`
+(new content on stdin) is the safety-first writer: validate + exact-byte backup,
+same-directory atomic exchange, file/directory fsync, concurrent-revision
+checks, and rollback, under allowlisted roots only. Symlinks, directories,
+devices, non-UTF-8 and oversized files are refused; existing encoding,
+newlines, mode and ownership are preserved. `restore` puts a backup back
+(validated, and re-backed-up first).
 
 ```console
 $ helm configs cascade ~/dev/myproject --harness claude

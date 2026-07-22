@@ -55,7 +55,7 @@ The pillars:
   page: your knowledge home, the quota chart + accounts table + credential
   homes, the full sessions browser (search inside transcripts, role-colored
   drawer, one-click resume, team tray), and the config-cascade editor
-  (backup → validate → atomic write, one-click restore).
+  (owner commands + rules included; conflict-safe atomic writes and restore).
 - **The lineage map** — projects fork, compose, supersede, and launch. helm's
   registry carries those edges and renders the family tree, including
   read-only external nodes, plus a ranked (read-only) "safe to archive and

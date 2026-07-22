@@ -2292,10 +2292,10 @@ async function cfgEdit(path) {
   $("#cfgBack").onclick = () => { CFG.sel && CFG.sel.type === "home" ? cfgSelectHome(CFG.sel.path) : cfgSelectCwd((CFG.sel && CFG.sel.path) || path.replace(/\/[^/]*$/, "")); };
   if (!ro) {
     $("#cfgSave").onclick = async () => {
-      const res = await cfgPost("/api/configs/file", {path: r.path, content: $("#cfgTA").value});
+      const res = await cfgPost("/api/configs/file", {path: r.path, content: $("#cfgTA").value, revision: r.revision});
       const m = $("#cfgSaveMsg");
       if (res.error) { m.innerHTML = '<span class="cfgro">' + esc(res.error) + '</span>'; }
-      else { m.textContent = `✓ ${res.note}${res.backup ? " · backup: " + res.backup : ""}`; toast("saved " + r.path); cfgLoadBackups(r.path); }
+      else { r.revision = res.revision; m.textContent = `✓ ${res.note}${res.backup ? " · backup: " + res.backup : ""}`; toast("saved " + r.path); cfgLoadBackups(r.path); }
     };
     if (isMcp) $("#cfgAddMcp").onclick = () => cfgAddMcp(r.path);
   }

@@ -101,8 +101,9 @@ class ConfigsModelTest(unittest.TestCase):
         with open(os.path.join(outside, "settings.json"), "w") as f:
             json.dump({"env": {"SECRET_NAME": "x"}}, f)
         r = configs.resolve(outside, _PROJ, "claude")
-        self.assertEqual(sorted(r), ["error"])
+        self.assertEqual(r["code"], "refused")
         self.assertIn("not a recognized cred home", r["error"])
+        self.assertNotIn(outside, r["error"])
         # the CLI surfaces the refusal as an error exit
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(
