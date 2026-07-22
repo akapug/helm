@@ -46,6 +46,19 @@
   @mention completion from the live roster, an unread divider and
   jump-to-latest.
 
+  Two defects found by adversarial re-verification and fixed in the same
+  slice: (1) a rotated-out parent could resolve to its **same-second twin** —
+  one seat posting twice inside a second shares `ts|from`, rotation drops the
+  oldest half, and the `(rts, rfrom)` fallback then quoted the wrong message
+  under the reply and hung a phantom `↩N` on an innocent row; the fallback now
+  fires only when there is no id to honor, in `chat.parent_of` AND the web
+  panel's `chatParent` (they must agree). (2) `helm chat verify` reported
+  `legacy` — the one never-alarming state — when a signed reply's recorded
+  payload was **stripped**, which was the cheapest re-parenting forgery
+  available; a signed row that is a reply and carries no payload is now
+  MISMATCH, because `reply_to` and the recorded payload shipped together and
+  the combination cannot occur honestly.
+
 - Stop-whisper slice 2 — the verify-grounding rungs: the contextual
   continuation ladder gains three signals read from record.py's own logs
   (one bounded read, fail-closed): a RED gate (a test-runner's latest run

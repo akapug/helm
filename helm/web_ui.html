@@ -2382,10 +2382,15 @@ function chatIndex(m) {           // both identities point at the same row
   if (!CHAT_BY_ID[k]) CHAT_BY_ID[k] = m;   // first writer wins a ts|from collision
 }
 
+/* mirrors chat.parent_of EXACTLY: the id wins, and the (rts|rfrom) fallback
+   fires ONLY when there is no id to honor. A named parent that is gone is an
+   ORPHAN — never its ts|from twin (one seat posting twice inside a second
+   shares that key, and rotation can drop one of the pair), because quoting the
+   twin puts the wrong words under the reply. */
 function chatParent(m) {
   if (m.react || !(m.reply_to || m.rts)) return null;
-  return CHAT_BY_ID[m.reply_to || ""] ||
-         CHAT_BY_ID[(m.rts || "") + "|" + (m.rfrom || "")] || null;
+  if (m.reply_to) return CHAT_BY_ID[m.reply_to] || null;
+  return CHAT_BY_ID[(m.rts || "") + "|" + (m.rfrom || "")] || null;
 }
 
 /* the one-level quote (builders.dev style — never nested): author + snippet,

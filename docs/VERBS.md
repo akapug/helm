@@ -1301,7 +1301,17 @@ re-derives each row's payload through the one shape dispatcher
 (`payload_for`) and compares it to the payload the signed row records —
 self-consistency (a hand-edited parent pointer or text is caught), *not*
 remote re-verification: the node still cannot disclose a turn's payload
-(`cell.verify_anchor` — "payload binding unavailable").
+(`cell.verify_anchor` — "payload binding unavailable"). Rows signed *before*
+that field existed report `legacy` (unverifiable, never a false alarm) — but
+a signed row that IS a reply and records no payload is a **MISMATCH**, not
+legacy: `reply_to` and the recorded payload shipped together, so deleting the
+payload to dodge the check is itself the tell.
+
+A reply names its parent by **row id**, so a parent that has rotated out is
+an orphan — never its `ts|from` twin. (One seat posting twice inside a second
+shares that key and rotation can split the pair; resolving the twin would
+quote words the author never wrote under the reply.) The `(rts, rfrom)`
+fallback fires only for a parent that never had an id at all.
 
 **Threading never changes who a message wakes.** `seats.deliverable()` reads
 text, `{dm}` and the room — never `reply_to` — so replying to a seat does

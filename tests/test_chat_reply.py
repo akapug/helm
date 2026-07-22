@@ -202,6 +202,31 @@ class ReplyDigestTest(ReplyBase):
             f.write("\n".join(lines))
         self.assertEqual(chat.verify()[3]["state"], "MISMATCH")
 
+    def test_stripping_the_payload_off_a_signed_reply_is_a_MISMATCH(self):
+        """The downgrade attack: `legacy` is the ONE state that never alarms,
+        so a forger's cheapest move is to delete the recorded payload and
+        re-parent freely. It cannot work — reply_to and {payload} shipped in
+        the same change, so a signed row that IS a reply and carries no
+        payload is forged by construction, never legacy."""
+        p1 = chat.post("parent one", who="alice")
+        p2 = chat.post("parent two", who="alice")
+        with mock.patch.object(chat, "_sign_send", return_value=(SENT, None)):
+            chat.post("signed reply", who="bob", profile="bob", sign=True,
+                      reply_to=p2["id"])
+        raw = os.path.join(chat.chat_dir(), "main.jsonl")
+        with open(raw, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        row = json.loads(lines[2])
+        row.pop("payload")                       # the downgrade
+        row.update(reply_to=p1["id"], rts=p1["ts"], rfrom=p1["from"])
+        lines[2] = json.dumps(row)
+        with open(raw, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        self.assertEqual(chat.verify()[2]["state"], "MISMATCH")
+        rc, _out, err = self.cli("verify")
+        self.assertEqual(rc, 1)                  # and the verb exits non-zero
+        self.assertIn("STRIPPED", err)
+
     def test_verify_calls_a_pre_payload_signed_row_legacy_not_broken(self):
         """Rows signed before the recorded-payload field are UNVERIFIABLE, not
         invalid — the honest state, never a false alarm."""
@@ -274,6 +299,47 @@ class ReplyRenderTest(ReplyBase):
         self.assertEqual(rc, 0)
         self.assertIn("(parent rotated out)", out)
         self.assertIn("child", out)
+
+    def test_a_rotated_parent_never_resolves_to_its_same_second_twin(self):
+        """MIS-ATTRIBUTION, the class rotation actually produces: one seat
+        posting twice inside a second shares ts|from, and rotation drops the
+        oldest half — which can split exactly that pair. The reply names its
+        parent by ID, so a gone parent is an ORPHAN, never the surviving twin
+        (quoting the twin would put words the author never wrote under the
+        reply, and hang a phantom ↩N on an innocent row)."""
+        a1 = chat.post("SECRET: approve the wire transfer", who="alice")
+        a2 = chat.post("lunch?", who="alice")
+        self.assertEqual(a1["ts"], a2["ts"])          # the precondition
+        chat.post("agreed, doing it", who="bob", reply_to=a1["id"])
+        raw = os.path.join(chat.chat_dir(), "main.jsonl")
+        with open(raw, encoding="utf-8") as f:
+            kept = f.read().split("\n")[1:]           # a1 rotates out
+        with open(raw, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept))
+        rows = self.rows()
+        idx = chat.index_rows(rows)
+        self.assertIsNone(chat.parent_of(rows[-1], idx))
+        self.assertEqual(chat.quote_of(rows[-1], idx),
+                         ("alice", "(parent rotated out)"))
+        self.assertEqual(idx["replies"], {})          # no phantom count
+        rc, out, _ = self.cli("read")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("lunch?\"", out)             # never quoted as parent
+        self.assertIn("(parent rotated out)", out)
+
+    def test_a_pre_id_parent_still_resolves_by_ts_and_from(self):
+        """The fallback the id-guard must NOT break: a parent with no id at
+        all is still reachable through (rts, rfrom)."""
+        chat._ensure_dir()
+        raw = os.path.join(chat.chat_dir(), "main.jsonl")
+        with open(raw, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "2026-07-01T00:00:00Z", "from": "old",
+                                "text": "ancient"}) + "\n")
+        r = chat.post("answering the ancestor", who="bob", reply_to="1")
+        idx = chat.index_rows(self.rows())
+        self.assertEqual(r["reply_to"], "")
+        self.assertIsNotNone(chat.parent_of(r, idx))
+        self.assertEqual(chat.quote_of(r, idx), ("old", "ancient"))
 
     def test_the_journal_keeps_the_thread(self):
         p = chat.post("parent", who="alice")

@@ -767,15 +767,25 @@ def index_rows(rows):
 def parent_of(m, idx):
     """The row `m` replies to, or None (never posted here / rotated out). The
     stable id wins; (rts, rfrom) is the fallback that reaches a parent from
-    BEFORE the id law — the same two-identity resolve reactions already do."""
+    BEFORE the id law — the same two-identity resolve reactions already do.
+
+    The fallback fires ONLY when there is no id to honor. A non-empty
+    reply_to NAMES one row (_parent_fields records "" exactly when the parent
+    had no id), so if that row is gone the parent is gone: resolving its
+    ts|from TWIN instead would quote a DIFFERENT message under the reply and
+    hang a phantom ↩N on an innocent row. That twin is real — one seat posting
+    twice inside a second shares ts|from, and rotation drops the oldest half,
+    which can split exactly such a pair (found adversarially 2026-07-22;
+    bug-class orphan-resolves-to-same-second-twin)."""
     if not is_reply(m):
         return None
     pid = m.get("reply_to")
-    p = idx["by_id"].get(pid) if pid else None
-    if p is None and m.get("rts"):
-        p = idx["by_key"].get("%s|%s" % (m.get("rts") or "",
-                                         m.get("rfrom") or ""))
-    return p
+    if pid:
+        return idx["by_id"].get(pid)
+    if m.get("rts"):
+        return idx["by_key"].get("%s|%s" % (m.get("rts") or "",
+                                            m.get("rfrom") or ""))
+    return None
 
 
 def _snip(text, cap=QUOTE_CHARS):
@@ -858,7 +868,12 @@ def verify(room="main"):
 
       ok        signed, and the row still recomputes to the payload it signed
       MISMATCH  signed, but the row NO LONGER recomputes — text or the parent
-                pointer was edited under the signature (naive re-parenting)
+                pointer was edited under the signature (naive re-parenting) —
+                OR the row is a signed REPLY carrying no payload at all, which
+                cannot be legacy: reply_to and the recorded {payload} shipped
+                in the SAME change, so signed+threaded+payload-less means the
+                payload was STRIPPED to dodge this check (bug-class
+                verify-downgrades-to-legacy-when-payload-stripped)
       legacy    signed before rows recorded their payload — nothing to compare
       unsigned  no chain receipt (the v1 path / no signer): nothing to verify
 
@@ -874,8 +889,8 @@ def verify(room="main"):
         want = payload_for(m)
         stored = m.get("payload")
         state = ("unsigned" if m.get("chain") is None else
-                 "legacy" if not stored else
-                 "ok" if stored == want else "MISMATCH")
+                 ("ok" if stored == want else "MISMATCH") if stored else
+                 "MISMATCH" if is_reply(m) else "legacy")
         out.append({"n": i, "from": m.get("from") or "?", "state": state,
                     "payload": want, "stored": stored,
                     "reply_to": m.get("reply_to")})
@@ -1164,7 +1179,9 @@ def cmd_chat(args):
              for s in ("ok", "MISMATCH", "legacy", "unsigned")}
         for r in bad:
             print("helm chat [%s] row %d (%s) MISMATCH: signed %s, recomputes "
-                  "%s%s" % (room, r["n"], r["from"], r["stored"], r["payload"],
+                  "%s%s" % (room, r["n"], r["from"],
+                            r["stored"] or "(no payload — STRIPPED from a "
+                            "signed reply)", r["payload"],
                             " — reply_to %s" % r["reply_to"]
                             if r["reply_to"] else ""), file=sys.stderr)
         print("helm chat [%s] verify: %d row%s — %d ok, %d mismatch, %d legacy "
