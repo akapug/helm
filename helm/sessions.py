@@ -94,33 +94,72 @@ def cred_homes():
     return out
 
 
+# How much a binding can be trusted, highest first. A binding may only ever be
+# OVERWRITTEN BY A STRICTLY BETTER SOURCE — the first version of this index had
+# no ranking, so the first guess to arrive won permanently and was consulted
+# ahead of the live signal that would have corrected it. A cache that can freeze
+# a guess forever and then shadow the truth is worse than no cache.
+AUTHORITY = {"environ": 3, "pidrecord": 2, "session-env": 1}
+
+
 def _bindings():
-    """The durable sid -> credhome index helm owns. Plain TSV because this is
-    append-mostly, read-hot, and must stay repairable by eye."""
+    """{sid: (home, source)}. Plain TSV because this is append-mostly, read-hot,
+    and must stay repairable by eye. Later rows win only if better-sourced."""
     out = {}
     try:
         with open(BINDINGS) as f:
             for line in f:
-                sid, _, home = line.rstrip("\n").partition("\t")
-                if sid and home:
-                    out[sid] = home
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2 or not parts[0] or not parts[1]:
+                    continue
+                sid, home = parts[0], parts[1]
+                src = parts[2] if len(parts) > 2 else "session-env"
+                prev = out.get(sid)
+                if prev is None or AUTHORITY.get(src, 0) >= AUTHORITY.get(prev[1], 0):
+                    out[sid] = (home, src)
     except OSError:
         pass
     return out
 
 
-def record_binding(sid, home):
-    """Freeze a sid -> credhome binding permanently. Best-effort by design: a
-    failure here must never break the read that triggered it."""
-    if not sid or not home or _bindings().get(sid) == home:
+def record_binding(sid, home, source="session-env"):
+    """Freeze a sid -> credhome binding. Best-effort by design: a failure here
+    must never break the read that triggered it. A weaker source never
+    overwrites a stronger one, and an identical row is not rewritten."""
+    if not sid or not home:
+        return False
+    prev = _bindings().get(sid)
+    if prev and (prev == (home, source)
+                 or AUTHORITY.get(source, 0) < AUTHORITY.get(prev[1], 0)):
         return False
     try:
         os.makedirs(os.path.dirname(BINDINGS), exist_ok=True)
         with open(BINDINGS, "a") as f:
-            f.write("%s\t%s\n" % (sid, home))
+            f.write("%s\t%s\t%s\n" % (sid, home, source))
         return True
     except OSError:
         return False
+
+
+def proc_home(pid):
+    """The home a LIVE pane is ACTUALLY using, read from its own environment.
+
+    This is ground truth and needs no inference: CLAUDE_CONFIG_DIR is fixed at
+    exec and /proc/<pid>/environ reports exactly what the process got. Its
+    ABSENCE is equally decisive — it means the pane runs on the default home.
+    Every other rung here is archaeology by comparison, and skipping this one is
+    how a live pane whose account is stated outright got attributed by guesswork
+    instead."""
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as f:
+            env = f.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        return None
+    for kv in env:
+        if kv.startswith("CLAUDE_CONFIG_DIR="):
+            val = kv.split("=", 1)[1]
+            return os.path.realpath(val) if val else None
+    return os.path.realpath(os.path.expanduser(DEFAULT_HOME))
 
 
 def latch_live():
@@ -142,8 +181,13 @@ def latch_live():
                     rec = json.load(f)
             except (OSError, ValueError):
                 continue
-            if record_binding(rec.get("sessionId"), home):
+            if record_binding(rec.get("sessionId"), home, "pidrecord"):
                 n += 1
+    # the strongest rung last so it OVERWRITES anything weaker already recorded
+    for sid, pid in live_sids().items():
+        h = proc_home(pid)
+        if h and record_binding(sid, h, "environ"):
+            n += 1
     return n
 
 
@@ -169,6 +213,30 @@ def live_sids():
                 continue
             if pid and rec.get("sessionId") and os.path.isdir("/proc/%d" % pid):
                 out[rec["sessionId"]] = pid
+    # SECOND RUNG, different failure mode. The pid-keyed record is the better
+    # signal but it is not universal: panes launched by a claude older than the
+    # feature never write one, and those are precisely the longest-running panes
+    # — the ones most likely to still be open and most overdue for a relaunch.
+    # A guard whose only rung is the record is therefore blindest exactly where
+    # a double-open is most likely. argv carries `--resume <sid>` for any pane
+    # started that way, so it covers the gap without depending on the same file.
+    for entry in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            with open(entry, "rb") as f:
+                argv = f.read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        if not argv or not argv[0].endswith("claude"):
+            continue
+        for flag in ("--resume", "-r"):
+            if flag in argv:
+                i = argv.index(flag)
+                if i + 1 < len(argv) and argv[i + 1] and argv[i + 1] not in out:
+                    try:
+                        out[argv[i + 1]] = int(entry.split("/")[2])
+                    except (ValueError, IndexError):
+                        pass
+                break
     return out
 
 
@@ -193,23 +261,39 @@ def credhome_for(sid, latch=True):
     ~/.claude is consulted LAST and only as a fallback: it accumulates entries
     for sessions that also belong to a named home, so preferring it would
     mis-attribute a named-home session to the default account."""
+    # RUNG 0 — a live pane STATES its home; never infer what you can read.
+    pid = live_sids().get(sid)
+    if pid is not None:
+        h = proc_home(pid)
+        if h and os.path.isdir(h):
+            if latch:
+                record_binding(sid, h, "environ")
+            return h
     latched = _bindings().get(sid)
-    if latched and os.path.isdir(latched):
-        return latched
-    fallback = None
+    if latched and os.path.isdir(latched[0]):
+        return latched[0]
+    # RUNG 2 — session-env, and it is NOT EXCLUSIVE. Measured live: one sid was
+    # claimed by THREE homes (a default-home pane also had entries under two
+    # named homes, written a day later). Returning the first non-default hit made
+    # the answer depend on listdir ORDER, and it picked a home the pane had never
+    # run on. The creating home is the one whose entry is OLDEST — it was written
+    # when the session began — so rank by mtime instead of by iteration order.
     default_home = os.path.realpath(os.path.expanduser(DEFAULT_HOME))
-    found = None
+    claims = []
     for home in cred_homes():
-        if not os.path.exists(os.path.join(home, "session-env", sid)):
+        entry = os.path.join(home, "session-env", sid)
+        try:
+            claims.append((os.path.getmtime(entry), home))
+        except OSError:
             continue
-        if home == default_home:
-            fallback = home
-        else:
-            found = home
-            break
+    if not claims:
+        return None
+    claims.sort()
+    found = claims[0][1]
+    fallback = default_home if any(h == default_home for _, h in claims) else None
     found = found or fallback
     if found and latch:
-        record_binding(sid, found)
+        record_binding(sid, found, "session-env")
     return found
 
 

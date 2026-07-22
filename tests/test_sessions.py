@@ -289,15 +289,50 @@ class CredHomeTest(unittest.TestCase):
         self.assertEqual(sorted(os.path.basename(g) for g in reals),
                          ["acct-one-com", "acct-two-com"])
 
-    def test_named_home_beats_the_default_catch_all(self):
-        # ~/.claude accumulates entries for sessions owned by a named home;
-        # preferring it would mis-attribute them to the default account
-        self._env("acct-one-com", "sid-b")
-        open(os.path.join(self.tmp, ".claude", "session-env", "sid-b"), "w").close()
-        self.assertTrue(sessions.credhome_for("sid-b").endswith("acct-one-com"))
+    def test_oldest_claim_wins_when_several_homes_claim_one_session(self):
+        # MEASURED LIVE: session-env is NOT exclusive — one sid was claimed by
+        # THREE homes, and returning the first non-default hit made the answer
+        # depend on listdir ORDER, picking a home the pane had never run on.
+        # The creating home is the one whose entry is OLDEST.
+        import time as _t
+        truth = os.path.join(self.tmp, ".claude", "session-env", "sid-b")
+        open(truth, "w").close()
+        os.utime(truth, (1_000_000, 1_000_000))
+        for h in ("acct-one-com", "acct-two-com"):
+            self._env(h, "sid-b")           # written LATER than the real owner
+            os.utime(os.path.join(self.homes, h, "session-env", "sid-b"),
+                     (2_000_000, 2_000_000))
+        self.assertTrue(sessions.credhome_for("sid-b").endswith(".claude"))
+
+    def test_a_live_pane_states_its_own_home(self):
+        # rung 0: CLAUDE_CONFIG_DIR is fixed at exec, so /proc/<pid>/environ is
+        # ground truth and must beat every archaeological signal — including a
+        # already-latched wrong answer
+        want = os.path.join(self.homes, "acct-two-com")
+        self._env("acct-one-com", "sid-live2")          # a WRONG weaker claim
+        sessions.record_binding("sid-live2", os.path.join(self.homes, "acct-one-com"),
+                                "session-env")
+        with mock.patch.object(sessions, "live_sids", return_value={"sid-live2": 99}), \
+             mock.patch.object(sessions, "proc_home", return_value=want):
+            self.assertEqual(sessions.credhome_for("sid-live2"), want)
+
+    def test_a_weaker_source_never_overwrites_a_stronger_one(self):
+        strong = os.path.join(self.homes, "acct-two-com")
+        weak = os.path.join(self.homes, "acct-one-com")
+        self.assertTrue(sessions.record_binding("s1", strong, "environ"))
+        self.assertFalse(sessions.record_binding("s1", weak, "session-env"))
+        self.assertEqual(sessions._bindings()["s1"], (strong, "environ"))
+
+    def test_a_stronger_source_corrects_a_frozen_guess(self):
+        weak = os.path.join(self.homes, "acct-one-com")
+        strong = os.path.join(self.homes, "acct-two-com")
+        self.assertTrue(sessions.record_binding("s2", weak, "session-env"))
+        self.assertTrue(sessions.record_binding("s2", strong, "environ"))
+        self.assertEqual(sessions._bindings()["s2"], (strong, "environ"))
 
     def test_lookup_latches_so_the_answer_survives_pruning(self):
         self._env("acct-one-com", "sid-c")
+        # no live pane for this sid — rung 0 must not shortcut the test
         self.assertTrue(sessions.credhome_for("sid-c").endswith("acct-one-com"))
         os.remove(os.path.join(self.homes, "acct-one-com", "session-env", "sid-c"))
         # session-env is gone (claude prunes it); the frozen binding still answers
@@ -308,9 +343,10 @@ class CredHomeTest(unittest.TestCase):
         rec = {"pid": 4242, "sessionId": "sid-live"}
         with open(os.path.join(self.homes, "acct-two-com", "sessions", "4242.json"), "w") as f:
             json.dump(rec, f)
-        self.assertEqual(sessions.latch_live(), 1)
-        self.assertTrue(sessions.credhome_for("sid-live").endswith("acct-two-com"))
-        self.assertEqual(sessions.latch_live(), 0)   # idempotent, no duplicate rows
+        with mock.patch.object(sessions, "live_sids", return_value={}):
+            self.assertEqual(sessions.latch_live(), 1)
+            self.assertTrue(sessions.credhome_for("sid-live").endswith("acct-two-com"))
+            self.assertEqual(sessions.latch_live(), 0)  # idempotent, no dup rows
 
     def test_binding_write_failure_never_breaks_the_read(self):
         self._env("acct-one-com", "sid-d")
