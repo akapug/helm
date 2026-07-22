@@ -106,9 +106,29 @@ class ScanTest(SessionBase):
         self.assertEqual(session.open_pids("deadbeef-memory-only"), [622078])
         self.assertEqual(session.open_pids("nosuch"), [])
 
-    def test_memory_only_panes_excludes_forced_and_unstamped(self):
-        mo = session.memory_only_panes()
+    def test_memory_only_panes_uses_transcript_truth_not_env(self):
+        # Both stamped and unstamped panes with transcripts are persisting;
+        # deadbeef has none and is the only at-risk row.
+        with mock.patch.object(session, "_persisting_sids", return_value={
+                "aaaa1111-integrator": "/x/a.jsonl",
+                "cccc2222-rescued": "/x/c.jsonl"}):
+            mo = session.memory_only_panes()
         self.assertEqual([r["pid"] for r in mo], [622078])
+
+        # The dangerous inverse: a top-level pane without a transcript is also
+        # memory-only; FORCE/stamp state never asserts persistence by itself.
+        with mock.patch.object(session, "_persisting_sids", return_value={
+                "cccc2222-rescued": "/x/c.jsonl"}):
+            mo = session.memory_only_panes()
+        self.assertEqual([r["pid"] for r in mo], [57699, 622078])
+
+        # A stamped-without-FORCE pane that has a transcript is persisting (the
+        # capcom case); the old env heuristic falsely included it.
+        with mock.patch.object(session, "_persisting_sids", return_value={
+                "deadbeef-memory-only": "/x/d.jsonl",
+                "cccc2222-rescued": "/x/c.jsonl"}):
+            mo = session.memory_only_panes()
+        self.assertEqual([r["pid"] for r in mo], [57699])
 
     def test_ls_persistence_is_transcript_truth_not_env(self):
         # persistence is decided by the on-disk transcript, NOT the env stamp

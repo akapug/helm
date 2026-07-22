@@ -247,19 +247,14 @@ def open_pids(sid):
 
 
 def memory_only_panes():
-    """Live interactive panes running persistence-OFF: stamped child WITHOUT
-    the FORCE override. These are the sessions a death would lose.
-
-    KNOWN OVER-REPORT (measured 2026-07-22, fix routed — do not trust this list
-    as-is): the env stamp is an INPUT to the persistence decision at launch, not
-    a REPORT of what is happening. Session 85935aed read stamped-without-FORCE
-    while writing an 80MB transcript that was still growing; 2 of 6 panes this
-    flagged were persisting fine. The ground truth is whether a transcript for
-    the sid EXISTS on disk (existence, not freshness — an idle-but-persisted
-    session is not at risk). Corroborating here needs sid attribution the
-    /proc scan often cannot resolve (several rows carry no session), which is
-    why this is a routed fix rather than a one-liner."""
-    return [r for r in _proc_claude_rows() if r["child"] and not r["force"]]
+    """Resolved live panes with NO transcript on disk. Transcript existence is
+    persistence truth; child/FORCE explain launch inputs but never override the
+    observed artifact. Unresolved panes remain UNKNOWN rather than false-alarm
+    memory-only rows."""
+    persisting = _persisting_sids()
+    return [r for r in _proc_claude_rows()
+            if (r.get("session") or r.get("resume"))
+            and not _sid_on_disk(r.get("session") or r.get("resume"), persisting)]
 
 
 # ---------------------------------------------------------------------------
@@ -359,19 +354,20 @@ def _persisting_sids():
     return out
 
 
+def _sid_on_disk(sid, persisting):
+    if not sid:
+        return False
+    if sid in persisting:
+        return True
+    return any(k.startswith(sid) or sid.startswith(k) for k in persisting)
+
+
 def cmd_ls(args):
     """session ls — sessions + a PERSISTENCE column: live panes cross-joined
     with their stamp AND the on-disk transcript, flagging genuinely memory-only
     panes (stamped, no transcript) and double-opens."""
     rows = _proc_claude_rows()
     persisting = _persisting_sids()
-
-    def _on_disk(sid):
-        if not sid:
-            return False
-        if sid in persisting:
-            return True
-        return any(k.startswith(sid) or sid.startswith(k) for k in persisting)
 
     # Persistence is decided by the TRANSCRIPT ON DISK, for EVERY pane — a
     # top-level session with no transcript is at-risk just as much as a stamped
@@ -383,7 +379,7 @@ def cmd_ls(args):
     # at-risk count is only panes we RESOLVED and found transcript-less.
     mo = [r for r in rows
           if (r.get("session") or r.get("resume"))
-          and not _on_disk(r.get("session") or r.get("resume"))]
+          and not _sid_on_disk(r.get("session") or r.get("resume"), persisting)]
     live = live_sids(rows)
     dbl = {s: ps for s, ps in live.items() if len(ps) > 1}
     print("helm session ls — %d live claude panes" % len(rows))
@@ -392,7 +388,7 @@ def cmd_ls(args):
         why = (" (rescued)" if r["force"] else " (stamped)" if r["child"] else "")
         if not sid:
             state = "UNKNOWN (sid unresolved — verify by hand)" + why
-        elif _on_disk(sid):
+        elif _sid_on_disk(sid, persisting):
             state = "persisted" + why
         elif r["child"] and not r["force"]:
             state = "MEMORY-ONLY (stamped, no FORCE)"
