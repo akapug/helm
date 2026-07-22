@@ -43,7 +43,9 @@ import glob
 import hashlib
 import json
 import os
+import stat
 import sys
+import tempfile
 import time
 
 from . import homes
@@ -57,6 +59,7 @@ TS_FMT = "%Y%m%dT%H%M%SZ"
 # account survive a new write, older ones are dropped (a rotated refresh token
 # is dead anyway — the RECOVERABLE pre-image is always the newest).
 KEEP = 20
+PROC_ROOT = "/proc"                 # module-level so tests can use a fixture tree
 
 # The pre-login guard as hook specs (hooks.py shape). SessionStart alone is NOT
 # enough: a live session refreshes its OWN token, and the grant ROTATES the
@@ -70,11 +73,11 @@ KEEP = 20
 # behind the token the next `/login` is about to destroy.
 GUARD_SPECS = (
     {"name": "cred-guard", "event": "SessionStart",
-     "args": "cred backup --quiet", "timeout": 5,
-     "own": ("cred backup --quiet", "helm cred backup"), "matcher": "*"},
+     "args": "cred backup --apply --quiet", "timeout": 5,
+     "own": ("cred backup --apply --quiet", "helm cred backup"), "matcher": "*"},
     {"name": "cred-guard-turn", "event": "Stop",
-     "args": "cred backup --quiet", "timeout": 5,
-     "own": ("cred backup --quiet", "helm cred backup"), "matcher": None},
+     "args": "cred backup --apply --quiet", "timeout": 5,
+     "own": ("cred backup --apply --quiet", "helm cred backup"), "matcher": None},
 )
 GUARD_SPEC = GUARD_SPECS[0]      # the name the SessionStart-only callers know
 
@@ -95,23 +98,65 @@ def cache_clear():
 
 
 def _stat_key(path):
+    """Identity key for a PLAIN regular file. Symlinks are not credential
+    files: following one would let a home escape its boundary between the stat
+    and read."""
     try:
-        st = os.stat(path)
+        st = os.lstat(path)
     except OSError:
         return None
-    return (st.st_mtime_ns, st.st_size, st.st_ino)
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_dev)
+
+
+def _read_regular(path):
+    """(bytes, mode) from one non-symlink regular file. The descriptor is the
+    object checked, closing the lstat/open swap window."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            return fh.read(), stat.S_IMODE(st.st_mode)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _json_bytes(blob):
+    try:
+        return json.loads(blob.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return None
 
 
 def _read_json(path):
     try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
+        blob, _ = _read_regular(path)
+    except OSError:
         return None
+    return _json_bytes(blob)
 
 
 def _str_or_none(v):
     return v if isinstance(v, str) and v else None
+
+
+def _email_or_none(v):
+    """Normalized account identity. Control characters and path-empty folds
+    are refused: identity is displayed and also selects a backup directory."""
+    if not isinstance(v, str):
+        return None
+    email = v.strip().lower()
+    if (not email or email.count("@") != 1 or "." not in email.rsplit("@", 1)[1]
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in email)
+            or not homes.canonical_name(email)):
+        return None
+    return email
 
 
 def _read_account(real):
@@ -130,9 +175,9 @@ def _read_account(real):
     if not isinstance(oa, dict):
         out["error"] = "no oauthAccount block (never logged in here?)"
         return out
-    email = _str_or_none(oa.get("emailAddress"))
+    email = _email_or_none(oa.get("emailAddress"))
     if not email:
-        out["error"] = "oauthAccount carries no emailAddress"
+        out["error"] = "oauthAccount carries no valid emailAddress"
         return out
     out.update(email=email, ok=True, uuid=_str_or_none(oa.get("accountUuid")),
                org=_str_or_none(oa.get("organizationName")))
@@ -246,11 +291,11 @@ def _snapshots_in(d):
             continue
         meta = _read_json(os.path.join(p, "meta.json")) or {}
         out.append({"path": p, "ts": os.path.basename(p),
-                    "account": meta.get("account"),
+                    "account": _email_or_none(meta.get("account")),
                     "source_name": meta.get("source_name"),
                     "source_home": meta.get("source_home"),
                     "digest": meta.get("digest"),
-                    "has_creds": os.path.exists(os.path.join(p, "credentials.json"))})
+                    "has_creds": _stat_key(os.path.join(p, "credentials.json")) is not None})
     return out
 
 
@@ -266,9 +311,12 @@ def snapshots_for_home_name(name):
 
 
 def _secure_dir(path):
-    """0700 explicitly — makedirs' mode is umask-masked."""
+    """Create/verify one plain 0700 directory. Never chmod through a symlink."""
     os.makedirs(path, mode=0o700, exist_ok=True)
-    os.chmod(path, 0o700)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        raise OSError("backup directory is not a plain directory")
+    os.chmod(path, 0o700, follow_symlinks=False)
 
 
 def _write_private(path, data):
@@ -276,6 +324,8 @@ def _write_private(path, data):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as fh:
         fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def _unlink(path):
@@ -286,33 +336,39 @@ def _unlink(path):
 
 
 def _stage_private(path, data, mode=0o600):
-    """Write `data` into a sibling temp (owner-only from creation) and return
-    the temp path — the caller commits it with os.replace. STAGING IS THE
-    FALLIBLE HALF: disk-full, quota and permission all land here, before any
-    live file has been touched, so a multi-file write can stage everything and
-    only then commit."""
-    tmp = "%s.helm-tmp.%d" % (path, os.getpid())
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-    except FileExistsError:
-        # the name is OURS by pid, so an existing one is a leftover from a
-        # crashed run (or a recycled pid) — never a live file. Clear it once;
-        # a second EEXIST is a real problem and propagates.
-        _unlink(tmp)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    """Durably stage `data` in the destination directory. tempfile's random
+    O_EXCL name avoids PID-reuse/concurrent-call collisions; bytes land while
+    the fd is 0600, then the requested final mode is set before commit."""
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".helm-tmp.",
+                               dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "wb") as fh:
+            fd = -1
             fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+            os.fchmod(fh.fileno(), mode)
     except OSError:
+        if fd >= 0:
+            os.close(fd)
         _unlink(tmp)
         raise
     return tmp
+
+
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _atomic_private(path, data, mode=0o600):
     tmp = _stage_private(path, data, mode)
     try:
         os.replace(tmp, path)
+        _fsync_dir(os.path.dirname(path))
     except OSError:
         _unlink(tmp)
         raise
@@ -352,64 +408,95 @@ def _identical(snapshot, blob, oa):
     """Byte-identical creds AND the same identity block — the idempotence
     test, done on content (never on a timestamp)."""
     try:
-        with open(os.path.join(snapshot["path"], "credentials.json"), "rb") as fh:
-            if fh.read() != blob:
-                return False
+        old, _ = _read_regular(os.path.join(snapshot["path"], "credentials.json"))
     except OSError:
         return False
-    return (_read_json(os.path.join(snapshot["path"], "account.json")) or {}) == oa
+    return old == blob and (_read_json(
+        os.path.join(snapshot["path"], "account.json")) or {}) == oa
 
 
-def backup(config_dir):
-    """Snapshot one home's credentials + identity block. Fail-closed: a home
-    whose account cannot be read is REPORTED and skipped, never filed under a
-    guessed name. -> {ok, action: backup|skip, account, dest, reason}."""
+def _capture_home(real):
+    """Stable credential + identity pre-image, or a secret-free reason. Both
+    files are read through checked descriptors and their inode/stat keys are
+    bracketed; a concurrent /login can therefore make capture REFUSE, never
+    file one account's tokens under another account's identity."""
+    cfg, auth = os.path.join(real, ACCOUNT_JSON), os.path.join(real, AUTH_JSON)
+    for _ in range(2):
+        before = (_stat_key(cfg), _stat_key(auth))
+        if before[0] is None:
+            return None, "%s absent, unreadable, or not a regular file" % ACCOUNT_JSON
+        if before[1] is None:
+            return None, "%s absent, unreadable, or not a regular file" % AUTH_JSON
+        try:
+            cfg_blob, _ = _read_regular(cfg)
+            blob, _ = _read_regular(auth)
+        except OSError as e:
+            return None, "credential pre-image unreadable (%s)" % e.__class__.__name__
+        if before != (_stat_key(cfg), _stat_key(auth)):
+            continue
+        doc = _json_bytes(cfg_blob)
+        if not isinstance(doc, dict):
+            return None, "%s unreadable or not an object" % ACCOUNT_JSON
+        oa = doc.get("oauthAccount")
+        if not isinstance(oa, dict):
+            return None, "no oauthAccount block (never logged in here?)"
+        email = _email_or_none(oa.get("emailAddress"))
+        if not email:
+            return None, "oauthAccount carries no valid emailAddress"
+        oa = dict(oa, emailAddress=email)
+        return {"blob": blob, "oa": oa, "email": email,
+                "uuid": _str_or_none(oa.get("accountUuid")),
+                "org": _str_or_none(oa.get("organizationName"))}, None
+    return None, "credential files changed during pre-image capture"
+
+
+def backup(config_dir, apply=False):
+    """Plan or snapshot one home's credentials + identity block. DRY-RUN is
+    the default; apply=True is the only path that creates directories/files.
+    Fail-closed: identity is captured from the same stable file pair as the
+    secret bytes, never guessed from a directory name."""
     real = os.path.realpath(os.path.expanduser(config_dir or ""))
     name = os.path.basename(real)
-    acct = account_of(real)
-    if not acct["ok"]:
+    cap, reason = _capture_home(real)
+    if cap is None:
         return {"ok": False, "action": "skip", "home": real, "name": name,
-                "account": None, "reason": acct["error"]}
-    try:
-        with open(os.path.join(real, AUTH_JSON), "rb") as fh:
-            blob = fh.read()
-    except OSError as e:
-        return {"ok": False, "action": "skip", "home": real, "name": name,
-                "account": acct["email"],
-                "reason": "no readable %s (%s)" % (AUTH_JSON, e.__class__.__name__)}
-    oa = oauth_block(real)
-    snaps = snapshots(acct["email"])
+                "account": None, "reason": reason}
+    blob, oa, email = cap["blob"], cap["oa"], cap["email"]
+    snaps = snapshots(email)
     if snaps and _identical(snaps[-1], blob, oa):
         return {"ok": True, "action": "skip", "home": real, "name": name,
-                "account": acct["email"], "dest": snaps[-1]["path"],
+                "account": email, "dest": snaps[-1]["path"],
                 "reason": "identical snapshot already exists"}
-    digest = hashlib.sha256(blob).hexdigest()[:12]   # fingerprint only, never the bytes
+    digest = hashlib.sha256(blob).hexdigest()[:12]
+    if not apply:
+        return {"ok": True, "action": "would-backup", "home": real, "name": name,
+                "account": email, "digest": digest,
+                "reason": "snapshot would be written; add --apply"}
     dest = None
     try:
         _secure_dir(backup_root())
-        _secure_dir(account_dir(acct["email"]))
-        dest = _claim_snapshot_dir(account_dir(acct["email"]))   # ours alone
+        _secure_dir(account_dir(email))
+        dest = _claim_snapshot_dir(account_dir(email))
         _write_private(os.path.join(dest, "credentials.json"), blob)
         _write_private(os.path.join(dest, "account.json"),
                        json.dumps(oa, indent=2, sort_keys=True).encode())
         _write_private(os.path.join(dest, "meta.json"), json.dumps({
-            "account": acct["email"], "uuid": acct["uuid"], "org": acct["org"],
+            "account": email, "uuid": cap["uuid"], "org": cap["org"],
             "source_home": real, "source_name": name, "digest": digest,
             "bytes": len(blob), "ts": os.path.basename(dest),
             "note": "digest is a sha256 PREFIX (content fingerprint); token bytes "
                     "live only in credentials.json, 0600, never printed",
         }, indent=2).encode())
+        _fsync_dir(dest)
+        _fsync_dir(account_dir(email))
     except OSError as e:
-        # a failed snapshot is REPORTED, never raised: callers on the mutating
-        # paths (keepalive's rotation) must not be blocked by a full disk —
-        # an unrotated token family is the worse outcome.
-        _drop(dest)                       # no half-snapshot survives to be restored
+        _drop(dest)
         return {"ok": False, "action": "skip", "home": real, "name": name,
-                "account": acct["email"],
+                "account": email,
                 "reason": "snapshot write failed (%s)" % e.__class__.__name__}
-    pruned = _prune(acct["email"])
+    pruned = _prune(email)
     return {"ok": True, "action": "backup", "home": real, "name": name,
-            "account": acct["email"], "dest": dest, "digest": digest,
+            "account": email, "dest": dest, "digest": digest,
             "pruned": pruned}
 
 
@@ -435,119 +522,194 @@ def _prune(email, keep=KEEP):
             if _drop(s["path"])]
 
 
-def backup_all():
-    return [backup(r["real"]) for r in rows() if r["authed"]]
+def backup_all(apply=False):
+    return [backup(r["real"], apply=apply) for r in rows() if r["authed"]]
 
 
-def restore(snapshot_path, config_dir):
-    """Put a snapshot back: credentials bytes (0600) AND the oauthAccount block
-    (so the home's identity stops lying). Everything else in .claude.json
-    survives byte-for-byte.
+def _pre_image(path):
+    """Exact file pre-image. Absence is distinct from an unreadable/symlink
+    file; only true ENOENT may later roll back by deletion."""
+    try:
+        blob, mode = _read_regular(path)
+        return {"exists": True, "blob": blob, "mode": mode}, None
+    except FileNotFoundError:
+        return {"exists": False, "blob": None, "mode": None}, None
+    except OSError as e:
+        return None, "pre-image unreadable (%s)" % e.__class__.__name__
 
-    ALL-OR-NOTHING across the TWO files. A home holding one account's tokens
-    under another account's identity block is exactly the state this module
-    exists to abolish, so: both files are STAGED before either is committed
-    (staging is where disk-full lands), and if the second commit somehow fails
-    the credentials file is put back the way it was. A partial restore never
-    survives this function.
 
-    It also REFUSES rather than clobbering an unparseable-but-present
-    .claude.json — that file holds the whole home's state (projects, MCP
-    servers, history) and rewriting it from {} would silently destroy it
-    (hooks.install_home's law, applied to the config the same way).
-    -> {ok, account, error}."""
+def _rollback_files(pre):
+    """Restore exact bytes, modes, and original absence after a failed commit."""
+    staged = []
+    try:
+        for path, image in pre.items():
+            if image["exists"]:
+                staged.append((path, _stage_private(
+                    path, image["blob"], image["mode"])))
+        for path, image in reversed(list(pre.items())):
+            if image["exists"]:
+                tmp = next(t for p, t in staged if p == path)
+                os.replace(tmp, path)
+            elif os.path.lexists(path):
+                os.unlink(path)
+        _fsync_dir(os.path.dirname(next(iter(pre))))
+        return True
+    except OSError:
+        return False
+    finally:
+        for _, tmp in staged:
+            _unlink(tmp)
+
+
+def _snapshot_files(snapshot_path):
+    """Checked snapshot payload. The snapshot itself and both files must be
+    plain objects under the configured backup root; symlinks never restore."""
+    root = os.path.realpath(backup_root())
+    snap = os.path.realpath(os.path.expanduser(snapshot_path))
+    try:
+        if os.path.commonpath((root, snap)) != root:
+            return None, None, "snapshot is outside the backup root"
+        st = os.lstat(snapshot_path)
+        if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            return None, None, "snapshot is not a plain directory"
+        blob, _ = _read_regular(os.path.join(snap, "credentials.json"))
+        account_blob, _ = _read_regular(os.path.join(snap, "account.json"))
+    except (OSError, ValueError) as e:
+        return None, None, "snapshot unreadable (%s)" % e.__class__.__name__
+    oa = _json_bytes(account_blob)
+    email = _email_or_none(oa.get("emailAddress")) if isinstance(oa, dict) else None
+    if not email:
+        return None, None, "snapshot has no valid identity block — refusing"
+    return blob, dict(oa, emailAddress=email), None
+
+
+def restore(snapshot_path, config_dir, require_free=False):
+    """Put a snapshot back transactionally. Credentials are byte-exact; the
+    oauthAccount block is merged into the home's current .claude.json while all
+    unrelated keys survive. Both outputs are 0600 and durably staged. Any
+    staging/replace/fsync failure restores exact original bytes, modes, and
+    absence for BOTH files.
+
+    require_free=True brackets the final commit with the conservative /proc
+    holder probe used by heal."""
     real = os.path.realpath(os.path.expanduser(config_dir))
     try:
-        with open(os.path.join(snapshot_path, "credentials.json"), "rb") as fh:
-            blob = fh.read()
+        st = os.lstat(real)
     except OSError as e:
-        return {"ok": False, "error": "snapshot unreadable (%s)" % e.__class__.__name__}
-    oa = _read_json(os.path.join(snapshot_path, "account.json"))
-    if not isinstance(oa, dict) or not _str_or_none(oa.get("emailAddress")):
-        return {"ok": False, "error": "snapshot has no identity block — refusing"}
+        return {"ok": False, "error": "home unavailable (%s)" % e.__class__.__name__}
+    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        return {"ok": False, "error": "home is not a plain directory — refusing"}
+    blob, oa, error = _snapshot_files(snapshot_path)
+    if error:
+        return {"ok": False, "error": error}
     cfg, auth = os.path.join(real, ACCOUNT_JSON), os.path.join(real, AUTH_JSON)
-    doc, mode = {}, 0o600
-    if os.path.exists(cfg):
-        mode = os.stat(cfg).st_mode & 0o777      # the operator's own perms survive
-        doc = _read_json(cfg)
+    pre = {}
+    for path in (auth, cfg):
+        image, error = _pre_image(path)
+        if error:
+            return {"ok": False, "error": error}
+        pre[path] = image
+    doc = {}
+    if pre[cfg]["exists"]:
+        doc = _json_bytes(pre[cfg]["blob"])
         if not isinstance(doc, dict):
             return {"ok": False, "error":
                     "%s is present but unreadable/not an object — refusing to "
                     "overwrite it (it holds this home's whole state)" % ACCOUNT_JSON}
     doc = dict(doc)
     doc["oauthAccount"] = oa
+    outputs = ((auth, blob),
+               (cfg, (json.dumps(doc, indent=2) + "\n").encode()))
     staged = []
     try:
-        staged.append((_stage_private(auth, blob), auth))
-        staged.append((_stage_private(
-            cfg, (json.dumps(doc, indent=2) + "\n").encode(), mode), cfg))
+        for path, data in outputs:
+            staged.append((path, _stage_private(path, data, 0o600)))
     except OSError as e:
-        for tmp, _ in staged:
+        for _, tmp in staged:
             _unlink(tmp)
         return {"ok": False, "error": "write failed (%s)" % e.__class__.__name__}
+    if require_free:
+        held = holders_of(real)
+        if held is None or held:
+            for _, tmp in staged:
+                _unlink(tmp)
+            return {"ok": False, "error": "home is no longer proven free — refusing"}
+    changed = []
     try:
-        with open(auth, "rb") as fh:
-            prior = fh.read()                    # the undo for a half-commit
-    except OSError:
-        prior = None
-    done = []
-    for tmp, dest in staged:
-        try:
-            os.replace(tmp, dest)
-        except OSError as e:
-            for leftover, _ in staged:
-                _unlink(leftover)
-            if auth in done:                     # creds landed, identity did not
-                if prior is None:
-                    _unlink(auth)
-                else:
-                    try:
-                        _atomic_private(auth, prior)
-                    except OSError:
-                        return {"ok": False, "error":
-                                "write failed (%s) AND the credentials file could "
-                                "not be rolled back — this home now holds the "
-                                "restored credentials under its previous identity"
-                                % e.__class__.__name__}
-            cache_clear()
-            return {"ok": False, "error": "write failed (%s)" % e.__class__.__name__}
-        done.append(dest)
+        for path, tmp in staged:
+            os.replace(tmp, path)
+            changed.append(path)
+        _fsync_dir(real)
+        got, mode = _read_regular(auth)
+        if got != blob or mode != 0o600:
+            raise OSError("credential verification failed")
+        cfg_blob, cfg_mode = _read_regular(cfg)
+        cfg_doc = _json_bytes(cfg_blob)
+        if (cfg_mode != 0o600 or not isinstance(cfg_doc, dict)
+                or _email_or_none((cfg_doc.get("oauthAccount") or {}).get(
+                    "emailAddress")) != oa["emailAddress"]):
+            raise OSError("identity verification failed")
+    except OSError as e:
+        for _, tmp in staged:
+            _unlink(tmp)
+        rolled = _rollback_files(pre) if changed else True
+        cache_clear()
+        if not rolled:
+            return {"ok": False, "error": "write failed (%s) and exact rollback failed"
+                    % e.__class__.__name__}
+        return {"ok": False, "error": "write failed (%s); exact pre-image restored"
+                % e.__class__.__name__}
     cache_clear()
-    return {"ok": True, "account": oa.get("emailAddress")}
+    return {"ok": True, "account": oa["emailAddress"]}
 
 
 # ------------------------------------------------------------- live holders ---
+def _proc_start(pid_dir):
+    """Starttime from /proc/<pid>/stat, whose comm may contain spaces/parens."""
+    with open(os.path.join(pid_dir, "stat")) as fh:
+        return int(fh.read().rsplit(")", 1)[1].split()[19])
+
+
 def holders_of(path, default=False):
     """[(pid, comm)] every live process pinned to this config dir (our own pid
-    excluded). None = the probe is unavailable (no /proc) — the caller must
-    then REFUSE, never assume free. Conservative on purpose: an inherited
-    CLAUDE_CONFIG_DIR counts, because it means a session owns this home."""
-    if not os.path.isdir("/proc"):
+    excluded). None means uncertainty, and every caller MUST refuse.
+
+    Each pid is bracketed by its starttime so PID reuse cannot mix one
+    process's environ with another's comm. A permission/read error while the pid
+    still exists is uncertainty, not evidence of absence; only a process that
+    demonstrably vanished during the scan is skipped."""
+    if not os.path.isdir(PROC_ROOT):
         return None
     real = os.path.realpath(path)
     me = os.getpid()
     out = []
-    for envf in glob.glob("/proc/[0-9]*/environ"):
-        try:
-            pid = int(envf.split("/")[2])
-        except ValueError:
+    try:
+        entries = list(os.scandir(PROC_ROOT))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == me:
             continue
-        if pid == me:
-            continue
+        pid, pdir = int(entry.name), entry.path
         try:
-            with open(envf, "rb") as fh:
+            start = _proc_start(pdir)
+            with open(os.path.join(pdir, "environ"), "rb") as fh:
                 env = fh.read()
-            with open("/proc/%d/comm" % pid) as fh:
+            with open(os.path.join(pdir, "comm")) as fh:
                 comm = fh.read().strip()
-        except OSError:
-            continue
+            if _proc_start(pdir) != start:
+                return None
+        except (OSError, ValueError, IndexError):
+            if not os.path.exists(pdir):
+                continue
+            return None
         val = None
         for var in env.split(b"\0"):
             if var.startswith(b"CLAUDE_CONFIG_DIR="):
-                val = var.split(b"=", 1)[1].decode("utf-8", "replace")
+                val = os.fsdecode(var.split(b"=", 1)[1])
                 break
         if val is None:
-            if default and comm == "claude":     # env-less claude runs on ~/.claude
+            if default and comm == "claude":
                 out.append((pid, comm))
             continue
         if os.path.realpath(os.path.expanduser(val)) == real:
@@ -560,7 +722,7 @@ def _held_note(holders, cap=3):
     owns the home), then whatever inherited the env, capped — the full roster
     stays on the plan for --json."""
     ranked = sorted(holders, key=lambda h: (h[1] not in ("claude", "codex"), h[0]))
-    head = ", ".join("pid %d (%s)" % (p, c) for p, c in ranked[:cap])
+    head = ", ".join("pid %d" % p for p, _ in ranked[:cap])
     extra = len(ranked) - cap
     return head + (" +%d more process%s holding this dir"
                    % (extra, "es"[:2 * (extra != 1)]) if extra > 0 else "")
@@ -596,6 +758,7 @@ def heal_plan(name=None):
             continue
         want = os.path.basename(r["real"])       # the NAME's promise (folded email)
         snaps = [s for s in snapshots_for_home_name(want) if s["has_creds"]]
+        snap_accounts = {s["account"] for s in snaps if s["account"]}
         holders = holders_of(r["real"], default=r["default"])
         clash = _family_live_elsewhere(snaps[-1], r, estate) if snaps else None
         plan = {"name": r["name"], "path": r["real"], "holds": r["account"],
@@ -613,6 +776,10 @@ def heal_plan(name=None):
             plan["status"], plan["reason"] = "no-backup", (
                 "no snapshot for %s — the evicted account can only come back "
                 "through a fresh login" % want)
+        elif len(snap_accounts) != 1:
+            plan["status"], plan["reason"] = "ambiguous-backup", (
+                "snapshots under %s claim multiple or missing account identities — "
+                "the folded directory name is not enough to choose safely" % want)
         elif clash:
             plan["status"], plan["reason"] = "revocation-risk", (
                 "that snapshot's token family is LIVE in %s — restoring it here "
@@ -662,7 +829,7 @@ def heal(name=None, apply=False):
                               % _held_note(holders)) if holders else \
                              "no /proc — refusing"
             continue
-        pre = backup(plan["path"])               # the evicted-now occupant, first
+        pre = backup(plan["path"], apply=True)    # the evicted-now occupant, first
         if not pre["ok"]:
             # THE LAW, ENFORCED not merely attempted: no eviction without a
             # pre-image. Proceeding here would delete the occupant's only copy
@@ -673,7 +840,14 @@ def heal(name=None, apply=False):
                 % (plan["holds"] or "?", pre["reason"]))
             continue
         plan["pre_image"] = pre.get("dest")
-        res = restore(plan["restore_from"], plan["path"])
+        holders = holders_of(plan["path"])
+        if holders is None or holders:
+            plan["status"] = "held" if holders else "cannot-probe"
+            plan["reason"] = ("held by %s (arrived during pre-image capture) — refused"
+                              % _held_note(holders)) if holders else \
+                             "holder probe became uncertain — refusing"
+            continue
+        res = restore(plan["restore_from"], plan["path"], require_free=True)
         if not res["ok"]:
             plan["status"], plan["reason"] = "failed", res["error"]
             continue
@@ -688,7 +862,9 @@ def heal(name=None, apply=False):
             "post-restore identity is %s — rolled back"
             % (got["email"] or got["error"]))
         if pre.get("dest"):
-            restore(pre["dest"], plan["path"])
+            rolled = restore(pre["dest"], plan["path"], require_free=True)
+            if not rolled["ok"]:
+                plan["reason"] += "; pre-image rollback refused or failed"
     return {"apply": True, "plans": plans}
 
 
@@ -698,9 +874,9 @@ def doctor_rows():
     row. Read-only; an audit that cannot run WARNs, it never claims health."""
     try:
         rs = rows()
-    except Exception as e:                       # an audit must never break doctor
-        return [("WARN", "cred identity audit unavailable (%s: %s)"
-                 % (e.__class__.__name__, e))]
+    except Exception as e:                       # no exception text: it may carry a path/token
+        return [("WARN", "cred identity audit unavailable (%s)"
+                 % e.__class__.__name__)]
     if not rs:
         return []
     out = []
@@ -744,13 +920,27 @@ def _take_flag(args, flag):
     return None
 
 
+def _display_path(path):
+    """Paths are operational metadata, except when a credential was pasted
+    where a path belonged. Never echo a token-shaped component back."""
+    parts = [p for p in os.path.normpath(str(path or "")).split(os.sep) if p]
+    for part in parts:
+        low = part.lower()
+        if (len(part) > 72 or any(k in low for k in
+                                  ("refresh-token", "access-token", "bearer-",
+                                   "oauth-token", "sk-ant-"))
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in part)):
+            return "<redacted-path>"
+    return str(path)
+
+
 def _resolve_home(name):
     """--home NAME | path -> realpath, via the same resolver every other verb
     uses. No name -> $CLAUDE_CONFIG_DIR -> the default home."""
     if name:
         row, err = homes._resolve(name, "claude")
         if err:
-            return None, err["error"]
+            return None, "home could not be resolved (see `helm cred list`)"
         return os.path.realpath(row["path"]), None
     env = os.environ.get(homes.ENV_VAR["claude"])
     if env:
@@ -799,83 +989,114 @@ def _print_list(args):
 
 
 def _print_backup(args):
+    args = list(args)
     quiet = "--quiet" in args
-    args = [a for a in args if a != "--quiet"]
+    apply = "--apply" in args
+    args = [a for a in args if a not in ("--quiet", "--apply")]
     name = _take_flag(args, "--home")
-    results = []
-    if "--all" in args:
-        results = backup_all()
+    all_homes = "--all" in args
+    args = [a for a in args if a != "--all"]
+    if args or (all_homes and name):
+        if not quiet:
+            print("helm cred backup: invalid arguments", file=sys.stderr)
+        return 2
+    if all_homes:
+        results = backup_all(apply=apply)
     else:
         path, err = _resolve_home(name)
         if err:
             if not quiet:
                 print("helm cred: " + err, file=sys.stderr)
-            return 0 if quiet else 1
-        results = [backup(path)]
-    if quiet:                       # hook mode: a SessionStart hook prints NOTHING
-        return 0
+            return 1
+        results = [backup(path, apply=apply)]
+    if quiet:
+        return 1 if any(not r["ok"] for r in results) else 0
     made = [r for r in results if r["action"] == "backup"]
+    planned = [r for r in results if r["action"] == "would-backup"]
     for r in results:
         if r["action"] == "backup":
             print("  backed up %-32s <- %s  (%s)"
-                  % (r["account"], r["name"], r["dest"]))
+                  % (r["account"], r["name"], _display_path(r["dest"])))
+        elif r["action"] == "would-backup":
+            print("  WOULD BACK UP %-26s <- %s" % (r["account"], r["name"]))
         elif r["ok"]:
             print("  %-32s %s (%s)" % (r["account"], r["reason"], r["name"]))
         else:
             print("  SKIP %-27s %s" % (r["name"], r["reason"]))
-    print("helm cred backup: %d snapshot%s written, %d already current (root %s, "
-          "0700 dirs / 0600 files — token bytes are copied, never printed)"
-          % (len(made), "s"[:len(made) != 1], len(results) - len(made), backup_root()))
-    return 0
+    if apply:
+        print("helm cred backup (APPLIED): %d snapshot%s written, %d already current "
+              "(root %s, 0700 dirs / 0600 files — token bytes are copied, never printed)"
+              % (len(made), "s"[:len(made) != 1], len(results) - len(made),
+                 _display_path(backup_root())))
+    else:
+        print("helm cred backup (dry-run): %d snapshot%s would be written; add --apply "
+              "(%d already current, no filesystem changes)"
+              % (len(planned), "s"[:len(planned) != 1], len(results) - len(planned)))
+    return 1 if any(not r["ok"] for r in results) else 0
 
 
 def _print_switch_guard(args):
-    if "--install" in args:
+    args = list(args)
+    apply = "--apply" in args
+    args = [a for a in args if a not in ("--apply", "--dry")]
+    install = "--install" in args
+    args = [a for a in args if a != "--install"]
+    name = _take_flag(args, "--home")
+    if args or (install and name):
+        print("helm cred switch-guard: invalid arguments", file=sys.stderr)
+        return 2
+    if install:
         from . import hooks
-        dry = "--dry" in args
         targets = hooks.claude_homes()
         if not targets:
             print("helm cred: no claude homes to guard")
             return 0
         worst = 0
         for hname, path in targets:
-            action, detail = hooks.install_home(path, dry=dry, specs=GUARD_SPECS)
-            print("  %-30s %s" % (hname, action if not dry else action))
+            action, detail = hooks.install_home(path, dry=not apply, specs=GUARD_SPECS)
+            print("  %-30s %s" % (hname, action))
             if action == "fail":
-                print("    " + detail, file=sys.stderr)
+                print("    hook install failed", file=sys.stderr)
                 worst = 1
-        print("helm cred switch-guard: SessionStart + Stop guard %sinstalled in %d "
-              "home%s — every session start AND every turn boundary snapshots what "
-              "the home holds, so a mid-session /login always has a pre-image "
-              "behind it that is at most one turn old (the live session rotates "
-              "its own refresh token; a session-start-only pre-image goes dead)"
-              % ("would be " if dry else "", len(targets), "s"[:len(targets) != 1]))
+        print("helm cred switch-guard (%s): SessionStart + Stop guard %s in %d home%s"
+              % ("APPLIED" if apply else "dry-run — add --apply",
+                 "installed" if apply else "would be installed",
+                 len(targets), "s"[:len(targets) != 1]))
         return worst
-    path, err = _resolve_home(_take_flag(list(args), "--home"))
+    path, err = _resolve_home(name)
     if err:
         print("helm cred: " + err, file=sys.stderr)
         return 1
-    res = backup(path)
+    res = backup(path, apply=apply)
     if not res["ok"]:
-        print("helm cred switch-guard: NOT protected — %s (%s)"
-              % (res["reason"], path), file=sys.stderr)
-        print("  a /login here is still safe for the NEW account, but the account "
-              "this home holds now cannot be restored afterwards.", file=sys.stderr)
+        print("helm cred switch-guard: NOT protected — %s" % res["reason"],
+              file=sys.stderr)
         return 1
-    print("helm cred switch-guard: %s is protected (%s)"
-          % (res["account"], "snapshot " + res["dest"] if res["action"] == "backup"
-             else "already snapshotted: " + res["dest"]))
-    print("  now safe to run:  %s" % homes.LOGIN_CMDS["claude"](path))
-    print("  after the login:  `helm cred list` shows what this home now holds; "
-          "`helm cred heal` puts %s back when no session holds it."
-          % res["account"])
+    if not apply and res["action"] == "would-backup":
+        print("helm cred switch-guard (dry-run): %s is NOT protected yet; add --apply"
+              % res["account"])
+        return 0
+    protected = ("snapshot " + _display_path(res["dest"])
+                 if res["action"] == "backup" else
+                 "already snapshotted: " + _display_path(res["dest"]))
+    print("helm cred switch-guard: %s is protected (%s)" % (res["account"], protected))
+    shown = _display_path(path)
+    if shown != "<redacted-path>":
+        print("  now safe to run:  %s" % homes.LOGIN_CMDS["claude"](shown))
+    else:
+        print("  home path redacted; select it by name before running /login")
+    print("  after the login: `helm cred list` shows what this home now holds; "
+          "`helm cred heal` puts %s back when no session holds it." % res["account"])
     return 0
 
 
 def _print_heal(args):
     apply = "--apply" in args
     as_json = "--json" in args
-    rest = [a for a in args if not a.startswith("-")]
+    rest = [a for a in args if a not in ("--apply", "--json")]
+    if len(rest) > 1 or any(a.startswith("-") for a in rest):
+        print("helm cred heal: invalid arguments", file=sys.stderr)
+        return 2
     res = heal(rest[0] if rest else None, apply=apply)
     if as_json:
         print(json.dumps(res, indent=2))
@@ -891,24 +1112,31 @@ def _print_heal(args):
         print("      %s" % p["reason"])
         if p.get("pre_image"):
             print("      pre-image of the evicted occupant: %s" % p["pre_image"])
-    bad = [p for p in plans
-           if p["status"] in ("failed", "cannot-probe", "no-preimage")]
+    bad = apply and any(p["status"] != "restored" for p in plans)
     return 1 if bad else 0
 
 
 def cmd_cred(args):
-    """cred [list|backup [--all]|switch-guard [--install]|heal [--apply]]"""
+    """cred [list|backup [--all] [--apply]|switch-guard [--install] [--apply]|heal [--apply]]"""
     args = list(args)
     verb = args[0] if args and not args[0].startswith("-") else "list"
     rest = args[1:] if args and not args[0].startswith("-") else args
-    if verb in ("list", "ls"):
-        return _print_list(rest)
-    if verb == "backup":
-        return _print_backup(rest)
-    if verb in ("switch-guard", "guard"):
-        return _print_switch_guard(rest)
-    if verb == "heal":
-        return _print_heal(rest)
-    print("helm cred: unknown subverb %r — %s" % (verb, cmd_cred.__doc__),
-          file=sys.stderr)
-    return 2
+    try:
+        if verb in ("list", "ls"):
+            if any(a != "--json" for a in rest):
+                print("helm cred list: invalid arguments", file=sys.stderr)
+                return 2
+            return _print_list(rest)
+        if verb == "backup":
+            return _print_backup(rest)
+        if verb in ("switch-guard", "guard"):
+            return _print_switch_guard(rest)
+        if verb == "heal":
+            return _print_heal(rest)
+        print("helm cred: unknown subverb — %s" % cmd_cred.__doc__, file=sys.stderr)
+        return 2
+    except Exception as e:
+        # Last-resort CLI boundary: exception strings can embed paths or parsed
+        # input. Class-only reporting guarantees no credential/token traceback.
+        print("helm cred: operation failed (%s)" % e.__class__.__name__, file=sys.stderr)
+        return 1

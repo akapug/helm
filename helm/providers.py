@@ -271,9 +271,12 @@ class NativeQuotaProvider:
 
     @staticmethod
     def _anthropic_identity(home):
-        """(email, human tier) from the home's .claude.json oauthAccount."""
+        """(email, human tier) from the ONE content identity reader. Quota,
+        command minting, homes/list/doctor and usage attribution must agree even
+        when a directory name lies."""
+        from . import cred
         oa = (_read_json(os.path.join(home, ".claude.json")) or {}).get("oauthAccount") or {}
-        email = oa.get("emailAddress") or None
+        email = cred.account_of(home)["email"]
         org = oa.get("organizationType") or ""
         rl = oa.get("organizationRateLimitTier") or oa.get("userRateLimitTier") or ""
         if org == "claude_team" or (oa.get("seatTier") or "").startswith("team"):

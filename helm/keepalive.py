@@ -100,56 +100,67 @@ def _predecessor_pids():
         if "python" not in os.path.basename(argv0):
             continue
         if "keepalive" in cmdline and ("sesh" in cmdline or "helm" in cmdline):
-            out.append((pid, cmdline.replace("\0", " ").strip()))
+            out.append((pid, "keepalive"))   # never return argv: it may carry pasted secrets
     return out
 
 
 def _read_oauth(cred_path):
-    with open(cred_path) as fh:
-        val = json.load(fh)
+    blob, _ = cred._read_regular(cred_path)
+    val = json.loads(blob.decode("utf-8"))
     return val, val.get("claudeAiOauth") or {}
 
 
-def refresh_home(home_path, early_horizon_s=60, force=False):
-    """Refresh one claude home's token if due. Returns a JSON-able result dict;
-    every outcome is logged. NEVER touches a home with a live holder."""
+def refresh_home(home_path, early_horizon_s=60, force=False, apply=False):
+    """Plan or refresh one claude home's token. DRY-RUN is the default and
+    performs no network call, log write, or filesystem mutation. apply=True
+    snapshots the exact pre-image BEFORE the rotating grant and refuses if that
+    capture fails."""
     home_path = os.path.realpath(os.path.expanduser(home_path))
-    name = os.path.basename(home_path)
-    # The dir NAME is a label, not an identity — a past `/login` can leave any
-    # account behind it. Every record below carries the account read from the
-    # home's CONTENT (cred.account_of), so this audit log can never say
-    # "refreshed cto-example" about someone else's token. Unreadable identity logs
-    # as null; it is NEVER inferred from the name.
+    raw_name = os.path.basename(home_path)
+    name = cred._display_path(raw_name)
     account = cred.account_of(home_path)["email"]
 
     def rec(event):
-        return _log({"home": name, "account": account, **event})
+        row = {"home": name, "account": account, **event}
+        return _log(row) if apply else row
 
     cred_path = os.path.join(home_path, ".credentials.json")
     if not os.path.exists(cred_path):
         return rec({"action": "skip", "reason": "no credentials file"})
-
     pid = _live_holder_pid(home_path)
     if pid:
         return rec({"action": "skip",
-                     "reason": f"live holder pid {pid} — one refresher per home, the agent owns it"})
-
+                    "reason": "live holder detected — one refresher per home"})
     try:
         val, oauth = _read_oauth(cred_path)
     except (OSError, ValueError) as e:
-        return rec({"action": "error", "reason": f"unreadable cred file: {e}"})
+        return rec({"action": "error",
+                    "reason": "unreadable cred file (%s)" % e.__class__.__name__})
     refresh_token = oauth.get("refreshToken")
     if not refresh_token:
         return rec({"action": "needs_reauth", "reason": "no refreshToken present"})
-
-    expires_at = oauth.get("expiresAt")  # ms epoch
+    expires_at = oauth.get("expiresAt")
     now_ms = int(time.time() * 1000)
     due = force or expires_at is None or expires_at <= now_ms + early_horizon_s * 1000
     if not due:
         return rec({"action": "skip",
-                     "reason": f"not due (expires in {(expires_at - now_ms) // 60000} min)"})
+                    "reason": "not due (expires in %d min)"
+                              % ((expires_at - now_ms) // 60000)})
+    if not apply:
+        return rec({"action": "would-refresh",
+                    "reason": "due; add --apply (no network or filesystem changes)"})
 
-    # ---- the refresh grant (rotation!) ----
+    # Capture before the grant. The endpoint rotates the refresh token, so
+    # taking the snapshot afterwards is already too late if storage is broken.
+    snap = cred.backup(home_path, apply=True)
+    if not snap["ok"]:
+        return rec({"action": "error",
+                    "reason": "pre-image capture failed — refresh refused"})
+    pid = _live_holder_pid(home_path)
+    if pid:
+        return rec({"action": "skip",
+                    "reason": "live holder arrived after pre-image capture — refused"})
+
     body = json.dumps({"grant_type": "refresh_token",
                        "refresh_token": refresh_token,
                        "client_id": OAUTH_CLIENT_ID}).encode()
@@ -160,76 +171,66 @@ def refresh_home(home_path, early_horizon_s=60, force=False):
         with urllib.request.urlopen(req, timeout=30) as resp:
             j = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        e.close()  # an HTTPError IS a response object — close its fp deterministically
+        e.close()
         return rec({"action": "needs_reauth",
-                     "reason": f"refresh HTTP {e.code} — refresh token dead, one-time re-login needed"})
+                    "reason": "refresh HTTP %s — one-time re-login needed" % e.code})
     except Exception as e:
-        return rec({"action": "error", "reason": f"refresh transport: {e}"})
-
+        return rec({"action": "error",
+                    "reason": "refresh transport failed (%s)" % e.__class__.__name__})
     new_access = j.get("access_token")
     if not new_access:
         return rec({"action": "error", "reason": "refresh response had no access_token"})
     expires_in = j.get("expires_in") or 28800
-
-    # ---- pre-image FIRST (every mutating cred path backs up first) ----
-    # Fail-closed and silent: a home whose account cannot be read is skipped,
-    # never filed under a guessed name; a failed snapshot never blocks the
-    # rotation (an unrotated family is the worse outcome).
-    snap = cred.backup(home_path)
-
-    # ---- persist the rotation (REQUIRED — else the family burns) ----
     oauth["accessToken"] = new_access
     if j.get("refresh_token"):
         oauth["refreshToken"] = j["refresh_token"]
     oauth["expiresAt"] = int(time.time() * 1000) + expires_in * 1000
     val["claudeAiOauth"] = oauth
-    tmp = f"{cred_path}.helm-tmp.{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # owner-only FROM CREATION
     try:
-        with os.fdopen(fd, "w") as fh:
-            json.dump(val, fh, indent=2)
-        os.replace(tmp, cred_path)
+        cred._atomic_private(cred_path, json.dumps(val, indent=2).encode(), 0o600)
     except OSError as e:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        return rec({"action": "error", "reason": f"write-back failed: {e}"})
+        return rec({"action": "error",
+                    "reason": "write-back failed (%s)" % e.__class__.__name__})
     return rec({"action": "refreshed",
                 "rotated_refresh_token": bool(j.get("refresh_token")),
                 "new_expiry_in_h": round(expires_in / 3600, 1),
-                "pre_image": snap.get("dest")})   # a path, never a token byte
+                "pre_image": snap.get("dest")})
 
 
-def sweep(early_h=24):
-    """The keepalive pass: every idle claude home whose token expires within
-    early_h hours gets rolled forward; codex homes get a stale-risk read-only
-    check. One sweep at a time machine-wide (file lock)."""
-    lockp = LOCK_PATH
-    os.makedirs(os.path.dirname(lockp), exist_ok=True)
+def _sweep_rows(early_h, apply):
     results = []
-    with open(lockp, "w") as lk:
+    homes = sorted(set(os.path.realpath(p) for p in glob.glob(f"{CLAUDE_HOMES_ROOT}/*")
+                       if os.path.isdir(p)))
+    for hp in homes:
+        results.append(refresh_home(hp, early_horizon_s=early_h * 3600,
+                                    apply=apply))
+    for hp in sorted(set(os.path.realpath(p) for p in glob.glob(f"{CODEX_HOMES_ROOT}/*")
+                         if os.path.isdir(p))):
+        ap = os.path.join(hp, "auth.json")
+        if not os.path.exists(ap):
+            continue
+        age_h = (time.time() - os.path.getmtime(ap)) / 3600
+        if age_h > 20:
+            row = {"home": cred._display_path(os.path.basename(hp)),
+                   "provider": "codex", "action": "stale-risk",
+                   "reason": "auth.json untouched %.0fh — run its codex CLI "
+                             "(self-refreshes on launch); helm never writes codex creds" % age_h}
+            results.append(_log(row) if apply else row)
+    return results
+
+
+def sweep(early_h=24, apply=False):
+    """Dry-run scans without even creating a lock file. Applied sweeps take the
+    machine-wide writer lock before any backup/network/write."""
+    if not apply:
+        return _sweep_rows(early_h, False)
+    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+    with open(LOCK_PATH, "w") as lk:
         try:
             fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return [{"action": "skip", "reason": "another keepalive sweep is running"}]
-        homes = sorted(set(os.path.realpath(p) for p in glob.glob(f"{CLAUDE_HOMES_ROOT}/*")
-                           if os.path.isdir(p)))
-        for hp in homes:
-            results.append(refresh_home(hp, early_horizon_s=early_h * 3600))
-        # codex: read-only stale-risk surfacing (never write; the codex CLI owns rotation)
-        for hp in sorted(set(os.path.realpath(p) for p in glob.glob(f"{CODEX_HOMES_ROOT}/*")
-                             if os.path.isdir(p))):
-            ap = os.path.join(hp, "auth.json")
-            if not os.path.exists(ap):
-                continue
-            age_h = (time.time() - os.path.getmtime(ap)) / 3600
-            if age_h > 20:
-                results.append(_log({"home": os.path.basename(hp), "provider": "codex",
-                                     "action": "stale-risk",
-                                     "reason": f"auth.json untouched {age_h:.0f}h — run its codex CLI "
-                                               f"(self-refreshes on launch); helm never writes codex creds"}))
-    return results
+        return _sweep_rows(early_h, True)
 
 
 def cmd_keepalive(args):
@@ -239,14 +240,17 @@ def cmd_keepalive(args):
     Log: ~/.cache/helm/keepalive-log.jsonl"""
     args = list(args or [])
     home = early = None
+    apply = False
     while args:
         a = args.pop(0)
-        if a == "--home" and args:
+        if a == "--apply":
+            apply = True
+        elif a == "--home" and args:
             home = args.pop(0)
         elif a == "--early" and args:
             early = args.pop(0)
         else:
-            print("usage: helm keepalive [--home NAME|PATH] [--early HOURS]",
+            print("usage: helm keepalive [--home NAME|PATH] [--early HOURS] [--apply]",
                   file=sys.stderr)
             return 2
     try:
@@ -256,23 +260,27 @@ def cmd_keepalive(args):
         return 2
     # one credential writer machine-wide: refuse to run beside a live keepalive
     # (the predecessor's copy uses a different lock file our sweep can't see).
-    live = _predecessor_pids()
+    live = _predecessor_pids() if apply else []
     if live:
         print("helm keepalive: REFUSED — a keepalive process is already running:",
               file=sys.stderr)
-        for pid, cmdline in live:
-            print("  pid %s: %s" % (pid, cmdline[:160]), file=sys.stderr)
+        for pid, _ in live:
+            print("  pid %s" % pid, file=sys.stderr)
         print("  one credential writer per machine; let it finish (or stop it) first.",
               file=sys.stderr)
         return 1
     if home:
         path = home if "/" in home else os.path.join(CLAUDE_HOMES_ROOT, home)
-        results = [refresh_home(path, early_horizon_s=int(early * 3600))]
+        results = [refresh_home(path, early_horizon_s=int(early * 3600),
+                                apply=apply)]
     else:
-        results = sweep(early_h=early)
+        results = sweep(early_h=early, apply=apply)
     acted = sum(1 for r in results if r.get("action") == "refreshed")
-    print("helm keepalive: %d home%s checked, %d refreshed" % (
-        len(results), "s"[:len(results) != 1], acted))
+    planned = sum(1 for r in results if r.get("action") == "would-refresh")
+    print("helm keepalive (%s): %d home%s checked, %d refreshed%s" % (
+        "APPLIED" if apply else "dry-run — add --apply",
+        len(results), "s"[:len(results) != 1], acted,
+        " (%d would refresh)" % planned if not apply else ""))
     worst = 0
     for r in results:
         print("  " + json.dumps(r))
