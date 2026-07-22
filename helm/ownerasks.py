@@ -59,7 +59,7 @@ def rows():
     garbled lines skip, a missing/unreadable ledger reads as empty."""
     out = {}
     try:
-        with open(ledger_path(), encoding="utf-8") as f:
+        with open(ledger_path(), encoding="utf-8", errors="replace") as f:
             for ln in f:
                 try:
                     d = json.loads(ln)

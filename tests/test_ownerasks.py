@@ -138,6 +138,13 @@ class LedgerTest(AsksBase):
         rc, out, _e = self.asks("list", "--json")
         self.assertEqual(json.loads(out)[0]["report_ref"], "post-3")
 
+    def test_invalid_utf8_line_skips_good_rows_survive(self):
+        rid = ownerasks.add("survives corruption")["id"]
+        with open(ownerasks.ledger_path(), "ab") as f:
+            f.write(b"\xff\xfe torn write \xff\n")       # non-utf8 garbage
+        self.assertEqual(ownerasks.rows()[rid]["ask"], "survives corruption")
+        self.assertEqual(self.asks("list")[0], 0)         # CLI never tracebacks
+
     def test_cli_usage_floors(self):
         self.assertEqual(self.asks()[0], 2)
         self.assertEqual(self.asks("add")[0], 2)
