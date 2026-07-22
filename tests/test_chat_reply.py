@@ -508,13 +508,15 @@ class ReplyCliTest(ReplyBase):
 
 
 # ---------------------------------------------------------------------------
-# 5. THE LAW: threading does not touch beacon-wake semantics
+# 5. THE LAW (inverted 2026-07-22): a reply is a direct address of the
+#    parent's author — mention-tier — and of nobody else
 # ---------------------------------------------------------------------------
 
 class ReplyWakeTest(ReplyBase):
-    """A reply wakes EXACTLY what its text alone would have woken. Asserted
-    against seats.deliverable() — the beacon's own decision function — not a
-    proxy for it."""
+    """A reply wakes the parent's author (the owner's WHY: replying replaces
+    typing the @mention) and otherwise EXACTLY what its text alone would have
+    woken. Asserted against seats.deliverable() — the beacon's own decision
+    function — not a proxy for it."""
 
     def deliv(self, row, seat, room="main"):
         return seats.deliverable(row, seat, room)
@@ -541,35 +543,47 @@ class ReplyWakeTest(ReplyBase):
         r = chat.post("@codex what about this", who="alice", reply_to=p["id"])
         self.assertTrue(self.deliv(r, "codex"))
 
-    def test_wake_is_identical_with_and_without_the_pointer_everywhere(self):
+    def test_the_pointer_changes_wake_only_for_the_parent_author(self):
         """The whole matrix: for every scope the beacon knows, the reply row
-        and the same text unparented decide the SAME way."""
+        and the same text unparented decide the SAME way for everyone EXCEPT
+        the parent's author, who is always woken (mention-tier). The parent
+        here is codex's own row, so the threaded/plain delta is exactly the
+        codex wake — a bystander seat sees no delta anywhere."""
         seats.write_roster("codex", session="s-codex", home_room="team-z")
-        p = chat.post("parent", room="team-z", who="alice")
+        seats.write_roster("kimi", session="s-kimi", home_room="team-k")
         cases = [("plain chatter", "main"), ("plain chatter", "team-z"),
                  ("@all hands", "main"), ("@all hands", "side"),
                  ("@codex ping", "side"), ("nothing for you", "side")]
         for text, room in cases:
+            p = chat.post("parent", room=room, who="codex")
             r = dict(chat.post(text, room=room, who="alice",
                                reply_to=p["id"]))
             plain = dict(r)
             for k in ("reply_to", "rts", "rfrom"):
                 plain.pop(k, None)
-            self.assertEqual(self.deliv(r, "codex", room),
-                             self.deliv(plain, "codex", room),
-                             "%r in #%s decided differently once threaded"
-                             % (text, room))
+            self.assertTrue(self.deliv(r, "codex", room),
+                            "reply to codex's row in #%s must wake codex"
+                            % room)
+            self.assertEqual(self.deliv(r, "kimi", room),
+                             self.deliv(plain, "kimi", room),
+                             "%r in #%s decided differently for a bystander "
+                             "once threaded" % (text, room))
 
-    def test_deliverable_never_reads_the_pointer(self):
-        """Structural proof, not just behavioural: the row's thread fields are
-        invisible to the wake decision by construction."""
+    def test_deliverable_reads_only_rfrom_of_the_thread_fields(self):
+        """Structural proof, not just behavioural: rfrom is the ONE thread
+        field the wake decision reads — non-mention text flips on it alone,
+        and reply_to/rts stay invisible. (Previously asserted the superseded
+        never-reads-the-pointer law, vacuously: an @codex mention kept the
+        old assertions true whatever rfrom said.)"""
         seats.write_roster("codex", session="s-codex")
-        row = {"ts": "T", "from": "alice", "text": "@codex hi",
+        row = {"ts": "T", "from": "alice", "text": "no mention here",
                "reply_to": "x", "rts": "T0", "rfrom": "codex"}
         self.assertTrue(seats.deliverable(row, "codex", "main"))
         row["reply_to"] = "totally-different"
-        row["rfrom"] = "someone-else"
+        row["rts"] = "T9"
         self.assertTrue(seats.deliverable(row, "codex", "main"))
+        row["rfrom"] = "someone-else"
+        self.assertFalse(seats.deliverable(row, "codex", "main"))
 
     def test_deliver_any_end_to_end_reply_wakes_parent(self):
         """Integration proof at the actual boundary hook: a bare reply to the

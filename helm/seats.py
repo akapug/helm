@@ -361,7 +361,8 @@ def deliverable(m, seat, room="main", scope=None):
                 or (bool(seat) and room == dm_lane(seat)))
     if _mention_re(seat).search(text):
         return True
-    if str(m.get("rfrom") or "") == seat:
+    rf = str(m.get("rfrom") or "")
+    if rf and rf.casefold() == str(seat or "").casefold():
         # A REPLY to this seat's row is a direct address of its author — the
         # same tier as an @mention, any room, before mute. This inverts the
         # original "threading is invisible to the beacon" law deliberately:
@@ -370,7 +371,9 @@ def deliverable(m, seat, room="main", scope=None):
         # the feature, so a reply that wakes nobody delivers the mechanism
         # while dropping its purpose. rfrom is the parent's recorded author,
         # stamped at post time; only the parent's author wakes, so a reply
-        # stays quieter than the mention it replaces ever was.
+        # stays quieter than the mention it replaces ever was. Casefold, like
+        # every seat-identity match here (roster keys, mentions, dm): a
+        # case-only rename must not silently drop direct reply delivery.
         return True
     sc = scope if scope is not None else seat_scope(seat)
     if room in sc["mute"]:
