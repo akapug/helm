@@ -1524,17 +1524,28 @@ def _dispatch_candidate():
     open->acked transition re-fires exactly once. Fail-closed to None."""
     try:
         from . import dispatches
-        r = dispatches.oldest_overdue()
+        r, kind, unavailable = dispatches.stop_candidate()
+        if unavailable:
+            return ("dispatch:ledger-unavailable",
+                    "dispatch ledger UNAVAILABLE — obligations are UNKNOWN, not "
+                    "zero; repair/read `helm dispatch list` before stopping")
         if not r:
             return None
         tip = str(r.get("tip") or r.get("ref") or "<reviewed-tip>")
+        lane = _clip(_scrub(str(r.get("lane") or "")), 32)
+        if kind == "retry":
+            return ("dispatch:%s:%s:%s" % (r.get("id"), r.get("status"), tip),
+                    "dispatch %s to @%s (%s) NEEDS DELIVERY RETRY — the send "
+                    "did not become a verdict obligation; rerun the original "
+                    "`helm dispatch send ... --key %s` before stopping"
+                    % (r.get("id"), r.get("recipient"), lane,
+                       _clip(_scrub(str(r.get("dispatch_key") or "<key>")), 24)))
         return ("dispatch:%s:%s:%s" % (r.get("id"), r.get("status"), tip),
                 "dispatch %s to @%s (%s) NEEDS CHECK-IN (OVERDUE) and is "
                 "PENDING VERDICT — verify at the exact recipient; do NOT "
                 "reassign on age alone. Close the exact reviewed tip with: "
                 "helm dispatch verdict %s %s <evidence>"
-                % (r.get("id"), r.get("recipient"),
-                   _clip(_scrub(str(r.get("lane") or "")), 32), r.get("id"),
+                % (r.get("id"), r.get("recipient"), lane, r.get("id"),
                    _clip(_scrub(tip), 16)))
     except Exception:
         return None

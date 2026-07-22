@@ -1439,9 +1439,11 @@ frames; this lane is called *delivery*.)
   UNREPORTED owner ask (top of the ladder: the owner-ask ledger's OLDEST row
   not yet `reported` — open or done-but-unreported — named one at a time with
   its `helm asks report` pointer; fp carries the row's status, so open→done
-  re-fires once), then the oldest overdue dispatch (reloaded from disk on each
-  stop; explicitly **NEEDS CHECK-IN / PENDING VERDICT**, with the exact-tip
-  verdict command; advisory only and never an automatic reassignment), stuck
+  re-fires once), then dispatch state reloaded from disk on each stop: ledger
+  **UNAVAILABLE / obligations UNKNOWN** first, then the oldest **NEEDS DELIVERY
+  RETRY** posting/aborted row, then the oldest overdue **NEEDS CHECK-IN /
+  PENDING VERDICT** row with its exact-tip verdict command (advisory only and
+  never an automatic reassignment), stuck
   session (`stuck-streak`≥3: surface the blocker), a RED gate (record.py's
   command-log shows a test-runner whose LATEST run exited nonzero — fix or
   surface before stopping; a green rerun silences it), unlanded owner/mention
@@ -1692,25 +1694,33 @@ not yet `reported` rides the stop-whisper's TOP rung (see `stop-guard`
 above) until the owner has actually heard it. Fail-open: an unwritable
 ledger never raises, and a failed `add` says NOT RECORDED loudly.
 
-### `helm dispatch send <recipient> <lane> <message...> --ref TIP [--key K] | add <recipient> <lane> [--ref TIP] | ack <id> <ref> | retarget <id> <old-tip> <new-tip> | verdict <id> <reviewed-tip> <evidence> | list [--open|--overdue|--needs-retry] [--json]`
+### `helm dispatch send <recipient> <lane> <message...> --ref TIP [--key K] | add <recipient> <lane> --ref TIP | ack <id> <ref> | retarget <id> <old-tip> <new-tip> | verdict <id> <reviewed-tip> <evidence> | list [--open|--overdue|--needs-retry] [--json]`
 
 The DISPATCH ledger is the durable obligation behind work handed to another
 seat. Prefer **`send`**, the atomic first-class path: it appends a `posting`
 event before an exact-token DM, gives that DM a deterministic message id, then
-appends `pending`. The optional `--key` is the caller's idempotency key; without
-one Helm derives it from recipient + lane + tip + message. A retry therefore
-reuses one logical ledger id and one DM id. Ledger staging failure sends
-nothing; DM failure records **NEEDS DELIVERY RETRY** on the same row; a crash
-after the DM is reconciled by retry without a duplicate message. `add` exists
-for recording a handoff performed by another transport, but is not a two-step
-replacement for `send`.
+appends `pending`. The optional `--key` is namespaced by the canonical sender +
+Git repository; without one Helm derives it from every semantic request field.
+Retries compare recipient, lane, exact tip, note, deadline, repository, sender,
+and message digest before reusing one logical ledger id and one DM id. Chat
+checks that id under the room lock **before signing**, repairs a torn room tail,
+then one-write appends + fsyncs + rereads the exact bytes before reporting the
+DM delivered. Ledger staging failure sends nothing; DM failure records **NEEDS
+DELIVERY RETRY** on the same row and outranks overdue rows in stop-whisper; a
+crash after the DM is reconciled by retry without a duplicate local message.
+`add` records a handoff performed by another transport, but still requires
+`--ref`: no new PENDING row may be born without the exact tip its verdict must
+name, and `add` is not a two-step replacement for `send`.
 
 Rows are append-only full snapshots in
 `~/.helm/_global/dispatches.jsonl`, separate from owner asks while sharing the
-same hardened event-ledger primitive: stable flock, one bounded `O_APPEND`
-write, fsync, partial-write rollback, 0600 files, symlink refusal, and replay
-that skips malformed/non-UTF8/truncated or invalid duplicate transitions
-without erasing the preceding good obligation. **POSTING and ACK are not
+same hardened event-ledger primitive: stable flock, incomplete-tail repair
+before append, one bounded `O_APPEND` write, file + first-directory-entry fsync,
+partial-write rollback, 0600 private regular files, symlink/hardlink refusal,
+and replay that skips malformed/non-UTF8/truncated or invalid duplicate
+transitions without erasing the preceding good obligation. An absent ledger is
+known-empty; an unsafe/unreadable ledger is **UNAVAILABLE / obligations UNKNOWN**
+(CLI nonzero and stop-whisper loud), never silently rendered as zero. **POSTING and ACK are not
 done.** Delivered rows say **PENDING VERDICT**; ACK records pickup and remains
 open. Only `verdict` closes, and it resolves the supplied reviewed tip in the
 original Git repository and requires it to equal the row's current exact
@@ -1721,8 +1731,10 @@ forward descendant `<new-tip>`. It preserves `original_ref`/`original_tip` in
 the replay history and rejects stale, backward, divergent, ambiguous, and
 foreign refs. Retarget and verdict serialize on the same lock, so a verdict for
 the old tip can never race through after a retarget. Legacy rows acquire their
-repository/tip binding only when their existing ref resolves uniquely in the
-caller's repository.
+repository/tip binding only when their existing ref is a stable hexadecimal
+object id that resolves uniquely in the caller's repository; mutable symbolic
+legacy refs are refused. Valid old no-seq/no-event open→acked/verdict and
+acked→verdict snapshots still replay, so upgrading never resurrects closed debt.
 
 Deadlines are advisory. An overdue row says **NEEDS CHECK-IN** and rides the
 stop-whisper after owner asks; it never reassigns work because a long turn is

@@ -86,6 +86,7 @@ import contextlib
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 import unicodedata
@@ -514,7 +515,7 @@ def _room_lock(room):
             fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         except OSError:
             lf = None
-        yield
+        yield lf is not None
     finally:
         if lf is not None:
             try:
@@ -524,28 +525,75 @@ def _room_lock(room):
             lf.close()
 
 
-def _append(row, room, idempotent=False):
-    """ONE serialized write path for every room writer: id-stamp, append the
-    whole row in one write, flush, then rotate — all under the room lock.
-    The stable per-row id is what delivery cursors key on (codex H5).  A caller
-    supplying an idempotency id gets compare-before-append semantics under the
-    same lock: retries return the one existing row; a payload collision fails
-    rather than silently aliasing two messages."""
+def _chat_tail(fd, size):
+    if not size or os.pread(fd, 1, size - 1) == b"\n":
+        return size
+    end = size
+    while end:
+        start = max(0, end - 8192)
+        data = os.pread(fd, end - start, start)
+        at = data.rfind(b"\n")
+        if at >= 0:
+            return start + at + 1
+        end = start
+    return 0
+
+
+def _chat_rows(fd, size):
+    raw = os.pread(fd, size, 0).decode("utf-8", errors="replace")
+    return [m for m in map(_msg, (x for x in raw.split("\n") if x)) if m]
+
+
+def _append(row, room, idempotent=False, prepare=None):
+    """Serialized, durable room append with torn-tail repair and retry dedup.
+
+    Idempotent compound writes require the room lock, deduplicate BEFORE their
+    signing callback, append once with O_APPEND, fsync, and verify the exact
+    bytes are replayable before reporting success. A partial write rolls back.
+    """
     row.setdefault("id", os.urandom(6).hex())
     path = room_path(room)
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)  # dm/ lane
-    with _room_lock(room):
-        if idempotent:
-            existing = next((r for r in read(room)[0]
-                             if r.get("id") == row["id"]), None)
-            if existing:
-                keys = ("from", "text", "dm", "reply_to")
-                if any(existing.get(k) != row.get(k) for k in keys):
-                    raise ValueError("chat idempotency id collision: %s" % row["id"])
-                return existing
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            f.flush()
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with _room_lock(room) as held:
+        if idempotent and not held:
+            raise OSError("chat room lock unavailable for idempotent append")
+        new_file = not os.path.exists(path)
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT
+                     | getattr(os, "O_CLOEXEC", 0)
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError("chat room is not a regular file")
+            os.fchmod(fd, 0o600)
+            before = _chat_tail(fd, st.st_size)
+            if before != st.st_size:
+                os.ftruncate(fd, before)
+                os.fsync(fd)
+            if idempotent:
+                existing = next((r for r in _chat_rows(fd, before)
+                                 if r.get("id") == row["id"]), None)
+                if existing:
+                    keys = ("from", "text", "dm", "reply_to")
+                    if any(existing.get(k) != row.get(k) for k in keys):
+                        raise ValueError("chat idempotency id collision: %s" % row["id"])
+                    return existing
+            row = prepare(row) if prepare else row
+            payload = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+            if os.write(fd, payload) != len(payload):
+                os.ftruncate(fd, before)
+                os.fsync(fd)
+                raise OSError("partial chat append rolled back")
+            os.fsync(fd)
+            if os.pread(fd, len(payload), before) != payload:
+                os.ftruncate(fd, before)
+                os.fsync(fd)
+                raise OSError("chat append failed replay verification")
+            if new_file:
+                from . import eventledger
+                eventledger._fsync_dir(os.path.dirname(path))
+        finally:
+            os.close(fd)
         _rotate(path)
     return row
 
@@ -650,8 +698,10 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
     if reply_to:
         row.update(_parent_fields(room, reply_to))
     _touch_poster_presence(row["from"])
-    return _append(_signed_row(row, text, profile, sign), room,
-                   idempotent=bool(message_id))
+    if message_id:
+        return _append(row, room, idempotent=True,
+                       prepare=lambda r: _signed_row(r, text, profile, sign))
+    return _append(_signed_row(row, text, profile, sign), room)
 
 
 def _touch_poster_presence(name):

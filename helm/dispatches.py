@@ -153,14 +153,18 @@ def _valid(row, prior):
             return row.get("status") in ("open", "acked", "verdict")
         if seq != 0:
             return False
+        bound = bool(row.get("ref") and row.get("tip")
+                     and row.get("original_ref") and row.get("original_tip")
+                     and row.get("repo") and row.get("repo_id"))
         if row.get("event") == "add" and row.get("status") == "pending":
-            return True
+            return bound
         if row.get("event") == "posting" and row.get("status") == "posting":
-            return bool(row.get("dispatch_key") and row.get("message_id")
-                        and row.get("message_hash") and row.get("sender"))
+            return bool(bound and row.get("dispatch_key") and row.get("message_id")
+                        and row.get("message_hash")
+                        and _TOKEN.fullmatch(str(row.get("sender") or "")))
         return False
-    immutable = ("id", "ts", "recipient", "lane", "source", "original_ref",
-                 "original_tip", "repo", "repo_id", "dispatch_key",
+    immutable = ("id", "ts", "recipient", "lane", "note", "deadline_s",
+                 "source", "original_ref", "original_tip", "repo", "repo_id", "dispatch_key",
                  "message_id", "message_hash", "sender")
     binding = {"original_ref", "original_tip", "repo", "repo_id"}
     for key in immutable:
@@ -172,9 +176,22 @@ def _valid(row, prior):
         return False
     seq = row.get("seq")
     prior_seq = prior.get("seq")
+    if seq is None and prior_seq is None and row.get("event") is None:
+        # Validated v1 snapshots: exact immutable work/ref, monotone status, and
+        # evidence on ACK/verdict. This preserves old closures without letting a
+        # seq-less duplicate retarget or rewrite the work identity.
+        if row.get("ref") != prior.get("ref") or row.get("tip") != prior.get("tip"):
+            return False
+        legacy = {"open": {"acked", "verdict"},
+                  "acked": {"acked", "verdict"}, "verdict": set()}
+        if row.get("status") not in legacy.get(prior.get("status"), set()):
+            return False
+        if row.get("status") == "acked":
+            return bool(row.get("ack_ref"))
+        return bool(row.get("verdict_ref"))
     if seq is not None and seq != (prior_seq if isinstance(prior_seq, int) else -1) + 1:
         return False
-    if seq is None and prior_seq is not None:
+    if seq is None or (prior_seq is not None and not isinstance(prior_seq, int)):
         return False
     allowed = {
         "posting": {("pending", "delivered"),
@@ -188,25 +205,62 @@ def _valid(row, prior):
                   ("verdict", "verdict")},
         "verdict": set(),
     }
-    transition = (row.get("status"), row.get("event"))
+    event = row.get("event")
+    transition = (row.get("status"), event)
     if transition not in allowed.get(prior.get("status"), set()):
         return False
-    if row.get("event") == "delivered" and (
+    prior_tip = prior.get("tip")
+    if event == "retarget":
+        adopted = prior_tip or row.get("original_tip")
+        if not adopted or row.get("retarget_from") != adopted \
+                or row.get("retarget_to") != row.get("tip") \
+                or row.get("tip") == adopted or row.get("status") != prior.get("status"):
+            return False
+    elif event == "verdict":
+        expected = prior_tip or row.get("original_tip")
+        if row.get("ref") != prior.get("ref") or not expected \
+                or row.get("tip") != expected or row.get("reviewed_tip") != expected:
+            return False
+    elif row.get("ref") != prior.get("ref") or row.get("tip") != prior_tip:
+        return False
+    mutable = {
+        "delivered": {"status", "event", "seq", "last_updated",
+                      "delivery_ref", "delivery_error"},
+        "delivery-failed": {"status", "event", "seq", "last_updated",
+                            "delivery_error"},
+        "retry": {"status", "event", "seq", "last_updated", "delivery_error"},
+        "ack": {"status", "event", "seq", "last_updated", "ack_ref"},
+        "retarget": {"status", "event", "seq", "last_updated", "ref", "tip",
+                     "retarget_from", "retarget_to", "original_ref",
+                     "original_tip", "repo", "repo_id"},
+        "verdict": {"status", "event", "seq", "last_updated", "tip",
+                    "verdict_ref", "reviewed_tip", "original_ref",
+                    "original_tip", "repo", "repo_id"},
+    }[event]
+    if any(row.get(key) != prior.get(key) for key in set(row) | set(prior)
+           if key not in mutable):
+        return False
+    if event == "delivered" and (
             not row.get("delivery_ref") or
             row.get("delivery_ref") != row.get("message_id")):
         return False
-    if row.get("event") == "delivery-failed" and not row.get("delivery_error"):
+    if event == "delivery-failed" and not row.get("delivery_error"):
         return False
     if row.get("status") == "acked" and not row.get("ack_ref"):
         return False
     if row.get("status") == "verdict":
-        return bool(row.get("verdict_ref") and row.get("reviewed_tip")
-                    and row.get("reviewed_tip") == row.get("tip"))
+        return bool(row.get("verdict_ref") and row.get("reviewed_tip"))
     return True
 
 
+def snapshot():
+    """(logical rows, unavailable reason). Missing is known-empty; unsafe or
+    unreadable storage is UNKNOWN and must surface rather than read as zero."""
+    return eventledger.latest_checked(ledger_path(), _valid)
+
+
 def rows():
-    return eventledger.latest(ledger_path(), _valid)
+    return snapshot()[0]
 
 
 def history(rid):
@@ -246,17 +300,17 @@ def _base(recipient, lane, ref, note, deadline_s, repo, status, rid=None,
     deadline_s, err = _deadline(deadline_s)
     if err:
         return None, err
+    original_ref, err = _clean(ref, "ref", 256)
+    if err:
+        return None, "ref is required so the eventual verdict can bind an exact tip"
     info = _repo_info(repo)
-    original_ref = original_tip = None
-    if ref:
-        original_ref, err = _clean(ref, "ref", 256)
-        if err:
-            return None, err
-        if not info:
-            return None, "ref needs a Git working tree (--repo PATH)"
-        original_tip = _resolve_tip(info["repo"], original_ref)
-        if not original_tip:
-            return None, "ref is missing, ambiguous, or not a commit in this repository"
+    if not info:
+        return None, "ref needs a Git working tree (--repo PATH)"
+    original_tip = _resolve_tip(info["repo"], original_ref)
+    if not original_tip:
+        return None, "ref is missing, ambiguous, or not a commit in this repository"
+    if sender is not None and not _TOKEN.fullmatch(str(sender)):
+        return None, "sender must be an exact 1-64 character seat token"
     ts = pk.now_ts()
     row = {"v": 2, "id": rid or os.urandom(16).hex(), "seq": 0,
            "event": "posting" if status == "posting" else "add", "ts": ts,
@@ -313,13 +367,16 @@ def send(recipient, lane, message, ref, note=None, deadline_s=DEFAULT_DEADLINE_S
         return None, err, False
     if not key:
         canonical = "\0".join((staged["recipient"], staged["lane"],
-                                staged.get("tip") or "", message))
+                                staged["tip"], message, str(staged["deadline_s"]),
+                                staged.get("note") or ""))
         key = "auto:" + hashlib.blake2b(
             canonical.encode("utf-8"), digest_size=16).hexdigest()
-    staged["id"] = hashlib.blake2b(("dispatch\0" + key).encode("utf-8"),
-                                    digest_size=16).hexdigest()
+    namespace = "\0".join((staged["sender"], staged["repo_id"], key))
+    staged["id"] = hashlib.blake2b(
+        ("dispatch\0" + namespace).encode("utf-8"),
+        digest_size=16).hexdigest()
     staged["message_id"] = hashlib.blake2b(
-        ("message\0" + key).encode("utf-8"), digest_size=6).hexdigest()
+        ("message\0" + namespace).encode("utf-8"), digest_size=6).hexdigest()
     staged["message_hash"] = hashlib.blake2b(
         message.encode("utf-8"), digest_size=16).hexdigest()
     staged["dispatch_key"] = key
@@ -328,10 +385,14 @@ def send(recipient, lane, message, ref, note=None, deadline_s=DEFAULT_DEADLINE_S
     with eventledger.locked(path) as held:
         if not held:
             return None, "ledger unwritable (%s) — nothing sent" % path, False
-        existing = eventledger.latest(path, _valid).get(rid)
+        current, unavailable = eventledger.latest_checked(path, _valid)
+        if unavailable:
+            return None, "dispatch ledger unavailable: %s" % unavailable, False
+        existing = current.get(rid)
         if existing:
             same = all(existing.get(k) == staged.get(k) for k in
-                       ("recipient", "lane", "tip", "dispatch_key", "message_id",
+                       ("recipient", "lane", "tip", "note", "deadline_s",
+                        "repo_id", "sender", "dispatch_key", "message_id",
                         "message_hash"))
             if not same:
                 return None, "idempotency key already names different work", False
@@ -371,7 +432,8 @@ def send(recipient, lane, message, ref, note=None, deadline_s=DEFAULT_DEADLINE_S
 
 
 def _get_locked(rid):
-    return eventledger.latest(ledger_path(), _valid).get(str(rid or ""))
+    current, unavailable = snapshot()
+    return current.get(str(rid or "")), unavailable
 
 
 def mark_ack(rid, ref):
@@ -382,7 +444,9 @@ def mark_ack(rid, ref):
     with eventledger.locked(path) as held:
         if not held:
             return None, "ledger unwritable (%s) — ACK NOT recorded" % path
-        row = _get_locked(rid)
+        row, unavailable = _get_locked(rid)
+        if unavailable:
+            return None, "dispatch ledger unavailable: %s" % unavailable
         if not row:
             return None, "no such dispatch: %s (helm dispatch list)" % rid
         if row.get("status") == "verdict":
@@ -410,10 +474,13 @@ def _repo_binding(row, caller_repo=None):
             return None, None, None, "dispatch repository binding has no exact tip"
         return caller["repo"], row["tip"], {}, None
     legacy = row.get("ref")
-    tip = _resolve_tip(caller["repo"], legacy) if legacy else None
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", str(legacy or "")):
+        return None, None, None, ("legacy dispatch ref is mutable or not an object id; "
+                                  "open a new exact-ref dispatch")
+    tip = _resolve_tip(caller["repo"], legacy)
     if not tip:
-        return None, None, None, ("legacy dispatch ref is missing, ambiguous, or foreign; "
-                                  "open a new ref-bound dispatch")
+        return None, None, None, ("legacy dispatch object id is missing, ambiguous, or foreign; "
+                                  "open a new exact-ref dispatch")
     patch = {"repo": caller["repo"], "repo_id": caller["repo_id"],
              "original_ref": legacy, "original_tip": tip}
     return caller["repo"], tip, patch, None
@@ -424,7 +491,9 @@ def retarget(rid, old_ref, new_ref, repo=None):
     with eventledger.locked(path) as held:
         if not held:
             return None, "ledger unwritable (%s) — retarget NOT recorded" % path
-        row = _get_locked(rid)
+        row, unavailable = _get_locked(rid)
+        if unavailable:
+            return None, "dispatch ledger unavailable: %s" % unavailable
         if not row:
             return None, "no such dispatch: %s (helm dispatch list)" % rid
         if row.get("status") == "verdict":
@@ -463,7 +532,9 @@ def mark_verdict(rid, reviewed_ref, evidence, repo=None):
     with eventledger.locked(path) as held:
         if not held:
             return None, "ledger unwritable (%s) — verdict NOT recorded" % path
-        row = _get_locked(rid)
+        row, unavailable = _get_locked(rid)
+        if unavailable:
+            return None, "dispatch ledger unavailable: %s" % unavailable
         if not row:
             return None, "no such dispatch: %s (helm dispatch list)" % rid
         stored, current_tip, binding, err = _repo_binding(row, repo)
@@ -523,9 +594,26 @@ def oldest_overdue():
     return out[0] if out else None
 
 
+def stop_candidate():
+    """(row, kind, unavailable). Delivery retries outrank aged check-ins; an
+    unreadable ledger is explicit UNKNOWN, never silent zero obligations."""
+    current, unavailable = snapshot()
+    if unavailable:
+        return None, None, unavailable
+    ordered = sorted(current.values(),
+                     key=lambda r: (str(r.get("ts") or ""), r["id"]))
+    retry = next((r for r in ordered
+                  if r.get("status") in ("posting", "aborted")), None)
+    if retry:
+        return retry, "retry", None
+    now = time.time()
+    late = next((r for r in ordered if _is_overdue(r, now)), None)
+    return late, "overdue" if late else None, None
+
+
 USAGE = ("usage: helm dispatch send <recipient> <lane> <message...> --ref TIP "
          "[--key K] [--note N] [--deadline SECONDS] [--repo PATH] | add "
-         "<recipient> <lane> [--ref TIP] [--note N] [--deadline SECONDS] "
+         "<recipient> <lane> --ref TIP [--note N] [--deadline SECONDS] "
          "[--repo PATH] | ack <id> <ref> | retarget <id> <old-tip> <new-tip> "
          "[--repo PATH] | verdict <id> <reviewed-tip> <evidence> [--repo PATH] | "
          "list [--open|--overdue|--needs-retry] [--json]")
@@ -583,10 +671,10 @@ def cmd_dispatch(args):
         if err:
             print("helm dispatch: " + err, file=sys.stderr)
             return 2
+        if not opts.get("--ref"):
+            print("helm dispatch: %s requires --ref TIP" % verb, file=sys.stderr)
+            return 2
         if verb == "send":
-            if not opts.get("--ref"):
-                print("helm dispatch: send requires --ref TIP", file=sys.stderr)
-                return 2
             row, why, posted = send(
                 pos[0], pos[1], " ".join(pos[2:]), opts["--ref"],
                 note=opts.get("--note"), deadline_s=deadline,
@@ -637,6 +725,11 @@ def cmd_dispatch(args):
             " at %s" % row["tip"][:12] if row.get("tip") else ""))
         return 0
     if verb == "list":
+        current, unavailable = snapshot()
+        if unavailable:
+            print("helm dispatch: ledger unavailable; obligations UNKNOWN: %s"
+                  % unavailable, file=sys.stderr)
+            return 1
         flags = set(rest)
         if flags - {"--open", "--overdue", "--needs-retry", "--json"}:
             print(USAGE, file=sys.stderr)
@@ -644,15 +737,16 @@ def cmd_dispatch(args):
         if len(flags & {"--open", "--overdue", "--needs-retry"}) > 1:
             print("helm dispatch: choose one status filter", file=sys.stderr)
             return 2
+        selected = sorted(current.values(),
+                          key=lambda r: (str(r.get("ts") or ""), r["id"]))
         if "--overdue" in flags:
-            selected = overdue()
+            now = time.time()
+            selected = [r for r in selected if _is_overdue(r, now)]
         elif "--open" in flags:
-            selected = open_rows()
+            selected = [r for r in selected if r.get("status") in ACTIVE]
         elif "--needs-retry" in flags:
-            selected = needs_retry()
-        else:
-            selected = sorted(rows().values(),
-                              key=lambda r: (str(r.get("ts") or ""), r["id"]))
+            selected = [r for r in selected
+                        if r.get("status") in ("posting", "aborted")]
         if "--json" in flags:
             print(json.dumps(selected, ensure_ascii=False, indent=1))
             return 0

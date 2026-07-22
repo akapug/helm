@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Small append-only JSONL event-ledger primitive.
+"""Durable append-only JSONL event-ledger primitive.
 
-Writers serialize on a stable sibling lock, append one bounded JSON event with
-O_APPEND, fsync it, and roll a short write back before releasing the lock.
-Readers skip malformed, non-UTF8, oversized, and truncated tail rows.  Paths
-are fail-closed on symlinks; callers turn failures into their domain-specific
-fail-open result (an empty read or a loud refused mutation).
+Writers serialize on a stable sibling lock, repair only an incomplete tail,
+append one bounded event with O_APPEND, fsync file + new directory entries, and
+roll short writes back. Readers distinguish an absent ledger (known empty) from
+an unsafe/unreadable ledger (obligations unknown), while domain callers choose
+whether that becomes loud unavailable state or their legacy fail-open result.
 """
 import contextlib
 import json
@@ -19,19 +19,36 @@ def _flags(base):
     return base | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
+def _fsync_dir(path):
+    fd = os.open(path, _flags(os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _mkdirs(path):
+    missing = []
+    ancestor = path
+    while not os.path.lexists(ancestor):
+        missing.append(ancestor)
+        older = os.path.dirname(ancestor)
+        if older == ancestor:
+            break
+        ancestor = older
+    if os.path.realpath(ancestor) != ancestor:
+        raise OSError("ledger parent contains a symlink")
+    for child in reversed(missing):
+        parent = os.path.dirname(child)
+        os.mkdir(child, 0o700)
+        _fsync_dir(parent)
+
+
 def _prepare(path, create=False):
     p = os.path.abspath(path)
     parent = os.path.dirname(p)
     if create:
-        ancestor = parent
-        while not os.path.lexists(ancestor):
-            older = os.path.dirname(ancestor)
-            if older == ancestor:
-                break
-            ancestor = older
-        if os.path.realpath(ancestor) != ancestor:
-            raise OSError("ledger parent contains a symlink")
-        os.makedirs(parent, mode=0o700, exist_ok=True)
+        _mkdirs(parent)
     if os.path.realpath(parent) != parent:
         raise OSError("ledger parent contains a symlink")
     st = os.stat(parent, follow_symlinks=False)
@@ -50,15 +67,19 @@ def _prepare(path, create=False):
 
 @contextlib.contextmanager
 def locked(path):
-    """Yield True while holding the ledger's stable sibling lock, False when
-    path/lock setup fails.  A mutation never proceeds unlocked."""
+    """Yield True under the stable sibling lock, False when setup fails.
+    Mutations never proceed unlocked."""
     try:
         p = _prepare(path, create=True)
-        fd = os.open(p + ".lock", _flags(os.O_RDWR | os.O_CREAT), 0o600)
+        lock_path = p + ".lock"
+        new_lock = not os.path.exists(lock_path)
+        fd = os.open(lock_path, _flags(os.O_RDWR | os.O_CREAT), 0o600)
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError("ledger lock is not a regular file")
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError("ledger lock is not a private regular file")
         os.fchmod(fd, 0o600)
+        if new_lock:
+            _fsync_dir(os.path.dirname(lock_path))
         import fcntl
         fcntl.flock(fd, fcntl.LOCK_EX)
     except (OSError, ValueError):
@@ -76,11 +97,13 @@ def locked(path):
         os.close(fd)
 
 
-def events(path):
-    """Return valid complete dict events in append order.  Trouble is empty.
-    A final line without a newline is a torn write and is never replayed."""
-    out = []
-    fd = None
+def checked_events(path):
+    """Return (complete dict events, unavailable reason).
+
+    A missing file or parent is a known empty ledger. Unsafe paths, permission
+    failures, and other I/O errors are UNKNOWN, not zero obligations.
+    """
+    out, fd = [], None
     try:
         p = _prepare(path)
         fd = os.open(p, _flags(os.O_RDONLY))
@@ -98,55 +121,87 @@ def events(path):
                     continue
                 if isinstance(row, dict) and row.get("id"):
                     out.append(row)
-    except OSError:
-        pass
+        return out, None
+    except FileNotFoundError:
+        return [], None
+    except OSError as exc:
+        return [], "%s: %s" % (type(exc).__name__, exc)
     finally:
         if fd is not None:
             os.close(fd)
-    return out
 
 
-def latest(path, accept=None):
-    """Replay events to id -> latest snapshot.  ``accept(row, prior)`` may
-    reject corrupt transitions without erasing the preceding good snapshot."""
+def events(path):
+    return checked_events(path)[0]
+
+
+def latest_checked(path, accept=None):
+    events_, unavailable = checked_events(path)
+    if unavailable:
+        return {}, unavailable
     out = {}
-    for row in events(path):
+    for row in events_:
         rid = str(row.get("id"))
         prior = out.get(rid)
         if accept is None or accept(row, prior):
             out[rid] = row
-    return out
+    return out, None
+
+
+def latest(path, accept=None):
+    return latest_checked(path, accept)[0]
+
+
+def _trim_torn_tail(fd, size):
+    """Return the last complete-line boundary under the ledger lock."""
+    if not size or os.pread(fd, 1, size - 1) == b"\n":
+        return size
+    end = size
+    while end:
+        start = max(0, end - 8192)
+        chunk = os.pread(fd, end - start, start)
+        newline = chunk.rfind(b"\n")
+        if newline >= 0:
+            return start + newline + 1
+        end = start
+    return 0
 
 
 def append_unlocked(path, row):
     """Append one event while the caller holds ``locked(path)``.
 
-    Returns False on any failure.  A partial os.write is truncated back to the
-    pre-write size before the lock can be released, so replay never mistakes a
-    torn tail for an event.
+    Repairs a pre-existing torn tail, writes once, fsyncs, and rolls a partial
+    write back. A newly-created ledger is not acknowledged until its containing
+    directory entry has also been fsynced.
     """
-    fd = None
-    before = None
+    fd, before = None, None
     try:
         payload = (json.dumps(row, ensure_ascii=False, separators=(",", ":"))
                    + "\n").encode("utf-8")
         if len(payload) > MAX_EVENT_BYTES:
             return False
         p = _prepare(path, create=True)
-        fd = os.open(p, _flags(os.O_WRONLY | os.O_APPEND | os.O_CREAT), 0o600)
+        new_file = not os.path.exists(p)
+        fd = os.open(p, _flags(os.O_RDWR | os.O_APPEND | os.O_CREAT), 0o600)
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError("ledger is not a regular file")
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError("ledger is not a private regular file")
         os.fchmod(fd, 0o600)
-        before = st.st_size
+        before = _trim_torn_tail(fd, st.st_size)
+        if before != st.st_size:
+            os.ftruncate(fd, before)
+            os.fsync(fd)
         if os.write(fd, payload) != len(payload):
             os.ftruncate(fd, before)
             os.fsync(fd)
             return False
         try:
             os.fsync(fd)
+            if new_file:
+                _fsync_dir(os.path.dirname(p))
         except OSError:
             os.ftruncate(fd, before)
+            os.fsync(fd)
             raise
         return True
     except (OSError, TypeError, ValueError):
