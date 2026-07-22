@@ -3,7 +3,9 @@
 
 Skills are repo/engine artifacts, not helm-store knowledge — helm references
 and audits them (the census + dupes report feed the web UI's enable/disable
-surface later; mutation stays a deliberate verb, not a side effect).
+surface later; mutation stays a deliberate verb, not a side effect). That
+deliberate verb now exists: `helm skills sync` (skillsync.py) — the census
+observes the estate, sync makes it canonical.
 
 Homes scanned: the shared ~/.claude/skills, every cred-home's skills dir
 (deduped on realpath — several are symlinks to one target), and any extra
@@ -75,7 +77,12 @@ def dupes(skills):
 
 
 def cmd_skills(args):
-    """skills [dupes] — census of every skill home; hygiene flags. Read-only."""
+    """skills [dupes|sync] — census of every skill home; hygiene flags.
+    Read-only except `sync` (the deliberate distribution verb, dry-run
+    default)."""
+    if args and args[0] == "sync":
+        from . import skillsync
+        return skillsync.cmd_sync(args[1:])
     skills, bad = census()
     if args and args[0] == "dupes":
         name_dupes, content_dupes = dupes(skills)

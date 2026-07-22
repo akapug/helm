@@ -167,7 +167,7 @@ _VERB_HELP = {
     "interview": "interview — the five-minute know-your-user interview",
     "doctor": "doctor — health check, read-only",
     "gc": "gc [--dry | --apply] — declared retention budgets over the derived exhaust (dry-run default; authored content never touched)",
-    "skills": "skills [dupes] — skills census across every home, read-only",
+    "skills": "skills [dupes|sync [--apply]] — census (read-only) + sync: one canonical skills source symlinked into EVERY claude-code config dir (credhomes + seats; dry-run default)",
     "evolve": "evolve — one observe/propose cycle (proposes, never mutates)",
     "mentor": "mentor observe <project> [--since 7d]|teach <project> \"<id> | <steer>\" [--attest]|review <project>|log — the inception actuator: critique brief, taught project reflexes with provenance, before/after review (teach is the one write; the rest read-only)",
     "sessions": "sessions [<project>] — every local session, all harnesses; resume in one paste",

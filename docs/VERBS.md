@@ -1005,6 +1005,30 @@ Census of every skill across every home, read-only. `dupes` flags multi-homed
 names (identical-everywhere = safe to consolidate vs diverged), same-content-
 different-name copies, and hygiene issues (e.g. a skill dir with no SKILL.md).
 
+### `helm skills sync [--apply]`
+Universal skill distribution — the deliberate mutation verb the census
+anticipated. One canonical skills source (the MC instance-home hub — a
+gitignored symlink farm into the MC repo, never the repo's own tracked dir;
+`HELM_SKILLS_CANONICAL` overrides), and every claude-code config dir — each real
+credhome under `~/.claude-homes` (alias symlinks fold onto their target), the
+default `~/.claude`, every seat and seat-instance `CLAUDE_CONFIG_DIR` — becomes
+a whole-dir symlink to it. Two phases, dry-run by default:
+
+1. **merge** — union every stray (an entry a REAL skills dir holds that
+   canonical lacks, or that outnews canonical's copy — newest-wins) into
+   canonical; displaced canonical entries land in the backup root first.
+2. **wire** — repoint each config dir's `skills/`. A real dir is MOVED whole
+   into `~/.skills-premerge-backup/<home>/` (the backup IS the original), the
+   symlink lands atomically (tmp + rename), and a post-swap superset check
+   proves every previously-visible skill name is still visible — or the move
+   rolls back. Indirect chains are normalized to direct links.
+
+Idempotent: a wired estate reports zero changes, so re-running after minting a
+new credhome (or adding a skill to canonical) is the whole maintenance story.
+Seat mint (`helm seat add`) links new seats to the same canonical at birth.
+This kills the stranding class where a skill dropped into one home's private
+farm stayed invisible everywhere else (the 2026-07-21 `i-have-audhd` case).
+
 ## substrate — the attested-truth leg
 
 ### `helm cell <join|accept|send|recv|heartbeat|roster|status>`

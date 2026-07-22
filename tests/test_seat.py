@@ -503,14 +503,18 @@ class SeatTest(unittest.TestCase):
 
     def test_seat_gets_host_skills(self):
         """A seat's fresh config dir has no skills of its own, so seat agents
-        couldn't /learn — _write_launch_assets shares the minting host's skills
-        in via symlink (resolved from CLAUDE_CONFIG_DIR); a real skills dir on a
-        seat is never clobbered."""
+        couldn't /learn — _write_launch_assets links skills in: canonical-first
+        (skillsync), and when NO canonical exists on the host (pinned here via
+        a dead HELM_SKILLS_CANONICAL) it falls back to the minting host's
+        CLAUDE_CONFIG_DIR skills; a real skills dir on a seat is never
+        clobbered at mint (that repair is `helm skills sync`'s job)."""
         host = os.path.join(self.tmp, "host-config")
         os.makedirs(os.path.join(host, "skills", "learn"))
         d = seat.seat_dir("codex")
         os.makedirs(d, exist_ok=True)
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
+        no_deck = {"CLAUDE_CONFIG_DIR": host,
+                   "HELM_SKILLS_CANONICAL": os.path.join(self.tmp, "no-such-deck")}
+        with mock.patch.dict(os.environ, no_deck):
             seat._write_launch_assets("codex", d)
         link = os.path.join(d, "claude", "skills")
         self.assertTrue(os.path.islink(link))
@@ -521,7 +525,7 @@ class SeatTest(unittest.TestCase):
         os.unlink(link)
         os.makedirs(link)
         open(os.path.join(link, "own.md"), "w").close()
-        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}):
+        with mock.patch.dict(os.environ, no_deck):
             seat._write_launch_assets("codex", d)
         self.assertFalse(os.path.islink(link))
         self.assertTrue(os.path.exists(os.path.join(link, "own.md")))
