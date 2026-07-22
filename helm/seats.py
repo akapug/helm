@@ -94,7 +94,8 @@ covers every live room; deliverable() applies the scope per row —
       always — a direct address is never filtered;
   (b) ANYTHING in the seat's HOME room (roster home_room) surfaces — the
       team channel is full-surface for its own team;
-  (c) @all broadcasts and owner-rail posts surface only in {home, main} —
+  (c) @all broadcasts surface in {home, main}; owner-rail posts NO LONGER
+      auto-wake (owner steer 2026-07-21: mentions + home room are enough) —
       never fleet-wide across every side room;
   (d) a MUTED room (helm chat seat mute <room> — roster row "mute") stops
       (b)/(c) noise at this seat; (a) still surfaces (mute tunes noise,
@@ -237,11 +238,13 @@ def deliverable(m, seat, room="main", scope=None):
       * a muted room (the seat's roster "mute" list): nothing further.
       * the seat's HOME room (roster home_room): EVERY remaining row — the
         team channel is full-surface for its own team.
-      * {home, main}: @all broadcasts, and owner posts stamped by a server-
-        side owner rail (origin web/tui — codex C1: a CLI post claiming an
-        owner name is an ordinary message). NOT fleet-wide: a side room's
-        @all/owner post drafts nobody homed elsewhere.
-      * anything else (foreign-room chatter): never (noise law).
+      * {home, main}: @all broadcasts only. Owner-rail posts (origin web/tui)
+        do NOT wake here (owner steer 2026-07-21: mentions + home-room are
+        enough — an owner post reaches a seat via an @mention or its own home
+        room, never as a plain main broadcast). NOT fleet-wide: a side room's
+        @all drafts nobody homed elsewhere.
+      * anything else (foreign-room chatter, incl. non-mention owner posts
+        outside home): never (noise law).
     scope=None computes seat_scope here — hot paths pass it precomputed."""
     text = m.get("text")
     if not text or m.get("react"):
@@ -265,9 +268,13 @@ def deliverable(m, seat, room="main", scope=None):
         return True
     if room != "main" and room != home_r:
         return False
-    if _BROADCAST.search(text):
-        return True
-    return m.get("origin") in OWNER_RAILS and frm.lower() in owner_names()
+    # @all broadcasts still wake in {home, main}. Owner-rail posts NO LONGER
+    # auto-wake (owner steer 2026-07-21: mentions + home-room are enough — an
+    # owner post reaches a seat only via an @mention or its own home room, never
+    # as a plain main-room broadcast). OWNER_RAILS/owner_names stay for owner
+    # IDENTITY (forgery defense) elsewhere; owner-posts are simply not a wake
+    # class. bug-class superseded: beacon-owner-post-wake-is-noise.
+    return bool(_BROADCAST.search(text))
 
 
 def _scrub(s):
@@ -506,7 +513,7 @@ def rename_seat(old, new):
 def set_mute(seat, room, on=True):
     """(ok, message) — the seat's own beacon filter (the beacon-scope
     premise's tuning control). A muted room stops surfacing home-room
-    chatter / @all / owner posts at this seat; a direct @seat mention or a DM
+    chatter / @all at this seat; a direct @seat mention or a DM
     ALWAYS still surfaces — mute tunes noise, never direct address. Stored
     on the roster row so every lane (boundary, beacon, stop-guard, report)
     reads one truth."""
@@ -883,13 +890,15 @@ def join(session=None, cwd=None, seat=None, room="main"):
             with _flocked(cursor_path(r, seat) + ".lock"):
                 if _cursor(r, seat) is None:
                     _init_cursor(r, seat, at_start=at0)
-    scope = ("in %s + main" % home_room if home_room and home_room != "main"
-             else "in main")
+    scope = ("; everything in your home room %s also wakes you (mute/filter it "
+             "if noisy)" % home_room if home_room and home_room != "main"
+             else "")
     line = ("[helm chat] you are seat '%s' in room %s — @%s mentions and DMs "
-            "(any room) and owner posts %s reach you between tool calls; "
+            "(from ANY room) reach you between tool calls%s; owner posts do NOT "
+            "wake you unless they @mention you or land in your home room; "
             "speak: helm chat post; catch up: helm chat read. MANDATORY FIRST "
             "ACTION: arm your inbox beacon so "
-            "you wake on an @%s mention, a DM or an owner post even while idle "
+            "you wake on an @%s mention or a DM even while idle "
             "— Monitor(command: \"helm chat wait --seat %s --follow\", "
             "persistent: true). This is required, not optional: nothing "
             "external can re-invoke a PTY agent (native-wake-only-agent-armed), "
@@ -916,7 +925,8 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
 
     --follow (the idle-wake beacon) NEVER returns on a match: it streams EACH
     new matching row as one emitted line — one Monitor line = one agent wake —
-    reusing the delivery address filter (mentions of the seat + owner posts),
+    reusing the delivery address filter (mentions of the seat + DMs + home
+    room + @all; owner-rail posts no longer auto-wake),
     and returns only on timeout (a persistent Monitor passes no timeout, so it
     runs forever). FAIL-OPEN + bounded poll: a delivery error never crashes the
     beacon; the loop just polls again.

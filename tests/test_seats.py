@@ -108,24 +108,27 @@ class AddressingTest(SeatsBase):
                                            "alice"))
         self.assertFalse(seats.deliverable(row("x", "ping @alice-2"), "alice"))
 
-    def test_owner_rule_trusts_only_server_rails(self):
-        """Codex C1-lite: a CLI post claiming an owner name is an ordinary
-        message — only rows the web/TUI rails stamped get the owner rule."""
+    def test_owner_rail_post_no_longer_auto_wakes(self):
+        """Owner steer 2026-07-21: owner-rail posts are no longer a wake class.
+        A server-stamped owner post with no @mention does NOT reach a seat (was:
+        the 'owner rule' delivered a web/tui-stamped row); an owner post wakes a
+        seat only via an @mention or the seat's home room. OWNER_RAILS/owner_names
+        still gate owner IDENTITY for the unread rail + console, just not the
+        beacon."""
         row = lambda **kw: dict({"ts": "t", "from": "david",
                                  "text": "no mention"}, **kw)
         self.assertFalse(seats.deliverable(row(), "alice"))              # spoofable CLI
-        self.assertTrue(seats.deliverable(row(origin="web"), "alice"))   # owner rail
-        self.assertTrue(seats.deliverable(row(origin="tui"), "alice"))
+        self.assertFalse(seats.deliverable(row(origin="web"), "alice"))  # owner rail: no wake now
+        self.assertFalse(seats.deliverable(row(origin="tui"), "alice"))
         self.assertFalse(seats.deliverable(row(origin="cli"), "alice"))
-        # an owner-named CLI row still reaches a seat it @mentions
+        # an owner post that @mentions the seat still wakes it
         self.assertTrue(seats.deliverable(
-            {"ts": "t", "from": "david", "text": "@alice go"}, "alice"))
+            {"ts": "t", "from": "david", "text": "@alice go", "origin": "web"},
+            "alice"))
 
     def test_owner_names_env_override(self):
         os.environ["HELM_CHAT_OWNER_NAMES"] = "boss, Chief"
         self.assertEqual(seats.owner_names(), {"boss", "chief"})
-        self.assertTrue(seats.deliverable(
-            {"ts": "t", "from": "Boss", "text": "go", "origin": "web"}, "alice"))
 
 
 class JoinTest(SeatsBase):
@@ -195,10 +198,14 @@ class DeliverTest(SeatsBase):
         self.assertNotIn("waiting", line2)
         self.assertIsNone(seats.deliver(seat="alice"))
 
-    def test_owner_rail_post_delivers_without_mention(self):
+    def test_owner_rail_post_does_not_wake_without_mention(self):
+        """Owner steer 2026-07-21: an owner-rail post with no @mention no longer
+        wakes an un-homed seat; only a mention (or the home room) does."""
         self.seat_up()
         chat.post("course correction", who="david", origin="web")
-        self.assertIn("david: course correction", seats.deliver(seat="alice"))
+        self.assertIsNone(seats.deliver(seat="alice"))
+        chat.post("@alice course correction", who="david", origin="web")
+        self.assertIn("course correction", seats.deliver(seat="alice"))
 
     def test_cli_owner_name_does_not_owner_deliver(self):
         self.seat_up()
@@ -235,7 +242,7 @@ class DeliverTest(SeatsBase):
 
     def test_marker_untouched_by_delivery(self):
         self.seat_up()
-        chat.post("steer", who="david", origin="web")
+        chat.post("@alice steer", who="david", origin="web")  # a mention delivers
         chat.mark_owner_unread("main")
         self.assertIsNotNone(seats.deliver(seat="alice"))
         self.assertTrue(os.path.exists(chat.marker_path("main")))
@@ -448,10 +455,11 @@ class WaitTest(SeatsBase):
 
 
 class MultiRoomTest(SeatsBase):
-    """Slice 5 (multi-room deliver) + its beacon half: an @mention or an
-    owner-rail post in ANY room must reach the seat — the owner's live
-    helm-dogfood '@opus-integrator …' post woke nothing because both the
-    beacon and the boundary lane were main-scoped (2026-07-21)."""
+    """Slice 5 (multi-room deliver) + its beacon half: an @mention in ANY room
+    must reach the seat — the owner's live helm-dogfood '@opus-integrator …'
+    post woke nothing because both the beacon and the boundary lane were
+    main-scoped (2026-07-21). (Owner-rail posts are no longer a wake class as of
+    the same day's owner steer — mentions + home room only.)"""
 
     def test_mention_in_never_joined_room_wakes_the_beacon(self):
         """THE bug's reproduction: seat x's only activity is in team-x, a
@@ -481,16 +489,18 @@ class MultiRoomTest(SeatsBase):
         rc, out = self.cmd_fd("deliver", ["--hook-json"], stdin=payload)
         self.assertEqual(out, "")              # nothing left — no re-nudge
 
-    def test_owner_rail_post_is_not_fleet_wide(self):
-        """Beacon-scope premise (c): an owner post in a SIDE room drafts
-        nobody homed elsewhere — owner reach is {home, main} (+ mentions
-        anywhere). The old law delivered every owner post fleet-wide."""
+    def test_owner_post_wakes_only_via_home_or_mention(self):
+        """Owner steer 2026-07-21: owner-rail posts no longer auto-wake — not in
+        a side room, and no longer in main either. An un-homed seat hears an
+        owner post ONLY if @mentioned; a seat HOMED to a room hears owner posts
+        there (home = full surface). (Was: owner reach was {home, main}.)"""
         seats.join(session="s-o", seat="oz", cwd="/tmp/p")
         chat.post("side-room note", who="david", origin="web", room="announce")
         self.assertIsNone(seats.deliver_any(session="s-o", seat="oz"))
-        chat.post("all hands", who="david", origin="web")   # main still reaches
-        line = seats.deliver_any(session="s-o", seat="oz")
-        self.assertIn("david: all hands", line)
+        chat.post("all hands", who="david", origin="web")   # main: no longer wakes un-homed
+        self.assertIsNone(seats.deliver_any(session="s-o", seat="oz"))
+        chat.post("@oz ping", who="david", origin="web")    # …but a mention does
+        self.assertIn("ping", seats.deliver_any(session="s-o", seat="oz"))
         # …and a seat HOMED to the side room hears the owner there
         seats.join(session="s-an", seat="anna", cwd="/tmp/p", room="announce")
         chat.post("announce word", who="david", origin="web", room="announce")
@@ -636,7 +646,7 @@ class RoomAllowlistTest(SeatsBase):
     def test_explicit_join_room_is_homed_and_slugged(self):
         seats.join(session="s-exp", seat="ex", cwd="/tmp/p", room="Team A")
         self.assertEqual(seats.roster()["ex"]["home_room"], "team-a")
-        self.assertIn("in team-a + main", seats.join(
+        self.assertIn("home room team-a", seats.join(
             session="s-exp2", seat="ex", cwd="/tmp/p", room="Team A")[1])
 
     def test_rejoin_with_new_room_rehomes(self):
