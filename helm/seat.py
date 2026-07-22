@@ -150,6 +150,10 @@ _USAGE = """usage: helm seat <verb> [args]
                                       (freshest launch.sh + --resume/--continue)
   smoke <family> [--multi]            the 4-leg acceptance gate (prompt/tool/subagent/whisper);
                                       --multi adds the mixed-model fan-out leg (conductor-log-verified)
+  autocompact [--threshold N] [--once]  proxy-seat context watchdog: read each
+                                      seat's context%%, inject /compact at the
+                                      threshold BEFORE the 100%% hang (latched;
+                                      --install-timer for the cadence)
   list | status                       seats, proxy liveness, cred expiry
   doctor                              binary + cred + seat health, read-only
 families: %s""" % ", ".join(sorted(FAMILIES))
@@ -1298,6 +1302,12 @@ def _doctor(args):
         print("codex cred: %s (newest valid, access token until %s)"
               % (src, _rfc3339(exp)))
     _status([])
+    try:      # proxy-seat context% + autocompact latch — read-only visibility
+        from . import autocompact
+        for ln in autocompact.report_lines():
+            print(ln)
+    except Exception as e:
+        print("autocompact: report unavailable (%s)" % e)
     return 0 if b and c and not err else 1
 
 
@@ -1316,6 +1326,9 @@ def cmd_seat(args):
         return _status(rest)
     if verb == "doctor":
         return _doctor(rest)
+    if verb == "autocompact":
+        from . import autocompact
+        return autocompact.cmd_autocompact(rest)
     if verb == "resume":
         if not rest:
             print("usage: helm seat resume <seat>", file=sys.stderr)

@@ -114,7 +114,11 @@ class OrcaAdapter(_CLIAdapter):
 
     def list(self):
         r = self._run(["terminal", "list", "--json"])
+        # preview (the pane's visible tail) rides along free — callers that
+        # can't rely on titles (manually-launched seats get auto-summary
+        # titles) match a seat's HELM_CHAT_NAME=<seat> in it instead.
         return [{"handle": t.get("handle"), "title": t.get("title") or "",
+                 "preview": t.get("preview") or "",
                  "status": "connected" if t.get("connected") else "disconnected"}
                 for t in (r.get("terminals") or [])]
 

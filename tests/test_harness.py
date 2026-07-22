@@ -90,8 +90,10 @@ class OrcaAdapterTest(unittest.TestCase):
                 {"handle": "t2", "connected": False}]})):
             rows = self.ad.list()
         self.assertEqual(rows, [
-            {"handle": "t1", "title": "codex", "status": "connected"},
-            {"handle": "t2", "title": "", "status": "disconnected"}])
+            {"handle": "t1", "title": "codex", "preview": "",
+             "status": "connected"},
+            {"handle": "t2", "title": "", "preview": "",
+             "status": "disconnected"}])
 
     def test_nonzero_rc_raises(self):
         with self._patch("", rc=1, stderr="boom"):
