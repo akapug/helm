@@ -9,21 +9,21 @@ the mechanics (read/reshape/rehome/shrink — ls/show/doctor/prune/port/resume);
 helm owns the POLICY:
 
   LAW 1 — never two live copies of one session. Before printing any launch
-    line, scan live claude pids for an open copy of the sid (argv --resume).
-    The built-in double-open detector is BLIND to child-stamped panes (no
-    heartbeat registers) — so this scan reads /proc directly. The inherited
-    stamp SID is an ancestor identity, never the child's own session. Found:
-    print the close-first instruction, never the incantation.
+    line, scan live Claude pids; prefer Claude Code's procStart-bound pid record,
+    then canonical argv/who/cwd evidence. Child-stamped panes are included even
+    when no heartbeat registers. The inherited stamp SID is an ancestor, never
+    the child's own session. Found or conservatively possible: close/verify
+    first, never print the incantation.
   LAW 2 — prepare + print, never launch. checkpoint/port/rescue end at a
     PRINTED incantation; only `resume --launch` spawns, and only after law 1.
 
-THE PERSISTENCE SURFACE (child-stamp-kills-seat-persistence): a pane stamped
-CLAUDE_CODE_CHILD_SESSION=1 (inherited from a claude-descended spawner, e.g.
-the orca daemon restarted inside a Bash tool) runs with transcript persistence
-silently OFF — memory-only, unrecoverable. `ls`/`doctor`/`doctor-panes` surface
-these; every printed incantation bakes CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1
-(the escape hatch) so a resume from a stamped pane can't re-trap. Strip-only is
-the mint default (seat.CHILD_STAMP_VARS); FORCE is the deliberate rescue tool.
+THE PERSISTENCE SURFACE: transcript presence is the verdict. A child stamp is
+only a reason to inspect (it has historically disabled persistence); stamped
+children that are writing transcripts are persisted, while unstamped panes with
+no transcript are memory-only too. Unresolved SIDs remain UNKNOWN. `ls` /
+`doctor` / `doctor-panes` surface all three states; printed incantations still
+strip inherited stamps and bake CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 so a
+resume cannot re-enter the known trap.
 
 EXPERTS (expert-sessions-beat-fresh-research): sessions are also the EXPERTISE
 layer — over time, querying/resuming a preserved expert beats fresh research.
@@ -42,6 +42,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -51,6 +52,11 @@ from . import home, pk
 CV = "cv"
 FORCE_VAR = "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"
 FORCE = FORCE_VAR + "=1"
+PROC = "/proc"
+_PROC_FILE_MAX = 4 * 1024 * 1024
+_SESSION_RECORD_MAX = 64 * 1024
+_SID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 # ---------------------------------------------------------------------------
@@ -128,13 +134,10 @@ def _cv_launch(sid):
 # ---------------------------------------------------------------------------
 
 def _who_holder_sid(row):
-    """Safety attribution from ``helm who``: exact wins; one sole cwd
-    candidate remains a possible holder even after its 5-minute freshness
-    window. Multiple candidates require the conservative candidate set."""
-    if row.get("session"):
-        return row["session"]
-    candidates = row.get("session_candidates") or []
-    return candidates[0] if len(candidates) == 1 else None
+    """Only ``helm who``'s fresh exact attribution is identity. Historical cwd
+    candidates remain possible holders; promoting a sole stale file invents a SID."""
+    exact = row.get("session")
+    return exact if isinstance(exact, str) and _SID_RE.fullmatch(exact) else None
 
 
 def _cwd_session_ids(home_dir, cwd):
@@ -149,16 +152,269 @@ def _cwd_session_ids(home_dir, cwd):
     except OSError:
         return []
     suffix = ".jsonl"
-    return [n[:-len(suffix)] for n in names
-            if n.endswith(suffix) and len(n) == 36 + len(suffix)]
+    return sorted(sid for n in names if n.endswith(suffix)
+                  for sid in [n[:-len(suffix)]] if _SID_RE.fullmatch(sid))
+
+
+def _starttime_from_stat(raw):
+    """Field 22 from one /proc/<pid>/stat payload. ``comm`` is parenthesized
+    but may itself contain spaces and ``)`` characters, so field counting starts
+    after the LAST close-paren. Return the exact decimal token Claude records."""
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "replace")
+    _comm, sep, tail = raw.rpartition(b")")
+    if not sep:
+        return None
+    fields = tail.split()
+    if len(fields) <= 19:
+        return None
+    value = fields[19]
+    return value.decode("ascii") if value.isdigit() else None
+
+
+def _proc_bytes(pid, name):
+    with open(os.path.join(PROC, str(pid), name), "rb") as f:
+        raw = f.read(_PROC_FILE_MAX + 1)
+    if len(raw) > _PROC_FILE_MAX:
+        raise OSError("proc file exceeds bounded census read")
+    return raw
+
+
+def _proc_start(pid):
+    try:
+        return _starttime_from_stat(_proc_bytes(pid, "stat"))
+    except OSError:
+        return None
+
+
+def _proc_matches(pid, start, cmdline, environ=None, cwd=None):
+    """The same pid generation and process image still brackets the reads.
+    starttime catches exit/PID reuse; cmdline+environ catch exec; cwd prevents
+    inference from composing two working-directory moments."""
+    try:
+        if _proc_start(pid) != start or _proc_bytes(pid, "cmdline") != cmdline:
+            return False
+        if environ is not None and _proc_bytes(pid, "environ") != environ:
+            return False
+        return cwd is None or os.readlink(os.path.join(PROC, str(pid), "cwd")) == cwd
+    except OSError:
+        return False
+
+
+def _selected_environ(raw):
+    keys = set(_stamp_vars()) | {FORCE_VAR, "CLAUDE_CONFIG_DIR", "HOME"}
+    out = {}
+    for kv in raw.split(b"\0"):
+        key, sep, value = kv.partition(b"=")
+        if not sep:
+            continue
+        try:
+            name = key.decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        if name not in keys:
+            continue
+        try:
+            out[name] = value.decode("utf-8")
+        except UnicodeDecodeError:
+            out[name] = None
+    return out
+
+
+def _proc_snapshot(pid):
+    """One same-uid Claude process, bracketed before later record/who reads.
+    Optional environ/cwd failures keep a visible UNKNOWN-capable row."""
+    base = os.path.join(PROC, str(pid))
+    try:
+        uid = os.stat(base).st_uid
+        start = _proc_start(pid)
+        if uid != os.geteuid() or not start:
+            return None
+        if _proc_bytes(pid, "comm").strip() != b"claude":
+            return None
+        cmdline = _proc_bytes(pid, "cmdline")
+    except OSError:
+        return None
+    try:
+        environ_raw = _proc_bytes(pid, "environ")
+        environ = _selected_environ(environ_raw)
+    except OSError:
+        environ_raw = environ = None
+    try:
+        cwd = os.readlink(os.path.join(base, "cwd"))
+    except OSError:
+        cwd = None
+    if not _proc_matches(pid, start, cmdline, environ_raw, cwd):
+        return None
+    return {"pid": pid, "uid": uid, "start": start, "cmdline": cmdline,
+            "environ": environ_raw,
+            "argv": cmdline.decode("utf-8", "replace").split("\0"),
+            "env": environ, "cwd": cwd}
+
+
+def _resume_sid(argv):
+    """One unambiguous full UUID from argv. Bare/trailing ``--resume``, a flag
+    consumed as its value, prefixes, and conflicting repeats are UNKNOWN — a
+    false holder is worse than falling through to another rung."""
+    found = []
+    for i, arg in enumerate(argv):
+        value = None
+        if arg == "--resume" and i + 1 < len(argv):
+            value = argv[i + 1]
+        elif arg.startswith("--resume="):
+            value = arg.split("=", 1)[1]
+        if isinstance(value, str) and _SID_RE.fullmatch(value):
+            found.append(value)
+    unique = sorted(set(found))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _safe_owned_dir(value, uid):
+    return (stat.S_ISDIR(value.st_mode) and value.st_uid == uid
+            and not value.st_mode & stat.S_IWOTH)
+
+
+def _safe_owned_record(value, uid):
+    return (stat.S_ISREG(value.st_mode) and value.st_uid == uid
+            and value.st_nlink == 1
+            and not value.st_mode & stat.S_IWOTH
+            and value.st_size <= _SESSION_RECORD_MAX)
+
+
+def _config_root(config_dir, home_dir, uid):
+    """Canonical process config home. Explicit config paths must already be
+    absolute; ``~`` is never expanded through the inspecting process's HOME.
+    Child paths are checked separately so a missing record store does not
+    suppress later cwd inference from a trusted home."""
+    if config_dir:
+        raw = config_dir
+    else:
+        base = home_dir if home_dir is not None else os.path.expanduser("~")
+        if not isinstance(base, str) or not os.path.isabs(base):
+            return None
+        raw = os.path.join(base, ".claude")
+    if not isinstance(raw, str) or "\0" in raw or not os.path.isabs(raw):
+        return None
+    try:
+        root = os.path.realpath(raw)
+        rst = os.stat(root)
+    except (OSError, ValueError):
+        return None
+    return root if _safe_owned_dir(rst, uid) else None
+
+
+def _record_unchanged(path, before):
+    try:
+        current = os.lstat(path)
+    except OSError:
+        return False
+    return (_safe_owned_record(current, before.st_uid)
+            and (current.st_dev, current.st_ino, current.st_mode, current.st_size,
+                 current.st_mtime_ns, current.st_ctime_ns)
+            == (before.st_dev, before.st_ino, before.st_mode, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns))
+
+
+def _read_session_record(root, pid, uid, proc_start):
+    """Read one bounded, owner-bound regular record without following links.
+    The opened inode and pathname must still agree after the read, so atomic
+    replacement or an in-place rewrite during the census degrades to UNKNOWN."""
+    sessions = os.path.join(root, "sessions")
+    path = os.path.join(sessions, "%d.json" % pid)
+    try:
+        sst = os.lstat(sessions)
+    except FileNotFoundError:
+        return None, "record-missing"
+    except OSError:
+        return None, "record-unreadable"
+    if not _safe_owned_dir(sst, uid):
+        return None, "record-unsafe"
+    try:
+        lst = os.lstat(path)
+    except FileNotFoundError:
+        return None, "record-missing"
+    except OSError:
+        return None, "record-unreadable"
+    if not _safe_owned_record(lst, uid):
+        return None, "record-unsafe"
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) \
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+        try:
+            before = os.fstat(fd)
+            if not _safe_owned_record(before, uid):
+                return None, "record-unsafe"
+            raw = b""
+            while len(raw) <= _SESSION_RECORD_MAX:
+                chunk = os.read(fd, min(8192, _SESSION_RECORD_MAX + 1 - len(raw)))
+                if not chunk:
+                    break
+                raw += chunk
+            after = os.fstat(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None, "record-unreadable"
+    before_id = (before.st_dev, before.st_ino, before.st_mode, before.st_size,
+                 before.st_mtime_ns, before.st_ctime_ns)
+    after_id = (after.st_dev, after.st_ino, after.st_mode, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns)
+    if (not _safe_owned_record(after, uid) or len(raw) > _SESSION_RECORD_MAX
+            or before_id != after_id or not _record_unchanged(path, before)):
+        return None, "record-replaced"
+    try:
+        rec = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, "record-corrupt"
+    if not isinstance(rec, dict) or type(rec.get("pid")) is not int \
+            or rec.get("pid") != pid:
+        return None, "record-schema"
+    want = rec.get("procStart")
+    sid = rec.get("sessionId")
+    if not isinstance(want, str) or not want.isdigit() \
+            or not isinstance(sid, str) or not _SID_RE.fullmatch(sid):
+        return None, "record-schema"
+    if want != proc_start:
+        return None, "record-stale"
+    return sid, "record-ok"
+
+
+def _session_record(pid, config_dir, home_dir, uid, proc_start):
+    root = _config_root(config_dir, home_dir, uid)
+    if not root:
+        return None, "config-untrusted", None
+    sid, reason = _read_session_record(root, pid, uid, proc_start)
+    return sid, reason, root
+
+
+def _sid_from_session_file(pid, config_dir, home_dir=None, uid=None,
+                           proc_start=None):
+    """Compatibility seam for tests/callers that need only the proven SID."""
+    try:
+        uid = os.stat(os.path.join(PROC, str(pid))).st_uid if uid is None else uid
+    except OSError:
+        return None
+    proc_start = proc_start or _proc_start(pid)
+    if not proc_start or uid != os.geteuid():
+        return None
+    return _session_record(pid, config_dir, home_dir, uid, proc_start)[0]
 
 
 def _proc_claude_rows():
-    """Every live pid whose argv[0] names claude. Row: {pid, resume, session,
-    possible_sessions, child, ancestor_sid8, force}. The stamp + --resume come from
-    /proc/<pid>/{environ,cmdline} directly. Fresh top-level sessions have no
-    --resume argv, so exact attribution composes the existing ``helm who``
-    layer; ambiguous candidates stay unresolved."""
+    """Every same-uid live Claude process. Resolution ladder, strongest first:
+    procStart-bound pid record -> unambiguous full ``--resume`` UUID -> exact
+    ``helm who`` attribution -> cwd candidate set. Every per-pid read is
+    bracketed; one bad record only demotes its own rung."""
+    snapshots = []
+    try:
+        pids = sorted((int(p) for p in os.listdir(PROC) if p.isdigit()))
+    except OSError:
+        pids = []
+    for pid in pids:
+        snap = _proc_snapshot(pid)
+        if snap:
+            snapshots.append(snap)
     try:
         from . import who
         who_rows = {r["pid"]: r for r in who.scan(accounts=[])
@@ -167,58 +423,54 @@ def _proc_claude_rows():
         who_rows = {}
     cwd_candidates = {}
     rows = []
-    for pid in (p for p in os.listdir("/proc") if p.isdigit()):
-        base = os.path.join("/proc", pid)
-        try:
-            with open(os.path.join(base, "cmdline"), "rb") as f:
-                argv = f.read().decode("utf-8", "replace").split("\0")
-        except OSError:
-            continue
-        if not argv or "claude" not in os.path.basename(argv[0]):
-            continue
-        env = {}
-        try:
-            with open(os.path.join(base, "environ"), "rb") as f:
-                for kv in f.read().decode("utf-8", "replace").split("\0"):
-                    k, sep, v = kv.partition("=")
-                    if sep and k in _stamp_vars() + (  # noqa: E731
-                            "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE",):
-                        env[k] = v
-        except OSError:
-            pass
-        resume = None
-        for i, a in enumerate(argv):
-            if a == "--resume" and i + 1 < len(argv):
-                resume = argv[i + 1]
-            elif a.startswith("--resume="):
-                resume = a.split("=", 1)[1]
+    for snap in snapshots:
+        pid, selected = snap["pid"], snap["env"]
+        env = selected or {}
+        invalid_home = (("CLAUDE_CONFIG_DIR" in env
+                         and env["CLAUDE_CONFIG_DIR"] is None)
+                        or (not env.get("CLAUDE_CONFIG_DIR") and "HOME" in env
+                            and env["HOME"] is None))
+        if selected is None:
+            declared, reason, root = None, "environ-unreadable", None
+        elif invalid_home:
+            declared, reason, root = None, "config-untrusted", None
+        else:
+            declared, reason, root = _session_record(
+                pid, env.get("CLAUDE_CONFIG_DIR"), env.get("HOME"),
+                snap["uid"], snap["start"])
+        resume = _resume_sid(snap["argv"])
         child = env.get("CLAUDE_CODE_CHILD_SESSION") == "1"
-        wr = who_rows.get(int(pid), {})
-        attributed = None if child else _who_holder_sid(wr)
+        attributed = None if child else _who_holder_sid(who_rows.get(pid, {}))
         possible = []
-        if not (child or resume or attributed) and wr:
-            key = (wr.get("home"), wr.get("cwd"))
+        if not (child or declared or resume or attributed) and root and snap["cwd"]:
+            key = (root, snap["cwd"])
             if key not in cwd_candidates:
                 cwd_candidates[key] = _cwd_session_ids(*key)
             possible = cwd_candidates[key]
+        if not _proc_matches(pid, snap["start"], snap["cmdline"],
+                             snap["environ"], snap["cwd"]):
+            continue
+        session_id = declared or resume or attributed
         rows.append({
-            "pid": int(pid),
+            "pid": pid,
             "resume": resume,
-            "session": resume or attributed,
+            "declared": declared,
+            "declared_reason": reason,
+            "identity": ("declared" if declared else "resume" if resume
+                         else "who" if attributed else "unknown"),
+            "session": session_id,
             "possible_sessions": possible,
             "child": child,
             "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
-            "force": env.get("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE") == "1",
+            "force": env.get(FORCE_VAR) == "1",
         })
     return rows
 
 
 def live_sids(rows=None):
-    """{sid: [pid,...]} of sessions with a LIVE open copy, resolved from the
-    process's own ``--resume`` argv or an exact ``helm who`` attribution for a
-    fresh top-level process. A child stamp's CLAUDE_CODE_SESSION_ID is the
-    spawning ancestor's identity, not the child's session, so using it here
-    invents false holders whenever several panes inherit one daemon's env."""
+    """{sid: [pid,...]} of proven live copies. The procStart-bound pid record
+    wins, then canonical resume/who evidence. An inherited stamp SID is only the
+    spawning ancestor and never enters this map."""
     out = {}
     for r in (rows if rows is not None else _proc_claude_rows()):
         sid = r.get("session") or r.get("resume")
@@ -227,34 +479,39 @@ def live_sids(rows=None):
     return out
 
 
-def open_pids(sid):
-    """Live pids holding, or conservatively capable of holding, sid. Exact
-    argv/attribution wins; an unresolved fresh pane blocks every historical sid
-    in its cwd rather than letting law 1 fail open."""
-    sid = (sid or "").lower()
-    rows = _proc_claude_rows()
-    pids = []
-    for live_sid, ps in live_sids(rows).items():
-        if live_sid.lower().startswith(sid) or sid.startswith(live_sid.lower()):
-            pids.extend(ps)
-    for r in rows:
-        for possible in r.get("possible_sessions") or []:
-            p = possible.lower()
-            if p.startswith(sid) or sid.startswith(p):
-                pids.append(r["pid"])
-                break
-    return sorted(set(pids))
+def _sid_matches(candidate, prefix):
+    candidate, prefix = (candidate or "").lower(), (prefix or "").lower()
+    return bool(candidate and prefix and
+                (candidate.startswith(prefix) or prefix.startswith(candidate)))
 
 
-def memory_only_panes():
-    """Resolved live panes with NO transcript on disk. Transcript existence is
-    persistence truth; child/FORCE explain launch inputs but never override the
-    observed artifact. Unresolved panes remain UNKNOWN rather than false-alarm
-    memory-only rows."""
-    persisting = _persisting_sids()
-    return [r for r in _proc_claude_rows()
-            if (r.get("session") or r.get("resume"))
-            and not _sid_on_disk(r.get("session") or r.get("resume"), persisting)]
+def _matching_rows(sid, rows):
+    """(proven rows, unproven candidate rows) for one sid/prefix."""
+    exact, possible = [], []
+    for row in rows:
+        if _sid_matches(row.get("session"), sid):
+            exact.append(row)
+        elif any(_sid_matches(candidate, sid)
+                 for candidate in row.get("possible_sessions") or []):
+            possible.append(row)
+    return exact, possible
+
+
+def open_pids(sid, rows=None):
+    """Live pids holding, or conservatively capable of holding, sid. Candidate
+    rows remain unproven but still block launch/resume so law 1 fails closed."""
+    exact, possible = _matching_rows(
+        sid, rows if rows is not None else _proc_claude_rows())
+    return sorted({r["pid"] for r in exact + possible})
+
+
+def memory_only_panes(rows=None, persisting=None):
+    """Proven live panes with NO transcript on disk. UNKNOWN candidate rows are
+    deliberately excluded: they are neither persistence PASS nor memory-only."""
+    rows = rows if rows is not None else _proc_claude_rows()
+    persisting = persisting if persisting is not None else _persisting_sids()
+    return [r for r in rows if r.get("session")
+            and _sid_on_disk(r["session"], persisting) is False]
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +561,12 @@ def _print_incantation(sid, cred_home=None, cwd=None):
         shlex.quote(cwd or _session_cwd(sid)), env, shlex.quote(sid))
 
 
+class _PersistenceCensus(dict):
+    def __init__(self, *args, complete=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.complete = complete
+
+
 def _persisting_sids():
     """Full sids that HAVE a real transcript on disk — persistence TRUTH, not
     the env stamp (premise transcript-on-disk-is-persistence-truth-not-env: a
@@ -320,7 +583,7 @@ def _persisting_sids():
     writing a multi-MB transcript (codex-2 at 2.9MB, codex-3 at 2.0MB). A
     persistence surface that lies about the seats is worse than none — it is
     what the fleet uses to decide whether an agent's work is safe to lose."""
-    out = {}
+    out, complete = {}, True
     try:
         from . import transcripts
         for r in transcripts.get_catalog().get("rows", []):
@@ -328,44 +591,45 @@ def _persisting_sids():
             if p and not str(p).endswith(".flat.jsonl") and os.path.exists(p):
                 out[r["i"]] = p
     except Exception:
-        pass
+        complete = False
     # seat homes — walk each seat's own projects store directly
     try:
-        from . import seat as _seat
         seats_root = os.path.join(home.global_dir(), "seats")
-        for fam in sorted(os.listdir(seats_root)):
-            fam_dir = os.path.join(seats_root, fam)
-            homes = [os.path.join(fam_dir, "claude")]
-            inst = os.path.join(fam_dir, "instances")
-            if os.path.isdir(inst):
-                homes += [os.path.join(inst, s, "claude")
-                          for s in sorted(os.listdir(inst))]
-            for h in homes:
-                proj = os.path.join(h, "projects")
-                if not os.path.isdir(proj):
-                    continue
-                for root, _dirs, files in os.walk(proj):
-                    for fn in files:
-                        if fn.endswith(".jsonl") and not fn.endswith(".flat.jsonl"):
-                            out.setdefault(fn[:-len(".jsonl")],
-                                           os.path.join(root, fn))
+        if os.path.isdir(seats_root):
+            for fam in sorted(os.listdir(seats_root)):
+                fam_dir = os.path.join(seats_root, fam)
+                homes = [os.path.join(fam_dir, "claude")]
+                inst = os.path.join(fam_dir, "instances")
+                if os.path.isdir(inst):
+                    homes += [os.path.join(inst, s, "claude")
+                              for s in sorted(os.listdir(inst))]
+                for h in homes:
+                    proj = os.path.join(h, "projects")
+                    if not os.path.isdir(proj):
+                        continue
+                    errors = []
+                    for root, _dirs, files in os.walk(
+                            proj, onerror=lambda _e: errors.append(True)):
+                        for fn in files:
+                            if fn.endswith(".jsonl") and not fn.endswith(".flat.jsonl"):
+                                out.setdefault(fn[:-len(".jsonl")],
+                                               os.path.join(root, fn))
+                    complete = complete and not errors
     except Exception:
-        pass
-    return out
+        complete = False
+    return _PersistenceCensus(out, complete=complete)
 
 
 def _sid_on_disk(sid, persisting):
-    if not sid:
-        return False
-    if sid in persisting:
+    """True persisted, False proven absent, None census incomplete/UNKNOWN."""
+    path = persisting.get(sid) if sid else None
+    if path and os.path.isfile(path):
         return True
-    return any(k.startswith(sid) or sid.startswith(k) for k in persisting)
+    return False if getattr(persisting, "complete", True) else None
 
 
-def cmd_ls(args):
-    """session ls — sessions + a PERSISTENCE column: live panes cross-joined
-    with their stamp AND the on-disk transcript, flagging genuinely memory-only
-    panes (stamped, no transcript) and double-opens."""
+def _cmd_ls(args, certify=False):
+    """Shared renderer. Certification refuses to call UNKNOWN a passing view."""
     rows = _proc_claude_rows()
     persisting = _persisting_sids()
 
@@ -377,9 +641,11 @@ def cmd_ls(args):
     # An UNRESOLVED sid can't be checked against disk — its persistence is
     # genuinely UNKNOWN, never assert-safe NOR false-alarm memory-only. The hard
     # at-risk count is only panes we RESOLVED and found transcript-less.
-    mo = [r for r in rows
-          if (r.get("session") or r.get("resume"))
-          and not _sid_on_disk(r.get("session") or r.get("resume"), persisting)]
+    disk = {r["pid"]: _sid_on_disk(r.get("session"), persisting)
+            for r in rows if r.get("session")}
+    mo = memory_only_panes(rows, persisting)
+    unknown = [r for r in rows if not r.get("session")
+               or disk.get(r["pid"]) is None]
     live = live_sids(rows)
     dbl = {s: ps for s, ps in live.items() if len(ps) > 1}
     print("helm session ls — %d live claude panes" % len(rows))
@@ -387,9 +653,13 @@ def cmd_ls(args):
         sid = r.get("session") or r.get("resume")
         why = (" (rescued)" if r["force"] else " (stamped)" if r["child"] else "")
         if not sid:
-            state = "UNKNOWN (sid unresolved — verify by hand)" + why
-        elif _sid_on_disk(sid, persisting):
+            reason = r.get("declared_reason")
+            detail = "; pid record %s" % reason if reason else ""
+            state = "UNKNOWN (sid unresolved%s — verify by hand)" % detail + why
+        elif disk[r["pid"]] is True:
             state = "persisted" + why
+        elif disk[r["pid"]] is None:
+            state = "UNKNOWN (transcript census incomplete — verify by hand)" + why
         elif r["child"] and not r["force"]:
             state = "MEMORY-ONLY (stamped, no FORCE)"
         else:
@@ -405,38 +675,63 @@ def cmd_ls(args):
     if mo:
         print("⚠ %d memory-only pane(s) — a death loses them; rescue via "
               "`helm session rescue`." % len(mo))
-    return 0
+    if unknown:
+        print("? %d pane(s) have UNKNOWN sid/persistence — no safety or absence "
+              "claim is certified." % len(unknown))
+    return 1 if certify and (unknown or mo or dbl) else 0
+
+
+def cmd_ls(args):
+    """List all panes without turning the inventory itself into a health gate."""
+    return _cmd_ls(args)
 
 
 def cmd_doctor_panes(args):
     """The doctor leg for LIVE panes: which are memory-only right now, which
     are double-open. (cv doctor owns per-session context-window diagnosis;
     this is the persistence/liveness layer cv doesn't see.)"""
-    return cmd_ls(args)
+    return _cmd_ls(args, certify=True)
 
 
-def cmd_doctor(args):
-    """session doctor <sid> — classify a session: normal / forked / compacted /
-    bridged-child / maxed-at-wall, and which lane applies. Wraps cv doctor +
-    the catalog + the live-pane scan."""
-    if not args:
-        print("usage: helm session doctor <sid-prefix>", file=sys.stderr)
-        return 2
-    sid, err = _resolve_sid(args[0])
-    if not sid:
-        print("helm session doctor: " + err, file=sys.stderr)
-        return 1
-    rc, out, cerr = _cv("doctor", sid, "--json")
-    if rc != 0:
-        print("helm session doctor: cv doctor failed: " + (cerr or out),
-              file=sys.stderr)
-        return 1
+def _live_sid(prefix, rows):
+    matches = sorted({r["session"] for r in rows
+                      if r.get("session") and _sid_matches(r["session"], prefix)})
+    if len(matches) == 1:
+        return matches[0], None
+    if matches:
+        return None, "%d live sessions match '%s'" % (len(matches), prefix)
+    return None, None
+
+
+def _doctor_sid(sid, rows):
+    """Render one already-resolved SID. A proven transcriptless live pane does
+    not depend on catalog/cv mechanics that require the missing transcript."""
     kinds = []
-    pids = open_pids(sid)
-    if pids:
-        stamped = [p for p in _proc_claude_rows()
-                   if p["pid"] in pids and p["child"] and not p["force"]]
-        kinds.append("bridged-child (memory-only)" if stamped else "live")
+    exact, uncertain = _matching_rows(sid, rows)
+    pids = sorted({r["pid"] for r in exact + uncertain})
+    disk_state = None
+    if exact:
+        # PERSISTENCE IS TRANSCRIPT-TRUTH, not the env stamp. The stamp is a
+        # reason to inspect; only a still-present transcript is the verdict.
+        disk_state = _sid_on_disk(sid, _persisting_sids())
+        if disk_state is None:
+            kinds.append("UNKNOWN (transcript census incomplete)")
+        elif disk_state is False:
+            stamped = any(p["child"] and not p["force"] for p in exact)
+            kinds.append("bridged-child (memory-only)" if stamped
+                         else "memory-only (no transcript on disk)")
+        else:
+            kinds.append("live")
+    out = ""
+    if disk_state is not False:
+        rc, out, cerr = _cv("doctor", sid, "--json")
+        if rc != 0:
+            print("helm session doctor: cv doctor failed: " + (cerr or out),
+                  file=sys.stderr)
+            return 1
+    if uncertain:
+        kinds.append("UNKNOWN (sid is only a cwd candidate in pid(s) %s)"
+                     % sorted(r["pid"] for r in uncertain))
     try:
         d = json.loads(out) if out.strip() else {}
     except ValueError:
@@ -449,15 +744,49 @@ def cmd_doctor(args):
         kinds.append("normal")
     print("helm session doctor %s" % sid[:12])
     print("  kind: %s" % " / ".join(kinds))
-    if pids:
-        print("  live in pid(s): %s%s" % (
-            pids, " — LAW 1: close before any resume" if pids else ""))
+    if uncertain:
+        print("  holder evidence: proven pid(s) %s; UNKNOWN candidate pid(s) %s "
+              "— LAW 1 blocks resume until verified" %
+              (sorted(r["pid"] for r in exact),
+               sorted(r["pid"] for r in uncertain)))
+    elif pids:
+        print("  live in pid(s): %s — LAW 1: close before any resume" % pids)
     if out.strip():
-        print("  cv doctor: " + (out.strip().splitlines()[0] if out else ""))
-    lane = ("rescue (memory-only — harvest first)" if any("bridged" in k for k in kinds)
+        print("  cv doctor: " + out.strip().splitlines()[0])
+    elif disk_state is False:
+        print("  cv doctor: skipped (no transcript on disk)")
+    # Key the lane on MEMORY-ONLY, not on "bridged": a stamped child and an
+    # unstamped transcript-less pane are the same emergency (context dies with
+    # the process) and both must route to rescue. Keying on the narrower token
+    # would send the unstamped case to checkpoint, which needs a transcript
+    # that by definition is not there.
+    lane = ("rescue (memory-only — harvest first)"
+            if any("memory-only" in k for k in kinds)
+            else "verify live pane identity before checkpoint/port"
+            if any("UNKNOWN" in k for k in kinds)
             else "checkpoint/port as needed")
     print("  lane: %s" % lane)
     return 0
+
+
+def cmd_doctor(args):
+    """session doctor <sid> — classify a session from transcript truth plus cv
+    metadata. A unique proven live SID can be diagnosed before it has a catalog
+    row, which is essential for transcriptless memory-only panes."""
+    if not args:
+        print("usage: helm session doctor <sid-prefix>", file=sys.stderr)
+        return 2
+    rows = _proc_claude_rows()
+    sid, err = _live_sid(args[0], rows)
+    if err:
+        print("helm session doctor: " + err, file=sys.stderr)
+        return 1
+    if not sid:
+        sid, err = _resolve_sid(args[0])
+    if not sid:
+        print("helm session doctor: " + err, file=sys.stderr)
+        return 1
+    return _doctor_sid(sid, rows)
 
 
 def cmd_checkpoint(args):
@@ -476,8 +805,20 @@ def cmd_checkpoint(args):
     if "--window" in args:
         i = args.index("--window")
         window = args[i + 1] if i + 1 < len(args) else window
-    if open_pids(sid) and any(p in [r["pid"] for r in memory_only_panes()]
-                              for p in open_pids(sid)):
+    rows = _proc_claude_rows()
+    exact, uncertain = _matching_rows(sid, rows)
+    if uncertain:
+        print("helm session checkpoint: %s has UNKNOWN live holder candidate(s) "
+              "in pid(s) %s — verify identity before prune." %
+              (sid[:12], sorted(r["pid"] for r in uncertain)), file=sys.stderr)
+        return 1
+    persisting = _persisting_sids()
+    states = [_sid_on_disk(r["session"], persisting) for r in exact]
+    if any(state is None for state in states):
+        print("helm session checkpoint: transcript persistence is UNKNOWN — "
+              "the census was incomplete; verify before prune.", file=sys.stderr)
+        return 1
+    if any(state is False for state in states):
         print("helm session checkpoint: %s is MEMORY-ONLY live — use "
               "`helm session rescue %s` (harvest lane), not prune." % (sid[:12], sid[:12]),
               file=sys.stderr)
@@ -587,16 +928,17 @@ def cmd_port(args):
 
 
 def cmd_rescue(args):
-    """session rescue <pid|sid> — the full pipeline: doctor -> harvest note ->
-    checkpoint/port-preflight -> PRINT incantation. Laws 1+2 enforced."""
+    """session rescue <pid|sid> — diagnose from the live census, then harvest
+    before close. Transcriptless panes never get a fabricated resume line."""
     if not args:
         print("usage: helm session rescue <pid|sid-prefix>", file=sys.stderr)
         return 2
     target = args[0]
+    rows = _proc_claude_rows()
     sid = None
-    if target.isdigit():  # a live pid: resolve its sid from the scan
+    if target.isdigit():  # a live pid: resolve its sid from the same census
         pid = int(target)
-        row = next((r for r in _proc_claude_rows() if r["pid"] == pid), None)
+        row = next((r for r in rows if r["pid"] == pid), None)
         if not row:
             print("helm session rescue: no live claude pid %s" % pid, file=sys.stderr)
             return 1
@@ -612,21 +954,26 @@ def cmd_rescue(args):
         print("pid %d -> sid %s (child-stamped: %s, FORCED: %s)"
               % (pid, sid[:12], row["child"], row["force"]))
     else:
-        sid, err = _resolve_sid(target)
+        sid, err = _live_sid(target, rows)
+        if err:
+            print("helm session rescue: " + err, file=sys.stderr)
+            return 1
+        if not sid:
+            sid, err = _resolve_sid(target)
         if not sid:
             print("helm session rescue: " + err, file=sys.stderr)
             return 1
-    rc = cmd_doctor([sid])
+    rc = _doctor_sid(sid, rows)
     if rc != 0:
         return rc
-    live = open_pids(sid)
+    live = open_pids(sid, rows)
     print("rescue plan for %s:" % sid[:12])
     print("  1. HARVEST side channels FIRST (pane scrollback, journals, "
           "/dev/shm/helm-chat) — they die with the pane/reboot.")
     print("  2. Write the pane's SELF-RECAP (the fidelity anchor).")
     if live:
-        print("  3. LAW 1: close live pid(s) %s BEFORE resuming; NOT printing "
-              "the incantation while it is open." % live)
+        print("  3. LAW 1: close live pid(s) %s after harvest; NOT printing "
+              "an incantation while it is open." % live)
         return 1
     print("  3. Resume: " + _print_incantation(sid))
     return 0

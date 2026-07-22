@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from helm import session, home, pk
+from helm import session, home, pk, who
 
 
 def run(fn, args):
@@ -60,6 +60,15 @@ class SessionBase(unittest.TestCase):
         return mock.patch.object(session, "_cv",
                                  return_value=(127, "", "cv not installed"))
 
+    def persisting(self, *sids):
+        out = {}
+        for sid in sids:
+            path = os.path.join(self.tmp, sid + ".jsonl")
+            with open(path, "w") as f:
+                f.write("{}\n")
+            out[sid] = path
+        return out
+
 
 class ScanTest(SessionBase):
     def test_live_sids_use_resume_not_inherited_ancestor(self):
@@ -70,12 +79,14 @@ class ScanTest(SessionBase):
         # child's own session and must never invent holders/double-opens.
         self.assertNotIn("85935aed", sids)
 
-    def test_who_holder_keeps_unique_stale_candidate_for_safety(self):
+    def test_who_holder_accepts_only_fresh_exact_identity(self):
+        sid = "33333333-3333-3333-3333-333333333333"
         self.assertEqual(session._who_holder_sid({
-            "session": None, "session_candidates": ["stale3333-session"]}),
-            "stale3333-session")
+            "session": sid, "session_candidates": []}), sid)
         self.assertIsNone(session._who_holder_sid({
-            "session": None, "session_candidates": ["one", "two"]}))
+            "session": None, "session_candidates": [sid]}))
+        self.assertIsNone(session._who_holder_sid({
+            "session": "not-a-session", "session_candidates": []}))
 
     def test_cwd_session_ids_returns_full_ambiguous_set(self):
         cwd = "/work/a.b"
@@ -86,7 +97,7 @@ class ScanTest(SessionBase):
         for sid in sids:
             open(os.path.join(d, sid + ".jsonl"), "w").close()
         open(os.path.join(d, "ignore.txt"), "w").close()
-        self.assertEqual(sorted(session._cwd_session_ids(self.tmp, cwd)), sids)
+        self.assertEqual(session._cwd_session_ids(self.tmp, cwd), sorted(sids))
 
     def test_live_sids_include_exact_fresh_session_attribution(self):
         self.panes.append({"pid": 701, "resume": None,
@@ -106,27 +117,60 @@ class ScanTest(SessionBase):
         self.assertEqual(session.open_pids("deadbeef-memory-only"), [622078])
         self.assertEqual(session.open_pids("nosuch"), [])
 
+    def test_ls_unknown_is_neither_persisted_nor_memory_only(self):
+        rows = [{"pid": 702, "resume": None, "declared": None,
+                 "declared_reason": "record-stale", "session": None,
+                 "possible_sessions": ["active22-session"], "child": False,
+                 "ancestor_sid8": "", "force": False}]
+        with mock.patch.object(session, "_proc_claude_rows", return_value=rows), \
+             mock.patch.object(session, "_persisting_sids", return_value={}):
+            rc, out, err = run(session.cmd_ls, [])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("UNKNOWN", out)
+        self.assertIn("no safety or absence claim", out)
+        self.assertNotIn("MEMORY-ONLY", out)
+        self.assertNotIn("persisted", out)
+        with mock.patch.object(session, "_proc_claude_rows", return_value=rows), \
+             mock.patch.object(session, "_persisting_sids", return_value={}):
+            cert_rc, cert_out, cert_err = run(session.cmd_doctor_panes, [])
+        self.assertEqual(cert_rc, 1, cert_err)
+        self.assertIn("UNKNOWN", cert_out)
+
+    def test_incomplete_transcript_census_is_unknown_not_memory_only(self):
+        rows = [{"pid": 703, "resume": "aaaa1111-integrator",
+                 "declared": None, "session": "aaaa1111-integrator",
+                 "possible_sessions": [], "child": False,
+                 "ancestor_sid8": "", "force": False}]
+        census = session._PersistenceCensus({}, complete=False)
+        with mock.patch.object(session, "_proc_claude_rows", return_value=rows), \
+             mock.patch.object(session, "_persisting_sids", return_value=census):
+            rc, out, err = run(session.cmd_ls, [])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("UNKNOWN (transcript census incomplete", out)
+        self.assertNotIn("MEMORY-ONLY", out)
+        self.assertEqual(session.memory_only_panes(rows, census), [])
+
     def test_memory_only_panes_uses_transcript_truth_not_env(self):
         # Both stamped and unstamped panes with transcripts are persisting;
         # deadbeef has none and is the only at-risk row.
-        with mock.patch.object(session, "_persisting_sids", return_value={
-                "aaaa1111-integrator": "/x/a.jsonl",
-                "cccc2222-rescued": "/x/c.jsonl"}):
+        with mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("aaaa1111-integrator",
+                                               "cccc2222-rescued")):
             mo = session.memory_only_panes()
         self.assertEqual([r["pid"] for r in mo], [622078])
 
         # The dangerous inverse: a top-level pane without a transcript is also
         # memory-only; FORCE/stamp state never asserts persistence by itself.
-        with mock.patch.object(session, "_persisting_sids", return_value={
-                "cccc2222-rescued": "/x/c.jsonl"}):
+        with mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("cccc2222-rescued")):
             mo = session.memory_only_panes()
         self.assertEqual([r["pid"] for r in mo], [57699, 622078])
 
         # A stamped-without-FORCE pane that has a transcript is persisting (the
         # capcom case); the old env heuristic falsely included it.
-        with mock.patch.object(session, "_persisting_sids", return_value={
-                "deadbeef-memory-only": "/x/d.jsonl",
-                "cccc2222-rescued": "/x/c.jsonl"}):
+        with mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("deadbeef-memory-only",
+                                               "cccc2222-rescued")):
             mo = session.memory_only_panes()
         self.assertEqual([r["pid"] for r in mo], [57699])
 
@@ -137,8 +181,8 @@ class ScanTest(SessionBase):
         self.panes.append({"pid": 700, "resume": "deadbeef-memory-only",
                            "session": "deadbeef-memory-only", "child": False,
                            "ancestor_sid8": "", "force": False})
-        with mock.patch.object(session, "_persisting_sids",
-                               return_value={"cccc2222-rescued": "/x/cccc2222.jsonl"}):
+        with mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("cccc2222-rescued")):
             rc, out, _ = run(session.cmd_ls, [])
         self.assertEqual(rc, 0)
         line = {l.split()[1]: l for l in out.splitlines() if l.strip().startswith("pid")}
@@ -150,6 +194,34 @@ class ScanTest(SessionBase):
         # `not child => persisted` rule mislabeled this safe: the dangerous way)
         self.assertIn("MEMORY-ONLY (no transcript on disk)", line["57699"])
         self.assertIn("DOUBLE-OPEN", out)  # deadbeef open in 622078 + 700
+
+    def test_doctor_panes_fails_bad_states_and_passes_clear_inventory(self):
+        with mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("cccc2222-rescued")):
+            bad_rc, bad_out, bad_err = run(session.cmd_doctor_panes, [])
+        self.assertEqual(bad_rc, 1, bad_err)
+        self.assertIn("MEMORY-ONLY", bad_out)
+
+        with mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("aaaa1111-integrator",
+                                               "deadbeef-memory-only",
+                                               "cccc2222-rescued")):
+            clear_rc, clear_out, clear_err = run(session.cmd_doctor_panes, [])
+        self.assertEqual(clear_rc, 0, clear_err)
+        self.assertNotIn("MEMORY-ONLY", clear_out)
+        self.assertNotIn("DOUBLE-OPEN", clear_out)
+        self.assertNotIn("UNKNOWN", clear_out)
+
+        self.panes.append({"pid": 700, "resume": "aaaa1111-integrator",
+                           "session": "aaaa1111-integrator", "child": False,
+                           "ancestor_sid8": "", "force": False})
+        with mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("aaaa1111-integrator",
+                                               "deadbeef-memory-only",
+                                               "cccc2222-rescued")):
+            double_rc, double_out, double_err = run(session.cmd_doctor_panes, [])
+        self.assertEqual(double_rc, 1, double_err)
+        self.assertIn("DOUBLE-OPEN", double_out)
 
 
 class LawTest(SessionBase):
@@ -310,7 +382,7 @@ class LawTest(SessionBase):
             return 0, json.dumps({"newId": newid}), ""
 
         with self._sid("aaaa1111-integrator"), \
-             mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_proc_claude_rows", return_value=[]), \
              mock.patch.object(session, "_session_cwd", return_value="/source cwd"), \
              mock.patch.object(session, "_cv", side_effect=prune) as cv:
             rc, out, _ = run(session.cmd_checkpoint, ["aaaa1111"])
@@ -325,7 +397,7 @@ class LawTest(SessionBase):
 
     def test_checkpoint_rejects_success_without_artifact_receipt(self):
         with self._sid("aaaa1111-integrator"), \
-             mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_proc_claude_rows", return_value=[]), \
              mock.patch.object(session, "_session_cwd", return_value="/work"), \
              self.cv_ok('{"ok":true}'):
             rc, out, err = run(session.cmd_checkpoint, ["aaaa1111"])
@@ -335,7 +407,7 @@ class LawTest(SessionBase):
 
     def test_checkpoint_validates_cwd_before_mutating(self):
         with self._sid("aaaa1111-integrator"), \
-             mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_proc_claude_rows", return_value=[]), \
              mock.patch.object(session, "_session_row", return_value=None), \
              mock.patch.object(session, "_cv") as cv, \
              mock.patch.object(pk, "event") as event:
@@ -347,16 +419,135 @@ class LawTest(SessionBase):
         cv.assert_not_called()
         event.assert_not_called()
 
-    def test_doctor_propagates_cv_failure(self):
+    def test_doctor_propagates_cv_failure_for_persisted_session(self):
         with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("aaaa1111-integrator")), \
              mock.patch.object(session, "_cv", return_value=(1, "", "bad session")):
             rc, out, err = run(session.cmd_doctor, ["aaaa1111"])
         self.assertEqual(rc, 1)
         self.assertEqual(out, "")
         self.assertIn("bad session", err)
 
-    def test_cv_absent_degrades_clean(self):
-        with self._sid("aaaa1111-integrator"), self.cv_absent():
+    def _doctor(self, on_disk, rows):
+        """Run doctor for a live sid with a controlled transcript census."""
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "open_pids", return_value=[901]), \
+             mock.patch.object(session, "_persisting_sids",
+                               return_value=on_disk), \
+             mock.patch.object(session, "_proc_claude_rows",
+                               return_value=rows), \
+             self.cv_ok("{}"):
+            return run(session.cmd_doctor, ["aaaa1111"])
+
+    def test_doctor_flags_an_UNSTAMPED_transcriptless_pane(self):
+        """The under-flag, and the reason this fix exists: doctor keyed on the
+        env stamp (`child and not force`), so a TOP-LEVEL pane carrying no
+        stamp and writing NO transcript reported as plain 'live'. Persistence
+        is transcript-truth — the stamp is only ever the REASON, never the
+        verdict — and that law landed in `ls` without being propagated here."""
+        rows = [{"pid": 901, "child": False, "force": False, "resume": None,
+                 "declared": None, "session": "aaaa1111-integrator",
+                 "possible_sessions": [], "ancestor_sid8": ""}]
+        rc, out, err = self._doctor({}, rows)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("memory-only", out)
+        self.assertIn("rescue", out)          # and it routes to rescue
+
+    def test_doctor_still_names_the_stamped_case_precisely(self):
+        rows = [{"pid": 901, "child": True, "force": False, "resume": None,
+                 "declared": None, "session": "aaaa1111-integrator",
+                 "possible_sessions": [], "ancestor_sid8": ""}]
+        rc, out, err = self._doctor({}, rows)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("bridged-child", out)
+        self.assertIn("rescue", out)
+
+    def test_doctor_live_memory_only_needs_neither_catalog_nor_cv(self):
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        rows = [{"pid": 901, "child": False, "force": False, "resume": None,
+                 "declared": sid, "session": sid, "possible_sessions": [],
+                 "ancestor_sid8": ""}]
+        with mock.patch.object(session, "_proc_claude_rows", return_value=rows), \
+             mock.patch.object(session, "_persisting_sids", return_value={}), \
+             mock.patch.object(session, "_resolve_sid") as resolve, \
+             mock.patch.object(session, "_cv") as cv:
+            rc, out, err = run(session.cmd_doctor, ["aaaaaaaa"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("memory-only", out)
+        self.assertIn("skipped (no transcript on disk)", out)
+        resolve.assert_not_called()
+        cv.assert_not_called()
+
+    def test_doctor_calls_a_persisting_pane_live(self):
+        rows = [{"pid": 901, "child": True, "force": True, "resume": None,
+                 "declared": None, "session": "aaaa1111-integrator",
+                 "possible_sessions": [], "ancestor_sid8": ""}]
+        rc, out, err = self._doctor(
+            self.persisting("aaaa1111-integrator"), rows)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("live", out)
+        self.assertNotIn("memory-only", out)
+        self.assertIn("checkpoint", out)      # not the rescue lane
+
+    def test_doctor_keeps_candidate_only_holder_unknown(self):
+        rows = [{"pid": 901, "child": False, "force": False, "resume": None,
+                 "declared": None, "session": None,
+                 "possible_sessions": ["aaaa1111-integrator"],
+                 "ancestor_sid8": ""}]
+        rc, out, err = self._doctor({}, rows)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("UNKNOWN", out)
+        self.assertIn("verify live pane identity", out)
+        self.assertNotIn("memory-only", out)
+
+    def test_doctor_keeps_incomplete_transcript_census_unknown(self):
+        rows = [{"pid": 901, "child": False, "force": False, "resume": None,
+                 "declared": "aaaa1111-integrator",
+                 "session": "aaaa1111-integrator",
+                 "possible_sessions": [], "ancestor_sid8": ""}]
+        census = session._PersistenceCensus({}, complete=False)
+        rc, out, err = self._doctor(census, rows)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("UNKNOWN (transcript census incomplete)", out)
+        self.assertIn("verify live pane identity", out)
+        self.assertNotIn("memory-only", out)
+
+    def test_checkpoint_refuses_candidate_only_unknown_holder(self):
+        rows = [{"pid": 901, "child": False, "force": False, "resume": None,
+                 "declared": None, "session": None,
+                 "possible_sessions": ["aaaa1111-integrator"],
+                 "ancestor_sid8": ""}]
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "_proc_claude_rows", return_value=rows), \
+             mock.patch.object(session, "_cv") as cv:
+            rc, out, err = run(session.cmd_checkpoint, ["aaaa1111"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("UNKNOWN", err)
+        cv.assert_not_called()
+
+    def test_checkpoint_refuses_incomplete_transcript_census(self):
+        rows = [{"pid": 901, "child": False, "force": False, "resume": None,
+                 "declared": "aaaa1111-integrator",
+                 "session": "aaaa1111-integrator",
+                 "possible_sessions": [], "ancestor_sid8": ""}]
+        census = session._PersistenceCensus({}, complete=False)
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "_proc_claude_rows", return_value=rows), \
+             mock.patch.object(session, "_persisting_sids", return_value=census), \
+             mock.patch.object(session, "_cv") as cv:
+            rc, out, err = run(session.cmd_checkpoint, ["aaaa1111"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("UNKNOWN", err)
+        cv.assert_not_called()
+
+    def test_cv_absent_degrades_clean_for_persisted_session(self):
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("aaaa1111-integrator")), \
+             self.cv_absent():
             rc, _o, err = run(session.cmd_doctor, ["aaaa1111"])
         self.assertEqual(rc, 1)
         self.assertIn("cv not installed", err)
@@ -387,6 +578,28 @@ class RescueTest(SessionBase):
         rc, _o, err = run(session.cmd_rescue, ["424242"])
         self.assertEqual(rc, 1)
         self.assertIn("no live claude pid", err)
+
+    def test_rescue_pid_uses_declared_identity_without_catalog_or_transcript(self):
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        for child in (False, True):
+            with self.subTest(child=child):
+                row = {"pid": 901, "child": child, "force": False,
+                       "resume": None, "declared": sid, "session": sid,
+                       "possible_sessions": [], "ancestor_sid8": "85935aed"}
+                with mock.patch.object(session, "_proc_claude_rows",
+                                       return_value=[row]), \
+                     mock.patch.object(session, "_persisting_sids", return_value={}), \
+                     mock.patch.object(session, "_resolve_sid") as resolve, \
+                     mock.patch.object(session, "_cv") as cv:
+                    rc, out, err = run(session.cmd_rescue, ["901"])
+                self.assertEqual(rc, 1, err)
+                self.assertIn("pid 901 -> sid aaaaaaaa", out)
+                self.assertIn("memory-only", out)
+                self.assertIn("HARVEST", out)
+                self.assertIn("SELF-RECAP", out)
+                self.assertNotIn("claude --resume", out)
+                resolve.assert_not_called()
+                cv.assert_not_called()
 
 
 class ExpertsTest(SessionBase):
@@ -512,6 +725,341 @@ class CliWiringTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("usage: helm session", err)
         self.assertNotIn("Traceback", err)
+
+
+class DeclaredSidTest(unittest.TestCase):
+    """The authoritative resolution rung: Claude Code's own pid-keyed
+    sessions/<pid>.json. Tested against THIS process and the LIVE kernel, so a
+    wrong /proc/<pid>/stat field index fails here instead of silently
+    resolving every pane to None (the shape that hid two UNKNOWN panes, and
+    with them a real law-1 double-open, behind a 131-candidate guess)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.pid = os.getpid()
+        os.makedirs(os.path.join(self.tmp, "sessions"))
+
+    def real_starttime(self):
+        with open("/proc/%d/stat" % self.pid, "rb") as f:
+            tail = f.read().decode("utf-8", "replace").rpartition(")")[2]
+        return tail.split()[19]
+
+    def write(self, **over):
+        rec = {"pid": self.pid, "sessionId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+               "procStart": self.real_starttime()}
+        rec.update(over)
+        path = os.path.join(self.tmp, "sessions", "%d.json" % rec.get("pid", self.pid))
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        return path
+
+    def test_resolves_against_live_proc_starttime(self):
+        self.write()
+        self.assertEqual(session._sid_from_session_file(self.pid, self.tmp),
+                         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+    def test_refuses_recycled_pid(self):
+        # Same pid, a DIFFERENT boot-relative start: the record describes a
+        # dead process whose pid the kernel handed to someone else.
+        self.write(procStart=str(int(self.real_starttime()) + 1))
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+    def test_refuses_record_naming_another_pid(self):
+        self.write(pid=self.pid + 1)
+        # Written under our own filename, but the body disowns us.
+        os.rename(os.path.join(self.tmp, "sessions", "%d.json" % (self.pid + 1)),
+                  os.path.join(self.tmp, "sessions", "%d.json" % self.pid))
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+    def test_absent_and_malformed_are_quiet_misses(self):
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        with open(os.path.join(self.tmp, "sessions", "%d.json" % self.pid), "w") as f:
+            f.write("{not json")
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+    def test_missing_procstart_is_unknown_not_identity(self):
+        self.write(procStart=None)
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+    def test_rejects_non_utf8_symlink_fifo_and_oversize_records(self):
+        path = os.path.join(self.tmp, "sessions", "%d.json" % self.pid)
+        with open(path, "wb") as f:
+            f.write(b"\xff")
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+        os.unlink(path)
+        target = os.path.join(self.tmp, "cross-home.json")
+        with open(target, "w") as f:
+            json.dump({"pid": self.pid, "sessionId":
+                       "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                       "procStart": self.real_starttime()}, f)
+        os.symlink(target, path)
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+        os.unlink(path)
+        os.mkfifo(path)
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+        os.unlink(path)
+        with open(path, "wb") as f:
+            f.write(b" " * (session._SESSION_RECORD_MAX + 1))
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+        os.unlink(path)
+        self.write()
+        os.chmod(path, 0)
+        try:
+            self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        finally:
+            os.chmod(path, 0o600)
+
+    def test_rejects_wrong_types_owner_and_record_replacement(self):
+        self.write(sessionId=7)
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        self.write(procStart=int(self.real_starttime()))
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        self.write()
+        self.assertEqual(session._read_session_record(
+            self.tmp, self.pid, os.geteuid() + 1, self.real_starttime())[1],
+            "record-unsafe")
+        with mock.patch.object(session, "_record_unchanged", return_value=False):
+            self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+    def test_explicit_config_homes_do_not_cross_resolve(self):
+        self.write(sessionId="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        other = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, other, ignore_errors=True)
+        os.mkdir(os.path.join(other, "sessions"))
+        with open(os.path.join(other, "sessions", "%d.json" % self.pid), "w") as f:
+            json.dump({"pid": self.pid,
+                       "sessionId": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+                       "procStart": self.real_starttime()}, f)
+        self.assertEqual(session._sid_from_session_file(self.pid, self.tmp),
+                         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        self.assertEqual(session._sid_from_session_file(self.pid, other),
+                         "bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
+
+    def test_config_home_rejects_caller_tilde_relative_and_writable_paths(self):
+        self.write()
+        self.assertIsNone(session._sid_from_session_file(self.pid, "~/.claude"))
+        self.assertIsNone(session._sid_from_session_file(self.pid, "relative"))
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp + "\0x"))
+
+        os.chmod(self.tmp, 0o777)
+        try:
+            self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        finally:
+            os.chmod(self.tmp, 0o700)
+
+        sessions = os.path.join(self.tmp, "sessions")
+        os.chmod(sessions, 0o777)
+        try:
+            self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        finally:
+            os.chmod(sessions, 0o755)
+
+        record = os.path.join(sessions, "%d.json" % self.pid)
+        os.chmod(record, 0o666)
+        try:
+            self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        finally:
+            os.chmod(record, 0o600)
+
+    def test_config_home_alias_resolves_but_sessions_symlink_does_not(self):
+        self.write()
+        alias = self.tmp + "-alias"
+        os.symlink(self.tmp, alias)
+        self.addCleanup(lambda: os.path.lexists(alias) and os.unlink(alias))
+        self.assertEqual(session._sid_from_session_file(self.pid, alias),
+                         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+        record = os.path.join(self.tmp, "sessions", "%d.json" % self.pid)
+        with open(record, "rb") as f:
+            data = f.read()
+        os.unlink(record)
+        real = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, real, ignore_errors=True)
+        os.rmdir(os.path.join(self.tmp, "sessions"))
+        os.makedirs(os.path.join(real, "sessions"))
+        with open(os.path.join(real, "sessions", "%d.json" % self.pid), "wb") as f:
+            f.write(data)
+        os.symlink(os.path.join(real, "sessions"), os.path.join(self.tmp, "sessions"))
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+    def test_missing_record_store_keeps_trusted_home_for_inference(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        sid, reason, trusted = session._session_record(
+            self.pid, root, None, os.geteuid(), self.real_starttime())
+        self.assertIsNone(sid)
+        self.assertEqual(reason, "record-missing")
+        self.assertEqual(trusted, root)
+
+    def test_proc_stat_field_22_handles_spaces_and_parentheses(self):
+        fields = [b"S"] + [str(i).encode() for i in range(4, 22)] + [b"424242"]
+        raw = b"77 (odd ) name (with spaces)) " + b" ".join(fields) + b"\n"
+        self.assertEqual(session._starttime_from_stat(raw), "424242")
+
+    def test_transcript_rotation_invalidates_persistence_census(self):
+        path = os.path.join(self.tmp, "live.jsonl")
+        with open(path, "w") as f:
+            f.write("{}\n")
+        census = {"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee": path}
+        self.assertTrue(session._sid_on_disk(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", census))
+        os.unlink(path)
+        self.assertFalse(session._sid_on_disk(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", census))
+
+
+class ProcSnapshotTest(unittest.TestCase):
+    SID = "11111111-1111-1111-1111-111111111111"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.old_proc = session.PROC
+        session.PROC = self.tmp
+        self.addCleanup(setattr, session, "PROC", self.old_proc)
+
+    def plant(self, pid=41, argv=None, env=None, start="424242"):
+        argv = argv or ["/adapter/launch-wrapper", "--resume", self.SID]
+        base = os.path.join(self.tmp, str(pid))
+        os.makedirs(base)
+        with open(os.path.join(base, "comm"), "wb") as f:
+            f.write(b"claude\n")
+        with open(os.path.join(base, "cmdline"), "wb") as f:
+            f.write(("\0".join(argv) + "\0").encode())
+        with open(os.path.join(base, "environ"), "wb") as f:
+            f.write(env if env is not None else
+                    ("HOME=%s\0" % os.path.expanduser("~")).encode())
+        fields = ["S"] + [str(i) for i in range(4, 22)] + [start, "0", "0"]
+        with open(os.path.join(base, "stat"), "w") as f:
+            f.write("%d (claude worker) %s\n" % (pid, " ".join(fields)))
+        os.symlink(self.tmp, os.path.join(base, "cwd"))
+        return base
+
+    def test_comm_identity_accepts_adapter_argv_and_parses_resume(self):
+        self.plant()
+        snap = session._proc_snapshot(41)
+        self.assertIsNotNone(snap)
+        self.assertEqual(session._resume_sid(snap["argv"]), self.SID)
+
+    def test_unreadable_environ_keeps_visible_snapshot_without_home_guess(self):
+        self.plant()
+        real = session._proc_bytes
+
+        def read(pid, name):
+            if name == "environ":
+                raise PermissionError("fixture")
+            return real(pid, name)
+
+        with mock.patch.object(session, "_proc_bytes", side_effect=read):
+            snap = session._proc_snapshot(41)
+        self.assertIsNotNone(snap)
+        self.assertIsNone(snap["env"])
+
+    def test_exec_or_pid_reuse_during_snapshot_drops_process(self):
+        self.plant()
+        with mock.patch.object(session, "_proc_matches", return_value=False):
+            self.assertIsNone(session._proc_snapshot(41))
+
+    def test_environment_change_breaks_process_bracket(self):
+        self.plant()
+        snap = session._proc_snapshot(41)
+        with open(os.path.join(self.tmp, "41", "environ"), "wb") as f:
+            f.write(b"HOME=/different\0")
+        self.assertFalse(session._proc_matches(
+            41, snap["start"], snap["cmdline"], snap["environ"], snap["cwd"]))
+
+
+class ProcCensusTest(unittest.TestCase):
+    OLD = "11111111-1111-1111-1111-111111111111"
+    NEW = "22222222-2222-2222-2222-222222222222"
+
+    def snap(self, pid=41, argv=None, cwd="/work"):
+        argv = argv or ["wrapper", "--resume", self.OLD]
+        raw = ("\0".join(argv) + "\0").encode()
+        environ = ("HOME=%s\0" % os.path.expanduser("~")).encode()
+        return {"pid": pid, "uid": os.geteuid(), "start": str(pid * 10),
+                "cmdline": raw, "environ": environ, "argv": argv + [""],
+                "env": {"HOME": os.path.expanduser("~")}, "cwd": cwd}
+
+    def rows(self, snapshots, records, who_rows=None, candidates=None,
+             matches=True):
+        by_pid = {s["pid"]: s for s in snapshots}
+        with mock.patch.object(session.os, "listdir",
+                               return_value=[str(p) for p in by_pid]), \
+             mock.patch.object(session, "_proc_snapshot",
+                               side_effect=lambda p: by_pid[p]), \
+             mock.patch.object(session, "_session_record",
+                               side_effect=lambda p, *_: records[p]), \
+             mock.patch.object(session, "_proc_matches", return_value=matches), \
+             mock.patch.object(who, "scan", return_value=who_rows or []), \
+             mock.patch.object(session, "_cwd_session_ids",
+                               return_value=candidates or []):
+            return session._proc_claude_rows()
+
+    def test_declared_outranks_resume_and_exposes_independent_double_open(self):
+        snaps = [self.snap(41), self.snap(42)]
+        records = {41: (self.NEW, "record-ok", "/cfg"),
+                   42: (self.NEW, "record-ok", "/cfg")}
+        rows = self.rows(snaps, records)
+        self.assertEqual([r["session"] for r in rows], [self.NEW, self.NEW])
+        self.assertEqual(session.live_sids(rows)[self.NEW], [41, 42])
+
+    def test_bad_record_falls_through_without_skipping_resume_or_who(self):
+        record = {41: (None, "record-stale", "/cfg")}
+        row = self.rows([self.snap()], record)[0]
+        self.assertEqual(row["session"], self.OLD)
+        self.assertEqual(row["identity"], "resume")
+
+        bare = self.snap(argv=["claude", "--resume", "--model", "opus"])
+        wr = [{"pid": 41, "provider": "anthropic", "child": False,
+               "session": self.NEW, "session_candidates": []}]
+        row = self.rows([bare], record, who_rows=wr)[0]
+        self.assertEqual(row["session"], self.NEW)
+        self.assertEqual(row["identity"], "who")
+
+    def test_conflicting_resume_values_are_not_identity(self):
+        snap = self.snap(argv=["claude", "--resume", self.OLD,
+                               "--resume=" + self.NEW])
+        row = self.rows([snap], {41: (None, "record-missing", "/cfg")})[0]
+        self.assertIsNone(row["session"])
+        self.assertEqual(row["identity"], "unknown")
+
+    def test_stale_who_candidate_stays_possible_without_false_sid(self):
+        snap = self.snap(argv=["claude", "--continue"])
+        wr = [{"pid": 41, "provider": "anthropic", "child": False,
+               "session": None, "session_candidates": [self.NEW]}]
+        row = self.rows([snap], {41: (None, "record-missing", "/cfg")},
+                        who_rows=wr, candidates=[self.NEW])[0]
+        self.assertIsNone(row["session"])
+        self.assertEqual(row["identity"], "unknown")
+        self.assertEqual(row["possible_sessions"], [self.NEW])
+        self.assertEqual(session.live_sids([row]), {})
+        self.assertEqual(session.open_pids(self.NEW, [row]), [41])
+
+    def test_failed_rungs_still_collect_deterministic_cwd_candidates(self):
+        snap = self.snap(argv=["claude", "--continue"])
+        candidates = [self.NEW, self.OLD]
+        row = self.rows([snap], {41: (None, "record-corrupt", "/cfg")},
+                        candidates=candidates)[0]
+        self.assertEqual(row["possible_sessions"], candidates)
+
+    def test_invalid_config_env_never_falls_back_to_callers_default_home(self):
+        snap = self.snap(argv=["claude", "--continue"])
+        snap["env"] = {"CLAUDE_CONFIG_DIR": None,
+                       "HOME": os.path.expanduser("~")}
+        row = self.rows([snap], {41: (self.NEW, "record-ok", "/cfg")})[0]
+        self.assertIsNone(row["session"])
+        self.assertEqual(row["declared_reason"], "config-untrusted")
+
+    def test_final_process_identity_recheck_drops_raced_row(self):
+        rows = self.rows([self.snap()],
+                         {41: (self.NEW, "record-ok", "/cfg")}, matches=False)
+        self.assertEqual(rows, [])
 
 
 if __name__ == "__main__":

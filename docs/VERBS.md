@@ -722,18 +722,23 @@ cd ~/dev/myproject && claude --resume 3f2a9c81-...
 ## session — the session substrate (wraps cv, owns the policy)
 
 ### `helm session ls | doctor-panes`
-Every live claude pane with a **persistence column**: a pane stamped
-`CLAUDE_CODE_CHILD_SESSION=1` without `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`
-is **MEMORY-ONLY** (transcript persistence silently off — a death loses it).
-Also flags DOUBLE-OPEN sids (law 1 violations). This is how the fleet sees the
-child-stamp trap before it bites.
+Every live claude pane with a **persistence column**, classified from transcript
+truth: transcript present = persisted; proven SID with no transcript =
+**MEMORY-ONLY**; unresolved SID = **UNKNOWN**, never a safety/absence claim. A
+child stamp explains why a pane may be memory-only but is not the verdict.
+PID-keyed Claude Code records are used only when their canonical UUID and
+`procStart` match the same live process. Also flags proven DOUBLE-OPEN SIDs (law
+1 violations).
 
 ### `helm session doctor <sid> | checkpoint <sid> [--window N] | rescue <pid|sid>`
-`doctor` classifies a session (normal / forked / compacted / bridged-child /
-maxed-at-wall) + the live-pane state. `checkpoint` mints a NEW resumable id
-(`cv prune --thinking`, original untouched) so a maxed/forked session becomes
-branchable. `rescue` is the full pipeline for a memory-only pane: harvest
-side-channels first, then print the incantation.
+`doctor` classifies a session (normal / forked / compacted / live /
+MEMORY-ONLY / UNKNOWN) + the live-pane state. A proven live memory-only SID is
+diagnosed directly even though its missing transcript gives `cv` and the catalog
+nothing to open. `checkpoint` mints a NEW resumable id (`cv prune --thinking`,
+original untouched) so a maxed/forked session becomes branchable. `rescue` tells
+stamped and unstamped transcriptless panes to harvest side-channels and write a
+self-recap while still live; it never invents a resume line for a missing
+transcript.
 
 ### `helm session port --cred <home> <sid> | resume <sid> [--launch]`
 Cred-switch resume PREP (`port`: verifies the target home's projects/trust,
