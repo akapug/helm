@@ -1178,6 +1178,11 @@ def _homing_from_launch(path):
         source if source == "derived" else None
 
 
+def _room_from_launch(path):
+    """Back-compatible room-only view used by the multi-resume seam."""
+    return _homing_from_launch(path)[0]
+
+
 def _multi_from_launch(path):
     """The seat's --multi (mixed-model fleet) shape, recovered from its current
     launch.sh — the resume re-mint must not silently strip it any more than it

@@ -1140,14 +1140,18 @@ class ProjectHomingTest(SeatsBase):
         seats.join(session="s-8", seat="ph", cwd=repo)
         self.assertIsNone(seats.roster()["ph"].get("home_room"))
 
-    def test_homed_project_seat_isolated_from_sibling_project(self):
+    def test_homed_project_filters_sibling_chatter_not_direct_mentions(self):
         ra, rb = self._repo("proj-a"), self._repo("proj-b")
         seats.join(session="s-a", seat="sea", cwd=ra)   # homed #proj-a
-        chat.post("@sea proj-b mention", who="bob", room="proj-b")
+        chat.post("proj-b chatter", who="bob", room="proj-b")
         chat.post("owner in proj-b", who="david", origin="web", room="proj-b")
         self.assertIsNone(seats.deliver_any(session="s-a", seat="sea"))
-        chat.post("@sea proj-a word", who="bob", room="proj-a")
-        self.assertIn("proj-a word", seats.deliver_any(session="s-a", seat="sea"))
+        chat.post("@sea proj-b direct", who="bob", room="proj-b")
+        self.assertIn("proj-b direct", seats.deliver_any(
+            session="s-a", seat="sea"))
+        chat.post("proj-a home chatter", who="bob", room="proj-a")
+        self.assertIn("proj-a home chatter", seats.deliver_any(
+            session="s-a", seat="sea"))
 
     def test_rehome_seat_deliberate_move_and_clear(self):
         repo = self._repo()
@@ -1156,11 +1160,16 @@ class ProjectHomingTest(SeatsBase):
         ok, msg = seats.rehome_seat("pi", "team-z")
         self.assertTrue(ok, msg)
         self.assertEqual(seats.roster()["pi"]["home_room"], "team-z")
-        # isolation follows the new home immediately (no relaunch)
-        chat.post("@pi proj-a traffic", who="bob", room="proj-a")
+        # Home-room chatter follows the new home immediately, while a direct
+        # mention remains cross-room under the beacon-scope law.
+        chat.post("proj-a chatter", who="bob", room="proj-a")
         self.assertIsNone(seats.deliver_any(session="s-9", seat="pi"))
-        chat.post("@pi team-z word", who="bob", room="team-z")
-        self.assertIn("team-z word", seats.deliver_any(session="s-9", seat="pi"))
+        chat.post("@pi proj-a direct", who="bob", room="proj-a")
+        self.assertIn("proj-a direct", seats.deliver_any(
+            session="s-9", seat="pi"))
+        chat.post("team-z home word", who="bob", room="team-z")
+        self.assertIn("team-z home word", seats.deliver_any(
+            session="s-9", seat="pi"))
         # clear back to un-homed
         ok, msg = seats.rehome_seat("pi", "main")
         self.assertTrue(ok, msg)
@@ -1175,8 +1184,12 @@ class ProjectHomingTest(SeatsBase):
         self.assertEqual(row["home_room"], "main")
         self.assertEqual(row["home_room_source"], "explicit")
         self.assertEqual(seats._scan_rooms("main", seat="pm"), ["main"])
-        chat.post("foreign", who="bob", room="team-y")
-        self.assertEqual(seats._scan_rooms("main", seat="pm"), ["main"])
+        chat.post("foreign chatter", who="bob", room="team-y")
+        self.assertIn("team-y", seats._scan_rooms("main", seat="pm"))
+        self.assertIsNone(seats.deliver_any(session="s-main", seat="pm"))
+        chat.post("@pm foreign direct", who="bob", room="team-y")
+        self.assertIn("foreign direct", seats.deliver_any(
+            session="s-main", seat="pm"))
 
     def test_explicit_main_preserves_pending_main_delivery(self):
         seats.join(session="s-old", seat="main-move", cwd=self.tmp,

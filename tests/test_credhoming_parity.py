@@ -150,7 +150,8 @@ class LaunchShAuthoritativeTest(_SeatBase):
         d = seat.seat_dir("codex")
         launch_sh = os.path.join(d, "launch.sh")
         cfgdir = os.path.join(d, "claude")
-        token = open(os.path.join(d, "token")).read().strip()
+        with open(os.path.join(d, "token")) as f:
+            token = f.read().strip()
 
         seen, _ = self._exec_launch(launch_sh)
 
@@ -200,15 +201,20 @@ class PerAccountIsolationTest(_SeatBase):
                       os.path.join(kdir, "launch.sh"))
         c_home = os.path.join(cdir, "claude")
         k_home = os.path.join(kdir, "claude")
-        c_tok = open(os.path.join(cdir, "token")).read().strip()
-        k_tok = open(os.path.join(kdir, "token")).read().strip()
+        with open(os.path.join(cdir, "token")) as f:
+            c_tok = f.read().strip()
+        with open(os.path.join(kdir, "token")) as f:
+            k_tok = f.read().strip()
 
         # distinct homes + distinct proxy tokens by construction
         self.assertNotEqual(c_home, k_home)
         self.assertNotEqual(c_tok, k_tok)
 
         # neither launch.sh carries the OTHER seat's token or home (on disk)
-        c_text, k_text = open(c_sh).read(), open(k_sh).read()
+        with open(c_sh) as f:
+            c_text = f.read()
+        with open(k_sh) as f:
+            k_text = f.read()
         self.assertNotIn(k_tok, c_text)
         self.assertNotIn(c_tok, k_text)
         self.assertNotIn(k_home, c_text)
@@ -249,8 +255,10 @@ class PerAccountIsolationTest(_SeatBase):
             self.assertIn("acct-WORK", pooled)
             # each pool file carries ONLY its own refresh token — no crossover
             pd = codexhomes.pool_dir()
-            personal = json.load(open(os.path.join(pd, "codex-acct-personal.json")))
-            work = json.load(open(os.path.join(pd, "codex-acct-work.json")))
+            with open(os.path.join(pd, "codex-acct-personal.json")) as f:
+                personal = json.load(f)
+            with open(os.path.join(pd, "codex-acct-work.json")) as f:
+                work = json.load(f)
             self.assertEqual(personal["refresh_token"], "rt-personal")
             self.assertEqual(work["refresh_token"], "rt-work")
             self.assertNotIn("rt-work", json.dumps(personal))
@@ -281,7 +289,8 @@ class RebootChecklistTest(unittest.TestCase):
 
     def test_checklist_exists_and_names_exact_checks(self):
         self.assertTrue(os.path.exists(self.PATH), self.PATH)
-        text = open(self.PATH).read()
+        with open(self.PATH) as f:
+            text = f.read()
         # each check the operator runs at the switch is present by command…
         for cmd in ("helm codex list", "helm seat launch codex",
                     "helm seat resume codex", "helm doctor",
