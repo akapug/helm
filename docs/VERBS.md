@@ -688,15 +688,17 @@ prints the `CLAUDE_CONFIG_DIR=… claude --resume` line) and the single-open-
 guarded resume. TWO LAWS enforced by every verb: (1) never two live copies of
 one session — a live pid holding the sid means close-first, never the
 incantation; (2) prepare + print, never launch — only `resume --launch`
-spawns, and only after law 1. Every printed line bakes
+spawns, attached to the current terminal under a per-session exclusion lock and
+an under-lock law-1 recheck. Every printed line bakes
 `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` + unsets the child-stamp trio, so a
 paste into a stamped pane can't re-trap.
 
 ### `helm session experts [--register <sid> --domain D [--note N]] [--refresh <sid>] | helm session ask <domain> <q…>`
 The expertise layer (expert-sessions-beat-fresh-research): a durable O(1)
 registry (sid → domain → last-refreshed) and the query ladder — registry hit →
-transcript search (cv) → resume-live (print-don't-launch, with a mandatory
-RE-GROUND step: the expert re-verifies its facts against the current substrate
+expert-transcript search → `cv pack` context digest → resume-live
+(print-don't-launch, with a mandatory RE-GROUND step: the expert re-verifies
+its facts against the current substrate
 before answering — expertise goes stale like everything else).
 
 ```console

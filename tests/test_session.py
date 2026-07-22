@@ -31,12 +31,15 @@ class SessionBase(unittest.TestCase):
         # a planted live-pane scan: one persisted integrator, one memory-only
         # pane resuming sid DEADBEEF, one stamped+forced rescue
         self.panes = [
-            {"pid": 57699, "resume": "aaaa1111-integrator", "child": False,
-             "sid8": "", "force": False},
-            {"pid": 622078, "resume": "deadbeef-memory-only", "child": True,
-             "sid8": "85935aed", "force": False},
-            {"pid": 998382, "resume": "cccc2222-rescued", "child": True,
-             "sid8": "85935aed", "force": True},
+            {"pid": 57699, "resume": "aaaa1111-integrator",
+             "session": "aaaa1111-integrator", "child": False,
+             "ancestor_sid8": "", "force": False},
+            {"pid": 622078, "resume": "deadbeef-memory-only",
+             "session": "deadbeef-memory-only", "child": True,
+             "ancestor_sid8": "85935aed", "force": False},
+            {"pid": 998382, "resume": "cccc2222-rescued",
+             "session": "cccc2222-rescued", "child": True,
+             "ancestor_sid8": "85935aed", "force": True},
         ]
         self._scan = mock.patch.object(session, "_proc_claude_rows",
                                        return_value=self.panes)
@@ -59,14 +62,44 @@ class SessionBase(unittest.TestCase):
 
 
 class ScanTest(SessionBase):
-    def test_live_sids_from_resume_and_stamp(self):
+    def test_live_sids_use_resume_not_inherited_ancestor(self):
         sids = session.live_sids()
-        # argv --resume resolves the full sid...
         self.assertIn("deadbeef-memory-only", sids)
         self.assertEqual(sids["deadbeef-memory-only"], [622078])
-        # ...and the child-stamp's inherited SID names the ancestor's open copy
-        self.assertIn("85935aed", sids)
-        self.assertEqual(sorted(sids["85935aed"]), [622078, 998382])
+        # Every child inherited the daemon's ancestor SID. It is not the
+        # child's own session and must never invent holders/double-opens.
+        self.assertNotIn("85935aed", sids)
+
+    def test_who_holder_keeps_unique_stale_candidate_for_safety(self):
+        self.assertEqual(session._who_holder_sid({
+            "session": None, "session_candidates": ["stale3333-session"]}),
+            "stale3333-session")
+        self.assertIsNone(session._who_holder_sid({
+            "session": None, "session_candidates": ["one", "two"]}))
+
+    def test_cwd_session_ids_returns_full_ambiguous_set(self):
+        cwd = "/work/a.b"
+        d = os.path.join(self.tmp, "projects", "-work-a-b")
+        os.makedirs(d)
+        sids = ["11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222"]
+        for sid in sids:
+            open(os.path.join(d, sid + ".jsonl"), "w").close()
+        open(os.path.join(d, "ignore.txt"), "w").close()
+        self.assertEqual(sorted(session._cwd_session_ids(self.tmp, cwd)), sids)
+
+    def test_live_sids_include_exact_fresh_session_attribution(self):
+        self.panes.append({"pid": 701, "resume": None,
+                           "session": "fresh3333-session", "child": False,
+                           "ancestor_sid8": "", "force": False})
+        self.assertEqual(session.open_pids("fresh3333"), [701])
+
+    def test_open_pids_fail_closed_across_ambiguous_cwd_candidates(self):
+        self.panes.append({"pid": 702, "resume": None, "session": None,
+                           "possible_sessions": ["old11111-session",
+                                                 "active22-session"],
+                           "child": False, "ancestor_sid8": "", "force": False})
+        self.assertEqual(session.open_pids("active22"), [702])
 
     def test_open_pids_prefix_both_ways(self):
         self.assertEqual(session.open_pids("deadbeef"), [622078])
@@ -79,7 +112,8 @@ class ScanTest(SessionBase):
 
     def test_ls_flags_memory_only_and_double_open(self):
         self.panes.append({"pid": 700, "resume": "deadbeef-memory-only",
-                           "child": False, "sid8": "", "force": False})
+                           "session": "deadbeef-memory-only", "child": False,
+                           "ancestor_sid8": "", "force": False})
         rc, out, _ = run(session.cmd_ls, [])
         self.assertEqual(rc, 0)
         self.assertIn("MEMORY-ONLY", out)
@@ -107,21 +141,74 @@ class LawTest(SessionBase):
         self.assertIn("NOT launching", err)
         cv.assert_not_called()  # never reaches cv with a live copy open
 
+    def test_resume_launch_uses_attached_cv_with_clean_env(self):
+        dirty = {v: "inherited" for v in session._stamp_vars()}
+        with mock.patch.dict(os.environ, dirty), \
+             mock.patch.object(subprocess, "call", return_value=0) as call:
+            rc, err = session._cv_launch("aaaa1111-integrator")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(call.call_args[0][0],
+                         ["cv", "resume", "aaaa1111-integrator", "--launch"])
+        self.assertEqual(set(call.call_args.kwargs), {"env"})
+        env = call.call_args.kwargs["env"]
+        for v in session._stamp_vars():
+            self.assertNotIn(v, env)
+        self.assertEqual(env[session.FORCE_VAR], "1")
+
+    def test_resume_launch_is_serialized_and_rechecked(self):
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_cv_launch", return_value=(0, "")) as launch:
+            with session._launch_lock("aaaa1111-integrator"):
+                rc, _out, err = run(session.cmd_resume,
+                                    ["aaaa1111", "--launch"])
+        self.assertEqual(rc, 1)
+        self.assertIn("already in progress", err)
+        launch.assert_not_called()
+
+    def test_resume_launch_calls_attached_helper_after_guard(self):
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_cv_launch", return_value=(0, "")) as launch:
+            rc, out, err = run(session.cmd_resume,
+                               ["aaaa1111", "--launch"])
+        self.assertEqual((rc, out, err), (0, "", ""))
+        launch.assert_called_once_with("aaaa1111-integrator")
+
     def test_resume_prints_incantation_with_force(self):
         with self._sid("aaaa1111-integrator"), \
-             mock.patch.object(session, "open_pids", return_value=[]):
+             mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_session_cwd", return_value="/source cwd"):
             rc, out, _ = run(session.cmd_resume, ["aaaa1111"])
         self.assertEqual(rc, 0)
         self.assertIn("claude --resume aaaa1111-integrator", out)
+        self.assertIn("cd '/source cwd'", out)
         self.assertIn("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1", out)
         # child-stamp unsets ride the line (paste-into-stamped-pane safe)
         for v in session._stamp_vars():
             self.assertIn("-u " + v, out)
 
+    def test_resume_refuses_command_without_recorded_cwd(self):
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_session_row", return_value=None):
+            rc, out, err = run(session.cmd_session,
+                               ["resume", "aaaa1111"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertIn("no recorded cwd", err)
+
     def test_port_refuses_live_and_prints_when_clear(self):
-        home_rows = [{"name": "cto-example", "path": "/creds/cto-example", "aliases": []}]
+        cred = os.path.join(self.tmp, "cto mv")
+        os.makedirs(cred)
+        cwd = "/work/project with spaces"
+        with open(os.path.join(cred, ".claude.json"), "w") as f:
+            json.dump({"projects": {cwd: {"hasTrustDialogAccepted": True}}}, f)
+        home_rows = [{"name": "cto-example", "path": cred, "aliases": [],
+                      "projects_link_ok": True}]
         import helm.homes as homes_mod
         with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "_session_cwd", return_value=cwd), \
              mock.patch.object(homes_mod, "homes_list", return_value=home_rows):
             # live copy -> refuse (no incantation line printed)
             with mock.patch.object(session, "open_pids", return_value=[57699]):
@@ -130,13 +217,54 @@ class LawTest(SessionBase):
             self.assertEqual(rc, 1)
             self.assertIn("LAW 1", out)
             self.assertNotIn("claude --resume", out)
-            # clear -> print with the credhome + FORCE
+            # clear -> print with quoted credhome/cwd + FORCE
             with mock.patch.object(session, "open_pids", return_value=[]):
                 rc, out, _ = run(session.cmd_port,
                                  ["--cred", "cto-example", "aaaa1111"])
             self.assertEqual(rc, 0)
-            self.assertIn("CLAUDE_CONFIG_DIR=/creds/cto-example", out)
+            self.assertIn("CLAUDE_CONFIG_DIR='" + cred + "'", out)
+            self.assertIn("cd '" + cwd + "'", out)
             self.assertIn("FORCE_SESSION_PERSISTENCE=1", out)
+
+    def test_port_requires_shared_store_and_seeded_trust(self):
+        cred = os.path.join(self.tmp, "cred")
+        os.makedirs(cred)
+        cwd = "/work/project"
+        import helm.homes as homes_mod
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "_session_cwd", return_value=cwd), \
+             mock.patch.object(session, "open_pids", return_value=[]):
+            owned = [{"name": "x", "path": cred, "aliases": [],
+                      "projects_link_ok": False}]
+            with mock.patch.object(homes_mod, "homes_list", return_value=owned):
+                rc, out, _ = run(session.cmd_port,
+                                 ["--cred", "x", "aaaa1111"])
+            self.assertEqual(rc, 1)
+            self.assertIn("cv port", out)
+            self.assertNotIn("claude --resume", out)
+
+            shared = [{"name": "x", "path": cred, "aliases": [],
+                       "projects_link_ok": True}]
+            with mock.patch.object(homes_mod, "homes_list", return_value=shared):
+                rc, out, _ = run(session.cmd_port,
+                                 ["--cred", "x", "aaaa1111"])
+            self.assertEqual(rc, 1)
+            self.assertIn("trust", out)
+            self.assertNotIn("claude --resume", out)
+
+    def test_port_refuses_archived_credhome(self):
+        import helm.homes as homes_mod
+        rows = [{"name": "old", "path": self.tmp, "aliases": [],
+                 "provider": "claude", "archived": True, "authed": True,
+                 "projects_link_ok": True}]
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(homes_mod, "homes_list", return_value=rows), \
+             mock.patch.object(session, "open_pids", return_value=[]):
+            rc, out, err = run(session.cmd_port,
+                               ["--cred", "old", "aaaa1111"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("archived", err)
 
     def test_checkpoint_routes_memory_only_to_rescue(self):
         with self._sid("deadbeef-memory-only"):
@@ -146,17 +274,55 @@ class LawTest(SessionBase):
         self.assertIn("rescue", err)
 
     def test_checkpoint_mints_new_id_original_untouched(self):
+        def prune(*argv, **_kwargs):
+            newid = argv[argv.index("--to") + 1]
+            return 0, json.dumps({"newId": newid}), ""
+
         with self._sid("aaaa1111-integrator"), \
              mock.patch.object(session, "open_pids", return_value=[]), \
-             self.cv_ok('{"ok":true}') as cv:
+             mock.patch.object(session, "_session_cwd", return_value="/source cwd"), \
+             mock.patch.object(session, "_cv", side_effect=prune) as cv:
             rc, out, _ = run(session.cmd_checkpoint, ["aaaa1111"])
         self.assertEqual(rc, 0)
         self.assertIn("checkpoint minted:", out)
+        self.assertIn("cd '/source cwd'", out)
         # cv prune got --thinking + --to <newid>, never mutating the original
         argv = cv.call_args[0]
         self.assertIn("prune", argv)
         self.assertIn("--thinking", argv)
         self.assertIn("--to", argv)
+
+    def test_checkpoint_rejects_success_without_artifact_receipt(self):
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_session_cwd", return_value="/work"), \
+             self.cv_ok('{"ok":true}'):
+            rc, out, err = run(session.cmd_checkpoint, ["aaaa1111"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("without the requested artifact id", err)
+
+    def test_checkpoint_validates_cwd_before_mutating(self):
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_session_row", return_value=None), \
+             mock.patch.object(session, "_cv") as cv, \
+             mock.patch.object(pk, "event") as event:
+            rc, out, err = run(session.cmd_session,
+                               ["checkpoint", "aaaa1111"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertIn("no recorded cwd", err)
+        cv.assert_not_called()
+        event.assert_not_called()
+
+    def test_doctor_propagates_cv_failure(self):
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "_cv", return_value=(1, "", "bad session")):
+            rc, out, err = run(session.cmd_doctor, ["aaaa1111"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("bad session", err)
 
     def test_cv_absent_degrades_clean(self):
         with self._sid("aaaa1111-integrator"), self.cv_absent():
@@ -167,13 +333,24 @@ class LawTest(SessionBase):
 
 
 class RescueTest(SessionBase):
-    def test_rescue_by_pid_resolves_sid_and_prints_plan(self):
-        rc, out, _ = run(session.cmd_rescue, ["622078"])
-        self.assertEqual(rc, 0)
+    def test_rescue_live_pid_prints_close_first_not_incantation(self):
+        with self.cv_ok('{"compactions":0}'), \
+             mock.patch.object(session, "_resolve_sid",
+                               return_value=("deadbeef-memory-only", None)):
+            rc, out, _ = run(session.cmd_rescue, ["622078"])
+        self.assertEqual(rc, 1)
         self.assertIn("deadbeef", out)          # resolved from the pid
         self.assertIn("HARVEST", out)            # the rescue-lane first step
-        self.assertIn("claude --resume deadbeef", out)
-        self.assertIn("FORCE_SESSION_PERSISTENCE=1", out)
+        self.assertIn("LAW 1", out)
+        self.assertNotIn("claude --resume", out)
+
+    def test_rescue_never_mistakes_stamp_ancestor_for_own_sid(self):
+        self.panes[1]["resume"] = None
+        self.panes[1]["session"] = None
+        rc, _out, err = run(session.cmd_rescue, ["622078"])
+        self.assertEqual(rc, 1)
+        self.assertIn("spawning ancestor, not this pane", err)
+        self.assertIn("85935aed", err)
 
     def test_rescue_unknown_pid(self):
         rc, _o, err = run(session.cmd_rescue, ["424242"])
@@ -214,6 +391,37 @@ class ExpertsTest(SessionBase):
         self.assertEqual(rc, 0)
         self.assertIn("refreshed", out)
 
+    def test_refresh_refuses_ambiguous_prefix(self):
+        session._write_experts({
+            "aaaa1111-one": {"domain": "x", "last_refreshed": "2026-01-01T00:00:00Z"},
+            "aaaa1111-two": {"domain": "y", "last_refreshed": "2026-01-01T00:00:00Z"},
+        })
+        rc, _out, err = run(session.cmd_experts, ["--refresh", "aaaa1111"])
+        self.assertEqual(rc, 1)
+        self.assertIn("disambiguate", err)
+
+    def test_ask_routes_to_freshest_expert_for_domain(self):
+        session._write_experts({
+            "aaaa1111-old": {"domain": "helm", "last_refreshed": "2026-01-01T00:00:00Z"},
+            "bbbb2222-new": {"domain": "helm", "last_refreshed": "2026-07-21T00:00:00Z"},
+        })
+        with mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_grep_expert", return_value=""), \
+             mock.patch.object(session, "_session_cwd", return_value="/work"), \
+             self.cv_ok(""):
+            rc, out, _ = run(session.cmd_ask, ["helm", "next"])
+        self.assertEqual(rc, 0)
+        self.assertIn("bbbb2222-new", out)
+        self.assertNotIn("claude --resume aaaa1111-old", out)
+
+    def test_pack_query_preserves_unicode_and_developer_terms(self):
+        q = session._pack_query("日本語-domain", "C++ と .claude の直し方は？")
+        self.assertIn("日本語", q)
+        self.assertIn("C plus plus", q)
+        self.assertIn("dot claude", q)
+        self.assertIn("直し方は", q)
+        self.assertNotIn(":", q)
+
     def test_ask_no_expert_falls_back_to_search(self):
         with self.cv_ok("search-hits") as cv:
             rc, out, _ = run(session.cmd_ask, ["nosuchdomain", "how", "does", "x"])
@@ -224,6 +432,7 @@ class ExpertsTest(SessionBase):
     def test_ask_with_expert_prints_regounded_resume(self):
         self._reg()
         with mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_session_cwd", return_value="/work"), \
              self.cv_ok(""):
             rc, out, _ = run(session.cmd_ask, ["helm-orchestration", "what", "next"])
         self.assertEqual(rc, 0)
@@ -238,24 +447,29 @@ class ExpertsTest(SessionBase):
              self.cv_ok(""):
             rc, out, _ = run(session.cmd_ask, ["helm-orchestration", "q"])
         self.assertIn("LIVE in pid(s) [57699]", out)
+        self.assertNotIn("claude --resume", out)
 
     def test_ask_scopes_search_to_the_expert_transcript(self):
         """the ladder's rung 2 is the EXPERT's own transcript, not the corpus —
-        a hit there is shown as such; a miss falls through to a corpus search."""
+        a hit there is shown as such; a miss falls through to a context pack."""
         self._reg()
         # expert's own transcript HAS the answer -> shown, no corpus fallback
         with mock.patch.object(session, "_grep_expert", return_value="  …the order is X…"), \
-             mock.patch.object(session, "open_pids", return_value=[]):
+             mock.patch.object(session, "open_pids", return_value=[]), \
+             mock.patch.object(session, "_session_cwd", return_value="/work"):
             rc, out, _ = run(session.cmd_ask, ["helm-orchestration", "order"])
         self.assertIn("expert-transcript hits", out)
-        self.assertNotIn("corpus search", out)
-        # expert's transcript misses -> falls through to the corpus search
+        self.assertNotIn("context pack", out)
+        # expert's transcript misses -> falls through to the context pack
         with mock.patch.object(session, "_grep_expert", return_value=""), \
              mock.patch.object(session, "open_pids", return_value=[]), \
-             self.cv_ok("corpus-hits"):
+             mock.patch.object(session, "_session_cwd", return_value="/work"), \
+             self.cv_ok("pack-hits") as cv:
             rc, out, _ = run(session.cmd_ask, ["helm-orchestration", "order"])
-        self.assertIn("corpus search", out)
-        self.assertIn("corpus-hits", out)
+        self.assertIn("context pack", out)
+        self.assertIn("pack-hits", out)
+        self.assertEqual(cv.call_args[0],
+                         ("pack", "--limit", "3", "helm orchestration order"))
 
 
 class CliWiringTest(unittest.TestCase):

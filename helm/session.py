@@ -9,11 +9,11 @@ the mechanics (read/reshape/rehome/shrink — ls/show/doctor/prune/port/resume);
 helm owns the POLICY:
 
   LAW 1 — never two live copies of one session. Before printing any launch
-    line, scan live claude pids for an open copy of the sid (argv --resume +
-    the child-stamp env + heartbeats). The built-in double-open detector is
-    BLIND to child-stamped panes (no heartbeat registers) — so this scan reads
-    /proc directly. Found: print the close-first instruction, never the
-    incantation.
+    line, scan live claude pids for an open copy of the sid (argv --resume).
+    The built-in double-open detector is BLIND to child-stamped panes (no
+    heartbeat registers) — so this scan reads /proc directly. The inherited
+    stamp SID is an ancestor identity, never the child's own session. Found:
+    print the close-first instruction, never the incantation.
   LAW 2 — prepare + print, never launch. checkpoint/port/rescue end at a
     PRINTED incantation; only `resume --launch` spawns, and only after law 1.
 
@@ -35,8 +35,13 @@ is always PRINT-DON'T-LAUNCH with a mandatory RE-GROUND instruction (expertise
 goes stale like everything else — the expert re-verifies key facts against the
 current substrate before answering).
 """
+import calendar
+import contextlib
+import fcntl
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -44,20 +49,21 @@ import time
 from . import home, pk
 
 CV = "cv"
-FORCE = "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"
+FORCE_VAR = "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"
+FORCE = FORCE_VAR + "=1"
 
 
 # ---------------------------------------------------------------------------
 # cv wrapper (the policy/mechanics seam — thin, timeout-bounded, clean degrade)
 # ---------------------------------------------------------------------------
 
-def _cv(*argv, timeout=120):
+def _cv(*argv, timeout=120, env=None):
     """Run cv, return (rc, stdout, stderr). FileNotFoundError / timeout degrade
     to a named error string, never a traceback — helm's policy layer must stay
     up when the mechanics layer is absent."""
     try:
         p = subprocess.run([CV] + list(argv), capture_output=True, text=True,
-                           timeout=timeout)
+                           timeout=timeout, env=env)
         return p.returncode, p.stdout, p.stderr
     except FileNotFoundError:
         return 127, "", "cv not installed — clustervision must be on PATH"
@@ -76,15 +82,90 @@ def _unset_prefix():
     return "env " + " ".join("-u " + v for v in _stamp_vars()) + " "
 
 
+def _launch_env():
+    """Environment for the one permitted launch path: strip inherited child
+    identity and force transcript persistence on."""
+    env = os.environ.copy()
+    for v in _stamp_vars():
+        env.pop(v, None)
+    env[FORCE_VAR] = "1"
+    return env
+
+
+@contextlib.contextmanager
+def _launch_lock(sid):
+    """Non-blocking, per-session exclusion held for the attached cv/Claude
+    lifetime. The under-lock process recheck closes the two-helm-launch race."""
+    path = os.path.join(home.global_dir(), ".state",
+                        "session-launch-%s.lock" % pk.slug(sid))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _cv_launch(sid):
+    """Run cv's native launch attached to this terminal. No capture and no
+    timeout: the interactive harness owns the TTY until it exits."""
+    try:
+        return subprocess.call([CV, "resume", sid, "--launch"],
+                               env=_launch_env()), ""
+    except FileNotFoundError:
+        return 127, "cv not installed — clustervision must be on PATH"
+    except OSError as e:
+        return 1, "cv failed to launch: %s" % e
+
+
 # ---------------------------------------------------------------------------
 # live-pane scan (law 1 + the memory-only surface) — /proc, never ps-grep
 # ---------------------------------------------------------------------------
 
+def _who_holder_sid(row):
+    """Safety attribution from ``helm who``: exact wins; one sole cwd
+    candidate remains a possible holder even after its 5-minute freshness
+    window. Multiple candidates require the conservative candidate set."""
+    if row.get("session"):
+        return row["session"]
+    candidates = row.get("session_candidates") or []
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _cwd_session_ids(home_dir, cwd):
+    """Every Claude sid in one cwd store, filenames only. Used solely as the
+    fail-closed holder set when a live fresh process cannot be attributed to
+    one of several historical sessions."""
+    if not (home_dir and cwd):
+        return []
+    slug = cwd.replace("/", "-").replace(".", "-")
+    try:
+        names = os.listdir(os.path.join(home_dir, "projects", slug))
+    except OSError:
+        return []
+    suffix = ".jsonl"
+    return [n[:-len(suffix)] for n in names
+            if n.endswith(suffix) and len(n) == 36 + len(suffix)]
+
+
 def _proc_claude_rows():
-    """Every live pid whose argv[0] names claude. Row: {pid, resume, child,
-    sid8, force}. The stamp + --resume come from /proc/<pid>/{environ,cmdline}
-    directly — a ps cmdline grep missed a `--resume`-bearing pid in the field
-    (session-surgery forensics), so the scan reads the kernel's own record."""
+    """Every live pid whose argv[0] names claude. Row: {pid, resume, session,
+    possible_sessions, child, ancestor_sid8, force}. The stamp + --resume come from
+    /proc/<pid>/{environ,cmdline} directly. Fresh top-level sessions have no
+    --resume argv, so exact attribution composes the existing ``helm who``
+    layer; ambiguous candidates stay unresolved."""
+    try:
+        from . import who
+        who_rows = {r["pid"]: r for r in who.scan(accounts=[])
+                    if r.get("provider") == "anthropic" and not r.get("child")}
+    except (OSError, ValueError):
+        who_rows = {}
+    cwd_candidates = {}
     rows = []
     for pid in (p for p in os.listdir("/proc") if p.isdigit()):
         base = os.path.join("/proc", pid)
@@ -111,37 +192,57 @@ def _proc_claude_rows():
                 resume = argv[i + 1]
             elif a.startswith("--resume="):
                 resume = a.split("=", 1)[1]
+        child = env.get("CLAUDE_CODE_CHILD_SESSION") == "1"
+        wr = who_rows.get(int(pid), {})
+        attributed = None if child else _who_holder_sid(wr)
+        possible = []
+        if not (child or resume or attributed) and wr:
+            key = (wr.get("home"), wr.get("cwd"))
+            if key not in cwd_candidates:
+                cwd_candidates[key] = _cwd_session_ids(*key)
+            possible = cwd_candidates[key]
         rows.append({
             "pid": int(pid),
             "resume": resume,
-            "child": env.get("CLAUDE_CODE_CHILD_SESSION") == "1",
-            "sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
+            "session": resume or attributed,
+            "possible_sessions": possible,
+            "child": child,
+            "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
             "force": env.get("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE") == "1",
         })
     return rows
 
 
-def live_sids():
-    """{sid: [pid,...]} of sessions with a LIVE open copy — from argv --resume
-    AND from the child-stamp's inherited SID (a stamped pane's
-    CLAUDE_CODE_SESSION_ID is its spawning ancestor's id, which that ancestor
-    has open). This is law 1's resolver."""
+def live_sids(rows=None):
+    """{sid: [pid,...]} of sessions with a LIVE open copy, resolved from the
+    process's own ``--resume`` argv or an exact ``helm who`` attribution for a
+    fresh top-level process. A child stamp's CLAUDE_CODE_SESSION_ID is the
+    spawning ancestor's identity, not the child's session, so using it here
+    invents false holders whenever several panes inherit one daemon's env."""
     out = {}
-    for r in _proc_claude_rows():
-        if r["resume"]:
-            out.setdefault(r["resume"], []).append(r["pid"])
-        if r["child"] and r["sid8"]:
-            out.setdefault(r["sid8"], []).append(r["pid"])
+    for r in (rows if rows is not None else _proc_claude_rows()):
+        sid = r.get("session") or r.get("resume")
+        if sid:
+            out.setdefault(sid, []).append(r["pid"])
     return out
 
 
 def open_pids(sid):
-    """Live pids holding an open copy of sid (full id or 8-char prefix)."""
+    """Live pids holding, or conservatively capable of holding, sid. Exact
+    argv/attribution wins; an unresolved fresh pane blocks every historical sid
+    in its cwd rather than letting law 1 fail open."""
     sid = (sid or "").lower()
+    rows = _proc_claude_rows()
     pids = []
-    for live_sid, ps in live_sids().items():
+    for live_sid, ps in live_sids(rows).items():
         if live_sid.lower().startswith(sid) or sid.startswith(live_sid.lower()):
             pids.extend(ps)
+    for r in rows:
+        for possible in r.get("possible_sessions") or []:
+            p = possible.lower()
+            if p.startswith(sid) or sid.startswith(p):
+                pids.append(r["pid"])
+                break
     return sorted(set(pids))
 
 
@@ -159,8 +260,11 @@ def _resolve_sid(prefix):
     """id-prefix -> full sid via the catalog (one resolver, the <sid> prefix
     convention). None + a printed reason when ambiguous/absent."""
     from . import sessions
-    hits = [r for r in sessions.rows_for(include_synthetic=True)
-            if r["i"].startswith(prefix)]
+    all_hits = [r for r in sessions.rows_for(include_synthetic=True)
+                if r["i"].startswith(prefix)]
+    hits = [r for r in all_hits if r.get("h") == "claude"]
+    if not hits and all_hits:
+        return None, "session '%s' is not a Claude session (v1 supports Claude)" % prefix
     if not hits:
         return None, "no session id starts with '%s'" % prefix
     if len(hits) > 1:
@@ -168,15 +272,31 @@ def _resolve_sid(prefix):
     return hits[0]["i"], None
 
 
+def _session_row(sid):
+    from . import sessions
+    return next((r for r in sessions.rows_for(include_synthetic=True)
+                 if r["i"] == sid), None)
+
+
+def _session_cwd(sid):
+    row = _session_row(sid)
+    cwd = os.path.expanduser((row or {}).get("cwd") or (row or {}).get("c") or "")
+    if not cwd:
+        raise ValueError("session %s has no recorded cwd; refusing an unsafe resume line"
+                         % sid[:12])
+    return cwd
+
+
 def _print_incantation(sid, cred_home=None, cwd=None):
     """LAW 2's output: the pasteable resume line, FORCE baked in, child-stamp
     unset (so a paste into a stamped pane can't re-trap), optional credhome.
+    Values are shell-quoted because cwd and configured home paths are data.
     Never executed here."""
-    cwd = cwd or os.getcwd()
     env = _unset_prefix() + FORCE + " "
     if cred_home:
-        env += "CLAUDE_CONFIG_DIR=%s " % cred_home
-    return "cd %s && %sclaude --resume %s" % (cwd, env, sid)
+        env += "CLAUDE_CONFIG_DIR=%s " % shlex.quote(cred_home)
+    return "cd %s && %sclaude --resume %s" % (
+        shlex.quote(cwd or _session_cwd(sid)), env, shlex.quote(sid))
 
 
 def cmd_ls(args):
@@ -184,13 +304,16 @@ def cmd_ls(args):
     with their stamp, flagging memory-only panes and double-opens."""
     rows = _proc_claude_rows()
     mo = [r for r in rows if r["child"] and not r["force"]]
-    live = live_sids()
+    live = live_sids(rows)
     dbl = {s: ps for s, ps in live.items() if len(ps) > 1}
     print("helm session ls — %d live claude panes" % len(rows))
     for r in sorted(rows, key=lambda x: x["pid"]):
         state = ("MEMORY-ONLY (stamped, no FORCE)" if r["child"] and not r["force"]
                  else "persisted" if not r["child"] else "stamped+FORCED (rescued)")
-        res = (" resume=%s" % r["resume"][:12]) if r["resume"] else ""
+        sid = r.get("session") or r.get("resume")
+        possible = len(r.get("possible_sessions") or [])
+        res = ((" session=%s" % sid[:12]) if sid else
+               (" session=? (%d cwd candidates)" % possible if possible else ""))
         print("  pid %-8d %s%s" % (r["pid"], state, res))
     if dbl:
         print("DOUBLE-OPEN (law 1 violation):")
@@ -221,8 +344,9 @@ def cmd_doctor(args):
         print("helm session doctor: " + err, file=sys.stderr)
         return 1
     rc, out, cerr = _cv("doctor", sid, "--json")
-    if rc == 127:
-        print("helm session doctor: " + cerr, file=sys.stderr)
+    if rc != 0:
+        print("helm session doctor: cv doctor failed: " + (cerr or out),
+              file=sys.stderr)
         return 1
     kinds = []
     pids = open_pids(sid)
@@ -275,6 +399,7 @@ def cmd_checkpoint(args):
               "`helm session rescue %s` (harvest lane), not prune." % (sid[:12], sid[:12]),
               file=sys.stderr)
         return 1
+    cwd = _session_cwd(sid)  # fail closed before cv creates any artifact
     import uuid
     newid = str(uuid.uuid4())
     rc, out, cerr = _cv("prune", sid, "--window", window, "--thinking",
@@ -283,10 +408,24 @@ def cmd_checkpoint(args):
         print("helm session checkpoint: cv prune failed: " + (cerr or out),
               file=sys.stderr)
         return 1
+    try:
+        report = json.loads(out)
+    except ValueError:
+        report = {}
+    if report.get("newId") != newid:
+        print("helm session checkpoint: cv prune returned success without the "
+              "requested artifact id", file=sys.stderr)
+        return 1
     pk.event("session-checkpoint", newid, "from %s window %s" % (sid[:12], window))
     print("checkpoint minted: %s (from %s)" % (newid, sid[:12]))
-    print("resume: " + _print_incantation(newid))
+    print("resume: " + _print_incantation(newid, cwd=cwd))
     return 0
+
+
+def _project_trusted(cred_home, cwd):
+    cfg = pk.read_json(os.path.join(cred_home, ".claude.json"), {}) or {}
+    return bool(((cfg.get("projects") or {}).get(cwd) or {})
+                .get("hasTrustDialogAccepted"))
 
 
 def cmd_port(args):
@@ -316,19 +455,51 @@ def cmd_port(args):
         print("helm session port: no cred home matches '%s'" % home_arg,
               file=sys.stderr)
         return 1
-    path = target.get("path", "?")
+    if target.get("archived"):
+        print("helm session port: target '%s' is archived; restore it before "
+              "resume" % home_arg, file=sys.stderr)
+        return 1
+    if target.get("provider") not in (None, "claude"):
+        print("helm session port: target '%s' is not a Claude cred home" % home_arg,
+              file=sys.stderr)
+        return 1
+    if target.get("authed") is False:
+        print("helm session port: target '%s' is not authenticated" % home_arg,
+              file=sys.stderr)
+        return 1
+    path = target.get("path")
+    if not path:
+        print("helm session port: target '%s' has no path" % home_arg,
+              file=sys.stderr)
+        return 1
+    cwd = _session_cwd(sid)
     # preflights (re-run at print time, never cached — homes mutate)
     proj = os.path.join(path, "projects")
-    shared = os.path.islink(proj)
+    shared = target.get("projects_link_ok")
+    if shared is None:
+        shared = (os.path.islink(proj)
+                  and os.path.realpath(proj) == os.path.realpath(
+                      os.path.expanduser("~/.claude/projects")))
+    trusted = _project_trusted(path, cwd)
     pids = open_pids(sid)
     print("helm session port %s -> %s" % (sid[:12], path))
     print("  projects: %s" % ("shared symlink (no file move)" if shared
                               else "OWNED dir — cv port --out required"))
+    print("  trust: %s for %s" % ("seeded" if trusted else "MISSING", cwd))
     if pids:
         print("  LAW 1: sid is LIVE in pid(s) %s — close first; NOT printing "
               "the incantation." % pids)
         return 1
-    print("  incantation: " + _print_incantation(sid, cred_home=path))
+    if not shared:
+        print("  prepare first: cv port %s --out %s" % (
+            shlex.quote(sid), shlex.quote(proj)))
+        return 1
+    if not trusted:
+        print("  target home has not accepted trust for this cwd; seed trust "
+              "before resume.")
+        return 1
+    print("  incantation: " + _print_incantation(
+        sid, cred_home=path, cwd=cwd))
     return 0
 
 
@@ -346,10 +517,14 @@ def cmd_rescue(args):
         if not row:
             print("helm session rescue: no live claude pid %s" % pid, file=sys.stderr)
             return 1
-        sid = row["resume"] or row["sid8"]
+        sid = row.get("session") or row.get("resume")
         if not sid:
-            print("helm session rescue: pid %s has no resolvable sid (no "
-                  "--resume argv, no stamp SID)" % pid, file=sys.stderr)
+            ancestor = row["ancestor_sid8"]
+            print("helm session rescue: pid %s has no resolvable own sid "
+                  "(--resume absent; live attribution ambiguous). Stamp SID %s "
+                  "is the spawning ancestor, "
+                  "not this pane; harvest/recap it before close." %
+                  (pid, ancestor or "unknown"), file=sys.stderr)
             return 1
         print("pid %d -> sid %s (child-stamped: %s, FORCED: %s)"
               % (pid, sid[:12], row["child"], row["force"]))
@@ -359,14 +534,18 @@ def cmd_rescue(args):
             print("helm session rescue: " + err, file=sys.stderr)
             return 1
     rc = cmd_doctor([sid])
+    if rc != 0:
+        return rc
     live = open_pids(sid)
     print("rescue plan for %s:" % sid[:12])
     print("  1. HARVEST side channels FIRST (pane scrollback, journals, "
           "/dev/shm/helm-chat) — they die with the pane/reboot.")
     print("  2. Write the pane's SELF-RECAP (the fidelity anchor).")
     if live:
-        print("  3. LAW 1: close live pid(s) %s BEFORE resuming." % live)
-    print("  4. Then: " + _print_incantation(sid))
+        print("  3. LAW 1: close live pid(s) %s BEFORE resuming; NOT printing "
+              "the incantation while it is open." % live)
+        return 1
+    print("  3. Resume: " + _print_incantation(sid))
     return 0
 
 
@@ -382,22 +561,28 @@ def cmd_resume(args):
     if not sid:
         print("helm session resume: " + err, file=sys.stderr)
         return 1
-    pids = open_pids(sid)
-    if pids:
-        print("helm session resume: LAW 1 — %s is LIVE in pid(s) %s. Close "
-              "first; NOT %s." % (sid[:12], pids,
-                                   "launching" if launch else "printing"),
-              file=sys.stderr)
-        return 1
-    line = _print_incantation(sid)
     if not launch:
-        print(line)
+        pids = open_pids(sid)
+        if pids:
+            print("helm session resume: LAW 1 — %s is LIVE in pid(s) %s. Close "
+                  "first; NOT printing." % (sid[:12], pids), file=sys.stderr)
+            return 1
+        print(_print_incantation(sid))
         return 0
-    rc, out, cerr = _cv("resume", sid, "--launch")
+    with _launch_lock(sid) as acquired:
+        if not acquired:
+            print("helm session resume: LAW 1 — a launch for %s is already in "
+                  "progress; NOT launching." % sid[:12], file=sys.stderr)
+            return 1
+        pids = open_pids(sid)  # under-lock recheck closes the check→launch race
+        if pids:
+            print("helm session resume: LAW 1 — %s is LIVE in pid(s) %s. Close "
+                  "first; NOT launching." % (sid[:12], pids), file=sys.stderr)
+            return 1
+        rc, cerr = _cv_launch(sid)
     if rc != 0:
-        print("helm session resume: cv failed: " + (cerr or out), file=sys.stderr)
+        print("helm session resume: cv failed: " + cerr, file=sys.stderr)
         return 1
-    print("launched %s" % sid[:12])
     return 0
 
 
@@ -407,6 +592,20 @@ def cmd_resume(args):
 
 def _experts_path():
     return os.path.join(home.global_dir(), "session-experts.json")
+
+
+@contextlib.contextmanager
+def _experts_lock():
+    """Serialize registry read-modify-write across fleet seats. Atomic replace
+    prevents torn files; this stable sibling lock prevents lost updates."""
+    path = _experts_path() + ".lock"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def _experts():
@@ -452,25 +651,32 @@ def cmd_experts(args):
         if not full:
             print("helm session experts: " + err, file=sys.stderr)
             return 1
-        ex = _experts()
-        now = pk.now_ts()
-        ex[full] = {"domain": domain, "registered": now,
-                    "last_refreshed": now, "note": note or ""}
-        _write_experts(ex)
+        with _experts_lock():
+            ex = _experts()
+            now = pk.now_ts()
+            ex[full] = {"domain": domain, "registered": now,
+                        "last_refreshed": now, "note": note or ""}
+            _write_experts(ex)
         pk.event("session-expert-register", full[:12], domain)
         print("registered %s as expert: %s" % (full[:12], domain))
         return 0
     if "--refresh" in args:
         i = args.index("--refresh")
         sid = args[i + 1] if i + 1 < len(args) else None
-        ex = _experts()
-        full = next((s for s in ex if s.startswith(sid or "")), None)
-        if not full:
-            print("helm session experts: no expert sid starts '%s'" % sid,
-                  file=sys.stderr)
-            return 1
-        ex[full]["last_refreshed"] = pk.now_ts()
-        _write_experts(ex)
+        with _experts_lock():
+            ex = _experts()
+            hits = [s for s in ex if s.startswith(sid or "")]
+            if not hits:
+                print("helm session experts: no expert sid starts '%s'" % sid,
+                      file=sys.stderr)
+                return 1
+            if len(hits) > 1:
+                print("helm session experts: %d expert sids start '%s' — "
+                      "disambiguate" % (len(hits), sid), file=sys.stderr)
+                return 1
+            full = hits[0]
+            ex[full]["last_refreshed"] = pk.now_ts()
+            _write_experts(ex)
         print("refreshed %s (%s)" % (full[:12], ex[full]["domain"]))
         return 0
     print("usage: helm session experts [--register <sid> --domain D [--note N]] "
@@ -481,7 +687,7 @@ def cmd_experts(args):
 def _fresh(ts):
     """ISO ts -> '3d'/'5h'/'now' age for the freshness flag."""
     try:
-        t = time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+        t = calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
         d = (time.time() - t) / 86400.0
         return "now" if d < 0.04 else ("%dh" % int(d * 24) if d < 1 else "%dd" % int(d))
     except (TypeError, ValueError):
@@ -491,8 +697,8 @@ def _fresh(ts):
 def _grep_expert(sid, q, cap=3):
     """Matching lines from the EXPERT's own transcript (the scoped rung of the
     ask ladder) — the expert's answer to q in its own words, not the corpus's.
-    Fail-open to '' (no transcript / no hit -> the caller falls to a corpus
-    search)."""
+    Fail-open to '' (no transcript / no hit -> the caller falls to a context
+    pack)."""
     try:
         from . import sessions
         row = next((r for r in sessions.rows_for(include_synthetic=True)
@@ -511,6 +717,14 @@ def _grep_expert(sid, q, cap=3):
         return ""
 
 
+def _pack_query(domain, q):
+    """Plain token query for cv's full-text parser. Preserve Unicode words and
+    spell syntax-bearing developer terms instead of dropping their meaning."""
+    text = (domain + " " + q).replace("+", " plus ").replace("#", " sharp ") \
+        .replace(".", " dot ")
+    return " ".join(re.findall(r"\w+", text, flags=re.UNICODE))
+
+
 def cmd_ask(args):
     """session ask <domain> <question...> — the QUERY LADDER over the experts
     registry: (1) registry hit (O(1) route) -> (2) transcript search scoped to
@@ -521,7 +735,9 @@ def cmd_ask(args):
         return 2
     domain, q = args[0], " ".join(args[1:])
     ex = _experts()
-    hit = next(((s, r) for s, r in ex.items() if r.get("domain") == domain), None)
+    candidates = [(s, r) for s, r in ex.items() if r.get("domain") == domain]
+    hit = max(candidates, key=lambda x: x[1].get("last_refreshed") or "") \
+        if candidates else None
     if not hit:
         print("no expert for domain '%s' — register one: helm session experts "
               "--register <sid> --domain %s" % (domain, domain))
@@ -534,23 +750,25 @@ def cmd_ask(args):
                                                   _fresh(reg.get("last_refreshed"))))
     # ladder rung 2: transcript search SCOPED TO THE EXPERT's own transcript
     # (cv search has no per-session scope — grep the expert's jsonl directly,
-    # the _grep_sessions pattern). Fall through to a corpus search when the
+    # the _grep_sessions pattern). Fall through to cv's context pack when the
     # expert's own transcript holds no hit.
     shown = _grep_expert(sid, q)
     if shown:
         print("expert-transcript hits:\n" + shown)
     else:
-        rc, out, _ = _cv("search", "--limit", "3", "--", q)
+        pack_q = _pack_query(domain, q)
+        rc, out, _ = _cv("pack", "--limit", "3", pack_q)
         if rc == 0 and out.strip():
-            print("(no hit in the expert's own transcript — corpus search:)\n"
+            print("(no hit in the expert's own transcript — context pack:)\n"
                   + out.rstrip())
     # ladder rung 3: resume-live, PRINT-DON'T-LAUNCH + mandatory re-ground
     pids = open_pids(sid)
     print("\nresume-live (re-grounds before answering):")
     if pids:
-        print("  expert is LIVE in pid(s) %s — ask in that pane, or close + "
-              "resume." % pids)
-    print("  " + _print_incantation(sid))
+        print("  expert is LIVE in pid(s) %s — ask in that pane; LAW 1 forbids "
+              "printing a competing resume incantation." % pids)
+    else:
+        print("  " + _print_incantation(sid))
     print("  RE-GROUND (mandatory): before answering '%s', the expert re-verifies "
           "its key facts against the CURRENT substrate — expertise goes stale." % q)
     return 0
