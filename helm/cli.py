@@ -150,6 +150,10 @@ VERBS = {
     "handoff": _lazy("handoff", "cmd_handoff"), "now": _lazy("handoff", "cmd_now"),
     "cmd": _lazy("transcripts", "cmd_cmd"),
     "web": _lazy("web", "cmd_web"),
+    "env": _lazy("envtidy", "cmd_env"),
+    "mcp": _lazy("envtidy", "cmd_mcp"),
+    "worktree": _lazy("envtidy", "cmd_worktree"),
+    "tidy": _lazy("envtidy", "cmd_tidy"),
 }
 
 _VERB_HELP = {
@@ -177,7 +181,7 @@ _VERB_HELP = {
     "session": "session ls|doctor|checkpoint|port|rescue|resume|experts|ask — the session substrate: inventory, persistence-health, checkpoint, port, compose (wraps cv; single-open law + print-don't-launch)",
     "homes": "homes [prepare|verify|archive|restore|archives] — credential-home lifecycle",
     "configs": "configs [list|show|cascade <cwd>] — every config across every home, read-only",
-    "hooks": "hooks [install [--dry]|status] — self-wire the per-turn inject hook into every claude home",
+    "hooks": "hooks [install [--dry]|status|sync [--apply]] — self-wire the per-turn inject hook into every claude home; sync reconciles every home to the NAMED canonical hook set (dry-run default)",
     "cell": "cell join|send|recv|heartbeat|roster|status — the a2a substrate, helm-named",
     "chat": "chat post|read [--since N|--follow]|rooms|react <n> <emoji>|log-flush|node up|down|status|join|deliver|wait|seats|claim|release|claims [--room R] — the human-included groupchat (RAM room + signed dregg transport; web panel = the owner's surface) + the delivery lane (tool-boundary nudge, roster presence, advisory session-bound claims)",
     "multiplayer": "multiplayer publish|read|presence|peers|leave — metaharness-agnostic local multiplayer: blind opaque-update relay + decoupled TTL presence",
@@ -206,6 +210,10 @@ _VERB_HELP = {
     "handoff": "handoff check [--hook-json]|write|recover <sid> — the compaction-continuity contract (PreCompact/SessionEnd nag; typed journal handoff; cv pre-compaction recovery)", "now": "now capture [--hook-json]|show — automatic session-continuity snapshot (_global/now.md, 40 lines newest-first, 48h freshness gate; SessionStart context)",
     "cmd": "cmd <sid> [--account A] [--model M] — account-aware pasteable resume command",
     "web": "web [--port N] — the same, warm, in a browser",
+    "env": "env census [--json] — READ-ONLY estate picture: every claude config dir's hooks + MCPs, the variance vs canonical, and the orphan-worktree snapshot (replaces poking the configs UI by hand)",
+    "mcp": "mcp sync [--apply] — reconcile canonical MCP servers into every home (dry-run default; additive + fail-closed; backup-first, superset-refusal)",
+    "worktree": "worktree gc [--apply] — prune orphan worktree-* branches + landed worktrees (dry-run default; rescue-dirty-first, locked-immune, unmerged-blocked; composes `helm work gc` for lane rooms)",
+    "tidy": "tidy [--apply] — the umbrella: census + hooks sync + mcp sync + worktree gc, all dry-run; one consolidated report (--apply runs them all backup-first)",
 }
 
 

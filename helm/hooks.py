@@ -559,7 +559,8 @@ _CODEX_PENDING = ("codex: recipe pending — docs/HOOKS.md carries no mechanical
                   "notify-hook shape yet; wire it by hand per that doc's codex section")
 
 _USAGE = """usage: helm hooks install [--harness claude|codex] [--home NAME] [--dry]
-       helm hooks status"""
+       helm hooks status
+       helm hooks sync [--apply]   (reconcile every home to the canonical set)"""
 
 
 def _select_homes(name):
@@ -583,6 +584,10 @@ def cmd_hooks(args):
         print(_USAGE, file=sys.stderr)
         return 2
     verb, rest = args[0], args[1:]
+
+    if verb == "sync":   # reconcile every home to the canonical set (envtidy)
+        from . import envtidy
+        return envtidy.cmd_hooks_sync(rest)
 
     if verb == "status":
         rows = status_rows()

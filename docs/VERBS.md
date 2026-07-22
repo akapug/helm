@@ -1048,7 +1048,7 @@ $ helm configs cascade ~/dev/myproject --harness claude
 $ helm configs edit ~/.claude/settings.json < settings.json
 ```
 
-### `helm hooks [install [--harness claude|codex] [--home NAME] [--dry] | status]`
+### `helm hooks [install [--harness claude|codex] [--home NAME] [--dry] | status | sync [--apply]]`
 The self-closing installer for the per-turn inject wiring **and the
 fleet-delivery lane**. `install` merges the `UserPromptSubmit` → `helm inject
 --hook-json` hook plus the delivery lane (`PostToolUse` → `chat deliver`,
@@ -1123,6 +1123,95 @@ new credhome (or adding a skill to canonical) is the whole maintenance story.
 Seat mint (`helm seat add`) links new seats to the same canonical at birth.
 This kills the stranding class where a skill dropped into one home's private
 farm stayed invisible everywhere else (the 2026-07-21 `i-have-audhd` case).
+
+## tidy — the estate janitor
+
+`skills sync`'s shape, widened from skills to the whole claude-config estate:
+census the picture, reconcile every home's hooks + MCP servers to a NAMED
+canonical set, gc the git worktrees. **Dry-run is the DEFAULT everywhere** —
+every destructive step needs an explicit `--apply`, and every mutate is
+backup-first (`~/.env-premerge-backup/`, the backup IS the pre-image), atomic
+(tmp + rename), superset-checked (a foreign hook, an existing MCP server —
+never lost), idempotent, and fail-CLOSED (a `settings.json` that will not parse
+is reported and SKIPPED, never a partial destructive apply). One discovery
+feeds all of it: `skillsync.config_dirs()` — every credhome (alias symlinks
+folded), the default `~/.claude`, every seat + seat-instance, smoke dirs
+skipped.
+
+### `helm env census [--json]`
+READ-ONLY: the whole estate in one screen — every config dir's helm hooks,
+which canonical hooks it is MISSING, the stray (non-helm) hooks it carries
+(repo-hygiene, herdr, orca — legit on the host home, always PRESERVED), its
+effective MCP names, the MCP variance vs the canonical set, and the orphan /
+stray / lane worktree snapshot. Replaces poking the configs UI by hand. Probes
+nothing, mutates nothing.
+
+```console
+$ helm env census
+helm env census — 9 config dir(s)
+  home                       kind      hooks miss strays
+  cto-example-invalid  home      8     0    0
+  owner-example-invalid        home      8     0    1
+  seat:codex                 seat      3     0    0
+...
+```
+
+### `helm hooks sync [--apply]`
+Reconcile every home's hooks to the NAMED canonical set — the survey's
+`proposed_canonical_hooks`, a module constant `CANONICAL_HOOKS` with a clear
+docstring and a `HELM_HOOKS_CANONICAL` env override (a JSON file of
+`[{event, matcher?, args, timeout?}]`), exactly like `skills sync`'s
+`canonical()`. Credhomes + the default get the full 8-hook set (inject, record
+×2 events, chat deliver, chat join, stop-guard, handoff ×2 events); seats get
+the LEAN delivery subset (deliver + join + stop-guard) derived from the same
+constant — a seat never ground-injects, records, or writes handoffs. **Additive
+only**: missing canonical hooks are ADDED (reusing the merge-preserving
+`hooks._merge_event` primitive), strays PRESERVED; the post-write superset
+check refuses any swap that would drop a foreign hook, restoring the backup.
+Dry-run prints the per-home diff; idempotent (a wired estate reports zero
+changes). Reachable as `helm hooks sync` beside `install`/`status`.
+
+### `helm mcp sync [--apply]`
+Same shape for MCP servers. `CANONICAL_MCPS` names the servers every home
+should reach (`HELM_MCPS_CANONICAL`, a JSON file `{name: config|null}`,
+overrides). Fail-CLOSED by construction: a server is ADDED to a home's
+`.claude.json` `mcpServers` only when (a) the name is missing from the home's
+EFFECTIVE set (not already provided by a plugin or a raw entry) AND (b) a
+concrete config is in hand — otherwise the gap is SURFACED to the owner, never
+guessed (blindly minting a raw `builders-dev` entry where a plugin already
+provides it would create the exact duplicate-shadow the census warns about).
+The default canonical carries no configs, so `--apply` is report-only until an
+override supplies them. Backup-first, superset-preserving (an existing server
+is never dropped), idempotent.
+
+### `helm worktree gc [--apply]`
+Prune orphan `worktree-*` branch stubs + landed worktrees. **COMPOSES** `helm
+work gc` for the lease-aware lane rooms (its rescue-commit logic is reused, not
+duplicated) and adds the estate-wide sweep the lane gc does not cover:
+registered worktrees (`wf_*`, `agent-*`) and orphan branch stubs. The rules the
+survey pins: **RESCUE-DIRTY-FIRST** (an uncommitted worktree is
+`git commit --no-verify`'d onto its OWN branch before any removal — never the
+dumpster), **NEVER touch a LOCKED worktree** (active review), and **never remove
+work that is ahead of the base** (unmerged unique commits = blocked, not
+prunable; a merged orphan stub gets `git branch -d`, which itself refuses
+unmerged — `-D` is never used). Dry-run classifies every row with its reason.
+
+### `helm tidy [--apply]`
+The umbrella: census + hooks sync + mcp sync + worktree gc, all in DRY-RUN, one
+consolidated owner-facing report — *here is everything that would change*.
+`--apply` runs them all backup-first.
+
+```console
+$ helm tidy
+========================================================================
+helm tidy [DRY-RUN — here is everything that would change]
+========================================================================
+[1/4] CENSUS   ...
+[2/4] HOOKS SYNC   every home carries its full canonical hook set (0 changes)
+[3/4] MCP SYNC     every home reaches the canonical MCP set (0 changes)
+[4/4] WORKTREE GC  ...
+helm tidy: dry-run complete — `helm tidy --apply` executes
+```
 
 ## substrate — the attested-truth leg
 
