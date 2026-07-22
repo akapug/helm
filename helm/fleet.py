@@ -28,7 +28,12 @@ consumed WITH its completeness channel: a failed /proc enumeration surfaces
 as census_failed — the verb prints estate-UNKNOWN and exits 1, never
 certifying an empty estate it never read — and a failed who scan marks every
 sub-declared/resume row sid-UNKNOWN instead of letting the vanished rung
-read as a proven blank.
+read as a proven blank. The same discipline holds PER PID below those
+estate-wide bits: a mandatory probe that failed AFTER comm proved claude
+arrives as a probe_failed UNKNOWN row (rendered, counted, exit 1 — never
+dropped as proven absence), and one that failed BEFORE comm could prove or
+refute claude arrives as census_partial — the estate total prints as a
+floor ("at least N, CENSUS PARTIAL") and the verb exits 1.
 
 The one display probe that DOES re-read /proc after the census — the
 daemon/host ppid walk — is only composed in after a FINAL generation
@@ -72,19 +77,22 @@ _SID_SRC = {"declared": "record", "resume": "argv", "who": "who"}
 # fact like record-missing/record-stale): an unresolved sid under one of these
 # is UNKNOWN, not a proven blank
 _FAILED_PROBE_REASONS = {"environ-unreadable", "record-unreadable",
-                         "record-replaced"}
+                         "record-replaced", "probe-failed"}
 
 
 def _census():
-    """({pid: row}, census_failed, who_failed) straight from
+    """({pid: row}, census_failed, who_failed, census_partial) straight from
     session._proc_claude_census() — the ONE sid truth owner (record/argv/who/
     cwd rungs, generation recheck, canonical config root, bracketed environ).
     Fleet never re-derives any of it. census_failed means the /proc
     enumeration itself failed: the empty table is a FAILED PROBE, not a
-    proven-empty estate. who_failed means the who rung was never probed."""
+    proven-empty estate. who_failed means the who rung was never probed.
+    census_partial means a mandatory per-pid probe failed before the pid's
+    comm could prove or refute claude: the row count is a FLOOR ('at least
+    N'), never a certified estate total."""
     c = session._proc_claude_census()
     return ({r["pid"]: r for r in c["rows"]}, c["listing_failed"],
-            c["who_failed"])
+            c["who_failed"], c["census_partial"])
 
 
 def _generation_intact(pid, start):
@@ -273,7 +281,7 @@ def rows():
     roster, roster_err = _roster()
     stamp_keys = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
                   "CLAUDE_CODE_BRIDGE_SESSION_ID")
-    census, census_failed, who_failed = _census()
+    census, census_failed, who_failed, census_partial = _census()
     live = session.live_sids(list(census.values()))
     tilde = lambda p: p.replace(os.path.expanduser("~"), "~")  # noqa: E731
     out, raw_cwds = [], {}
@@ -289,6 +297,10 @@ def rows():
         # a census row can itself be a failed probe: unresolved because the
         # record/environ READ failed — or because the who rung was never
         # probed at all — not because evidence proved a blank
+        # a mandatory probe that failed AFTER comm proved claude: the pid is
+        # known, every fact on it is unprovable — the row is UNKNOWN and the
+        # verb's exit status must say so, never a silent drop
+        probe_failed = bool(sr.get("probe_failed"))
         sid_unknown = sid is None and (
             sr.get("declared_reason") in _FAILED_PROBE_REASONS
             or (who_failed and not sr.get("child")))
@@ -311,10 +323,12 @@ def rows():
             "sid": sid, "sid_src": sid_src,
             "candidates": candidates,
             "double_open": double_open,
+            "probe_failed": probe_failed,
             # the row-level bit carries EVERY failed probe the row rests on
             # (home/config root and seat included) so JSON consumers never
             # receive a false known-row bit the footer contradicts
-            "unknown": (env_unknown or sid_unknown or cwd is None
+            "unknown": (probe_failed or env_unknown or sid_unknown
+                        or cwd is None
                         or root is None or seat_src == "roster-error"
                         or daemon_state == "unknown"),
             "home": tilde(root) if root else "?",
@@ -350,23 +364,27 @@ def rows():
             continue
         r["daemon"], r["daemon_state"], r["pane"] = None, "unknown", None
         r["unknown"] = True
-    return out, sorted(daemons), census_failed
+    return out, sorted(daemons), census_failed, census_partial
 
 
 def cmd_fleet(args):
     """fleet [--json] — every live claude process, composition truth."""
-    table, daemons, census_failed = rows()
+    table, daemons, census_failed, census_partial = rows()
+    probe_failed = [r for r in table if r["probe_failed"]]
+    rc = 1 if census_failed or census_partial or probe_failed else 0
     if "--json" in args:
         print(json.dumps({"rows": table, "daemons": daemons,
-                          "census_failed": census_failed}, indent=2))
-        return 1 if census_failed else 0
+                          "census_failed": census_failed,
+                          "census_partial": census_partial}, indent=2))
+        return rc
     if census_failed:
         print("helm fleet — CENSUS FAILED: /proc could not be enumerated. "
               "The estate is UNKNOWN, not empty — zero rows is a failed "
               "probe, never proven absence.")
         return 1
-    print("helm fleet — %d live claude process(es), %d orca daemon(s)"
-          % (len(table), len(daemons)))
+    print("helm fleet — %s live claude process(es), %d orca daemon(s)%s"
+          % (("at least %d" % len(table)) if census_partial else len(table),
+             len(daemons), " — CENSUS PARTIAL" if census_partial else ""))
     for r in table:
         sid8 = (r["sid"] or "?")[:8]
         if r["sid_src"] in ("argv", "who"):
@@ -398,8 +416,16 @@ def cmd_fleet(args):
     if unknowns:
         print("  ? %d row(s) carry UNKNOWN columns — failed probes, not "
               "absence; verify by hand before acting" % len(unknowns))
+    if probe_failed:
+        print("  ! pid(s) %s PROVED claude but a mandatory census probe "
+              "FAILED — facts unprovable (UNKNOWN), never proven absence"
+              % ", ".join(str(r["pid"]) for r in probe_failed))
+    if census_partial:
+        print("  ! CENSUS PARTIAL: a same-uid pid failed a mandatory probe "
+              "before its comm could prove or refute claude — the total "
+              "above is a floor, not a certified estate")
     doubles = sorted({r["sid"] for r in table if r["double_open"]})
     if doubles:
         print("  ‼ %d sid(s) are live in MULTIPLE pids (DOUBLE-OPEN) — "
               "resolve before resuming or injecting" % len(doubles))
-    return 0
+    return rc

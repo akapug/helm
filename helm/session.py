@@ -37,6 +37,7 @@ current substrate before answering).
 """
 import calendar
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -233,20 +234,57 @@ def _full_environ(raw):
                 raw.decode("utf-8", "replace").split("\0") if "=" in kv)
 
 
+_GONE_ERRNOS = {errno.ENOENT, errno.ESRCH}
+
+
+def _gone(err):
+    """The pid left mid-scan (genuine absence) vs a failed PROBE on a pid
+    that persists (EACCES/EIO/anything else on a mandatory read)."""
+    return err.errno in _GONE_ERRNOS
+
+
 def _proc_snapshot(pid):
     """One same-uid Claude process, bracketed before later record/who reads.
+    Tri-state, fail-closed — a pass whose input was missing is vacuous:
+
+      ("ok", snap)      every mandatory fact proven.
+      ("absent", None)  structurally not ours (foreign uid, non-claude comm)
+                        or the process left mid-scan (ENOENT/ESRCH) — genuine
+                        absence, skipped.
+      ("unknown", stub) comm PROVED claude, then a mandatory read failed while
+                        the pid persists — the pid is KNOWN, its facts are
+                        unprovable; the census must surface it, never drop it
+                        as proven absence.
+      ("partial", None) a mandatory read failed BEFORE comm could prove or
+                        refute claude on a pid that may be ours — the census
+                        cannot certify its own completeness (census_partial).
+
     Optional environ/cwd failures keep a visible UNKNOWN-capable row."""
     base = os.path.join(PROC, str(pid))
     try:
         uid = os.stat(base).st_uid
-        start = _proc_start(pid)
-        if uid != os.geteuid() or not start:
-            return None
-        if _proc_bytes(pid, "comm").strip() != b"claude":
-            return None
+    except OSError as e:
+        return ("absent", None) if _gone(e) else ("partial", None)
+    if uid != os.geteuid():
+        return "absent", None  # foreign uid: structurally not ours
+    try:
+        start = _starttime_from_stat(_proc_bytes(pid, "stat"))
+    except OSError as e:
+        return ("absent", None) if _gone(e) else ("partial", None)
+    if not start:
+        return "partial", None  # stat read but unparsable: a failed probe
+    try:
+        comm = _proc_bytes(pid, "comm").strip()
+    except OSError as e:
+        return ("absent", None) if _gone(e) else ("partial", None)
+    if comm != b"claude":
+        return "absent", None
+    try:
         cmdline = _proc_bytes(pid, "cmdline")
-    except OSError:
-        return None
+    except OSError as e:
+        if _gone(e):
+            return "absent", None
+        return "unknown", {"pid": pid, "uid": uid, "start": start}
     try:
         environ_raw = _proc_bytes(pid, "environ")
         environ = _selected_environ(environ_raw)
@@ -257,11 +295,11 @@ def _proc_snapshot(pid):
     except OSError:
         cwd = None
     if not _proc_matches(pid, start, cmdline, environ_raw, cwd):
-        return None
-    return {"pid": pid, "uid": uid, "start": start, "cmdline": cmdline,
-            "environ": environ_raw,
-            "argv": cmdline.decode("utf-8", "replace").split("\0"),
-            "env": environ, "cwd": cwd}
+        return "absent", None
+    return "ok", {"pid": pid, "uid": uid, "start": start, "cmdline": cmdline,
+                  "environ": environ_raw,
+                  "argv": cmdline.decode("utf-8", "replace").split("\0"),
+                  "env": environ, "cwd": cwd}
 
 
 def _resume_sid(argv):
@@ -429,21 +467,33 @@ def _proc_claude_census():
     render estate-UNKNOWN, never certify an empty estate. ``who_failed`` True
     means the who rung was never probed: an unresolved non-child row may only
     look unresolved because its strongest remaining rung silently vanished —
-    a failed probe, not a proven blank.
+    a failed probe, not a proven blank. ``census_partial`` True means a
+    mandatory per-pid probe failed BEFORE the pid's comm could prove or
+    refute claude while the pid persists: the row count is a FLOOR ("at
+    least N"), never a certified estate total — surfaced the same way as
+    listing_failed, never dropped as proven absence. A mandatory probe that
+    fails AFTER comm proved claude yields a ``probe_failed`` UNKNOWN row
+    (pid known, facts unprovable) instead of vanishing. Only ENOENT/ESRCH —
+    the process left mid-scan — is genuine absence.
 
     Each row also exports its bracket: ``start`` (the pid generation every
     fact was proven against — a consumer making LATER /proc reads must
     re-prove it before composing them in) and ``environ`` (the bracketed
     environ, whole, so env facts never need a second unbracketed read)."""
-    snapshots, listing_failed = [], False
+    snapshots, unknown_stubs = [], []
+    listing_failed = census_partial = False
     try:
         pids = sorted((int(p) for p in os.listdir(PROC) if p.isdigit()))
     except OSError:
         pids, listing_failed = [], True
     for pid in pids:
-        snap = _proc_snapshot(pid)
-        if snap:
+        status, snap = _proc_snapshot(pid)
+        if status == "ok":
             snapshots.append(snap)
+        elif status == "unknown":
+            unknown_stubs.append(snap)
+        elif status == "partial":
+            census_partial = True
     who_failed = False
     try:
         from . import who
@@ -501,9 +551,31 @@ def _proc_claude_census():
             "child": child,
             "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
             "force": env.get(FORCE_VAR) == "1",
+            "probe_failed": False,
         })
+    for stub in unknown_stubs:
+        # comm proved claude, then a mandatory read failed while the pid
+        # persisted. Surface the pid as an UNKNOWN row — but only while its
+        # GENERATION still persists: a gone pid (ENOENT/ESRCH) is genuine
+        # absence, while an unreadable recheck stays fail-closed UNKNOWN.
+        try:
+            still = _starttime_from_stat(
+                _proc_bytes(stub["pid"], "stat")) == stub["start"]
+        except OSError as e:
+            still = not _gone(e)
+        if not still:
+            continue
+        rows.append({
+            "pid": stub["pid"], "resume": None, "declared": None,
+            "declared_reason": "probe-failed",
+            "cwd": None, "root": None, "start": stub["start"],
+            "environ": None, "identity": "unknown", "session": None,
+            "possible_sessions": [], "child": False, "ancestor_sid8": "",
+            "force": False, "probe_failed": True,
+        })
+    rows.sort(key=lambda r: r["pid"])
     return {"rows": rows, "listing_failed": listing_failed,
-            "who_failed": who_failed}
+            "who_failed": who_failed, "census_partial": census_partial}
 
 
 def _proc_claude_rows():

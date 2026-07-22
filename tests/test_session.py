@@ -4,6 +4,7 @@ layer over cv. cv is stubbed (the mechanics are cv's own tested surface); the
 /proc scan is stubbed via a planted row list; the experts registry rides a tmp
 HELM_HOME."""
 import contextlib
+import errno
 import io
 import json
 import os
@@ -913,7 +914,7 @@ class DeclaredSidTest(unittest.TestCase):
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", census))
 
 
-class ProcSnapshotTest(unittest.TestCase):
+class PlantedProcBase(unittest.TestCase):
     SID = "11111111-1111-1111-1111-111111111111"
 
     def setUp(self):
@@ -940,38 +941,87 @@ class ProcSnapshotTest(unittest.TestCase):
         os.symlink(self.tmp, os.path.join(base, "cwd"))
         return base
 
+    def read_failing(self, failures):
+        """A _proc_bytes that raises per proc-file name, real otherwise."""
+        real = session._proc_bytes
+
+        def read(pid, name):
+            if name in failures:
+                raise failures[name]
+            return real(pid, name)
+        return read
+
+
+class ProcSnapshotTest(PlantedProcBase):
     def test_comm_identity_accepts_adapter_argv_and_parses_resume(self):
         self.plant()
-        snap = session._proc_snapshot(41)
-        self.assertIsNotNone(snap)
+        status, snap = session._proc_snapshot(41)
+        self.assertEqual(status, "ok")
         self.assertEqual(session._resume_sid(snap["argv"]), self.SID)
 
     def test_unreadable_environ_keeps_visible_snapshot_without_home_guess(self):
         self.plant()
-        real = session._proc_bytes
-
-        def read(pid, name):
-            if name == "environ":
-                raise PermissionError("fixture")
-            return real(pid, name)
-
+        read = self.read_failing({"environ": PermissionError("fixture")})
         with mock.patch.object(session, "_proc_bytes", side_effect=read):
-            snap = session._proc_snapshot(41)
-        self.assertIsNotNone(snap)
+            status, snap = session._proc_snapshot(41)
+        self.assertEqual(status, "ok")
         self.assertIsNone(snap["env"])
 
     def test_exec_or_pid_reuse_during_snapshot_drops_process(self):
         self.plant()
         with mock.patch.object(session, "_proc_matches", return_value=False):
-            self.assertIsNone(session._proc_snapshot(41))
+            self.assertEqual(session._proc_snapshot(41), ("absent", None))
 
     def test_environment_change_breaks_process_bracket(self):
         self.plant()
-        snap = session._proc_snapshot(41)
+        _status, snap = session._proc_snapshot(41)
         with open(os.path.join(self.tmp, "41", "environ"), "wb") as f:
             f.write(b"HOME=/different\0")
         self.assertFalse(session._proc_matches(
             41, snap["start"], snap["cmdline"], snap["environ"], snap["cwd"]))
+
+    def test_cmdline_probe_failure_after_comm_proved_claude_is_unknown(self):
+        # codex-2 HIGH, exact probe: same-uid stat+start succeeded, comm
+        # proved 'claude', then the MANDATORY cmdline read raised
+        # PermissionError. The pid is KNOWN; its facts are unprovable —
+        # ("unknown", stub), never a silent None that certifies absence.
+        self.plant()
+        read = self.read_failing({"cmdline": PermissionError("fixture")})
+        with mock.patch.object(session, "_proc_bytes", side_effect=read):
+            status, stub = session._proc_snapshot(41)
+        self.assertEqual(status, "unknown")
+        self.assertEqual((stub["pid"], stub["start"]), (41, "424242"))
+
+    def test_cmdline_enoent_mid_scan_stays_genuine_absence(self):
+        # the process left between comm and cmdline: ENOENT/ESRCH is EXIT,
+        # not a probe failure — keep skipping
+        self.plant()
+        read = self.read_failing({"cmdline": OSError(errno.ENOENT, "gone")})
+        with mock.patch.object(session, "_proc_bytes", side_effect=read):
+            self.assertEqual(session._proc_snapshot(41), ("absent", None))
+        read = self.read_failing({"cmdline": OSError(errno.ESRCH, "gone")})
+        with mock.patch.object(session, "_proc_bytes", side_effect=read):
+            self.assertEqual(session._proc_snapshot(41), ("absent", None))
+
+    def test_pre_comm_probe_failure_is_partial_not_absence(self):
+        # a same-uid pid whose comm read failed before it could prove or
+        # refute claude: the census can no longer certify completeness
+        self.plant()
+        read = self.read_failing({"comm": PermissionError("fixture")})
+        with mock.patch.object(session, "_proc_bytes", side_effect=read):
+            self.assertEqual(session._proc_snapshot(41), ("partial", None))
+        # ...but an ENOENT there is still genuine absence
+        read = self.read_failing({"comm": OSError(errno.ENOENT, "gone")})
+        with mock.patch.object(session, "_proc_bytes", side_effect=read):
+            self.assertEqual(session._proc_snapshot(41), ("absent", None))
+
+    def test_foreign_uid_pid_stays_structurally_not_ours(self):
+        # same-uid scoping holds: an unreadable FOREIGN pid must not spam
+        # UNKNOWN rows for every system process — it is structurally not ours
+        self.plant()
+        with mock.patch.object(session.os, "geteuid",
+                               return_value=os.geteuid() + 1):
+            self.assertEqual(session._proc_snapshot(41), ("absent", None))
 
 
 class ProcCensusTest(unittest.TestCase):
@@ -988,13 +1038,24 @@ class ProcCensusTest(unittest.TestCase):
 
     def census(self, snapshots, records, who_rows=None, candidates=None,
                matches=True, who_fail=False):
-        by_pid = {s["pid"]: s for s in snapshots}
+        # snapshots: plain dicts read as ("ok", snap); explicit
+        # (status, payload, pid) tuples pass through the tri-state contract
+        by_pid, statuses = {}, {}
+        for s in snapshots:
+            if isinstance(s, tuple):
+                status, snap = s[0], s[1]
+                pid = s[2] if len(s) > 2 else snap["pid"]
+            else:
+                status, snap, pid = "ok", s, s["pid"]
+            by_pid[pid] = snap
+            statuses[pid] = status
         who_scan = (mock.Mock(side_effect=OSError) if who_fail
                     else mock.Mock(return_value=who_rows or []))
         with mock.patch.object(session.os, "listdir",
                                return_value=[str(p) for p in by_pid]), \
              mock.patch.object(session, "_proc_snapshot",
-                               side_effect=lambda p: by_pid[p]), \
+                               side_effect=lambda p: (statuses[p],
+                                                      by_pid[p])), \
              mock.patch.object(session, "_session_record",
                                side_effect=lambda p, *_: records[p]), \
              mock.patch.object(session, "_proc_matches", return_value=matches), \
@@ -1110,6 +1171,80 @@ class ProcCensusTest(unittest.TestCase):
         row = self.rows([snap], {41: (self.NEW, "record-ok", "/cfg")})[0]
         self.assertIsNone(row["environ"])
         self.assertEqual(row["declared_reason"], "environ-unreadable")
+
+
+class ProcCensusFailureChannelTest(PlantedProcBase):
+    """codex-2 HIGH: per-PID mandatory probe failures below the global bits
+    must never vanish as proven absence. The REAL _proc_snapshot and census
+    run over a planted /proc; only the failing byte-reads are injected."""
+
+    def census(self, failures=(), read=None):
+        read = read or self.read_failing(dict(failures))
+        with mock.patch.object(session, "_proc_bytes", side_effect=read), \
+             mock.patch.object(who, "scan", return_value=[]), \
+             mock.patch.object(session, "_cwd_session_ids",
+                               return_value=[]):
+            return session._proc_claude_census()
+
+    def test_post_comm_probe_failure_surfaces_unknown_row(self):
+        # the exact probe: pid listed; same-uid stat+start succeeded; comm
+        # proved 'claude'; cmdline raised PermissionError. Before the fix the
+        # census answered {rows: [], listing_failed: False, who_failed:
+        # False} — certifying 0 live processes after failing to read a KNOWN
+        # claude pid. Now: an UNKNOWN row, never proven absence.
+        self.plant()
+        c = self.census({"cmdline": PermissionError("fixture")})
+        self.assertEqual((c["listing_failed"], c["who_failed"],
+                          c["census_partial"]), (False, False, False))
+        [row] = c["rows"]
+        self.assertTrue(row["probe_failed"])
+        self.assertEqual(
+            (row["pid"], row["identity"], row["session"],
+             row["declared_reason"], row["start"], row["environ"],
+             row["cwd"], row["root"]),
+            (41, "unknown", None, "probe-failed", "424242", None, None, None))
+
+    def test_pre_comm_probe_failure_raises_census_partial(self):
+        # cannot even tell whether the pid is claude: the census can no
+        # longer certify its own completeness — the total becomes a floor
+        self.plant()
+        c = self.census({"comm": PermissionError("fixture")})
+        self.assertTrue(c["census_partial"])
+        self.assertEqual((c["rows"], c["listing_failed"]), ([], False))
+
+    def test_enoent_mid_scan_stays_absence_not_partial(self):
+        # the process left mid-scan: genuine absence keeps being skipped
+        self.plant()
+        c = self.census({"cmdline": OSError(errno.ENOENT, "gone")})
+        self.assertEqual((c["rows"], c["census_partial"]), ([], False))
+
+    def test_healthy_census_certifies_complete_with_proven_rows(self):
+        self.plant()
+        c = self.census()
+        self.assertFalse(c["census_partial"])
+        [row] = c["rows"]
+        self.assertFalse(row["probe_failed"])
+        self.assertEqual(row["pid"], 41)
+
+    def test_unknown_stub_rechecks_its_generation_before_row_build(self):
+        # exited before row build (ENOENT on the recheck) -> dropped as
+        # genuine absence; an UNREADABLE recheck stays fail-closed UNKNOWN
+        self.plant()
+        for exc, expect_rows in ((OSError(errno.ENOENT, "gone"), 0),
+                                 (OSError(errno.EACCES, "opaque"), 1)):
+            real, seen = session._proc_bytes, {"stat": 0}
+
+            def read(pid, name, exc=exc):
+                if name == "cmdline":
+                    raise PermissionError("fixture")
+                if name == "stat":
+                    seen["stat"] += 1
+                    if seen["stat"] > 1:
+                        raise exc
+                return real(pid, name)
+            c = self.census(read=read)
+            self.assertEqual(len(c["rows"]), expect_rows, exc)
+            self.assertFalse(c["census_partial"])
 
 
 if __name__ == "__main__":

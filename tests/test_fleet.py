@@ -10,6 +10,7 @@ import inspect
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import fleet, session  # noqa: E402
+from helm import fleet, session, who  # noqa: E402
 
 SID_A = "12345678-1234-1234-1234-123456789abc"
 SID_B = "87654321-4321-4321-4321-cba987654321"
@@ -41,7 +42,8 @@ def srow(pid, sid=None, identity="unknown", root=None, cwd="/w",
 class FleetRowsTest(unittest.TestCase):
     def _wire(self, envs, census=(), daemons=(), daemons_failed=False,
               daemon_for=None, roster=({}, False), terminals=([], False),
-              census_failed=False, who_failed=False, generation=None):
+              census_failed=False, who_failed=False, census_partial=False,
+              generation=None):
         merged = []
         for r in census:
             r = dict(r)
@@ -56,7 +58,8 @@ class FleetRowsTest(unittest.TestCase):
         generation = generation or (lambda pid, start: True)
         return [
             mock.patch.object(fleet, "_census",
-                              lambda: (census, census_failed, who_failed)),
+                              lambda: (census, census_failed, who_failed,
+                                       census_partial)),
             mock.patch.object(fleet, "_daemon_pids",
                               lambda: (daemons, set(), daemons_failed)),
             mock.patch.object(fleet, "_daemon_for", daemon_for),
@@ -76,7 +79,7 @@ class FleetRowsTest(unittest.TestCase):
                 p.stop()
 
     def _rows(self, *a, **kw):
-        table, daemons, _failed = self._rows_full(*a, **kw)
+        table, daemons, _failed, _partial = self._rows_full(*a, **kw)
         return table, daemons
 
     def _render_rc(self, *a, args=(), **kw):
@@ -117,7 +120,7 @@ class FleetRowsTest(unittest.TestCase):
 
         def census():
             calls["census"] += 1
-            return {r["pid"]: r for r in rows_}, False, False
+            return {r["pid"]: r for r in rows_}, False, False, False
 
         def daemon_pids():
             calls["daemons"] += 1
@@ -183,8 +186,10 @@ class SidDelegationTest(FleetRowsTest):
         with mock.patch.object(
                 session, "_proc_claude_census",
                 return_value={"rows": rows, "listing_failed": False,
-                              "who_failed": False}) as prc:
-            self.assertEqual(fleet._census(), ({7: rows[0]}, False, False))
+                              "who_failed": False,
+                              "census_partial": False}) as prc:
+            self.assertEqual(fleet._census(),
+                             ({7: rows[0]}, False, False, False))
         prc.assert_called_once_with()
 
     def test_fleet_source_rederives_no_sid_or_config_parsing(self):
@@ -570,7 +575,7 @@ class GenerationBracketTest(FleetRowsTest):
             order.append("recheck")
             return True
         with mock.patch.object(fleet, "_census",
-                               lambda: (census, False, False)), \
+                               lambda: (census, False, False, False)), \
              mock.patch.object(fleet, "_daemon_pids",
                                lambda: ({99: "1"}, set(), False)), \
              mock.patch.object(fleet, "_daemon_for", daemon_for), \
@@ -600,7 +605,8 @@ class CensusCompletenessTest(FleetRowsTest):
     sub-declared/resume row sid-UNKNOWN."""
 
     def test_census_failure_cannot_certify_an_empty_estate(self):
-        table, daemons, failed = self._rows_full({}, (), census_failed=True)
+        table, daemons, failed, _partial = self._rows_full(
+            {}, (), census_failed=True)
         self.assertEqual(table, [])
         self.assertTrue(failed)
         out, rc = self._render_rc({}, (), census_failed=True)
@@ -645,6 +651,128 @@ class CensusCompletenessTest(FleetRowsTest):
         # the healthy counterpart: same rows, probed who, no taint
         rows, _ = self._rows(envs, census + [child])
         self.assertFalse(any(r["unknown"] for r in rows))
+
+
+def pfrow(pid, start="g1"):
+    """One probe-failed census row exactly as session shapes it: comm proved
+    claude, then a mandatory read failed while the pid persisted."""
+    return {"pid": pid, "resume": None, "declared": None,
+            "declared_reason": "probe-failed", "cwd": None, "root": None,
+            "start": start, "environ": None, "identity": "unknown",
+            "session": None, "possible_sessions": [], "child": False,
+            "ancestor_sid8": "", "force": False, "probe_failed": True}
+
+
+class PerPidProbeFailureTest(FleetRowsTest):
+    """codex-2 HIGH: per-PID mandatory probe failures below the global bits
+    must never vanish as proven absence. A post-comm failure is an UNKNOWN
+    row in the output AND the exit status; a pre-comm failure is
+    census_partial — the estate total is a floor, surfaced like
+    listing_failed, exit nonzero."""
+
+    def test_probe_failed_row_is_unknown_and_fails_the_exit_status(self):
+        census = [pfrow(41)]
+        table, _daemons, failed, partial = self._rows_full({}, census)
+        r = table[0]
+        self.assertTrue(r["probe_failed"])
+        self.assertTrue(r["unknown"])
+        self.assertIsNone(r["sid"])
+        self.assertFalse(failed)
+        self.assertFalse(partial)
+        out, rc = self._render_rc({}, census)
+        self.assertEqual(rc, 1)
+        self.assertIn("pid 41", out)
+        self.assertIn("mandatory census probe", out)
+        self.assertIn("never proven absence", out)
+        self.assertIn("UNKNOWN columns", out)
+
+    def test_probe_failed_reaches_json_consumers(self):
+        out, rc = self._render_rc({}, [pfrow(41)], args=("--json",))
+        self.assertEqual(rc, 1)
+        data = json.loads(out)
+        self.assertTrue(data["rows"][0]["probe_failed"])
+        self.assertTrue(data["rows"][0]["unknown"])
+        self.assertFalse(data["census_partial"])
+
+    def test_census_partial_prints_a_floor_and_exits_nonzero(self):
+        census = [srow(1, SID_A, "declared", root="/r")]
+        out, rc = self._render_rc({1: {}}, census, census_partial=True)
+        self.assertEqual(rc, 1)
+        self.assertIn("at least 1 live claude process(es)", out)
+        self.assertIn("CENSUS PARTIAL", out)
+        self.assertIn("floor", out)
+
+    def test_census_partial_reaches_json_consumers(self):
+        out, rc = self._render_rc({}, (), census_partial=True,
+                                  args=("--json",))
+        self.assertEqual(rc, 1)
+        self.assertTrue(json.loads(out)["census_partial"])
+        # the healthy counterpart still certifies the affirmative bits
+        out, rc = self._render_rc({}, (), args=("--json",))
+        self.assertEqual(rc, 0)
+        self.assertFalse(json.loads(out)["census_partial"])
+
+    def test_healthy_estate_total_is_not_a_floor(self):
+        out, rc = self._render_rc({1: {}},
+                                  [srow(1, SID_A, "declared", root="/r")])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("at least", out)
+        self.assertNotIn("CENSUS PARTIAL", out)
+
+
+@unittest.skipIf(os.geteuid() == 0, "root bypasses file permissions")
+class ProbeFailedEndToEndTest(unittest.TestCase):
+    """The finding's exact probe, END TO END through the CLI: a planted
+    /proc pid whose comm proves 'claude' and whose cmdline raises
+    PermissionError must surface as an UNKNOWN row and a nonzero exit —
+    helm fleet must never certify 0 live processes after failing to read a
+    KNOWN claude pid."""
+
+    def _run(self, args):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        base = os.path.join(tmp, "41")
+        os.makedirs(base)
+        with open(os.path.join(base, "comm"), "wb") as f:
+            f.write(b"claude\n")
+        cmdline = os.path.join(base, "cmdline")
+        with open(cmdline, "wb") as f:
+            f.write(b"claude\0")
+        with open(os.path.join(base, "environ"), "wb") as f:
+            f.write(b"HOME=/nonexistent-home\0")
+        fields = ["S"] + [str(i) for i in range(4, 22)] + ["424242", "0", "0"]
+        with open(os.path.join(base, "stat"), "w") as f:
+            f.write("41 (claude) %s\n" % " ".join(fields))
+        os.symlink(tmp, os.path.join(base, "cwd"))
+        os.chmod(cmdline, 0)
+        self.addCleanup(os.chmod, cmdline, 0o644)
+        buf = io.StringIO()
+        with mock.patch.object(session, "PROC", tmp), \
+             mock.patch.object(who, "scan", return_value=[]), \
+             mock.patch.object(fleet, "_daemon_pids",
+                               lambda: ({}, set(), False)), \
+             mock.patch.object(fleet, "_daemon_for",
+                               lambda *a: ("unknown", None)), \
+             mock.patch.object(fleet, "_roster", lambda: ({}, False)), \
+             contextlib.redirect_stdout(buf):
+            rc = fleet.cmd_fleet(list(args))
+        return buf.getvalue(), rc
+
+    def test_unreadable_known_claude_pid_is_unknown_row_nonzero_exit(self):
+        out, rc = self._run(["--json"])
+        self.assertEqual(rc, 1)
+        data = json.loads(out)
+        [row] = data["rows"]
+        self.assertEqual(row["pid"], 41)
+        self.assertTrue(row["probe_failed"])
+        self.assertTrue(row["unknown"])
+        self.assertIsNone(row["sid"])
+        self.assertFalse(data["census_failed"])
+        self.assertFalse(data["census_partial"])
+        out, rc = self._run([])
+        self.assertEqual(rc, 1)
+        self.assertIn("pid 41", out)
+        self.assertIn("mandatory census probe", out)
 
 
 class SidParserTest(unittest.TestCase):
