@@ -196,6 +196,11 @@ def fmt_tokens(n):
 
 def cmd_crosscheck(args):
     """creds crosscheck [--json] — local-scan second source vs header truth."""
+    from .cli import guard_tail
+    rc = guard_tail("helm creds crosscheck", args, flags=("--json",),
+                    usage="creds crosscheck [--json]")
+    if rc is not None:
+        return rc
     from .providers import ProviderError
     try:
         rows = crosscheck()

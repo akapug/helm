@@ -255,6 +255,11 @@ def cmd_corpus(args):
     dry = bool(_flag(args, "--dry"))
     sub = args[0] if args else None
     if sub == "status":
+        from .cli import guard_tail
+        rc = guard_tail("helm corpus status", args[1:],
+                        usage="corpus status [--dest DIR]")
+        if rc is not None:
+            return rc
         rows = scan()
         man = load_manifest(dest)
         pending, unchanged = plan(rows, man)

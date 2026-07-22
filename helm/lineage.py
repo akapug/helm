@@ -281,6 +281,11 @@ def cmd_lineage(args):
         return 0
     verb, rest = args[0], args[1:]
     if verb == "seed":
+        # seed MUTATES the registry; trailing junk refuses before it applies.
+        from .cli import guard_tail
+        rc = guard_tail("helm lineage seed", rest, usage="lineage seed")
+        if rc is not None:
+            return rc
         rep = apply_seed()
         ne, nx = len(rep["edges"]), len(rep["externals"])
         print("helm lineage seed: %d external%s added, %d edge%s applied" % (
@@ -314,6 +319,11 @@ def cmd_lineage(args):
         print("external: %s -> %s" % (rest[0], path))
         return 0
     if verb == "archive-report":
+        from .cli import guard_tail
+        rc = guard_tail("helm lineage archive-report", rest,
+                        usage="lineage archive-report")
+        if rc is not None:
+            return rc
         rows = archive_report()
         print("helm lineage archive-report — READ-ONLY (ranked; nothing is moved by this slice)")
         if not rows:

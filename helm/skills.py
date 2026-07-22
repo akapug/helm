@@ -88,6 +88,13 @@ def cmd_skills(args):
         print("helm skills: unknown verb '%s' (skills [dupes|sync])" % args[0],
               file=sys.stderr)
         return 2
+    # trailing junk after the matched subverb refuses BEFORE the census runs
+    # (`skills dupes --bogus --help` used to scan and exit 0).
+    from .cli import guard_tail
+    rc = guard_tail("helm skills dupes" if args else "helm skills", args[1:],
+                    usage="skills [dupes|sync [--apply]]")
+    if rc is not None:
+        return rc
     skills, bad = census()
     if args and args[0] == "dupes":
         name_dupes, content_dupes = dupes(skills)

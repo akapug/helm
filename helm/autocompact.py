@@ -498,9 +498,17 @@ def _install_timer(args):
 
 def cmd_autocompact(args):
     args = list(args)
-    if "--help" in args or "-h" in args:
-        print(_USAGE)
-        return 0
+    # junk refuses BEFORE help and BEFORE the check() sweep — `seat
+    # autocompact frobnicate --help` is an existence probe, and a typo'd arg
+    # must not fire the /compact injector as if the arg existed.
+    from .cli import guard_tail
+    rc = guard_tail("helm seat autocompact", args,
+                    flags=("--install-timer", "--apply", "--dry-run",
+                           "--quiet", "--json"),
+                    valued=("--threshold", "--seat", "--interval"),
+                    usage=_USAGE)
+    if rc is not None:
+        return rc
     if "--install-timer" in args:
         return _install_timer(args)
     thr = None

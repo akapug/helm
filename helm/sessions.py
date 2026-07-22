@@ -635,14 +635,33 @@ def cmd_sessions(args):
             print("  warn: " + w, file=sys.stderr)
         return 0
 
-    project = None
+    # the bare-list path: ONE optional positional (the <project> filter, the
+    # docstring's contract) — unknown flag-shaped args refuse instead of
+    # silently listing as if they existed.
+    rest = list(args)
     limit = 25
-    if "--limit" in args:
-        limit = int(args[args.index("--limit") + 1])
-    for a in args:
-        if not a.startswith("--") and (not args.index(a) or args[args.index(a) - 1] != "--limit"):
-            project = a
-    rows = rows_for(project=project, include_synthetic="--all" in args, limit=limit)
+    if "--limit" in rest:
+        i = rest.index("--limit")
+        try:
+            limit = int(rest[i + 1])
+        except (IndexError, ValueError):
+            print("helm sessions: --limit wants an integer", file=sys.stderr)
+            return 2
+        del rest[i:i + 2]
+    include_synthetic = "--all" in rest
+    rest = [a for a in rest if a != "--all"]
+    junk = [a for a in rest if a.startswith("-")]
+    if junk:
+        print("helm sessions: unknown arg '%s' (sessions [<project>] "
+              "[--limit N] [--all] | sessions resume <id-prefix>)" % junk[0],
+              file=sys.stderr)
+        return 2
+    if len(rest) > 1:
+        print("helm sessions: one <project> filter at most (got: %s)"
+              % ", ".join(rest), file=sys.stderr)
+        return 2
+    project = rest[0] if rest else None
+    rows = rows_for(project=project, include_synthetic=include_synthetic, limit=limit)
     if not rows:
         print("helm sessions: none%s." % (" for project '%s'" % project if project else ""))
         return 0

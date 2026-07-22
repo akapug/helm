@@ -281,6 +281,12 @@ def cmd_whoami(args):
     know about you: profile + active notes."""
     if args and args[0] == "note":
         return _note_cmd(args[1:])
+    if args:
+        # `whoami <junk>` used to silently show the profile and exit 0 — the
+        # one advertised subverb is `note`; anything else refuses.
+        print("helm whoami: unknown subverb '%s' (whoami [note <text...>])"
+              % args[0], file=sys.stderr)
+        return 2
     p = merge_scaffold()
     notes = load_notes()
     if not (p["technical_level"] or p["guidance"] or notes):
@@ -428,6 +434,11 @@ def cmd_interview(args):
     keep/correct/drop); an empty one gets the blank questions. Interactive on a
     tty; otherwise prints the sheet, or the drafts unwritten. Never nags: done
     latches it off."""
+    from .cli import guard_tail
+    rc = guard_tail("helm interview", args, flags=("--questions", "--redo"),
+                    usage="interview [--questions] [--redo]")
+    if rc is not None:
+        return rc
     p = merge_scaffold()
     if p["interview_status"] == "done" and "--redo" not in args and "--questions" not in args:
         print("helm interview: already done (updated %s) — you're known." % (p["updated_at"] or "?"))

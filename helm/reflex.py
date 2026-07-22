@@ -387,7 +387,8 @@ def cmd_reflex(args):
         return _cmd_retire(args[1:])
     if args[0] == "smoke":
         return _cmd_smoke(args[1:])
-    print("helm reflex: unknown subcommand '%s'" % args[0])
+    import sys
+    print("helm reflex: unknown subcommand '%s'" % args[0], file=sys.stderr)
     return 2
 
 

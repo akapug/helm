@@ -82,6 +82,44 @@ def cmd_show(args):
     return 0
 
 
+def guard_tail(prog, args, flags=(), valued=(), usage=None):
+    """The nested-dispatcher honesty contract, companion to main()'s
+    unknown-verb refusal: once a subverb is matched, every REMAINING token
+    must be a known flag. Trailing junk refuses with exit 2 BEFORE any work
+    runs (`seat down codex --bogus` used to stop the seat and exit 0), and
+    `--help` after junk still refuses — the existence probe stays honest.
+    A clean tail carrying -h/--help prints `usage` and returns 0. `valued`
+    flags must carry a non-flag value exactly once. Returns None to proceed,
+    else the exit code for the caller to return."""
+    args = list(args or [])
+    junk, want_help, seen = [], False, set()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            want_help = True
+        elif a in valued:
+            if a in seen:
+                print("%s: duplicate %s" % (prog, a), file=sys.stderr)
+                return 2
+            seen.add(a)
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                print("%s: %s wants a value" % (prog, a), file=sys.stderr)
+                return 2
+            i += 1
+        elif a not in flags:
+            junk.append(a)
+        i += 1
+    if junk:
+        print("%s: unknown arg '%s'%s" % (
+            prog, junk[0], (" (%s)" % usage) if usage else ""), file=sys.stderr)
+        return 2
+    if want_help:
+        print(usage or prog)
+        return 0
+    return None
+
+
 def _lazy(module, fn):
     """Import a leg only when its verb runs — `helm projects` never pays for
     the web server's imports, and one broken leg never takes the CLI down."""
