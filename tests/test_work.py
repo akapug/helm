@@ -70,10 +70,20 @@ class WorkBase(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def room(self, lane, dirty=None):
-        """Mint a lease-less room directly (git only, never the desk)."""
+        """Mint a lease-less room directly (git only, never the desk).
+
+        Carries HELM_WORK_INTEGRATOR=1 because once the ref-guard is installed
+        this raw `worktree add -b` is REFUSED by design — minting a branch in
+        the shared checkout is exactly what the rail exists to stop, and the
+        sanctioned paths are `helm work claim` or this override. The fixture
+        is standing in for the integrator, so it declares that rather than
+        quietly weakening the guard to let a test through."""
         path = work.lane_path(self.root, lane)
-        r = _sh(self.root, "git", "worktree", "add", "-q", "-b",
-                work.lane_branch(lane), path, "main")
+        r = subprocess.run(["git", "worktree", "add", "-q", "-b",
+                            work.lane_branch(lane), path, "main"],
+                           cwd=self.root, capture_output=True, text=True,
+                           timeout=30,
+                           env=dict(os.environ, HELM_WORK_INTEGRATOR="1"))
         self.assertEqual(r.returncode, 0, r.stderr)
         if dirty:
             with open(os.path.join(path, dirty), "w") as f:
@@ -286,14 +296,24 @@ class GuardTest(WorkBase):
         rc, out, _err = self.work("install-guard", "--apply")
         self.assertEqual(rc, 0)
         self.assertTrue(os.access(hook, os.X_OK))
-        # the motivating failure: `checkout -b` in the shared checkout heals —
-        # pointer back to main, the created branch SURVIVES, message is loud
+        # THE MOTIVATING FAILURE, now enforced rather than healed. It used to
+        # SUCCEED (rc 0) and be silently corrected afterwards — git printed
+        # "Switched to a new branch", the heal spoke only on stderr, and the
+        # next commit landed on main. post-checkout cannot do better: git
+        # ignores its exit code. reference-transaction refuses outright.
         r = _sh(self.root, "git", "checkout", "-b", "oops")
-        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.returncode, 128, r.stderr)
+        self.assertIn("REFUSED", r.stderr)
+        self.assertIn("helm work claim oops", r.stderr)
         head = _sh(self.root, "git", "symbolic-ref", "--short", "HEAD")
         self.assertEqual(head.stdout.strip(), "main")
-        self.assertTrue(work._has_branch(self.root, "oops"))
-        self.assertIn("integrator", r.stderr)
+        # and the ref never came into existence — nothing to clean up later
+        self.assertFalse(work._has_branch(self.root, "oops"))
+        # committing on the trunk is untouched by the ref guard
+        with open(os.path.join(self.root, "README"), "a") as f:
+            f.write("trunk work\n")
+        self.assertEqual(_sh(self.root, "git", "commit", "-qam", "t").returncode,
+                         0)
         # worktree add must NOT trip the guard (lane rooms are unguarded)
         wt = self.room("quiet")
         self.assertEqual(
@@ -307,6 +327,71 @@ class GuardTest(WorkBase):
         self.assertEqual(r.returncode, 0, r.stderr)
         head = _sh(self.root, "git", "symbolic-ref", "--short", "HEAD")
         self.assertEqual(head.stdout.strip(), "intg")
+
+    def test_claim_still_works_with_the_ref_guard_installed(self):
+        """The guard must not break the verb it points at. `worktree add -b`
+        runs the hook with cwd AND toplevel both equal to the shared checkout
+        — indistinguishable from a forbidden `checkout -b` — so claim exports
+        HELM_WORK_CLAIM=1 to announce itself. Without that, installing the
+        rail would refuse every `helm work claim` and strand the fleet."""
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.work("claim", "after-guard", "--seat", "s1")
+        self.assertEqual(rc, 0, err)
+        path = out.split("\t")[0]
+        self.assertTrue(os.path.isdir(path))
+        self.assertTrue(work._has_branch(self.root, "lane/after-guard"))
+        self.assertEqual(
+            _sh(path, "git", "symbolic-ref", "--short", "HEAD").stdout.strip(),
+            "lane/after-guard")
+        # the shared checkout never left the trunk
+        self.assertEqual(
+            _sh(self.root, "git", "symbolic-ref", "--short", "HEAD").stdout.strip(),
+            "main")
+
+    def test_ref_guard_leaves_lane_rooms_alone(self):
+        """Branching INSIDE a lane room is the sanctioned workflow and must
+        stay free — the rail guards the integrator's tree, nothing else."""
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        room = self.room("free")
+        r = _sh(room, "git", "checkout", "-b", "free-sub")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            _sh(room, "git", "symbolic-ref", "--short", "HEAD").stdout.strip(),
+            "free-sub")
+
+    def test_install_is_all_or_nothing_on_a_foreign_ref_hook(self):
+        """Half a rail is the advisory guard we are replacing: the heal
+        without the refusal silently corrects and lets the next commit land on
+        main. A foreign hook of EITHER name aborts the whole install."""
+        ref_hook = work.hook_path(self.root, "reference-transaction")
+        os.makedirs(os.path.dirname(ref_hook), exist_ok=True)
+        with open(ref_hook, "w") as f:
+            f.write("#!/bin/sh\n# somebody else's hook\nexit 0\n")
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 1)
+        self.assertIn("not ours", err)
+        with open(ref_hook) as f:
+            self.assertIn("somebody else", f.read())
+        # and the post-checkout half must NOT have been left behind
+        self.assertFalse(os.path.exists(work.hook_path(self.root)))
+
+    def test_a_foreign_post_checkout_also_installs_nothing(self):
+        """The mirror case, which a write-as-you-go install would fail: the
+        ref hook is written FIRST, so only a pre-flight scan keeps a foreign
+        post-checkout from leaving half a rail behind."""
+        heal = work.hook_path(self.root)
+        os.makedirs(os.path.dirname(heal), exist_ok=True)
+        with open(heal, "w") as f:
+            f.write("#!/bin/sh\n# somebody else's checkout hook\nexit 0\n")
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 1)
+        self.assertIn("not ours", err)
+        self.assertFalse(
+            os.path.exists(work.hook_path(self.root, "reference-transaction")))
+        with open(heal) as f:
+            self.assertIn("somebody else", f.read())
 
     def test_install_guard_refuses_foreign_hook(self):
         hook = work.hook_path(self.root)

@@ -41,6 +41,49 @@ DEFAULT_TTL = 4 * 3600          # a build lane, not a chat lock
 LANE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}$")
 _VALUE_FLAGS = ("--repo", "--seat", "--lease", "--ttl")
 
+REF_GUARD_HOOK = """#!/bin/sh
+# helm work ref-guard — the DETERMINISTIC half of the shared-checkout rail
+# (installed beside the post-checkout heal by `helm work install-guard`).
+#
+# WHY THIS EXISTS: post-checkout is a NON-BLOCKING hook — git ignores its exit
+# code — so the heal below can only correct `checkout -b` AFTER the fact and
+# explain itself on stderr. git reports "Switched to a new branch", the heal is
+# invisible unless you read stderr, and the next commit lands on %(base)s. That
+# is an ADVISORY guard, and a guard whose correction is invisible to its
+# subject has not guarded anything (it put one agent's commit straight onto
+# main on 2026-07-21).
+#
+# reference-transaction CAN refuse: a non-zero exit in the `prepared` state
+# ABORTS the ref update (`fatal: ref updates aborted by hook`, rc 128) and HEAD
+# never moves. Probed, not assumed.
+#
+# The discriminator can NOT be cwd or toplevel: `git worktree add -b lane/x`
+# runs this hook with BOTH equal to the shared checkout, byte-identical to a
+# forbidden `checkout -b`. So the sanctioned creator ANNOUNCES ITSELF —
+# `helm work claim` exports HELM_WORK_CLAIM=1 around its worktree add. Anything
+# else minting a branch in the integrator's tree is refused outright.
+[ "$1" = "prepared" ] || exit 0
+[ "$HELM_WORK_INTEGRATOR" = "1" ] && exit 0       # the integrator's own env
+[ "$HELM_WORK_CLAIM" = "1" ] && exit 0            # `helm work claim` itself
+top=$(git rev-parse --show-toplevel 2>/dev/null)
+main_wt=$(git worktree list --porcelain | sed -n 's/^worktree //p' | head -n 1)
+[ "$top" = "$main_wt" ] || exit 0                 # lane rooms are unguarded
+while read -r old new ref; do
+  case "$ref" in
+    refs/heads/%(base)s) ;;                       # trunk commits: fine
+    refs/heads/*)
+      branch="${ref#refs/heads/}"
+      echo "[helm work] REFUSED: '$branch' may not be created in the shared" >&2
+      echo "[helm work] checkout — that tree is the integrator's. Claim a room:" >&2
+      echo "[helm work]   helm work claim $branch" >&2
+      echo "[helm work] (integrator override: HELM_WORK_INTEGRATOR=1)" >&2
+      exit 1 ;;
+  esac
+done
+exit 0
+"""
+
+
 GUARD_HOOK = """#!/bin/sh
 # helm work guard — the shared checkout is the integrator's tree (installed
 # by `helm work install-guard`; design: in-cave git coordination §3d).
@@ -79,12 +122,18 @@ exit 0
 # the two ledgers, each read from its native system — the join is computed
 # ---------------------------------------------------------------------------
 
-def _git(where, *args, timeout=30):
+def _git(where, *args, timeout=30, env=None):
     """git under a path -> (rc, stdout, stderr). Spawn trouble reads as
-    rc -1 — every caller fails toward its SAFE verdict (dirty, unmerged)."""
+    rc -1 — every caller fails toward its SAFE verdict (dirty, unmerged).
+
+    `env` OVERLAYS the ambient environment for this one call (never replaces
+    it — git needs HOME/PATH/GIT_CONFIG_*). Used to hand the ref-guard the
+    single bit that distinguishes the sanctioned branch creator from a
+    forbidden one, scoped to the call rather than leaked into the process."""
     try:
         r = subprocess.run(["git", "-C", where] + list(args),
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           env=dict(os.environ, **env) if env else None)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
     except Exception as exc:
         return -1, "", str(exc)
@@ -253,7 +302,11 @@ def claim(root, lane, seat, ttl=DEFAULT_TTL, lease=None, session=None):
     if path not in {w["path"] for w in worktrees(root)}:
         args = (["worktree", "add", path, branch] if _has_branch(root, branch)
                 else ["worktree", "add", "-b", branch, path, _base(root)])
-        rc, _out, err = _git(root, *args)
+        # The ref-guard cannot tell this apart from a forbidden `checkout -b`
+        # — `worktree add -b` runs it with cwd AND toplevel both equal to the
+        # shared checkout. So the ONE sanctioned branch creator announces
+        # itself, scoped to this single call rather than the process env.
+        rc, _out, err = _git(root, *args, env={"HELM_WORK_CLAIM": "1"})
         if rc != 0:
             seats.release(res, seat, lease=lease_id, session=session)
             return 1, "helm work: worktree add failed — %s (lease returned)" % err
@@ -426,37 +479,68 @@ def list_rows(root):
     return rows
 
 
-def hook_path(root):
+def hook_path(root, name="post-checkout"):
     rc, out, _err = _git(root, "rev-parse", "--path-format=absolute",
                          "--git-common-dir")
     gitdir = out if rc == 0 and out else os.path.join(root, ".git")
-    return os.path.join(gitdir, "hooks", "post-checkout")
+    return os.path.join(gitdir, "hooks", name)
+
+
+GUARD_HOOKS = (("reference-transaction", "REF_GUARD_HOOK"),
+               ("post-checkout", "GUARD_HOOK"))
 
 
 def install_guard(root, apply=False):
-    """(rc, [lines]). The shared-checkout rail: PRINT the post-checkout heal
-    hook by default; --apply installs it into the main checkout's hooks dir
-    (the integrator's coordinated step). Refuses to clobber a foreign hook."""
-    script = GUARD_HOOK % {"base": _base(root)}
-    target = hook_path(root)
+    """(rc, [lines]). The shared-checkout rail, in TWO hooks because one
+    cannot do the job:
+
+      reference-transaction — REFUSES the branch outright (non-zero in the
+        `prepared` state aborts the update; HEAD never moves). This is the
+        enforcement.
+      post-checkout — heals a branch that got created anyway (an older git,
+        a hook-bypassing path) back to the trunk. This is the SAFETY NET,
+        and it is advisory by nature: git ignores a post-checkout exit code,
+        so on its own it can only explain itself on stderr AFTER the fact.
+
+    PRINT by default; --apply installs both. Refuses to clobber a foreign
+    hook of either name."""
+    subs = {"base": _base(root)}
+    scripts = [(name, globals()[var] % subs) for name, var in GUARD_HOOKS]
     if not apply:
-        return 0, [script.rstrip("\n"), "",
-                   "helm work: DRY — would install the guard at %s (--apply "
-                   "installs; the integrator's own env sets "
-                   "HELM_WORK_INTEGRATOR=1)" % target]
-    try:
-        with open(target) as f:
-            prior = f.read()
-    except OSError:
-        prior = None
-    if prior is not None and "helm work guard" not in prior:
-        return 1, ["helm work: %s exists and is not ours — not overwriting "
-                   "(merge by hand)" % target]
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    pk.atomic_write(target, script)
-    os.chmod(target, 0o755)
-    return 0, ["helm work: guard installed at %s (escape hatch: "
-               "HELM_WORK_INTEGRATOR=1 in the integrator's env)" % target]
+        lines = []
+        for name, script in scripts:
+            lines += ["# ---- %s ----" % hook_path(root, name),
+                      script.rstrip("\n"), ""]
+        return 0, lines + [
+            "helm work: DRY — would install %d hooks (--apply installs; the "
+            "integrator's own env sets HELM_WORK_INTEGRATOR=1)" % len(scripts)]
+    # CHECK EVERY TARGET BEFORE WRITING ANY — half a rail is worse than none.
+    # The heal without the refusal IS the advisory guard being replaced, and
+    # a partial install would read as "guarded" while behaving as it always
+    # did. Scanning first is what makes all-or-nothing true rather than
+    # merely intended.
+    planned = []
+    for name, script in scripts:
+        target = hook_path(root, name)
+        try:
+            with open(target) as f:
+                prior = f.read()
+        except OSError:
+            prior = None
+        if prior is not None and "helm work" not in prior:
+            return 1, ["helm work: %s exists and is not ours — not "
+                       "overwriting (merge by hand). NOTHING was installed; "
+                       "the rail is all-or-nothing." % target]
+        planned.append((target, script))
+    out = []
+    for target, script in planned:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        pk.atomic_write(target, script)
+        os.chmod(target, 0o755)
+        out.append("helm work: installed %s" % target)
+    return 0, out + ["helm work: rail is DETERMINISTIC — `git checkout -b` in "
+                     "the shared checkout now FAILS (rc 128) instead of being "
+                     "silently healed (escape hatch: HELM_WORK_INTEGRATOR=1)"]
 
 
 # ---------------------------------------------------------------------------
