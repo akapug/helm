@@ -253,7 +253,9 @@ def _pid_alive(pid):
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, TypeError):
+    except (ProcessLookupError, TypeError, ValueError, OverflowError):
+        # no such pid, a non-int, or an int too large for C (a corrupt/hostile
+        # pidfile body) — all unparseable, all "not a live proxy we can prove".
         return False
     except PermissionError:
         return True
@@ -1184,6 +1186,19 @@ def _up(family, quiet=False, seat=None):
                   "%s, PATH all empty) — run `helm seat doctor`"
                   % PROXY_BIN_DEFAULT, file=sys.stderr)
             return 1
+        # refuse a pre-bound target: an unrelated listener already on the port
+        # means a collision — spawning against it would either fight for the
+        # bind or, worse, _port_open would read the STRANGER as readiness (the
+        # codex MED: _up returned rc=0 + wrote proxy.pid against a foreign
+        # listener while its own child lost the bind). Family bases/comments
+        # prove no RUNTIME ownership.
+        if _port_open(port):
+            print("helm seat: port %d already has a listener that is not %s's "
+                  "proxy — refusing to spawn against someone else's socket "
+                  "(collision). Identify it (`ss -ltnp | grep :%d`) or `helm "
+                  "seat down %s` if it is a stale record."
+                  % (port, seat, port, seat), file=sys.stderr)
+            return 1
         log = open(os.path.join(cfgd, "proxy.log"), "ab")
         try:
             p = subprocess.Popen([b, "-config",
@@ -1213,6 +1228,10 @@ def _up(family, quiet=False, seat=None):
                   % p.pid, file=sys.stderr)
             return 1
         _write_private(os.path.join(cfgd, "proxy.pid"), "%d %s\n" % (p.pid, ident))
+        # readiness = OUR child alive AND the port open. Poll the child first:
+        # a dead child with the port held by a late foreign listener must NOT
+        # read as success (the other half of the codex MED). We already refused
+        # a pre-bound port above, so an open port with a live child is ours.
         for _ in range(30):  # up to ~6s for the port to open
             if p.poll() is not None or _port_open(port):
                 break
@@ -1221,6 +1240,16 @@ def _up(family, quiet=False, seat=None):
             os.remove(os.path.join(cfgd, "proxy.pid"))
             print("helm seat: proxy exited rc %s — tail %s"
                   % (p.returncode, os.path.join(cfgd, "proxy.log")), file=sys.stderr)
+            return 1
+        if not _port_open(port):
+            # child alive but never bound (lost the race to a late listener, or
+            # wedged): not a proxy we can reach — kill it, don't leave an
+            # unmanageable record.
+            p.kill()
+            os.remove(os.path.join(cfgd, "proxy.pid"))
+            print("helm seat: proxy pid %d alive but port %d never opened — "
+                  "killed the orphan; tail %s"
+                  % (p.pid, port, os.path.join(cfgd, "proxy.log")), file=sys.stderr)
             return 1
     if not quiet:
         print("helm seat: %s proxy up — 127.0.0.1:%d (pid %d)"
@@ -1249,8 +1278,14 @@ def _down(family, seat=None):
             if rec and _pid_alive(rec["pid"]):
                 os.remove(pidfile)
                 print("helm seat: %s proxy pidfile stale — pid %d now belongs to "
-                      "an unrelated process (reused); NOT signalled, record reaped"
-                      % (seat, rec["pid"]))
+                      "an unrelated process (reused); NOT signalled, record "
+                      "reaped. NOTE: this includes LEGACY bare-pid records from "
+                      "pre-per-instance proxies (every proxy running at land). "
+                      "The old proxy may STILL hold the port — to load the new "
+                      "config, kill it by hand: `kill %d` (verify with "
+                      "`ss -ltnp | grep :%d`), then `helm seat up %s`."
+                      % (seat, rec["pid"], rec["pid"],
+                         _instance_port(family, seat), seat))
                 return 0
             if os.path.exists(pidfile):
                 os.remove(pidfile)  # stale
@@ -1262,7 +1297,18 @@ def _down(family, seat=None):
         # different starttime, so the recheck refuses to signal it. (pidfd would
         # close the window outright; /proc starttime narrows it to the
         # check→kill instant, which is the portable floor here.)
-        expected = _proxy_pid_record(family, seat)["identity"]
+        # Re-read the record under the lock and FAIL CLOSED if it vanished or
+        # changed out from under the verified pid (a transient read failure,
+        # manual pidfile removal, or a malformed replacement must never crash
+        # the lifecycle on a None subscript — codex-2 advisory on 224e6b5).
+        owned = _proxy_pid_record(family, seat)
+        if not owned or owned["pid"] != pid or not owned["identity"] \
+                or owned["identity"] == "?":
+            print("helm seat: %s proxy record changed/vanished mid-down — "
+                  "refusing to signal an unowned pid %d" % (seat, pid),
+                  file=sys.stderr)
+            return 1
+        expected = owned["identity"]
 
         def _still_ours():
             return _pid_alive(pid) and _pid_identity(pid) == expected
@@ -1605,6 +1651,18 @@ def _resume(seat_name, rest):
         # assets (identity vars, delivery hooks, context env), room preserved.
         _write_launch_assets(
             family, d, room, seat_name, room_source=room_source, multi=multi)
+        # resume must not strand the seat on a dead proxy either (the same
+        # silent-dead-seat class the fable HIGH named in _spawn): mint the
+        # instance proxy (idempotent) and start it if down, so the relaunched
+        # seat's 8319 line has a live proxy behind it.
+        fam = FAMILIES[family]
+        if seat_name != family and fam["mode"] == "proxy":
+            _mint_instance_proxy(family, seat_name)
+        if os.path.exists(os.path.join(_proxy_home(family, seat_name),
+                                       "config.yaml")) \
+                and not _running_pid(family, seat_name):
+            if _up(family, quiet=True, seat=seat_name) == 0:
+                print("  (proxy was down — auto-started)")
         handle = ad.spawn(command, title=seat_name,
                           cwd=sess_cwd or os.getcwd())
     except harness.HarnessError as e:
@@ -1868,6 +1926,26 @@ def _spawn(seat_name, rest, _locked=False):
     if err:
         print("helm seat: " + err, file=sys.stderr)
         return 2
+    # Instance-spawn gate (the fable MED — it lived only on `launch`, so
+    # `spawn kimi-2` / `spawn codex-1` minted launch lines pointed at a SIBLING
+    # family's port range). Per-instance proxies are a proxy-family feature;
+    # and the numeric suffix must be N>=2 — `-1` maps onto the family itself
+    # and base+1 collides with the adjacent family's base port (codex-1 -> 8318
+    # = kimi's base). Refuse both before any asset is minted.
+    if seat_name != family:
+        fam = FAMILIES[family]
+        m = re.match(r"^%s-(\d+)$" % re.escape(family), seat_name)
+        if fam["mode"] != "proxy":
+            print("helm seat: per-instance proxies need an OAuth-pool family "
+                  "(mode=proxy); %s is mode=%s — only the family seat `%s` is "
+                  "supported" % (family, fam["mode"], family), file=sys.stderr)
+            return 2
+        if m and int(m.group(1)) < 2:
+            print("helm seat: %s is not a distinct instance — instance 1 IS the "
+                  "family seat `%s` (and base+1 would collide with a sibling "
+                  "family's port); use `%s` or instance N>=2"
+                  % (seat_name, family, family), file=sys.stderr)
+            return 2
     d = _instance_dir(family, seat_name)
     launch_sh = os.path.join(d, "launch.sh")
     if not os.path.exists(launch_sh) and \
@@ -1909,11 +1987,16 @@ def _spawn(seat_name, rest, _locked=False):
     # seed covers where the seat will actually run.
     _write_launch_assets(family, d, room, seat_name, workdir=cwd, multi=multi)
     # per-instance proxy fate: an INSTANCE seat owns its OWN proxy
-    # (instances/<seat>/), so spawn checks/starts THAT seat's proxy — never
-    # the family's. `_running_pid(family)` here was the shared-fate seam the
-    # per-instance lane exists to remove: `spawn codex-2` with family 8317 up
-    # but codex-2's 8319 down would launch a dead seat. Gate on the seat's own
-    # config (instance minted) or, for instance 1, the family config.
+    # (instances/<seat>/), so spawn mints + starts THAT seat's proxy — never
+    # the family's. MINT FIRST (the fable HIGH): a never-launched instance has
+    # no config yet, and gating on its existence silently skipped BOTH the
+    # auto-start AND the WARN — a spawn-first codex-2 launched DEAD (launch.sh
+    # pointed at 8319, empty token, no proxy) where pre-lane it WORKED on the
+    # shared family proxy. `_mint_instance_proxy` is idempotent, so minting
+    # here mirrors `launch` and is a no-op for an already-minted instance.
+    fam = FAMILIES[family]
+    if seat_name != family and fam["mode"] == "proxy":
+        _mint_instance_proxy(family, seat_name)
     seat_cfg = os.path.join(_proxy_home(family, seat_name), "config.yaml")
     if os.path.exists(seat_cfg) and not _running_pid(family, seat_name):
         if _up(family, quiet=True, seat=seat_name) == 0:

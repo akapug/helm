@@ -421,6 +421,46 @@ class ProxyFixRoundTest(Slice6Base):
         # the replacement record was NOT unlinked (the pidfile still exists)
         self.assertTrue(os.path.exists(os.path.join(home, "proxy.pid")))
 
+    def test_down_fails_closed_when_ownership_reread_vanishes(self):
+        # codex-2 advisory on 224e6b5: after `_running_pid` succeeds, the
+        # ownership re-read under the lock can return None (transient read
+        # failure / manual pidfile removal / malformed replacement). _down must
+        # FAIL CLOSED (rc 1, no signal, no crash) — never TypeError on a None
+        # subscript. Pin both the None and the wrong-pid cases.
+        home = seat._proxy_home("codex", "codex-2")
+        os.makedirs(home, exist_ok=True)
+        live = os.getpid()      # alive, NOT a proxy
+        old_ident = seat._pid_identity(live)
+        seat._write_private(os.path.join(home, "proxy.pid"),
+                            "%d %s\n" % (live, old_ident), mode=0o600)
+        real = seat._proxy_pid_record
+        for bad in (None, {"pid": live + 99999, "identity": "proc:other"}):
+            calls = {"n": 0}
+
+            def vanishing(family, seat=None, _bad=bad):
+                calls["n"] += 1
+                # 1st call = _running_pid's read (real, so pid verifies);
+                # 2nd = the ownership re-read -> the BAD value.
+                return real(family, seat) if calls["n"] == 1 else _bad
+
+            def no_real_signal(pid, sig=0, *a, **k):
+                # kill(pid, 0) is the liveness probe — allowed. Any REAL signal
+                # (SIGTERM/SIGKILL) means _down failed to refuse.
+                if sig not in (0,):
+                    raise AssertionError("must never signal, got %r" % sig)
+
+            with mock.patch.object(seat, "_proxy_pid_record", vanishing), \
+                    mock.patch.object(seat.os, "kill", no_real_signal):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(err):
+                    rc = seat._down("codex", seat="codex-2")
+            self.assertEqual(rc, 1, "must fail closed on %r" % (bad,))
+            self.assertIn("changed/vanished", err.getvalue())
+            # the live pid was never signalled (we are still running) and the
+            # pidfile was NOT unlinked (down refused, not reaped).
+            self.assertTrue(os.path.exists(os.path.join(home, "proxy.pid")))
+
     def test_up_serializes_concurrent_starts(self):
         # atomic-ownership finding: the check→spawn critical section is under
         # the per-home flock, so a second _up sees the first's record and
@@ -470,6 +510,65 @@ class ProxyFixRoundTest(Slice6Base):
 
     def test_proxy_family_bases_are_unique(self):
         self.assertTrue(seat._family_port_bases_are_unique())
+
+
+class FableRoundTest(Slice6Base):
+    """The fable-pair (land-gate) findings on 224e6b5: spawn/resume mint the
+    instance proxy (the silent-dead-seat HIGH), the spawn-seam family/name
+    gate, and the hostile-pidfile corpus. Each test names its finding."""
+
+    def test_spawn_mints_the_instance_proxy(self):
+        # HIGH: spawn of a never-launched instance produced a DEAD seat —
+        # launch.sh pointed at the instance port with an EMPTY token, no proxy
+        # auto-started, no warning (the seat_cfg-exists gate silently no-opped).
+        # Now _spawn mints the instance proxy (idempotent) BEFORE the gate, so
+        # the config exists and the auto-start/WARN branch can fire. Probe the
+        # mint directly: after a spawn-path mint the instance config + token
+        # exist (pre-fix they did not).
+        seat._mint_instance_proxy("codex", "codex-2")   # what _spawn now calls
+        home = seat._proxy_home("codex", "codex-2")
+        self.assertTrue(os.path.exists(os.path.join(home, "config.yaml")))
+        self.assertTrue(os.path.exists(os.path.join(home, "token")))
+        # and the token resolves NON-empty (the dead-seat signature was empty)
+        self.assertTrue(seat._read_token("codex", "codex-2"))
+
+    def test_spawn_refuses_proxy_key_family_instances(self):
+        # MED: the family gate lived only on `launch`; `spawn kimi-2` minted a
+        # launch line pointed at a sibling family's port. Now refused rc 2.
+        os.makedirs(seat.seat_dir("kimi"), exist_ok=True)
+        seat._write_private(os.path.join(seat.seat_dir("kimi"), "config.yaml"),
+                            "port: 8318\n", mode=0o600)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["spawn", "kimi-2"])
+        self.assertEqual(rc, 2)
+        self.assertIn("mode=proxy", err.getvalue())
+
+    def test_spawn_refuses_instance_one_name(self):
+        # MED: `codex-1` maps onto the family AND base+1 collides with the
+        # adjacent family's base port (codex-1 -> 8318 = kimi's). Refused rc 2.
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["spawn", "codex-1"])
+        self.assertEqual(rc, 2)
+        self.assertIn("not a distinct instance", err.getvalue())
+
+    def test_hostile_pidfile_corpus_fails_closed(self):
+        # LOW: every hostile pidfile shape must fail CLOSED (no signal, no
+        # crash) — including an overflow-sized pid (was an uncaught
+        # OverflowError). Probe each through _running_pid with our own live pid.
+        home = seat._proxy_home("codex", "codex-2")
+        os.makedirs(home, exist_ok=True)
+        live = os.getpid()
+        ident = seat._pid_identity(live)
+        for body in ("garbage\n", "", "-1 proc:x\n", "0 proc:x\n",
+                     "99999999999999999999 proc:x\n",      # overflow
+                     "%d proc:wrong-identity\n" % live,    # live but not ours
+                     "%d\n" % live,                        # legacy bare pid
+                     ):
+            seat._write_private(os.path.join(home, "proxy.pid"), body, mode=0o600)
+            self.assertIsNone(seat._running_pid("codex", "codex-2"),
+                              "hostile pidfile must fail closed: %r" % body)
 
 
 if __name__ == "__main__":
