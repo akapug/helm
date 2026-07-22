@@ -157,10 +157,16 @@ def digest(items):
     {"active","done","total","fp"}. `fp` is the MATERIAL fingerprint — the
     in-progress line plus the done/total counts. Reordering, re-wording a
     pending item, or any other churn leaves it unchanged, which is exactly
-    what makes 'nothing materially changed' cheap to detect."""
-    items = items or []
-    active = next((i["text"] for i in items if i["status"] == ACTIVE), None)
-    done = sum(1 for i in items if i["status"] == DONE)
+    what makes 'nothing materially changed' cheap to detect.
+
+    Rows that are not well-formed dicts are DROPPED, not trusted: this reads
+    a file a hand-edit or a truncated write can reach, and every consumer of
+    the digest (CLI, roster, web) has to survive it."""
+    items = [i for i in (items or []) if isinstance(i, dict)] \
+        if isinstance(items, list) else []
+    active = next((str(i.get("text") or "") for i in items
+                   if i.get("status") == ACTIVE), None)
+    done = sum(1 for i in items if i.get("status") == DONE)
     return {"active": active, "done": done, "total": len(items),
             "fp": "%s|%d|%d" % (active or "", done, len(items))}
 
@@ -186,8 +192,16 @@ def state_path(sid):
 
 def state(sid):
     """One session's mirrored todo state, {} when absent — the read seam
-    every consumer (CLI, roster, web) uses instead of hardcoding the path."""
-    return pk.read_json(state_path(sid), {}) or {}
+    every consumer (CLI, roster, web) uses instead of hardcoding the path.
+
+    A file that parses to something OTHER than an object answers {}: a
+    hand-edit or a truncated race must degrade to 'no mirror yet', never to
+    an AttributeError. Without the coercion a `todos.json` holding a bare
+    list killed the session's mirror PERMANENTLY (capture raised before its
+    own write, so the bad file could never be replaced) and crashed
+    `helm todos --all` for the whole fleet."""
+    st = pk.read_json(state_path(sid), {})
+    return st if isinstance(st, dict) else {}
 
 
 def capture(event, sid, tool, tin, resp):
@@ -216,8 +230,15 @@ def post_enabled():
 
 def _maybe_post(sid, st, old, new):
     """The rate-capped, meaningful-transition-only room line. Never an
-    @mention, never a DM. Fail-closed: a chat rail that is down, slow, or
-    absent leaves the MIRROR intact and the tool call untouched."""
+    @mention, never a DM, and never a WAKE: the row rides `ambient` so
+    seats.deliverable() drops it before every wake rule. Stripping '@' alone
+    was not enough — the home-room rule hands EVERY plain row in a team
+    channel to every seat homed there, so on a `helm launch --room team-x`
+    fleet a todo transition woke the whole team (found adversarially; that
+    is precisely the beacon noise class the owner had removed).
+
+    Fail-closed: a chat rail that is down, slow, or absent leaves the MIRROR
+    intact and the tool call untouched."""
     try:
         if not (post_enabled() and _meaningful(old, new)):
             return
@@ -240,7 +261,8 @@ def _maybe_post(sid, st, old, new):
         st["post"] = {"fp": new["fp"], "ts": int(now)}
         pk.write_json(state_path(sid), st)
         chat.post(line, room=home.env("CHAT_ROOM") or "main", who=seat,
-                  sign=False)            # sign=False: no node probe on a hook
+                  sign=False,            # sign=False: no node probe on a hook
+                  ambient=True)          # ambient=True: renders, wakes nobody
     except Exception:
         pass
 
@@ -258,6 +280,16 @@ def _age(secs):
     return "%dd" % (secs // 86400)
 
 
+def _ts(st):
+    """A mirror file's timestamp as an int, 0 when it is missing or not a
+    number — every ordering/age read goes through here so a hand-written
+    "yesterday" cannot ValueError its way out of a read-only surface."""
+    try:
+        return int(float((st or {}).get("ts") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def for_seat(row):
     """A roster row -> its freshest mirrored todo state ({} when none). A
     seat's co-named sessions all mirror separately; the newest wins."""
@@ -267,7 +299,7 @@ def for_seat(row):
     best = {}
     for sid in sids:
         st = state(sid)
-        if st and int(st.get("ts") or 0) >= int(best.get("ts") or 0):
+        if st and _ts(st) >= _ts(best):
             best = st
     return best
 
@@ -280,13 +312,36 @@ def seat_digest(row):
         return None
     d = digest(st.get("items"))
     return {"active": d["active"], "done": d["done"], "total": d["total"],
-            "ts": st.get("ts")}
+            "ts": _ts(st)}
 
 
-def fleet():
+ORPHAN_CAP = 25         # unclaimed sessions shown, freshest first
+
+
+def _row(name, project, st, items):
+    d = digest(st.get("items"))
+    r = {"seat": name, "project": project, "active": d["active"],
+         "done": d["done"], "total": d["total"], "ts": _ts(st)}
+    if items:
+        r["items"] = [i for i in (st.get("items") or []) if isinstance(i, dict)]
+    return r
+
+
+def fleet(items=False):
     """{"seats":[…], "orphans":[…]} — every roster seat with its current
     task, plus mirrored sessions no seat claims (a session that never
-    joined a room still did work worth seeing). Read-only, fail-open."""
+    joined a room still did work worth seeing). Read-only, fail-open.
+
+    `items` is OFF by default: the two live consumers (the fleet table and
+    the web panel) render only seat/active/done/total/ts, and shipping every
+    seat's full list made the 3-second `/api/todos` poll carry hundreds of
+    kilobytes on a busy estate. `helm todos --all --json` asks for them.
+
+    Orphans are the UNBOUNDED half — gc prunes reflex-state at 30 days, so a
+    busy fleet leaves hundreds of stale session dirs behind — and are cut to
+    the ORPHAN_CAP freshest, with the remainder reported as a count. A
+    thousand rows of dead sessions is the attention tax this bridge exists
+    to avoid, not a fleet view."""
     from . import record, seats
     rows, claimed = [], set()
     try:
@@ -299,12 +354,7 @@ def fleet():
         for s in (row.get("sessions") or []) + [row.get("session")]:
             if s:
                 claimed.add(record.session_key(s))
-        st = for_seat(row)
-        d = digest(st.get("items"))
-        rows.append({"seat": seat, "project": row.get("project"),
-                     "active": d["active"], "done": d["done"],
-                     "total": d["total"], "ts": st.get("ts"),
-                     "items": st.get("items") or []})
+        rows.append(_row(seat, row.get("project"), for_seat(row), items))
     orphans = []
     try:
         names = os.listdir(record.state_root())
@@ -313,15 +363,15 @@ def fleet():
     for n in sorted(names):
         if n in claimed:
             continue
-        st = pk.read_json(os.path.join(record.state_root(), n, STATE), {}) or {}
+        st = pk.read_json(os.path.join(record.state_root(), n, STATE), {})
+        st = st if isinstance(st, dict) else {}
         if not st.get("items"):
             continue
-        d = digest(st["items"])
-        orphans.append({"seat": "(session " + n[:8] + ")", "project": None,
-                        "active": d["active"], "done": d["done"],
-                        "total": d["total"], "ts": st.get("ts"),
-                        "items": st["items"]})
-    return {"seats": rows, "orphans": orphans, "now": int(time.time())}
+        orphans.append(_row("(session " + n[:8] + ")", None, st, items))
+    orphans.sort(key=lambda r: -(r["ts"] or 0))
+    hidden = max(0, len(orphans) - ORPHAN_CAP)
+    return {"seats": rows, "orphans": orphans[:ORPHAN_CAP],
+            "orphans_hidden": hidden, "now": int(time.time())}
 
 
 def this_session():
@@ -337,10 +387,11 @@ _USAGE = """usage: helm todos [--json]           this seat's mirrored todo list
 _GLYPH = {ACTIVE: "▶", DONE: "✓", "pending": "·"}
 
 
-def _print_all(rows, now):
+def _print_all(rows, now, hidden=0):
     """The fleet table. Seats that have mirrored NOTHING collapse into one
     footer line — an estate is mostly idle seats, and a screen of '—' rows is
-    exactly the attention tax this bridge exists to avoid."""
+    exactly the attention tax this bridge exists to avoid. `hidden` counts the
+    unclaimed sessions fleet() cut past ORPHAN_CAP, reported the same way."""
     live = [r for r in rows if r["total"]]
     quiet = len(rows) - len(live)
     if live:
@@ -356,6 +407,9 @@ def _print_all(rows, now):
     if quiet:
         print("  (%d seat%s with no mirrored todos — they fill on the next "
               "TodoWrite/Task* call)" % (quiet, "s"[:quiet != 1]))
+    if hidden:
+        print("  (%d older unclaimed session%s hidden — the %d freshest show)"
+              % (hidden, "s"[:hidden != 1], ORPHAN_CAP))
 
 
 def cmd_todos(args):
@@ -371,12 +425,14 @@ def cmd_todos(args):
         return 2
     as_json = "--json" in args
     if "--all" in args:
-        rep = fleet()
-        rows = rep["seats"] + rep["orphans"]
+        # --json is the DETAIL surface (it carries every item); the table
+        # reads only the digest, so it never pays for the lists.
+        rep = fleet(items=as_json)
         if as_json:
             print(json.dumps(rep, indent=2, ensure_ascii=False))
             return 0
-        _print_all(rows, rep["now"])
+        _print_all(rep["seats"] + rep["orphans"], rep["now"],
+                   rep.get("orphans_hidden") or 0)
         return 0
     sid = this_session()
     st = state(sid) if sid else {}
@@ -388,13 +444,15 @@ def cmd_todos(args):
         print("  no session in this environment — `helm todos --all` reads "
               "the fleet")
         return 0
-    items = st.get("items") or []
+    items = [i for i in (st.get("items") or []) if isinstance(i, dict)] \
+        if isinstance(st.get("items"), list) else []
     if not items:
         print("  no todos mirrored for this session yet")
         return 0
     d = digest(items)
     print("  %d/%d done · mirrored %s ago" % (
-        d["done"], d["total"], _age(time.time() - int(st.get("ts") or 0))))
+        d["done"], d["total"], _age(time.time() - _ts(st))))
     for it in items:
-        print("  %s %s" % (_GLYPH.get(it["status"], "·"), it["text"]))
+        print("  %s %s" % (_GLYPH.get(it.get("status"), "·"),
+                           it.get("text") or ""))
     return 0

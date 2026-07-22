@@ -901,7 +901,8 @@ def _api_todos(qs):
         from . import todos
         return todos.fleet(), 200
     except Exception:
-        return {"seats": [], "orphans": [], "now": 0, "unavailable": True}, 200
+        return {"seats": [], "orphans": [], "orphans_hidden": 0, "now": 0,
+                "unavailable": True}, 200
 
 
 def _api_chat_seat(payload):

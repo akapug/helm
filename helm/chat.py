@@ -417,7 +417,7 @@ def _append(row, room):
 
 
 def post(text, room="main", who=None, profile=None, sign=None, origin=None,
-         dm=None):
+         dm=None, ambient=False):
     """Append one message; returns it. v2: shortcodes expand, and when the
     room node answers the digest rides a signed self-write turn FIRST — the
     row carries {turn, receipt, chain}. Node down -> plain v1 row (rendered
@@ -433,7 +433,15 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
 
     `dm` names the ONE recipient (exact token — seats.dm resolves it): the
     row is stamped {dm} and lands in the recipient's private lane, OVERRIDING
-    `room` — a DM never touches a room file (no fanout, by construction)."""
+    `room` — a DM never touches a room file (no fanout, by construction).
+
+    `ambient` stamps the row NON-WAKING: it renders on every read surface
+    (the room, `helm chat read`, the web feed) but seats.deliverable() drops
+    it before any wake rule — including the home-room rule, which otherwise
+    hands EVERY plain row in a team channel to every seat homed there. It is
+    the class for machine status a teammate PULLS (the todo mirror), never
+    the class for a word addressed to anyone; a mention or DM must not use
+    it (and does not: only the mirror passes ambient=True)."""
     _ensure_dir()
     from . import emoji
     text = emoji.expand(text)
@@ -443,6 +451,8 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
         room = dm_room(dm)
     if origin:
         row["origin"] = origin
+    if ambient and not dm:
+        row["ambient"] = 1
     _touch_poster_presence(row["from"])
     return _append(_signed_row(row, text, profile, sign), room)
 

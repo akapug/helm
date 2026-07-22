@@ -224,6 +224,28 @@ class RecorderRegressionTest(TodosBase):
             self.write(("no subprocess on this path", "in_progress"))
         probe.assert_not_called()
 
+    def test_the_recorders_tool_list_matches_the_mirrors(self):
+        """record.py spells the tool names itself so the hot path never
+        imports todos.py for the 99% of events that are not todo writes —
+        which means the two lists can DRIFT, and a name added only to
+        todos.TOOLS would be captured never. Pin them equal."""
+        self.assertEqual(set(record.TASK_TOOLS), set(todos.TOOLS))
+
+    def test_the_mirror_runs_after_the_counters_are_on_disk(self):
+        """The mirror's push leg appends to a chat room under that room's
+        flock — and an exception is not the only way to lose a write, a
+        BLOCK is. The stop-whisper's ground truth must already be durable
+        before the mirror can wait on anybody."""
+        seen = {}
+
+        def spy(*a, **kw):
+            seen["counters"] = record.counters(SID).get("last-tool")
+            return None
+
+        with mock.patch.object(todos, "capture", spy):
+            self.write(("ordering", "in_progress"))
+        self.assertEqual(seen.get("counters"), "TodoWrite")
+
 
 class TransitionPostTest(TodosBase):
     def test_a_burst_of_writes_yields_at_most_one_post(self):
@@ -305,6 +327,53 @@ class TransitionPostTest(TodosBase):
                          "a todo mirror post must never wake another seat")
         self.assertFalse(os.path.isdir(os.path.join(chat.chat_dir(), "dm")))
 
+    def test_post_does_not_wake_a_seat_homed_to_the_posting_room(self):
+        """The un-homed case is the EASY one. Stripping '@' is not enough:
+        deliverable() hands EVERY plain row in a seat's home room to that
+        seat, so on a `helm launch --room team-x` fleet a todo transition
+        woke the whole team — the exact beacon-noise class the owner had
+        removed. The row rides `ambient`, which is dropped before every wake
+        rule (found adversarially; regression pin)."""
+        os.environ["HELM_CHAT_ROOM"] = "team-x"
+        self.seat("seat-a")
+        for peer in ("homed-peer", "muted-peer", "unhomed-peer"):
+            seats.write_roster(peer, session="s-" + peer, cwd=self.tmp)
+        seats.write_roster("homed-peer", home_room="team-x")
+        self.write(("land the slice", "in_progress"))
+        rows = self.room("team-x")
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].get("ambient"))
+        for peer in ("homed-peer", "muted-peer", "unhomed-peer"):
+            self.assertFalse(
+                seats.deliverable(rows[0], peer, room="team-x"),
+                "the todo mirror woke %s — it must wake NOBODY" % peer)
+
+    def test_ambient_is_a_wake_rule_not_a_visibility_rule(self):
+        """The line still LANDS: the owner and every reader see it, an @all
+        in it cannot smuggle a wake, and a real (non-ambient) row in the same
+        room still wakes its home seat — the gate is scoped, not a mute."""
+        seats.write_roster("homed-peer", session="s-h", cwd=self.tmp,
+                           home_room="team-x")
+        chat.post("todo · now: something (0/1 done)", room="team-x",
+                  who="seat-a", sign=False, ambient=True)
+        chat.post("@all standup in five", room="team-x", who="seat-a",
+                  sign=False)
+        rows = self.room("team-x")
+        self.assertEqual(len(rows), 2)
+        self.assertFalse(seats.deliverable(rows[0], "homed-peer", room="team-x"))
+        self.assertTrue(seats.deliverable(rows[1], "homed-peer", room="team-x"))
+        self.assertEqual(rows[0]["text"], "todo · now: something (0/1 done)")
+
+    def test_ambient_never_silences_a_dm(self):
+        """`ambient` is for machine status in a ROOM. A DM is addressed to a
+        person and must stay deliverable whatever else a caller passes."""
+        seats.write_roster("seat-b", session="s-b", cwd=self.tmp)
+        row = chat.post("look at this", who="seat-a", dm="seat-b",
+                        sign=False, ambient=True)
+        self.assertNotIn("ambient", row)
+        self.assertTrue(seats.deliverable(row, "seat-b",
+                                          room=seats.dm_lane("seat-b")))
+
     def test_an_unseated_session_posts_nothing_but_still_mirrors(self):
         self.write(("headless work", "in_progress"))
         self.assertEqual(self.room(), [])
@@ -379,6 +448,82 @@ class PullSurfaceTest(TodosBase):
         self.assertIn("the only real task", out)
         self.assertNotIn("idle-3", out)          # no screen of '—' rows
         self.assertIn("6 seats with no mirrored todos", out)
+
+    def test_a_corrupt_mirror_file_never_crashes_a_read_surface(self):
+        """todos.json is a file a hand-edit, a truncated race or a foreign
+        writer can reach. Every shape must degrade to 'no mirror', never to
+        a traceback out of `helm todos --all` — which reads the WHOLE fleet,
+        so one bad file would blind every seat at once."""
+        self.seat("builder", SID)
+        self.write(("healthy", "in_progress"))
+        good = json.dumps({"v": 1, "ts": int(time.time()),
+                           "items": [{"id": "1", "text": "healthy",
+                                      "status": "in_progress"}]})
+        for blob in ('[1, 2, 3]', '"just a string"', '17', 'null',
+                     '{"v": 1, "items": "abc"}', '{"v": 1, "items": ["a"]}',
+                     '{"v": 1, "ts": "yesterday", "items": [{"text": "x"}]}',
+                     '{"v": 1, "ts": 1, "items": [{"id": "1"}]}'):
+            with open(todos.state_path(SID), "w", encoding="utf-8") as f:
+                f.write(blob)
+            for argv in (["--all"], ["--all", "--json"]):
+                rc, _out, _err = self.run_cli(argv)
+                self.assertEqual(rc, 0, "helm todos %s died on %s"
+                                 % (" ".join(argv), blob))
+            with mock.patch.object(todos, "this_session", lambda: SID):
+                self.assertEqual(self.run_cli([])[0], 0, "this-seat view: " + blob)
+            self.assertEqual(web.QUERY_API["/api/todos"]({})[1], 200)
+            rep = seats.roster_report()
+            self.assertTrue(any(s["seat"] == "builder" for s in rep["seats"]))
+            with open(todos.state_path(SID), "w", encoding="utf-8") as f:
+                f.write(good)
+
+    def test_the_hot_path_heals_a_corrupt_mirror_file(self):
+        """A non-object todos.json used to make capture() raise BEFORE its
+        own write, so the mirror could never replace the bad file: one stray
+        byte killed that session's mirror permanently. The next write wins."""
+        self.write(("first", "in_progress"))
+        with open(todos.state_path(SID), "w", encoding="utf-8") as f:
+            f.write("[1, 2, 3]")
+        self.assertEqual(todos.state(SID), {})
+        self.write(("second", "in_progress"))
+        self.assertEqual(todos.digest(todos.state(SID)["items"])["active"],
+                         "second")
+
+    def test_fleet_ships_items_only_when_asked(self):
+        """/api/todos is polled every few seconds and the table reads only
+        the digest — every seat's full list on that wire is pure cost."""
+        self.seat("builder", SID)
+        self.write(*[("item %d" % i, "pending") for i in range(40)])
+        self.assertNotIn("items", todos.fleet()["seats"][0])
+        self.assertNotIn("items", web.QUERY_API["/api/todos"]({})[0]["seats"][0])
+        detail = todos.fleet(items=True)["seats"][0]
+        self.assertEqual(len(detail["items"]), 40)
+        rc, out, _ = self.run_cli(["--all", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(json.loads(out)["seats"][0]["items"]), 40)
+
+    def test_stale_unclaimed_sessions_are_capped_not_a_wall(self):
+        """gc keeps reflex-state for 30 days, so a busy estate carries
+        hundreds of dead session dirs. The fleet view shows the freshest and
+        COUNTS the rest — a thousand orphan rows is the attention tax this
+        bridge exists to avoid, not a fleet view."""
+        n = todos.ORPHAN_CAP + 12
+        for i in range(n):
+            record.record(self.ev(sid="orphan-%03d" % i,
+                                  tin={"todos": todo_list(("work %d" % i,
+                                                           "in_progress"))}))
+            st = todos.state("orphan-%03d" % i)
+            st["ts"] = 1_000_000 + i          # deterministic recency order
+            pk.write_json(todos.state_path("orphan-%03d" % i), st)
+        rep = todos.fleet()
+        self.assertEqual(len(rep["orphans"]), todos.ORPHAN_CAP)
+        self.assertEqual(rep["orphans_hidden"], 12)
+        self.assertEqual(rep["orphans"][0]["active"], "work %d" % (n - 1))
+        rc, out, _ = self.run_cli(["--all"])
+        self.assertEqual(rc, 0)
+        self.assertIn("12 older unclaimed sessions hidden", out)
+        self.assertEqual(len([l for l in out.splitlines() if "work " in l]),
+                         todos.ORPHAN_CAP)
 
     def test_bad_flag_is_usage_rc2(self):
         rc, _out, err = self.run_cli(["--nope"])

@@ -2744,7 +2744,10 @@ function fleetTodos(rep) {
     '<span class="lbadge' + (r.total && r.done === r.total ? " final" : " tent") + '">' + r.done + '/' + r.total + '</span>' +
     '<span class="lage">' + (r.ts ? lago(r.ts) : "—") + '</span></div>' +
     '<div class="lmeta">' + (r.active ? esc(r.active) : "<i>no task in progress</i>") +
-    (r.project ? ' · ' + esc(r.project) : '') + '</div></div>').join("");
+    (r.project ? ' · ' + esc(r.project) : '') + '</div></div>').join("") +
+    ((rep && rep.orphans_hidden) ? '<div class="lmeta" style="margin-top:6px">' +
+      rep.orphans_hidden + ' older unclaimed session' +
+      (rep.orphans_hidden === 1 ? '' : 's') + ' hidden</div>' : '');
 }
 
 // The "message a seat" picker is a real anchored popup rather than a browser

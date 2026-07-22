@@ -16,9 +16,14 @@
   finished, or an idle seat picking up a new in-progress task), collapsed to
   the latest state, at most once per 5 min per seat, nothing at all when
   nothing materially changed, `HELM_TODO_POST=0` to silence. Never an
-  @mention, never a DM (those pierce mute and wake seats — every `@` is
-  stripped from the posted text). The owner's parity surface is the ledger
-  tab's **fleet todos** panel.
+  @mention, never a DM, and **never a wake**: every `@` is stripped from the
+  posted text, and the row rides the new `ambient` class — a row
+  `seats.deliverable()` drops before every wake rule, including the
+  home-room rule that would otherwise have handed the line to every seat on
+  a `helm launch --room team-x` team. It renders everywhere and wakes
+  nobody. The owner's parity surface is the ledger tab's **fleet todos**
+  panel; `/api/todos` carries the digest only (item lists ride
+  `helm todos --all --json`) and caps unclaimed sessions at the 25 freshest.
 
 - Stop-whisper slice 2 — the verify-grounding rungs: the contextual
   continuation ladder gains three signals read from record.py's own logs

@@ -485,7 +485,11 @@ attention budget). Todo state churns on nearly every turn, so:
 
 * **Pull is the surface.** `helm todos` is this seat's list; `helm todos
   --all` is the fleet table (seat · in-progress · done/total · age, with
-  never-mirrored seats collapsed into one footer line); `--json` for tooling.
+  never-mirrored seats collapsed into one footer line and unclaimed sessions
+  cut to the 25 freshest — gc keeps `reflex-state` for 30 days, and a wall of
+  dead sessions is the same attention tax); `--json` for tooling, and it is
+  the only surface that carries every item (the table and `/api/todos` read
+  the digest alone, so the polled endpoint stays kilobytes on a big estate).
   The same state rides `helm chat seats` and the roster row, so the delivery
   roster now answers *who is working on what*, not just who is here. Reading
   costs the reader nothing until they ask.
@@ -495,10 +499,15 @@ attention budget). Todo state churns on nearly every turn, so:
   most once per 5 minutes per seat, and never at all when nothing materially
   changed (a re-word, a reorder, a new *pending* item is the seat's own
   bookkeeping). `HELM_TODO_POST=0` switches it off entirely.
-* **Never an @mention, never a DM.** Those pierce mute and *wake* seats; a
-  todo update must never wake the fleet. Every `@` is stripped from the
-  posted text, so a todo that merely contains "@someone" cannot become a
-  mention by accident.
+* **Never an @mention, never a DM — and never a wake.** Every `@` is
+  stripped from the posted text, so a todo that merely contains "@someone"
+  cannot become a mention by accident. That alone is not enough: a seat's
+  **home room** delivers every plain row to every seat homed there, so on a
+  `helm launch --room team-x` fleet the line would wake the whole team. The
+  row therefore rides `ambient` — a row class `seats.deliverable()` drops
+  before every wake rule, so it renders on every read surface (the room,
+  `helm chat read`, the web feed) and wakes nobody. `ambient` is for machine
+  status a teammate *pulls*; a mention or a DM never carries it.
 
 The owner's parity surface is the web tab's **fleet todos** panel (and
 `GET /api/todos`) — who is working on what, without a CLI.

@@ -324,7 +324,11 @@ def deliverable(m, seat, room="main", scope=None):
     """Does this row reach `seat` at a tool boundary, given the ROOM it sits
     in? The beacon-scope law (premise beacon-scope-mentions-plus-home-room-
     owner-posts-not-all), top to bottom:
-      * reactions and the seat's own posts: never.
+      * reactions, AMBIENT rows and the seat's own posts: never. An ambient
+        row ({ambient}: the todo mirror's status line) is machine state a
+        teammate PULLS — it renders everywhere and wakes nobody, including
+        in a home room, where the rule below would otherwise hand every
+        plain row to every seat on the team.
       * a {dm} row: the EXACT-token recipient only (casefold — never a
         substring, never a slug fold), whatever lane it sits in.
       * an @seat mention: ANY room, ALWAYS — checked before mute, because a
@@ -341,7 +345,7 @@ def deliverable(m, seat, room="main", scope=None):
         outside home): never (noise law).
     scope=None computes seat_scope here — hot paths pass it precomputed."""
     text = m.get("text")
-    if not text or m.get("react"):
+    if not text or m.get("react") or m.get("ambient"):
         return False
     frm = str(m.get("from") or "")
     if frm == seat:

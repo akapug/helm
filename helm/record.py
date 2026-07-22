@@ -251,19 +251,23 @@ def _record(event):
             _append(os.path.join(sd, "edit-targets.log"),
                     os.path.basename(str(fp)) + "\n")
 
-    # the seat todo mirror — purely additive, and walled off from every
-    # writer above: its own try/except means a broken mirror can never cost
-    # the counters, command-log or edit-targets that back the stop-whisper.
+    c.update(v=1, ts=pk.now_ts())
+    c["last-tool"] = tool
+    pk.write_json(os.path.join(sd, "counters.json"), c)
+
+    # The seat todo mirror — purely additive, and DEAD LAST on purpose.
+    # Walled off by its own try/except (a broken mirror can never cost the
+    # counters, command-log or edit-targets that back the stop-whisper), and
+    # ordered AFTER the counters write because the mirror's push leg appends
+    # to a chat room under that room's flock: an exception is not the only
+    # way to lose a write, a BLOCK is, and the stop-whisper's ground truth
+    # must already be on disk before this can wait on anyone.
     if tool in TASK_TOOLS and not failed:
         try:
             from . import todos
             todos.capture(event, sid, tool, tin, resp)
         except Exception:
             pass
-
-    c.update(v=1, ts=pk.now_ts())
-    c["last-tool"] = tool
-    pk.write_json(os.path.join(sd, "counters.json"), c)
 
 
 # ── wiring (claude first): install/status/doctor around the PostToolUse hook ──
