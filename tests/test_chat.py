@@ -292,16 +292,21 @@ class PostUnknownFlagTest(ChatBase):
         self.assertEqual(self._rows(), [])
 
     def test_single_dash_flags_are_refused_too(self):
-        # xrev: startswith("--") left `-h` and `-x` broadcasting
-        for flag in ("-h", "-x"):
-            rc, _ = self._post(flag)
-            self.assertEqual(rc, 2, flag)
+        # xrev: startswith("--") left `-x` broadcasting (-h is now a help
+        # ask, answered rc 0 by the dispatcher gate — see HelpBeforeWorkTest)
+        rc, _ = self._post("-x")
+        self.assertEqual(rc, 2)
         self.assertEqual(self._rows(), [])
 
     def test_help_gets_usage_not_a_broadcast(self):
-        rc, err = self._post("--help")
-        self.assertEqual(rc, 2)
-        self.assertIn("usage:", err)
+        # upgraded from refusal (rc 2) to an ANSWER (rc 0, usage on stdout)
+        # by the dispatcher help gate; still never a broadcast
+        for flag in ("--help", "-h"):
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                rc = chat.cmd_chat(["post", flag])
+            self.assertEqual(rc, 0, flag)
+            self.assertIn("usage:", out.getvalue())
         self.assertEqual(self._rows(), [])
 
     def test_prose_about_flags_is_sendable(self):
@@ -330,6 +335,86 @@ class PostUnknownFlagTest(ChatBase):
         rc, _ = self._post("--seat", "tester", "an ordinary message")
         self.assertEqual(rc, 0)
         self.assertEqual(len(self._rows()), 1)
+
+
+class HelpBeforeWorkTest(ChatBase):
+    """--help is answered at the dispatcher, BEFORE any verb runs (the
+    block-before-help class, live-probed 2026-07-22): `wait --help` entered
+    the wait loop and blocked forever — the mandatory-first-action verb every
+    new seat probes — and join/deliver/claim/log-flush DID WORK under --help
+    (`claim --help` leased a resource named "--help"). The seats/node/meld
+    legs are patched to raise, so a regression fails FAST instead of hanging
+    the suite."""
+
+    def _no_dispatch(self, args):
+        """cmd_chat(args) with every downstream leg booby-trapped: reaching
+        one means the help gate did not fire."""
+        from helm import seats, chatnode, meld
+        boom = mock.Mock(side_effect=AssertionError(
+            "dispatched past the --help gate"))
+        with mock.patch.object(seats, "cmd", boom), \
+                mock.patch.object(chatnode, "cmd_node", boom), \
+                mock.patch.object(meld, "cmd", boom):
+            return self.run_cmd(args)
+
+    def test_wait_help_answers_before_the_loop(self):
+        # THE bug: rc 124/143, zero output, harness timeout. Pin: rc 0 +
+        # usage naming every flag's semantics, loop never entered.
+        for argv in (["wait", "--help"], ["wait", "-h"],
+                     ["wait", "--seat", "s", "--help"]):
+            rc, out, err = self._no_dispatch(argv)
+            self.assertEqual(rc, 0, argv)
+            for token in ("--seat", "--room", "--follow", "--timeout",
+                          "--any", "timeout"):
+                self.assertIn(token, out, argv)
+            self.assertEqual(err, "")
+
+    def test_every_seat_verb_answers_help_without_running(self):
+        for verb in ("join", "deliver", "stop-guard", "seats", "seat", "dm",
+                     "claim", "release", "claims"):
+            rc, out, _ = self._no_dispatch([verb, "--help"])
+            self.assertEqual(rc, 0, verb)
+            self.assertIn("usage: helm chat %s" % verb, out)
+
+    def test_node_and_meld_answer_help_without_dispatch(self):
+        for verb in ("node", "meld"):
+            rc, out, _ = self._no_dispatch([verb, "--help"])
+            self.assertEqual(rc, 0, verb)
+            self.assertIn("usage: helm chat %s" % verb, out)
+
+    def test_read_follow_help_returns(self):
+        # read --follow --help blocked forever too (same class, chat-local)
+        rc, out, _ = self.run_cmd(["read", "--follow", "--help"])
+        self.assertEqual(rc, 0)
+        self.assertIn("usage: helm chat read", out)
+
+    def test_inert_verbs_answer_help_without_side_effects(self):
+        for verb in ("react", "rooms", "verify", "log-flush", "post",
+                     "reply"):
+            rc, out, _ = self.run_cmd([verb, "--help"])
+            self.assertEqual(rc, 0, verb)
+            self.assertIn("usage: helm chat %s" % verb, out)
+        self.assertEqual(chat.read()[1], 0)   # nothing posted, nothing leased
+
+    def test_claim_help_creates_no_lease(self):
+        rc, out, _ = self._no_dispatch(["claim", "--help"])
+        self.assertEqual(rc, 0)
+        from helm import seats
+        self.assertEqual(seats.claims_list(), [])
+
+    def test_prose_about_help_still_sends(self):
+        # free-text verbs scan only the LEADING position: a body ABOUT
+        # --help must stay sendable (post's flag-refusal scope law)
+        rc, out, _ = self.run_cmd(["post", "--seat", "t", "run", "it",
+                                   "with", "--help", "first"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(chat.read()[0][-1]["text"],
+                         "run it with --help first")
+
+    def test_roster_alias_shares_the_seats_help(self):
+        rc, out, _ = self._no_dispatch(["roster", "--help"])
+        self.assertEqual(rc, 0)
+        self.assertIn("usage: helm chat seats", out)
 
 
 if __name__ == "__main__":
