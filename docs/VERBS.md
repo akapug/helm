@@ -103,9 +103,12 @@ helm store list [--type T] [--all] [--candidates]
 helm store get <id>                        one entry, full record
 helm store resolve <text>                  JIT lookup — what fires for this prompt
                                            (or pipe the prompt on stdin)
-helm store confirm <id> [--edit <stmt...>] promote a candidate -> live
-helm store reject <id> [why...]            reject a candidate — retired in
+helm store confirm <id> [--type T] [--edit <stmt...>]
+                                           promote a candidate -> live
+helm store reject <id> [--type T] [why...] reject a candidate — retired in
                                            place (file kept as the record)
+                                           (--type on either: disambiguate a
+                                           slug shared across candidate types)
 helm store pinned [--stats]                the always-on lane (--stats: budget
                                            walk + ledger made-it/starved counts)
 helm store add <type> <id> | <statement> [| ...]
@@ -138,7 +141,10 @@ LIVE in scope is a hard refuse — never a silent overwrite — and the refusal
 prints the exact `evidence`/`supersede` commands to run instead. A *different*
 id whose statement is near-identical (token-set overlap ≥ 0.8) warns loudly,
 names the other id and the supersede command, and proceeds — similarity alone
-never blocks. Lexicon is exempt: redefining a term is its update lane.
+never blocks. Lexicon is exempt: redefining a term is its update lane — except
+a `--candidate` add over a LIVE term, which is refused (writing
+`status:candidate` in place would DE-canonize the confirmed definition;
+capture may coin, never demote — redefine live or pick a distinct id).
 
 `resolve` ranks JIT hits DF-weighted: each matched probe scores 1/df (df = how
 many entries carry that keyword), summed and confidence-weighted — one rare
@@ -159,7 +165,10 @@ confirm <id> [--edit <stmt...>]` promotes candidate → live (`source:explicit`;
 a prior keeps its captured confidence — confirming ratifies the capture, never
 inflates the belief — and carries the who/when receipt in its own
 evidence_log); `helm store reject <id> [why...]` retires the wrong inference
-IN PLACE (file kept as the record, never deleted); and decay is
+IN PLACE (file kept as the record, never deleted). Both resolve against the
+candidate set first, and a slug shared across candidate types is refused
+without `--type T` (never ratify/retire the wrong entry — the `list
+--candidates` hints print the qualifier when needed). Decay is
 operator-visible, never a silent job: `helm drain --expire-candidates
 [--days N] [--apply]` archives-then-prunes unconfirmed candidates of every
 type older than N days (14 default; a no-timestamp candidate never expires;

@@ -943,8 +943,40 @@ def retire(eid, ts, why="", project=None):
 # per-type alias key the writers actually serialize beside "statement"
 _STMT_ALIAS = {"lexicon": "definition", "heuristic": "move", "reference": "summary"}
 
+# the types a candidate can be born as (premise refused — the human-only rail)
+_CANDIDATE_TYPES = ("prior", "lexicon", "heuristic", "reference")
 
-def confirm(eid, ts, new_statement=None, project=None):
+
+def _pick_candidate(eid, project=None, ctype=None):
+    """Resolve a confirm/reject id against the CANDIDATE set first — bare
+    _find is typed-first (prior > heuristic > reference > lexicon), and with
+    candidates mintable in all four types a slug shared across types would
+    silently ratify/retire the WRONG entry. >1 same-slug candidate without a
+    type qualifier is REFUSED with the exact disambiguation; zero candidate
+    hits falls back to _find so the not-found / not-a-candidate errors keep
+    their precision."""
+    if ctype:
+        ctype = "prior" if ctype == "premise" else ctype
+        if ctype not in _CANDIDATE_TYPES:
+            return None, "unknown --type '%s' (one of: %s)" \
+                % (ctype, ", ".join(_CANDIDATE_TYPES))
+    types = (ctype,) if ctype else None
+    want = _slug(str(eid or ""))
+    hits = [e for e in candidates(project=project, types=types)
+            if _slug(str(e["id"])) == want]
+    if len(hits) > 1:
+        return None, "'%s' is ambiguous — %d candidates share the id (%s); " \
+            "re-run with --type <type>" \
+            % (eid, len(hits), ", ".join(sorted(e["type"] for e in hits)))
+    if hits:
+        return hits[0], None
+    e = _find(eid, project=project, types=types)
+    if not e:
+        return None, "'" + str(eid) + "' not found"
+    return e, None
+
+
+def confirm(eid, ts, new_statement=None, project=None, ctype=None):
     """Promote a candidate -> live (the owner/confirm gate that makes inferred
     capture safe to leave on) — v2: every capturable type (autolearn widened
     it from lexicon-only; capture everything, canonize nothing automatically).
@@ -952,10 +984,11 @@ def confirm(eid, ts, new_statement=None, project=None):
     the knowledge is now human-confirmed. A prior carries the who/when receipt
     in its own evidence_log (confidence untouched — confirming ratifies the
     capture, never inflates the belief); the other types' receipt is the
-    events journal row."""
-    e = _find(eid, project=project)
-    if not e:
-        return None, "'" + str(eid) + "' not found"
+    events journal row. ctype disambiguates a slug shared across candidate
+    types (ambiguity without it is refused — never ratify the wrong entry)."""
+    e, err = _pick_candidate(eid, project=project, ctype=ctype)
+    if err:
+        return None, err
     if e.get("status") != STATUS_CANDIDATE:
         return None, "'%s' is not a candidate (status=%s)" % (eid, e.get("status"))
     edited = bool(str(new_statement or "").strip())
@@ -976,14 +1009,15 @@ def confirm(eid, ts, new_statement=None, project=None):
     return e, None
 
 
-def reject(eid, ts, why="", project=None):
+def reject(eid, ts, why="", project=None, ctype=None):
     """The wrong-inference exit: candidate -> retired IN PLACE (the record law:
     the file STAYS, never deleted — a rejected inference is itself knowledge).
-    Refuses non-candidates (retire is the live-entry verb); drain
+    Refuses non-candidates (retire is the live-entry verb) and cross-type
+    slug ambiguity without a ctype qualifier (same law as confirm); drain
     --expire-candidates remains the age leg for the never-reviewed."""
-    e = _find(eid, project=project)
-    if not e:
-        return None, "'" + str(eid) + "' not found"
+    e, err = _pick_candidate(eid, project=project, ctype=ctype)
+    if err:
+        return None, err
     if e.get("status") != STATUS_CANDIDATE:
         return None, "'%s' is not a candidate (status=%s) — retire handles live entries" \
             % (eid, e.get("status"))
@@ -1243,6 +1277,13 @@ DUP_OVERLAP = 0.8  # near-identical statement threshold (token-set Jaccard)
 _GUARD_TYPE = {"prior": "prior", "premise": "prior",
                "heuristic": "heuristic", "reference": "reference"}
 
+# re-minting a retired/superseded id starts a FRESH lifecycle: the old
+# record's tombstone metadata must not ride into a live entry ("live but
+# replaced_by X" / "live but retired_ts Y" corrupts provenance — codex-seat
+# review). Every parse-then-update add branch scrubs these; reject makes
+# rejected -> re-add a routine agent lane, so the scrub is load-bearing.
+_STALE_ON_REMINT = ("replaced_by", "supersedes", "retired_ts", "retired_why")
+
 
 def _tokens(s):
     return set(re.split(r"[^a-z0-9]+", (s or "").lower())) - {""}
@@ -1285,10 +1326,13 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
              capture — writes a non-live candidate EXCLUDED from inject until
              confirmed (premise refused: certainty is the human-only lane)
       a LIVE same-id add is REFUSED (supersede/evidence instead, printed);
-      a near-identical statement warns and proceeds (lexicon redefines freely)
-  confirm <id> [--edit <new statement...>]    promote a candidate -> live
-  reject <id> [why...]                        reject a candidate — retired in
+      a near-identical statement warns and proceeds (lexicon redefines freely
+      EXCEPT --candidate over a live term — capture never de-canonizes)
+  confirm <id> [--type T] [--edit <stmt...>]  promote a candidate -> live
+  reject <id> [--type T] [why...]             reject a candidate — retired in
                                               place (file kept as the record)
+      --type on either: disambiguate when candidates share an id across types
+      (ambiguous bare id is refused — never ratify/retire the wrong entry)
   evidence <ts> <id> <delta> <reason...>      move a belief (logged + clamped)
   supersede <ts> <old-id> <new-id> [reason]   TOMBSTONE old (file kept)
   retire <ts> <id> [why...]                   retire (file kept as the record)
@@ -1343,14 +1387,22 @@ def cmd_store(args):
                 print("helm store: no candidates (safe-inferred capture is empty)")
                 return 0
             cs.sort(key=lambda e: (e["type"], str(e["id"])))
+            byslug = {}
+            for e in cs:
+                k = _slug(str(e["id"]))
+                byslug[k] = byslug.get(k, 0) + 1
             print("helm store candidates (%d — excluded from inject until confirmed):"
                   % len(cs))
             for e in cs:
+                # a slug shared across types needs the qualifier — the bare
+                # printed command would resolve ambiguously and be refused
+                dq = (" --type " + e["type"]) \
+                    if byslug[_slug(str(e["id"]))] > 1 else ""
                 print("  ? " + str(e["id"]) + " [" + e["type"] + " src="
                       + (e.get("source") or "?") + " " + e["scope"] + "]: "
                       + (e.get("statement") or "")[:100])
-                print("      confirm: helm store confirm " + str(e["id"])
-                      + "   reject: helm store reject " + str(e["id"]))
+                print("      confirm: helm store confirm " + str(e["id"]) + dq
+                      + "   reject: helm store reject " + str(e["id"]) + dq)
             return 0
         es = load_all(project=project, include_retired=("--all" in rest),
                       types=(t,) if t else None)
@@ -1383,6 +1435,14 @@ def cmd_store(args):
         return 0
 
     if cmd == "confirm":
+        ctype = None
+        if "--type" in rest:
+            i = rest.index("--type")
+            if i + 1 >= len(rest):
+                print("helm store confirm: --type needs a type", file=sys.stderr)
+                return 2
+            ctype = rest[i + 1]
+            del rest[i:i + 2]
         new_stmt = None
         if "--edit" in rest:
             i = rest.index("--edit")
@@ -1391,10 +1451,11 @@ def cmd_store(args):
         else:
             eid = " ".join(a for a in rest if not a.startswith("--")).strip()
         if not eid:
-            print("usage: helm store confirm <id> [--edit <new definition...>]",
-                  file=sys.stderr)
+            print("usage: helm store confirm <id> [--type T] "
+                  "[--edit <new definition...>]", file=sys.stderr)
             return 2
-        e, err = confirm(eid, pk.now_ts(), new_statement=new_stmt, project=project)
+        e, err = confirm(eid, pk.now_ts(), new_statement=new_stmt, project=project,
+                         ctype=ctype)
         if err:
             print("helm store confirm: " + err, file=sys.stderr)
             return 1
@@ -1404,11 +1465,19 @@ def cmd_store(args):
         return 0
 
     if cmd == "reject":
+        ctype = None
+        if "--type" in rest:
+            i = rest.index("--type")
+            if i + 1 >= len(rest):
+                print("helm store reject: --type needs a type", file=sys.stderr)
+                return 2
+            ctype = rest[i + 1]
+            del rest[i:i + 2]
         if not rest:
-            print("usage: helm store reject <id> [why...]", file=sys.stderr)
+            print("usage: helm store reject <id> [--type T] [why...]", file=sys.stderr)
             return 2
         e, err = reject(rest[0], pk.now_ts(), why=" ".join(rest[1:]).strip(),
-                        project=project)
+                        project=project, ctype=ctype)
         if err:
             print("helm store reject: " + err, file=sys.stderr)
             return 1
@@ -1491,6 +1560,25 @@ def cmd_store(args):
                 print("  helm store supersede %s %s %s <reason...>%s"
                       % (ts, dup["id"], parts[0], pflag))
 
+        # lexicon is _GUARD_TYPE-exempt (redefinition is its one update lane) —
+        # but a CANDIDATE add must never ride that exemption over a LIVE term:
+        # writing status:candidate in place DE-canonizes the human-confirmed
+        # definition (it drops out of inject until re-confirmed, and a later
+        # reject retires it with the original knowledge already gone). Capture
+        # may coin, never demote.
+        if etype == "lexicon" and candidate:
+            cur = _find(parts[0], project=project, types=("lexicon",))
+            if cur and cur.get("status") == STATUS_LIVE:
+                pflag = (" --project " + project) if project else ""
+                print("helm store add: term '%s' is already LIVE [lexicon %s] — "
+                      "refusing the candidate add (capture never de-canonizes a "
+                      "confirmed term)" % (parts[0], cur["root"]), file=sys.stderr)
+                print("  redefine it live:  helm store add lexicon %s | <definition...>%s"
+                      % (parts[0], pflag), file=sys.stderr)
+                print("  or capture the new sense under a distinct term id",
+                      file=sys.stderr)
+                return 1
+
         if etype in ("prior", "premise"):
             path = os.path.join(_default_dir("prior", project),
                                 PRIOR_PREFIX + _slug(parts[0]) + ".md")
@@ -1513,11 +1601,10 @@ def cmd_store(args):
                 # the prior verb mints BELIEFS; certainty (1.0) is the premise
                 # verb's human-only lane — an add-prior 0.999/1.0 clamps to 0.99
                 conf = min(conf, BELIEF_CLAMP[1])
-            # re-minting a retired/superseded id starts a FRESH lifecycle: the
-            # old record's tombstone metadata must not ride into a live entry
-            # ("live but replaced_by X" corrupts provenance — codex-seat review)
-            for stale in ("replaced_by", "supersedes", "retired_ts", "retired_why",
-                          "evidence_log", "confidence_history"):
+            # fresh lifecycle on re-mint (see _STALE_ON_REMINT); a prior also
+            # sheds the old belief's audit trail — the new statement's
+            # confidence is not evidence-continuous with the retired one's
+            for stale in _STALE_ON_REMINT + ("evidence_log", "confidence_history"):
                 e.pop(stale, None)
             e.update({"id": parts[0], "statement": parts[1],
                       "status": STATUS_CANDIDATE if candidate else STATUS_LIVE,
@@ -1570,6 +1657,8 @@ def cmd_store(args):
             path = os.path.join(_default_dir("heuristic", project),
                                 "heuristic-" + _slug(parts[0]) + ".md")
             e = _parse_heuristic(path) or {}
+            for stale in _STALE_ON_REMINT:  # fresh lifecycle on re-mint
+                e.pop(stale, None)
             trig = parts[2] if len(parts) > 2 else (e.get("trigger") or "")
             dom = parts[3] if len(parts) > 3 else e.get("domain", "")
             e.update({"id": parts[0], "move": parts[1], "statement": parts[1],
@@ -1596,6 +1685,8 @@ def cmd_store(args):
         path = os.path.join(_default_dir("reference", project),
                             "ref-" + _slug(parts[0]) + ".md")
         e = _parse_reference(path, os.path.basename(path)) or {}
+        for stale in _STALE_ON_REMINT:  # fresh lifecycle on re-mint
+            e.pop(stale, None)
         e.update({"id": parts[0], "statement": parts[1], "summary": parts[1],
                   "url": parts[2] if len(parts) > 2 else e.get("url", ""),
                   "keywords": parts[3] if len(parts) > 3 else e.get("keywords", ""),

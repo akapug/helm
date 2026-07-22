@@ -1282,6 +1282,111 @@ class CandidateTierTest(StoreBase):
         self.assertEqual(self.one(store.load_all(), "glorpterm")["definition"],
                          "the real sense")
 
+    def test_candidate_over_live_lexicon_refused(self):
+        # lexicon's redefine-freely exemption must not let a CANDIDATE add
+        # de-canonize a LIVE term (writing status:candidate in place destroys
+        # the human-confirmed definition and drops it out of inject)
+        self.add("lexicon", "glorpterm | the confirmed sense")
+        rc, _, err = self.add("lexicon", "glorpterm | an agent guess", "--candidate")
+        self.assertEqual(rc, 1)
+        self.assertIn("already LIVE", err)
+        self.assertIn("de-canonize", err)
+        # the confirmed definition is untouched and still fires
+        e = self.one(store.load_all(), "glorpterm")
+        self.assertEqual((e["status"], e["definition"]),
+                         ("live", "the confirmed sense"))
+        self.assertEqual(store.candidates(), [])
+        self.assertEqual([x["id"] for x in store.resolve_prompt("glorpterm now")],
+                         ["glorpterm"])
+        # candidate-over-candidate stays a legal guess update...
+        self.add("lexicon", "newterm | first guess", "--candidate")
+        rc, _, _ = self.add("lexicon", "newterm | better guess", "--candidate")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.one(store.candidates(), "newterm")["definition"],
+                         "better guess")
+        # ...and a rejected term re-captures cleanly (retired != live)
+        store.reject("newterm", TS, why="off")
+        rc, _, _ = self.add("lexicon", "newterm | third guess", "--candidate")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.one(store.candidates(), "newterm")["status"],
+                         "candidate")
+
+    def test_confirm_reject_ambiguous_cross_type_refused(self):
+        # candidates mint in all four types now — a bare id shared across
+        # types must never silently ratify/retire _find's typed-first winner
+        self.add("prior", "dupx | a belief guess | 0.6", "--candidate")
+        self.add("lexicon", "dupx | a term guess", "--candidate")
+        for verb in (store.confirm, store.reject):
+            e, err = verb("dupx", TS)
+            self.assertIsNone(e)
+            self.assertIn("ambiguous", err)
+            self.assertIn("lexicon", err)
+            self.assertIn("prior", err)
+        self.assertEqual(len(store.candidates()), 2)  # nothing moved
+        # the type qualifier resolves it — and confirms the RIGHT entry
+        e, err = store.confirm("dupx", TS, ctype="lexicon")
+        self.assertIsNone(err)
+        self.assertEqual(e["type"], "lexicon")
+        self.assertEqual(self.one(store.load_all(), "dupx")["type"], "lexicon")
+        # one candidate left -> the bare id is unambiguous again, and the
+        # candidate-first pick beats _find's typed-first live-lexicon shadow
+        e, err = store.reject("dupx", TS, why="wrong lane")
+        self.assertIsNone(err)
+        self.assertEqual((e["type"], e["status"]), ("prior", "retired"))
+        # bad qualifier is refused before anything resolves
+        e, err = store.confirm("dupx", TS, ctype="episodic")
+        self.assertIsNone(e)
+        self.assertIn("unknown --type", err)
+
+    def test_ambiguous_candidates_cli_type_flag_and_hints(self):
+        self.add("prior", "dupx | a belief guess | 0.6", "--candidate")
+        self.add("lexicon", "dupx | a term guess", "--candidate")
+        self.add("heuristic", "solo | lone move | glorpwork", "--candidate")
+        # list hints carry the qualifier ONLY where the slug is shared
+        rc, out, _ = self.run_cli(["list", "--candidates"])
+        self.assertIn("helm store confirm dupx --type prior", out)
+        self.assertIn("helm store reject dupx --type lexicon", out)
+        self.assertNotIn("solo --type", out)
+        # bare CLI confirm refuses with the disambiguation
+        rc, _, err = self.run_cli(["confirm", "dupx"])
+        self.assertEqual(rc, 1)
+        self.assertIn("ambiguous", err)
+        rc, _, _ = self.run_cli(["confirm", "dupx", "--type", "lexicon"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.one(store.load_all(), "dupx")["type"], "lexicon")
+        rc, _, _ = self.run_cli(["reject", "dupx", "--type", "prior", "not", "real"])
+        self.assertEqual(rc, 0)
+        self.assertEqual([x["id"] for x in store.candidates()], ["solo"])
+        st = {e["type"]: e["status"]
+              for e in store.load_all(include_retired=True) if e["id"] == "dupx"}
+        self.assertEqual(st, {"lexicon": "live", "prior": "retired"})
+        # a dangling --type is a usage error, not a silent bare-id fall-through
+        rc, _, err = self.run_cli(["confirm", "solo", "--type"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--type needs", err)
+
+    def test_readd_after_reject_scrubs_tombstone_receipt(self):
+        # rejected -> re-add mints a FRESH lifecycle: the heuristic/reference
+        # branches must scrub the retire receipt exactly like the prior branch
+        # ("live but retired_ts X" corrupts provenance)
+        for typ, first, again in (
+                ("heuristic", "h1 | bad move | glorpwork",
+                 "h1 | good move | glorpwork"),
+                ("reference", "r1 | wrong paper | https://x.example",
+                 "r1 | right paper | https://x.example")):
+            eid = typ[0] + "1"
+            rc, _, _ = self.add(typ, first, "--candidate")
+            self.assertEqual(rc, 0, typ)
+            _, err = store.reject(eid, TS, why="bad " + typ)
+            self.assertIsNone(err, typ)
+            rc, _, _ = self.add(typ, again)
+            self.assertEqual(rc, 0, typ)
+            e = self.one(store.load_all(), eid)
+            self.assertEqual(e["status"], "live", typ)
+            with open(e["path"]) as f:
+                raw = f.read()
+            self.assertNotIn("retired", raw, typ)
+
 
 if __name__ == "__main__":
     unittest.main()
