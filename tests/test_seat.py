@@ -806,6 +806,30 @@ class SeatMultiTest(unittest.TestCase):
         with open(os.path.join(d, "launch.sh")) as f:
             self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol", f.read())
 
+    def test_resume_preserves_multi_shape(self):
+        """A --multi seat re-minted on resume must NOT regain the pin — the pin's
+        absence is the only marker, so _multi_from_launch reads it back and the
+        re-mint stays pinless. Guards the mixed-model fleet against silent
+        collapse to single-model on any resume/env-refresh."""
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        d = seat.seat_dir("codex")
+        launch_sh = os.path.join(d, "launch.sh")
+        # multi mint: pinless launch.sh, detector reads True
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(seat.cmd_seat(["launch", "codex", "--multi"]), 0)
+        self.assertTrue(seat._multi_from_launch(launch_sh))
+        # the resume re-mint path (env refresh) must keep it pinless
+        seat._write_launch_assets(
+            "codex", d, seat._room_from_launch(launch_sh), "codex",
+            multi=seat._multi_from_launch(launch_sh))
+        with open(launch_sh) as f:
+            self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", f.read())
+        # a pinned (non-multi) seat reads False and re-mints WITH the pin
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(seat.cmd_seat(["launch", "codex"]), 0)
+        self.assertFalse(seat._multi_from_launch(launch_sh))
+
     def test_seat_env_multi_no_pin_and_no_inherited_pin(self):
         self._plant("home-a")
         self.assertEqual(self._add()[0], 0)

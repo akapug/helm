@@ -1143,6 +1143,22 @@ def _room_from_launch(path):
     return shlex.split(m.group(1))[0] if m else None
 
 
+def _multi_from_launch(path):
+    """The seat's --multi (mixed-model fleet) shape, recovered from its current
+    launch.sh — the resume re-mint must not silently strip it any more than it
+    strips --room. --multi's whole effect is DROPPING the CLAUDE_CODE_SUBAGENT_MODEL
+    pin (frontmatter routes per subagent); a non-multi exec line ASSIGNS that var.
+    The child-stamp unset line names only CHILD_STAMP_VARS, never the pin, so the
+    bare assignment substring is an unambiguous marker: present = pinned (non-multi),
+    absent = multi. Without this, a --multi seat re-minted on resume regains the
+    blunt pin and silently collapses back to single-model."""
+    try:
+        with open(path) as f:
+            return "CLAUDE_CODE_SUBAGENT_MODEL=" not in f.read()
+    except OSError:
+        return False
+
+
 def _resume(seat_name, rest):
     """seat resume <seat> — relaunch the seat's pane at its drain point via
     the detected metaharness: the pane runs the seat's freshly re-minted
@@ -1163,6 +1179,7 @@ def _resume(seat_name, rest):
               % (seat_name, launch_sh, family, seat_name), file=sys.stderr)
         return 1
     room = _room_from_launch(launch_sh)
+    multi = _multi_from_launch(launch_sh)
     sid, sess_cwd = _newest_seat_session(d)
     command = "%s %s" % (shlex.quote(launch_sh),
                          ("--resume " + shlex.quote(sid)) if sid else "--continue")
@@ -1184,7 +1201,7 @@ def _resume(seat_name, rest):
                 print("  stopped stale %s pane %s" % (seat_name, row["handle"]))
         # env refresh half of the contract: the relaunch rides the LATEST
         # assets (identity vars, delivery hooks, context env), room preserved.
-        _write_launch_assets(family, d, room, seat_name)
+        _write_launch_assets(family, d, room, seat_name, multi=multi)
         handle = ad.spawn(command, title=seat_name,
                           cwd=sess_cwd or os.getcwd())
     except harness.HarnessError as e:
