@@ -58,12 +58,25 @@ TS_FMT = "%Y%m%dT%H%M%SZ"
 # is dead anyway — the RECOVERABLE pre-image is always the newest).
 KEEP = 20
 
-# the pre-login guard as a hook spec (hooks.py shape): every SessionStart
-# snapshots whatever the home currently holds, so a mid-session /login always
-# has a pre-image behind it. Fail-open text + timeout come from hooks.py.
-GUARD_SPEC = {"name": "cred-guard", "event": "SessionStart",
-              "args": "cred backup --quiet", "timeout": 5,
-              "own": ("cred backup --quiet", "helm cred backup"), "matcher": "*"}
+# The pre-login guard as hook specs (hooks.py shape). SessionStart alone is NOT
+# enough: a live session refreshes its OWN token, and the grant ROTATES the
+# refresh token (keepalive.py's first law), so hours into a session the
+# SessionStart pre-image holds a refresh token the server has already consumed
+# — restoring it is the temporal twin of the byte-copy revocation bomb that
+# _family_live_elsewhere refuses. keepalive cannot cover the gap either: it
+# SKIPS any home with a live holder. So the guard also rides the TURN BOUNDARY
+# (Stop, like hooks.SPECS' stop-guard), where an identical snapshot costs two
+# file reads and a compare, and the pre-image is never more than one turn
+# behind the token the next `/login` is about to destroy.
+GUARD_SPECS = (
+    {"name": "cred-guard", "event": "SessionStart",
+     "args": "cred backup --quiet", "timeout": 5,
+     "own": ("cred backup --quiet", "helm cred backup"), "matcher": "*"},
+    {"name": "cred-guard-turn", "event": "Stop",
+     "args": "cred backup --quiet", "timeout": 5,
+     "own": ("cred backup --quiet", "helm cred backup"), "matcher": None},
+)
+GUARD_SPEC = GUARD_SPECS[0]      # the name the SessionStart-only callers know
 
 
 def backup_root():
@@ -184,8 +197,24 @@ def rows(provider="claude"):
             "wants_home": homes.canonical_name(acct["email"]) if acct["ok"] else None,
             "live_pids": r["live_pids"], "backups": len(snaps),
             "family": r.get("family"),        # sha256 PREFIX of the refresh token
-            "latest_backup": snaps[-1]["ts"] if snaps else None})
+            "latest_backup": snaps[-1]["ts"] if snaps else None,
+            # `backups` counts the OCCUPANT's snapshots — on a drifted home that
+            # is the account that just arrived, and it reads as 0 exactly when
+            # the owner most needs to know the EVICTED one is safe. This is the
+            # number that answers "can heal put the named account back?".
+            "named_backups": 0 if r["default"] else
+            len([s for s in snapshots_for_home_name(os.path.basename(real))
+                 if s["has_creds"]])})
     return out
+
+
+def _snapshot_expiry(snapshot_path):
+    """The snapshot's ACCESS-token expiry (ms epoch), or None — the staleness
+    signal. Only a TIMESTAMP leaves this function; the credential bytes beside
+    it are never read into any returned value."""
+    doc = _read_json(os.path.join(snapshot_path, "credentials.json")) or {}
+    exp = (doc.get("claudeAiOauth") or {}).get("expiresAt")
+    return exp if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None
 
 
 def _snapshot_family(snapshot_path):
@@ -249,34 +278,74 @@ def _write_private(path, data):
         fh.write(data)
 
 
-def _atomic_private(path, data, mode=0o600):
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _stage_private(path, data, mode=0o600):
+    """Write `data` into a sibling temp (owner-only from creation) and return
+    the temp path — the caller commits it with os.replace. STAGING IS THE
+    FALLIBLE HALF: disk-full, quota and permission all land here, before any
+    live file has been touched, so a multi-file write can stage everything and
+    only then commit."""
     tmp = "%s.helm-tmp.%d" % (path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    except FileExistsError:
+        # the name is OURS by pid, so an existing one is a leftover from a
+        # crashed run (or a recycled pid) — never a live file. Clear it once;
+        # a second EEXIST is a real problem and propagates.
+        _unlink(tmp)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
+    except OSError:
+        _unlink(tmp)
+        raise
+    return tmp
+
+
+def _atomic_private(path, data, mode=0o600):
+    tmp = _stage_private(path, data, mode)
+    try:
         os.replace(tmp, path)
     except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        _unlink(tmp)
         raise
 
 
-def _next_snapshot_dir(acct_dir):
-    """A snapshot name that sorts STRICTLY after every surviving one — newest
-    is `snapshots()[-1]` by name alone, and pruning (which frees old names)
-    can never resurrect one ahead of the newest."""
+def _claim_snapshot_dir(acct_dir):
+    """CLAIM a snapshot dir: a name that sorts STRICTLY after every surviving
+    one (newest is `snapshots()[-1]` by name alone, and pruning — which frees
+    old names — can never resurrect one ahead of the newest), created with an
+    EXCLUSIVE mkdir at 0700.
+
+    Exclusive because the guard runs per turn in every home and one account can
+    occupy two homes: two backups can land in the same account dir in the same
+    SECOND. A shared name would mean the second writer's O_EXCL file write
+    fails and its error path deletes the first writer's finished snapshot — a
+    concurrent backup destroying a good pre-image. Whoever loses the mkdir race
+    simply takes the next name."""
     base = time.strftime(TS_FMT, time.gmtime())
     existing = [os.path.basename(p) for p in glob.glob(os.path.join(acct_dir, "*"))
                 if os.path.isdir(p)]
     top = max(existing) if existing else ""
     cand, n = base, 0
-    while cand <= top or os.path.exists(os.path.join(acct_dir, cand)):
+    while n < 1000:
+        if cand > top:
+            try:
+                os.mkdir(os.path.join(acct_dir, cand), 0o700)
+                os.chmod(os.path.join(acct_dir, cand), 0o700)   # umask-proof
+                return os.path.join(acct_dir, cand)
+            except FileExistsError:
+                pass
         n += 1
         cand = "%s-%03d" % (base, n)
-    return os.path.join(acct_dir, cand)
+    raise OSError("cannot claim a snapshot name under %s" % acct_dir)
 
 
 def _identical(snapshot, blob, oa):
@@ -319,8 +388,7 @@ def backup(config_dir):
     try:
         _secure_dir(backup_root())
         _secure_dir(account_dir(acct["email"]))
-        dest = _next_snapshot_dir(account_dir(acct["email"]))
-        _secure_dir(dest)
+        dest = _claim_snapshot_dir(account_dir(acct["email"]))   # ours alone
         _write_private(os.path.join(dest, "credentials.json"), blob)
         _write_private(os.path.join(dest, "account.json"),
                        json.dumps(oa, indent=2, sort_keys=True).encode())
@@ -374,7 +442,20 @@ def backup_all():
 def restore(snapshot_path, config_dir):
     """Put a snapshot back: credentials bytes (0600) AND the oauthAccount block
     (so the home's identity stops lying). Everything else in .claude.json
-    survives byte-for-byte. -> {ok, account, error}."""
+    survives byte-for-byte.
+
+    ALL-OR-NOTHING across the TWO files. A home holding one account's tokens
+    under another account's identity block is exactly the state this module
+    exists to abolish, so: both files are STAGED before either is committed
+    (staging is where disk-full lands), and if the second commit somehow fails
+    the credentials file is put back the way it was. A partial restore never
+    survives this function.
+
+    It also REFUSES rather than clobbering an unparseable-but-present
+    .claude.json — that file holds the whole home's state (projects, MCP
+    servers, history) and rewriting it from {} would silently destroy it
+    (hooks.install_home's law, applied to the config the same way).
+    -> {ok, account, error}."""
     real = os.path.realpath(os.path.expanduser(config_dir))
     try:
         with open(os.path.join(snapshot_path, "credentials.json"), "rb") as fh:
@@ -384,18 +465,53 @@ def restore(snapshot_path, config_dir):
     oa = _read_json(os.path.join(snapshot_path, "account.json"))
     if not isinstance(oa, dict) or not _str_or_none(oa.get("emailAddress")):
         return {"ok": False, "error": "snapshot has no identity block — refusing"}
-    doc = _read_json(os.path.join(real, ACCOUNT_JSON))
-    doc = doc if isinstance(doc, dict) else {}
-    doc["oauthAccount"] = oa
-    cfg = os.path.join(real, ACCOUNT_JSON)
-    mode = 0o600
+    cfg, auth = os.path.join(real, ACCOUNT_JSON), os.path.join(real, AUTH_JSON)
+    doc, mode = {}, 0o600
     if os.path.exists(cfg):
         mode = os.stat(cfg).st_mode & 0o777      # the operator's own perms survive
+        doc = _read_json(cfg)
+        if not isinstance(doc, dict):
+            return {"ok": False, "error":
+                    "%s is present but unreadable/not an object — refusing to "
+                    "overwrite it (it holds this home's whole state)" % ACCOUNT_JSON}
+    doc = dict(doc)
+    doc["oauthAccount"] = oa
+    staged = []
     try:
-        _atomic_private(os.path.join(real, AUTH_JSON), blob)
-        _atomic_private(cfg, (json.dumps(doc, indent=2) + "\n").encode(), mode=mode)
+        staged.append((_stage_private(auth, blob), auth))
+        staged.append((_stage_private(
+            cfg, (json.dumps(doc, indent=2) + "\n").encode(), mode), cfg))
     except OSError as e:
+        for tmp, _ in staged:
+            _unlink(tmp)
         return {"ok": False, "error": "write failed (%s)" % e.__class__.__name__}
+    try:
+        with open(auth, "rb") as fh:
+            prior = fh.read()                    # the undo for a half-commit
+    except OSError:
+        prior = None
+    done = []
+    for tmp, dest in staged:
+        try:
+            os.replace(tmp, dest)
+        except OSError as e:
+            for leftover, _ in staged:
+                _unlink(leftover)
+            if auth in done:                     # creds landed, identity did not
+                if prior is None:
+                    _unlink(auth)
+                else:
+                    try:
+                        _atomic_private(auth, prior)
+                    except OSError:
+                        return {"ok": False, "error":
+                                "write failed (%s) AND the credentials file could "
+                                "not be rolled back — this home now holds the "
+                                "restored credentials under its previous identity"
+                                % e.__class__.__name__}
+            cache_clear()
+            return {"ok": False, "error": "write failed (%s)" % e.__class__.__name__}
+        done.append(dest)
     cache_clear()
     return {"ok": True, "account": oa.get("emailAddress")}
 
@@ -468,7 +584,8 @@ def _family_live_elsewhere(snapshot, target, estate):
 
 def heal_plan(name=None):
     """One plan per DRIFTED home: what heal WOULD do, and why it can't.
-    status: ready | held | cannot-probe | no-backup | revocation-risk."""
+    status: ready | held | cannot-probe | no-backup | revocation-risk
+    (apply adds: restored | failed | no-preimage)."""
     plans = []
     estate = rows()
     for r in estate:
@@ -503,8 +620,26 @@ def heal_plan(name=None):
                 "reuse detection revokes the whole family. Fresh login instead: %s"
                 % (clash, homes.LOGIN_CMDS["claude"](r["real"])))
         else:
+            # STALENESS is the temporal twin of the shared-family bomb: an
+            # access token that had already expired means whoever held this
+            # home next had to refresh, and the grant ROTATES the refresh
+            # token — the snapshot's copy may already be consumed, and a
+            # consumed refresh token is what reuse detection revokes families
+            # over. Not a refusal (this is still the only recovery on disk),
+            # but the owner sees it before typing --apply.
+            exp = _snapshot_expiry(snaps[-1]["path"])
+            plan["stale_pre_image"] = bool(exp is not None
+                                           and exp < time.time() * 1000)
             plan["status"], plan["reason"] = "ready", (
                 "restore %s from %s" % (snaps[-1]["account"] or want, snaps[-1]["ts"]))
+            if plan["stale_pre_image"]:
+                plan["reason"] += (
+                    " — WARNING: that snapshot's access token was already expired, "
+                    "so the home very likely refreshed (and ROTATED the refresh "
+                    "token) after it was taken; the snapshot's copy may be spent, "
+                    "and a spent refresh token is what reuse detection revokes a "
+                    "family over. A fresh login is the safe move: %s"
+                    % homes.LOGIN_CMDS["claude"](r["real"]))
         plans.append(plan)
     return plans
 
@@ -528,6 +663,15 @@ def heal(name=None, apply=False):
                              "no /proc — refusing"
             continue
         pre = backup(plan["path"])               # the evicted-now occupant, first
+        if not pre["ok"]:
+            # THE LAW, ENFORCED not merely attempted: no eviction without a
+            # pre-image. Proceeding here would delete the occupant's only copy
+            # of a live credential — the exact loss heal exists to prevent.
+            plan["status"], plan["reason"] = "no-preimage", (
+                "cannot snapshot the current occupant %s first (%s) — refusing "
+                "to evict an account whose credentials would then exist nowhere"
+                % (plan["holds"] or "?", pre["reason"]))
+            continue
         plan["pre_image"] = pre.get("dest")
         res = restore(plan["restore_from"], plan["path"])
         if not res["ok"]:
@@ -564,9 +708,13 @@ def doctor_rows():
         if r["verdict"] == "DRIFT":
             out.append(("WARN",
                         "credhome %s HOLDS %s (drift — that account's home is %s); "
-                        "`helm cred heal` restores the named account, "
-                        "`helm cred list` shows the whole estate"
-                        % (r["name"], r["account"], r["wants_home"])))
+                        "%s, `helm cred list` shows the whole estate"
+                        % (r["name"], r["account"], r["wants_home"],
+                           "`helm cred heal` restores %s from its %d snapshot%s"
+                           % (r["name"], r["named_backups"],
+                              "s"[:r["named_backups"] != 1]) if r["named_backups"]
+                           else "and NOTHING was snapshotted for %s — only a fresh "
+                                "login brings it back" % r["name"])))
         elif r["verdict"] == "UNKNOWN" and r["authed"]:
             out.append(("WARN", "credhome %s holds credentials but its identity is "
                                 "unreadable (%s) — no account claimed"
@@ -627,6 +775,11 @@ def _print_list(args):
         note = []
         if r["verdict"] == "DRIFT":
             note.append("this account's home is %s" % r["wants_home"])
+            note.append("heal can restore %s (%d snapshot%s)"
+                        % (r["name"], r["named_backups"],
+                           "s"[:r["named_backups"] != 1]) if r["named_backups"]
+                        else "NO snapshot of %s — only a fresh login brings it "
+                             "back" % r["name"])
         if r["verdict"] == "UNKNOWN":
             note.append(r["error"] or "identity unreadable")
         if r["aliases"]:
@@ -686,14 +839,16 @@ def _print_switch_guard(args):
             return 0
         worst = 0
         for hname, path in targets:
-            action, detail = hooks.install_home(path, dry=dry, specs=(GUARD_SPEC,))
+            action, detail = hooks.install_home(path, dry=dry, specs=GUARD_SPECS)
             print("  %-30s %s" % (hname, action if not dry else action))
             if action == "fail":
                 print("    " + detail, file=sys.stderr)
                 worst = 1
-        print("helm cred switch-guard: SessionStart guard %sinstalled in %d home%s "
-              "— every session start snapshots what the home holds, so a mid-session "
-              "/login always has a pre-image behind it"
+        print("helm cred switch-guard: SessionStart + Stop guard %sinstalled in %d "
+              "home%s — every session start AND every turn boundary snapshots what "
+              "the home holds, so a mid-session /login always has a pre-image "
+              "behind it that is at most one turn old (the live session rotates "
+              "its own refresh token; a session-start-only pre-image goes dead)"
               % ("would be " if dry else "", len(targets), "s"[:len(targets) != 1]))
         return worst
     path, err = _resolve_home(_take_flag(list(args), "--home"))
@@ -736,7 +891,8 @@ def _print_heal(args):
         print("      %s" % p["reason"])
         if p.get("pre_image"):
             print("      pre-image of the evicted occupant: %s" % p["pre_image"])
-    bad = [p for p in plans if p["status"] in ("failed", "cannot-probe")]
+    bad = [p for p in plans
+           if p["status"] in ("failed", "cannot-probe", "no-preimage")]
     return 1 if bad else 0
 
 

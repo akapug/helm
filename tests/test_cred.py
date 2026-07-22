@@ -10,6 +10,7 @@ import os
 import shutil
 import stat
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -219,12 +220,107 @@ class BackupTest(CredBase):
         self.assertFalse(res["ok"])
         self.assertIn("snapshot write failed", res["reason"])
 
+    def test_a_concurrent_backup_never_deletes_the_other_one(self):
+        """One account can occupy two homes and the guard runs per turn, so two
+        backups can land in the same account dir in the same SECOND. A shared
+        snapshot name would make the loser's error path delete the winner's
+        finished pre-image."""
+        a = self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-A")
+        b = self.plant("cto-example-com", "owner@example.invalid", token="FAKE-B")
+        first = cred.backup(a)
+        # freeze the clock so both claims want the SAME timestamp name
+        with mock.patch.object(cred.time, "strftime",
+                               lambda *a_, **k: os.path.basename(first["dest"])):
+            second = cred.backup(b)
+        self.assertTrue(second["ok"], second)
+        self.assertNotEqual(second["dest"], first["dest"])
+        self.assertTrue(os.path.exists(os.path.join(first["dest"], "credentials.json")))
+        snaps = cred.snapshots("owner@example.invalid")
+        self.assertEqual(len(snaps), 2)
+        self.assertEqual(snaps[-1]["path"], second["dest"])      # newest sorts last
+        for s in snaps:
+            self.assertEqual(stat.S_IMODE(os.stat(s["path"]).st_mode), 0o700)
+
     def test_backup_all_covers_every_authed_home(self):
         self.plant("david-example-invalid", "owner@example.invalid")
         self.plant("team-example-com", "hey@simbi.com")
         self.plant("no-creds-com", "no@creds.com", token=None)
         done = {r["account"] for r in cred.backup_all() if r["action"] == "backup"}
         self.assertEqual(done, {"owner@example.invalid", "hey@simbi.com"})
+
+
+class RestoreAtomicityTest(CredBase):
+    """A restore is ALL-OR-NOTHING across .credentials.json AND .claude.json.
+    A home holding one account's tokens under another's identity block is the
+    exact state this module exists to abolish — a half-written restore must
+    never be able to mint it."""
+
+    def staged(self, token="FAKE-OLD"):
+        d = self.plant("david-example-invalid", "owner@example.invalid", token=token)
+        snap = cred.backup(d)["dest"]
+        self.plant("david-example-invalid", "intruder@example.invalid", token="FAKE-INTRUDER")
+        return d, snap
+
+    def test_staging_failure_touches_neither_live_file(self):
+        """Disk-full lands in staging — before any live byte moves."""
+        d, snap = self.staged()
+        creds = open(os.path.join(d, ".credentials.json"), "rb").read()
+        cfg = open(os.path.join(d, ".claude.json"), "rb").read()
+        real = cred._stage_private
+
+        def flaky(path, data, mode=0o600):
+            if path.endswith(".claude.json"):
+                raise OSError(28, "No space left on device")
+            return real(path, data, mode)
+
+        with mock.patch.object(cred, "_stage_private", flaky):
+            res = cred.restore(snap, d)
+        self.assertFalse(res["ok"])
+        self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(), creds)
+        self.assertEqual(open(os.path.join(d, ".claude.json"), "rb").read(), cfg)
+        cred.cache_clear()
+        self.assertEqual(cred.account_of(d)["email"], "intruder@example.invalid")   # consistent
+        self.assertFalse([f for f in os.listdir(d) if "helm-tmp" in f])
+
+    def test_half_commit_rolls_the_credentials_file_back(self):
+        """The second rename fails: the creds that already landed are undone."""
+        d, snap = self.staged()
+        creds = open(os.path.join(d, ".credentials.json"), "rb").read()
+        real = os.replace
+
+        def flaky(src, dst, *a, **kw):
+            if str(dst).endswith(".claude.json"):
+                raise OSError(5, "I/O error")
+            return real(src, dst, *a, **kw)
+
+        with mock.patch.object(cred.os, "replace", flaky):
+            res = cred.restore(snap, d)
+        self.assertFalse(res["ok"])
+        self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(), creds)
+        self.assertFalse([f for f in os.listdir(d) if "helm-tmp" in f])
+
+    def test_unparseable_claude_json_is_refused_not_overwritten(self):
+        """.claude.json holds the home's WHOLE state (projects, mcp, history).
+        Rewriting it from {} would destroy that — refuse, like hooks.py does."""
+        d, snap = self.staged()
+        with open(os.path.join(d, ".claude.json"), "w") as f:
+            f.write('{"projects": {"a": 1}, TRUNCATED')
+        cred.cache_clear()
+        res = cred.restore(snap, d)
+        self.assertFalse(res["ok"])
+        self.assertIn("refusing to overwrite", res["error"])
+        self.assertEqual(open(os.path.join(d, ".claude.json")).read(),
+                         '{"projects": {"a": 1}, TRUNCATED')
+
+    def test_a_leftover_temp_file_cannot_block_a_restore_forever(self):
+        """The temp name is ours by pid; a crashed run must not brick recovery."""
+        d, snap = self.staged()
+        with open(os.path.join(d, ".credentials.json.helm-tmp.%d" % os.getpid()),
+                  "w") as f:
+            f.write("leftover")
+        res = cred.restore(snap, d)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(cred.account_of(d)["email"], "owner@example.invalid")
 
 
 class HealTest(CredBase):
@@ -307,6 +403,32 @@ class HealTest(CredBase):
         self.assertIn("claude /login", plan["reason"])
         self.assertEqual(cred.account_of(cto)["email"], "owner@example.invalid")   # untouched
 
+    def test_refuses_to_evict_an_occupant_whose_pre_image_failed(self):
+        """The pre-image law ENFORCED, not merely attempted: if the occupant
+        cannot be snapshotted (full/blocked disk), evicting it would delete the
+        only copy of a live credential. Refuse."""
+        d = self.drifted()
+        occupant = open(os.path.join(d, ".credentials.json"), "rb").read()
+        with mock.patch.object(cred, "backup", lambda p: {
+                "ok": False, "action": "skip", "account": "owner@example.invalid",
+                "reason": "snapshot write failed (OSError)"}):
+            res = cred.heal(apply=True)
+        plan = res["plans"][0]
+        self.assertEqual(plan["status"], "no-preimage")
+        self.assertIn("exist nowhere", plan["reason"])
+        self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(),
+                         occupant)
+        self.assertEqual(cred.account_of(d)["email"], "owner@example.invalid")
+
+    def test_cli_exits_nonzero_when_a_heal_refused_mid_apply(self):
+        self.drifted()
+        with mock.patch.object(cred, "backup", lambda p: {
+                "ok": False, "action": "skip", "account": "owner@example.invalid",
+                "reason": "snapshot write failed (OSError)"}):
+            rc, out, _ = self.out(cred.cmd_cred, ["heal", "--apply"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no-preimage", out)
+
     def test_agreeing_homes_are_never_planned(self):
         self.plant("david-example-invalid", "owner@example.invalid")
         self.assertEqual(cred.heal()["plans"], [])
@@ -326,11 +448,38 @@ class HealTest(CredBase):
 
 class DoctorTest(CredBase):
     def test_drift_row_names_the_account_and_the_verb(self):
+        """With a snapshot of the NAMED account, the row names the repair verb."""
+        cto = self.plant("cto-example-com", "cto@example.invalid")
+        cred.backup(cto)
         self.plant("cto-example-com", "owner@example.invalid")
         msgs = [m for lvl, m in cred.doctor_rows() if lvl == "WARN"]
         self.assertTrue(any("credhome cto-example-com HOLDS owner@example.invalid (drift" in m
                             for m in msgs), msgs)
-        self.assertTrue(any("helm cred heal" in m for m in msgs))
+        self.assertTrue(any("`helm cred heal` restores cto-example-com from its 1 "
+                            "snapshot" in m for m in msgs), msgs)
+
+    def test_drift_row_is_honest_when_nothing_was_snapshotted(self):
+        """Naming `helm cred heal` here would be a lie — it cannot restore an
+        account that was never snapshotted."""
+        self.plant("cto-example-com", "owner@example.invalid")
+        msgs = [m for lvl, m in cred.doctor_rows() if lvl == "WARN"]
+        self.assertTrue(any("NOTHING was snapshotted for cto-example-com" in m
+                            for m in msgs), msgs)
+        self.assertFalse(any("`helm cred heal` restores" in m for m in msgs), msgs)
+
+    def test_list_tells_the_owner_the_evicted_account_is_recoverable(self):
+        """At the moment of the incident the BACKUPS column counts the ARRIVING
+        account (0) — the owner must still see that the EVICTED one is safe."""
+        cto = self.plant("cto-example-com", "cto@example.invalid")
+        cred.backup(cto)
+        self.plant("cto-example-com", "owner@example.invalid")
+        row = {r["name"]: r for r in cred.rows()}["cto-example-com"]
+        self.assertEqual((row["backups"], row["named_backups"]), (0, 1))
+        _, out, _ = self.out(cred.cmd_cred, ["list"])
+        self.assertIn("heal can restore cto-example-com (1 snapshot)", out)
+        self.plant("nobackup-example-invalid", "owner@example.invalid")
+        _, out, _ = self.out(cred.cmd_cred, ["list"])
+        self.assertIn("NO snapshot of nobackup-example-invalid", out)
 
     def test_missing_backup_row(self):
         self.plant("david-example-invalid", "owner@example.invalid")
@@ -427,6 +576,71 @@ class CliTest(CredBase):
         rc, _, err = self.out(cred.cmd_cred, ["bogus"])
         self.assertEqual(rc, 2)
         self.assertIn("unknown subverb", err)
+
+
+class GuardFreshnessTest(CredBase):
+    """A pre-image is only worth the token it still holds. A live session
+    refreshes its own credentials and the grant ROTATES the refresh token, so a
+    SessionStart-only guard goes dead hours before the `/login` it exists for."""
+
+    def test_the_guard_rides_the_turn_boundary_as_well_as_session_start(self):
+        events = {s["event"] for s in cred.GUARD_SPECS}
+        self.assertEqual(events, {"SessionStart", "Stop"})
+        self.assertEqual(len({s["name"] for s in cred.GUARD_SPECS}), 2)
+        for s in cred.GUARD_SPECS:                    # hooks.py spec contract
+            self.assertEqual(s["args"], "cred backup --quiet")
+            self.assertIn("timeout", s)
+        self.assertIsNone(dict(  # Stop takes no matcher (hooks.SPECS' law)
+            (s["event"], s["matcher"]) for s in cred.GUARD_SPECS)["Stop"])
+
+    def test_install_writes_both_events_into_every_home(self):
+        from helm import configs
+        d = self.plant("david-example-invalid", "owner@example.invalid")
+        orig = (configs.HOME_ROOTS, configs.BACKUP_DIR)
+        configs.HOME_ROOTS = [d]                      # the fake estate's gate
+        configs.BACKUP_DIR = os.path.join(self.tmp, "config-backups")
+        self.addCleanup(lambda: setattr(configs, "HOME_ROOTS", orig[0]))
+        self.addCleanup(lambda: setattr(configs, "BACKUP_DIR", orig[1]))
+        rc, out, err = self.out(cred.cmd_cred, ["switch-guard", "--install"])
+        self.assertEqual(rc, 0, err)
+        sp = os.path.join(homes.ROOTS["claude"], "david-example-invalid", "settings.json")
+        cfg = json.load(open(sp))
+        for event in ("SessionStart", "Stop"):
+            cmds = [h["command"] for g in cfg["hooks"][event] for h in g["hooks"]]
+            self.assertTrue(any("cred backup --quiet" in c for c in cmds), event)
+        # idempotent
+        rc, out, _ = self.out(cred.cmd_cred, ["switch-guard", "--install"])
+        self.assertEqual(json.load(open(sp)), cfg)
+
+    def test_a_spent_looking_snapshot_warns_before_apply(self):
+        """expiresAt in the past ⇒ the home refreshed after the snapshot ⇒ its
+        refresh token may already be consumed. Surfaced, not hidden."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        with open(os.path.join(cto, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {"refreshToken": "FAKE-CTO",
+                                         "expiresAt": 1}}, f)          # long dead
+        cred.cache_clear()
+        cred.backup(cto)
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        plan = cred.heal()["plans"][0]
+        self.assertEqual(plan["status"], "ready")
+        self.assertTrue(plan["stale_pre_image"])
+        self.assertIn("reuse detection", plan["reason"])
+        self.assertIn("claude /login", plan["reason"])
+        rc, out, _ = self.out(cred.cmd_cred, ["heal"])
+        self.assertIn("WARNING", out)
+
+    def test_a_live_snapshot_carries_no_warning(self):
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        with open(os.path.join(cto, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {"refreshToken": "FAKE-CTO",
+                                         "expiresAt": (time.time() + 3600) * 1000}}, f)
+        cred.cache_clear()
+        cred.backup(cto)
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        plan = cred.heal()["plans"][0]
+        self.assertFalse(plan["stale_pre_image"])
+        self.assertNotIn("WARNING", plan["reason"])
 
 
 class SecrecyTest(CredBase):

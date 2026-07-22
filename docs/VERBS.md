@@ -892,7 +892,7 @@ all** rather than a guess.
 | --- | --- |
 | `list` (default) | DIR NAME &#124; ACTUAL ACCOUNT &#124; verdict (`AGREE` / `DRIFT` / `UNKNOWN` / `N/A`) &#124; backup depth. Pure read — the owner-visible truth surface. |
 | `backup [--all] [--home H] [--quiet]` | Snapshot a home's `.credentials.json` bytes + its `oauthAccount` block into `~/.cred-backups/<folded-email>/<ts>/` (dirs `0700`, files `0600`, owner-only from creation). Skips when an identical snapshot already exists; keeps the newest 20 per account. `--quiet` is hook mode: prints nothing, ever. |
-| `switch-guard [--home H]` | **Run this before a `/login`.** Backs the home's current account up, then prints the exact login command. Whatever `/login` evicts is now recoverable. `--install` wires the same backup as a `SessionStart` hook in every claude home, so a pre-image exists even when nobody remembered. |
+| `switch-guard [--home H]` | **Run this before a `/login`.** Backs the home's current account up, then prints the exact login command. Whatever `/login` evicts is now recoverable. `--install` wires the same backup as a `SessionStart` **and** `Stop` hook in every claude home, so a pre-image exists even when nobody remembered — and stays within one turn of the live token (a session refreshes its own credentials and the grant rotates the refresh token, so a session-start-only pre-image is dead by hour two; keepalive cannot cover it either, because it skips every home with a live holder). |
 | `heal [<home>] [--apply]` | Put the correctly-named account back into a DRIFTED home from its newest snapshot. **Dry-run by default.** |
 
 `heal` refuses more than it acts, on purpose:
@@ -908,12 +908,36 @@ all** rather than a guess.
   home. Restoring it would leave byte-copies of one token family in two homes,
   and reuse detection revokes the whole family (see `helm homes verify`). helm
   prints the fresh-login command instead.
+* **no-preimage** — the current occupant could not be snapshotted (full or
+  blocked disk). Evicting it would delete the only copy of a live credential,
+  so heal refuses: **no eviction without a pre-image**, enforced, not merely
+  attempted.
+
+A `ready` plan additionally carries `stale_pre_image` when the snapshot's own
+access token had already expired — meaning the home almost certainly refreshed
+(and ROTATED the refresh token) after the snapshot was taken, so the copy on
+disk may already be spent, and a *spent* refresh token is what reuse detection
+revokes a family over. That is the temporal twin of `revocation-risk`; it warns
+rather than refuses (the snapshot is still the only recovery on disk) and
+prints the fresh-login command beside it.
 
 An applied heal snapshots the CURRENT occupant first (the undo is itself
 undoable), restores, then VERIFIES the home now reads as the expected account —
-rolling back if it does not. Restored credentials can still be stale (refresh
+rolling back if it does not. The restore itself is ALL-OR-NOTHING across the
+two files it touches: `.credentials.json` and `.claude.json` are both staged
+before either is committed, and a failed commit puts the credentials file back,
+because a home holding one account's tokens under another account's identity
+block is exactly the state this verb exists to abolish. A present-but-
+unparseable `.claude.json` is refused, never rewritten from scratch — that file
+holds the home's whole state. Restored credentials can still be stale (refresh
 tokens rotate); when claude rejects them the fix is one fresh login, and the
 identity is right either way.
+
+**What heal does NOT do:** it never *places* an account into a home that is not
+already drifted. After a heal, the account the `/login` brought in lives only as
+a pre-image snapshot; giving it a home of its own is a fresh `/login` into that
+home (a non-destructive act — nothing is evicted). No credential is lost either
+way, but there is no `restore-into` verb yet.
 
 Secrets never surface: credential bytes are copied and compared, never printed,
 logged, or placed in an error string. The only derived value ever written is a

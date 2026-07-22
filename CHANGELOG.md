@@ -90,6 +90,35 @@
   credential files — now snapshots a pre-image before every rotation and logs
   the ACCOUNT beside the home name.
 
+- `helm cred` hardened under adversarial review (five findings, all fixed):
+  (1) heal now REFUSES with `no-preimage` when the current occupant cannot be
+  snapshotted — it used to evict anyway, deleting the only copy of a live
+  credential, which is the exact loss the verb exists to prevent;
+  (2) `restore` is all-or-nothing across `.credentials.json` and
+  `.claude.json` — both are staged before either is committed, and a failed
+  commit rolls the credentials file back, so a half-written restore can no
+  longer leave a home holding one account's tokens under another's identity
+  block; (3) `restore` REFUSES a present-but-unparseable `.claude.json`
+  instead of rewriting it from `{}` (that file holds the home's whole state —
+  projects, MCP servers, history — and the old path silently destroyed it);
+  (4) a leftover `.helm-tmp.<pid>` file can no longer block a restore
+  permanently (the name is ours by pid, so a crashed run's leftover is
+  cleared once); (5) the switch-guard now rides `Stop` as well as
+  `SessionStart`, because a live session refreshes its own credentials and the
+  grant ROTATES the refresh token — a session-start-only pre-image is dead
+  hours before the `/login` it exists for, and keepalive cannot cover the gap
+  (it skips every home with a live holder). heal additionally flags
+  `stale_pre_image` when a snapshot's own access token had already expired,
+  the temporal twin of the shared-family revocation bomb. Two more: snapshot
+  dirs are now CLAIMED with an exclusive `mkdir` (one account can occupy two
+  homes and the guard runs per turn, so two backups could land on the same
+  name in the same second and the loser's error path deleted the winner's
+  finished pre-image); and `helm cred list` + doctor's drift row now report
+  whether the EVICTED account is recoverable — the BACKUPS column counts the
+  ARRIVING account, which reads as `0` at exactly the moment the owner needs
+  to know the evicted one is safe (live estate: `cto-example-invalid`
+  now says plainly that nothing was ever snapshotted for it).
+
 - Stop-whisper slice 2 — the verify-grounding rungs: the contextual
   continuation ladder gains three signals read from record.py's own logs
   (one bounded read, fail-closed): a RED gate (a test-runner's latest run
