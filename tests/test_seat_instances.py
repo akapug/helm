@@ -13,6 +13,7 @@ import stat
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from helm import codexhomes, seat
 
@@ -352,6 +353,94 @@ class ProxyFixRoundTest(Slice6Base):
                 rc = seat._down("codex", seat="codex-2")
             self.assertEqual(rc, 0)             # we survived => not signalled
             self.assertFalse(os.path.exists(os.path.join(home, "proxy.pid")))
+
+    def test_config_emits_top_level_nonstream_keepalive(self):
+        # owner-witnessed /compact empty-HTTP-200 (2026-07-22): a long
+        # non-streaming summarize sits silent, the proxy reaps the idle socket.
+        # The fix is a TOP-LEVEL key — NonStreamKeepAliveInterval lives on
+        # SDKConfig (yaml:",inline" into root), NOT under streaming: (that
+        # struct only holds keepalive-seconds/bootstrap-retries). The live
+        # family configs carry it top-level by hand; the generator must too.
+        cfg = seat._config_yaml(8319, "/auth", "tok")
+        self.assertIn("\nnonstream-keepalive-interval: 15\n", cfg)
+        self.assertNotIn("streaming:", cfg)      # NOT nested — see above
+        kcfg = seat._config_yaml_key(8318, "tok", "moonshot",
+                                     "https://api.moonshot.ai/v1", "kimi-k3",
+                                     "sk-x")
+        self.assertIn("\nnonstream-keepalive-interval: 15\n", kcfg)
+
+    def test_down_preserves_a_concurrent_replacements_pidfile(self):
+        # atomic-ownership finding: _down kills the old proxy, then must unlink
+        # ONLY the exact pid+birth record it owned — a replacement's fresh
+        # pidfile (different pid) written before the unlink must SURVIVE.
+        home = seat._proxy_home("codex", "codex-2")
+        os.makedirs(home, exist_ok=True)
+        live = os.getpid()      # our own pid: alive, NOT a proxy (never signalled)
+        # the record _down will "kill": forged to match `_running_pid`'s check,
+        # then we swap in a REPLACEMENT record before the unlink by patching
+        # _proxy_pid_record to return the replacement on the ownership re-read.
+        old_ident = seat._pid_identity(live)
+        seat._write_private(os.path.join(home, "proxy.pid"),
+                            "%d %s\n" % (live, old_ident), mode=0o600)
+        real = seat._proxy_pid_record
+        calls = {"n": 0}
+
+        def swapping(family, seat=None):
+            # 1st call = _running_pid's read, 2nd = expected-identity read,
+            # 3rd = the ownership re-read before unlink -> the REPLACEMENT.
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                return {"pid": live + 99999, "identity": "proc:replacement"}
+            return real(family, seat)
+
+        # the record matches our own live pid, so _down "owns" it and WOULD
+        # signal — stub os.kill to a no-op so the flow completes without
+        # killing the test runner (the signal path is covered elsewhere; this
+        # test pins the UNLINK-ownership behavior only).
+        with mock.patch.object(seat, "_proxy_pid_record", swapping), \
+                mock.patch.object(seat.os, "kill", lambda *a, **k: None):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                rc = seat._down("codex", seat="codex-2")
+        self.assertEqual(rc, 0)
+        # the replacement record was NOT unlinked (the pidfile still exists)
+        self.assertTrue(os.path.exists(os.path.join(home, "proxy.pid")))
+
+    def test_up_serializes_concurrent_starts(self):
+        # atomic-ownership finding: the check→spawn critical section is under
+        # the per-home flock, so a second _up sees the first's record and
+        # refuses. Prove the lock file is taken during _up (re-entrant attempt
+        # to grab it non-blocking fails while _up holds it).
+        import fcntl
+        home = seat._proxy_home("codex", "codex-2")
+        os.makedirs(home, exist_ok=True)
+        seat._write_private(os.path.join(home, "config.yaml"), "port: 8319\n",
+                            mode=0o600)
+        lockpath = os.path.join(home, ".proxy.lock")
+        held = {"fd": None}
+        real_bin = seat._proxy_bin
+
+        def probe_lock():
+            # called inside _up's critical section (under the flock): a
+            # non-blocking grab of the SAME lock must FAIL, proving it's held.
+            fd = os.open(lockpath, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    raise AssertionError("proxy lock NOT held during _up")
+                except BlockingIOError:
+                    pass          # correct: the lock is held by _up
+            finally:
+                os.close(fd)
+            return None            # no binary -> _up exits before spawning
+
+        with mock.patch.object(seat, "_proxy_bin", probe_lock):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                rc = seat._up("codex", seat="codex-2")
+        self.assertEqual(rc, 1)     # no binary (our probe returned None)
 
     def test_launch_refuses_instances_for_proxy_key_families(self):
         # Finding 5 (unsupported family): kimi is proxy-key — `launch kimi -i 2`

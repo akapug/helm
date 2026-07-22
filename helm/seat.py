@@ -321,6 +321,29 @@ def _instance_port(family, seat=None):
     return base  # a non-numeric seat name shares the family port (instance 1)
 
 
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def _proxy_lock(family, seat=None):
+    """Serialize _up/_down per proxy-home: an flock on <proxy_home>/.proxy.lock.
+    Without it two concurrent _up calls both pass the empty-pidfile check and
+    double-start, and a _down can delete a CONCURRENT replacement's fresh
+    pidfile (killing the old proxy, then unlinking the NEW record — leaving
+    the new proxy alive but unmanageable). The lock makes the check→spawn→
+    record and the verify→signal→unlink sequences each atomic."""
+    import fcntl
+    home = _proxy_home(family, seat)
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(home, ".proxy.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def _proxy_pid_record(family, seat=None):
     """The pidfile as an authenticated record: {pid, identity} or None. The
     pidfile carries the process-BIRTH identity beside the pid (`<pid>
@@ -486,7 +509,14 @@ then re-run `helm seat add codex`."""
 # ---------------------------------------------------------------------------
 
 def _config_yaml(port, auth_dir, token):
-    """The proxy config that passed the live eval, verbatim shape."""
+    """The proxy config that passed the live eval, verbatim shape. The
+    nonstream-keepalive-interval is NOT optional: a long non-streaming pass
+    (compaction's ~360k summarize — the longest single request a session
+    makes) sits silent while the upstream thinks, the proxy reaps the idle
+    socket, and Claude Code gets an empty HTTP 200 ('proxy or gateway
+    intercepting') — owner-witnessed on a codex-2 /compact 2026-07-22. The
+    live family configs carry 15s by hand; the generator must emit it too or
+    every re-mint silently strips the fix (as-prevented)."""
     return ('host: "127.0.0.1"\n'
             "port: %d\n"
             'auth-dir: "%s"\n'
@@ -497,7 +527,9 @@ def _config_yaml(port, auth_dir, token):
             "remote-management:\n"
             "  allow-remote: false\n"
             '  secret-key: ""\n'
-            "  disable-control-panel: true\n") % (port, auth_dir, token)
+            "  disable-control-panel: true\n"
+            # heartbeat during long non-streaming thinking passes — see docstring.
+            "nonstream-keepalive-interval: 15\n") % (port, auth_dir, token)
 
 
 def _config_yaml_key(port, token, provider, base_url, model, api_key):
@@ -523,6 +555,8 @@ def _config_yaml_key(port, token, provider, base_url, model, api_key):
             "    models:\n"
             '      - name: "%s"\n'
             '        alias: "%s"\n'
+            # same long-nonstream keepalive as _config_yaml (compaction survival)
+            "nonstream-keepalive-interval: 15\n"
             % (port, token, provider, base_url, api_key, model, model))
 
 
@@ -1120,55 +1154,61 @@ def _up(family, quiet=False, seat=None):
               file=sys.stderr)
         return 1
     port = _instance_port(family, seat)
-    pid = _running_pid(family, seat)
-    if pid:
-        print("helm seat: %s proxy already running (pid %d, port %d) — "
-              "`helm seat down %s` first" % (seat, pid, port, seat),
-              file=sys.stderr)
-        return 1
-    b = _proxy_bin()
-    if not b:
-        print("helm seat: cli-proxy-api binary not found (HELM_PROXY_BIN, %s, "
-              "PATH all empty) — run `helm seat doctor`" % PROXY_BIN_DEFAULT,
-              file=sys.stderr)
-        return 1
-    log = open(os.path.join(cfgd, "proxy.log"), "ab")
-    try:
-        p = subprocess.Popen([b, "-config", os.path.join(cfgd, "config.yaml")],
-                             stdout=log, stderr=log, start_new_session=True)
-    except OSError as exc:
-        print("helm seat: proxy failed to launch: %s" % exc, file=sys.stderr)
-        return 1
-    finally:
-        log.close()
-    # record pid + BIRTH identity so `_down`/`_running_pid` signal only THIS
-    # incarnation — a reused pid is never proxied-on or killed (the bare
-    # reusable-PID finding). Capture right after spawn; /proc can lag a tick,
-    # so retry briefly. If identity is STILL unverifiable the proxy would be
-    # unmanageable (fail-closed `_down` would refuse to ever signal it) — kill
-    # the orphan and fail loudly rather than leave a proxy we cannot stop.
-    ident = None
-    for _ in range(10):
-        ident = _pid_identity(p.pid)
-        if ident or p.poll() is not None:
-            break
-        time.sleep(0.1)
-    if not ident:
-        p.kill()
-        print("helm seat: proxy pid %d birth identity unverifiable — killed "
-              "the orphan rather than leave an unstoppable proxy (no /proc?)"
-              % p.pid, file=sys.stderr)
-        return 1
-    _write_private(os.path.join(cfgd, "proxy.pid"), "%d %s\n" % (p.pid, ident))
-    for _ in range(30):  # up to ~6s for the port to open
-        if p.poll() is not None or _port_open(port):
-            break
-        time.sleep(0.2)
-    if p.poll() is not None:
-        os.remove(os.path.join(cfgd, "proxy.pid"))
-        print("helm seat: proxy exited rc %s — tail %s"
-              % (p.returncode, os.path.join(cfgd, "proxy.log")), file=sys.stderr)
-        return 1
+    # Serialize check→spawn→record under the per-home lock: without it two
+    # concurrent _up calls both read an empty pidfile and double-start (the
+    # atomic-ownership finding). The whole critical section runs under the
+    # flock so the empty-check and the record-write are one atomic step.
+    with _proxy_lock(family, seat):
+        pid = _running_pid(family, seat)
+        if pid:
+            print("helm seat: %s proxy already running (pid %d, port %d) — "
+                  "`helm seat down %s` first" % (seat, pid, port, seat),
+                  file=sys.stderr)
+            return 1
+        b = _proxy_bin()
+        if not b:
+            print("helm seat: cli-proxy-api binary not found (HELM_PROXY_BIN, "
+                  "%s, PATH all empty) — run `helm seat doctor`"
+                  % PROXY_BIN_DEFAULT, file=sys.stderr)
+            return 1
+        log = open(os.path.join(cfgd, "proxy.log"), "ab")
+        try:
+            p = subprocess.Popen([b, "-config",
+                                  os.path.join(cfgd, "config.yaml")],
+                                 stdout=log, stderr=log, start_new_session=True)
+        except OSError as exc:
+            print("helm seat: proxy failed to launch: %s" % exc, file=sys.stderr)
+            return 1
+        finally:
+            log.close()
+        # record pid + BIRTH identity so `_down`/`_running_pid` signal only THIS
+        # incarnation — a reused pid is never proxied-on or killed (the bare
+        # reusable-PID finding). Capture right after spawn; /proc can lag a tick,
+        # so retry briefly. If identity is STILL unverifiable the proxy would be
+        # unmanageable (fail-closed `_down` would refuse to ever signal it) — kill
+        # the orphan and fail loudly rather than leave a proxy we cannot stop.
+        ident = None
+        for _ in range(10):
+            ident = _pid_identity(p.pid)
+            if ident or p.poll() is not None:
+                break
+            time.sleep(0.1)
+        if not ident:
+            p.kill()
+            print("helm seat: proxy pid %d birth identity unverifiable — killed "
+                  "the orphan rather than leave an unstoppable proxy (no /proc?)"
+                  % p.pid, file=sys.stderr)
+            return 1
+        _write_private(os.path.join(cfgd, "proxy.pid"), "%d %s\n" % (p.pid, ident))
+        for _ in range(30):  # up to ~6s for the port to open
+            if p.poll() is not None or _port_open(port):
+                break
+            time.sleep(0.2)
+        if p.poll() is not None:
+            os.remove(os.path.join(cfgd, "proxy.pid"))
+            print("helm seat: proxy exited rc %s — tail %s"
+                  % (p.returncode, os.path.join(cfgd, "proxy.log")), file=sys.stderr)
+            return 1
     if not quiet:
         print("helm seat: %s proxy up — 127.0.0.1:%d (pid %d)"
               % (seat, port, p.pid))
@@ -1181,43 +1221,55 @@ def _down(family, seat=None):
         return 1
     seat = seat or family
     pidfile = os.path.join(_proxy_home(family, seat), "proxy.pid")
-    pid = _running_pid(family, seat)
-    if not pid:
-        # Distinguish a merely-dead proxy from a REUSED pid: a live process
-        # holding our recorded pid with a DIFFERENT birth identity is NOT our
-        # proxy — never signal it (the reused-pid SIGTERM finding). Reap the
-        # stale file, say so plainly.
-        rec = _proxy_pid_record(family, seat)
-        if rec and _pid_alive(rec["pid"]):
-            os.remove(pidfile)
-            print("helm seat: %s proxy pidfile stale — pid %d now belongs to "
-                  "an unrelated process (reused); NOT signalled, record reaped"
-                  % (seat, rec["pid"]))
+    # Serialize verify→signal→unlink under the per-home lock (the atomic-
+    # ownership finding): without it a concurrent _up/replacement can write a
+    # FRESH pidfile after the old proxy exits, and an unconditional os.remove
+    # then deletes the NEW record — leaving the new proxy alive but
+    # unmanageable and eligible for a duplicate start.
+    with _proxy_lock(family, seat):
+        pid = _running_pid(family, seat)
+        if not pid:
+            # Distinguish a merely-dead proxy from a REUSED/unauthenticated pid:
+            # a live process holding our recorded pid that we cannot prove is
+            # ours is NOT our proxy — never signal it. Reap the stale file.
+            rec = _proxy_pid_record(family, seat)
+            if rec and _pid_alive(rec["pid"]):
+                os.remove(pidfile)
+                print("helm seat: %s proxy pidfile stale — pid %d now belongs to "
+                      "an unrelated process (reused); NOT signalled, record reaped"
+                      % (seat, rec["pid"]))
+                return 0
+            if os.path.exists(pidfile):
+                os.remove(pidfile)  # stale
+            print("helm seat: %s proxy not running" % seat)
             return 0
-        if os.path.exists(pidfile):
-            os.remove(pidfile)  # stale
-        print("helm seat: %s proxy not running" % seat)
-        return 0
-    # TOCTOU guard: re-verify the birth identity IMMEDIATELY before each
-    # signal. `_running_pid` verified at entry, but the proxy could die and its
-    # pid be recycled in the gap before a kill; a recycled pid has a different
-    # starttime, so the recheck refuses to signal it. (pidfd would close the
-    # window outright; /proc starttime narrows it to the check→kill instant,
-    # which is the portable floor here.)
-    expected = _proxy_pid_record(family, seat)["identity"]
+        # TOCTOU guard: re-verify the birth identity IMMEDIATELY before each
+        # signal. `_running_pid` verified at entry, but the proxy could die and
+        # its pid be recycled in the gap before a kill; a recycled pid has a
+        # different starttime, so the recheck refuses to signal it. (pidfd would
+        # close the window outright; /proc starttime narrows it to the
+        # check→kill instant, which is the portable floor here.)
+        expected = _proxy_pid_record(family, seat)["identity"]
 
-    def _still_ours():
-        return _pid_alive(pid) and _pid_identity(pid) == expected
+        def _still_ours():
+            return _pid_alive(pid) and _pid_identity(pid) == expected
 
-    if _still_ours():
-        os.kill(pid, signal.SIGTERM)
-    for _ in range(15):
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.2)
-    if _still_ours():
-        os.kill(pid, signal.SIGKILL)
-    os.remove(pidfile)
+        if _still_ours():
+            os.kill(pid, signal.SIGTERM)
+        for _ in range(15):
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.2)
+        if _still_ours():
+            os.kill(pid, signal.SIGKILL)
+        # Unlink ONLY the exact record this operation killed: re-read under the
+        # lock and remove just if the pidfile still names THIS pid+birth. A
+        # concurrent replacement's fresh record (different pid or birth) is
+        # left intact.
+        cur = _proxy_pid_record(family, seat)
+        if cur and cur["pid"] == pid and cur["identity"] == expected \
+                and os.path.exists(pidfile):
+            os.remove(pidfile)
     print("helm seat: %s proxy stopped (pid %d)" % (seat, pid))
     return 0
 

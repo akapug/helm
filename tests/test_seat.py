@@ -293,7 +293,9 @@ class SeatTest(unittest.TestCase):
             '      - api-key: "fake-key-xyz"\n'
             "    models:\n"
             '      - name: "kimi-k3"\n'
-            '        alias: "kimi-k3"\n'))
+            '        alias: "kimi-k3"\n'
+            # long-nonstream keepalive (compaction survival) rides every config
+            "nonstream-keepalive-interval: 15\n"))
         self.assertNotIn("auth-dir", cfg)
 
     # -- key-flavor -> base-url dispatch (kimi coding vs Moonshot platform) --
