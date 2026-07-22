@@ -110,15 +110,26 @@ class ScanTest(SessionBase):
         mo = session.memory_only_panes()
         self.assertEqual([r["pid"] for r in mo], [622078])
 
-    def test_ls_flags_memory_only_and_double_open(self):
+    def test_ls_persistence_is_transcript_truth_not_env(self):
+        # persistence is decided by the on-disk transcript, NOT the env stamp
+        # (transcript-on-disk-is-persistence-truth-not-env). A second pane
+        # double-opens deadbeef; cccc2222 has a transcript, the rest don't.
         self.panes.append({"pid": 700, "resume": "deadbeef-memory-only",
                            "session": "deadbeef-memory-only", "child": False,
                            "ancestor_sid8": "", "force": False})
-        rc, out, _ = run(session.cmd_ls, [])
+        with mock.patch.object(session, "_persisting_sids",
+                               return_value={"cccc2222-rescued": "/x/cccc2222.jsonl"}):
+            rc, out, _ = run(session.cmd_ls, [])
         self.assertEqual(rc, 0)
-        self.assertIn("MEMORY-ONLY", out)
+        line = {l.split()[1]: l for l in out.splitlines() if l.strip().startswith("pid")}
+        # cccc2222 (stamped+forced) HAS a transcript -> persisting, the capcom case
+        self.assertIn("persisted", line["998382"])
+        # deadbeef (stamped, no FORCE) has NO transcript -> genuinely memory-only
+        self.assertIn("MEMORY-ONLY (stamped, no FORCE)", line["622078"])
+        # aaaa1111 is TOP-LEVEL but has NO transcript -> still at-risk (the old
+        # `not child => persisted` rule mislabeled this safe: the dangerous way)
+        self.assertIn("MEMORY-ONLY (no transcript on disk)", line["57699"])
         self.assertIn("DOUBLE-OPEN", out)  # deadbeef open in 622078 + 700
-        self.assertIn("stamped+FORCED (rescued)", out)
 
 
 class LawTest(SessionBase):

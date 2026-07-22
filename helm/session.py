@@ -248,7 +248,17 @@ def open_pids(sid):
 
 def memory_only_panes():
     """Live interactive panes running persistence-OFF: stamped child WITHOUT
-    the FORCE override. These are the sessions a death would lose."""
+    the FORCE override. These are the sessions a death would lose.
+
+    KNOWN OVER-REPORT (measured 2026-07-22, fix routed — do not trust this list
+    as-is): the env stamp is an INPUT to the persistence decision at launch, not
+    a REPORT of what is happening. Session 85935aed read stamped-without-FORCE
+    while writing an 80MB transcript that was still growing; 2 of 6 panes this
+    flagged were persisting fine. The ground truth is whether a transcript for
+    the sid EXISTS on disk (existence, not freshness — an idle-but-persisted
+    session is not at risk). Corroborating here needs sid attribution the
+    /proc scan often cannot resolve (several rows carry no session), which is
+    why this is a routed fix rather than a one-liner."""
     return [r for r in _proc_claude_rows() if r["child"] and not r["force"]]
 
 
@@ -299,18 +309,64 @@ def _print_incantation(sid, cred_home=None, cwd=None):
         shlex.quote(cwd or _session_cwd(sid)), env, shlex.quote(sid))
 
 
+def _persisting_sids():
+    """Full sids that HAVE a real transcript on disk — persistence TRUTH, not
+    the env stamp (premise transcript-on-disk-is-persistence-truth-not-env: a
+    child-stamped pane whose transcript is growing on disk is persisting fine,
+    and the env heuristic over-flags it MEMORY-ONLY). Sourced from the session
+    catalog — the canonical scanner that already follows symlinked homes
+    (cto-example -> …) and never indexes the derived .flat.jsonl variant."""
+    try:
+        from . import transcripts
+        out = {}
+        for r in transcripts.get_catalog().get("rows", []):
+            p = r.get("p")
+            if p and not str(p).endswith(".flat.jsonl") and os.path.exists(p):
+                out[r["i"]] = p
+        return out
+    except Exception:
+        return {}
+
+
 def cmd_ls(args):
     """session ls — sessions + a PERSISTENCE column: live panes cross-joined
-    with their stamp, flagging memory-only panes and double-opens."""
+    with their stamp AND the on-disk transcript, flagging genuinely memory-only
+    panes (stamped, no transcript) and double-opens."""
     rows = _proc_claude_rows()
-    mo = [r for r in rows if r["child"] and not r["force"]]
+    persisting = _persisting_sids()
+
+    def _on_disk(sid):
+        if not sid:
+            return False
+        if sid in persisting:
+            return True
+        return any(k.startswith(sid) or sid.startswith(k) for k in persisting)
+
+    # Persistence is decided by the TRANSCRIPT ON DISK, for EVERY pane — a
+    # top-level session with no transcript is at-risk just as much as a stamped
+    # one; the stamp/force is only WHY, never the persistence verdict. (The old
+    # code trusted `not child` => persisted and mislabeled genuinely-transcript-
+    # less top-level panes as safe — the dangerous direction.)
+    # An UNRESOLVED sid can't be checked against disk — its persistence is
+    # genuinely UNKNOWN, never assert-safe NOR false-alarm memory-only. The hard
+    # at-risk count is only panes we RESOLVED and found transcript-less.
+    mo = [r for r in rows
+          if (r.get("session") or r.get("resume"))
+          and not _on_disk(r.get("session") or r.get("resume"))]
     live = live_sids(rows)
     dbl = {s: ps for s, ps in live.items() if len(ps) > 1}
     print("helm session ls — %d live claude panes" % len(rows))
     for r in sorted(rows, key=lambda x: x["pid"]):
-        state = ("MEMORY-ONLY (stamped, no FORCE)" if r["child"] and not r["force"]
-                 else "persisted" if not r["child"] else "stamped+FORCED (rescued)")
         sid = r.get("session") or r.get("resume")
+        why = (" (rescued)" if r["force"] else " (stamped)" if r["child"] else "")
+        if not sid:
+            state = "UNKNOWN (sid unresolved — verify by hand)" + why
+        elif _on_disk(sid):
+            state = "persisted" + why
+        elif r["child"] and not r["force"]:
+            state = "MEMORY-ONLY (stamped, no FORCE)"
+        else:
+            state = "MEMORY-ONLY (no transcript on disk)"
         possible = len(r.get("possible_sessions") or [])
         res = ((" session=%s" % sid[:12]) if sid else
                (" session=? (%d cwd candidates)" % possible if possible else ""))
@@ -806,6 +862,12 @@ def cmd_session(args):
     if not args or args[0] not in _VERBS:
         print(USAGE, file=sys.stderr)
         return 2
+    # `--help`/`-h` anywhere is a help request, never a <sid> prefix — without
+    # this, `session checkpoint --help` resolves "--help" as an id and dies
+    # with "no session id starts with '--help'" (helm-claude dogfood, 07-22).
+    if any(a in ("--help", "-h") for a in args[1:]):
+        print(USAGE)
+        return 0
     try:
         return _VERBS[args[0]](args[1:])
     except (OSError, ValueError) as e:
