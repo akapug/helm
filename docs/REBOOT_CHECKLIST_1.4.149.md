@@ -211,6 +211,25 @@ dirs regardless (they were never cred homes).
   (backup + identity-from-content + heal) remains necessary regardless of who
   owns the home. This is the one row worth running live.
 
-*Owner feedback loop: the orca team explicitly asked for feedback from exactly
-this multi-account power-user case. The measured `/login` drift and the
-proxy-seat decoupling above are the feedback worth sending back.*
+### Feedback to the orca team — DEFERRED, with a trigger
+
+The team asked for feedback from exactly this multi-account power-user case, and
+the owner intends to give it — **but not until we have actually RUN the rc.2+
+credhome solution for a while.** Feedback before real use would be speculation.
+
+**Trigger:** the reboot has landed AND the fleet has run a meaningful soak on
+rc.2+ per-account credhoming (multiple accounts, concurrent sessions, at least
+one sleep/wake resume and one account switch).
+
+**Framing (owner, 2026-07-21) — write it as a USER, not as helm:** from orca's
+perspective they do not care that helm has its own credhoming. What matters to
+them is only that the owner *had to solve it himself until orca did*. So the
+feedback is about whether THEIR feature serves the multi-account workflow —
+does switch→launch hold, do per-account sessions really stay pinned across
+sleep/wake and restart, is usage attribution right, what breaks at 4+ accounts.
+Do NOT send a tour of helm's architecture; that is not the ask and not useful
+to them.
+
+Candidate content once soaked: whether E8 holds (a `/login` inside a managed
+pane overwriting that account's home in place), plus anything the soak surfaces
+about concurrency and resume-pinning at our fleet's scale.
