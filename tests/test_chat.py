@@ -365,5 +365,77 @@ class PostUnknownFlagTest(ChatBase):
         self.assertEqual(len(self._rows()), 1)
 
 
+class DeletedCwdTest(ChatBase):
+    """A session whose process cwd was DELETED (a pruned lane worktree — a
+    ROUTINE lifecycle state here) must keep chatting. The homing prologue's
+    eager os.getcwd() crashed every default chat verb AND all three delivery
+    hooks BEFORE their fail-open guards could catch it (fable composition
+    HIGH @ 8313d9f; main handled this, the lane regressed it). seats.safe_cwd
+    fails open to None -> un-homed -> #main; the session lives."""
+
+    def _delete_cwd(self):
+        d = tempfile.mkdtemp(dir=self.tmp)
+        os.chdir(d)
+        os.rmdir(d)
+        self.assertRaises(OSError, os.getcwd)   # the probe's precondition
+
+    def _hook(self, args, payload=b"{}"):
+        """chat.cmd_chat with hook-JSON stdin + FD-1 capture (the hook emit
+        writes fd 1 directly — invisible to redirect_stdout)."""
+        import types
+        fake = types.SimpleNamespace(buffer=io.BytesIO(payload))
+        r, w = os.pipe()
+        saved = os.dup(1)
+        os.dup2(w, 1)
+        os.close(w)
+        try:
+            with mock.patch.object(sys, "stdin", fake), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = chat.cmd_chat(list(args))
+            sys.stdout.flush()
+        finally:
+            os.dup2(saved, 1)
+            os.close(saved)
+        chunks = []
+        while True:
+            b = os.read(r, 65536)
+            if not b:
+                break
+            chunks.append(b)
+        os.close(r)
+        return rc, b"".join(chunks).decode("utf-8")
+
+    def test_default_chat_io_survives_a_deleted_cwd(self):
+        self._delete_cwd()
+        rc, _, err = self.run_cmd(["post", "still", "alive"])
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.run_cmd(["read"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("still alive", out)
+
+    def test_all_three_delivery_hooks_survive_a_deleted_cwd(self):
+        payload = json.dumps({"session_id": "s-del-cwd"}).encode("utf-8")
+        self._delete_cwd()
+        rc, out = self._hook(["join", "--hook-json"], payload)
+        self.assertEqual(rc, 0)
+        # the join RAN and emitted its identity line — a crash swallowed by
+        # a fail-open guard would also rc 0, but emit nothing
+        self.assertIn("SessionStart", out)
+        rc, _ = self._hook(["deliver", "--hook-json"], payload)
+        self.assertEqual(rc, 0)
+        rc, _ = self._hook(["stop-guard", "--hook-json"], payload)
+        self.assertEqual(rc, 0)
+
+    def test_seat_add_homing_resolves_from_a_deleted_cwd(self):
+        """The same eager-getcwd class at seat.py's _resolve_homing: `helm
+        seat add --room X` from a deleted cwd must resolve, not crash."""
+        from helm import seat as seat_mod
+        from helm import seats
+        self._delete_cwd()
+        self.assertIsNone(seats.safe_cwd())
+        self.assertEqual(seat_mod._resolve_homing("ops"), ("ops", None))
+        self.assertEqual(seat_mod._resolve_homing(None), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

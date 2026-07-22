@@ -109,8 +109,11 @@ def cmd_launch(args):
         home_note(home_path, opts["home"])
     seat = opts["seat"] or os.environ.get("HELM_CHAT_NAME") or stable_seat()
     # seats.resolve_homing is THE one precedence (CLI --room > env seam >
-    # project derivation) — launch never re-derives its own copy.
-    room, source = seats.resolve_homing(opts["room"], os.getcwd())
+    # project derivation) — launch never re-derives its own copy. safe_cwd:
+    # a deleted process cwd must not crash the launch seam (eager-getcwd
+    # class), it just launches un-homed.
+    cwd = seats.safe_cwd()
+    room, source = seats.resolve_homing(opts["room"], cwd)
     room_source = "derived" if source == "derived" else None
     room_explicit = source == "explicit"
     if opts["install"]:
@@ -120,7 +123,7 @@ def cmd_launch(args):
             if action == "fail":
                 print("helm launch: hook install failed in %s: %s"
                       % (name, detail), file=sys.stderr)
-    seats.join(cwd=os.getcwd(), seat=seat, room=room or "main",
+    seats.join(cwd=cwd, seat=seat, room=room or "main",
                room_explicit=room_explicit, room_source=room_source)
     env = build_env(os.environ, seat, home_path, room, room_source)
     print("[helm launch] seat '%s'%s — exec claude" % (

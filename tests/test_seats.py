@@ -2376,6 +2376,72 @@ class HomingOneTruthTest(SeatsBase):
         # nothing at all: un-homed
         self.assertEqual(seats.resolve_homing(None, self.tmp), (None, None))
 
+    def _chat_hook(self, args, payload):
+        """chat.cmd_chat (the REAL hook entry — the process-cwd pre-resolution
+        lives in its prologue) with hook-JSON stdin + FD-1 capture."""
+        fake = types.SimpleNamespace(buffer=io.BytesIO(payload))
+        r, w = os.pipe()
+        saved = os.dup(1)
+        os.dup2(w, 1)
+        os.close(w)
+        try:
+            with mock.patch.object(sys, "stdin", fake), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = chat.cmd_chat(list(args))
+            sys.stdout.flush()
+        finally:
+            os.dup2(saved, 1)
+            os.close(saved)
+        chunks = []
+        while True:
+            b = os.read(r, 65536)
+            if not b:
+                break
+            chunks.append(b)
+        os.close(r)
+        return rc, b"".join(chunks).decode("utf-8")
+
+    def test_hook_join_homes_from_the_payload_cwd_not_the_hook_process(self):
+        """The hook payload's cwd is the SESSION's ground truth; the hook
+        PROCESS may run elsewhere (metaharness seam). cmd_chat pre-resolves
+        the default room from its own cwd — a derived pre-resolution must be
+        re-resolved against the payload cwd, or the seat homes to the hook
+        runner's project instead of its own."""
+        repo_a, repo_b = self._repo("proj-alpha"), self._repo("proj-beta")
+        prior = os.getcwd()
+        os.chdir(repo_b)                    # the hook PROCESS cwd: proj-beta
+        try:
+            rc, _ = self._chat_hook(
+                ["join", "--hook-json"],
+                json.dumps({"session_id": "s-payload",
+                            "cwd": repo_a}).encode("utf-8"))
+        finally:
+            os.chdir(prior)
+        self.assertEqual(rc, 0)
+        seat = seats.seat_for_session("s-payload")
+        row = seats.roster()[seat]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("proj-alpha", "derived"))
+
+    def test_hook_join_with_projectless_payload_cwd_stays_unhomed(self):
+        """A project-less payload cwd must not inherit the hook process's
+        derived room either — the seat stays un-homed (legacy all-room)."""
+        repo_b = self._repo("proj-beta")
+        bare = os.path.join(self.tmp, "no-project")
+        os.makedirs(bare)
+        prior = os.getcwd()
+        os.chdir(repo_b)
+        try:
+            rc, _ = self._chat_hook(
+                ["join", "--hook-json"],
+                json.dumps({"session_id": "s-bare",
+                            "cwd": bare}).encode("utf-8"))
+        finally:
+            os.chdir(prior)
+        self.assertEqual(rc, 0)
+        row = seats.roster()[seats.seat_for_session("s-bare")]
+        self.assertIsNone(row.get("home_room"))
+
     def test_historical_writers_converge_on_the_unified_answer(self):
         """Each historical writer's shape, same context -> ONE answer.
         (a) the hook join (chat.py passes room='main', nothing explicit);
@@ -2491,6 +2557,40 @@ class RosterGcTest(SeatsBase):
         os.makedirs(roots, exist_ok=True)
         os.makedirs(proc, exist_ok=True)
         return [roots], proc
+
+    def test_state_unlink_and_move_stop_at_the_key_boundary(self):
+        """Substring cross-fire (fable adversarial B3): seat 'foo' (key
+        foo-<h1>) must not match the state files of a live seat literally
+        NAMED 'foo-<h1>' (its key foo-<h1>-<h2>) — the bare substring test
+        let pruning or renaming 'foo' destroy the OTHER seat's delivery
+        ground (the gc state cross-fire class, substring flavor)."""
+        chat._ensure_dir()
+        d = chat.chat_dir()
+        key = seats._seat_key("foo")
+        okey = seats._seat_key(key)             # the adversarial twin's key
+        self.assertTrue(okey.startswith(key))   # the collision shape is real
+        own = ["main.cursor.%s" % key, "main.cursor.%s.k1" % key,
+               "main.cursor.%s.lock" % key, ".seen.%s" % key]
+        twin = ["main.cursor.%s" % okey, "main.cursor.%s.k1" % okey,
+                ".seen.%s" % okey]
+        for n in own + twin:
+            open(os.path.join(d, n), "w").close()
+        seats._unlink_seat_state("foo")
+        for n in own:
+            self.assertFalse(os.path.exists(os.path.join(d, n)), n)
+        for n in twin:
+            self.assertTrue(os.path.exists(os.path.join(d, n)), n)
+        # the rename mover shares the matcher: foo -> bar moves ONLY foo's
+        for n in own:
+            open(os.path.join(d, n), "w").close()
+        seats._move_seat_state("foo", "bar")
+        nk = seats._seat_key("bar")
+        for n in twin:
+            self.assertTrue(os.path.exists(os.path.join(d, n)), n)
+        self.assertTrue(
+            os.path.exists(os.path.join(d, "main.cursor.%s" % nk)))
+        self.assertFalse(
+            os.path.exists(os.path.join(d, "main.cursor.%s" % key)))
 
     def test_gc_refuses_fresh_presence(self):
         self._row("alive", session="sid-alive-1", stale=False)

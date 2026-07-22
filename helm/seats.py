@@ -293,6 +293,20 @@ def derive_home_room(cwd):
     return None if not room or room == "main" else room
 
 
+def safe_cwd():
+    """os.getcwd() failing OPEN to None when the process cwd no longer exists
+    (a pruned lane worktree is a ROUTINE lifecycle state here, not an error).
+    Every homing call site must use this instead of a bare os.getcwd(): an
+    eager getcwd in the chat/hook prologue crashed every default chat verb and
+    all three delivery hooks for a deleted-cwd session, BEFORE any fail-open
+    guard could catch it. resolve_homing/derive_home_room treat None as
+    un-homed, so the session keeps working (in #main) instead of dying."""
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
 def resolve_homing(cli_room=None, cwd=None):
     """THE one home-room precedence — every writer resolves through here and
     write_roster is the one enforcement gate behind it. The bug-class this
@@ -525,6 +539,14 @@ def write_roster(seat, session=None, cwd=None, home_room=None,
         row = r.get(seat) or {}
         home_room = pk.slug(home_room) if home_room else None
         if home_room_source == "explicit":
+            # Known tier gap (documented; follow-up card): explicit beats
+            # explicit regardless of AGE, so an operator rehome holds only
+            # until a pane launched with env HELM_CHAT_ROOM (explicit, no
+            # derived stamp) restarts — its SessionStart join re-writes the
+            # stale env room. The homing law only forbids DERIVED downgrades;
+            # ranking 'operator' above a stale explicit env (or re-minting
+            # launch.sh on rehome) is the candidate fix, deliberately not
+            # smuggled into this lane.
             old = row.get("home_room")
             if home_room != old:
                 newly_admitted = _rooms_to_baseline(old, home_room)
@@ -595,6 +617,31 @@ def _resolve_seat(r, token):
     return None
 
 
+_STATE_MARKERS = (".cursor.", ".seen.", ".stopfp.", ".scan.")
+
+
+def _key_bounded(name, key):
+    """Does this state filename belong to THIS seat key? Match only at a
+    FIELD BOUNDARY: after '<marker><key>' the name must end or continue with
+    '.' (the .k<sid8>/.lock suffixes — _seat_key's slug+hash alphabet never
+    contains '.'). A bare substring test cross-fired: seat 'foo' (key
+    foo-<h1>) prefix-matched every state file of a seat literally NAMED
+    'foo-<h1>' (its key foo-<h1>-<h2>), so pruning/renaming 'foo' unlinked or
+    moved the LIVE seat's cursors — the same gc state cross-fire class the
+    case-variant fix closed, substring flavor (fable adversarial probe B3)."""
+    for m in _STATE_MARKERS:
+        probe, i = m + key, 0
+        while True:
+            i = name.find(probe, i)
+            if i < 0:
+                break
+            end = i + len(probe)
+            if end == len(name) or name[end] == ".":
+                return True
+            i += 1
+    return False
+
+
 def _move_seat_state(old, new):
     """Carry every state file from the old seat key to the new one — cursors
     (+ per-session variants + locks), .seen, stop latches, every room. The
@@ -611,9 +658,8 @@ def _move_seat_state(old, new):
         names = os.listdir(d)
     except OSError:
         return
-    markers = (".cursor.", ".seen.", ".stopfp.", ".scan.")
     for n in names:
-        if any(marker + ok in n for marker in markers):
+        if _key_bounded(n, ok):
             try:
                 # replace EVERY key occurrence: a dm-lane cursor carries the
                 # key twice (dm-<key>.cursor.<key>…) and both must move —
@@ -1952,9 +1998,8 @@ def _unlink_seat_state(seat):
         names = os.listdir(d)
     except OSError:
         return
-    markers = (".cursor.", ".seen.", ".stopfp.", ".scan.")
     for n in names:
-        if any((m + key) in n for m in markers):
+        if _key_bounded(n, key):
             try:
                 os.remove(os.path.join(d, n))
             except OSError:
@@ -2204,6 +2249,23 @@ def _hook_emit(event):
     return emit
 
 
+def _payload_homing(cwd, room, room_source):
+    """The hook seam homes from the SESSION's payload cwd, not the hook
+    PROCESS's. cmd_chat pre-resolves the default room from its own cwd —
+    normally identical to the session's, but a metaharness may run hooks
+    elsewhere (or the two may diverge), and a derived room from the WRONG
+    cwd would home the seat to the wrong project. So: a DERIVED
+    pre-resolution is re-resolved through THE one resolver against the
+    payload cwd when one is present; explicit rooms (--room, operator env)
+    pass through untouched."""
+    if not cwd or room_source != "derived":
+        return room, room_source
+    r2, s2 = resolve_homing(None, cwd)
+    if not r2:
+        return "main", None                     # payload cwd is project-less
+    return r2, ("derived" if s2 == "derived" else None)
+
+
 def cmd(verb, args, room="main", room_explicit=False, room_source=None):
     """The seats subverbs, reached through `helm chat <verb>`."""
     args = list(args or [])
@@ -2213,7 +2275,8 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             if "--hook-json" in args:
                 d = _hook_stdin()
                 session, cwd = d.get("session_id"), d.get("cwd")
-            seat, line = join(session=session, cwd=cwd or os.getcwd(),
+                room, room_source = _payload_homing(cwd, room, room_source)
+            seat, line = join(session=session, cwd=cwd or safe_cwd(),
                               seat=_flag(args, "--seat"), room=room,
                               room_explicit=room_explicit,
                               room_source=room_source)
@@ -2230,6 +2293,7 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             if "--hook-json" in args:
                 d = _hook_stdin()
                 session, cwd = d.get("session_id"), d.get("cwd")
+                room, _ = _payload_homing(cwd, room, room_source)
             emit = _hook_emit("PostToolUse") if "--hook-json" in args else print
             deliver_any(session=session, room=room,   # every room, one nudge
                         seat=_flag(args, "--seat"), emit=emit, cwd=cwd)
@@ -2316,6 +2380,7 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                 d = _hook_stdin()
                 session = d.get("session_id")
                 stop_active = bool(d.get("stop_hook_active"))
+                room, _ = _payload_homing(d.get("cwd"), room, room_source)
             blocks, warns = stop_guard(session=session, room=room,
                                        seat=_flag(args, "--seat"),
                                        stop_active=stop_active)

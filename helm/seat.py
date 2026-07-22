@@ -804,7 +804,9 @@ def _resolve_homing(explicit_room=None):
     carries the marker into launch assets; explicit choices clear any
     inherited derived provenance."""
     from . import seats
-    room, source = seats.resolve_homing(explicit_room, os.getcwd())
+    # safe_cwd, never a bare os.getcwd(): `helm seat add --room X` from a
+    # deleted cwd must resolve (eager-getcwd class), not crash pre-resolver.
+    room, source = seats.resolve_homing(explicit_room, seats.safe_cwd())
     return room, ("derived" if source == "derived" else None)
 
 

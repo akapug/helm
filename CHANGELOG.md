@@ -2,6 +2,27 @@
 
 ## Unreleased (0.2)
 
+- Homing review round (fable composition + adversarial lenses @ 8313d9f).
+  HIGH closed: the homing prologue's EAGER `os.getcwd()` crashed every
+  default chat verb and all three delivery hooks (join/deliver/stop-guard)
+  for a session whose cwd was deleted — a pruned lane worktree is routine;
+  main handled it, the lane regressed it. `seats.safe_cwd()` fails open to
+  None (un-homed -> #main) and every lane-introduced call site (`cmd_chat`'s
+  prologue, `helm launch`, `seat._resolve_homing`) plus the adjacent
+  same-class sites (`whoname`'s auto-name, the hook join's cwd fallback) now
+  resolve through it. LOW closed: the hook seam re-resolves a DERIVED
+  pre-resolution against the hook PAYLOAD's cwd (the session's ground
+  truth) instead of trusting the hook PROCESS's cwd. LOW closed (adversarial
+  B3): `_unlink_seat_state`/`_move_seat_state` match keyed state files at a
+  KEY BOUNDARY (`<marker><key>` then `.` or end) — the bare substring test
+  let pruning/renaming seat `foo` destroy the delivery ground of a live
+  seat literally named foo's key. Documented-accepted LOWs: the catalog's
+  glob-empty-root proof-of-absence bound (transcript proof is gc's LAST
+  tier behind fail-closed presence/process tiers; loss bounded to roster
+  row + cursors, rejoin self-heals) and the explicit-beats-explicit tier
+  gap (an operator rehome holds until a pane with a stale explicit
+  `HELM_CHAT_ROOM` env restarts — follow-up: rank operator above stale
+  explicit env or re-mint launch.sh on rehome).
 - Roster GC gets ONE evidence owner (codex-2's independent review, three
   HIGHs closed). (1) Transcript truth is no longer a hand-rolled root list —
   `seat gc` delegates to session's persistence census, which covers helm's

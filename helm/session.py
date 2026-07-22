@@ -584,6 +584,16 @@ def _persisting_sids():
     persistence surface that lies about the seats is worse than none — it is
     what the fleet uses to decide whether an agent's work is safe to lose."""
     out, complete = {}, True
+    # Known bound (documented, accepted): the catalog GLOBS its roots, so a
+    # missing/unreadable/offline store (e.g. a network-mounted ~/.claude-homes)
+    # reads as [] — indistinguishable from legitimately empty — and `complete`
+    # stays True. Accepted because transcript proof is gc's LAST tier: the
+    # presence window and the FAIL-CLOSED live-process scan both precede it,
+    # so a live seat with an invisible store is still kept; the worst case
+    # (idle past REAP_S, no live process, store offline) loses only the
+    # roster row + cursors, and the next join self-heals at EOF. A
+    # mount-aware completeness probe would false-trip every host without
+    # per-account stores, which is the common shape.
     try:
         from . import transcripts
         for r in transcripts.get_catalog().get("rows", []):

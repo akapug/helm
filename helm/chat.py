@@ -171,7 +171,8 @@ def whoname():
     if sid:
         try:
             from . import seats
-            return seats.seat_for_session(sid) or seats.auto_name(sid, os.getcwd())
+            return seats.seat_for_session(sid) \
+                or seats.auto_name(sid, seats.safe_cwd())
         except Exception:
             return "agent-" + sid[:8]
     return "agent"
@@ -1111,7 +1112,12 @@ def cmd_chat(args):
         del args[i:i + 2]
     else:
         from . import seats     # deferred: seats imports chat at module top
-        resolved, source = seats.resolve_homing(None, os.getcwd())
+        # seats.safe_cwd, NEVER a bare os.getcwd(): this prologue runs before
+        # verb dispatch AND before the hook branches' fail-open try blocks —
+        # an eager getcwd here crashed every default verb + all three
+        # delivery hooks for a session whose cwd was deleted (a pruned lane
+        # worktree is routine). None ⇒ un-homed ⇒ #main; the session lives.
+        resolved, source = seats.resolve_homing(None, seats.safe_cwd())
         if resolved:
             room = resolved
             room_source = "derived" if source == "derived" else None
