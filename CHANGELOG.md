@@ -26,10 +26,10 @@
   `helm todos --all --json`) and caps unclaimed sessions at the 25 freshest.
 - Chat replies + the owner-surface UX pass. `helm chat reply <id|n> <text…>`
   (and `post … --reply-to`) threads a message under a parent by REUSING the
-  stable row id — additive `{reply_to, rts, rfrom}`, no second identity, so
-  the (ts, from) fallback still reaches a parent that predates the id law.
-  Signed replies BIND the parent through a disjoint algorithm tag
-  (`chat:reply:b2b:` over RS-joined parent id + ts + from + text) — never an
+  stable row id — additive `{reply_to, rts, rfrom}` (plus `rtext` only for a
+  pre-id parent), no second identity. Signed replies BIND the parent through a
+  disjoint algorithm tag (`chat:reply:b2b:` over RS-joined, injectively escaped
+  parent fields + text) — never an
   in-band prefix on the plain-post payload, which attacker-chosen text could
   forge into a free re-parenting. Plain posts stay byte-identical, so every
   signed row already on disk verifies unchanged; `payload_for()` is the one
@@ -57,7 +57,13 @@
   payload was **stripped**, which was the cheapest re-parenting forgery
   available; a signed row that is a reply and carries no payload is now
   MISMATCH, because `reply_to` and the recorded payload shipped together and
-  the combination cannot occur honestly.
+  the combination cannot occur honestly. Follow-up review closed the same
+  twin hole for **pre-id** parents: `(ts, from)` was already ambiguous before
+  rotation and could still resolve to the wrong survivor. Such replies now
+  bind and match `rtext`, with every ts|from candidate retained; zero or
+  multiple exact matches render an orphan. It also escaped literal RS bytes
+  inside digest fields, preventing author/text field sliding from preserving
+  a signed digest after an edit.
 
 - Stop-whisper slice 2 — the verify-grounding rungs: the contextual
   continuation ladder gains three signals read from record.py's own logs

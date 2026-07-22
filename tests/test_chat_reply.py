@@ -114,7 +114,8 @@ class ReplyRowTest(ReplyBase):
             f.write(json.dumps({"ts": "2026-07-01T00:00:00Z", "from": "old",
                                 "text": "ancient"}) + "\n")
         r = chat.post("answering the ancestor", who="bob", reply_to="1")
-        self.assertEqual((r["reply_to"], r["rfrom"]), ("", "old"))
+        self.assertEqual((r["reply_to"], r["rfrom"], r["rtext"]),
+                         ("", "old", "ancient"))
         idx = chat.index_rows(self.rows())
         self.assertEqual(chat.quote_of(r, idx), ("old", "ancient"))
 
@@ -181,6 +182,30 @@ class ReplyDigestTest(ReplyBase):
         b = chat.reply_digest("abc", "T", "alice", "hi")
         self.assertNotEqual(a, b)   # the RS separator keeps the fields apart
 
+    def test_literal_separator_cannot_slide_between_author_and_text(self):
+        """RS itself is attacker-controlled input too. Without field escaping,
+        these two tuples serialize to the same joined bytes and a text edit can
+        keep verify green by moving content into rfrom."""
+        a = chat.reply_digest("abc", "T", "alice\x1eadmin", "approved")
+        b = chat.reply_digest("abc", "T", "alice", "admin\x1eapproved")
+        self.assertNotEqual(a, b)
+
+    def test_verify_rejects_separator_field_sliding(self):
+        p = chat.post("parent", who="alice\x1eadmin")
+        with mock.patch.object(chat, "_sign_send", return_value=(SENT, None)):
+            chat.post("approved", who="bob", profile="bob", sign=True,
+                      reply_to=p["id"])
+        raw = os.path.join(chat.chat_dir(), "main.jsonl")
+        with open(raw, encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        row = json.loads(lines[1])
+        row["rfrom"] = "alice"
+        row["text"] = "admin\x1eapproved"
+        lines[1] = json.dumps(row)
+        with open(raw, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        self.assertEqual(chat.verify()[1]["state"], "MISMATCH")
+
     def test_verify_flags_a_re_parented_row_and_passes_the_rest(self):
         chat.post("parent one", who="alice")
         p2 = chat.post("parent two", who="alice")
@@ -201,6 +226,22 @@ class ReplyDigestTest(ReplyBase):
         with open(raw, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         self.assertEqual(chat.verify()[3]["state"], "MISMATCH")
+
+    def test_signed_pre_id_reply_binds_the_exact_parent_text(self):
+        chat._ensure_dir()
+        raw = os.path.join(chat.chat_dir(), "main.jsonl")
+        with open(raw, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "2026-07-01T00:00:00Z", "from": "old",
+                                "text": "first twin"}) + "\n")
+            f.write(json.dumps({"ts": "2026-07-01T00:00:00Z", "from": "old",
+                                "text": "second twin"}) + "\n")
+        with mock.patch.object(chat, "_sign_send", return_value=(SENT, None)):
+            r = chat.post("answer", who="bob", profile="bob", sign=True,
+                          reply_to="2")
+        self.assertEqual(r["rtext"], "second twin")
+        self.assertEqual(chat.verify()[-1]["state"], "ok")
+        r["rtext"] = "first twin"
+        self.assertNotEqual(chat.payload_for(r), r["payload"])
 
     def test_stripping_the_payload_off_a_signed_reply_is_a_MISMATCH(self):
         """The downgrade attack: `legacy` is the ONE state that never alarms,
@@ -327,9 +368,9 @@ class ReplyRenderTest(ReplyBase):
         self.assertNotIn("lunch?\"", out)             # never quoted as parent
         self.assertIn("(parent rotated out)", out)
 
-    def test_a_pre_id_parent_still_resolves_by_ts_and_from(self):
-        """The fallback the id-guard must NOT break: a parent with no id at
-        all is still reachable through (rts, rfrom)."""
+    def test_a_pre_id_parent_still_resolves_by_ts_from_and_text(self):
+        """The id guard must not strand an old parent, but ts|from alone is
+        never enough: exact text is the third, signed discriminator."""
         chat._ensure_dir()
         raw = os.path.join(chat.chat_dir(), "main.jsonl")
         with open(raw, "w", encoding="utf-8") as f:
@@ -337,9 +378,43 @@ class ReplyRenderTest(ReplyBase):
                                 "text": "ancient"}) + "\n")
         r = chat.post("answering the ancestor", who="bob", reply_to="1")
         idx = chat.index_rows(self.rows())
-        self.assertEqual(r["reply_to"], "")
+        self.assertEqual((r["reply_to"], r["rtext"]), ("", "ancient"))
         self.assertIsNotNone(chat.parent_of(r, idx))
         self.assertEqual(chat.quote_of(r, idx), ("old", "ancient"))
+
+    def test_pre_id_same_second_twins_resolve_exactly_or_orphan(self):
+        """The prior fallback still mis-attributed PRE-ID parents: selecting
+        twin two quoted twin one immediately, and rotating the selected twin
+        could quote its survivor. rtext makes both states exact."""
+        chat._ensure_dir()
+        raw = os.path.join(chat.chat_dir(), "main.jsonl")
+        twins = [{"ts": "2026-07-01T00:00:00Z", "from": "old",
+                  "text": "SECRET: approve the wire"},
+                 {"ts": "2026-07-01T00:00:00Z", "from": "old",
+                  "text": "lunch?"}]
+        with open(raw, "w", encoding="utf-8") as f:
+            for row in twins:
+                f.write(json.dumps(row) + "\n")
+        r = chat.post("answering lunch", who="bob", reply_to="2")
+        idx = chat.index_rows(self.rows())
+        self.assertEqual(chat.quote_of(r, idx), ("old", "lunch?"))
+        self.assertNotIn(chat.tkey(twins[0]), idx["replies"])
+        self.assertEqual(idx["replies"][chat.tkey(twins[1])], 1)
+        rc, out, _ = self.cli("read")
+        self.assertEqual(rc, 0)
+        lines = out.splitlines()
+        self.assertNotIn("↩", lines[0])
+        self.assertIn("↩1", lines[1])
+        # The chosen parent rotates out while its same-second sibling survives.
+        with open(raw, "w", encoding="utf-8") as f:
+            f.write(json.dumps(twins[0]) + "\n")
+            f.write(json.dumps(r) + "\n")
+        rows = self.rows()
+        idx = chat.index_rows(rows)
+        self.assertIsNone(chat.parent_of(rows[-1], idx))
+        self.assertEqual(chat.quote_of(rows[-1], idx),
+                         ("old", "(parent rotated out)"))
+        self.assertEqual(idx["replies"], {})
 
     def test_the_journal_keeps_the_thread(self):
         p = chat.post("parent", who="alice")
@@ -383,6 +458,14 @@ class ReplyCliTest(ReplyBase):
         rc, _out, err = self.cli("reply", "1")
         self.assertEqual(rc, 2)
         self.assertIn("usage: helm chat reply", err)
+
+    def test_reply_to_flag_requires_its_own_value(self):
+        for args in (("post", "hello", "--reply-to"),
+                     ("post", "hello", "--reply-to", "--dm", "codex")):
+            rc, _out, err = self.cli(*args)
+            self.assertEqual(rc, 2)
+            self.assertIn("--reply-to wants", err)
+        self.assertEqual(self.rows(), [])
 
     def test_reply_rides_the_room_flag(self):
         chat.post("team parent", room="team-z", who="alice")
@@ -466,6 +549,18 @@ class ReplyWakeTest(ReplyBase):
         row["reply_to"] = "totally-different"
         row["rfrom"] = "someone-else"
         self.assertTrue(seats.deliverable(row, "codex", "main"))
+
+    def test_deliver_any_end_to_end_stays_text_driven(self):
+        """Integration proof at the actual boundary hook: replying to a seat's
+        own row is silent, then the same threaded path wakes once its text
+        contains the exact mention."""
+        seats.join(session="s-codex", seat="codex", cwd="/tmp/reply-wake")
+        p = chat.post("codex parent", who="codex")
+        chat.post("quiet threaded answer", who="alice", reply_to=p["id"])
+        self.assertIsNone(seats.deliver_any(session="s-codex", seat="codex"))
+        chat.post("@codex threaded ping", who="alice", reply_to=p["id"])
+        line = seats.deliver_any(session="s-codex", seat="codex")
+        self.assertIn("@codex threaded ping", line)
 
 
 if __name__ == "__main__":

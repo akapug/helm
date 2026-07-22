@@ -2354,16 +2354,17 @@ let CHAT_ROOM = chatSlug(localStorage.getItem("helm.chatroom")) || "main";
 let CHAT_ROOMS_LAST = []; // last poll's rooms — instant sidebar repaint on switch
 
 /* ---- threading + the UX pass state (all reset by chatSwitch / a since=0 repaint) ----
-   CHAT_BY_ID is the client's only row store (the DOM stays the render): id ->
-   row AND "ts|from" -> row, the same two-identity resolve chat.parent_of does,
-   so a quote survives a parent that predates the row-id law. */
-let CHAT_BY_ID = {}, CHAT_REPLYN = {}, CHAT_KIDS = {}, CHAT_REPLY_TO = null;
+   CHAT_BY_ID maps stable ids; CHAT_BY_KEY retains EVERY ts|from twin so a
+   pre-id reply can require an exact (ts, from, text) match instead of silently
+   quoting whichever sibling happened to index first. */
+let CHAT_BY_ID = {}, CHAT_BY_KEY = {}, CHAT_REPLYN = {}, CHAT_KIDS = {}, CHAT_REPLY_TO = null;
 let CHAT_ROSTER = [], CHAT_PRESENCE = {};   // @mention completion + seat ages
 let CHAT_DIVIDED = false, CHAT_AWAY = 0;    // the unread divider + jump button
 const CHAT_CLAMP_CHARS = 1200, CHAT_CLAMP_LINES = 14; // a ledger post must not bury the pane
 const CHAT_DIV_HTML = '<div id="chatdivider">new since you last looked</div>';
 
 function chatKey(m) { return (m.ts || "") + "|" + (m.from || ""); }
+function chatThreadKey(m) { return m.id || chatKey(m) + "|" + encodeURIComponent(String(m.text || "")); }
 // own age formatter: the ledger's lago() is a const defined LATER in this file
 // and the first pollChat() fires before it initializes (TDZ) — never share it
 const chatAgo = s => !s && s !== 0 ? "" : s < 60 ? Math.max(0, Math.round(s)) + "s"
@@ -2376,21 +2377,22 @@ const chatSnip = s => { const one = String(s || "").replace(/\s+/g, " ").trim();
 // left still says '…platform-codex'; the full name rides the title tooltip
 const chatShort = s => String(s || "").length <= 15 ? String(s || "") : "…" + String(s).slice(-14);
 
-function chatIndex(m) {           // both identities point at the same row
+function chatIndex(m) {
   if (m.id) CHAT_BY_ID[m.id] = m;
-  const k = chatKey(m);
-  if (!CHAT_BY_ID[k]) CHAT_BY_ID[k] = m;   // first writer wins a ts|from collision
+  (CHAT_BY_KEY[chatKey(m)] = CHAT_BY_KEY[chatKey(m)] || []).push(m);
 }
 
-/* mirrors chat.parent_of EXACTLY: the id wins, and the (rts|rfrom) fallback
-   fires ONLY when there is no id to honor. A named parent that is gone is an
-   ORPHAN — never its ts|from twin (one seat posting twice inside a second
-   shares that key, and rotation can drop one of the pair), because quoting the
-   twin puts the wrong words under the reply. */
+/* mirrors chat.parent_of EXACTLY: a named id that is gone is an ORPHAN —
+   never its ts|from twin. A pre-id reply carries rtext and resolves only when
+   (ts, from, text) identifies exactly one surviving row; ambiguity is an
+   orphan, not permission to put the wrong words under a reply. */
 function chatParent(m) {
   if (m.react || !(m.reply_to || m.rts)) return null;
   if (m.reply_to) return CHAT_BY_ID[m.reply_to] || null;
-  return CHAT_BY_ID[(m.rts || "") + "|" + (m.rfrom || "")] || null;
+  if (!("rtext" in m)) return null;
+  const hits = (CHAT_BY_KEY[(m.rts || "") + "|" + (m.rfrom || "")] || [])
+    .filter(p => String(p.text || "") === String(m.rtext || ""));
+  return hits.length === 1 ? hits[0] : null;
 }
 
 /* the one-level quote (builders.dev style — never nested): author + snippet,
@@ -2402,15 +2404,14 @@ function chatQuote(m) {
   if (!p) return '<div class="cquote orphan" title="the message this replies to is no ' +
     'longer in the room (rotated out)">↳ <b>' + esc(m.rfrom || "?") +
     "</b> <span>— original rotated out</span></div>";
-  return '<div class="cquote" data-jump="' + esc(p.id || chatKey(p)) +
+  return '<div class="cquote" data-jump="' + esc(chatThreadKey(p)) +
     '" title="jump to the message this replies to">↳ <b>' + esc(String(p.from || "?")) +
     "</b> <span>" + esc(chatSnip(p.text)) + "</span></div>";
 }
 
 function chatFind(p) {
   const log = $("#chatlog");
-  return (p.id && log.querySelector('.chatmsg[data-id="' + CSS.escape(p.id) + '"]')) ||
-    log.querySelector('.chatmsg[data-key="' + CSS.escape(chatKey(p)) + '"]');
+  return log.querySelector('.chatmsg[data-thread="' + CSS.escape(chatThreadKey(p)) + '"]');
 }
 
 // a resolved reply bumps its parent's counter IN PLACE — the append-only poll
@@ -2418,9 +2419,9 @@ function chatFind(p) {
 function chatBumpReply(m) {
   const p = chatParent(m);
   if (!p) return;
-  const k = p.id || chatKey(p);
+  const k = chatThreadKey(p);
   CHAT_REPLYN[k] = (CHAT_REPLYN[k] | 0) + 1;
-  (CHAT_KIDS[k] = CHAT_KIDS[k] || []).push(m.id || chatKey(m));
+  (CHAT_KIDS[k] = CHAT_KIDS[k] || []).push(chatThreadKey(m));
   const el = chatFind(p), s = el && el.querySelector(".creplies");
   if (!s) return;
   s.textContent = "↩" + CHAT_REPLYN[k];
@@ -2432,15 +2433,14 @@ function chatBumpReply(m) {
 // re-render — the chronological log stays the log.
 function chatJumpTo(key) {
   const log = $("#chatlog");
-  const el = log.querySelector('.chatmsg[data-id="' + CSS.escape(key) + '"]') ||
-             log.querySelector('.chatmsg[data-key="' + CSS.escape(key) + '"]');
+  const el = log.querySelector('.chatmsg[data-thread="' + CSS.escape(key) + '"]');
   if (!el) { toast("that message is no longer in this room"); return; }
   el.scrollIntoView({block: "center"});
   el.classList.add("flash");
   setTimeout(() => el.classList.remove("flash"), 1200);
 }
 function chatJumpReplies(div) {
-  const kids = CHAT_KIDS[div.dataset.id || div.dataset.key] || [];
+  const kids = CHAT_KIDS[div.dataset.thread] || [];
   if (kids.length) chatJumpTo(kids[0]);
 }
 
@@ -2458,7 +2458,8 @@ function chatRow(m) {
   const long = txt.length > CHAT_CLAMP_CHARS || txt.split("\n").length > CHAT_CLAMP_LINES;
   chatIndex(m);
   return '<div class="chatmsg' + (owner ? " owner" : "") + '" data-key="' + esc(chatKey(m)) +
-    '" data-id="' + esc(m.id || "") + '" data-ts="' + esc(m.ts || "") + '" data-from="' + esc(who) +
+    '" data-thread="' + esc(chatThreadKey(m)) + '" data-id="' + esc(m.id || "") +
+    '" data-ts="' + esc(m.ts || "") + '" data-from="' + esc(who) +
     '">' + chatQuote(m) + '<span class="cwho">' + esc(who) +
     '</span><span class="cts">' + esc(String(m.ts || "").slice(11, 16)) + '</span>' + tick +
     '<span class="creplies"></span>' + rbar +
@@ -2541,7 +2542,7 @@ async function pollChat() {
 // divider together — one place, so a room switch and a rotation reset agree
 function chatResetLog() {
   $("#chatlog").innerHTML = "";
-  CHAT_REACTS = {}; CHAT_BY_ID = {}; CHAT_REPLYN = {}; CHAT_KIDS = {};
+  CHAT_REACTS = {}; CHAT_BY_ID = {}; CHAT_BY_KEY = {}; CHAT_REPLYN = {}; CHAT_KIDS = {};
   CHAT_DIVIDED = false; CHAT_AWAY = 0;
 }
 
@@ -2676,7 +2677,7 @@ async function sendReact(div, e) {
 function chatSetReply(div) {
   const id = div.dataset.id || "";
   if (!id) { toast("that message predates row ids — reply by posting normally"); return; }
-  const p = CHAT_BY_ID[id] || CHAT_BY_ID[div.dataset.key] || {};
+  const p = CHAT_BY_ID[id] || {};
   CHAT_REPLY_TO = id;
   const strip = $("#chatreply");
   strip.hidden = false;

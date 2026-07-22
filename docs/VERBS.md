@@ -1283,8 +1283,9 @@ emoji and react like anyone else in the room**.
 **Replies (one level, builders.dev style).** `helm chat reply <id|n> <text…>`
 (or `post … --reply-to <id|n>`) threads a message under a parent: the row
 gains `{reply_to, rts, rfrom}` — the parent's **stable row id** plus its
-`(ts, from)` pair, so a parent that predates the id law still resolves. The
-reference is a row id, an unambiguous id prefix, or a message ordinal (`-1` =
+`(ts, from)` pair. A parent that predates the id law also records `rtext`, so
+same-second twins resolve by exact `(ts, from, text)` rather than whichever
+row indexed first. The reference is a row id, an unambiguous id prefix, or a message ordinal (`-1` =
 latest). Rendering is **one level, never nested**: a reply shows a compact
 `↳author "quote"` of its parent, a parent shows `↩N`, and an orphan (the
 parent rotated out of the RAM room) renders as `(parent rotated out)` — in
@@ -1292,8 +1293,9 @@ parent rotated out of the RAM room) renders as `(parent rotated out)` — in
 clickable and `↩N` jumps to the first reply).
 
 Signed replies **bind the parent**: the payload is a distinct algorithm tag,
-`chat:reply:b2b:` over RS-joined `(parent id, parent ts, parent from, text)`
-— a separate tag, never an in-band prefix, because the text is
+`chat:reply:b2b:` over RS-joined, injectively escaped parent fields + text
+(a pre-id parent also binds `rtext`) — a separate tag, never an in-band
+prefix, because the text is
 attacker-chosen and an in-band prefix would let a plain post mint a reply's
 digest (free re-parenting). Plain posts stay **byte-identical** to v2, so
 every signed row already on disk verifies unchanged. `helm chat verify`
@@ -1310,8 +1312,9 @@ payload to dodge the check is itself the tell.
 A reply names its parent by **row id**, so a parent that has rotated out is
 an orphan — never its `ts|from` twin. (One seat posting twice inside a second
 shares that key and rotation can split the pair; resolving the twin would
-quote words the author never wrote under the reply.) The `(rts, rfrom)`
-fallback fires only for a parent that never had an id at all.
+quote words the author never wrote under the reply.) A parent that never had
+an id resolves only through an exact `(rts, rfrom, rtext)` match; ambiguity or
+rotation renders an orphan rather than guessing.
 
 **Threading never changes who a message wakes.** `seats.deliverable()` reads
 text, `{dm}` and the room — never `reply_to` — so replying to a seat does

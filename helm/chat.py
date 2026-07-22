@@ -56,17 +56,19 @@ signs like any post.
 
 Replies (PRD CHAT_REPLY): a row may carry {reply_to} — the PARENT ROW'S
 STABLE ID (chat._append's id law, reused; no second identity is invented) —
-plus {rts, rfrom}, the parent's (ts, from), exactly the shape reaction rows
-already use so ONE resolver serves both and a parent predating the id law is
-still addressable. One level only, builders.dev style: a reply renders with a
-compact quote of its parent, a parent renders its reply count, and an orphan
-parent (rotated out) renders as such — never a crash. Threading is INVISIBLE
+plus {rts, rfrom}, the parent's (ts, from). A parent predating the id law also
+carries {rtext}: ts|from is not unique when one author posts twice inside a
+second, so exact text disambiguates without inventing an identity. One level
+only, builders.dev style: a reply renders with a compact quote of its parent,
+a parent renders its reply count, and an orphan parent (rotated out) renders
+as such — never a crash. Threading is INVISIBLE
 to the beacon: seats.deliverable never reads reply_to, so a reply wakes
 exactly what its text alone would have woken (a reply is not a mention).
 
 Signed replies bind the parent: the payload is a DISTINCT algorithm tag
-("chat:reply:b2b:") over \\x1e-joined (parent id, parent ts, parent from,
-text) — a separate tag, never an in-band prefix on the plain-post payload,
+("chat:reply:b2b:") over \\x1e-joined, injectively escaped parent fields +
+text (a pre-id parent includes rtext) — a separate tag, never an in-band
+prefix on the plain-post payload,
 because the text is attacker-chosen and an in-band prefix would let a plain
 post whose text reads `reply|<id>|hi` mint a reply's digest (a free
 re-parenting forgery). Plain posts stay BYTE-IDENTICAL to v2 — every row
@@ -241,21 +243,32 @@ def _b2b(s):
                            digest_size=32).hexdigest()
 
 
-def reply_digest(pid, pts, pfrom, text):
-    """chat:reply:b2b:<blake2b-256 of RS-joined (parent id, parent ts, parent
-    from, text)> — the signed claim of a REPLY: "this author, at this chain
-    index, asserts this text is a child of that exact row".
+def _reply_field(value):
+    """An injective field encoding that leaves ordinary payloads byte-for-byte
+    unchanged. RS is the tuple separator, so a literal RS inside an
+    attacker-controlled author/text must be escaped; backslash is escaped
+    first so the encoding itself cannot collide."""
+    return str(value or "").replace("\\", "\\\\").replace(FIELD_SEP, "\\x1e")
+
+
+def reply_digest(pid, pts, pfrom, text, parent_text=None):
+    """chat:reply:b2b:<blake2b-256 of RS-joined parent fields + text> — the
+    signed claim of a REPLY: "this author, at this chain index, asserts this
+    text is a child of that exact row".
 
     Why a distinct TAG and not a prefix inside the plain-post payload: the
     text is attacker-chosen, so an in-band `reply|<id>|…` prefix on the SAME
     tag would let an ordinary post whose text reads like that prefix produce
     a reply's digest — free re-parenting. Disjoint tags make the two payload
     spaces disjoint by construction (the `<alg>:<hash>` pattern premise.py
-    and ATTESTATION.md already canonize). The RS separator stops field
-    sliding, and BOTH parent identities ride it (the id, and the (ts, from)
-    pair) so the binding survives a parent that predates the id law."""
-    return REPLY_TAG + _b2b(FIELD_SEP.join([pid or "", pts or "", pfrom or "",
-                                            text or ""]))
+    and ATTESTATION.md already canonize). RS separates injectively-escaped
+    fields. A pre-id parent additionally binds its text: (ts, from) alone is
+    not an identity when one author posts twice inside a second."""
+    fields = [pid, pts, pfrom]
+    if parent_text is not None:
+        fields.append(parent_text)
+    fields.append(text)
+    return REPLY_TAG + _b2b(FIELD_SEP.join(map(_reply_field, fields)))
 
 
 def _react_payload(row):
@@ -289,7 +302,8 @@ def payload_for(row, text=None):
     body = row.get("text") if text is None else text
     if is_reply(row):
         return reply_digest(row.get("reply_to"), row.get("rts"),
-                            row.get("rfrom"), body)
+                            row.get("rfrom"), body,
+                            row.get("rtext") if "rtext" in row else None)
     return digest_payload(body)
 
 
@@ -531,16 +545,22 @@ def resolve_ref(rows, ref):
 
 
 def _parent_fields(room, ref):
-    """{reply_to, rts, rfrom} for a parent reference — the ONE place a ref
-    becomes a row-shaped pointer. An unresolvable ref (already rotated out,
-    or a typo) still records the literal ref: the reply lands, renders as an
-    orphan, and nothing crashes (fallback law — drop the LINK, never the
-    message)."""
+    """Parent fields for one reference — the ONE place a ref becomes a
+    row-shaped pointer. An unresolvable ref (already rotated out, or a typo)
+    still records the literal ref: the reply lands, renders as an orphan, and
+    nothing crashes (fallback law — drop the LINK, never the message).
+
+    Rows predating stable ids also carry `rtext`. Their (ts, from) pair is not
+    unique when one author posts twice inside a second; the exact parent text
+    disambiguates the surviving rows and rides the signed digest."""
     p = resolve_ref(read(room)[0], ref)
     if not p:
         return {"reply_to": str(ref)}
-    return {"reply_to": p.get("id") or "", "rts": p.get("ts") or "",
-            "rfrom": p.get("from") or ""}
+    out = {"reply_to": p.get("id") or "", "rts": p.get("ts") or "",
+           "rfrom": p.get("from") or ""}
+    if not p.get("id"):
+        out["rtext"] = p.get("text") or ""
+    return out
 
 
 def post(text, room="main", who=None, profile=None, sign=None, origin=None,
@@ -572,7 +592,8 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
 
     `reply_to` is a parent REFERENCE (row id, id prefix, or ordinal) resolved
     against the room the row lands in: the row gains {reply_to, rts, rfrom}
-    and, when signed, a parent-bound digest. It changes NOTHING about who the
+    (plus rtext for a pre-id parent) and, when signed, a parent-bound digest.
+    It changes NOTHING about who the
     message wakes — seats.deliverable never reads it, so a reply reaches
     exactly what its text alone would have reached."""
     _ensure_dir()
@@ -738,24 +759,25 @@ def react_line(counts):
 # ---------------------------------------------------------------------------
 
 def tkey(m):
-    """A row's THREAD key: its stable id when it has one, else rkey. Never
-    rkey alone — two rows from one seat inside the same second share a ts|from,
-    so an rkey-keyed reply count leaks onto the sibling row (caught on the
-    first smoke run). Reaction targeting keeps rkey; threading is id-first."""
-    return m.get("id") or rkey(m)
+    """A row's THREAD key: its stable id, else exact (ts, from, text). Never
+    rkey alone — two pre-id rows from one seat inside the same second share a
+    ts|from, so an rkey-keyed reply count leaks onto the sibling even when the
+    parent resolver chose correctly. Reaction targeting keeps rkey."""
+    return m.get("id") or FIELD_SEP.join((rkey(m), _reply_field(m.get("text"))))
 
 
 def index_rows(rows):
-    """{"by_id", "by_key", "replies"} for a room's rows. `replies` counts
-    RESOLVED children per parent tkey — an orphan reply is never counted
-    against a row that isn't there."""
+    """{"by_id", "by_key", "replies"} for a room's rows. `by_key` retains
+    EVERY ts|from twin; first-writer-wins would make a pre-id reply quote the
+    wrong sibling. `replies` counts resolved children per parent tkey — an
+    orphan reply is never counted against a row that isn't there."""
     idx = {"by_id": {}, "by_key": {}, "replies": {}}
     for m in rows:
         if m.get("react"):
             continue
         if m.get("id"):
             idx["by_id"][m["id"]] = m
-        idx["by_key"].setdefault(rkey(m), m)   # first writer wins the collision
+        idx["by_key"].setdefault(rkey(m), []).append(m)
     for m in rows:
         p = parent_of(m, idx)
         if p is not None:
@@ -766,26 +788,27 @@ def index_rows(rows):
 
 def parent_of(m, idx):
     """The row `m` replies to, or None (never posted here / rotated out). The
-    stable id wins; (rts, rfrom) is the fallback that reaches a parent from
-    BEFORE the id law — the same two-identity resolve reactions already do.
+    stable id wins. A pre-id parent resolves only when its remembered
+    (ts, from, text) identifies exactly one surviving row.
 
-    The fallback fires ONLY when there is no id to honor. A non-empty
-    reply_to NAMES one row (_parent_fields records "" exactly when the parent
-    had no id), so if that row is gone the parent is gone: resolving its
-    ts|from TWIN instead would quote a DIFFERENT message under the reply and
-    hang a phantom ↩N on an innocent row. That twin is real — one seat posting
-    twice inside a second shares ts|from, and rotation drops the oldest half,
-    which can split exactly such a pair (found adversarially 2026-07-22;
-    bug-class orphan-resolves-to-same-second-twin)."""
+    A non-empty reply_to NAMES one row, so if that row is gone the parent is
+    gone: resolving its ts|from TWIN instead would quote a DIFFERENT message
+    under the reply and hang a phantom ↩N on an innocent row. The same rule
+    applies to pre-id rows: (ts, from) alone is ambiguous even before rotation,
+    and after rotation cannot prove which twin disappeared. New pre-id replies
+    therefore record `rtext`; a malformed/older pointer without it stays an
+    orphan rather than guessing (bug-class orphan-resolves-to-same-second-twin)."""
     if not is_reply(m):
         return None
     pid = m.get("reply_to")
     if pid:
         return idx["by_id"].get(pid)
-    if m.get("rts"):
-        return idx["by_key"].get("%s|%s" % (m.get("rts") or "",
-                                            m.get("rfrom") or ""))
-    return None
+    if not m.get("rts") or "rtext" not in m:
+        return None
+    rows = idx["by_key"].get("%s|%s" % (m.get("rts") or "",
+                                        m.get("rfrom") or ""), [])
+    hits = [p for p in rows if (p.get("text") or "") == m.get("rtext")]
+    return hits[0] if len(hits) == 1 else None
 
 
 def _snip(text, cap=QUOTE_CHARS):
@@ -1076,6 +1099,13 @@ def cmd_chat(args):
             room_source=room_source)
     if verb in ("post", "reply"):
         seat = _seat_flag(args)
+        if "--reply-to" in args:
+            i = args.index("--reply-to")
+            if i + 1 >= len(args) or not args[i + 1] \
+                    or args[i + 1].startswith("--"):
+                print("helm chat: --reply-to wants a parent id or number",
+                      file=sys.stderr)
+                return 2
         ref = _pop_flag(args, "--reply-to")
         if verb == "reply":
             # `reply <ref> <text...>` — the ref is positional, everything else
