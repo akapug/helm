@@ -1026,28 +1026,50 @@ class GuardFreshnessTest(CredBase):
     def test_the_guard_rides_the_turn_boundary_as_well_as_session_start(self):
         events = {s["event"] for s in cred.GUARD_SPECS}
         self.assertEqual(events, {"SessionStart", "Stop"})
-        self.assertEqual(len({s["name"] for s in cred.GUARD_SPECS}), 2)
+        self.assertEqual(len({s["name"] for s in cred.GUARD_SPECS}), 4)
         for s in cred.GUARD_SPECS:                    # hooks.py spec contract
-            self.assertEqual(s["args"], "cred backup --apply --quiet")
+            self.assertIn(s["args"], ("cred backup --apply --quiet",
+                                      "cred heal --apply --quiet"))
             self.assertIn("timeout", s)
-        self.assertIsNone(dict(  # Stop takes no matcher (hooks.SPECS' law)
-            (s["event"], s["matcher"]) for s in cred.GUARD_SPECS)["Stop"])
+            # Stop takes no matcher (hooks.SPECS' law); SessionStart takes *
+            self.assertEqual(s["matcher"], {"Stop": None}.get(s["event"], "*"))
+        for verb in ("backup", "heal"):               # each leg rides BOTH events
+            self.assertEqual({s["event"] for s in cred.GUARD_SPECS
+                              if verb in s["args"]}, {"SessionStart", "Stop"})
 
-    def test_install_writes_both_events_into_every_home(self):
+    def test_backup_precedes_heal_structurally(self):
+        """backup-before-heal is BY CONSTRUCTION: every backup spec sorts
+        before every heal spec, so _merge_event's append order puts the
+        snapshot hook ahead of the heal hook in each event's list."""
+        idx = {v: [i for i, s in enumerate(cred.GUARD_SPECS) if v in s["args"]]
+               for v in ("backup", "heal")}
+        self.assertTrue(idx["backup"] and idx["heal"])
+        self.assertLess(max(idx["backup"]), min(idx["heal"]))
+        self.assertEqual(cred.GUARD_SPECS, cred._BACKUP_GUARDS + cred._HEAL_GUARDS)
+
+    def install_estate(self, d):
         from helm import configs
-        d = self.plant("david-example-invalid", "owner@example.invalid")
         orig = (configs.HOME_ROOTS, configs.BACKUP_DIR)
         configs.HOME_ROOTS = [d]                      # the fake estate's gate
         configs.BACKUP_DIR = os.path.join(self.tmp, "config-backups")
         self.addCleanup(lambda: setattr(configs, "HOME_ROOTS", orig[0]))
         self.addCleanup(lambda: setattr(configs, "BACKUP_DIR", orig[1]))
-        rc, out, err = self.out(cred.cmd_cred, ["switch-guard", "--install", "--apply"])
+        return self.out(cred.cmd_cred, ["switch-guard", "--install", "--apply"])
+
+    def test_install_writes_both_events_into_every_home(self):
+        d = self.plant("david-example-invalid", "owner@example.invalid")
+        rc, out, err = self.install_estate(d)
         self.assertEqual(rc, 0, err)
         sp = os.path.join(homes.ROOTS["claude"], "david-example-invalid", "settings.json")
         cfg = json.load(open(sp))
         for event in ("SessionStart", "Stop"):
             cmds = [h["command"] for g in cfg["hooks"][event] for h in g["hooks"]]
-            self.assertTrue(any("cred backup --apply --quiet" in c for c in cmds), event)
+            for verb in ("cred backup --apply --quiet", "cred heal --apply --quiet"):
+                self.assertTrue(any(verb in c for c in cmds), (event, verb))
+            # ordering survives into the settings file itself
+            self.assertLess(next(i for i, c in enumerate(cmds) if "cred backup" in c),
+                            next(i for i, c in enumerate(cmds) if "cred heal" in c),
+                            event)
         # idempotent
         rc, out, _ = self.out(cred.cmd_cred, ["switch-guard", "--install", "--apply"])
         self.assertEqual(json.load(open(sp)), cfg)
@@ -1081,6 +1103,60 @@ class GuardFreshnessTest(CredBase):
         plan = cred.heal()["plans"][0]
         self.assertFalse(plan["stale_pre_image"])
         self.assertNotIn("WARNING", plan["reason"])
+
+
+class GuardHealTest(CredBase):
+    """The guard's heal leg, run exactly as the installed hook runs it
+    (`cred heal --apply --quiet`) — the cto-example incident's replay: a home whose
+    credential was overwritten while a snapshot of the rightful account
+    exists."""
+
+    def incident(self):
+        """cto-example-com held cto@example.invalid, the guard's backup leg snapshotted it,
+        then a /login overwrote the home with owner@example.invalid."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        cred.backup(cto, apply=True)
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        return cto
+
+    def test_guard_command_restores_a_holder_free_home_silently(self):
+        d = self.incident()
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))
+        self.assertEqual(cred.account_of(d)["email"], "cto@example.invalid")
+        creds = json.load(open(os.path.join(d, ".credentials.json")))
+        self.assertEqual(creds["claudeAiOauth"]["refreshToken"], "FAKE-CTO")
+
+    def test_guard_command_never_evicts_a_live_borrower(self):
+        d = self.incident()
+        before = open(os.path.join(d, ".credentials.json"), "rb").read()
+        with mock.patch.object(cred, "holders_of",
+                               lambda p, default=False: [(4242, "claude")]):
+            rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((out, err), ("", ""))   # silent even on refusal
+        self.assertEqual(rc, 1)                  # honest exit; the hook's || true absorbs it
+        self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(),
+                         before)
+        self.assertEqual(cred.account_of(d)["email"], "owner@example.invalid")
+
+    def test_guard_heal_snapshots_the_overwritten_credential_before_restore(self):
+        """Nothing is ever lost in either direction: the occupant heal evicts
+        is itself snapshotted BEFORE the restore commits."""
+        d = self.incident()
+        self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        david = cred.snapshots("owner@example.invalid")
+        self.assertEqual(len(david), 1)
+        blob = json.load(open(os.path.join(david[-1]["path"], "credentials.json")))
+        self.assertEqual(blob["claudeAiOauth"]["refreshToken"], "FAKE-DAVID")
+        self.assertEqual(cred.account_of(d)["email"], "cto@example.invalid")
+
+    def test_quiet_no_op_prints_nothing_and_exits_zero(self):
+        """Hook law: silence on no-op — a clean estate injects zero context."""
+        self.plant("david-example-invalid", "owner@example.invalid")
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))
 
 
 class SecrecyTest(CredBase):

@@ -25,7 +25,9 @@ We do not fight the write. We make it NON-DESTRUCTIVE, TRUTHFUL, REVERSIBLE:
     drifted home from its newest snapshot. DRY-RUN BY DEFAULT, it backs the
     current occupant up first (so the undo is itself undoable), and it REFUSES
     while any live process holds that config dir — a live session is never
-    evicted, never raced.
+    evicted, never raced. The installed guard runs `heal --apply --quiet` at
+    every turn boundary AFTER its backup leg, so a polluted holder-free home
+    SELF-restores at the first fleet turn boundary after the borrower frees it.
 
 LAWS (violating these is how accounts get bricked):
   * SECRETS NEVER SURFACE. Credential bytes are read, copied and compared —
@@ -71,7 +73,7 @@ PROC_ROOT = "/proc"                 # module-level so tests can use a fixture tr
 # (Stop, like hooks.SPECS' stop-guard), where an identical snapshot costs two
 # file reads and a compare, and the pre-image is never more than one turn
 # behind the token the next `/login` is about to destroy.
-GUARD_SPECS = (
+_BACKUP_GUARDS = (
     {"name": "cred-guard", "event": "SessionStart",
      "args": "cred backup --apply --quiet", "timeout": 5,
      "own": ("cred backup --apply --quiet", "helm cred backup"), "matcher": "*"},
@@ -79,6 +81,28 @@ GUARD_SPECS = (
      "args": "cred backup --apply --quiet", "timeout": 5,
      "own": ("cred backup --apply --quiet", "helm cred backup"), "matcher": None},
 )
+# The HEAL leg: the guard doesn't just make the incident reversible, it
+# REVERSES it — every turn boundary (and session start; heal_plan is a
+# handful of file reads when nothing drifted) runs `heal --apply --quiet`,
+# which only ever touches a DRIFTED home no live process holds. So a live
+# borrowing session is never evicted, and the polluted home self-restores at
+# the first fleet turn boundary after the borrower frees it.
+_HEAL_GUARDS = (
+    {"name": "cred-heal", "event": "SessionStart",
+     "args": "cred heal --apply --quiet", "timeout": 10,
+     "own": ("cred heal --apply --quiet", "helm cred heal"), "matcher": "*"},
+    {"name": "cred-heal-turn", "event": "Stop",
+     "args": "cred heal --apply --quiet", "timeout": 10,
+     "own": ("cred heal --apply --quiet", "helm cred heal"), "matcher": None},
+)
+# Backup strictly before heal, BY CONSTRUCTION: hooks._merge_event appends
+# entries in spec order, so within each event the snapshot hook precedes the
+# heal hook in every settings.json this tuple installs. And the ordering is
+# belt-and-braces, not load-bearing alone: heal itself refuses to evict an
+# occupant it could not snapshot first (the no-preimage refusal), so
+# backup-before-heal survives even a harness that runs same-event hooks
+# concurrently.
+GUARD_SPECS = _BACKUP_GUARDS + _HEAL_GUARDS
 GUARD_SPEC = GUARD_SPECS[0]      # the name the SessionStart-only callers know
 
 
@@ -1200,7 +1224,8 @@ def _print_switch_guard(args):
             if action == "fail":
                 print("    hook install failed", file=sys.stderr)
                 worst = 1
-        print("helm cred switch-guard (%s): SessionStart + Stop guard %s in %d home%s"
+        print("helm cred switch-guard (%s): SessionStart + Stop backup+heal "
+              "guard %s in %d home%s"
               % ("APPLIED" if apply else "dry-run — add --apply",
                  "installed" if apply else "would be installed",
                  len(targets), "s"[:len(targets) != 1]))
@@ -1233,13 +1258,21 @@ def _print_switch_guard(args):
 
 
 def _print_heal(args):
+    quiet = "--quiet" in args
     apply = "--apply" in args
     as_json = "--json" in args
-    rest = [a for a in args if a not in ("--apply", "--json")]
+    rest = [a for a in args if a not in ("--apply", "--json", "--quiet")]
     if len(rest) > 1 or any(a.startswith("-") for a in rest):
-        print("helm cred heal: invalid arguments", file=sys.stderr)
+        if not quiet:
+            print("helm cred heal: invalid arguments", file=sys.stderr)
         return 2
     res = heal(rest[0] if rest else None, apply=apply)
+    if quiet:
+        # hook mode: stdout would land in the session's context — total
+        # silence either way; the exit code alone says whether every plan
+        # (if any) reached restored.
+        return 1 if apply and any(p["status"] != "restored"
+                                  for p in res["plans"]) else 0
     if as_json:
         print(json.dumps(_public_paths(res), indent=2))
         return 0
@@ -1260,7 +1293,7 @@ def _print_heal(args):
 
 
 def cmd_cred(args):
-    """cred [list|backup [--all] [--apply]|switch-guard [--install] [--apply]|heal [--apply]]"""
+    """cred [list|backup [--all] [--apply]|switch-guard [--install] [--apply]|heal [--apply] [--quiet]]"""
     args = list(args)
     verb = args[0] if args and not args[0].startswith("-") else "list"
     rest = args[1:] if args and not args[0].startswith("-") else args
