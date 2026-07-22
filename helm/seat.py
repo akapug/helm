@@ -1264,6 +1264,18 @@ def _multi_from_launch(path):
         return False
 
 
+def _multi_from_launch(path):
+    """Recover the seat's mixed-model shape from launch.sh. --multi's durable
+    marker is the ABSENCE of the blunt CLAUDE_CODE_SUBAGENT_MODEL pin; every
+    single-model launch assigns it. Missing/unreadable assets default safely to
+    the normal pinned shape."""
+    try:
+        with open(path) as f:
+            return "CLAUDE_CODE_SUBAGENT_MODEL=" not in f.read()
+    except OSError:
+        return False
+
+
 def _resume(seat_name, rest):
     """seat resume <seat> — relaunch the seat's pane at its drain point via
     the detected metaharness: the pane runs the seat's freshly re-minted
