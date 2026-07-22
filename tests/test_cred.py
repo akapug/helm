@@ -693,6 +693,116 @@ class HealTest(CredBase):
         finally:
             self._holders.start()
 
+    def foreign(self, pid):
+        """Patch the uid seam so `pid` reads as another user's process, and
+        deny every read under its /proc dir — the kernel's behavior for a
+        foreign environ. create=True so the patch also applies to code that
+        lacks the seam (the stash-verified pre-fix behavior)."""
+        marker = os.sep + str(pid)
+        me = os.geteuid()
+        uidp = mock.patch.object(
+            cred, "_proc_uid", create=True,
+            new=lambda pdir: me + 1 if pdir.endswith(marker) else me)
+        real_open = open
+
+        def denied(path, *a, **kw):
+            if marker + os.sep in str(path):
+                raise PermissionError("synthetic foreign-uid environ")
+            return real_open(path, *a, **kw)
+
+        openp = mock.patch("builtins.open", side_effect=denied)
+        return uidp, openp
+
+    def test_foreign_uid_unreadable_pids_do_not_poison_the_scan(self):
+        """The live-probed bug: on any real host, other users' pids raise
+        EACCES on environ, and ONE such pid turned the whole scan into
+        uncertainty — heal was a permanent no-op. A holder of our 0600
+        credentials is necessarily our uid; foreign pids are structurally
+        not holders, never uncertainty."""
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, _ = self.fake_proc(4242, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            self.fake_proc(5555, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            uidp, openp = self.foreign(5555)
+            with mock.patch.object(cred, "PROC_ROOT", root), uidp, openp:
+                self.assertEqual(cred.holders_of(d), [(4242, "claude")])
+        finally:
+            self._holders.start()
+
+    def test_same_uid_read_error_is_still_uncertainty(self):
+        """Scoping to our uid must not soften the fail-closed core: a SAME-UID
+        pid whose environ cannot be read while the pid persists stays None."""
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, p = self.fake_proc(4242, b"")
+            real_open = open
+
+            def denied(path, *a, **kw):
+                if str(path).endswith(os.path.join(str(4242), "environ")):
+                    raise PermissionError("synthetic")
+                return real_open(path, *a, **kw)
+
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    mock.patch("builtins.open", side_effect=denied):
+                self.assertIsNone(cred.holders_of(d))
+        finally:
+            self._holders.start()
+
+    def test_pid_vanishing_mid_scan_is_absence_not_uncertainty(self):
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, _ = self.fake_proc(4242, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            _, p9 = self.fake_proc(9999, b"")
+            real_open = open
+
+            def vanishing(path, *a, **kw):
+                if (os.sep + "9999" + os.sep) in str(path):
+                    shutil.rmtree(p9, ignore_errors=True)
+                    raise FileNotFoundError(path)
+                return real_open(path, *a, **kw)
+
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    mock.patch("builtins.open", side_effect=vanishing):
+                self.assertEqual(cred.holders_of(d), [(4242, "claude")])
+        finally:
+            self._holders.start()
+
+    def test_heal_dry_run_reaches_ready_through_the_real_probe(self):
+        """End-to-end pin of the bug: a free drifted home with a snapshot must
+        plan `ready` even though the process table holds foreign-uid pids —
+        before the fix this was cannot-probe on every real multi-user host."""
+        self._holders.stop()
+        try:
+            d = self.drifted()
+            root, _ = self.fake_proc(5555, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            uidp, openp = self.foreign(5555)
+            with mock.patch.object(cred, "PROC_ROOT", root), uidp, openp:
+                res = cred.heal()
+            plan = res["plans"][0]
+            self.assertEqual(plan["status"], "ready", plan)
+            self.assertEqual(plan["holders"], [])
+        finally:
+            self._holders.start()
+
+    def test_cannot_probe_reason_matches_the_actual_platform(self):
+        """`no /proc` was reported even where /proc was right there. The two
+        distinct uncertainties get two distinct reasons."""
+        self.drifted()
+        with mock.patch.object(cred, "holders_of", lambda p, default=False: None):
+            with mock.patch.object(cred, "PROC_ROOT",
+                                   os.path.join(self.tmp, "no-such-proc")):
+                plan = cred.heal()["plans"][0]
+                self.assertEqual(plan["status"], "cannot-probe")
+                self.assertIn("no /proc on this platform", plan["reason"])
+            with mock.patch.object(cred, "PROC_ROOT", self.tmp):
+                plan = cred.heal()["plans"][0]
+                self.assertEqual(plan["status"], "cannot-probe")
+                self.assertIn("same-uid", plan["reason"])
+                self.assertNotIn("no /proc", plan["reason"])
+
 
 class DoctorTest(CredBase):
     def test_drift_row_names_the_account_and_the_verb(self):

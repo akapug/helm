@@ -727,18 +727,37 @@ def _proc_start(pid_dir):
         return int(fh.read().rsplit(")", 1)[1].split()[19])
 
 
+def _proc_uid(pid_dir):
+    """The uid /proc itself reports for this pid (seam for tests)."""
+    return os.stat(pid_dir).st_uid
+
+
+def _unprovable_note():
+    """cannot-probe, precisely: the platform has no /proc at all, or a
+    SAME-UID process defeated the scan. The old single string blamed a
+    missing /proc even on hosts where /proc was right there."""
+    if not os.path.isdir(PROC_ROOT):
+        return "no /proc on this platform — cannot prove the home is free"
+    return ("a same-uid process could not be proven free "
+            "(per-pid read failed while the pid persisted)")
+
+
 def holders_of(path, default=False):
     """[(pid, comm)] every live process pinned to this config dir (our own pid
     excluded). None means uncertainty, and every caller MUST refuse.
 
-    Each pid is bracketed by its starttime so PID reuse cannot mix one
-    process's environ with another's comm. A process that vanishes mid-scan is
-    skipped; every permission/read error while the pid remains is uncertainty,
-    never evidence of absence."""
+    A holder of a claude config dir necessarily runs as OUR uid — it reads
+    this home's 0600 credentials — so foreign-uid pids are structurally not
+    holders, and their kernel-unreadable environs never poison the scan
+    (before this scoping, ANY multi-user host made every scan return None).
+    Each same-uid pid is bracketed by its starttime so PID reuse cannot mix
+    one process's environ with another's comm. A process that vanishes
+    mid-scan is absence; a SAME-UID read error while the pid remains is
+    uncertainty, never evidence of absence."""
     if not os.path.isdir(PROC_ROOT):
         return None
     real = os.path.realpath(path)
-    me = os.getpid()
+    me, uid = os.getpid(), os.geteuid()
     out = []
     try:
         entries = list(os.scandir(PROC_ROOT))
@@ -749,12 +768,14 @@ def holders_of(path, default=False):
             continue
         pid, pdir = int(entry.name), entry.path
         try:
+            if _proc_uid(pdir) != uid:
+                continue
             start = _proc_start(pdir)
             with open(os.path.join(pdir, "environ"), "rb") as fh:
                 env = fh.read()
             with open(os.path.join(pdir, "comm")) as fh:
                 comm = fh.read().strip()
-            if _proc_start(pdir) != start:
+            if _proc_start(pdir) != start or _proc_uid(pdir) != uid:
                 return None
         except (OSError, ValueError, IndexError):
             if not os.path.exists(pdir):
@@ -825,7 +846,7 @@ def heal_plan(name=None):
                 "holders": holders or []}
         if holders is None:
             plan["status"], plan["reason"] = "cannot-probe", (
-                "no /proc — cannot prove the home is free; refusing to touch it")
+                _unprovable_note() + " — refusing to touch it")
         elif holders:
             plan["status"], plan["reason"] = "held", (
                 "held by %s — a live session is never evicted" % _held_note(holders))
@@ -884,7 +905,7 @@ def heal(name=None, apply=False):
             plan["status"] = "held" if holders else "cannot-probe"
             plan["reason"] = ("held by %s (arrived mid-heal) — refused"
                               % _held_note(holders)) if holders else \
-                             "no /proc — refusing"
+                             _unprovable_note() + " — refusing"
             continue
         pre = backup(plan["path"], apply=True)    # the evicted-now occupant, first
         if not pre["ok"]:
@@ -902,7 +923,7 @@ def heal(name=None, apply=False):
             plan["status"] = "held" if holders else "cannot-probe"
             plan["reason"] = ("held by %s (arrived during pre-image capture) — refused"
                               % _held_note(holders)) if holders else \
-                             "holder probe became uncertain — refusing"
+                             _unprovable_note() + " — refusing"
             continue
         res = restore(plan["restore_from"], plan["path"], require_free=True)
         if not res["ok"]:
