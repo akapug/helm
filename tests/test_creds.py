@@ -142,7 +142,7 @@ class SwapTest(unittest.TestCase):
                       out)
         self.assertIn(
             "    cd '/work/alpha' && env CLAUDE_CONFIG_DIR=/creds/h-fresh "
-            "claude --resume " + SID, out)
+            + ResumeCommandTest.UNSET + "claude --resume " + SID, out)
 
     def test_swap_alias_resolves_the_home(self):
         rc, out, _ = self.swap("dry")
@@ -157,7 +157,7 @@ class SwapTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn(
             "    cd '/work/claude stuff' && env CLAUDE_CONFIG_DIR=/creds/h-fresh "
-            "claude --resume " + SID, out)
+            + ResumeCommandTest.UNSET + "claude --resume " + SID, out)
         self.assertNotIn("cd '/work/env ", out)
 
     def test_swap_no_alternative(self):
@@ -190,22 +190,28 @@ class SwapTest(unittest.TestCase):
 
 class ResumeCommandTest(unittest.TestCase):
     """Pin sessions.resume_command's exact per-harness format — the string
-    cmd_swap's env-prefix injection depends on."""
+    cmd_swap's env-prefix injection depends on. The child-stamp unset run
+    (env -u …, child-stamp-kills-seat-persistence) precedes the harness
+    binary so a paste into a stamped shell can't resume as a subprocess
+    child (transcript persistence silently OFF)."""
+
+    UNSET = ("env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID "
+             "-u CLAUDE_CODE_BRIDGE_SESSION_ID ")
 
     def test_claude_format(self):
         self.assertEqual(
             sessions.resume_command({"h": "claude", "i": SID, "cwd": "/work/alpha"}),
-            "cd '/work/alpha' && claude --resume " + SID)
+            "cd '/work/alpha' && " + self.UNSET + "claude --resume " + SID)
 
     def test_codex_format(self):
         self.assertEqual(
             sessions.resume_command({"h": "codex", "i": SID, "cwd": "/work/beta"}),
-            "cd '/work/beta' && codex resume " + SID)
+            "cd '/work/beta' && " + self.UNSET + "codex resume " + SID)
 
     def test_missing_cwd_defaults_to_dot(self):
         self.assertEqual(
             sessions.resume_command({"h": "claude", "i": SID, "cwd": None}),
-            "cd '.' && claude --resume " + SID)
+            "cd '.' && " + self.UNSET + "claude --resume " + SID)
 
 
 if __name__ == "__main__":

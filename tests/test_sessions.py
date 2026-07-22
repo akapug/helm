@@ -129,6 +129,23 @@ class ResumeCommandTest(unittest.TestCase):
         cmd = sessions.resume_command(_row("uuid-3", h="claude", cwd=""))
         self.assertIn("'.'", cmd)
 
+    def test_paste_line_strips_child_stamp(self):
+        """child-stamp-kills-seat-persistence: a resume line pasted into a
+        stamped shell (CLAUDE_CODE_CHILD_SESSION + inherited SID/bridge id
+        from a daemon born inside a Claude session) must not resume the
+        session as a subprocess child — transcript persistence would be
+        silently OFF. The line unsets the trio before the harness binary."""
+        from helm import seat
+        for cmd in (sessions.resume_command(_row("u1", h="claude", cwd="/p")),
+                    sessions.resume_command(_row("u2", h="codex", cwd="/p"))):
+            for v in seat.CHILD_STAMP_VARS:
+                self.assertIn("-u " + v, cmd)
+                self.assertNotIn(v + "=", cmd)  # unset, never re-exported
+            # the unset rides the executed half, after the cd, before claude
+            self.assertLess(cmd.index("&&"), cmd.index("-u CLAUDE_CODE_CHILD_SESSION"))
+            self.assertLess(cmd.index("-u CLAUDE_CODE_CHILD_SESSION"),
+                            cmd.index("resume"))
+
 
 class ResumeWarningsTest(unittest.TestCase):
     def test_clean_session_has_no_warnings(self):

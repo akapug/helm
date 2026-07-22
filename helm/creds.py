@@ -134,9 +134,12 @@ def cmd_swap(args):
         if target_home:
             # inject the env prefix onto the HARNESS clause (the last " && "
             # clause), never a raw substring replace — a cwd containing
-            # "claude " must not be corrupted (test-pinned)
+            # "claude " must not be corrupted (test-pinned). The clause may
+            # carry an env-run prefix (child-stamp unsets) before the harness
+            # binary, so anchor on the binary token, not position 0.
             head, sep, tail = base.rpartition(" && ")
-            if sep and tail.startswith(provider + " "):
+            harness_at = tail.find(" " + provider + " ")
+            if sep and (tail.startswith(provider + " ") or harness_at > 0):
                 base = "%s && env %s=%s %s" % (head, env_var,
                                                target_home.get("path", "?"), tail)
         print("    " + base)

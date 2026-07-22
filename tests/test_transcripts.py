@@ -348,6 +348,25 @@ class TranscriptsTest(unittest.TestCase):
         self.assertTrue(text.startswith("helm prune:"))
         self.assertIn("will run: cv prune", text)
 
+    def test_native_cmd_strips_child_stamp(self):
+        """child-stamp-kills-seat-persistence: the fallback paste line a
+        stamped shell receives must not resume the session as a subprocess
+        child (transcript persistence silently OFF) — unset the trio."""
+        from helm import seat
+        row = {"i": "uuid-9", "h": "claude", "cwd": "/p"}
+        for cmd in (transcripts._native_cmd(row),
+                    transcripts._native_cmd(dict(row, h="codex"))):
+            for v in seat.CHILD_STAMP_VARS:
+                self.assertIn("-u " + v, cmd)
+                self.assertNotIn(v + "=", cmd)
+            self.assertTrue(cmd.startswith("env -u "))
+            self.assertLess(cmd.index("-u CLAUDE_CODE_CHILD_SESSION"),
+                            cmd.index("resume"))
+        # model flag survives the prefix composition
+        cmd = transcripts._native_cmd(row, model="opus")
+        self.assertIn("--model opus", cmd)
+        self.assertTrue(cmd.startswith("env -u "))
+
 
 if __name__ == "__main__":
     unittest.main()

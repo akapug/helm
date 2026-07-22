@@ -59,11 +59,17 @@ def rows_for(project=None, include_synthetic=False, limit=None):
 
 def resume_command(row):
     """The harness's own resume invocation. claude resume is cwd-scoped, so the
-    command carries the cd; codex resume is global-by-UUID (the cd is comfort)."""
+    command carries the cd; codex resume is global-by-UUID (the cd is comfort).
+    A paste-for-human command must be safe in a STAMPED shell: an inherited
+    CLAUDE_CODE_CHILD_SESSION/SID/bridge id would make the resumed session a
+    subprocess child with transcript persistence silently OFF
+    (child-stamp-kills-seat-persistence) — so the line unsets the trio first."""
+    from . import seat
+    unset = "env -u " + " -u ".join(seat.CHILD_STAMP_VARS) + " "
     cwd = os.path.expanduser(row.get("cwd") or "") or "."
     if row["h"] == "claude":
-        return "cd %r && claude --resume %s" % (cwd, row["i"])
-    return "cd %r && codex resume %s" % (cwd, row["i"])
+        return "cd %r && %sclaude --resume %s" % (cwd, unset, row["i"])
+    return "cd %r && %scodex resume %s" % (cwd, unset, row["i"])
 
 
 def resume_warnings(row):

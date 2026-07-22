@@ -527,11 +527,16 @@ def _native_cmd(row, model=None):
     """The harness's own resume invocation with no provider in the loop —
     helm degrades to a single-account tool instead of a broken one.
     The sid is shell-quoted: catalog ids derive from filenames, and a pasteable
-    command must stay a resume command whatever the filename looked like."""
+    command must stay a resume command whatever the filename looked like.
+    Pasted into a STAMPED shell, a bare claude/codex would resume as a
+    subprocess child (transcript persistence silently OFF —
+    child-stamp-kills-seat-persistence), so the line unsets the stamp trio."""
+    from . import seat
+    unset = "env -u " + " -u ".join(seat.CHILD_STAMP_VARS) + " "
     sid = shlex.quote(row["i"])
     if row["h"] == "claude":
-        return "claude" + (f" --model {shlex.quote(model)}" if model else "") + f" --resume {sid}"
-    return f"codex resume {sid}"
+        return unset + "claude" + (f" --model {shlex.quote(model)}" if model else "") + f" --resume {sid}"
+    return unset + f"codex resume {sid}"
 
 
 def make_cmd(account, sid, model=None):
