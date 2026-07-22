@@ -237,7 +237,14 @@ def main(argv=None):
     verb = argv[0]
     fn = VERBS.get(verb)
     if fn is None:
-        print("helm: unknown verb '%s' (helm --help)" % verb, file=sys.stderr)
+        # Honest even under --help: an unknown verb NEVER falls through to the
+        # global usage with exit 0 — that false positive taught the fleet to
+        # distrust `helm <verb> --help` as an existence probe.
+        import difflib
+        near = difflib.get_close_matches(verb, VERBS, n=1)
+        hint = (" — did you mean '%s'?" % near[0]) if near else ""
+        print("helm: unknown verb '%s'%s (helm --help)" % (verb, hint),
+              file=sys.stderr)
         return 2
     rest = argv[1:]
     if rest and rest[0] in ("-h", "--help"):

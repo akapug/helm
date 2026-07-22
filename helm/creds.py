@@ -61,6 +61,11 @@ def cmd_creds(args):
     if args and args[0] == "crosscheck":
         from . import localscan
         return localscan.cmd_crosscheck(args[1:])
+    if args:
+        import sys
+        print("helm creds: unknown verb '%s' (creds [crosscheck])" % args[0],
+              file=sys.stderr)
+        return 2
     try:
         rows = _rows()
     except ProviderError as e:

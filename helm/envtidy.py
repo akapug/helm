@@ -882,9 +882,20 @@ def cmd_tidy(args):
     gc, all dry-run by default. One consolidated 'here is everything that would
     change' report; --apply runs them all backup-first."""
     args = list(args or [])
-    from . import seats
-    apply = "--apply" in args
-    r = tidy(root=seats._flag(args, "--repo"), apply=apply)
+    root, apply, i = None, False, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--apply":
+            apply = True
+        elif a == "--repo" and i + 1 < len(args):
+            root = args[i + 1]
+            i += 1
+        else:
+            print("helm tidy: unknown arg '%s' (tidy [--apply] [--repo PATH])"
+                  % a, file=sys.stderr)
+            return 2
+        i += 1
+    r = tidy(root=root, apply=apply)
     mode = "APPLY" if apply else "DRY-RUN — here is everything that would change"
     print("=" * 72)
     print("helm tidy [%s]" % mode)

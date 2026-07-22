@@ -144,6 +144,14 @@ def cmd_watchdog(args):
     if "--help" in args or "-h" in args:
         print(_USAGE)
         return 0
+    junk = [a for a in args if a not in ("--json", "--quiet")]
+    if junk:
+        # Refuse BEFORE check(): a typo'd arg must not run the side-effecting
+        # scan (chat alert) and exit 0 as if the arg existed.
+        import sys
+        print("helm watchdog: unknown arg '%s' (watchdog [--json] [--quiet])"
+              % junk[0], file=sys.stderr)
+        return 2
     res = check(post="--quiet" not in args)
     if "--json" in args:
         import json
