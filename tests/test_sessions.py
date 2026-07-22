@@ -486,3 +486,33 @@ class PreflightTest(unittest.TestCase):
             skip = sessions.resume_exec(_row("s", cwd="/w"), skip_permissions=True)
         self.assertNotIn("--dangerously-skip-permissions", plain)
         self.assertIn("--dangerously-skip-permissions", skip)
+
+
+class ResumeKickTest(unittest.TestCase):
+    """A resume restores the SESSION, not the momentum — the kick is the wire
+    that makes the restored agent move without anyone remembering to speak."""
+
+    def test_kick_sends_into_the_pane_with_enter(self):
+        ad = mock.Mock()
+        self.assertTrue(sessions.kick_resumed(ad, "term_x"))
+        args, kwargs = ad.send.call_args
+        self.assertEqual(args[0], "term_x")
+        self.assertIn("RESUMED via `helm sessions resume`", args[1])
+        self.assertIn("re-arm your inbox beacon", args[1])
+        self.assertTrue(kwargs.get("enter"))
+
+    def test_resumer_note_rides_the_kick(self):
+        ad = mock.Mock()
+        sessions.kick_resumed(ad, "t", note="repo is /x; continue console design")
+        self.assertIn("CONTEXT FROM THE RESUMER: repo is /x", ad.send.call_args[0][1])
+
+    def test_a_failed_kick_never_unwinds_the_resume(self):
+        ad = mock.Mock()
+        ad.send.side_effect = RuntimeError("pane still booting")
+        self.assertFalse(sessions.kick_resumed(ad, "t"))
+
+    def test_missing_work_instruction_is_honest_not_hopeful(self):
+        # the kick must pre-empt the failure mode measured live: a resumed agent
+        # confidently narrating context that was never persisted
+        self.assertIn("never persisted", sessions.RESUME_KICK)
+        self.assertIn("say so plainly", sessions.RESUME_KICK)

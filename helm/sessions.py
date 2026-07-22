@@ -446,6 +446,35 @@ def spawn_resume(row, title=None, home=None, skip_permissions=False):
         return path, ad.spawn(path, title=title), ad.name
 
 
+RESUME_KICK = (
+    "This session was RESUMED via `helm sessions resume` after its pane died. "
+    "Your transcript is intact through its last persisted turn — pick up exactly "
+    "where it leaves off. If any recent work is missing from the transcript, it "
+    "was never persisted (say so plainly rather than guessing at it). If you are "
+    "a fleet seat, re-arm your inbox beacon before anything else "
+    "(Monitor: helm chat wait --seat <your-seat> --follow).")
+
+
+def kick_resumed(ad, handle, note=None):
+    """Type the resume brief INTO the pane so the restored agent starts moving.
+
+    A resume restores the SESSION, not the momentum: the agent sits at a prompt
+    until someone speaks to it, and both live recoveries on 2026-07-22 needed a
+    human-typed brief before the seat did anything (the second one sat idle for
+    minutes as a mystery). A DM cannot close this gap — a freshly resumed
+    session has no beacon armed yet, and a seatless session has no DM lane at
+    all. Injection through the adapter is the only path that reaches every
+    resumed pane, so it rides the spawn instead of anyone's memory."""
+    text = RESUME_KICK + ((" CONTEXT FROM THE RESUMER: " + note) if note else "")
+    try:
+        ad.send(handle, text, enter=True)
+        return True
+    except Exception:
+        # the pane may still be booting claude; the resume itself succeeded and
+        # a failed kick must not unwind it — report, never raise
+        return False
+
+
 def resume_warnings(row):
     """Why THIS resume might not do what you expect — the catalog-level signals
     (make_cmd's provider-coupled preflight is the richer surface; this is the
@@ -485,7 +514,7 @@ def cmd_sessions(args):
     """sessions [<project>] [--limit N] [--all] | sessions resume <id-prefix>"""
     if args and args[0] == "resume":
         if len(args) < 2:
-            print("usage: helm sessions resume <session-id-prefix> [--go] [--title T]")
+            print("usage: helm sessions resume <session-id-prefix> [--go] [--title T] [--note TEXT]")
             return 2
         pref = args[1]
         rest = args[2:]
@@ -554,6 +583,12 @@ def cmd_sessions(args):
             print("  paste instead: " + resume_command(row, home=home), file=sys.stderr)
             return 1
         print("helm sessions: resumed %s via %s — pane %s" % (row["i"][:8], adapter, handle))
+        note = rest[rest.index("--note") + 1] if "--note" in rest else None
+        from . import harness as _h
+        kicked = kick_resumed(_h.detect(), handle, note=note)
+        print("  kick: %s" % ("delivered — the agent has its resume brief"
+                              if kicked else
+                              "FAILED — the pane is up but idle; speak to it or re-send by hand"))
         print("  cred: %s" % (home if is_pinnable(home)
                                 else "%s (default account — deliberately UNPINNED; "
                                      "pinning it opens the first-run wizard)" % (home or "unknown")))
