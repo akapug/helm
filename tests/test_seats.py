@@ -854,6 +854,41 @@ class RoomAllowlistTest(SeatsBase):
         self.assertIn("stranded-pending",
                       "\n".join(row["text"] for _room, row in pending))
 
+    def test_roster_observation_cannot_steal_delivery_scan_slots(self):
+        seats.join(session="s-victim", seat="victim", cwd="/tmp/p")
+        for i in range(seats.ROOM_SCAN_CAP * 2):
+            text = "@victim stranded" if i == 0 else "noise"
+            chat.post(text, who="bob", room="f%02d" % i)
+        row = next(r for r in seats.roster_report()["seats"]
+                   if r["seat"] == "victim")
+        self.assertEqual(row["pending"], 1)
+        got = seats.deliver_any(session="s-victim", seat="victim")
+        self.assertIn("stranded", got)
+
+    def test_roster_observation_cannot_steal_stop_scan_slots(self):
+        seats.join(session="s-gate", seat="gate", cwd="/tmp/p")
+        for i in range(seats.ROOM_SCAN_CAP * 2):
+            text = "@gate stranded" if i == 0 else "noise"
+            chat.post(text, who="bob", room="g%02d" % i)
+        seats.roster_report()
+        blocks, _warns = seats.stop_guard(session="s-gate", seat="gate")
+        self.assertTrue(blocks)
+        self.assertIn("stranded", "\n".join(blocks))
+
+    def test_overflow_identity_queue_survives_rooms_inserted_before_target(self):
+        seats.join(session="s-churn", seat="churn", cwd="/tmp/p")
+        for i in range(seats.ROOM_SCAN_CAP - 1):
+            chat.post("noise", who="bob", room="a%02d" % i)
+        chat.post("@churn stable-target", who="bob", room="z-target")
+        self.assertIsNone(seats.deliver_any(session="s-churn", seat="churn"))
+        got = []
+        for turn in range(4):
+            for i in range(seats.ROOM_SCAN_CAP - 1):
+                chat.post("new noise", who="bob",
+                          room="m%02d-%02d" % (turn, i))
+            got.append(seats.deliver_any(session="s-churn", seat="churn"))
+        self.assertIn("stable-target", "\n".join(x for x in got if x))
+
     def test_join_baselines_every_room_beyond_hot_scan_cap(self):
         for i in range(seats.ROOM_SCAN_CAP + 8):
             chat.post("@late stale prejoin", who="bob", room="pre-%02d" % i)

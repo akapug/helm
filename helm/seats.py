@@ -966,42 +966,49 @@ def dm_lane(seat):
     return chat.DM_PREFIX + _seat_key(seat)
 
 
-def scan_path(seat, session=None):
-    """Per-seat/session overflow-ring position for eventual room coverage."""
+def scan_path(seat, session=None, lane="deliver"):
+    """Per-seat/session/lane overflow-ring state for eventual room coverage."""
     p = os.path.join(chat.chat_dir(), ".scan." + _seat_key(seat))
     s8 = _sid8(session)
-    return "%s.%s" % (p, s8) if s8 else p
+    return ".".join(x for x in (p, s8, lane) if x)
 
 
-def _fair_room_slice(names, seat, session, size):
-    """A bounded round-robin slice. Stable lexical order plus a persisted
-    index guarantees every overflow room eventually receives a scan slot;
-    newest-only slicing permanently starved older direct mentions."""
-    ring = sorted(names)
-    if not ring or size <= 0:
+def _fair_room_slice(names, seat, session, size, lane):
+    """A bounded round-robin over stable room identities. Survivors retain
+    their queue order while newly discovered rooms append behind them, so
+    insertions cannot move an old room's goalpost forever. Each consumer lane
+    owns its queue: roster observation must never advance delivery or stop."""
+    live = set(names)
+    if not live or size <= 0:
         return []
-    path = scan_path(seat, session)
+    path = scan_path(seat, session, lane)
     try:
         with _flocked(path + ".lock"):
             state = pk.read_json(path, {}) or {}
-            start = state.get("next", 0)
-            start = start if isinstance(start, int) else 0
-            start %= len(ring)
+            saved = state.get("rooms")
+            saved = saved if isinstance(saved, list) else []
+            ring = []
+            seen = set()
+            for name in saved:
+                if isinstance(name, str) and name in live and name not in seen:
+                    ring.append(name)
+                    seen.add(name)
+            ring.extend(sorted(live - seen))
             count = min(size, len(ring))
-            out = [ring[(start + i) % len(ring)] for i in range(count)]
-            pk.write_json(path, {"next": (start + count) % len(ring)})
+            out = ring[:count]
+            pk.write_json(path, {"rooms": ring[count:] + out})
             return out
     except OSError:
-        return ring[:size]
+        return sorted(live)[:size]
 
 
 def _scan_rooms(primary="main", seat=None, scope=None, session=None,
-                fair=False, bounded=True):
+                scan_lane=None, bounded=True):
     """Rooms considered by one delivery/gate pass. The seat's private DM lane,
     primary room, home room, and main are pinned first. Foreign rooms use a
     ROOM_SCAN_CAP-bounded overflow budget on hot paths; when that budget
-    overflows, a persisted round-robin position gives every room eventual
-    coverage instead of permanently selecting the same newest slice. Join is
+    overflows, a persisted identity queue per consumer lane gives every room
+    eventual coverage without observation stealing delivery slots. Join is
     the one-time `bounded=False` caller so every existing room receives an EOF
     admission baseline and pre-join backlog can never emerge in a later slice.
 
@@ -1037,8 +1044,9 @@ def _scan_rooms(primary="main", seat=None, scope=None, session=None,
     if not bounded:
         return rooms + sorted(others)
     size = ROOM_SCAN_CAP - 1
-    if fair and seat and len(others) > size:
-        others = _fair_room_slice(others, seat, session, size)
+    if scan_lane and seat and len(others) > size:
+        others = _fair_room_slice(
+            others, seat, session, size, scan_lane)
     else:
         def mtime(n):
             try:
@@ -1164,7 +1172,8 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main"):
     tracked = sc["tracked"] \
         or (_cursor(room, seat, session) or _cursor(room, seat)) is not None
     for r in _scan_rooms(
-            room, seat=seat, scope=sc, session=session, fair=True):
+            room, seat=seat, scope=sc, session=session,
+            scan_lane="deliver"):
         if not _room_dirty(r, seat, session):
             continue
         # the DM lane ALWAYS backfills from 0 — every row in it is addressed
@@ -1400,17 +1409,18 @@ def _pending_rows(room, seat, session=None, backfill=False, scope=None):
             if r is not None and deliverable(r, seat, room, sc)]
 
 
-def _pending_all(room, seat, session=None):
-    """[(room, row)] pending across the bounded room scan, cursors untouched
-    — the stop-guard's and roster report's multi-room truth. Same tracked/
-    backfill rule as deliver_any, same _room_dirty fast path per room, same
-    one-roster-read scope."""
+def _pending_all(room, seat, session=None, scan_lane="pending"):
+    """[(room, row)] pending across one lane's bounded room scan, cursors
+    untouched. Delivery, stop-guard, and roster observation own independent
+    identity queues so one consumer cannot steal another's eventual coverage.
+    The tracked/backfill law and one-roster-read scope match deliver_any."""
     sc = seat_scope(seat)
     tracked = sc["tracked"] \
         or (_cursor(room, seat, session) or _cursor(room, seat)) is not None
     out = []
     for r in _scan_rooms(
-            room, seat=seat, scope=sc, session=session, fair=True):
+            room, seat=seat, scope=sc, session=session,
+            scan_lane=scan_lane):
         if not _room_dirty(r, seat, session):
             continue
         out.extend((r, row) for row in _pending_rows(
@@ -1703,7 +1713,8 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
     inbox_blocked = False
 
     if not _off("STOP_GUARD_INBOX"):
-        pending = _pending_all(room, seat, session)   # EVERY room's inbox gates
+        pending = _pending_all(
+            room, seat, session, scan_lane="stop")  # EVERY room's inbox gates
         if pending:
             fp = _rows_fp(pending)
             fpp = _stop_fp_path(room, seat, session)
@@ -1960,7 +1971,8 @@ def roster_report(room="main"):
         # helm-dogfood mention, not just main), read off the row's newest
         # session cursor (hook joins are session-keyed) with the seat-level
         # fallback — cursors never move here.
-        hits = _pending_all(room, seat, session=row.get("session"))
+        hits = _pending_all(
+            room, seat, session=row.get("session"), scan_lane="report")
         pending, preview = len(hits), None
         if hits:
             preview = _scrub(hits[-1][1].get("text") or "")[:PREVIEW_CHARS]
