@@ -228,28 +228,71 @@ class AtomicSendTest(DispatchBase):
                 return real_write(fd, payload[:len(payload) // 2])
             return real_write(fd, payload)
 
-        with mock.patch.object(os, "write", side_effect=partial):
-            with self.assertRaises(OSError):
-                seats.dm("codex-3", "one", who="integrator", sign=False,
-                         message_id="abc123abc123")
-        self.assertEqual(chat.read(lane)[0], [])
-        row, err = seats.dm("codex-3", "one", who="integrator", sign=False,
-                            message_id="abc123abc123")
+        def signed(row, *_args):
+            row = dict(row)
+            row["turn"] = "remote-turn"
+            return row
+
+        with mock.patch.object(chat, "_signed_row", side_effect=signed) as sign:
+            with mock.patch.object(os, "write", side_effect=partial):
+                with self.assertRaises(OSError):
+                    seats.dm("codex-3", "one", who="integrator", sign=True,
+                             message_id="abc123abc123")
+            self.assertEqual(chat.read(lane)[0], [])
+            row, err = seats.dm("codex-3", "one", who="integrator", sign=True,
+                                message_id="abc123abc123")
         self.assertIsNone(err)
         self.assertEqual(row["id"], "abc123abc123")
+        self.assertEqual(row["turn"], "remote-turn")
+        self.assertEqual(sign.call_count, 1)
         self.assertEqual(len(chat.read(lane)[0]), 1)
 
-    def test_chat_retry_deduplicates_under_lock_before_signing(self):
+    def test_chat_fsync_failure_retries_without_signing_twice(self):
         chat = seats.chat
+        lane = seats.dm_lane("codex-3")
+        path = chat.room_path(lane)
+        real_fsync = os.fsync
+        fired = {"fail": False}
+
+        def fsync(fd):
+            target = os.readlink("/proc/self/fd/%d" % fd)
+            if target == path and not fired["fail"]:
+                fired["fail"] = True
+                raise OSError("injected fsync failure")
+            return real_fsync(fd)
+
+        def signed(row, *_args):
+            row = dict(row)
+            row["turn"] = "remote-turn"
+            return row
+
+        with mock.patch.object(chat, "_signed_row", side_effect=signed) as sign:
+            with mock.patch.object(os, "fsync", side_effect=fsync):
+                with self.assertRaises(OSError):
+                    seats.dm("codex-3", "one", who="integrator", sign=True,
+                             message_id="f5f5f5f5f5f5")
+            row, err = seats.dm("codex-3", "one", who="integrator", sign=True,
+                                message_id="f5f5f5f5f5f5")
+        self.assertIsNone(err)
+        self.assertEqual(row["turn"], "remote-turn")
+        self.assertEqual(sign.call_count, 1)
+        self.assertEqual(len(chat.read(lane)[0]), 1)
+
+    def test_chat_retry_dedup_survives_room_rotation(self):
+        chat = seats.chat
+        lane = seats.dm_lane("codex-3")
         with mock.patch.object(chat, "_signed_row", wraps=chat._signed_row) as sign:
             first, err = seats.dm("codex-3", "one", who="integrator", sign=False,
                                   message_id="feedfacefeed")
+            with open(chat.room_path(lane), "w", encoding="utf-8"):
+                pass  # simulate the row aging out of the bounded room
             again, err2 = seats.dm("codex-3", "one", who="integrator", sign=False,
                                    message_id="feedfacefeed")
         self.assertIsNone(err)
         self.assertIsNone(err2)
         self.assertEqual(again["id"], first["id"])
         self.assertEqual(sign.call_count, 1)
+        self.assertEqual(chat.read(lane)[0], [])
 
     def test_chat_torn_tail_is_repaired_before_next_idempotent_append(self):
         chat = seats.chat
@@ -398,6 +441,34 @@ class RetargetTest(DispatchBase):
             self.assertEqual(final["tip"], self.b)
             self.assertEqual(final["status"], "pending")
 
+    def test_e226_v2_ref_less_row_surfaces_and_cas_binds_then_closes(self):
+        ts = dispatches.pk.now_ts()
+        row = {"v": 2, "id": "0123456789abcdef0123456789abcdef", "seq": 0,
+               "event": "add", "ts": ts, "recipient": "codex-3",
+               "lane": "legacy-v2-unbound", "ref": None, "tip": None,
+               "original_ref": None, "original_tip": None, "note": None,
+               "deadline_s": 60, "source": "old-v2", "repo": None,
+               "repo_id": None, "dispatch_key": None, "message_id": None,
+               "message_hash": None, "sender": None, "status": "pending",
+               "ack_ref": None, "verdict_ref": None, "reviewed_tip": None,
+               "delivery_ref": None, "delivery_error": None,
+               "last_updated": ts}
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), row))
+        self.assertIn(row["id"], dispatches.rows())
+        fp, text = seats._dispatch_candidate()
+        self.assertIn("needs-tip-binding", fp)
+        self.assertIn("NEEDS TIP BINDING", text)
+        rc, out, err = run(dispatches.cmd_dispatch,
+                           ["bind", row["id"], self.a, "--repo", self.repo])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("PENDING VERDICT", out)
+        bound = dispatches.rows()[row["id"]]
+        self.assertEqual(bound["tip"], self.a)
+        closed, why = dispatches.mark_verdict(row["id"], self.a, "safe",
+                                              repo=self.repo)
+        self.assertIsNone(why)
+        self.assertEqual(closed["status"], "verdict")
+
     def test_validated_v1_no_seq_transitions_preserve_old_closures(self):
         ts = dispatches.pk.now_ts()
         base = {"id": "1a2b3c4d", "ts": ts, "recipient": "codex-3",
@@ -536,18 +607,19 @@ class StorageSafetyTest(DispatchBase):
         self.assertEqual(len(dispatches.history(row["id"])), 1)
 
     def test_well_shaped_ack_verdict_and_retarget_cannot_rewrite_tip(self):
-        row = self.add()
+        row = self.add(ref=self.b)
         forged_ack = dict(row, seq=1, event="ack", status="acked",
-                          ack_ref="post", ref=self.b, tip=self.b)
+                          ack_ref="post", ref=self.c, tip=self.c)
         self.assertTrue(eventledger.append(dispatches.ledger_path(), forged_ack))
         forged_verdict = dict(row, seq=1, event="verdict", status="verdict",
-                              ref=self.b, tip=self.b, reviewed_tip=self.b,
+                              ref=self.c, tip=self.c, reviewed_tip=self.c,
                               verdict_ref="forged")
         self.assertTrue(eventledger.append(dispatches.ledger_path(), forged_verdict))
-        forged_move = dict(row, seq=1, event="retarget", ref=self.b, tip=self.b,
-                           retarget_from=self.c, retarget_to=self.b)
+        forged_move = dict(row, seq=1, event="retarget", ref=self.side,
+                           tip=self.side, retarget_from=self.b,
+                           retarget_to=self.side)
         self.assertTrue(eventledger.append(dispatches.ledger_path(), forged_move))
-        self.assertEqual(dispatches.rows()[row["id"]]["tip"], self.a)
+        self.assertEqual(dispatches.rows()[row["id"]]["tip"], self.b)
         self.assertEqual(len(dispatches.history(row["id"])), 1)
 
     def test_symlink_ledger_is_refused_without_touching_target(self):
@@ -571,6 +643,11 @@ class StorageSafetyTest(DispatchBase):
                                          repo=self.repo))
         with open(victim, encoding="utf-8") as f:
             self.assertEqual(f.read(), "safe")
+        _rows, unavailable = dispatches.snapshot()
+        self.assertIn("private regular file", unavailable)
+        rc, _out, err = run(dispatches.cmd_dispatch, ["list"])
+        self.assertEqual(rc, 1)
+        self.assertIn("obligations UNKNOWN", err)
 
     def test_symlinked_home_parent_is_refused_before_ledger_creation(self):
         target = os.path.join(self.tmp, "redirect-target")
@@ -609,14 +686,17 @@ class StorageSafetyTest(DispatchBase):
 
     def test_concurrent_adds_are_all_replayable(self):
         made = []
+        barrier = threading.Barrier(25)
 
         def add_one(i):
+            barrier.wait()
             made.append(dispatches.add("seat-%d" % i, "lane", ref=self.a,
                                          repo=self.repo))
 
         threads = [threading.Thread(target=add_one, args=(i,)) for i in range(24)]
         for thread in threads:
             thread.start()
+        barrier.wait()
         for thread in threads:
             thread.join()
         self.assertTrue(all(made))
@@ -664,7 +744,7 @@ class CmdTest(DispatchBase):
 
     def test_bad_usage_is_rc2_without_traceback(self):
         cases = ([], ["add"], ["send", "s", "l", "message"], ["bogus"],
-                 ["ack", "id"], ["retarget", "id", "old"],
+                 ["ack", "id"], ["bind", "id"], ["retarget", "id", "old"],
                  ["verdict", "id", "tip"], ["list", "--wat"])
         for args in cases:
             rc, out, err = run(dispatches.cmd_dispatch, args)

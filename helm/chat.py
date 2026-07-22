@@ -544,12 +544,37 @@ def _chat_rows(fd, size):
     return [m for m in map(_msg, (x for x in raw.split("\n") if x)) if m]
 
 
-def _append(row, room, idempotent=False, prepare=None):
-    """Serialized, durable room append with torn-tail repair and retry dedup.
+def _idempotency_path():
+    return os.path.join(home.global_dir(), "chat-message-idempotency.jsonl")
 
-    Idempotent compound writes require the room lock, deduplicate BEFORE their
-    signing callback, append once with O_APPEND, fsync, and verify the exact
-    bytes are replayable before reporting success. A partial write rolls back.
+
+def _idempotency_core(row):
+    return {key: row.get(key) for key in ("from", "text", "dm", "reply_to")}
+
+
+def _idempotency_get(message_id):
+    from . import eventledger
+    rows, unavailable = eventledger.latest_checked(_idempotency_path())
+    if unavailable:
+        raise OSError("chat idempotency ledger unavailable: %s" % unavailable)
+    return rows.get(str(message_id))
+
+
+def _idempotency_put(message_id, state, core, row=None):
+    from . import eventledger
+    event = {"id": str(message_id), "state": state, "core": core,
+             "row": row, "ts": pk.now_ts()}
+    if not eventledger.append(_idempotency_path(), event):
+        raise OSError("chat idempotency state %s was not durable" % state)
+
+
+def _append(row, room, idempotent=False, prepare=None):
+    """Serialized, durable room append with persistent message-id idempotency.
+
+    Compound writes persist INTENT before signing, PREPARED (including the
+    signed receipt) before the rotating room write, and DELIVERED afterward.
+    Thus local write/fsync failure retries never sign twice, and room rotation
+    cannot expire the message-id dedup record.
     """
     row.setdefault("id", os.urandom(6).hex())
     path = room_path(room)
@@ -557,6 +582,13 @@ def _append(row, room, idempotent=False, prepare=None):
     with _room_lock(room) as held:
         if idempotent and not held:
             raise OSError("chat room lock unavailable for idempotent append")
+        core = _idempotency_core(row) if idempotent else None
+        record = _idempotency_get(row["id"]) if idempotent else None
+        if record:
+            if record.get("core") != core:
+                raise ValueError("chat idempotency id collision: %s" % row["id"])
+            if record.get("state") == "delivered" and record.get("row"):
+                return record["row"]
         new_file = not os.path.exists(path)
         fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT
                      | getattr(os, "O_CLOEXEC", 0)
@@ -574,17 +606,30 @@ def _append(row, room, idempotent=False, prepare=None):
                 existing = next((r for r in _chat_rows(fd, before)
                                  if r.get("id") == row["id"]), None)
                 if existing:
-                    keys = ("from", "text", "dm", "reply_to")
-                    if any(existing.get(k) != row.get(k) for k in keys):
+                    if _idempotency_core(existing) != core:
                         raise ValueError("chat idempotency id collision: %s" % row["id"])
+                    _idempotency_put(row["id"], "delivered", core, existing)
                     return existing
-            row = prepare(row) if prepare else row
+                if not record:
+                    _idempotency_put(row["id"], "intent", core)
+                if record and record.get("state") == "prepared" and record.get("row"):
+                    row = record["row"]
+                else:
+                    row = prepare(row) if prepare else row
+                    _idempotency_put(row["id"], "prepared", core, row)
+            else:
+                row = prepare(row) if prepare else row
             payload = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
             if os.write(fd, payload) != len(payload):
                 os.ftruncate(fd, before)
                 os.fsync(fd)
                 raise OSError("partial chat append rolled back")
-            os.fsync(fd)
+            try:
+                os.fsync(fd)
+            except OSError:
+                os.ftruncate(fd, before)
+                os.fsync(fd)
+                raise
             if os.pread(fd, len(payload), before) != payload:
                 os.ftruncate(fd, before)
                 os.fsync(fd)
@@ -595,6 +640,8 @@ def _append(row, room, idempotent=False, prepare=None):
         finally:
             os.close(fd)
         _rotate(path)
+        if idempotent:
+            _idempotency_put(row["id"], "delivered", core, row)
     return row
 
 

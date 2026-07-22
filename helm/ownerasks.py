@@ -8,9 +8,9 @@ fleet owner-ask list (premise: builtin-tasklist-mirrored-to-dregg is the
 fleet coordination primitive; agents SELF-ADD, a2a-self-add culture). Every
 mutation appends a full SNAPSHOT row (event-sourced: last line per id wins),
 so writes are O(1) — one unbuffered O_APPEND write, never a read — and the
-history is never lost. FAIL-OPEN: ledger trouble never raises; an add that
-did not land says so loudly (a silent success-lie would re-create the very
-bug this ledger fixes).
+history is never lost. Mutations never raise and a refused add says so loudly;
+reads distinguish absent/empty from UNAVAILABLE, so owner debt is UNKNOWN on
+CLI/stop surfaces rather than silently disappearing.
 
 Row schema (every snapshot carries the full shape):
   {id, ts, ask, source, status: open|done|reported,
@@ -42,10 +42,14 @@ def _append(row, path=None):
     return eventledger.append(path or ledger_path(), row)
 
 
+def snapshot(path=None):
+    """(rows, unavailable). Missing is known-empty; unsafe/unreadable storage
+    is UNKNOWN and must surface on owner-debt list/stop paths."""
+    return eventledger.latest_checked(path or ledger_path())
+
+
 def rows(path=None):
-    """id -> latest complete snapshot.  Malformed/non-UTF8/truncated rows and
-    unsafe paths fail open without hiding earlier good events."""
-    return eventledger.latest(path or ledger_path())
+    return snapshot(path)[0]
 
 
 def add(ask, source=None):
@@ -73,7 +77,10 @@ def _update(rid, status, **patch):
     with eventledger.locked(path) as held:
         if not held:
             return None, "ledger unwritable (%s) — update NOT recorded" % path
-        r = eventledger.latest(path).get(str(rid or ""))
+        current, unavailable = eventledger.latest_checked(path)
+        if unavailable:
+            return None, "owner-ask ledger unavailable: %s" % unavailable
+        r = current.get(str(rid or ""))
         if not r:
             return None, "no such ask: %s (helm asks list)" % rid
         if r.get("status") == "reported":
@@ -114,6 +121,15 @@ def unreported():
 def oldest_unreported():
     rs = unreported()
     return rs[0] if rs else None
+
+
+def stop_candidate():
+    current, unavailable = snapshot()
+    if unavailable:
+        return None, unavailable
+    rs = [r for r in current.values() if r.get("status") != "reported"]
+    rs.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("id") or "")))
+    return (rs[0] if rs else None), None
 
 
 USAGE = ("usage: helm asks add <text> [--source S] | done <id> <evidence> | "
@@ -160,7 +176,12 @@ def cmd_asks(args):
             print("ask %s reported — closed (post %s)" % (rid, ref))
         return 0
     if verb == "list":
-        rs = sorted(rows().values(),
+        current, unavailable = snapshot()
+        if unavailable:
+            print("helm asks: ledger unavailable; owner debt UNKNOWN: %s"
+                  % unavailable, file=sys.stderr)
+            return 1
+        rs = sorted(current.values(),
                     key=lambda r: (str(r.get("ts") or ""), str(r.get("id") or "")))
         if "--open" in rest:
             rs = [r for r in rs if r.get("status") != "reported"]

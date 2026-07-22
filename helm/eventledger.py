@@ -40,7 +40,12 @@ def _mkdirs(path):
         raise OSError("ledger parent contains a symlink")
     for child in reversed(missing):
         parent = os.path.dirname(child)
-        os.mkdir(child, 0o700)
+        try:
+            os.mkdir(child, 0o700)
+        except FileExistsError:
+            st = os.stat(child, follow_symlinks=False)
+            if not stat.S_ISDIR(st.st_mode) or os.path.realpath(child) != child:
+                raise OSError("raced ledger parent is unsafe")
         _fsync_dir(parent)
 
 
@@ -108,8 +113,8 @@ def checked_events(path):
         p = _prepare(path)
         fd = os.open(p, _flags(os.O_RDONLY))
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError("ledger is not a regular file")
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError("ledger is not a private regular file")
         with os.fdopen(fd, "rb") as f:
             fd = None
             for raw in f:

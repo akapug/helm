@@ -116,6 +116,13 @@ def _is_ancestor(repo, older, newer):
     return p.returncode == 0
 
 
+def _binding_valid(row, ref=None, tip=None):
+    info = _repo_info(row.get("repo"))
+    expected = tip or row.get("tip")
+    return bool(info and info["repo_id"] == row.get("repo_id") and expected
+                and _resolve_tip(info["repo"], ref or row.get("ref")) == expected)
+
+
 def _valid(row, prior):
     """Replay validator.  A corrupt duplicate/update is skipped, preserving the
     preceding good snapshot instead of letting one bad tail erase an obligation."""
@@ -157,7 +164,10 @@ def _valid(row, prior):
                      and row.get("original_ref") and row.get("original_tip")
                      and row.get("repo") and row.get("repo_id"))
         if row.get("event") == "add" and row.get("status") == "pending":
-            return bound
+            legacy_v2_unbound = row.get("v") == 2 and not any(
+                row.get(k) for k in ("ref", "tip", "original_ref",
+                                     "original_tip", "repo", "repo_id"))
+            return bound or legacy_v2_unbound
         if row.get("event") == "posting" and row.get("status") == "posting":
             return bool(bound and row.get("dispatch_key") and row.get("message_id")
                         and row.get("message_hash")
@@ -170,7 +180,7 @@ def _valid(row, prior):
     for key in immutable:
         if row.get(key) == prior.get(key):
             continue
-        if row.get("event") in ("retarget", "verdict") and key in binding \
+        if row.get("event") in ("bind", "retarget", "verdict") and key in binding \
                 and prior.get(key) is None and row.get(key):
             continue
         return False
@@ -197,8 +207,8 @@ def _valid(row, prior):
         "posting": {("pending", "delivered"),
                     ("aborted", "delivery-failed")},
         "aborted": {("posting", "retry")},
-        "pending": {("pending", "retarget"), ("acked", "ack"),
-                    ("verdict", "verdict")},
+        "pending": {("pending", "bind"), ("pending", "retarget"),
+                    ("acked", "ack"), ("verdict", "verdict")},
         "open": {("open", "retarget"), ("acked", "ack"),
                  ("verdict", "verdict")},
         "acked": {("acked", "retarget"), ("acked", "ack"),
@@ -210,11 +220,21 @@ def _valid(row, prior):
     if transition not in allowed.get(prior.get("status"), set()):
         return False
     prior_tip = prior.get("tip")
-    if event == "retarget":
+    if event == "bind":
+        if any(prior.get(k) for k in ("ref", "tip", "original_ref",
+                                      "original_tip", "repo", "repo_id")) \
+                or row.get("status") != prior.get("status") \
+                or row.get("tip") != row.get("original_tip") \
+                or row.get("ref") != row.get("original_ref") \
+                or not _binding_valid(row):
+            return False
+    elif event == "retarget":
         adopted = prior_tip or row.get("original_tip")
         if not adopted or row.get("retarget_from") != adopted \
                 or row.get("retarget_to") != row.get("tip") \
-                or row.get("tip") == adopted or row.get("status") != prior.get("status"):
+                or row.get("tip") == adopted or row.get("status") != prior.get("status") \
+                or not _binding_valid(row, ref=row.get("ref"), tip=row.get("tip")) \
+                or not _is_ancestor(row.get("repo"), adopted, row.get("tip")):
             return False
     elif event == "verdict":
         expected = prior_tip or row.get("original_tip")
@@ -230,6 +250,8 @@ def _valid(row, prior):
                             "delivery_error"},
         "retry": {"status", "event", "seq", "last_updated", "delivery_error"},
         "ack": {"status", "event", "seq", "last_updated", "ack_ref"},
+        "bind": {"status", "event", "seq", "last_updated", "ref", "tip",
+                 "original_ref", "original_tip", "repo", "repo_id"},
         "retarget": {"status", "event", "seq", "last_updated", "ref", "tip",
                      "retarget_from", "retarget_to", "original_ref",
                      "original_tip", "repo", "repo_id"},
@@ -486,6 +508,37 @@ def _repo_binding(row, caller_repo=None):
     return caller["repo"], tip, patch, None
 
 
+def bind(rid, ref, repo=None):
+    """CAS-bind an e226-era v2 ref-less row to one exact repository commit so
+    its verdict becomes closable without rewriting its original add event."""
+    path = ledger_path()
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "ledger unwritable (%s) — bind NOT recorded" % path
+        row, unavailable = _get_locked(rid)
+        if unavailable:
+            return None, "dispatch ledger unavailable: %s" % unavailable
+        if not row:
+            return None, "no such dispatch: %s (helm dispatch list)" % rid
+        if row.get("status") == "verdict":
+            return None, "dispatch %s already has a verdict (closed)" % rid
+        if any(row.get(k) for k in ("ref", "tip", "original_ref",
+                                    "original_tip", "repo", "repo_id")):
+            return None, "dispatch %s is already tip-bound" % rid
+        info = _repo_info(repo)
+        clean, err = _clean(ref, "ref", 256)
+        tip = _resolve_tip(info["repo"], clean) if info and not err else None
+        if not tip:
+            return None, "bind ref is missing, ambiguous, or foreign"
+        nxt = _next(row, event="bind", ref=clean, tip=tip,
+                    original_ref=clean, original_tip=tip,
+                    repo=info["repo"], repo_id=info["repo_id"])
+        if not eventledger.append_unlocked(path, nxt):
+            return None, "ledger unwritable (%s) — bind NOT recorded" % path
+    pk.event("dispatch-bind", str(rid), tip)
+    return nxt, None
+
+
 def retarget(rid, old_ref, new_ref, repo=None):
     path = ledger_path()
     with eventledger.locked(path) as held:
@@ -602,6 +655,10 @@ def stop_candidate():
         return None, None, unavailable
     ordered = sorted(current.values(),
                      key=lambda r: (str(r.get("ts") or ""), r["id"]))
+    unbound = next((r for r in ordered
+                    if r.get("status") in ACTIVE and not r.get("tip")), None)
+    if unbound:
+        return unbound, "bind", None
     retry = next((r for r in ordered
                   if r.get("status") in ("posting", "aborted")), None)
     if retry:
@@ -614,7 +671,8 @@ def stop_candidate():
 USAGE = ("usage: helm dispatch send <recipient> <lane> <message...> --ref TIP "
          "[--key K] [--note N] [--deadline SECONDS] [--repo PATH] | add "
          "<recipient> <lane> --ref TIP [--note N] [--deadline SECONDS] "
-         "[--repo PATH] | ack <id> <ref> | retarget <id> <old-tip> <new-tip> "
+         "[--repo PATH] | ack <id> <ref> | bind <id> <tip> [--repo PATH] | "
+         "retarget <id> <old-tip> <new-tip> "
          "[--repo PATH] | verdict <id> <reviewed-tip> <evidence> [--repo PATH] | "
          "list [--open|--overdue|--needs-retry] [--json]")
 
@@ -636,7 +694,9 @@ def _parse(rest, names):
     return pos, opts, None
 
 
-def _label(status):
+def _label(status, row=None):
+    if row is not None and status in ACTIVE and not row.get("tip"):
+        return "NEEDS TIP BINDING"
     return {"posting": "NEEDS DELIVERY RETRY", "aborted": "NEEDS DELIVERY RETRY",
             "pending": "PENDING VERDICT", "open": "PENDING VERDICT",
             "acked": "ACKED / PENDING VERDICT", "verdict": "VERDICT"}.get(
@@ -649,7 +709,7 @@ def _fmt(row, late=False):
     tip = row.get("tip") or row.get("ref") or "-"
     suffix = "  NEEDS CHECK-IN (OVERDUE)" if late else ""
     return "  %s  %-16s %-24s %-27s %3dm/%dm%s  %s" % (
-        row["id"], row["recipient"], row["lane"], _label(row["status"]),
+        row["id"], row["recipient"], row["lane"], _label(row["status"], row),
         age, deadline, suffix, str(tip)[:12])
 
 
@@ -701,6 +761,12 @@ def cmd_dispatch(args):
             print(USAGE, file=sys.stderr)
             return 2
         row, why = mark_ack(rest[0], " ".join(rest[1:]))
+    elif verb == "bind":
+        pos, opts, err = _parse(rest, {"--repo"})
+        if err or len(pos) != 2:
+            print("helm dispatch: " + (err or USAGE), file=sys.stderr)
+            return 2
+        row, why = bind(pos[0], pos[1], repo=opts.get("--repo"))
     elif verb == "retarget":
         pos, opts, err = _parse(rest, {"--repo"})
         if err or len(pos) != 3:
@@ -716,7 +782,7 @@ def cmd_dispatch(args):
                                 repo=opts.get("--repo"))
     else:
         row = why = None
-    if verb in ("ack", "retarget", "verdict"):
+    if verb in ("ack", "bind", "retarget", "verdict"):
         if why:
             print("helm dispatch: " + why, file=sys.stderr)
             return 1

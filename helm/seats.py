@@ -1494,7 +1494,11 @@ def _ask_candidate():
     to None: ledger trouble = silence."""
     try:
         from . import ownerasks
-        r = ownerasks.oldest_unreported()
+        r, unavailable = ownerasks.stop_candidate()
+        if unavailable:
+            return ("ask:ledger-unavailable",
+                    "owner-ask ledger UNAVAILABLE — owner debt is UNKNOWN, not "
+                    "zero; repair/read `helm asks list` before stopping")
         if not r:
             return None
         return ("ask:%s:%s" % (r.get("id"), r.get("status")),
@@ -1533,6 +1537,12 @@ def _dispatch_candidate():
             return None
         tip = str(r.get("tip") or r.get("ref") or "<reviewed-tip>")
         lane = _clip(_scrub(str(r.get("lane") or "")), 32)
+        if kind == "bind":
+            return ("dispatch:%s:needs-tip-binding" % r.get("id"),
+                    "dispatch %s to @%s (%s) NEEDS TIP BINDING — migrate the "
+                    "legacy ref-less row with: helm dispatch bind %s <tip> "
+                    "--repo <path>" % (r.get("id"), r.get("recipient"), lane,
+                                       r.get("id")))
         if kind == "retry":
             return ("dispatch:%s:%s:%s" % (r.get("id"), r.get("status"), tip),
                     "dispatch %s to @%s (%s) NEEDS DELIVERY RETRY — the send "
