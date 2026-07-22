@@ -1094,9 +1094,11 @@ class IndexCapTest(StoreBase):
 
 
 class CandidateTierTest(StoreBase):
-    """Candidate tier (v1: lexicon): safe inferred capture — a candidate is a
-    non-live status EXCLUDED from every injecting lane (the hard law), surfaced
-    only in list --candidates, promoted by confirm."""
+    """Candidate tier: safe inferred capture — a candidate is a non-live
+    status EXCLUDED from every injecting lane (the hard law), surfaced only
+    in list --candidates, promoted by confirm, rejected in place by reject.
+    v2 (autolearn): every capturable type may be born a candidate — capture
+    everything, canonize nothing automatically; premise stays human-only."""
 
     def add(self, *args):
         out, err = io.StringIO(), io.StringIO()
@@ -1130,10 +1132,100 @@ class CandidateTierTest(StoreBase):
         self.assertEqual(self.one(store.load_all(include_retired=True),
                                   "glorpterm")["status"], "candidate")
 
-    def test_candidate_only_lexicon_in_v1(self):
-        rc, _, err = self.add("prior", "x-law | inferred belief", "--candidate")
+    def test_candidate_all_capturable_types(self):
+        # capture-everything: prior/heuristic/reference candidates land as
+        # non-live files with inferred source, invisible to every inject lane
+        for args in (("prior", "x-law | inferred belief | 0.7 | glorpwork"),
+                     ("heuristic", "x-move | try the glorp first | glorpwork"),
+                     ("reference", "x-ref | the glorp paper | https://x.example")):
+            rc, out, _ = self.add(*args, "--candidate")
+            self.assertEqual(rc, 0, args[0])
+            self.assertIn("CANDIDATE", out)
+            self.assertIn("src=inferred", out)
+        self.assertEqual(sorted(e["id"] for e in store.candidates()),
+                         ["x-law", "x-move", "x-ref"])
+        for e in store.candidates():
+            with open(e["path"]) as f:
+                raw = f.read()
+            self.assertIn("  status: candidate", raw)
+            self.assertIn("  source: inferred", raw)
+        # the hard law holds across types: nothing loads, resolves, or pins
+        self.assertEqual(store.load_all(), [])
+        self.assertEqual(store.resolve_prompt("glorpwork x-law x-move x-ref"), [])
+        self.assertEqual(store.pinned(), [])
+
+    def test_premise_candidate_refused(self):
+        # the certainty rail is human-only — an inference cannot claim 1.0
+        # even in escrow; the refusal routes to the prior-candidate lane
+        rc, _, err = self.add("premise", "x-truth | inferred certainty", "--candidate")
         self.assertEqual(rc, 2)
-        self.assertIn("lexicon-only", err)
+        self.assertIn("human-only", err)
+        self.assertIn("add prior", err)
+        self.assertEqual(store.candidates(), [])
+
+    def test_confirm_prior_receipt_and_confidence_untouched(self):
+        self.add("prior", "x-law | glorp before zork | 0.7 | glorpwork", "--candidate")
+        e, err = store.confirm("x-law", TS)
+        self.assertIsNone(err)
+        self.assertEqual((e["status"], e["source"]), ("live", "explicit"))
+        # confirm ratifies the capture, never inflates the belief
+        e = self.one(store.load_all(), "x-law")
+        self.assertAlmostEqual(e["confidence"], 0.7)
+        # who/when receipt lives in the prior's own evidence_log
+        r = e["evidence_log"][-1]
+        self.assertEqual((r["type"], r["by"]), ("confirmed", "human"))
+        self.assertEqual([x["id"] for x in store.resolve_prompt("glorpwork now")],
+                         ["x-law"])
+
+    def test_confirm_edit_swaps_move(self):
+        self.add("heuristic", "x-move | first guess | glorpwork", "--candidate")
+        e, err = store.confirm("x-move", TS, new_statement="the sharpened move")
+        self.assertIsNone(err)
+        e = self.one(store.load_all(), "x-move")
+        self.assertEqual((e["move"], e["statement"]),
+                         ("the sharpened move", "the sharpened move"))
+
+    def test_reject_retires_in_place(self):
+        self.add("lexicon", "glorpterm | a wrong guess", "--candidate")
+        path = self.one(store.candidates(), "glorpterm")["path"]
+        e, err = store.reject("glorpterm", TS, why="not a real coinage")
+        self.assertIsNone(err)
+        self.assertEqual(e["status"], "retired")
+        # the record law: the file STAYS, carrying the receipt
+        self.assertTrue(os.path.isfile(path))
+        with open(path) as f:
+            raw = f.read()
+        self.assertIn("  status: retired", raw)
+        self.assertIn("  retired_why: not a real coinage", raw)
+        # gone from every surface: candidates, live load, resolve
+        self.assertEqual(store.candidates(), [])
+        self.assertEqual(store.load_all(), [])
+        e = self.one(store.load_all(include_retired=True), "glorpterm")
+        self.assertEqual((e["status"], e["retired_why"]),
+                         ("retired", "not a real coinage"))
+        self.assertTrue(any(r.get("verb") == "store.reject"
+                            and r.get("target") == "glorpterm"
+                            for r in pk.read_events(50)))
+
+    def test_reject_guards(self):
+        e, err = store.reject("ghost", TS)
+        self.assertIsNone(e)
+        self.assertIn("not found", err)
+        self.add("lexicon", "liveterm | a live one")
+        e, err = store.reject("liveterm", TS)
+        self.assertIsNone(e)
+        self.assertIn("not a candidate", err)
+
+    def test_reject_cli(self):
+        self.add("prior", "x-law | wrong inference | 0.6", "--candidate")
+        rc, out, _ = self.run_cli(["reject", "x-law", "misread", "the", "log"])
+        self.assertEqual(rc, 0)
+        self.assertIn("REJECTED 'x-law'", out)
+        self.assertEqual(self.one(store.load_all(include_retired=True),
+                                  "x-law")["retired_why"], "misread the log")
+        rc, _, err = self.run_cli(["reject"])
+        self.assertEqual(rc, 2)
+        self.assertIn("usage", err)
 
     def test_list_candidates_surface(self):
         self.add("lexicon", "glorpterm | a coined word", "--candidate")

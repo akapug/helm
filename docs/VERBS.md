@@ -103,7 +103,9 @@ helm store list [--type T] [--all] [--candidates]
 helm store get <id>                        one entry, full record
 helm store resolve <text>                  JIT lookup — what fires for this prompt
                                            (or pipe the prompt on stdin)
-helm store confirm <id> [--edit <def...>]  promote a candidate -> live (lexicon v1)
+helm store confirm <id> [--edit <stmt...>] promote a candidate -> live
+helm store reject <id> [why...]            reject a candidate — retired in
+                                           place (file kept as the record)
 helm store pinned [--stats]                the always-on lane (--stats: budget
                                            walk + ledger made-it/starved counts)
 helm store add <type> <id> | <statement> [| ...]
@@ -113,8 +115,9 @@ helm store add <type> <id> | <statement> [| ...]
     heuristic: <id> | <move> [| trigger-csv [| domain]]
     reference: <id> | <summary> [| url [| keywords [| domain]]]
     flags: [--source S] [--rationale <text...>] [--candidate]
-           --candidate (lexicon v1): SAFE inferred capture — writes a non-live
-           candidate EXCLUDED from inject/resolve until `confirm`ed
+           --candidate (prior|lexicon|heuristic|reference): SAFE inferred
+           capture — writes a non-live candidate EXCLUDED from inject/resolve
+           until `confirm`ed (premise refused: certainty is human-only)
 helm store evidence <ts> <id> <delta> <reason...>  move a belief (logged + clamped)
 helm store supersede <ts> <old-id> <new-id> [reason]  TOMBSTONE old (file kept)
 helm store retire <ts> <id> [why...]               retire (file kept as the record)
@@ -142,17 +145,25 @@ many entries carry that keyword), summed and confidence-weighted — one rare
 keyword outranks a pile of shared ones. Ties break most-recently-updated,
 never alphabetical. `helm inject --explain` shows the per-probe contributions.
 
-**Candidate tier (safe inferred capture).** An agent-inferred entry lands as
-`status:candidate` (v1: lexicon; `add lexicon ... --candidate`, `source:
-inferred`). A candidate is a *non-live* status, so the resolver's live-filter
-already EXCLUDES it from resolve / pinned / inject — the hard law: nothing
-inferred is ever silently authoritative. `list --candidates` surfaces them (and
-coach's dup-search reads `store.candidates()`); `helm store confirm <id>
-[--edit <def...>]` promotes candidate → live (`source:explicit`) with an events
-receipt. Decay is operator-visible, never a silent job: `helm drain
---expire-candidates [--days N] [--apply]` archives-then-prunes unconfirmed
-candidates older than N days (14 default; a no-timestamp candidate never
-expires; dry-run default; net + receipt).
+**Candidate tier (safe inferred capture — capture everything, canonize
+nothing automatically).** An agent-inferred entry lands as `status:candidate`
+(`add <type> ... --candidate`, `source:inferred` — every capturable type:
+prior, lexicon, heuristic, reference; **premise is refused**: an inference may
+not claim certainty even in escrow, the 1.0 rail stays human-only — capture it
+as a prior belief instead). A candidate is a *non-live* status, so the
+resolver's live-filter already EXCLUDES it from resolve / pinned / inject —
+the hard law: nothing inferred is ever silently authoritative. `list
+--candidates` surfaces them (and coach's dup-search reads
+`store.candidates()`). Three exits, all receipted, none silent: `helm store
+confirm <id> [--edit <stmt...>]` promotes candidate → live (`source:explicit`;
+a prior keeps its captured confidence — confirming ratifies the capture, never
+inflates the belief — and carries the who/when receipt in its own
+evidence_log); `helm store reject <id> [why...]` retires the wrong inference
+IN PLACE (file kept as the record, never deleted); and decay is
+operator-visible, never a silent job: `helm drain --expire-candidates
+[--days N] [--apply]` archives-then-prunes unconfirmed candidates of every
+type older than N days (14 default; a no-timestamp candidate never expires;
+dry-run default; net + receipt).
 
 **Adopted project roots.** With `--project P`, the store also reads P's OWN
 claude memory dir(s) as `adopted-project` roots (canonical cwd + observed

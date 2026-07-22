@@ -64,7 +64,11 @@ STATUS_DELETE_ELIGIBLE = "delete_eligible"
 # CANDIDATE (safe inferred capture): an agent-inferred entry lands here, NEVER
 # live — it is a non-live status, so the load_all live-filter already excludes
 # it from resolve/pinned/inject (the hard law: never silently authoritative).
-# `helm store confirm` promotes it. source: inferred|asked-once|explicit.
+# v2 (autolearn): EVERY capturable type may be born a candidate — capture
+# everything, canonize NOTHING automatically; premise stays refused (an
+# inference may not claim certainty even in escrow — the human-only rail).
+# `helm store confirm` promotes, `reject` retires-in-place, drain
+# --expire-candidates is the age leg. source: inferred|asked-once|explicit.
 STATUS_CANDIDATE = "candidate"
 
 # PINNED priors inject EVERY turn (load_class always). Pin = a `pin: true`
@@ -273,7 +277,7 @@ _PRIOR_DEFAULTS = {
 
 _LEX_DEFAULTS = {"term": "", "scope": "global", "definition": "", "kind": "",
                  "source": "", "examples": [], "updated_ts": "", "hits": "0",
-                 "status": "live"}
+                 "status": "live", "retired_ts": "", "retired_why": ""}
 
 _HEUR_DEFAULTS = {
     "id": "", "move": "", "statement": "", "trigger": "", "keywords": "",
@@ -736,6 +740,9 @@ def write_lexicon(e, root_dir=None, path=None):
     status = str(e.get("status") or STATUS_LIVE)
     if status != STATUS_LIVE:
         body.insert(6, "  status: " + status)
+    if e.get("retired_ts"):  # a rejected candidate keeps its receipt in-file
+        body += ["  retired_ts: " + str(e["retired_ts"]),
+                 "  retired_why: " + (e.get("retired_why") or "")]
     ex = e.get("examples") or []
     if ex:
         body.append("  examples: " + " || ".join(ex))
@@ -933,27 +940,57 @@ def retire(eid, ts, why="", project=None):
     return e, None
 
 
+# per-type alias key the writers actually serialize beside "statement"
+_STMT_ALIAS = {"lexicon": "definition", "heuristic": "move", "reference": "summary"}
+
+
 def confirm(eid, ts, new_statement=None, project=None):
     """Promote a candidate -> live (the owner/confirm gate that makes inferred
-    capture safe to leave on). v1 is lexicon-only (the schema-touch is bounded
-    to one type); --edit swaps the definition in the same turn. source flips to
-    'explicit' — the knowledge is now human-confirmed — and the events journal
-    carries the promotion receipt (lexicon has no evidence_log)."""
+    capture safe to leave on) — v2: every capturable type (autolearn widened
+    it from lexicon-only; capture everything, canonize nothing automatically).
+    --edit swaps the statement in the same turn. source flips to 'explicit' —
+    the knowledge is now human-confirmed. A prior carries the who/when receipt
+    in its own evidence_log (confidence untouched — confirming ratifies the
+    capture, never inflates the belief); the other types' receipt is the
+    events journal row."""
     e = _find(eid, project=project)
     if not e:
         return None, "'" + str(eid) + "' not found"
     if e.get("status") != STATUS_CANDIDATE:
         return None, "'%s' is not a candidate (status=%s)" % (eid, e.get("status"))
-    if e["type"] != "lexicon":
-        return None, "candidate confirm is lexicon-only in v1 (got %s)" % e["type"]
     edited = bool(str(new_statement or "").strip())
     if edited:
-        e["definition"] = new_statement.strip()
-        e["statement"] = new_statement.strip()
-    e.update({"status": STATUS_LIVE, "source": "explicit", "updated_ts": ts})
-    write_lexicon(e, path=e["path"])
-    pk.event("store.confirm", str(e["id"]),
-             "candidate -> live" + (" (edited)" if edited else ""))
+        s = new_statement.strip()
+        e["statement"] = s
+        alias = _STMT_ALIAS.get(e["type"])
+        if alias:
+            e[alias] = s
+    note = "candidate -> live" + (" (edited)" if edited else "")
+    e.update({"status": STATUS_LIVE, "source": "explicit",
+              "updated_ts": ts, "last_updated": ts})
+    if e["type"] == "prior":
+        e["evidence_log"] = list(e.get("evidence_log") or []) + [
+            {"ts": ts, "type": "confirmed", "delta": 0, "reason": note, "by": "human"}]
+    _WRITERS[e["type"]](e, path=e["path"])
+    pk.event("store.confirm", str(e["id"]), note)
+    return e, None
+
+
+def reject(eid, ts, why="", project=None):
+    """The wrong-inference exit: candidate -> retired IN PLACE (the record law:
+    the file STAYS, never deleted — a rejected inference is itself knowledge).
+    Refuses non-candidates (retire is the live-entry verb); drain
+    --expire-candidates remains the age leg for the never-reviewed."""
+    e = _find(eid, project=project)
+    if not e:
+        return None, "'" + str(eid) + "' not found"
+    if e.get("status") != STATUS_CANDIDATE:
+        return None, "'%s' is not a candidate (status=%s) — retire handles live entries" \
+            % (eid, e.get("status"))
+    e.update({"status": STATUS_RETIRED, "retired_ts": ts,
+              "retired_why": why or "rejected", "updated_ts": ts, "last_updated": ts})
+    _WRITERS[e["type"]](e, path=e["path"])
+    pk.event("store.reject", str(e["id"]), why or "candidate rejected")
     return e, None
 
 
@@ -1244,11 +1281,14 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
       heuristic: <id> | <move> [| trigger-csv [| domain]]
       reference: <id> | <summary> [| url [| keywords [| domain]]]
       flags: [--source S] [--rationale <text...>] [--candidate]
-             --candidate (lexicon only, v1): safe inferred capture — writes a
-             non-live candidate EXCLUDED from inject until confirmed
+             --candidate (prior|lexicon|heuristic|reference): safe inferred
+             capture — writes a non-live candidate EXCLUDED from inject until
+             confirmed (premise refused: certainty is the human-only lane)
       a LIVE same-id add is REFUSED (supersede/evidence instead, printed);
       a near-identical statement warns and proceeds (lexicon redefines freely)
-  confirm <id> [--edit <new definition...>]   promote a candidate -> live (lexicon v1)
+  confirm <id> [--edit <new statement...>]    promote a candidate -> live
+  reject <id> [why...]                        reject a candidate — retired in
+                                              place (file kept as the record)
   evidence <ts> <id> <delta> <reason...>      move a belief (logged + clamped)
   supersede <ts> <old-id> <new-id> [reason]   TOMBSTONE old (file kept)
   retire <ts> <id> [why...]                   retire (file kept as the record)
@@ -1277,7 +1317,7 @@ def _fmt(e):
 
 
 def cmd_store(args):
-    """store <list|get|add|resolve|pinned|evidence|supersede|retire|demote|events|counts> — the ONE typed personal-knowledge store."""
+    """store <list|get|add|resolve|pinned|confirm|reject|evidence|supersede|retire|demote|events|counts> — the ONE typed personal-knowledge store."""
     args = list(args)
     project = None
     if "--project" in args:
@@ -1309,7 +1349,8 @@ def cmd_store(args):
                 print("  ? " + str(e["id"]) + " [" + e["type"] + " src="
                       + (e.get("source") or "?") + " " + e["scope"] + "]: "
                       + (e.get("statement") or "")[:100])
-                print("      confirm: helm store confirm " + str(e["id"]))
+                print("      confirm: helm store confirm " + str(e["id"])
+                      + "   reject: helm store reject " + str(e["id"]))
             return 0
         es = load_all(project=project, include_retired=("--all" in rest),
                       types=(t,) if t else None)
@@ -1362,6 +1403,19 @@ def cmd_store(args):
               + " - now fires in the JIT lane")
         return 0
 
+    if cmd == "reject":
+        if not rest:
+            print("usage: helm store reject <id> [why...]", file=sys.stderr)
+            return 2
+        e, err = reject(rest[0], pk.now_ts(), why=" ".join(rest[1:]).strip(),
+                        project=project)
+        if err:
+            print("helm store reject: " + err, file=sys.stderr)
+            return 1
+        print("helm store: REJECTED '" + rest[0] + "' candidate -> retired "
+              "(file kept as the record)")
+        return 0
+
     if cmd == "add":
         if len(rest) < 2:
             print(_USAGE, file=sys.stderr)
@@ -1391,9 +1445,14 @@ def cmd_store(args):
                 break
             kept.append(tail[i])
             i += 1
-        if candidate and etype != "lexicon":
-            print("helm store add: --candidate is lexicon-only in v1 (the "
-                  "candidate schema-touch is bounded to one type)", file=sys.stderr)
+        if candidate and etype == "premise":
+            # an inference may not claim certainty even in escrow — confirm
+            # ratifies the CAPTURE, it must not be the door to an auto-1.0
+            print("helm store add: a premise (certainty 1.0) cannot be born a "
+                  "candidate — the certainty rail is human-only. Capture the "
+                  "inference as a belief:", file=sys.stderr)
+            print("  helm store add prior <id> | <statement> [| conf] --candidate",
+                  file=sys.stderr)
             return 2
         parts = [p.strip() for p in " ".join(kept).split("|")]
         if len(parts) < 2 or not parts[0] or not parts[1]:
@@ -1443,7 +1502,7 @@ def cmd_store(args):
                     conf = 0.6
                 kw = parts[3] if len(parts) > 3 else e.get("keywords", "")
                 dom = parts[4] if len(parts) > 4 else e.get("domain", "")
-                src = source or "agent-inferred"
+                src = source or ("inferred" if candidate else "agent-inferred")
             else:
                 conf = CERTAIN
                 kw = parts[2] if len(parts) > 2 else e.get("keywords", "")
@@ -1460,7 +1519,8 @@ def cmd_store(args):
             for stale in ("replaced_by", "supersedes", "retired_ts", "retired_why",
                           "evidence_log", "confidence_history"):
                 e.pop(stale, None)
-            e.update({"id": parts[0], "statement": parts[1], "status": STATUS_LIVE,
+            e.update({"id": parts[0], "statement": parts[1],
+                      "status": STATUS_CANDIDATE if candidate else STATUS_LIVE,
                       "stated_ts": ts, "last_updated": ts, "confidence": conf,
                       "keywords": kw, "domain": dom, "source": src})
             # SEED the audit trail at creation when a rationale is given, so a
@@ -1472,9 +1532,15 @@ def cmd_store(args):
                 e["confidence_history"] = [{"ts": ts, "value": round(conf, 4),
                                             "reason": rationale}]
             p = write_prior(e, path=path)
-            pk.event("store.add", parts[0], etype + " — " + parts[1])
-            print("helm store: LIVE '" + parts[0] + "' [" + derive_class(conf) + " "
-                  + ("%.2f" % conf) + "] - " + parts[1])
+            pk.event("store.add", parts[0],
+                     etype + (" candidate — " if candidate else " — ") + parts[1])
+            if candidate:
+                print("helm store: CANDIDATE '" + parts[0] + "' [prior "
+                      + ("%.2f" % conf) + " src=" + src + "] - " + parts[1])
+                print("  excluded from inject until confirmed: helm store confirm " + parts[0])
+            else:
+                print("helm store: LIVE '" + parts[0] + "' [" + derive_class(conf) + " "
+                      + ("%.2f" % conf) + "] - " + parts[1])
             print("  stored: " + p)
             return 0
 
@@ -1507,12 +1573,20 @@ def cmd_store(args):
             trig = parts[2] if len(parts) > 2 else (e.get("trigger") or "")
             dom = parts[3] if len(parts) > 3 else e.get("domain", "")
             e.update({"id": parts[0], "move": parts[1], "statement": parts[1],
-                      "trigger": trig, "domain": dom, "status": STATUS_LIVE,
+                      "trigger": trig, "domain": dom,
+                      "status": STATUS_CANDIDATE if candidate else STATUS_LIVE,
                       "stated_ts": ts, "last_updated": ts,
-                      "source": source or e.get("source") or "human"})
+                      "source": source or ("inferred" if candidate
+                                           else (e.get("source") or "human"))})
             p = write_heuristic(e, path=path)
-            pk.event("store.add", parts[0], "heuristic — " + parts[1])
-            print("helm store: LIVE '" + parts[0] + "' [heuristic conf=1 jit] - " + parts[1])
+            pk.event("store.add", parts[0],
+                     ("heuristic candidate — " if candidate else "heuristic — ") + parts[1])
+            if candidate:
+                print("helm store: CANDIDATE '" + parts[0] + "' [heuristic src="
+                      + e["source"] + "] - " + parts[1])
+                print("  excluded from inject until confirmed: helm store confirm " + parts[0])
+            else:
+                print("helm store: LIVE '" + parts[0] + "' [heuristic conf=1 jit] - " + parts[1])
             if trig:
                 print("  trigger: " + trig)
             print("  stored: " + p)
@@ -1526,11 +1600,19 @@ def cmd_store(args):
                   "url": parts[2] if len(parts) > 2 else e.get("url", ""),
                   "keywords": parts[3] if len(parts) > 3 else e.get("keywords", ""),
                   "domain": parts[4] if len(parts) > 4 else e.get("domain", ""),
-                  "status": STATUS_LIVE, "stated_ts": e.get("stated_ts") or ts,
-                  "last_updated": ts, "source": source or e.get("source") or "harvest"})
+                  "status": STATUS_CANDIDATE if candidate else STATUS_LIVE,
+                  "stated_ts": e.get("stated_ts") or ts, "last_updated": ts,
+                  "source": source or ("inferred" if candidate
+                                       else (e.get("source") or "harvest"))})
         p = write_reference(e, path=path)
-        pk.event("store.add", parts[0], "reference — " + parts[1])
-        print("helm store: LIVE '" + parts[0] + "' [reference jit] - " + parts[1])
+        pk.event("store.add", parts[0],
+                 ("reference candidate — " if candidate else "reference — ") + parts[1])
+        if candidate:
+            print("helm store: CANDIDATE '" + parts[0] + "' [reference src="
+                  + e["source"] + "] - " + parts[1])
+            print("  excluded from inject until confirmed: helm store confirm " + parts[0])
+        else:
+            print("helm store: LIVE '" + parts[0] + "' [reference jit] - " + parts[1])
         print("  stored: " + p)
         return 0
 
