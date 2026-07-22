@@ -315,17 +315,48 @@ def _persisting_sids():
     child-stamped pane whose transcript is growing on disk is persisting fine,
     and the env heuristic over-flags it MEMORY-ONLY). Sourced from the session
     catalog — the canonical scanner that already follows symlinked homes
-    (cto-example -> …) and never indexes the derived .flat.jsonl variant."""
+    (cto-example -> …) and never indexes the derived .flat.jsonl variant.
+
+    PLUS the SEAT homes, which the catalog does NOT cover: a proxy seat's
+    CLAUDE_CONFIG_DIR lives under ~/.helm/_global/seats/<family>[/instances/
+    <seat>]/claude, so its transcripts are invisible to a ~/.claude +
+    ~/.claude-homes scan. Measured 2026-07-22: the catalog held 1472 rows and
+    ZERO under ~/.helm, so EVERY proxy seat was reported MEMORY-ONLY while
+    writing a multi-MB transcript (codex-2 at 2.9MB, codex-3 at 2.0MB). A
+    persistence surface that lies about the seats is worse than none — it is
+    what the fleet uses to decide whether an agent's work is safe to lose."""
+    out = {}
     try:
         from . import transcripts
-        out = {}
         for r in transcripts.get_catalog().get("rows", []):
             p = r.get("p")
             if p and not str(p).endswith(".flat.jsonl") and os.path.exists(p):
                 out[r["i"]] = p
-        return out
     except Exception:
-        return {}
+        pass
+    # seat homes — walk each seat's own projects store directly
+    try:
+        from . import seat as _seat
+        seats_root = os.path.join(home.global_dir(), "seats")
+        for fam in sorted(os.listdir(seats_root)):
+            fam_dir = os.path.join(seats_root, fam)
+            homes = [os.path.join(fam_dir, "claude")]
+            inst = os.path.join(fam_dir, "instances")
+            if os.path.isdir(inst):
+                homes += [os.path.join(inst, s, "claude")
+                          for s in sorted(os.listdir(inst))]
+            for h in homes:
+                proj = os.path.join(h, "projects")
+                if not os.path.isdir(proj):
+                    continue
+                for root, _dirs, files in os.walk(proj):
+                    for fn in files:
+                        if fn.endswith(".jsonl") and not fn.endswith(".flat.jsonl"):
+                            out.setdefault(fn[:-len(".jsonl")],
+                                           os.path.join(root, fn))
+    except Exception:
+        pass
+    return out
 
 
 def cmd_ls(args):
