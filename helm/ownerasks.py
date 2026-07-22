@@ -32,17 +32,17 @@ from . import home, pk
 STATUSES = ("open", "done", "reported")
 
 
-def ledger_path():
-    return os.path.join(home.global_dir(), "owner-asks.jsonl")
+def ledger_path(name="owner-asks.jsonl"):
+    return os.path.join(home.global_dir(), name)
 
 
-def _append(row):
+def _append(row, path=None):
     """The O(1) append: makedirs + ONE unbuffered O_APPEND os.write (torn-line
     proof under concurrent appenders — kernel appends are atomic for one small
     write; the emit-law kin). Fail-open: False on any trouble, never a raise.
     No rotation — this ledger is DURABLE record, not telemetry exhaust."""
     try:
-        path = ledger_path()
+        path = path or ledger_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
@@ -54,12 +54,13 @@ def _append(row):
         return False
 
 
-def rows():
+def rows(path=None):
     """id -> latest snapshot (last line per id wins). Fail-open to {}:
     garbled lines skip, a missing/unreadable ledger reads as empty."""
     out = {}
     try:
-        with open(ledger_path(), encoding="utf-8", errors="replace") as f:
+        with open(path or ledger_path(), encoding="utf-8",
+                  errors="replace") as f:
             for ln in f:
                 try:
                     d = json.loads(ln)

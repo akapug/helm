@@ -1495,6 +1495,37 @@ def _ask_candidate():
         return None
 
 
+def _dispatch_candidate():
+    """The DISPATCH rung — sits directly under the owner-ask rung: work you
+    handed to another seat and have not checked on. One cheap local read of
+    the dispatch ledger; whispers the OLDEST OVERDUE row, never the list.
+
+    This is the durable half of the owner's ask (2026-07-21): "we definitely
+    need some timer fallback for anything that is sent to them, to make sure
+    it is remembered to check on their progress". Per-session Monitor
+    watchdogs die at compaction; this rung re-fires from disk in whatever
+    session is running.
+
+    The whisper says CHECK IN, never reassign — an overdue row means the
+    deadline passed, not that the seat is dead, and tonight a lane quiet 47
+    minutes turned out to be a long turn. The fp carries status so an
+    open->acked transition re-fires exactly once. Fail-closed to None."""
+    try:
+        from . import dispatches
+        r = dispatches.oldest_overdue()
+        if not r:
+            return None
+        return ("dispatch:%s:%s" % (r.get("id"), r.get("status")),
+                "dispatch %s to @%s (%s) is OVERDUE and has no verdict — CHECK "
+                "IN at the recipient side (its beacon/transcript), do NOT "
+                "reassign on age alone; close it with: helm dispatch verdict "
+                "%s <ref>" % (r.get("id"), r.get("recipient"),
+                              _clip(_scrub(str(r.get("lane") or "")), 32),
+                              r.get("id")))
+    except Exception:
+        return None
+
+
 def _runner_latest(session):
     """{token: row} — the LATEST recorded run per test-runner token from the
     session's command-log tail (record.py's verify-grounding log: REAL exit
@@ -1599,6 +1630,9 @@ def _whisper_candidates(session, pending, inbox_blocked):
     ask = _ask_candidate()   # owner-ask rung: unsurfaced owner debt outranks all
     if ask:
         out.append(ask)
+    dsp = _dispatch_candidate()   # then: work handed out and never checked on
+    if dsp:
+        out.append(dsp)
     c = {}
     if session:
         try:
