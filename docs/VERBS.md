@@ -1577,9 +1577,28 @@ helm path):
 
 **A note on `helm seat`:** the multimodel-seat verb (giving a non-Claude
 model family the full claude-code harness through a local wire proxy —
-`seat add|up|down|launch|smoke|list|status|doctor`) is wired into the
-dispatcher; see [MULTIMODEL_SEATS_ADDENDUM.md](MULTIMODEL_SEATS_ADDENDUM.md)
-while its live proving rounds finish. Two family modes are live: `codex`
+`seat add|up|down|launch|spawn|where|resume|smoke|list|status|doctor`) is
+wired into the dispatcher; see
+[MULTIMODEL_SEATS_ADDENDUM.md](MULTIMODEL_SEATS_ADDENDUM.md)
+while its live proving rounds finish.
+
+**`helm seat spawn <seat>` — the harness-agnostic SELF-ONBOARDING spawn.**
+A hand-spawned seat is a bare idle pane: no beacon, no work, not
+addressable. `spawn` closes that gap with one verb and three paths behind
+`harness.detect()`: **headless** (no orca/herdr — the standalone default:
+launch.sh runs detached under its own setsid session, io to `spawn.log`,
+and the onboarding rides as the script's positional arg, i.e. claude's
+first prompt at boot); **orca** (adapter `terminal create` + `terminal
+send --enter` of the onboarding); **herdr** (`agent start` + `pane run`).
+Common to all: dup-name REAP first (a prior bare same-name seat is
+killed/closed), mint hygiene (child-stamp stripped, skills linked,
+`--dangerously` canonical), and a roster register (`spawn.json` +
+chat-roster mirror) so any agent can `helm seat where <seat>` — harness,
+handle/pid, worktree, room, liveness. The onboarding directs the seat to
+arm its `helm chat wait --seat <seat> --follow` beacon FIRST, read its
+home room, announce, and take `@<seat>` work. `--print` shows the exact
+per-harness calls without spawning; `--room R` homes the seat (else the
+room is recovered from launch.sh); `--cwd DIR` sets the worktree. Two family modes are live: `codex`
 (mode "proxy" — a subscription OAuth cred translated read-only into the
 proxy) and `kimi` (mode "proxy-key" — an API-key provider behind the same
 proxy via its openai-compatibility block; the key comes from `KIMI_API_KEY`

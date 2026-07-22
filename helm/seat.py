@@ -146,6 +146,15 @@ _USAGE = """usage: helm seat <verb> [args]
                                       --multi: mixed-model fleet — DROP the
                                       CLAUDE_CODE_SUBAGENT_MODEL pin (it blunt-pins
                                       over per-agent frontmatter) + mint probe agents
+  spawn <seat> [--room R] [--cwd DIR] [--print]  SELF-ONBOARDING spawn: reap a
+                                      stale same-name seat, launch via the
+                                      detected metaharness (orca/herdr pane +
+                                      onboarding injection) or DETACHED HEADLESS
+                                      when none (onboarding = the boot first-
+                                      prompt), register spawn.json; --print
+                                      shows the exact per-harness calls
+  where <seat> [--json]               resolve a spawned seat: harness,
+                                      handle/pid, worktree, room, liveness
   resume <seat>                       relaunch the seat's pane via the metaharness
                                       (freshest launch.sh + --resume/--continue)
   smoke <family> [--multi]            the 4-leg acceptance gate (prompt/tool/subagent/whisper);
@@ -1187,6 +1196,287 @@ def _resume(seat_name, rest):
 
 
 # ---------------------------------------------------------------------------
+# spawn / where — the harness-agnostic SELF-ONBOARDING seat spawn
+# ---------------------------------------------------------------------------
+# THE GAP this closes: a hand-spawned seat is a BARE idle pane — no beacon,
+# no work, not addressable (feature without RSH = dead scaffolding). One verb,
+# THREE spawn paths dispatched by harness.detect():
+#   headless  no metaharness (the standalone DEFAULT — helm is the substrate,
+#             orca/herdr are optional front-ends): the minted launch.sh runs
+#             DETACHED (start_new_session=True IS setsid; nohup-equivalent io
+#             to spawn.log), and the onboarding rides as launch.sh's
+#             positional arg — launch.sh execs `claude … "$@"`, so the prompt
+#             is the seat's FIRST TURN, self-run at boot. No pane to inject
+#             into ⇒ deliver at launch time.
+#   orca      adapter.spawn (terminal create, handle captured) + adapter.send
+#             --enter of the onboarding first-prompt into the pane.
+#   herdr     the same two seam calls (agent start + pane run) via the adapter.
+# Common to all: mint hygiene via _write_launch_assets (child-stamp stripped ⇒
+# persistence forced ON, --dangerously canonical, skills linked), DUP-NAME
+# REAP first (a prior bare same-name seat is killed/closed — the exact live
+# bug), and a ROSTER REGISTER (spawn.json + chat-roster mirror) so any agent
+# can `helm seat where <name>` and reap. TOKEN LAW holds: the adapter seam
+# carries the launch.sh PATH + the secret-free onboarding text, never the
+# expanded launch line.
+
+SPAWN_SEND_DELAY_S = 5   # pane-boot grace before the onboarding keystrokes
+                         # (HELM_SPAWN_SEND_DELAY overrides; tests set 0)
+
+
+def onboarding_prompt(seat_name, room=None):
+    """The seat's self-onboarding FIRST PROMPT — identical across all three
+    spawn paths (only the delivery differs). One line, no newlines (it rides
+    `terminal send`/`pane run` as a single keystroke burst) and no secrets
+    (it crosses the adapter seam). Content law: arm the beacon FIRST (the only
+    idle wake), read the home room, announce, take @<seat> work."""
+    r = room or "main"
+    flag = "" if r == "main" else " --room %s" % shlex.quote(r)
+    return ("You are helm fleet seat '%(s)s' (home room %(r)s). Self-onboard "
+            "now, in order: (1) ARM YOUR INBOX BEACON before anything else — "
+            "Monitor(command: \"helm chat wait --seat %(s)s --follow\", "
+            "persistent: true); no Monitor tool? run `helm chat wait --seat "
+            "%(s)s --follow` as a background Bash task. Nothing external can "
+            "wake an idle seat, so the beacon is mandatory. (2) CATCH UP: "
+            "`helm chat read%(f)s` — read the room before acting. (3) "
+            "ANNOUNCE: `helm chat post%(f)s \"%(s)s online — beacon armed, "
+            "taking @%(s)s work\"`. (4) TAKE WORK: rows addressed @%(s)s and "
+            "owner posts are yours — do the work, reply in the room, and when "
+            "idle again stay parked on the beacon."
+            % {"s": seat_name, "r": r, "f": flag})
+
+
+def _spawn_path(d):
+    return os.path.join(d, "spawn.json")
+
+
+def _spawn_record(d):
+    from . import pk
+    rec = pk.read_json(_spawn_path(d), None)
+    return rec if isinstance(rec, dict) else None
+
+
+def _reap_stale(seat_name, d, ad):
+    """Dup-name reap, BOTH legs (a prior bare same-name seat must die before
+    its replacement spawns — the exact live bug): (a) a recorded HEADLESS pid
+    still alive gets SIGTERM→SIGKILL; (b) any same-titled pane in the detected
+    metaharness is closed via the seam. Returns note lines; best-effort loud —
+    a failed reap is reported, never silently skipped."""
+    notes = []
+    rec = _spawn_record(d)
+    pid = (rec or {}).get("pid")
+    if (rec or {}).get("harness") == "headless" and pid and _pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(15):
+                if not _pid_alive(pid):
+                    break
+                time.sleep(0.2)
+            if _pid_alive(pid):
+                os.kill(pid, signal.SIGKILL)
+            notes.append("reaped stale headless %s (pid %d)" % (seat_name, pid))
+        except OSError as e:
+            notes.append("stale headless %s pid %s NOT reaped (%s)"
+                         % (seat_name, pid, e))
+    if ad is not None:
+        for row in ad.list():
+            if row.get("title") == seat_name and row.get("handle"):
+                ad.stop(row["handle"])
+                notes.append("reaped stale %s pane %s"
+                             % (seat_name, row["handle"]))
+    return notes
+
+
+def _headless_spawn(launch_sh, onboarding, cwd, log_path):
+    """The standalone path: launch.sh detached (start_new_session=True = its
+    own setsid session — survives this CLI and any parent pane), stdin from
+    /dev/null, stdout+stderr appended to spawn.log (the nohup shape). The
+    onboarding is launch.sh's POSITIONAL ARG: the script execs
+    `claude … "$@"`, so the prompt lands as the seat's first turn at boot —
+    the launch-time delivery, since headless has no pane to inject into."""
+    with open(log_path, "ab") as log, open(os.devnull, "rb") as devnull:
+        p = subprocess.Popen([launch_sh, onboarding], cwd=cwd, stdin=devnull,
+                             stdout=log, stderr=log, start_new_session=True)
+    return p.pid
+
+
+def _register_spawn(seat_name, d, rec):
+    """The roster register: spawn.json in the seat's own dir (durable, any
+    agent can read it through `helm seat where`) + a best-effort chat-roster
+    mirror so the fleet surfaces (helm chat seats, the web panel) show the
+    seat's worktree/room before its first session even joins."""
+    from . import pk
+    pk.write_json(_spawn_path(d), rec)
+    try:
+        from . import seats as _seats
+        _seats.write_roster(seat_name, cwd=rec.get("worktree"),
+                            home_room=rec.get("room"))
+    except Exception as e:
+        print("helm seat: chat-roster mirror skipped (%s) — spawn.json is "
+              "still authoritative for `helm seat where`" % e, file=sys.stderr)
+
+
+def _spawn_plan(seat_name, d, launch_sh, room, cwd, onboard, ad):
+    """--print/--dry-run: the exact per-harness calls, nothing spawned,
+    reaped, or re-minted."""
+    print("helm seat spawn %s — plan (--print: nothing spawned, reaped, or "
+          "re-minted):" % seat_name)
+    rec = _spawn_record(d)
+    would = []
+    if (rec or {}).get("harness") == "headless" and rec.get("pid") \
+            and _pid_alive(rec["pid"]):
+        would.append("kill stale headless pid %d (SIGTERM, then SIGKILL)"
+                     % rec["pid"])
+    if ad is not None:
+        try:
+            would += ["%s stop pane %s" % (ad.name, r["handle"])
+                      for r in ad.list()
+                      if r.get("title") == seat_name and r.get("handle")]
+        except Exception as e:
+            would.append("(pane scan failed: %s)" % e)
+    print("  reap:  " + ("; ".join(would) or "none (no stale same-name seat)"))
+    print("  mint:  refresh %s (child-stamp stripped => persistence ON, "
+          "--dangerously canonical, skills linked, hooks wired)" % launch_sh)
+    q = shlex.quote(launch_sh)
+    if ad is None:
+        print("  harness: headless (no metaharness detected — the standalone "
+              "default)")
+        print("  spawn: detached setsid: %s '<onboarding>'  "
+              "(stdin /dev/null, log %s)" % (q, os.path.join(d, "spawn.log")))
+        print("  onboard: delivered AT LAUNCH as the claude first-prompt "
+              "positional arg")
+    else:
+        print("  harness: " + ad.name)
+        print("  spawn: %s.spawn(command=%s, title=%s, cwd=%s) -> <handle>"
+              % (ad.name, q, seat_name, cwd))
+        print("  onboard: %s.send(<handle>, <onboarding>, enter=True)"
+              % ad.name)
+    print("  register: %s {harness, %s, worktree=%s, room=%s}"
+          % (_spawn_path(d), "pid" if ad is None else "handle", cwd,
+             room or "main"))
+    print("  onboarding first-prompt:\n    " + onboard)
+    return 0
+
+
+def _spawn(seat_name, rest):
+    """seat spawn <seat> [--room R] [--cwd DIR] [--print] — see the section
+    comment above for the three paths + the common laws."""
+    family, err = _seat_family(seat_name)
+    if err:
+        print("helm seat: " + err, file=sys.stderr)
+        return 2
+    d = _instance_dir(family, seat_name)
+    launch_sh = os.path.join(d, "launch.sh")
+    if not os.path.exists(launch_sh) and \
+            not os.path.exists(os.path.join(seat_dir(family), "config.yaml")):
+        print("helm seat: no %s seat minted — `helm seat add %s` first, then "
+              "`helm seat spawn %s`" % (seat_name, family, seat_name),
+              file=sys.stderr)
+        return 1
+    room = rest[rest.index("--room") + 1] if "--room" in rest \
+        else _room_from_launch(launch_sh)
+    cwd = os.path.abspath(os.path.expanduser(rest[rest.index("--cwd") + 1])) \
+        if "--cwd" in rest else os.getcwd()
+    onboard = onboarding_prompt(seat_name, room)
+    from . import harness
+    ad = harness.detect()
+    if "--print" in rest or "--dry-run" in rest:
+        return _spawn_plan(seat_name, d, launch_sh, room, cwd, onboard, ad)
+    for note in _reap_stale(seat_name, d, ad):
+        print("  " + note)
+    # mint hygiene AFTER the reap (a stale pane's sh may still be reading the
+    # old launch.sh — the resume-verb ordering law), workdir=cwd so the trust
+    # seed covers where the seat will actually run.
+    _write_launch_assets(family, d, room, seat_name, workdir=cwd)
+    if os.path.exists(os.path.join(seat_dir(family), "config.yaml")) \
+            and not _running_pid(family):
+        if _up(family, quiet=True) == 0:
+            print("  (proxy was down — auto-started)")
+        else:
+            print("helm seat: WARN — %s proxy not running and auto-start "
+                  "failed; the seat errors until `helm seat up %s`"
+                  % (family, family), file=sys.stderr)
+    from . import pk
+    rec = {"v": 1, "seat": seat_name, "worktree": cwd, "room": room or "main",
+           "launch_sh": launch_sh, "ts": pk.now_ts()}
+    if ad is None:
+        try:
+            pid = _headless_spawn(launch_sh, onboard, cwd,
+                                  os.path.join(d, "spawn.log"))
+        except OSError as e:
+            print("helm seat: headless spawn failed: %s" % e, file=sys.stderr)
+            return 1
+        rec.update(harness="headless", pid=pid)
+        _register_spawn(seat_name, d, rec)
+        print("helm seat: spawned %s HEADLESS (pid %d, detached; log %s) — "
+              "onboarding rides as its first prompt (beacon-arm + @%s work); "
+              "`helm seat where %s` resolves it"
+              % (seat_name, pid, os.path.join(d, "spawn.log"), seat_name,
+                 seat_name))
+        return 0
+    try:
+        handle = ad.spawn(shlex.quote(launch_sh), title=seat_name, cwd=cwd)
+        try:
+            delay = float(home.env("SPAWN_SEND_DELAY", SPAWN_SEND_DELAY_S))
+        except (TypeError, ValueError):
+            delay = SPAWN_SEND_DELAY_S
+        if delay > 0:            # let claude reach its composer before the
+            time.sleep(delay)    # onboarding keystrokes land
+        ad.send(handle, onboard, enter=True)
+    except harness.HarnessError as e:
+        print("helm seat: %s spawn via %s failed: %s"
+              % (seat_name, ad.name, e), file=sys.stderr)
+        return 1
+    rec.update(harness=ad.name, handle=handle)
+    _register_spawn(seat_name, d, rec)
+    print("helm seat: spawned %s via %s — pane %s; onboarding sent "
+          "(beacon-arm + @%s work); `helm seat where %s` resolves it"
+          % (seat_name, ad.name, handle, seat_name, seat_name))
+    return 0
+
+
+def _where(seat_name, rest):
+    """seat where <seat> — resolve the spawn register: harness, handle/pid,
+    worktree, room, and a liveness probe (headless: the pid; pane: the handle
+    still listed by the SAME detected metaharness). The record is what a
+    reaper needs; `helm seat spawn <seat>` reaps-then-replaces it."""
+    family, err = _seat_family(seat_name)
+    if err:
+        print("helm seat: " + err, file=sys.stderr)
+        return 2
+    d = _instance_dir(family, seat_name)
+    rec = _spawn_record(d)
+    if rec is None:
+        print("helm seat: no spawn record for %s (%s missing) — `helm seat "
+              "spawn %s` registers one" % (seat_name, _spawn_path(d),
+                                           seat_name), file=sys.stderr)
+        return 1
+    alive = None
+    if rec.get("harness") == "headless":
+        alive = _pid_alive(rec.get("pid"))
+    else:
+        from . import harness
+        ad = harness.detect()
+        if ad is not None and ad.name == rec.get("harness"):
+            try:
+                alive = any(r.get("handle") == rec.get("handle")
+                            for r in ad.list())
+            except harness.HarnessError:
+                alive = None    # adapter trouble: report, never guess
+    if "--json" in rest:
+        print(json.dumps(dict(rec, alive=alive), indent=2, sort_keys=True))
+        return 0
+    ref = ("pid %s" % rec.get("pid")) if rec.get("harness") == "headless" \
+        else ("handle %s" % rec.get("handle"))
+    state = {True: "LIVE", False: "GONE (helm seat spawn %s respawns)"
+             % seat_name}.get(alive, "unverified (metaharness %r not "
+                              "detected here)" % rec.get("harness"))
+    print("%s: %s %s — %s; worktree %s, room %s, spawned %s"
+          % (seat_name, rec.get("harness"), ref, state, rec.get("worktree"),
+             rec.get("room"), rec.get("ts")))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # list / status / doctor
 # ---------------------------------------------------------------------------
 
@@ -1277,7 +1567,8 @@ def _doctor(args):
 # ---------------------------------------------------------------------------
 
 def cmd_seat(args):
-    """seat add|up|down|launch|resume|smoke|list|status|doctor — multimodel seats."""
+    """seat add|up|down|launch|spawn|where|resume|smoke|list|status|doctor —
+    multimodel seats."""
     args = list(args)
     if not args:
         print(_USAGE, file=sys.stderr)
@@ -1287,6 +1578,17 @@ def cmd_seat(args):
         return _status(rest)
     if verb == "doctor":
         return _doctor(rest)
+    if verb == "spawn":
+        if not rest:
+            print("usage: helm seat spawn <seat> [--room R] [--cwd DIR] "
+                  "[--print]", file=sys.stderr)
+            return 2
+        return _spawn(rest[0], rest[1:])
+    if verb == "where":
+        if not rest:
+            print("usage: helm seat where <seat> [--json]", file=sys.stderr)
+            return 2
+        return _where(rest[0], rest[1:])
     if verb == "resume":
         if not rest:
             print("usage: helm seat resume <seat>", file=sys.stderr)
