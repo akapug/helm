@@ -36,8 +36,14 @@ class ChatBase(unittest.TestCase):
         # SET-BUT-EMPTY disables the signed transport — v1 behavior, hermetic
         # even when a real room node is live on this machine
         os.environ["HELM_CHAT_NODE_URL"] = ""
+        # cwd hermeticity: the default room resolves through seats.
+        # resolve_homing, which derives a project room from a git cwd — run
+        # from tmp (not the helm checkout) so defaults stay 'main'
+        self.cwd_prior = os.getcwd()
+        os.chdir(self.tmp)
 
     def tearDown(self):
+        os.chdir(self.cwd_prior)
         for k, v in self.env_prior.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -183,6 +189,33 @@ class CmdTest(ChatBase):
         self.assertEqual(chat.read("main"), ([], 0))
         rc, out, _ = self.run_cmd(["read", "--room", "ops"])
         self.assertIn("sidebar", out)
+
+    def test_default_io_consumes_the_one_homing_resolver(self):
+        """The roster-scatter hole codex probed: the SessionStart join homed
+        the seat to its project room (seats.resolve_homing, cwd-derived), but
+        a no---room `helm chat post` privately defaulted to env-or-'main' and
+        wrote ZERO rows to that home. Default chat I/O now consumes the SAME
+        resolver: post and read land in the derived project room; --room
+        still wins; a project-less cwd (the base-class chdir) keeps main."""
+        import subprocess
+        from helm import seats
+        repo = os.path.join(self.tmp, "proj-a")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True,
+                       capture_output=True)
+        home_room = seats.derive_home_room(repo)
+        self.assertIsNotNone(home_room)         # the join's answer, one truth
+        os.chdir(repo)
+        rc, out, _ = self.run_cmd(["post", "to", "my", "home"])
+        self.assertEqual(rc, 0)
+        self.assertIn("[%s]" % home_room, out)
+        self.assertEqual(chat.read("main"), ([], 0))    # zero rows to main
+        self.assertEqual(chat.read(home_room)[1], 1)    # the home room got it
+        rc, out, _ = self.run_cmd(["read"])             # default read: home too
+        self.assertIn("to my home", out)
+        self.assertEqual(
+            self.run_cmd(["post", "aside", "--room", "main"])[0], 0)
+        self.assertEqual(chat.read("main")[1], 1)       # --room still beats
 
     def test_env_room_homes_the_default(self):
         """Team-room homing (slice 3): HELM_CHAT_ROOM re-homes every no---room

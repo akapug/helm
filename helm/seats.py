@@ -539,15 +539,15 @@ def write_roster(seat, session=None, cwd=None, home_room=None,
             row["home_room_source"] = "explicit"
         elif home_room:
             # derived — or UNLABELED (provenance unknown reads as derived, the
-            # weakest tier): fills a never-homed row or follows a still-derived
-            # one; it can never overwrite an explicit/operator home or clear,
-            # so a re-join/resume/mirror never downgrades a deliberate home.
+            # weakest tier): fills a never-homed row or follows a derived-tier
+            # one — and an EXISTING home with no source IS derived-tier, so it
+            # follows too (a pre-upgrade row {home: main, source: None} must
+            # not freeze its stale scattered value against every later derived
+            # join). It can never overwrite an explicit/operator home or
+            # clear, so a re-join/resume/mirror never downgrades a deliberate
+            # home.
             old, source = row.get("home_room"), row.get("home_room_source")
-            if source == "derived" and home_room != old:
-                _baseline_rooms(
-                    seat, row, _rooms_to_baseline(old, home_room))
-                row["home_room"] = home_room
-            elif not old and not source:
+            if source in (None, "derived") and home_room != old:
                 _baseline_rooms(
                     seat, row, _rooms_to_baseline(old, home_room))
                 row["home_room"] = home_room

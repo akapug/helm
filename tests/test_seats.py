@@ -2417,6 +2417,31 @@ class HomingOneTruthTest(SeatsBase):
                            home_room_source="derived")          # labeled derived
         self.assertEqual(seats.roster()["pinned"]["home_room"], "team-a")
 
+    def test_pre_upgrade_unlabeled_home_takes_the_weakest_tier(self):
+        """codex's exact probe row: {home_room: 'main', home_room_source:
+        None} — write_roster's contract says an unlabeled existing home reads
+        as DERIVED, but the old branches only moved a labeled-derived or
+        never-homed row, so the stale scattered value froze forever. An
+        unlabeled home now follows a derived join and loses to every labeled
+        writer."""
+        repo = self._repo("proj-b")
+        r = seats.roster()
+        r["legacy"] = {"home_room": "main"}       # pre-upgrade, no source
+        pk.write_json(seats.roster_path(), r)
+        seats.join(session="s-l", seat="legacy", cwd=repo)   # a derived join
+        row = seats.roster()["legacy"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("proj-b", "derived"))   # unfrozen, labeled honestly
+        # …and the unlabeled tier loses to a labeled explicit writer too
+        r = seats.roster()
+        r["legacy2"] = {"home_room": "main"}
+        pk.write_json(seats.roster_path(), r)
+        seats.write_roster("legacy2", home_room="team-e",
+                           home_room_source="explicit")
+        row = seats.roster()["legacy2"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("team-e", "explicit"))
+
     def test_operator_rehome_survives_derived_rejoin_and_mirror(self):
         repo = self._repo()
         seats.join(session="s-op", seat="oper", cwd=repo)

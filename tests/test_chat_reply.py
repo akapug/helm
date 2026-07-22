@@ -35,8 +35,13 @@ class ReplyBase(unittest.TestCase):
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""   # hermetic: no signing probe
+        # cwd hermeticity: the default room derives from a git cwd
+        # (seats.resolve_homing) — run from tmp so defaults stay 'main'
+        self.cwd_prior = os.getcwd()
+        os.chdir(self.tmp)
 
     def tearDown(self):
+        os.chdir(self.cwd_prior)
         for k, v in self.env_prior.items():
             if v is None:
                 os.environ.pop(k, None)

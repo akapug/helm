@@ -35,6 +35,10 @@ class TestWebChat(unittest.TestCase):
         os.environ["HELM_HOME"] = os.path.join(cls.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(cls.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""  # transport off — hermetic v1
+        # cwd hermeticity: the CLI default room derives from a git cwd
+        # (seats.resolve_homing) — run from tmp so defaults stay 'main'
+        cls.cwd_prior = os.getcwd()
+        os.chdir(cls.tmp)
         cls.srv = web.make_server(0)  # ephemeral port
         cls.port = cls.srv.server_address[1]
         cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
@@ -45,6 +49,7 @@ class TestWebChat(unittest.TestCase):
         cls.srv.shutdown()
         cls.srv.server_close()
         cls.thread.join(timeout=5)
+        os.chdir(cls.cwd_prior)
         for k, v in cls.env_prior.items():
             if v is None:
                 os.environ.pop(k, None)

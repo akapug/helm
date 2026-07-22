@@ -341,6 +341,40 @@ class AdapterSpawnTest(SpawnBase):
         self.assertEqual((row["home_room"], row["home_room_source"]),
                          ("team-ops", "explicit"))  # never downgraded
 
+    def test_spawn_remint_carries_derived_provenance_into_the_script(self):
+        """The provenance-laundering hole (codex): _spawn recovered
+        room_source from the old launch.sh, then dropped it at
+        _write_launch_assets — the reminted script carried
+        HELM_CHAT_ROOM=proj-x with NO HELM_CHAT_ROOM_SOURCE=derived, so the
+        child's SessionStart join upgraded derived to explicit and could
+        overwrite an operator-set home. NON-VACUOUS: asset writing is NOT
+        mocked here — read the ACTUAL reminted launch.sh and assert the
+        derived stamp survives the round trip (fails without the
+        room_source= thread)."""
+        d = seat._instance_dir("codex", "codex")
+        os.makedirs(d, exist_ok=True)
+        launch = os.path.join(d, "launch.sh")
+        with open(launch, "w") as f:
+            f.write("#!/bin/sh\nexec env FAKE=1 HELM_CHAT_ROOM=proj-x "
+                    "HELM_CHAT_ROOM_SOURCE=derived "
+                    "CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol claude \"$@\"\n")
+        os.chmod(launch, 0o700)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(harness, "detect",
+                               return_value=FakeAdapter()), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["spawn", "codex"])
+        self.assertEqual(rc, 0, err.getvalue())
+        with open(launch) as f:
+            text = f.read()
+        self.assertIn("HELM_CHAT_ROOM=proj-x", text)
+        self.assertIn("HELM_CHAT_ROOM_SOURCE=derived", text)
+        # and the recovery seam reads the reminted pair back unchanged —
+        # the NEXT spawn/resume sees derived too, not a laundered explicit
+        self.assertEqual(seat._homing_from_launch(launch),
+                         ("proj-x", "derived"))
+
     def test_spawn_remints_legacy_launch_before_adapter_launch(self):
         """A pre-child-stamp launch.sh must be replaced from current code
         before the adapter starts it, or the child is born MEMORY-ONLY."""

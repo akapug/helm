@@ -1598,7 +1598,11 @@ def _spawn(seat_name, rest, _locked=False):
     # mint hygiene AFTER the reap (a stale pane's sh may still be reading the
     # old launch.sh — the resume-verb ordering law), workdir=cwd so the trust
     # seed covers where the seat will actually run.
-    _write_launch_assets(family, d, room, seat_name, workdir=cwd, multi=multi)
+    # room_source rides INTO the re-minted script (HELM_CHAT_ROOM_SOURCE):
+    # dropping it here laundered a derived room to explicit — the child's
+    # SessionStart join then outranked (and overwrote) an operator-set home.
+    _write_launch_assets(family, d, room, seat_name, workdir=cwd,
+                         room_source=room_source, multi=multi)
     if os.path.exists(os.path.join(seat_dir(family), "config.yaml")) \
             and not _running_pid(family):
         if _up(family, quiet=True) == 0:
