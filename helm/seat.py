@@ -246,6 +246,38 @@ def _pid_alive(pid):
         return True
 
 
+def _pid_identity(pid):
+    """Stable process-birth identity used to distinguish a spawned seat from a
+    later process that reused its pid. Linux /proc starttime is preferred; ps
+    keeps the guard useful on other Unix hosts. None means unverifiable."""
+    try:
+        with open("/proc/%d/stat" % int(pid)) as f:
+            tail = f.read().rpartition(") ")[2].split()
+        return "proc:%s" % tail[19] if len(tail) > 19 else None
+    except (OSError, TypeError, ValueError):
+        pass
+    try:
+        p = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))],
+                           capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
+        return None
+    started = p.stdout.strip()
+    return "ps:%s" % started if p.returncode == 0 and started else None
+
+
+def _recorded_pid_alive(rec):
+    """True only when the recorded headless process is still the same process;
+    False when gone/reused, None when a live pid cannot be authenticated."""
+    pid = (rec or {}).get("pid")
+    if not _pid_alive(pid):
+        return False
+    expected = (rec or {}).get("pid_identity")
+    actual = _pid_identity(pid)
+    if expected is None or actual is None:
+        return None
+    return actual == expected
+
+
 def _running_pid(family):
     """The live proxy pid from the seat's pidfile, else None."""
     try:
@@ -1208,6 +1240,18 @@ def _multi_from_launch(path):
         return False
 
 
+def _multi_from_launch(path):
+    """Recover the seat's mixed-model shape from launch.sh. --multi's durable
+    marker is the ABSENCE of the blunt CLAUDE_CODE_SUBAGENT_MODEL pin; every
+    single-model launch assigns it. Missing/unreadable assets default safely to
+    the normal pinned shape."""
+    try:
+        with open(path) as f:
+            return "CLAUDE_CODE_SUBAGENT_MODEL=" not in f.read()
+    except OSError:
+        return False
+
+
 def _resume(seat_name, rest):
     """seat resume <seat> — relaunch the seat's pane at its drain point via
     the detected metaharness: the pane runs the seat's freshly re-minted
@@ -1326,34 +1370,75 @@ def _spawn_record(d):
 
 
 def _reap_stale(seat_name, d, ad):
-    """Dup-name reap, BOTH legs (a prior bare same-name seat must die before
-    its replacement spawns — the exact live bug): (a) a recorded HEADLESS pid
-    still alive gets SIGTERM→SIGKILL; (b) any same-titled pane in the detected
-    metaharness is closed via the seam. Returns note lines; best-effort loud —
-    a failed reap is reported, never silently skipped."""
-    notes = []
+    """Dup-name reap, BOTH legs. Returns (notes, errors): a replacement must
+    never launch after a known same-name process failed to close. Recorded
+    headless pids are birth-identity checked so pid reuse cannot kill an
+    unrelated process."""
+    notes, errors = [], []
     rec = _spawn_record(d)
     pid = (rec or {}).get("pid")
-    if (rec or {}).get("harness") == "headless" and pid and _pid_alive(pid):
+    if (rec or {}).get("harness") == "headless" and pid:
+        live = _recorded_pid_alive(rec)
+        if live is None:
+            errors.append("stale headless %s pid %s is live but its process "
+                          "identity is unverifiable; refusing to kill it"
+                          % (seat_name, pid))
+        elif live:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                for _ in range(15):
+                    if _recorded_pid_alive(rec) is not True:
+                        break
+                    time.sleep(0.2)
+                if _recorded_pid_alive(rec) is True:
+                    os.kill(pid, signal.SIGKILL)
+                    for _ in range(10):
+                        if _recorded_pid_alive(rec) is not True:
+                            break
+                        time.sleep(0.1)
+                if _recorded_pid_alive(rec) is True:
+                    errors.append("stale headless %s pid %s survived SIGKILL"
+                                  % (seat_name, pid))
+                else:
+                    notes.append("reaped stale headless %s (pid %d)"
+                                 % (seat_name, pid))
+            except OSError as e:
+                errors.append("stale headless %s pid %s NOT reaped (%s)"
+                              % (seat_name, pid, e))
+    adapters = [ad] if ad is not None else []
+    recorded_harness = (rec or {}).get("harness")
+    if recorded_harness not in (None, "headless") and \
+            all(a.name != recorded_harness for a in adapters):
+        from . import harness
+        cls = harness.ADAPTERS.get(recorded_harness)
+        path = shutil.which(cls.bin) if cls else None
+        if path:
+            adapters.append(cls(path))
+        else:
+            errors.append("recorded %s pane %s cannot be checked or reaped: "
+                          "the %s CLI is unavailable"
+                          % (recorded_harness, (rec or {}).get("handle"),
+                             recorded_harness))
+    for adapter in adapters:
         try:
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(15):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.2)
-            if _pid_alive(pid):
-                os.kill(pid, signal.SIGKILL)
-            notes.append("reaped stale headless %s (pid %d)" % (seat_name, pid))
-        except OSError as e:
-            notes.append("stale headless %s pid %s NOT reaped (%s)"
-                         % (seat_name, pid, e))
-    if ad is not None:
-        for row in ad.list():
-            if row.get("title") == seat_name and row.get("handle"):
-                ad.stop(row["handle"])
+            rows = adapter.list()
+        except Exception as e:
+            errors.append("%s pane scan failed (%s)" % (adapter.name, e))
+            rows = []
+        for row in rows:
+            handle = row.get("handle")
+            recorded = adapter.name == recorded_harness and \
+                handle == (rec or {}).get("handle")
+            if not handle or (row.get("title") != seat_name and not recorded):
+                continue
+            try:
+                adapter.stop(handle)
                 notes.append("reaped stale %s pane %s"
                              % (seat_name, row["handle"]))
-    return notes
+            except Exception as e:
+                errors.append("stale %s pane %s NOT reaped (%s)"
+                              % (seat_name, row["handle"], e))
+    return notes, errors
 
 
 def _headless_spawn(launch_sh, onboarding, cwd, log_path):
@@ -1370,12 +1455,16 @@ def _headless_spawn(launch_sh, onboarding, cwd, log_path):
 
 
 def _register_spawn(seat_name, d, rec):
-    """The roster register: spawn.json in the seat's own dir (durable, any
-    agent can read it through `helm seat where`) + a best-effort chat-roster
-    mirror so the fleet surfaces (helm chat seats, the web panel) show the
-    seat's worktree/room before its first session even joins."""
+    """Write the authoritative spawn.json, then its best-effort roster mirror.
+    False means the spawn must be torn back down: an unregistered headless
+    process cannot be found safely for the next duplicate-name reap."""
     from . import pk
-    pk.write_json(_spawn_path(d), rec)
+    try:
+        pk.write_json(_spawn_path(d), rec)
+    except OSError as e:
+        print("helm seat: spawn register write failed (%s): %s"
+              % (_spawn_path(d), e), file=sys.stderr)
+        return False
     try:
         from . import seats as _seats
         _seats.write_roster(seat_name, cwd=rec.get("worktree"),
@@ -1383,6 +1472,7 @@ def _register_spawn(seat_name, d, rec):
     except Exception as e:
         print("helm seat: chat-roster mirror skipped (%s) — spawn.json is "
               "still authoritative for `helm seat where`" % e, file=sys.stderr)
+    return True
 
 
 def _spawn_plan(seat_name, d, launch_sh, room, cwd, onboard, ad):
@@ -1392,10 +1482,14 @@ def _spawn_plan(seat_name, d, launch_sh, room, cwd, onboard, ad):
           "re-minted):" % seat_name)
     rec = _spawn_record(d)
     would = []
-    if (rec or {}).get("harness") == "headless" and rec.get("pid") \
-            and _pid_alive(rec["pid"]):
-        would.append("kill stale headless pid %d (SIGTERM, then SIGKILL)"
-                     % rec["pid"])
+    if (rec or {}).get("harness") == "headless" and rec.get("pid"):
+        live = _recorded_pid_alive(rec)
+        if live:
+            would.append("kill stale headless pid %d (SIGTERM, then SIGKILL)"
+                         % rec["pid"])
+        elif live is None:
+            would.append("REFUSE live headless pid %d: process identity "
+                         "unverifiable" % rec["pid"])
     if ad is not None:
         try:
             would += ["%s stop pane %s" % (ad.name, r["handle"])
@@ -1427,9 +1521,35 @@ def _spawn_plan(seat_name, d, launch_sh, room, cwd, onboard, ad):
     return 0
 
 
-def _spawn(seat_name, rest):
+def _spawn_args(rest):
+    """Parse spawn's small option surface without letting a missing value raise
+    IndexError or an unknown flag silently change the launch."""
+    room, cwd, dry_run = None, os.getcwd(), False
+    i = 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg in ("--print", "--dry-run"):
+            dry_run = True
+            i += 1
+            continue
+        if arg not in ("--room", "--cwd"):
+            return None, "unknown option %s" % arg
+        if i + 1 >= len(rest) or rest[i + 1].startswith("--"):
+            return None, "%s wants a value" % arg
+        value = rest[i + 1]
+        if arg == "--room":
+            room = value
+        else:
+            cwd = os.path.abspath(os.path.expanduser(value))
+        i += 2
+    return (room, cwd, dry_run), None
+
+
+def _spawn(seat_name, rest, _locked=False):
     """seat spawn <seat> [--room R] [--cwd DIR] [--print] — see the section
-    comment above for the three paths + the common laws."""
+    comment above for the three paths + the common laws. Live replacements are
+    serialized per seat so concurrent callers cannot both reap an empty slot,
+    launch duplicates, and race the one spawn.json register."""
     family, err = _seat_family(seat_name)
     if err:
         print("helm seat: " + err, file=sys.stderr)
@@ -1442,21 +1562,38 @@ def _spawn(seat_name, rest):
               "`helm seat spawn %s`" % (seat_name, family, seat_name),
               file=sys.stderr)
         return 1
-    room = rest[rest.index("--room") + 1] if "--room" in rest \
-        else _room_from_launch(launch_sh)
-    cwd = os.path.abspath(os.path.expanduser(rest[rest.index("--cwd") + 1])) \
-        if "--cwd" in rest else os.getcwd()
+    parsed, arg_err = _spawn_args(rest)
+    if arg_err:
+        print("helm seat: %s; usage: helm seat spawn <seat> [--room R] "
+              "[--cwd DIR] [--print]" % arg_err, file=sys.stderr)
+        return 2
+    room, cwd, dry_run = parsed
+    room = room if room is not None else _room_from_launch(launch_sh)
+    multi = _multi_from_launch(launch_sh)
     onboard = onboarding_prompt(seat_name, room)
     from . import harness
     ad = harness.detect()
-    if "--print" in rest or "--dry-run" in rest:
+    if dry_run:
         return _spawn_plan(seat_name, d, launch_sh, room, cwd, onboard, ad)
-    for note in _reap_stale(seat_name, d, ad):
+    if not _locked:
+        import fcntl
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        with open(os.path.join(d, ".spawn.lock"), "a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            return _spawn(seat_name, rest, _locked=True)
+    notes, reap_errors = _reap_stale(seat_name, d, ad)
+    for note in notes:
         print("  " + note)
+    if reap_errors:
+        for error in reap_errors:
+            print("helm seat: " + error, file=sys.stderr)
+        print("helm seat: replacement aborted; resolve the stale same-name seat "
+              "before retrying", file=sys.stderr)
+        return 1
     # mint hygiene AFTER the reap (a stale pane's sh may still be reading the
     # old launch.sh — the resume-verb ordering law), workdir=cwd so the trust
     # seed covers where the seat will actually run.
-    _write_launch_assets(family, d, room, seat_name, workdir=cwd)
+    _write_launch_assets(family, d, room, seat_name, workdir=cwd, multi=multi)
     if os.path.exists(os.path.join(seat_dir(family), "config.yaml")) \
             and not _running_pid(family):
         if _up(family, quiet=True) == 0:
@@ -1475,14 +1612,24 @@ def _spawn(seat_name, rest):
         except OSError as e:
             print("helm seat: headless spawn failed: %s" % e, file=sys.stderr)
             return 1
-        rec.update(harness="headless", pid=pid)
-        _register_spawn(seat_name, d, rec)
+        rec.update(harness="headless", pid=pid,
+                   pid_identity=_pid_identity(pid))
+        if not _register_spawn(seat_name, d, rec):
+            try:
+                if rec["pid_identity"] is None or \
+                        _recorded_pid_alive(rec) is True:
+                    os.kill(pid, signal.SIGTERM)
+            except OSError as e:
+                print("helm seat: WARNING — unregistered headless pid %d could "
+                      "not be stopped: %s" % (pid, e), file=sys.stderr)
+            return 1
         print("helm seat: spawned %s HEADLESS (pid %d, detached; log %s) — "
               "onboarding rides as its first prompt (beacon-arm + @%s work); "
               "`helm seat where %s` resolves it"
               % (seat_name, pid, os.path.join(d, "spawn.log"), seat_name,
                  seat_name))
         return 0
+    handle = None
     try:
         handle = ad.spawn(shlex.quote(launch_sh), title=seat_name, cwd=cwd)
         try:
@@ -1493,11 +1640,25 @@ def _spawn(seat_name, rest):
             time.sleep(delay)    # onboarding keystrokes land
         ad.send(handle, onboard, enter=True)
     except harness.HarnessError as e:
-        print("helm seat: %s spawn via %s failed: %s"
-              % (seat_name, ad.name, e), file=sys.stderr)
+        cleanup = ""
+        if handle:
+            try:
+                ad.stop(handle)
+                cleanup = "; incomplete pane %s closed" % handle
+            except harness.HarnessError as stop_err:
+                cleanup = "; WARNING incomplete pane %s not closed: %s" \
+                    % (handle, stop_err)
+        print("helm seat: %s spawn via %s failed: %s%s"
+              % (seat_name, ad.name, e, cleanup), file=sys.stderr)
         return 1
     rec.update(harness=ad.name, handle=handle)
-    _register_spawn(seat_name, d, rec)
+    if not _register_spawn(seat_name, d, rec):
+        try:
+            ad.stop(handle)
+        except harness.HarnessError as e:
+            print("helm seat: WARNING — unregistered pane %s could not be "
+                  "closed: %s" % (handle, e), file=sys.stderr)
+        return 1
     print("helm seat: spawned %s via %s — pane %s; onboarding sent "
           "(beacon-arm + @%s work); `helm seat where %s` resolves it"
           % (seat_name, ad.name, handle, seat_name, seat_name))
@@ -1509,6 +1670,9 @@ def _where(seat_name, rest):
     worktree, room, and a liveness probe (headless: the pid; pane: the handle
     still listed by the SAME detected metaharness). The record is what a
     reaper needs; `helm seat spawn <seat>` reaps-then-replaces it."""
+    if any(arg != "--json" for arg in rest) or rest.count("--json") > 1:
+        print("usage: helm seat where <seat> [--json]", file=sys.stderr)
+        return 2
     family, err = _seat_family(seat_name)
     if err:
         print("helm seat: " + err, file=sys.stderr)
@@ -1522,7 +1686,7 @@ def _where(seat_name, rest):
         return 1
     alive = None
     if rec.get("harness") == "headless":
-        alive = _pid_alive(rec.get("pid"))
+        alive = _recorded_pid_alive(rec)
     else:
         from . import harness
         ad = harness.detect()
