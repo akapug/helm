@@ -10,6 +10,7 @@ import inspect
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -41,14 +42,12 @@ class FleetRowsTest(unittest.TestCase):
         census = {r["pid"]: r for r in census}
         daemons = dict(daemons)
         daemon_for = daemon_for or (
-            lambda pid, ds: (("daemon", sorted(ds)[0]) if ds
-                             else ("headless", None)))
+            lambda pid, ds, unproven: (("daemon", sorted(ds)[0]) if ds
+                                       else ("headless", None)))
         return [
-            mock.patch.object(fleet, "_claude_pids",
-                              lambda: sorted(set(envs) | set(census))),
             mock.patch.object(fleet, "_census", lambda: census),
             mock.patch.object(fleet, "_daemon_pids",
-                              lambda: (daemons, daemons_failed)),
+                              lambda: (daemons, set(), daemons_failed)),
             mock.patch.object(fleet, "_environ", lambda pid: envs.get(pid)),
             mock.patch.object(fleet, "_daemon_for", daemon_for),
             mock.patch.object(fleet, "_roster", lambda: roster),
@@ -101,7 +100,7 @@ class FleetRowsTest(unittest.TestCase):
             calls["n"] += 1
             return {}
         ps = self._wire({1: {}, 2: {}}, [srow(1), srow(2)])
-        ps[3] = mock.patch.object(fleet, "_environ", envs)
+        ps[2] = mock.patch.object(fleet, "_environ", envs)
         for p in ps:
             p.start()
         try:
@@ -126,13 +125,28 @@ class FleetRowsTest(unittest.TestCase):
         self.assertIn("failed probes, not absence", out)
 
     def test_roster_exception_surfaces_as_roster_error(self):
-        rows, _ = self._rows({6: {}}, [srow(6)], roster=({}, True))
+        rows, _ = self._rows({6: {}}, [srow(6, root="/r")], roster=({}, True))
         self.assertEqual((rows[0]["seat"], rows[0]["seat_src"]),
                          (None, "roster-error"))
+        # round-2 finding 4: a failed roster probe is a row-level UNKNOWN —
+        # the JSON bit must agree with the footer, and the render must never
+        # claim the affirmative '(no seat)' fact
+        self.assertTrue(rows[0]["unknown"])
+        out = self._render({6: {}}, [srow(6, root="/r")], roster=({}, True))
+        self.assertNotIn("(no seat)", out)
+        self.assertIn("UNKNOWN columns", out)
         # a readable env with a seat name still wins over a broken roster
         rows, _ = self._rows({6: {"HELM_CHAT_NAME": "s"}}, [srow(6)],
                              roster=({}, True))
         self.assertEqual(rows[0]["seat_src"], "env")
+
+    def test_probed_empty_roster_is_a_fact_not_unknown(self):
+        # the affirmative counterpart: roster probe SUCCEEDED and holds no
+        # seat -> '(no seat)' renders and the row is not unknown
+        census = [srow(6, SID_A, "declared", root="/r")]
+        rows, _ = self._rows({6: {}}, census, roster=({}, False))
+        self.assertFalse(rows[0]["unknown"])
+        self.assertIn("(no seat)", self._render({6: {}}, census))
 
 
 class SidDelegationTest(FleetRowsTest):
@@ -149,11 +163,14 @@ class SidDelegationTest(FleetRowsTest):
 
     def test_fleet_source_rederives_no_sid_or_config_parsing(self):
         # the design law, pinned at the source level: fleet may CALL the
-        # census; the private sid/config helpers it once spliced are gone
+        # census; the private sid/config helpers it once spliced are gone,
+        # and (round-2 finding 1) so are the second comm scan and the
+        # unbracketed /proc cwd re-read
         src = inspect.getsource(fleet)
         for banned in ("_proc_snapshot", "_session_record", "_resume_sid",
                        "_sid_for", "_sids_for", "argv~ancestor",
-                       "_config_root", "CLAUDE_CONFIG_DIR"):
+                       "_config_root", "CLAUDE_CONFIG_DIR",
+                       "_claude_pids", "glob", "readlink"):
             self.assertNotIn(banned, src, banned)
 
     def test_every_census_identity_maps_to_its_source_label(self):
@@ -181,19 +198,31 @@ class SidDelegationTest(FleetRowsTest):
         self.assertIn("DOUBLE-OPEN", out)
         self.assertIn("live in MULTIPLE pids", out)
 
-    def test_pid_absent_from_census_is_unknown_not_a_blank_fact(self):
-        # snapshot/generation-recheck failure = the pid never enters the
-        # census; fleet must render UNKNOWN, not an unresolved-looking fact
+    def test_rows_come_solely_from_the_census_no_second_scan(self):
+        # round-2 finding 1: a pid the census rejected (its generation
+        # recheck failed — no two reads cohere) must never be resurrected by
+        # a fleet-side comm scan and composed into a row of fictions
         rows, _ = self._rows({5: {}}, census=())
+        self.assertEqual(rows, [])
+
+    def test_census_none_cwd_is_never_re_read_from_proc(self):
+        # round-2 finding 1: census cwd=None means the BRACKETED probe
+        # failed. Use our OWN pid, whose /proc/<pid>/cwd is readable — a
+        # surviving unbracketed fallback would return a real path and clear
+        # the unknown bit; the row must stay '?' and UNKNOWN
+        pid = os.getpid()
+        census = [srow(pid, SID_A, "declared", root="/r", cwd=None)]
+        rows, _ = self._rows({pid: {}}, census)
+        self.assertEqual(rows[0]["cwd"], "?")
         self.assertTrue(rows[0]["unknown"])
-        self.assertIsNone(rows[0]["sid"])
 
     def test_failed_record_probe_reason_marks_row_unknown(self):
-        census = [srow(6, reason="record-replaced")]
+        census = [srow(6, reason="record-replaced", root="/r")]
         rows, _ = self._rows({6: {}}, census)
         self.assertTrue(rows[0]["unknown"])
         # an affirmative blank (record-missing) is NOT a failed probe
-        rows, _ = self._rows({6: {}}, [srow(6, reason="record-missing")])
+        rows, _ = self._rows({6: {}}, [srow(6, reason="record-missing",
+                                            root="/r")])
         self.assertFalse(rows[0]["unknown"])
 
 
@@ -213,6 +242,9 @@ class HomeColumnTest(FleetRowsTest):
         rows, _ = self._rows({8: {}}, [srow(8, reason="config-untrusted",
                                             root=None)])
         self.assertEqual(rows[0]["home"], "?")
+        # round-2 finding 4: home='?' is unproven evidence — the row-level
+        # bit must say so, not hand JSON consumers a false known-row bit
+        self.assertTrue(rows[0]["unknown"])
 
 
 class DaemonDetectionTest(unittest.TestCase):
@@ -253,11 +285,11 @@ class DaemonWalkTest(unittest.TestCase):
     runs; only the /proc probes are mocked."""
     DAEMON_ARGV = ["orca-ide", "/x/daemon-entry.js", "--socket", "/s"]
 
-    def _walk(self, tree, daemons, argv=None, start="111"):
+    def _walk(self, tree, daemons, argv=None, start="111", unproven=()):
         with mock.patch.object(fleet, "_stat_ppid", lambda p: tree.get(p)), \
              mock.patch.object(fleet, "_cmdline_argv", lambda p: argv), \
              mock.patch.object(session, "_proc_start", lambda p: start):
-            return fleet._daemon_for(7, daemons)
+            return fleet._daemon_for(7, daemons, set(unproven))
 
     def test_matching_incarnation_is_a_proven_daemon(self):
         self.assertEqual(self._walk({7: 99}, {99: "111"},
@@ -286,6 +318,95 @@ class DaemonWalkTest(unittest.TestCase):
         tree = {p: p + 1 for p in range(7, 40)}
         self.assertEqual(self._walk(tree, {}), ("unknown", None))
 
+    def test_walk_through_an_unproven_pid_is_unknown_never_headless(self):
+        # round-2 finding 2, exact probe: daemon-shaped 99 whose starttime
+        # read failed is UNPROVEN; child 7->99->1 must answer UNKNOWN, not
+        # walk through the maybe-daemon to init and claim proven HEADLESS
+        self.assertEqual(self._walk({7: 99, 99: 1}, {}, unproven={99}),
+                         ("unknown", None))
+
+    def test_unreadable_cmdline_ancestor_is_unknown(self):
+        # a hop whose cmdline could not be read cannot be ruled out as the
+        # daemon — headless is unprovable through it
+        self.assertEqual(self._walk({7: 42, 42: 1}, {}, unproven={42}),
+                         ("unknown", None))
+
+
+class DaemonScanTest(unittest.TestCase):
+    """codex round-2 finding 2: partial probe failures inside the daemon
+    scan must surface as UNPROVEN pids — never be silently dropped behind
+    scan_failed=False and later converted into a proven-HEADLESS absence.
+    The REAL _daemon_pids runs; only the /proc probes are mocked."""
+
+    def _scan(self, argvs, starts, listing=None):
+        names = [str(p) for p in argvs] if listing is None else listing
+        with mock.patch.object(fleet.os, "listdir", lambda p: names), \
+             mock.patch.object(fleet, "_cmdline_argv",
+                               lambda p: argvs.get(p)), \
+             mock.patch.object(session, "_proc_start",
+                               lambda p: starts.get(p)):
+            return fleet._daemon_pids()
+
+    DAEMON = ["orca-ide", "/x/daemon-entry.js", "--socket", "/s"]
+
+    def test_proven_daemon_is_bracketed_with_its_starttime(self):
+        self.assertEqual(self._scan({99: self.DAEMON}, {99: "111"}),
+                         ({99: "111"}, set(), False))
+
+    def test_daemon_shape_without_starttime_is_unproven_not_dropped(self):
+        # the review's exact probe: daemon argv recognized, _proc_start=None
+        # -> previously ({}, False); now the pid survives as UNPROVEN
+        self.assertEqual(self._scan({99: self.DAEMON}, {}),
+                         ({}, {99}, False))
+
+    def test_unreadable_cmdline_is_unproven_not_dropped(self):
+        self.assertEqual(self._scan({77: None}, {}), ({}, {77}, False))
+
+    def test_ordinary_processes_enter_neither_set(self):
+        self.assertEqual(self._scan({8: ["bash", "-c", "sleep 1"]}, {}),
+                         ({}, set(), False))
+
+    def test_failed_proc_listing_is_scan_failed(self):
+        with mock.patch.object(fleet.os, "listdir",
+                               mock.Mock(side_effect=OSError)):
+            self.assertEqual(fleet._daemon_pids(), ({}, set(), True))
+
+
+class OrcaTerminalsTest(unittest.TestCase):
+    """codex round-2 finding 3: a successful orca command returning valid
+    JSON of the WRONG SCHEMA is a failed probe (pane truth UNKNOWN) — never
+    an AttributeError that crashes the whole truth verb."""
+
+    def _terms(self, stdout, rc=0):
+        proc = subprocess.CompletedProcess([], rc, stdout=stdout, stderr="")
+        with mock.patch.object(fleet.subprocess, "run", return_value=proc):
+            return fleet._orca_terminals()
+
+    def test_top_level_list_is_failed_not_a_crash(self):
+        # the review's exact probe: stdout '[]' raised AttributeError before
+        self.assertEqual(self._terms("[]"), ([], True))
+
+    def test_wrong_shapes_are_failed_probes(self):
+        for stdout in ('{"result": []}', '{"result": {"terminals": {}}}',
+                       '{"result": {}}', '"ok"', "3",
+                       '{"result": {"terminals": [{"handle": "t"}, 3]}}'):
+            self.assertEqual(self._terms(stdout), ([], True), stdout)
+
+    def test_documented_shape_passes_through_verbatim(self):
+        terms = [{"handle": "t1", "worktreePath": "/w"}]
+        self.assertEqual(
+            self._terms('{"result": {"terminals": '
+                        '[{"handle": "t1", "worktreePath": "/w"}]}}'),
+            (terms, False))
+
+    def test_successful_empty_list_is_a_fact_not_a_failure(self):
+        self.assertEqual(self._terms('{"result": {"terminals": []}}'),
+                         ([], False))
+
+    def test_nonzero_exit_and_bad_json_are_failed(self):
+        self.assertEqual(self._terms("", rc=3), ([], True))
+        self.assertEqual(self._terms("not json"), ([], True))
+
 
 class UnknownPlumbingTest(FleetRowsTest):
     """codex finding 3 / codex-2 finding 2: a failed probe is UNKNOWN in the
@@ -293,7 +414,7 @@ class UnknownPlumbingTest(FleetRowsTest):
     owner-cannot-see claim."""
 
     def test_unprovable_host_renders_unknown_not_headless(self):
-        unk = lambda pid, ds: ("unknown", None)  # noqa: E731
+        unk = lambda pid, ds, unproven: ("unknown", None)  # noqa: E731
         census = [srow(3, SID_A, "declared", root="/r")]
         rows, _ = self._rows({3: {}}, census, daemon_for=unk)
         self.assertEqual(rows[0]["daemon_state"], "unknown")
@@ -312,7 +433,7 @@ class UnknownPlumbingTest(FleetRowsTest):
         self.assertNotIn("UNKNOWN columns", out)
 
     def test_daemon_scan_failure_makes_every_host_unknown(self):
-        boom = lambda pid, ds: self.fail("walk must not run")  # noqa: E731
+        boom = lambda p, ds, unp: self.fail("walk must not run")  # noqa: E731
         rows, _ = self._rows({3: {}}, [srow(3, SID_A, "declared", root="/r")],
                              daemons_failed=True, daemon_for=boom)
         self.assertEqual(rows[0]["daemon_state"], "unknown")
