@@ -1755,14 +1755,22 @@ everywhere; from inside a repo the root resolves itself.
   construction.
 - **`helm work list`** — the room board: lane, holder + remaining, dirty,
   ahead/behind the base, lock, path (registry ⋈ claims, computed).
-- **`helm work install-guard [--apply]`** — the ONE deterministic rail: a
-  ~25-line `post-checkout` hook for the shared main checkout. `checkout -b`
-  at the tip (`flag=1 ∧ prev==new`) HEALS pointer-only back to main — the
-  branch survives, the message names `helm work claim <branch>`; a real
-  content switch is alert-only, never touched. Lane rooms are unguarded;
-  `HELM_WORK_INTEGRATOR=1` is the escape hatch. Prints by default;
-  `--apply` installs (the integrator's coordinated step) and refuses to
-  clobber a foreign hook.
+- **`helm work install-guard [--apply]`** — the deterministic rail is a
+  composed `reference-transaction` + `post-checkout` pair in Git's effective
+  repo-local hooks directory. The transaction hook refuses shared-checkout
+  branch creation, switch/detach, non-fast-forward trunk movement, and
+  plumbing mutation/deletion of a branch occupied by another registered
+  worktree **before any ref changes**. The
+  checkout hook remains a pointer-only safety net for an otherwise-created
+  branch. Lane rooms may branch normally; commits on each room's own branch
+  remain legal. Existing executable hooks run first and are preserved
+  byte-for-byte (including symlinks and executable mode) as `.helm-user`
+  companions; non-executable hooks stay inactive. Installation is serialized,
+  per-file atomic, rolls the full pair back on partial failure, and is
+  idempotent. A repo-local `core.hooksPath` is honored; a path outside the
+  checkout/common git directory is refused rather than mutating shared or
+  foreign hooks. `HELM_WORK_INTEGRATOR=1` is the explicit override. Prints a
+  no-write plan by default; `--apply` installs.
 
 ```console
 $ helm work claim webui            # path  branch  lease  ttl — keep the lease
