@@ -524,15 +524,25 @@ def _room_lock(room):
             lf.close()
 
 
-def _append(row, room):
+def _append(row, room, idempotent=False):
     """ONE serialized write path for every room writer: id-stamp, append the
     whole row in one write, flush, then rotate — all under the room lock.
-    The stable per-row id is what delivery cursors key on (codex H5); rows
-    predating it (or hand-written) simply have no id and never match one."""
+    The stable per-row id is what delivery cursors key on (codex H5).  A caller
+    supplying an idempotency id gets compare-before-append semantics under the
+    same lock: retries return the one existing row; a payload collision fails
+    rather than silently aliasing two messages."""
     row.setdefault("id", os.urandom(6).hex())
     path = room_path(room)
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)  # dm/ lane
     with _room_lock(room):
+        if idempotent:
+            existing = next((r for r in read(room)[0]
+                             if r.get("id") == row["id"]), None)
+            if existing:
+                keys = ("from", "text", "dm", "reply_to")
+                if any(existing.get(k) != row.get(k) for k in keys):
+                    raise ValueError("chat idempotency id collision: %s" % row["id"])
+                return existing
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
@@ -588,7 +598,7 @@ def _parent_fields(room, ref):
 
 
 def post(text, room="main", who=None, profile=None, sign=None, origin=None,
-         dm=None, ambient=False, reply_to=None):
+         dm=None, ambient=False, reply_to=None, message_id=None):
     """Append one message; returns it. v2: shortcodes expand, and when the
     room node answers the digest rides a signed self-write turn FIRST — the
     row carries {turn, receipt, chain}. Node down -> plain v1 row (rendered
@@ -619,11 +629,17 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
     (plus rtext for a pre-id parent) and, when signed, a parent-bound digest.
     It changes NOTHING about who the
     message wakes — seats.deliverable never reads it, so a reply reaches
-    exactly what its text alone would have reached."""
+    exactly what its text alone would have reached.
+
+    `message_id` is the retry seam for compound operations such as `helm
+    dispatch send`: under the room lock the same id+payload returns the existing
+    row, while an id collision with different content raises."""
     _ensure_dir()
     from . import emoji
     text = emoji.expand(text)
     row = {"ts": pk.now_ts(), "from": who or whoname(), "text": text}
+    if message_id:
+        row["id"] = str(message_id)
     if dm:
         row["dm"] = dm
         room = dm_room(dm)
@@ -634,7 +650,8 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
     if reply_to:
         row.update(_parent_fields(room, reply_to))
     _touch_poster_presence(row["from"])
-    return _append(_signed_row(row, text, profile, sign), room)
+    return _append(_signed_row(row, text, profile, sign), room,
+                   idempotent=bool(message_id))
 
 
 def _touch_poster_presence(name):

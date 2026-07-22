@@ -1,246 +1,677 @@
 #!/usr/bin/env python3
-"""helm dispatches — the DISPATCH LEDGER: a durable obligation for every piece
-of work handed to another seat, with a deadline.
+"""Durable, event-sourced obligations for work handed to another seat.
 
-ROOT CAUSE (owner, 2026-07-21): "we definitely need some timer fallback for
-anything that is sent to them, to make sure it is remembered to check on their
-progress" and, after a seat sat stuck unnoticed, "the failure was still yours
-in not checking in". Dispatch tracking lived in per-session Monitor watchdogs,
-so it EVAPORATED at compaction or session end — the same class as
-landed-but-never-armed. A dispatch has to outlive the session that made it.
-
-THE BAR, exactly parallel to the owner-ask ledger's: POSTING IS NOT DONE. A
-dispatch closes only on a VERDICT from the recipient (prem ensure-contributions-
-acked: "a contribution is done when the integrator ACKNOWLEDGES + LANDS it").
-`ack` records that the seat picked it up; it does NOT close the row. Anything
-without a verdict is live fleet debt and keeps surfacing.
-
-DEADLINES ARE ADVISORY-BY-DESIGN, and that is deliberate: `overdue` names a row
-for a HUMAN-OR-AGENT CHECK-IN, never an automatic reassignment. Tonight proved
-why — a lane untouched 47 minutes looked exactly like a dead seat and was a
-long turn (prem pending-zero-means-delivered-not-lost); an auto-reassign on
-that signal would have duplicated live work. Overdue means LOOK, not ACT.
-
-Storage reuses the owner-ask ledger's proven mechanics (event-sourced snapshot
-rows in one append-only jsonl, last line per id wins, O(1) unbuffered O_APPEND
-write, FAIL-OPEN everywhere) via ownerasks' now path-parameterised primitives —
-the same shape, not a second copy of it.
-
-Row schema:
-  {id, ts, recipient, lane, ref, note, deadline_ts,
-   status: open|acked|verdict, ack_ref, verdict_ref, last_updated}
+A sent dispatch is PENDING until a verdict names both the exact reviewed tip
+and its evidence.  ACK never closes it.  Deadlines only produce NEEDS CHECK-IN;
+they never reassign work.  `send` is the first-class handoff path: it stages a
+ledger event before an idempotent DM, then activates the same logical row.  A
+retry reuses both ids, so it cannot create a second obligation or message.
 """
 import calendar
 import hashlib
 import json
 import os
+import re
+import subprocess
 import sys
 import time
+import unicodedata
 
-from . import home, ownerasks, pk
+from . import eventledger, home, pk
 
 LEDGER = "dispatches.jsonl"
-STATUSES = ("open", "acked", "verdict")
-DEFAULT_DEADLINE_S = 2700          # 45min — a long review turn is normal
+DEFAULT_DEADLINE_S = 2700
+MAX_DEADLINE_S = 31 * 24 * 60 * 60
+STATUSES = ("posting", "aborted", "pending", "open", "acked", "verdict")
+ACTIVE = ("pending", "open", "acked")
+_ID = re.compile(r"[0-9a-f]{8,64}\Z")
+_TOKEN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 
 
 def ledger_path():
-    return ownerasks.ledger_path(LEDGER)
+    return os.path.join(home.global_dir(), LEDGER)
+
+
+def _clean(value, label, cap):
+    value = str(value or "").strip()
+    if not value:
+        return None, "%s is required" % label
+    if len(value) > cap or any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp")
+                               for c in value):
+        return None, "%s must be one printable line of at most %d characters" % (label, cap)
+    return value, None
+
+
+def _deadline(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None, "deadline takes SECONDS"
+    if not 1 <= value <= MAX_DEADLINE_S:
+        return None, "deadline must be between 1 and %d seconds" % MAX_DEADLINE_S
+    return value, None
+
+
+def _repo_info(path=None):
+    cwd = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    try:
+        top = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5)
+        common = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--path-format=absolute",
+             "--git-common-dir"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if top.returncode or common.returncode:
+        return None
+    return {"repo": os.path.realpath(top.stdout.strip()),
+            "repo_id": os.path.realpath(common.stdout.strip())}
+
+
+def _resolve_tip(repo, ref):
+    """Resolve exactly one commit.  Short object ids are accepted only when
+    Git reports one object; symbolic shorthand is accepted only when exactly
+    one of heads/tags/remotes owns it.  Ambiguity is never guessed through."""
+    ref, err = _clean(ref, "tip", 256)
+    if err or not repo or ref.startswith("-"):
+        return None
+    candidates = []
+    try:
+        if re.fullmatch(r"[0-9a-fA-F]{7,64}", ref):
+            p = subprocess.run(["git", "-C", repo, "rev-parse",
+                                "--disambiguate=" + ref.lower()],
+                               capture_output=True, text=True, timeout=5)
+            candidates = [x.strip() for x in p.stdout.splitlines() if x.strip()]
+            if p.returncode or len(candidates) != 1:
+                return None
+            ref = candidates[0]
+        elif ref != "HEAD" and not ref.startswith("refs/"):
+            for name in ("refs/heads/" + ref, "refs/tags/" + ref,
+                         "refs/remotes/" + ref):
+                p = subprocess.run(["git", "-C", repo, "show-ref", "--verify",
+                                    "--hash", name], capture_output=True,
+                                   text=True, timeout=5)
+                if p.returncode == 0:
+                    candidates.append(name)
+            if len(candidates) != 1:
+                return None
+            ref = candidates[0]
+        p = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", "--end-of-options",
+             ref + "^{commit}"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = p.stdout.splitlines()
+    tip = lines[0].strip().lower() if p.returncode == 0 and len(lines) == 1 else ""
+    return tip if re.fullmatch(r"[0-9a-f]{40,64}", tip) else None
+
+
+def _is_ancestor(repo, older, newer):
+    try:
+        p = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor",
+                            older, newer], capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0
+
+
+def _valid(row, prior):
+    """Replay validator.  A corrupt duplicate/update is skipped, preserving the
+    preceding good snapshot instead of letting one bad tail erase an obligation."""
+    if not _ID.fullmatch(str(row.get("id") or "")):
+        return False
+    if row.get("status") not in STATUSES or not _TOKEN.fullmatch(
+            str(row.get("recipient") or "")):
+        return False
+    lane, err = _clean(row.get("lane"), "lane", 160)
+    if err or lane != row.get("lane"):
+        return False
+    if row.get("note") is not None:
+        note, err = _clean(row.get("note"), "note", 1000)
+        if err or note != row.get("note"):
+            return False
+    for key in ("ref", "ack_ref", "verdict_ref"):
+        if row.get(key) is not None and _clean(row.get(key), key, 256)[1]:
+            return False
+    for key in ("tip", "original_tip", "reviewed_tip"):
+        if row.get(key) is not None and not re.fullmatch(
+                r"[0-9a-f]{40,64}", str(row.get(key))):
+            return False
+    try:
+        if not 1 <= int(row.get("deadline_s")) <= MAX_DEADLINE_S:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if prior is None:
+        seq = row.get("seq")
+        if seq is None:  # v1 snapshot compatibility
+            if row.get("status") == "acked" and not row.get("ack_ref"):
+                return False
+            if row.get("status") == "verdict" and not row.get("verdict_ref"):
+                return False
+            return row.get("status") in ("open", "acked", "verdict")
+        if seq != 0:
+            return False
+        if row.get("event") == "add" and row.get("status") == "pending":
+            return True
+        if row.get("event") == "posting" and row.get("status") == "posting":
+            return bool(row.get("dispatch_key") and row.get("message_id")
+                        and row.get("message_hash") and row.get("sender"))
+        return False
+    immutable = ("id", "ts", "recipient", "lane", "source", "original_ref",
+                 "original_tip", "repo", "repo_id", "dispatch_key",
+                 "message_id", "message_hash", "sender")
+    binding = {"original_ref", "original_tip", "repo", "repo_id"}
+    for key in immutable:
+        if row.get(key) == prior.get(key):
+            continue
+        if row.get("event") in ("retarget", "verdict") and key in binding \
+                and prior.get(key) is None and row.get(key):
+            continue
+        return False
+    seq = row.get("seq")
+    prior_seq = prior.get("seq")
+    if seq is not None and seq != (prior_seq if isinstance(prior_seq, int) else -1) + 1:
+        return False
+    if seq is None and prior_seq is not None:
+        return False
+    allowed = {
+        "posting": {("pending", "delivered"),
+                    ("aborted", "delivery-failed")},
+        "aborted": {("posting", "retry")},
+        "pending": {("pending", "retarget"), ("acked", "ack"),
+                    ("verdict", "verdict")},
+        "open": {("open", "retarget"), ("acked", "ack"),
+                 ("verdict", "verdict")},
+        "acked": {("acked", "retarget"), ("acked", "ack"),
+                  ("verdict", "verdict")},
+        "verdict": set(),
+    }
+    transition = (row.get("status"), row.get("event"))
+    if transition not in allowed.get(prior.get("status"), set()):
+        return False
+    if row.get("event") == "delivered" and (
+            not row.get("delivery_ref") or
+            row.get("delivery_ref") != row.get("message_id")):
+        return False
+    if row.get("event") == "delivery-failed" and not row.get("delivery_error"):
+        return False
+    if row.get("status") == "acked" and not row.get("ack_ref"):
+        return False
+    if row.get("status") == "verdict":
+        return bool(row.get("verdict_ref") and row.get("reviewed_tip")
+                    and row.get("reviewed_tip") == row.get("tip"))
+    return True
 
 
 def rows():
-    return ownerasks.rows(ledger_path())
+    return eventledger.latest(ledger_path(), _valid)
 
 
-def add(recipient, lane, ref=None, note=None, deadline_s=DEFAULT_DEADLINE_S):
-    """Open a dispatch. -> row, or None when the ledger refused the write
-    (the caller MUST surface that; a silent success-lie re-creates the very
-    bug this ledger exists to fix)."""
-    recipient = (recipient or "").strip()
-    lane = (lane or "").strip()
-    if not recipient or not lane:
-        return None
+def history(rid):
+    out, prior = [], None
+    for row in eventledger.events(ledger_path()):
+        if str(row.get("id")) != str(rid):
+            continue
+        if _valid(row, prior):
+            out.append(row)
+            prior = row
+    return out
+
+
+def _next(row, status=None, event=None, **patch):
+    nxt = dict(row)
+    nxt.update(patch)
+    nxt["seq"] = (row.get("seq") if isinstance(row.get("seq"), int) else -1) + 1
+    nxt["status"] = status or row["status"]
+    nxt["event"] = event or nxt["status"]
+    nxt["last_updated"] = pk.now_ts()
+    return nxt
+
+
+def _base(recipient, lane, ref, note, deadline_s, repo, status, rid=None,
+          dispatch_key=None, message_id=None, message_hash=None, sender=None):
+    from . import seats
+    recipient, err = seats.resolve_recipient(recipient)
+    if err:
+        return None, err
+    lane, err = _clean(lane, "lane", 160)
+    if err:
+        return None, err
+    if note is not None:
+        note, err = _clean(note, "note", 1000)
+        if err:
+            return None, err
+    deadline_s, err = _deadline(deadline_s)
+    if err:
+        return None, err
+    info = _repo_info(repo)
+    original_ref = original_tip = None
+    if ref:
+        original_ref, err = _clean(ref, "ref", 256)
+        if err:
+            return None, err
+        if not info:
+            return None, "ref needs a Git working tree (--repo PATH)"
+        original_tip = _resolve_tip(info["repo"], original_ref)
+        if not original_tip:
+            return None, "ref is missing, ambiguous, or not a commit in this repository"
     ts = pk.now_ts()
-    rid = hashlib.blake2b(
-        ("%s|%s|%s|%d" % (ts, recipient, lane, os.getpid())).encode("utf-8"),
-        digest_size=4).hexdigest()
-    row = {"id": rid, "ts": ts, "recipient": recipient, "lane": lane,
-           "ref": (ref or "").strip() or None,
-           "note": (note or "").strip() or None,
-           "deadline_s": int(deadline_s),
-           "source": home.session_id() or "cli",
-           "status": "open", "ack_ref": None, "verdict_ref": None,
+    row = {"v": 2, "id": rid or os.urandom(16).hex(), "seq": 0,
+           "event": "posting" if status == "posting" else "add", "ts": ts,
+           "recipient": recipient, "lane": lane, "ref": original_ref,
+           "tip": original_tip, "original_ref": original_ref,
+           "original_tip": original_tip, "note": note,
+           "deadline_s": deadline_s, "source": home.session_id() or "cli",
+           "repo": info["repo"] if info else None,
+           "repo_id": info["repo_id"] if info else None,
+           "dispatch_key": dispatch_key, "message_id": message_id,
+           "message_hash": message_hash, "sender": sender, "status": status,
+           "ack_ref": None, "verdict_ref": None, "reviewed_tip": None,
+           "delivery_ref": None, "delivery_error": None,
            "last_updated": ts}
-    if not ownerasks._append(row, ledger_path()):
-        return None
-    pk.event("dispatch-add", rid, "%s -> %s" % (recipient, lane))
-    return row
-
-
-def _update(rid, status, **patch):
-    r = rows().get(str(rid or ""))
-    if not r:
-        return None, "no such dispatch: %s (helm dispatch list)" % rid
-    if r.get("status") == "verdict":
-        return None, ("dispatch %s already has a verdict (closed) — open a new "
-                      "one" % rid)
-    row = dict(r)
-    row.update(patch)
-    row["status"] = status
-    row["last_updated"] = pk.now_ts()
-    if not ownerasks._append(row, ledger_path()):
-        return None, "ledger unwritable (%s) — update NOT recorded" % ledger_path()
-    pk.event("dispatch-" + status, str(rid),
-             str(patch.get("verdict_ref") or patch.get("ack_ref") or ""))
     return row, None
 
 
+def _add(recipient, lane, ref=None, note=None, deadline_s=DEFAULT_DEADLINE_S,
+         repo=None):
+    row, err = _base(recipient, lane, ref, note, deadline_s, repo, "pending")
+    if err:
+        return None, err
+    if not eventledger.append(ledger_path(), row):
+        return None, "ledger unwritable (%s) — dispatch NOT recorded" % ledger_path()
+    pk.event("dispatch-add", row["id"], "%s -> %s" % (row["recipient"], row["lane"]))
+    return row, None
+
+
+def add(recipient, lane, ref=None, note=None, deadline_s=DEFAULT_DEADLINE_S,
+        repo=None):
+    """Compatibility API: row or None.  The CLI uses `_add` to surface why."""
+    return _add(recipient, lane, ref, note, deadline_s, repo)[0]
+
+
+def send(recipient, lane, message, ref, note=None, deadline_s=DEFAULT_DEADLINE_S,
+         key=None, repo=None, sign=None):
+    """Atomically stage one logical dispatch before delivering its idempotent
+    DM.  Returns (row, reason, created_message).  On delivery failure the same
+    row records ABORTED/NEEDS RETRY; retrying the same key/payload reuses both
+    ids.  A ledger failure occurs before any DM side effect."""
+    message = str(message or "").strip()
+    if not message or len(message) > 16000 or "\x00" in message:
+        return None, "message must be 1-16000 characters without NUL", False
+    key = str(key or "").strip()
+    if key:
+        key, err = _clean(key, "idempotency key", 256)
+        if err:
+            return None, err, False
+    from . import seats
+    sender = seats.derive_seat(home.session_id())
+    staged, err = _base(recipient, lane, ref, note, deadline_s, repo, "posting",
+                        sender=sender)
+    if err:
+        return None, err, False
+    if not key:
+        canonical = "\0".join((staged["recipient"], staged["lane"],
+                                staged.get("tip") or "", message))
+        key = "auto:" + hashlib.blake2b(
+            canonical.encode("utf-8"), digest_size=16).hexdigest()
+    staged["id"] = hashlib.blake2b(("dispatch\0" + key).encode("utf-8"),
+                                    digest_size=16).hexdigest()
+    staged["message_id"] = hashlib.blake2b(
+        ("message\0" + key).encode("utf-8"), digest_size=6).hexdigest()
+    staged["message_hash"] = hashlib.blake2b(
+        message.encode("utf-8"), digest_size=16).hexdigest()
+    staged["dispatch_key"] = key
+    rid = staged["id"]
+    path = ledger_path()
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "ledger unwritable (%s) — nothing sent" % path, False
+        existing = eventledger.latest(path, _valid).get(rid)
+        if existing:
+            same = all(existing.get(k) == staged.get(k) for k in
+                       ("recipient", "lane", "tip", "dispatch_key", "message_id",
+                        "message_hash"))
+            if not same:
+                return None, "idempotency key already names different work", False
+            if existing.get("status") in ACTIVE or existing.get("status") == "verdict":
+                return existing, None, False
+            row = existing
+            if row.get("status") == "aborted":
+                row = _next(row, status="posting", event="retry",
+                            delivery_error=None)
+                if not eventledger.append_unlocked(path, row):
+                    return None, "ledger retry stage failed — nothing sent", False
+        else:
+            row = staged
+            if not eventledger.append_unlocked(path, row):
+                return None, "ledger stage failed — nothing sent", False
+        try:
+            delivered, dm_err = seats.dm(
+                row["recipient"], message, who=row["sender"], profile=row["sender"],
+                sign=sign, session=home.session_id(), message_id=row["message_id"])
+        except Exception as exc:
+            delivered, dm_err = None, "%s: %s" % (type(exc).__name__, exc)
+        if dm_err or not delivered:
+            failed = _next(row, status="aborted", event="delivery-failed",
+                           delivery_error=str(dm_err or "DM returned no row")[:500])
+            if not eventledger.append_unlocked(path, failed):
+                return row, "delivery failed and failure event could not append: %s" % (
+                    dm_err or "no row"), False
+            return failed, "delivery failed; row is NEEDS RETRY: %s" % (
+                dm_err or "no row"), False
+        active = _next(row, status="pending", event="delivered",
+                       delivery_ref=delivered.get("id"), delivery_error=None)
+        if not eventledger.append_unlocked(path, active):
+            return row, ("DM %s landed but activation event failed; retry the same "
+                         "command/key to reconcile it" % delivered.get("id")), False
+    pk.event("dispatch-send", active["id"], active["delivery_ref"])
+    return active, None, True
+
+
+def _get_locked(rid):
+    return eventledger.latest(ledger_path(), _valid).get(str(rid or ""))
+
+
 def mark_ack(rid, ref):
-    """The seat picked it up. Does NOT close the row — an ack is a promise,
-    and promises are what this ledger exists to stop trusting."""
-    if not (ref or "").strip():
-        return None, "ack needs a ref (the chat-post id that acknowledged it)"
-    return _update(rid, "acked", ack_ref=str(ref).strip())
+    ref, err = _clean(ref, "ack ref", 256)
+    if err:
+        return None, err
+    path = ledger_path()
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "ledger unwritable (%s) — ACK NOT recorded" % path
+        row = _get_locked(rid)
+        if not row:
+            return None, "no such dispatch: %s (helm dispatch list)" % rid
+        if row.get("status") == "verdict":
+            return None, "dispatch %s already has a verdict (closed)" % rid
+        if row.get("status") not in ACTIVE:
+            return None, "dispatch %s was not delivered; it NEEDS RETRY, not ACK" % rid
+        nxt = _next(row, status="acked", event="ack", ack_ref=ref)
+        if not eventledger.append_unlocked(path, nxt):
+            return None, "ledger unwritable (%s) — ACK NOT recorded" % path
+    pk.event("dispatch-ack", str(rid), ref)
+    return nxt, None
 
 
-def mark_verdict(rid, ref):
-    """THE ONLY CLOSER: the verdict/commit the recipient actually produced."""
-    if not (ref or "").strip():
-        return None, "verdict needs a ref (commit sha or chat-post id)"
-    return _update(rid, "verdict", verdict_ref=str(ref).strip())
+def _repo_binding(row, caller_repo=None):
+    """Return (caller worktree, current tip, migration patch, error).
+    Pre-v2 rows are safely adopted only when their literal ref resolves in the
+    caller's repository; that one retarget/verdict event records the binding."""
+    caller = _repo_info(caller_repo)
+    if not caller:
+        return None, None, None, "caller is outside a Git working tree"
+    if row.get("repo_id"):
+        if caller["repo_id"] != row["repo_id"]:
+            return None, None, None, "caller is outside the dispatch repository (foreign ref refused)"
+        if not row.get("tip"):
+            return None, None, None, "dispatch repository binding has no exact tip"
+        return caller["repo"], row["tip"], {}, None
+    legacy = row.get("ref")
+    tip = _resolve_tip(caller["repo"], legacy) if legacy else None
+    if not tip:
+        return None, None, None, ("legacy dispatch ref is missing, ambiguous, or foreign; "
+                                  "open a new ref-bound dispatch")
+    patch = {"repo": caller["repo"], "repo_id": caller["repo_id"],
+             "original_ref": legacy, "original_tip": tip}
+    return caller["repo"], tip, patch, None
 
 
-def _age_s(row):
-    """Seconds since the dispatch was opened. pk.now_ts() is a UTC
-    '%Y-%m-%dT%H:%M:%SZ' string, so parse it back through calendar.timegm —
-    time.mktime would read it as LOCAL and silently skew every deadline by the
-    UTC offset (7h here, which would hide every overdue row all evening).
-    Fail-open to 0: an unparseable ts reads as brand new, never as overdue,
-    so a bad row can never manufacture a false alarm."""
+def retarget(rid, old_ref, new_ref, repo=None):
+    path = ledger_path()
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "ledger unwritable (%s) — retarget NOT recorded" % path
+        row = _get_locked(rid)
+        if not row:
+            return None, "no such dispatch: %s (helm dispatch list)" % rid
+        if row.get("status") == "verdict":
+            return None, "dispatch %s already has a verdict (closed)" % rid
+        if row.get("status") not in ACTIVE:
+            return None, "dispatch %s NEEDS DELIVERY RETRY before retarget" % rid
+        stored, current_tip, binding, err = _repo_binding(row, repo)
+        if err:
+            return None, err
+        old_tip = _resolve_tip(stored, old_ref)
+        new_tip = _resolve_tip(stored, new_ref)
+        if not old_tip or not new_tip:
+            return None, "old/new ref is missing, ambiguous, or foreign"
+        if old_tip != current_tip:
+            return None, "stale retarget: current tip is %s" % current_tip
+        if new_tip == old_tip:
+            return row, None
+        if not _is_ancestor(stored, old_tip, new_tip):
+            return None, "backward or divergent retarget refused"
+        ref, err = _clean(new_ref, "new ref", 256)
+        if err:
+            return None, err
+        nxt = _next(row, event="retarget", ref=ref, tip=new_tip,
+                    retarget_from=old_tip, retarget_to=new_tip, **binding)
+        if not eventledger.append_unlocked(path, nxt):
+            return None, "ledger unwritable (%s) — retarget NOT recorded" % path
+    pk.event("dispatch-retarget", str(rid), "%s -> %s" % (old_tip, new_tip))
+    return nxt, None
+
+
+def mark_verdict(rid, reviewed_ref, evidence, repo=None):
+    evidence, err = _clean(evidence, "verdict evidence", 256)
+    if err:
+        return None, err
+    path = ledger_path()
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "ledger unwritable (%s) — verdict NOT recorded" % path
+        row = _get_locked(rid)
+        if not row:
+            return None, "no such dispatch: %s (helm dispatch list)" % rid
+        stored, current_tip, binding, err = _repo_binding(row, repo)
+        if err:
+            return None, err
+        reviewed_tip = _resolve_tip(stored, reviewed_ref)
+        if not reviewed_tip:
+            return None, "reviewed tip is missing, ambiguous, or foreign"
+        if row.get("status") == "verdict":
+            if row.get("reviewed_tip") == reviewed_tip and row.get("verdict_ref") == evidence:
+                return row, None
+            return None, "dispatch %s already has a verdict (closed)" % rid
+        if row.get("status") not in ACTIVE:
+            return None, "dispatch %s was not delivered; it NEEDS RETRY" % rid
+        if reviewed_tip != current_tip:
+            return None, "stale verdict: reviewed %s but current tip is %s" % (
+                reviewed_tip, current_tip)
+        nxt = _next(row, status="verdict", event="verdict", tip=current_tip,
+                    verdict_ref=evidence, reviewed_tip=reviewed_tip, **binding)
+        if not eventledger.append_unlocked(path, nxt):
+            return None, "ledger unwritable (%s) — verdict NOT recorded" % path
+    pk.event("dispatch-verdict", str(rid), evidence)
+    return nxt, None
+
+
+def _age_s(row, now=None):
+    """UTC calendar age.  Clock skew clamps to NEW; malformed timestamps are
+    NEW too, never false-overdue."""
     try:
-        t = time.strptime(str(row.get("ts") or ""), "%Y-%m-%dT%H:%M:%SZ")
-        return max(0, int(time.time() - calendar.timegm(t)))
-    except (ValueError, TypeError):
+        stamp = time.strptime(str(row.get("ts") or ""), "%Y-%m-%dT%H:%M:%SZ")
+        return max(0, int((time.time() if now is None else now) - calendar.timegm(stamp)))
+    except (OverflowError, ValueError, TypeError):
         return 0
 
 
 def open_rows():
-    """Every dispatch still awaiting a verdict, oldest first."""
-    rs = [r for r in rows().values() if r.get("status") != "verdict"]
-    rs.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("id") or "")))
-    return rs
+    out = [r for r in rows().values() if r.get("status") in ACTIVE]
+    return sorted(out, key=lambda r: (str(r.get("ts") or ""), str(r.get("id") or "")))
+
+
+def needs_retry():
+    out = [r for r in rows().values() if r.get("status") in ("posting", "aborted")]
+    return sorted(out, key=lambda r: (str(r.get("ts") or ""), str(r.get("id") or "")))
+
+
+def _is_overdue(row, now=None):
+    return row.get("status") in ACTIVE and _age_s(row, now) >= int(row["deadline_s"])
 
 
 def overdue():
-    """Open dispatches past their deadline — LOOK, do not act. See the module
-    docstring: an auto-reassign on this signal duplicates live work."""
-    out = []
-    for r in open_rows():
-        d = int(r.get("deadline_s") or DEFAULT_DEADLINE_S)
-        if _age_s(r) >= d:
-            out.append(r)
-    return out
+    now = time.time()
+    return [r for r in open_rows() if _is_overdue(r, now)]
 
 
 def oldest_overdue():
-    rs = overdue()
-    return rs[0] if rs else None
+    out = overdue()
+    return out[0] if out else None
 
 
-USAGE = ("usage: helm dispatch add <recipient> <lane> [--ref R] [--note N] "
-         "[--deadline SECONDS] | ack <id> <ref> | verdict <id> <ref> | "
-         "list [--open] [--overdue] [--json]")
+USAGE = ("usage: helm dispatch send <recipient> <lane> <message...> --ref TIP "
+         "[--key K] [--note N] [--deadline SECONDS] [--repo PATH] | add "
+         "<recipient> <lane> [--ref TIP] [--note N] [--deadline SECONDS] "
+         "[--repo PATH] | ack <id> <ref> | retarget <id> <old-tip> <new-tip> "
+         "[--repo PATH] | verdict <id> <reviewed-tip> <evidence> [--repo PATH] | "
+         "list [--open|--overdue|--needs-retry] [--json]")
 
 
-def _flag(args, name):
-    if name in args:
-        i = args.index(name)
-        if i + 1 < len(args):
-            v = args[i + 1]
-            del args[i:i + 2]
-            return v
-        del args[i:i + 1]
-    return None
+def _parse(rest, names):
+    pos, opts, i = [], {}, 0
+    while i < len(rest):
+        arg = rest[i]
+        if not arg.startswith("--"):
+            pos.append(arg)
+            i += 1
+            continue
+        if arg not in names:
+            return None, None, "unknown option %s" % arg
+        if i + 1 >= len(rest) or rest[i + 1].startswith("--"):
+            return None, None, "%s wants a value" % arg
+        opts[arg] = rest[i + 1]
+        i += 2
+    return pos, opts, None
 
 
-def _fmt(r):
-    age = _age_s(r) // 60
-    d = int(r.get("deadline_s") or DEFAULT_DEADLINE_S) // 60
-    late = " OVERDUE" if r in overdue() else ""
-    return "  %s  %-16s %-26s %-8s %3dm/%dm%s%s" % (
-        r["id"], r.get("recipient", "?"), r.get("lane", "?"),
-        r.get("status", "?"), age, d, late,
-        ("  " + r["ref"]) if r.get("ref") else "")
+def _label(status):
+    return {"posting": "NEEDS DELIVERY RETRY", "aborted": "NEEDS DELIVERY RETRY",
+            "pending": "PENDING VERDICT", "open": "PENDING VERDICT",
+            "acked": "ACKED / PENDING VERDICT", "verdict": "VERDICT"}.get(
+                status, "NEEDS INSPECTION")
+
+
+def _fmt(row, late=False):
+    age = _age_s(row) // 60
+    deadline = int(row["deadline_s"]) // 60
+    tip = row.get("tip") or row.get("ref") or "-"
+    suffix = "  NEEDS CHECK-IN (OVERDUE)" if late else ""
+    return "  %s  %-16s %-24s %-27s %3dm/%dm%s  %s" % (
+        row["id"], row["recipient"], row["lane"], _label(row["status"]),
+        age, deadline, suffix, str(tip)[:12])
 
 
 def cmd_dispatch(args):
-    """dispatch add|ack|verdict|list — every hand-off is an obligation with a
-    deadline, durable past the session that made it."""
     args = list(args or [])
     if not args or args[0] in ("-h", "--help"):
         print(USAGE, file=sys.stderr)
         return 2
     verb, rest = args[0], args[1:]
-    if verb == "add":
-        ref = _flag(rest, "--ref")
-        note = _flag(rest, "--note")
-        dl = _flag(rest, "--deadline")
-        pos = [a for a in rest if not a.startswith("--")]
-        if len(pos) < 2:
-            print(USAGE, file=sys.stderr)
+    if verb in ("add", "send"):
+        names = {"--ref", "--note", "--deadline", "--repo"}
+        if verb == "send":
+            names.add("--key")
+        pos, opts, err = _parse(rest, names)
+        if err or len(pos) < (3 if verb == "send" else 2):
+            print("helm dispatch: " + (err or USAGE), file=sys.stderr)
             return 2
-        try:
-            deadline = int(dl) if dl else DEFAULT_DEADLINE_S
-        except ValueError:
-            print("helm dispatch: --deadline takes SECONDS", file=sys.stderr)
+        deadline, err = _deadline(opts.get("--deadline", DEFAULT_DEADLINE_S))
+        if err:
+            print("helm dispatch: " + err, file=sys.stderr)
             return 2
-        row = add(pos[0], pos[1], ref=ref, note=note, deadline_s=deadline)
-        if row is None:
-            print("helm dispatch: ledger would not take the write — dispatch "
-                  "NOT recorded (fix %s before relying on it)" % ledger_path(),
-                  file=sys.stderr)
-            return 1
-        print("helm dispatch: %s -> @%s  %s  (check back in %dm)" % (
-            row["id"], row["recipient"], row["lane"], deadline // 60))
-        return 0
-    if verb in ("ack", "verdict"):
-        pos = [a for a in rest if not a.startswith("--")]
-        if len(pos) < 2:
-            print(USAGE, file=sys.stderr)
-            return 2
-        fn = mark_ack if verb == "ack" else mark_verdict
-        row, why = fn(pos[0], pos[1])
+        if verb == "send":
+            if not opts.get("--ref"):
+                print("helm dispatch: send requires --ref TIP", file=sys.stderr)
+                return 2
+            row, why, posted = send(
+                pos[0], pos[1], " ".join(pos[2:]), opts["--ref"],
+                note=opts.get("--note"), deadline_s=deadline,
+                key=opts.get("--key"), repo=opts.get("--repo"))
+            if why:
+                print("helm dispatch: " + why, file=sys.stderr)
+                return 1
+            print("helm dispatch: %s @%s %s — PENDING VERDICT%s" % (
+                row["id"], row["recipient"], row["lane"],
+                " (DM %s sent)" % row["delivery_ref"] if posted else
+                " (idempotent retry: already sent)"))
+            return 0
+        row, why = _add(pos[0], pos[1], ref=opts.get("--ref"),
+                        note=opts.get("--note"), deadline_s=deadline,
+                        repo=opts.get("--repo"))
         if why:
             print("helm dispatch: " + why, file=sys.stderr)
             return 1
-        print("helm dispatch: %s -> %s (%s)" % (
-            row["id"], row["status"],
-            row.get("verdict_ref") or row.get("ack_ref")))
+        print("helm dispatch: %s -> @%s %s — PENDING VERDICT; CHECK IN after %dm" % (
+            row["id"], row["recipient"], row["lane"], deadline // 60))
+        return 0
+    if verb == "ack":
+        if len(rest) < 2:
+            print(USAGE, file=sys.stderr)
+            return 2
+        row, why = mark_ack(rest[0], " ".join(rest[1:]))
+    elif verb == "retarget":
+        pos, opts, err = _parse(rest, {"--repo"})
+        if err or len(pos) != 3:
+            print("helm dispatch: " + (err or USAGE), file=sys.stderr)
+            return 2
+        row, why = retarget(pos[0], pos[1], pos[2], repo=opts.get("--repo"))
+    elif verb == "verdict":
+        pos, opts, err = _parse(rest, {"--repo"})
+        if err or len(pos) < 3:
+            print("helm dispatch: " + (err or USAGE), file=sys.stderr)
+            return 2
+        row, why = mark_verdict(pos[0], pos[1], " ".join(pos[2:]),
+                                repo=opts.get("--repo"))
+    else:
+        row = why = None
+    if verb in ("ack", "retarget", "verdict"):
+        if why:
+            print("helm dispatch: " + why, file=sys.stderr)
+            return 1
+        print("helm dispatch: %s — %s%s" % (
+            row["id"], _label(row["status"]),
+            " at %s" % row["tip"][:12] if row.get("tip") else ""))
         return 0
     if verb == "list":
-        if "--overdue" in rest:
-            rs = overdue()
-        elif "--open" in rest:
-            rs = open_rows()
+        flags = set(rest)
+        if flags - {"--open", "--overdue", "--needs-retry", "--json"}:
+            print(USAGE, file=sys.stderr)
+            return 2
+        if len(flags & {"--open", "--overdue", "--needs-retry"}) > 1:
+            print("helm dispatch: choose one status filter", file=sys.stderr)
+            return 2
+        if "--overdue" in flags:
+            selected = overdue()
+        elif "--open" in flags:
+            selected = open_rows()
+        elif "--needs-retry" in flags:
+            selected = needs_retry()
         else:
-            rs = sorted(rows().values(),
-                        key=lambda r: str(r.get("ts") or ""))
-        if "--json" in rest:
-            print(json.dumps(rs, ensure_ascii=False, indent=1))
+            selected = sorted(rows().values(),
+                              key=lambda r: (str(r.get("ts") or ""), r["id"]))
+        if "--json" in flags:
+            print(json.dumps(selected, ensure_ascii=False, indent=1))
             return 0
-        if not rs:
-            print("helm dispatch: nothing outstanding — every hand-off has a "
-                  "verdict")
+        if not selected:
+            print("helm dispatch: no matching rows; no PENDING obligation in this view")
             return 0
-        print("helm dispatch — %d row%s (id | recipient | lane | status | "
-              "age/deadline)" % (len(rs), "s"[:len(rs) != 1]))
-        for r in rs:
-            print(_fmt(r))
-        od = overdue()
-        if od:
-            print("⚠ %d OVERDUE — CHECK IN, do not reassign on this signal "
-                  "alone: a long turn looks identical to a dead seat. Verify "
-                  "at the recipient side first." % len(od))
+        print("helm dispatch — %d logical row%s" % (
+            len(selected), "" if len(selected) == 1 else "s"))
+        now = time.time()
+        for row in selected:
+            print(_fmt(row, _is_overdue(row, now)))
+        late = [r for r in selected if _is_overdue(r, now)]
+        if late:
+            print("%d NEEDS CHECK-IN (OVERDUE) — advisory only; do not reassign. "
+                  "Verify at the exact recipient first." % len(late))
+        retry = [r for r in selected if r.get("status") in ("posting", "aborted")]
+        if retry:
+            print("%d NEEDS DELIVERY RETRY — retry the same send/key; no verdict "
+                  "obligation exists until delivery lands." % len(retry))
         return 0
     print(USAGE, file=sys.stderr)
     return 2

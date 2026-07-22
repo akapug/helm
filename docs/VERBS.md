@@ -1439,7 +1439,9 @@ frames; this lane is called *delivery*.)
   UNREPORTED owner ask (top of the ladder: the owner-ask ledger's OLDEST row
   not yet `reported` — open or done-but-unreported — named one at a time with
   its `helm asks report` pointer; fp carries the row's status, so open→done
-  re-fires once), stuck
+  re-fires once), then the oldest overdue dispatch (reloaded from disk on each
+  stop; explicitly **NEEDS CHECK-IN / PENDING VERDICT**, with the exact-tip
+  verdict command; advisory only and never an automatic reassignment), stuck
   session (`stuck-streak`≥3: surface the blocker), a RED gate (record.py's
   command-log shows a test-runner whose LATEST run exited nonzero — fix or
   surface before stopping; a green rerun silences it), unlanded owner/mention
@@ -1689,6 +1691,43 @@ the ONLY closer, and its argument is the chat post that told the OWNER
 not yet `reported` rides the stop-whisper's TOP rung (see `stop-guard`
 above) until the owner has actually heard it. Fail-open: an unwritable
 ledger never raises, and a failed `add` says NOT RECORDED loudly.
+
+### `helm dispatch send <recipient> <lane> <message...> --ref TIP [--key K] | add <recipient> <lane> [--ref TIP] | ack <id> <ref> | retarget <id> <old-tip> <new-tip> | verdict <id> <reviewed-tip> <evidence> | list [--open|--overdue|--needs-retry] [--json]`
+
+The DISPATCH ledger is the durable obligation behind work handed to another
+seat. Prefer **`send`**, the atomic first-class path: it appends a `posting`
+event before an exact-token DM, gives that DM a deterministic message id, then
+appends `pending`. The optional `--key` is the caller's idempotency key; without
+one Helm derives it from recipient + lane + tip + message. A retry therefore
+reuses one logical ledger id and one DM id. Ledger staging failure sends
+nothing; DM failure records **NEEDS DELIVERY RETRY** on the same row; a crash
+after the DM is reconciled by retry without a duplicate message. `add` exists
+for recording a handoff performed by another transport, but is not a two-step
+replacement for `send`.
+
+Rows are append-only full snapshots in
+`~/.helm/_global/dispatches.jsonl`, separate from owner asks while sharing the
+same hardened event-ledger primitive: stable flock, one bounded `O_APPEND`
+write, fsync, partial-write rollback, 0600 files, symlink refusal, and replay
+that skips malformed/non-UTF8/truncated or invalid duplicate transitions
+without erasing the preceding good obligation. **POSTING and ACK are not
+done.** Delivered rows say **PENDING VERDICT**; ACK records pickup and remains
+open. Only `verdict` closes, and it resolves the supplied reviewed tip in the
+original Git repository and requires it to equal the row's current exact
+commit.
+
+When a lane advances, `retarget` compare-and-swaps `<old-tip>` to a strict
+forward descendant `<new-tip>`. It preserves `original_ref`/`original_tip` in
+the replay history and rejects stale, backward, divergent, ambiguous, and
+foreign refs. Retarget and verdict serialize on the same lock, so a verdict for
+the old tip can never race through after a retarget. Legacy rows acquire their
+repository/tip binding only when their existing ref resolves uniquely in the
+caller's repository.
+
+Deadlines are advisory. An overdue row says **NEEDS CHECK-IN** and rides the
+stop-whisper after owner asks; it never reassigns work because a long turn is
+observationally identical to a dead seat. UTC timestamps use calendar
+semantics; future or malformed timestamps read as NEW, never false-overdue.
 
 ## ops — health, evolution, the browser
 

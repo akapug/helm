@@ -22,12 +22,11 @@ OWNER — moves a row to `reported`. Anything not `reported` is still open
 fleet debt, and the stop-whisper's top rung (seats._ask_candidate) keeps
 naming the oldest such row until the owner has actually been told.
 """
-import hashlib
 import json
 import os
 import sys
 
-from . import home, pk
+from . import eventledger, home, pk
 
 STATUSES = ("open", "done", "reported")
 
@@ -37,40 +36,16 @@ def ledger_path(name="owner-asks.jsonl"):
 
 
 def _append(row, path=None):
-    """The O(1) append: makedirs + ONE unbuffered O_APPEND os.write (torn-line
-    proof under concurrent appenders — kernel appends are atomic for one small
-    write; the emit-law kin). Fail-open: False on any trouble, never a raise.
-    No rotation — this ledger is DURABLE record, not telemetry exhaust."""
-    try:
-        path = path or ledger_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-        try:
-            os.write(fd, (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
-        finally:
-            os.close(fd)
-        return True
-    except Exception:
-        return False
+    """Append one durable event.  The shared primitive owns symlink defense,
+    serialization, one-write O_APPEND, fsync, short-write rollback, and 0600
+    permissions.  False is the fail-open mutation result; callers surface it."""
+    return eventledger.append(path or ledger_path(), row)
 
 
 def rows(path=None):
-    """id -> latest snapshot (last line per id wins). Fail-open to {}:
-    garbled lines skip, a missing/unreadable ledger reads as empty."""
-    out = {}
-    try:
-        with open(path or ledger_path(), encoding="utf-8",
-                  errors="replace") as f:
-            for ln in f:
-                try:
-                    d = json.loads(ln)
-                except ValueError:
-                    continue
-                if isinstance(d, dict) and d.get("id"):
-                    out[str(d["id"])] = d
-    except OSError:
-        pass
-    return out
+    """id -> latest complete snapshot.  Malformed/non-UTF8/truncated rows and
+    unsafe paths fail open without hiding earlier good events."""
+    return eventledger.latest(path or ledger_path())
 
 
 def add(ask, source=None):
@@ -80,8 +55,7 @@ def add(ask, source=None):
     if not ask:
         return None
     ts = pk.now_ts()
-    rid = hashlib.blake2b(("%s|%s|%d" % (ts, ask, os.getpid())).encode("utf-8"),
-                          digest_size=4).hexdigest()
+    rid = os.urandom(4).hex()
     row = {"id": rid, "ts": ts, "ask": ask,
            "source": source or home.session_id() or "cli",
            "status": "open", "done_ref": None, "report_ref": None,
@@ -93,18 +67,23 @@ def add(ask, source=None):
 
 
 def _update(rid, status, **patch):
-    """Append the row's next snapshot. -> (row, None) | (None, why)."""
-    r = rows().get(str(rid or ""))
-    if not r:
-        return None, "no such ask: %s (helm asks list)" % rid
-    if r.get("status") == "reported":
-        return None, "ask %s already reported (closed) — add a new ask" % rid
-    row = dict(r)
-    row.update(patch)
-    row["status"] = status
-    row["last_updated"] = pk.now_ts()
-    if not _append(row):
-        return None, "ledger unwritable (%s) — update NOT recorded" % ledger_path()
+    """Append the row's next snapshot under one read/validate/write lock.
+    Concurrent done/report calls therefore cannot reopen a reported ask."""
+    path = ledger_path()
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "ledger unwritable (%s) — update NOT recorded" % path
+        r = eventledger.latest(path).get(str(rid or ""))
+        if not r:
+            return None, "no such ask: %s (helm asks list)" % rid
+        if r.get("status") == "reported":
+            return None, "ask %s already reported (closed) — add a new ask" % rid
+        row = dict(r)
+        row.update(patch)
+        row["status"] = status
+        row["last_updated"] = pk.now_ts()
+        if not eventledger.append_unlocked(path, row):
+            return None, "ledger unwritable (%s) — update NOT recorded" % path
     pk.event("asks-" + status, str(rid), str(patch.get("done_ref")
                                              or patch.get("report_ref") or ""))
     return row, None

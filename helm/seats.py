@@ -1192,8 +1192,25 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main"):
 _SEAT_TOKEN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")   # what an @mention can say
 
 
+def resolve_recipient(to):
+    """Validate and case-snap one exact seat token.  This is the canonical
+    addressee resolver shared by DM and compound dispatch-send operations."""
+    to = (to or "").strip().lstrip("@")
+    if not _SEAT_TOKEN.match(to):
+        return None, ("recipient %r must be 1-64 chars of [A-Za-z0-9._-] — "
+                      "the exact seat token" % to)
+    r = roster()
+    if to not in r:
+        hits = [k for k in r if k.casefold() == to.casefold()]
+        if len(hits) == 1:
+            to = hits[0]
+        elif len(hits) > 1:
+            return None, "recipient %r is ambiguous by case" % to
+    return to, None
+
+
 def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None,
-       reply_to=None):
+       reply_to=None, message_id=None):
     """One TRUE 1:1 message -> (row, None) or (None, reason). The recipient
     is the EXACT seat token (premise exact-token-addressee-match): the only
     resolution ever applied is a casefold snap onto a live roster key —
@@ -1204,20 +1221,15 @@ def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None,
     first in the scan. A DM to a not-yet-joined seat waits in its lane; the
     join baselines that lane at 0, so it delivers. `reply_to` (a parent row id
     or ordinal IN THAT LANE) threads the DM — chat.post owns the resolve."""
-    to = (to or "").strip().lstrip("@")
-    if not _SEAT_TOKEN.match(to):
-        return None, ("recipient %r must be 1-64 chars of [A-Za-z0-9._-] — "
-                      "the exact seat token" % to)
-    r = roster()
-    if to not in r:
-        hits = [k for k in r if k.casefold() == to.casefold()]
-        if len(hits) == 1:
-            to = hits[0]        # case-snap to the live seat, nothing looser
+    to, err = resolve_recipient(to)
+    if err:
+        return None, err
     sender = who or seat_for_session(session) or derive_seat(session)
     if str(sender).casefold() == to.casefold():
         return None, "a DM to yourself would never deliver (own posts don't)"
     return chat.post(text, who=sender, profile=profile, sign=sign,
-                     origin=origin, dm=to, reply_to=reply_to), None
+                     origin=origin, dm=to, reply_to=reply_to,
+                     message_id=message_id), None
 
 
 # ---------------------------------------------------------------------------
@@ -1515,13 +1527,15 @@ def _dispatch_candidate():
         r = dispatches.oldest_overdue()
         if not r:
             return None
-        return ("dispatch:%s:%s" % (r.get("id"), r.get("status")),
-                "dispatch %s to @%s (%s) is OVERDUE and has no verdict — CHECK "
-                "IN at the recipient side (its beacon/transcript), do NOT "
-                "reassign on age alone; close it with: helm dispatch verdict "
-                "%s <ref>" % (r.get("id"), r.get("recipient"),
-                              _clip(_scrub(str(r.get("lane") or "")), 32),
-                              r.get("id")))
+        tip = str(r.get("tip") or r.get("ref") or "<reviewed-tip>")
+        return ("dispatch:%s:%s:%s" % (r.get("id"), r.get("status"), tip),
+                "dispatch %s to @%s (%s) NEEDS CHECK-IN (OVERDUE) and is "
+                "PENDING VERDICT — verify at the exact recipient; do NOT "
+                "reassign on age alone. Close the exact reviewed tip with: "
+                "helm dispatch verdict %s %s <evidence>"
+                % (r.get("id"), r.get("recipient"),
+                   _clip(_scrub(str(r.get("lane") or "")), 32), r.get("id"),
+                   _clip(_scrub(tip), 16)))
     except Exception:
         return None
 
