@@ -118,6 +118,9 @@ class HeadlessSpawnTest(SpawnBase):
         onboard = argv[1]                          # launch.sh "$@" -> claude's
         self.assertIn("helm chat wait --seat codex --follow", onboard)
         self.assertIn("@codex", onboard)           # first prompt at boot
+        self.assertIn("END YOUR TURNS", onboard)   # turn discipline is birthright
+        self.assertIn("process, post, END", onboard)
+        self.assertNotIn("\n", onboard)            # single keystroke burst
         kw = popen.call_args[1]
         self.assertTrue(kw.get("start_new_session"))   # setsid = detached
         self.assertEqual(kw.get("cwd"), os.getcwd())

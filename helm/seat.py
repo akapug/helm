@@ -1384,7 +1384,12 @@ def onboarding_prompt(seat_name, room=None):
             "ANNOUNCE: `helm chat post%(f)s \"%(s)s online — beacon armed, "
             "taking @%(s)s work\"`. (4) TAKE WORK: rows addressed @%(s)s and "
             "owner posts are yours — do the work, reply in the room, and when "
-            "idle again stay parked on the beacon."
+            "idle again stay parked on the beacon. (5) END YOUR TURNS: at "
+            "every bounded milestone post progress and STOP — the beacon "
+            "re-wakes you; that is what it is for. A turn held open blocks "
+            "queued messages and /compact, inflates context toward the "
+            "100%% cliff, and is indistinguishable from a hang. A routine "
+            "event = process, post, END."
             % {"s": seat_name, "r": r, "f": flag})
 
 
