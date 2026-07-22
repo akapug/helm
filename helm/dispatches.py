@@ -115,6 +115,16 @@ def _resolve_tip(repo, ref):
     return tip if _TIP.fullmatch(tip) else None
 
 
+def _pre_boundary(ts):
+    """True only for an honest pre-boundary timestamp: a non-empty string
+    that LOOKS like one (year 2xxx) and sorts before the boundary. Numeric,
+    empty, whitespace, and low-sorting garbage ts all fail CLOSED — the r3
+    isinstance guard alone let '' through (fable delta MED), and the r2
+    or-tilde let numerics through; the shape check closes the class."""
+    return isinstance(ts, str) and ts.startswith("20") \
+        and ts < LEGACY_COMPAT_BOUNDARY
+
+
 def _int_seq(value, fallback):
     """Adopt a row's seq only when it is a real integer — a type-corrupt seq
     must never enter replay state, where int(state.seq)+1 would crash."""
@@ -161,8 +171,7 @@ def _new_state(row):
         return None
     tip = str(row.get("tip") or "").lower()
     exact = tip if _TIP.fullmatch(tip) else None
-    genesis_ts = row.get("ts")
-    closable = isinstance(genesis_ts, str) and genesis_ts < LEGACY_COMPAT_BOUNDARY
+    closable = _pre_boundary(row.get("ts"))
     out = {"v": row.get("v") or 1, "id": str(row["id"]),
            "event": "dispatch", "seq": int(row.get("seq") or 0),
            "ts": row.get("ts"), "recipient": row.get("recipient"),
@@ -200,8 +209,7 @@ def _apply(state, row):
     # Compat replays ONLY rows stamped before the reduced core landed: an
     # event appended today can never drive the removed machinery, however
     # well-shaped. Missing ts is never compat (fail-closed, "~" sorts high).
-    ts = row.get("ts")
-    compat = legacy and isinstance(ts, str) and ts < LEGACY_COMPAT_BOUNDARY
+    compat = legacy and _pre_boundary(row.get("ts"))
     # Historical full-snapshot compatibility.
     if event is None:
         if compat and row.get("status") == "verdict" and row.get("verdict_ref"):

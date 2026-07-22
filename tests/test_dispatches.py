@@ -373,7 +373,7 @@ class HistoricalCompatTest(DispatchBase):
         # fable adversarial r3: ts=1 stringifies below the boundary — the
         # type-corruption class seq already guards must cover ts too.
         self._legacy_open("ce1e7dd0", self.a[:7], lane="legacy")
-        for bad_ts in (1, 123456, 0.5, True):
+        for bad_ts in (1, 123456, 0.5, True, "", " ", "!pre", "1999-01-01T00:00:00Z"):
             move = {"id": "ce1e7dd0", "event": "retarget", "tip": self.b,
                     "ref": self.b, "ts": bad_ts}
             self.assertTrue(eventledger.append(dispatches.ledger_path(), move))
@@ -396,6 +396,10 @@ class HistoricalCompatTest(DispatchBase):
         got = dispatches.rows()["1a" * 16]
         self.assertEqual(got["status"], "open")     # visible, but never closed
         self.assertEqual(got["migration"], "needs-redispatch")
+        # empty-string ts is NOT an honest pre-boundary stamp (fable delta MED)
+        empty = dict(fab, id="4d" * 16, ts="", last_updated="")
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), empty))
+        self.assertEqual(dispatches.rows()["4d" * 16]["status"], "open")
         # the same genesis stamped BEFORE the boundary is honest history: closed
         old = dict(fab, id="2b" * 16, ts=OLD_TS, last_updated=OLD_TS)
         self.assertTrue(eventledger.append(dispatches.ledger_path(), old))
