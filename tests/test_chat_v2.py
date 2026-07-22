@@ -378,9 +378,14 @@ class ReactToggleTest(V2Base):
             row, err = chat.react(1, ":tada:", who="a2", profile="a2", sign=True)
         self.assertIsNone(err)
         self.assertEqual((row["from"], row["chain"]), ("a2", 7))
-        # the digest binds WHO reacted, not just what — forgery-evident
+        # the digest binds WHO reacted, not just what — forgery-evident — and
+        # rides REACT_TAG, its own payload space. Under the v2 shape a plain
+        # post whose text read `react|<ts>|a1|🎉|a2` digested identically to
+        # this reaction; a disjoint tag makes that impossible by construction.
         ss.assert_called_once_with(
-            chat.digest_payload("react|%s|a1|🎉|a2" % m["ts"]), "a2")
+            chat.react_digest({"react": "🎉", "tts": m["ts"], "tfrom": "a1",
+                               "from": "a2"}), "a2")
+        self.assertTrue(ss.call_args[0][0].startswith(chat.REACT_TAG))
         self.assertNotIn("[unsigned]", chat._fmt(row))
         # fail-open: the unsigned path still lands, visibly unattested
         row2, err2 = chat.react(1, ":fire:", who="a3")

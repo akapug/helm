@@ -100,6 +100,7 @@ SIZE_CAP = 2 * 1024 * 1024  # per-room rotation threshold — RAM etiquette
 POLL_S = 2.0                # --follow poll cadence (the web panel matches)
 CHAT_TAG = "chat:b2b:"      # algorithm-tagged digest, premise.py's pattern
 REPLY_TAG = "chat:reply:b2b:"   # DISJOINT payload space for parent-bound rows
+REACT_TAG = "chat:react:b2b:"   # ditto for reactions (v2 shared the post tag)
 CHAT_TOPIC = "helm.chat"    # the signed turn's event topic on the room node
 DM_PREFIX = "dm-"           # reserved room-name namespace: the private lanes
 FIELD_SEP = "\x1e"          # ASCII RS: fields cannot be slid into one another
@@ -271,9 +272,32 @@ def reply_digest(pid, pts, pfrom, text, parent_text=None):
     return REPLY_TAG + _b2b(FIELD_SEP.join(map(_reply_field, fields)))
 
 
+def react_digest(row):
+    """chat:react:b2b:<blake2b-256 of RS-joined reaction fields> — the signed
+    claim of a REACTION, in its OWN payload space.
+
+    Why the retag: v2 signed reactions as `react|tts|tfrom|emoji|reactor`
+    under the PLAIN-POST tag, so a post whose TEXT was literally that string
+    digested identically to a reaction — a free forgery, exactly the in-band
+    prefix collision reply_digest refuses to repeat. It was harmless while
+    nothing re-derived a chat digest; `helm chat verify` (landed with
+    threading) means something now does, which turns a latent collision into
+    a live one. Reactions therefore get a disjoint tag and the same
+    injectively-escaped RS join, so no post text can ever reach this space.
+
+    Retagging costs nothing: every signed reaction already on disk predates
+    the recorded `payload` field, so verify already classes them `legacy` and
+    re-derives none of them (measured: 0 ok / 103 legacy on the live room)."""
+    fields = ["unreact" if row.get("un") else "react",
+              row.get("tts") or "", row.get("tfrom") or "",
+              row.get("react") or "", row.get("from") or ""]
+    return REACT_TAG + _b2b(FIELD_SEP.join(map(_reply_field, fields)))
+
+
 def _react_payload(row):
-    """A reaction row's payload string — react|unreact|tts|tfrom|emoji|reactor
-    (the v2 shape, unchanged; rebuilt here so ONE function knows it)."""
+    """The v2 reaction payload string, kept ONLY to recompute pre-retag rows.
+    New reactions sign react_digest(); this exists so a historical row can
+    still be explained rather than silently mis-verified."""
     return "%s|%s|%s|%s|%s" % ("unreact" if row.get("un") else "react",
                                row.get("tts") or "", row.get("tfrom") or "",
                                row.get("react") or "", row.get("from") or "")
@@ -293,12 +317,12 @@ def payload_for(row, text=None):
     caller's payload text at post time; None ⇒ read it off the stored row,
     which is what `verify` does.
 
-      reaction  -> chat:b2b: over react|unreact|tts|tfrom|emoji|reactor
+      reaction  -> chat:react:b2b: over the RS-joined reaction fields
       reply     -> chat:reply:b2b: over the parent binding + the text
       any other -> chat:b2b: over the text   (BYTE-IDENTICAL to v2 — every
                    signed row already on disk recomputes exactly as before)"""
     if row.get("react"):
-        return digest_payload(_react_payload(row))
+        return react_digest(row)
     body = row.get("text") if text is None else text
     if is_reply(row):
         return reply_digest(row.get("reply_to"), row.get("rts"),

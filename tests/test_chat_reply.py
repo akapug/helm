@@ -148,10 +148,24 @@ class ReplyDigestTest(ReplyBase):
                   "chain": 3}
         self.assertEqual(chat.payload_for(legacy), chat.digest_payload("hello"))
         self.assertTrue(chat.payload_for(legacy).startswith(chat.CHAT_TAG))
+        # REACTIONS were deliberately RETAGGED out of the plain-post space:
+        # v2 signed them as `react|tts|tfrom|emoji|reactor` under CHAT_TAG, so
+        # a post whose TEXT was literally that string digested identically to a
+        # reaction. Harmless while nothing re-derived a digest; `helm chat
+        # verify` means something now does. Retagging cost nothing: no signed
+        # reaction on disk records a payload, so verify classes them all
+        # `legacy` and re-derives none (measured 0-of-28 at the change).
         legacy_react = {"ts": "t", "from": "a2", "react": "🎉",
                         "tts": "T", "tfrom": "a1", "chain": 4}
         self.assertEqual(chat.payload_for(legacy_react),
-                         chat.digest_payload("react|T|a1|🎉|a2"))
+                         chat.react_digest(legacy_react))
+        self.assertTrue(chat.payload_for(legacy_react).startswith(chat.REACT_TAG))
+        # THE COLLISION IS CLOSED: a plain post whose text IS the v2 react
+        # payload can no longer mint a reaction's digest.
+        forged = {"ts": "t", "from": "mallory",
+                  "text": chat._react_payload(legacy_react)}
+        self.assertNotEqual(chat.payload_for(forged),
+                            chat.payload_for(legacy_react))
 
     def test_signed_reply_binds_the_parent(self):
         p = chat.post("the parent", who="alice")
