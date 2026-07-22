@@ -194,7 +194,7 @@ def refresh_home(home_path, early_horizon_s=60, force=False, apply=False):
     return rec({"action": "refreshed",
                 "rotated_refresh_token": bool(j.get("refresh_token")),
                 "new_expiry_in_h": round(expires_in / 3600, 1),
-                "pre_image": snap.get("dest")})
+                "pre_image": cred._display_path(snap.get("dest"))})
 
 
 def _sweep_rows(early_h, apply):
@@ -233,8 +233,8 @@ def sweep(early_h=24, apply=False):
         return _sweep_rows(early_h, True)
 
 
-def cmd_keepalive(args):
-    """keepalive [--home H] [--early N] — roll idle claude homes' OAuth tokens
+def _cmd_keepalive(args):
+    """keepalive [--home H] [--early N] [--apply] — roll idle claude homes' OAuth tokens
     forward before their refresh chains rot (full sweep by default; codex is
     read-only by design). The ONE credential-writing verb.
     Log: ~/.cache/helm/keepalive-log.jsonl"""
@@ -287,3 +287,13 @@ def cmd_keepalive(args):
         if r.get("action") == "error":
             worst = 1
     return worst
+
+
+def cmd_keepalive(args):
+    """keepalive [--home H] [--early N] [--apply] — dry-run by default."""
+    try:
+        return _cmd_keepalive(args)
+    except Exception as e:
+        print("helm keepalive: operation failed (%s)" % e.__class__.__name__,
+              file=sys.stderr)
+        return 1

@@ -2,6 +2,7 @@
 dirs; the OAuth endpoint is mocked; the live-holder probe is stubbed. No real
 credential home is ever read or written."""
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -62,16 +63,31 @@ class KeepaliveTest(unittest.TestCase):
         if oauth is not None:
             with open(os.path.join(d, ".credentials.json"), "w") as f:
                 json.dump({"claudeAiOauth": oauth}, f)
+            with open(os.path.join(d, ".claude.json"), "w") as f:
+                json.dump({"oauthAccount": {
+                    "emailAddress": name.replace("_", "-") + "@example.test"}}, f)
         return d
 
     def _log_lines(self):
         with open(keepalive.LOG_PATH) as f:
             return [json.loads(l) for l in f]
 
+    def _tree_state(self):
+        out = []
+        for root, dirs, files in os.walk(self.tmp):
+            for name in sorted(dirs + files):
+                p = os.path.join(root, name)
+                st = os.lstat(p)
+                digest = hashlib.sha256(open(p, "rb").read()).hexdigest() \
+                    if stat.S_ISREG(st.st_mode) else None
+                out.append((os.path.relpath(p, self.tmp), stat.S_IMODE(st.st_mode),
+                            st.st_size, st.st_mtime_ns, digest))
+        return out
+
     # -- refresh_home guards -----------------------------------------------
     def test_skip_when_no_credentials(self):
         d = self._plant_home("empty-home")
-        res = keepalive.refresh_home(d)
+        res = keepalive.refresh_home(d, apply=True)
         self.assertEqual(res["action"], "skip")
         self.assertIn("no credentials file", res["reason"])
         self.assertEqual(self._log_lines()[-1]["action"], "skip")  # every outcome logged
@@ -81,22 +97,45 @@ class KeepaliveTest(unittest.TestCase):
         with open(os.path.join(d, ".credentials.json")) as fh:
             before = fh.read()
         keepalive._live_holder_pid = lambda p: "4242"
-        res = keepalive.refresh_home(d)
+        res = keepalive.refresh_home(d, apply=True)
         self.assertEqual(res["action"], "skip")
-        self.assertIn("live holder pid 4242", res["reason"])
+        self.assertIn("live holder detected", res["reason"])
         with open(os.path.join(d, ".credentials.json")) as _f:
             self.assertEqual(_f.read(), before)
 
     def test_skip_when_not_due(self):
         far = int(time.time() * 1000) + 100 * 3600 * 1000
         d = self._plant_home("fresh-home", {"refreshToken": "r", "expiresAt": far})
-        res = keepalive.refresh_home(d)  # default horizon 60s
+        res = keepalive.refresh_home(d, apply=True)  # default horizon 60s
         self.assertEqual(res["action"], "skip")
         self.assertIn("not due", res["reason"])
 
     def test_needs_reauth_without_refresh_token(self):
         d = self._plant_home("dead-home", {"expiresAt": 0})
-        self.assertEqual(keepalive.refresh_home(d)["action"], "needs_reauth")
+        self.assertEqual(keepalive.refresh_home(d, apply=True)["action"], "needs_reauth")
+
+    def test_default_dry_run_is_recursive_metadata_noop_and_makes_no_request(self):
+        d = self._plant_home("nested/path/due-home", {
+            "refreshToken": "FAKE-R", "expiresAt": 0})
+        before = self._tree_state()
+        with mock.patch("urllib.request.urlopen") as request:
+            res = keepalive.refresh_home(d)
+            self.assertEqual(res["action"], "would-refresh")
+            request.assert_not_called()
+        self.assertEqual(self._tree_state(), before)
+        self.assertFalse(os.path.exists(keepalive.LOG_PATH))
+        self.assertFalse(os.path.exists(keepalive.LOCK_PATH))
+
+    def test_preimage_failure_refuses_before_rotating_grant(self):
+        d = self._plant_home("due-home", {"refreshToken": "FAKE-R", "expiresAt": 0})
+        before = open(os.path.join(d, ".credentials.json"), "rb").read()
+        with mock.patch.object(keepalive.cred, "backup", return_value={
+                "ok": False, "reason": "synthetic failure"}), \
+                mock.patch("urllib.request.urlopen") as request:
+            res = keepalive.refresh_home(d, apply=True)
+        self.assertEqual(res["action"], "error")
+        request.assert_not_called()
+        self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(), before)
 
     # -- the refresh grant: rotation persisted, owner-only, token-free log --
     def test_refresh_persists_rotation_atomically(self):
@@ -105,7 +144,7 @@ class KeepaliveTest(unittest.TestCase):
         resp = _FakeResp({"access_token": "NEW-A", "refresh_token": "NEW-R",
                           "expires_in": 3600})
         with mock.patch("urllib.request.urlopen", return_value=resp) as uo:
-            res = keepalive.refresh_home(d)
+            res = keepalive.refresh_home(d, apply=True)
         self.assertEqual(res["action"], "refreshed")
         self.assertTrue(res["rotated_refresh_token"])
         self.assertEqual(res["new_expiry_in_h"], 1.0)
@@ -138,7 +177,7 @@ class KeepaliveTest(unittest.TestCase):
                           "expires_in": 3600})
         with mock.patch.dict(os.environ, {"HELM_CRED_BACKUP_ROOT": backups}), \
                 mock.patch("urllib.request.urlopen", return_value=resp):
-            res = keepalive.refresh_home(d)
+            res = keepalive.refresh_home(d, apply=True)
         self.assertEqual(res["home"], "cto-example")            # the label survives
         self.assertEqual(res["account"], "owner@example.invalid")   # …beside the TRUTH
         pre = os.path.join(res["pre_image"], "credentials.json")
@@ -153,11 +192,34 @@ class KeepaliveTest(unittest.TestCase):
         with open(os.path.join(d, ".credentials.json")) as fh:
             before = fh.read()
         with mock.patch("urllib.request.urlopen", side_effect=_http_error(403)):
-            res = keepalive.refresh_home(d)
+            res = keepalive.refresh_home(d, apply=True)
         self.assertEqual(res["action"], "needs_reauth")
         self.assertIn("HTTP 403", res["reason"])
         with open(os.path.join(d, ".credentials.json")) as _f:
             self.assertEqual(_f.read(), before)
+
+    def test_non_utf8_and_exception_messages_never_reach_output_or_log(self):
+        sentinel = "sk-ant-oat01-" + "Q" * 96
+        d = self._plant_home("secret-shaped-home", {"refreshToken": sentinel,
+                                                     "expiresAt": 0})
+        with mock.patch("urllib.request.urlopen", side_effect=RuntimeError(sentinel)):
+            res = keepalive.refresh_home(d, apply=True)
+        text = json.dumps(res) + open(keepalive.LOG_PATH).read()
+        self.assertNotIn(sentinel, text)
+        with open(os.path.join(d, ".credentials.json"), "wb") as f:
+            f.write(b"\xff\xfe" + sentinel.encode())
+        res = keepalive.refresh_home(d, apply=True)
+        text = json.dumps(res) + open(keepalive.LOG_PATH).read()
+        self.assertNotIn(sentinel, text)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(keepalive, "_predecessor_pids",
+                               side_effect=RuntimeError(sentinel)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(keepalive.cmd_keepalive(["--apply"]), 1)
+        self.assertNotIn(sentinel, out.getvalue() + err.getvalue())
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            keepalive.cmd_keepalive(["--home", sentinel])
+        self.assertNotIn(sentinel, out.getvalue() + err.getvalue())
 
     # -- sweep: claude rolled forward, codex read-only stale-risk -----------
     def test_sweep_covers_claude_and_flags_stale_codex(self):
@@ -184,7 +246,7 @@ class KeepaliveTest(unittest.TestCase):
             ("999", "python3 /home/x/sesh/server/keepalive.py --sweep")]
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            rc = keepalive.cmd_keepalive([])
+            rc = keepalive.cmd_keepalive(["--apply"])
         self.assertEqual(rc, 1)
         self.assertIn("REFUSED", err.getvalue())
         self.assertIn("pid 999", err.getvalue())
@@ -197,7 +259,8 @@ class KeepaliveTest(unittest.TestCase):
             rc = keepalive.cmd_keepalive([])
         self.assertEqual(rc, 0)
         text = out.getvalue()
-        self.assertTrue(text.startswith("helm keepalive: 1 home checked, 0 refreshed"))
+        self.assertTrue(text.startswith(
+            "helm keepalive (dry-run — add --apply): 1 home checked, 0 refreshed"))
         self.assertIn('"skip"', text)
 
     def test_cmd_keepalive_one_home_and_bad_args(self):

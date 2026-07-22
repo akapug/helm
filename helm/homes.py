@@ -94,10 +94,12 @@ def _token_family(provider, home):
     """10-hex sha256 prefix of the home's refresh token — the FAMILY
     fingerprint. Content-equality grouping only: the bytes are read solely to
     hash IN MEMORY; nothing but the digest prefix leaves this function."""
-    auth = _read_json(os.path.join(home, AUTH_FILE[provider])) or {}
     if provider == "claude":
+        from . import cred
+        auth = cred._read_json(os.path.join(home, AUTH_FILE[provider])) or {}
         tok = (auth.get("claudeAiOauth") or {}).get("refreshToken")
     else:
+        auth = _read_json(os.path.join(home, AUTH_FILE[provider])) or {}
         tokens = auth.get("tokens") or {}
         tok = tokens.get("refresh_token") or tokens.get("refreshToken")
     if not isinstance(tok, str) or not tok:

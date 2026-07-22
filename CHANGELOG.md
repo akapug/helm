@@ -73,10 +73,10 @@
   the directory name), and `homes.py`'s identity reader, `helm launch --home`,
   the keepalive audit log and `helm doctor` all read it, so a dir name can no
   longer speak for an account. `helm cred list` is the owner-visible truth
-  surface (DIR NAME | ACTUAL ACCOUNT | verdict); `helm cred backup [--all]`
+  surface (DIR NAME | ACTUAL ACCOUNT | verdict); `helm cred backup [--all] --apply`
   snapshots credentials + identity into `~/.cred-backups/<folded-email>/<ts>/`
   (0700 dirs, 0600 files, idempotent, newest-20 retention);
-  `helm cred switch-guard [--install]` is the pre-login guard (explicit verb,
+  `helm cred switch-guard [--install] --apply` is the pre-login guard (explicit verb,
   or wired as a SessionStart hook in every claude home); `helm cred heal`
   restores a drifted home — DRY-RUN BY DEFAULT, backing up the current
   occupant first, verifying after, and refusing when a live session holds the
@@ -101,9 +101,9 @@
   block; (3) `restore` REFUSES a present-but-unparseable `.claude.json`
   instead of rewriting it from `{}` (that file holds the home's whole state —
   projects, MCP servers, history — and the old path silently destroyed it);
-  (4) a leftover `.helm-tmp.<pid>` file can no longer block a restore
-  permanently (the name is ours by pid, so a crashed run's leftover is
-  cleared once); (5) the switch-guard now rides `Stop` as well as
+  (4) a leftover temp file can no longer block a restore permanently (staging
+  uses random exclusive sibling names, not a recycled PID name); (5) the
+  switch-guard now rides `Stop` as well as
   `SessionStart`, because a live session refreshes its own credentials and the
   grant ROTATES the refresh token — a session-start-only pre-image is dead
   hours before the `/login` it exists for, and keepalive cannot cover the gap
@@ -118,6 +118,22 @@
   ARRIVING account, which reads as `0` at exactly the moment the owner needs
   to know the evicted one is safe (live estate: `cto-example-invalid`
   now says plainly that nothing was ever snapshotted for it).
+
+- Second independent CRED-SAFE-SWITCH review closed the remaining safety gaps:
+  every credential mutation, including `backup`, guard installation, and
+  `keepalive`, is now dry-run unless `--apply`; keepalive takes its stable
+  pre-image before the rotating network grant; backup brackets identity and
+  credential reads so a concurrent `/login` cannot cross-file a snapshot;
+  restore rejects symlinks and snapshot identity/digest/length mismatches, then
+  performs durable two-file commit with exact
+  bytes/mode/absence rollback at every staging/rename/fsync boundary; heal
+  re-probes holders after capture and at commit, with permission/read/PID-reuse
+  uncertainty refusing; lossy folded-name collisions have exact-account
+  counting/retention and ambiguous heal selection refuses; and CLI,
+  doctor, keepalive log, invalid-path, non-UTF8 and exception surfaces report
+  class/reason only, never credential or token-shaped values. Native quota
+  usage and command-mint attribution now share `cred.account_of`, so content
+  identity is consistent end-to-end.
 
 - Stop-whisper slice 2 — the verify-grounding rungs: the contextual
   continuation ladder gains three signals read from record.py's own logs

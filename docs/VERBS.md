@@ -875,7 +875,7 @@ helm creds crosscheck — local-session scan vs header truth (drift = a health s
     commingled — 4 accounts share this store; not a per-account cross-check
 ```
 
-### `helm cred [list | backup [--all] | switch-guard [--install] | heal [--apply]]`
+### `helm cred [list | backup [--all] [--apply] | switch-guard [--install] [--apply] | heal [--apply]]`
 **The safe `/login`.** Hitting a session limit and running `/login` must never
 be a scary act. It cannot be redirected — a live session's `CLAUDE_CONFIG_DIR`
 is fixed, so the new account lands in the config dir that session is pinned to
@@ -891,8 +891,8 @@ all** rather than a guess.
 | sub-verb | what it does |
 | --- | --- |
 | `list` (default) | DIR NAME &#124; ACTUAL ACCOUNT &#124; verdict (`AGREE` / `DRIFT` / `UNKNOWN` / `N/A`) &#124; backup depth. Pure read — the owner-visible truth surface. |
-| `backup [--all] [--home H] [--quiet]` | Snapshot a home's `.credentials.json` bytes + its `oauthAccount` block into `~/.cred-backups/<folded-email>/<ts>/` (dirs `0700`, files `0600`, owner-only from creation). Skips when an identical snapshot already exists; keeps the newest 20 per account. `--quiet` is hook mode: prints nothing, ever. |
-| `switch-guard [--home H]` | **Run this before a `/login`.** Backs the home's current account up, then prints the exact login command. Whatever `/login` evicts is now recoverable. `--install` wires the same backup as a `SessionStart` **and** `Stop` hook in every claude home, so a pre-image exists even when nobody remembered — and stays within one turn of the live token (a session refreshes its own credentials and the grant rotates the refresh token, so a session-start-only pre-image is dead by hour two; keepalive cannot cover it either, because it skips every home with a live holder). |
+| `backup [--all] [--home H] [--apply] [--quiet]` | Plan a snapshot of a home's stable `.credentials.json` bytes + `oauthAccount` block; **dry-run by default**. `--apply` writes it under `~/.cred-backups/<folded-email>/<ts>/` (dirs `0700`, files `0600`, owner-only from creation). Concurrent identity/token changes, symlinks, unreadable files, and failed pre-image capture refuse. Skips an identical newest snapshot; keeps 20 per account. `--quiet` is hook mode. |
+| `switch-guard [--home H] [--apply]` | **Run with `--apply` before a `/login`.** Dry-run is the default. Applied mode backs the home's current account up, then prints the login command. `--install --apply` wires `cred backup --apply --quiet` as both `SessionStart` and `Stop` hooks in every claude home, keeping the pre-image within one turn of the rotating live token. |
 | `heal [<home>] [--apply]` | Put the correctly-named account back into a DRIFTED home from its newest snapshot. **Dry-run by default.** |
 
 `heal` refuses more than it acts, on purpose:
@@ -901,9 +901,13 @@ all** rather than a guess.
   `/proc/<pid>/environ`, agent processes named first). A live session is never
   evicted; the probe is re-run immediately before the write, so a holder that
   arrives mid-heal still wins.
-* **cannot-probe** — no `/proc` to prove the home is free. Fail closed.
+* **cannot-probe** — `/proc` is unavailable, an own process cannot be read, or a
+  PID changes identity during the bracketed scan. Uncertainty is never treated
+  as absence.
 * **no-backup** — nothing to restore; the account can only come back through a
   fresh login, and helm says so instead of inventing a restore.
+* **ambiguous-backup** — snapshots sharing a folded home name claim multiple or
+  missing identities. A lossy filename fold is never enough to select an account.
 * **revocation-risk** — the snapshot's refresh token is still LIVE in another
   home. Restoring it would leave byte-copies of one token family in two homes,
   and reuse detection revokes the whole family (see `helm homes verify`). helm
@@ -922,14 +926,15 @@ rather than refuses (the snapshot is still the only recovery on disk) and
 prints the fresh-login command beside it.
 
 An applied heal snapshots the CURRENT occupant first (the undo is itself
-undoable), restores, then VERIFIES the home now reads as the expected account —
-rolling back if it does not. The restore itself is ALL-OR-NOTHING across the
-two files it touches: `.credentials.json` and `.claude.json` are both staged
-before either is committed, and a failed commit puts the credentials file back,
-because a home holding one account's tokens under another account's identity
-block is exactly the state this verb exists to abolish. A present-but-
-unparseable `.claude.json` is refused, never rewritten from scratch — that file
-holds the home's whole state. Restored credentials can still be stale (refresh
+undoable), re-probes holders after capture and again at the restore commit,
+restores, then VERIFIES the home now reads as the expected account. The restore
+is transactional across `.credentials.json` and `.claude.json`: both are durably
+staged at `0600` before either rename, the directory is fsynced, and every
+staging/rename/fsync/verification failure restores exact original bytes, modes,
+and absence for every file already changed. Snapshot/home/file symlinks and
+snapshot identity/digest/length mismatches are refused. A present-but-
+unparseable `.claude.json` is never rewritten from
+scratch — it holds the home's whole state. Restored credentials can still be stale (refresh
 tokens rotate); when claude rejects them the fix is one fresh login, and the
 identity is right either way.
 
@@ -959,7 +964,7 @@ helm cred — identity read from CONTENT (.claude.json oauthAccount), never from
   you-example-com                you@example.com                  AGREE    2
 helm cred: 2 homes, 1 drift — `helm cred heal` (dry-run) shows the repair
 
-$ helm cred switch-guard --home you-example-com
+$ helm cred switch-guard --home you-example-com --apply
 helm cred switch-guard: you@example.com is protected (snapshot /home/you/.cred-backups/you-example-com/20260722T032630Z)
   now safe to run:  CLAUDE_CONFIG_DIR=/home/you/.claude-homes/you-example-com claude /login
   after the login:  `helm cred list` shows what this home now holds; `helm cred heal` puts you@example.com back when no session holds it.
@@ -1114,13 +1119,14 @@ helm codex: launch gate (fresh = rollout tail <60m, near >= 80%)
 env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL=http://127.0.0.1:8317 … HELM_CHAT_NAME=codex-3 …
 ```
 
-### `helm keepalive [--home NAME|PATH] [--early HOURS]`
-Roll idle claude homes' OAuth tokens forward before their refresh chains rot —
-the **one** credential-writing verb in helm, with every safety rule inherited:
-rotation persists atomically, one live refresher machine-wide, owner-only file
-modes from creation, refresh only when due (default `--early 24`). Codex homes
-are read-only by design and surfaced as stale-risk instead. Every action is
-logged to `~/.cache/helm/keepalive-log.jsonl`; token values appear nowhere.
+### `helm keepalive [--home NAME|PATH] [--early HOURS] [--apply]`
+Roll idle claude homes' OAuth tokens forward before their refresh chains rot.
+**Dry-run by default:** without `--apply` it makes no network call, lock/log
+file, backup, or credential write. Applied mode captures a stable pre-image
+*before* the rotating grant and refuses the grant if capture fails; then it
+persists the rotated pair atomically at `0600`. Codex homes remain read-only and
+surface as stale-risk. Applied outcomes are logged to
+`~/.cache/helm/keepalive-log.jsonl`; token and exception values appear nowhere.
 
 ## configs — every config, every home
 

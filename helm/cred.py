@@ -111,14 +111,19 @@ def _stat_key(path):
 
 
 def _read_regular(path):
-    """(bytes, mode) from one non-symlink regular file. The descriptor is the
-    object checked, closing the lstat/open swap window."""
+    """(bytes, mode) from one non-symlink regular file. lstat/open/fstat inode
+    equality closes both symlink and regular-file swap races, even where
+    O_NOFOLLOW is unavailable."""
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        raise OSError("not a plain regular file")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError("not a regular file")
+        if (not stat.S_ISREG(st.st_mode)
+                or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino)):
+            raise OSError("file changed during open")
         with os.fdopen(fd, "rb") as fh:
             fd = -1
             return fh.read(), stat.S_IMODE(st.st_mode)
@@ -189,12 +194,21 @@ def account_of(config_dir):
     from its CONTENT. -> {path, email, uuid, org, ok, error}. Cached by the
     .claude.json stat key, so every caller can ask freely."""
     real = os.path.realpath(os.path.expanduser(config_dir or ""))
-    key = _stat_key(os.path.join(real, ACCOUNT_JSON))
+    src = os.path.join(real, ACCOUNT_JSON)
+    key = _stat_key(src)
     hit = _CACHE.get(real)
     if hit is not None and hit[0] == key:
         return dict(hit[1])
-    res = _read_account(real)
-    _CACHE[real] = (key, res)
+    for _ in range(2):
+        before = _stat_key(src)
+        res = _read_account(real)
+        after = _stat_key(src)
+        if before == after:
+            _CACHE[real] = (after, res)
+            return dict(res)
+    res = {"path": real, "email": None, "uuid": None, "org": None,
+           "ok": False, "error": "%s changed during identity read" % ACCOUNT_JSON}
+    _CACHE[real] = (_stat_key(src), res)
     return dict(res)
 
 
@@ -300,8 +314,12 @@ def _snapshots_in(d):
 
 
 def snapshots(email):
-    """Every snapshot of one account, oldest first (the ts name sorts)."""
-    return _snapshots_in(account_dir(email)) if email else []
+    """Snapshots claiming this exact normalized account, oldest first. The
+    folded directory name is lossy (`+` and `-` collide), so account metadata —
+    never the directory alone — owns filtering and retention."""
+    expected = _email_or_none(email)
+    return ([s for s in _snapshots_in(account_dir(expected))
+             if s["account"] == expected] if expected else [])
 
 
 def snapshots_for_home_name(name):
@@ -531,34 +549,49 @@ def _pre_image(path):
     file; only true ENOENT may later roll back by deletion."""
     try:
         blob, mode = _read_regular(path)
-        return {"exists": True, "blob": blob, "mode": mode}, None
+        return {"exists": True, "blob": blob, "mode": mode,
+                "key": _stat_key(path)}, None
     except FileNotFoundError:
-        return {"exists": False, "blob": None, "mode": None}, None
+        return {"exists": False, "blob": None, "mode": None, "key": None}, None
     except OSError as e:
         return None, "pre-image unreadable (%s)" % e.__class__.__name__
 
 
 def _rollback_files(pre):
-    """Restore exact bytes, modes, and original absence after a failed commit."""
-    staged = []
-    try:
-        for path, image in pre.items():
+    """Restore exact bytes, modes, and original absence after a failed commit.
+
+    BEST-EFFORT PER FILE, credentials first: the same persistent fault that
+    broke the commit (disk-full, EIO) can also break the undo, and an all-or-
+    nothing rollback that aborts on the FIRST file leaves the MORE sensitive
+    one unrestored. The credential file is rolled back before the identity
+    file, and a failure on either is recorded — never allowed to skip the
+    other. -> True only when every file is byte-exactly back."""
+    ordered = sorted(pre.items(), key=lambda kv: 0 if kv[0].endswith(AUTH_JSON) else 1)
+    staged = {}
+    ok = True
+    for path, image in ordered:
+        if not image["exists"]:
+            continue
+        try:
+            staged[path] = _stage_private(path, image["blob"], image["mode"])
+        except OSError:
+            ok = False          # cannot even stage this file's undo — still try the rest
+    for path, image in ordered:
+        try:
             if image["exists"]:
-                staged.append((path, _stage_private(
-                    path, image["blob"], image["mode"])))
-        for path, image in reversed(list(pre.items())):
-            if image["exists"]:
-                tmp = next(t for p, t in staged if p == path)
-                os.replace(tmp, path)
+                if path in staged:
+                    os.replace(staged[path], path)
             elif os.path.lexists(path):
                 os.unlink(path)
+        except OSError:
+            ok = False
+    try:
         _fsync_dir(os.path.dirname(next(iter(pre))))
-        return True
     except OSError:
-        return False
-    finally:
-        for _, tmp in staged:
-            _unlink(tmp)
+        ok = False
+    for tmp in staged.values():
+        _unlink(tmp)
+    return ok
 
 
 def _snapshot_files(snapshot_path):
@@ -574,12 +607,18 @@ def _snapshot_files(snapshot_path):
             return None, None, "snapshot is not a plain directory"
         blob, _ = _read_regular(os.path.join(snap, "credentials.json"))
         account_blob, _ = _read_regular(os.path.join(snap, "account.json"))
+        meta_blob, _ = _read_regular(os.path.join(snap, "meta.json"))
     except (OSError, ValueError) as e:
         return None, None, "snapshot unreadable (%s)" % e.__class__.__name__
     oa = _json_bytes(account_blob)
     email = _email_or_none(oa.get("emailAddress")) if isinstance(oa, dict) else None
     if not email:
         return None, None, "snapshot has no valid identity block — refusing"
+    meta = _json_bytes(meta_blob)
+    if (not isinstance(meta, dict) or _email_or_none(meta.get("account")) != email
+            or meta.get("digest") != hashlib.sha256(blob).hexdigest()[:12]
+            or meta.get("bytes") != len(blob)):
+        return None, None, "snapshot metadata/content mismatch — refusing"
     return blob, dict(oa, emailAddress=email), None
 
 
@@ -599,6 +638,7 @@ def restore(snapshot_path, config_dir, require_free=False):
         return {"ok": False, "error": "home unavailable (%s)" % e.__class__.__name__}
     if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
         return {"ok": False, "error": "home is not a plain directory — refusing"}
+    home_mode = stat.S_IMODE(st.st_mode)
     blob, oa, error = _snapshot_files(snapshot_path)
     if error:
         return {"ok": False, "error": error}
@@ -634,8 +674,18 @@ def restore(snapshot_path, config_dir, require_free=False):
             for _, tmp in staged:
                 _unlink(tmp)
             return {"ok": False, "error": "home is no longer proven free — refusing"}
+    for path, image in pre.items():
+        stable = (_stat_key(path) == image["key"] if image["exists"]
+                  else not os.path.lexists(path))
+        if not stable:
+            for _, tmp in staged:
+                _unlink(tmp)
+            return {"ok": False, "error": "home changed during restore — refusing"}
     changed = []
+    dir_changed = False
     try:
+        os.chmod(real, 0o700, follow_symlinks=False)
+        dir_changed = home_mode != 0o700
         for path, tmp in staged:
             os.replace(tmp, path)
             changed.append(path)
@@ -645,14 +695,21 @@ def restore(snapshot_path, config_dir, require_free=False):
             raise OSError("credential verification failed")
         cfg_blob, cfg_mode = _read_regular(cfg)
         cfg_doc = _json_bytes(cfg_blob)
-        if (cfg_mode != 0o600 or not isinstance(cfg_doc, dict)
+        if (stat.S_IMODE(os.lstat(real).st_mode) != 0o700
+                or cfg_mode != 0o600 or not isinstance(cfg_doc, dict)
                 or _email_or_none((cfg_doc.get("oauthAccount") or {}).get(
                     "emailAddress")) != oa["emailAddress"]):
             raise OSError("identity verification failed")
     except OSError as e:
         for _, tmp in staged:
             _unlink(tmp)
-        rolled = _rollback_files(pre) if changed else True
+        rolled = _rollback_files({p: pre[p] for p in changed}) if changed else True
+        if dir_changed:
+            try:
+                os.chmod(real, home_mode, follow_symlinks=False)
+                _fsync_dir(real)
+            except OSError:
+                rolled = False
         cache_clear()
         if not rolled:
             return {"ok": False, "error": "write failed (%s) and exact rollback failed"
@@ -675,9 +732,9 @@ def holders_of(path, default=False):
     excluded). None means uncertainty, and every caller MUST refuse.
 
     Each pid is bracketed by its starttime so PID reuse cannot mix one
-    process's environ with another's comm. A permission/read error while the pid
-    still exists is uncertainty, not evidence of absence; only a process that
-    demonstrably vanished during the scan is skipped."""
+    process's environ with another's comm. A process that vanishes mid-scan is
+    skipped; every permission/read error while the pid remains is uncertainty,
+    never evidence of absence."""
     if not os.path.isdir(PROC_ROOT):
         return None
     real = os.path.realpath(path)
@@ -740,7 +797,7 @@ def _family_live_elsewhere(snapshot, target, estate):
         return None
     for other in estate:
         if other["real"] != target["real"] and other.get("family") == fam:
-            return other["name"]
+            return _display_path(other["name"])
     return None
 
 
@@ -761,7 +818,7 @@ def heal_plan(name=None):
         snap_accounts = {s["account"] for s in snaps if s["account"]}
         holders = holders_of(r["real"], default=r["default"])
         clash = _family_live_elsewhere(snaps[-1], r, estate) if snaps else None
-        plan = {"name": r["name"], "path": r["real"], "holds": r["account"],
+        plan = {"name": _display_path(r["name"]), "path": r["real"], "holds": r["account"],
                 "wants_account_folded": want,
                 "restore_from": snaps[-1]["path"] if snaps else None,
                 "restore_account": snaps[-1]["account"] if snaps else None,
@@ -775,7 +832,7 @@ def heal_plan(name=None):
         elif not snaps:
             plan["status"], plan["reason"] = "no-backup", (
                 "no snapshot for %s — the evicted account can only come back "
-                "through a fresh login" % want)
+                "through a fresh login" % _display_path(want))
         elif len(snap_accounts) != 1:
             plan["status"], plan["reason"] = "ambiguous-backup", (
                 "snapshots under %s claim multiple or missing account identities — "
@@ -785,7 +842,7 @@ def heal_plan(name=None):
                 "that snapshot's token family is LIVE in %s — restoring it here "
                 "would leave byte-copies of ONE refresh token in two homes, and "
                 "reuse detection revokes the whole family. Fresh login instead: %s"
-                % (clash, homes.LOGIN_CMDS["claude"](r["real"])))
+                % (clash, _login_cmd(r["real"])))
         else:
             # STALENESS is the temporal twin of the shared-family bomb: an
             # access token that had already expired means whoever held this
@@ -806,7 +863,7 @@ def heal_plan(name=None):
                     "token) after it was taken; the snapshot's copy may be spent, "
                     "and a spent refresh token is what reuse detection revokes a "
                     "family over. A fresh login is the safe move: %s"
-                    % homes.LOGIN_CMDS["claude"](r["real"]))
+                    % _login_cmd(r["real"]))
         plans.append(plan)
     return plans
 
@@ -885,16 +942,16 @@ def doctor_rows():
             out.append(("WARN",
                         "credhome %s HOLDS %s (drift — that account's home is %s); "
                         "%s, `helm cred list` shows the whole estate"
-                        % (r["name"], r["account"], r["wants_home"],
+                        % (_display_path(r["name"]), r["account"], r["wants_home"],
                            "`helm cred heal` restores %s from its %d snapshot%s"
-                           % (r["name"], r["named_backups"],
+                           % (_display_path(r["name"]), r["named_backups"],
                               "s"[:r["named_backups"] != 1]) if r["named_backups"]
                            else "and NOTHING was snapshotted for %s — only a fresh "
-                                "login brings it back" % r["name"])))
+                                "login brings it back" % _display_path(r["name"]))))
         elif r["verdict"] == "UNKNOWN" and r["authed"]:
             out.append(("WARN", "credhome %s holds credentials but its identity is "
                                 "unreadable (%s) — no account claimed"
-                        % (r["name"], r["error"])))
+                        % (_display_path(r["name"]), r["error"])))
     accounts = sorted({r["account"] for r in rs if r["account"]})
     missing = [a for a in accounts if not snapshots(a)]
     for a in missing:
@@ -934,6 +991,25 @@ def _display_path(path):
     return str(path)
 
 
+def _login_cmd(path):
+    shown = _display_path(path)
+    return (homes.LOGIN_CMDS["claude"](shown) if shown != "<redacted-path>"
+            else "select the home by name, then run claude /login (path redacted)")
+
+
+def _public_paths(value, key=None):
+    """Redact token-shaped values only in fields whose schema is a path/label."""
+    if isinstance(value, dict):
+        return {k: _public_paths(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_public_paths(v, key) for v in value]
+    if isinstance(value, str) and key in {
+            "path", "real", "home", "dest", "restore_from", "pre_image",
+            "source_home", "name", "aliases", "wants_account_folded"}:
+        return _display_path(value)
+    return value
+
+
 def _resolve_home(name):
     """--home NAME | path -> realpath, via the same resolver every other verb
     uses. No name -> $CLAUDE_CONFIG_DIR -> the default home."""
@@ -952,7 +1028,7 @@ def _print_list(args):
     as_json = "--json" in args
     rs = rows()
     if as_json:
-        print(json.dumps(rs, indent=2))
+        print(json.dumps(_public_paths(rs), indent=2))
         return 0
     if not rs:
         print("helm cred: no claude credential homes found")
@@ -966,20 +1042,20 @@ def _print_list(args):
         if r["verdict"] == "DRIFT":
             note.append("this account's home is %s" % r["wants_home"])
             note.append("heal can restore %s (%d snapshot%s)"
-                        % (r["name"], r["named_backups"],
+                        % (_display_path(r["name"]), r["named_backups"],
                            "s"[:r["named_backups"] != 1]) if r["named_backups"]
                         else "NO snapshot of %s — only a fresh login brings it "
-                             "back" % r["name"])
+                             "back" % _display_path(r["name"]))
         if r["verdict"] == "UNKNOWN":
             note.append(r["error"] or "identity unreadable")
         if r["aliases"]:
-            note.append("alias: " + ",".join(r["aliases"]))
+            note.append("alias: " + ",".join(_display_path(a) for a in r["aliases"]))
         if r["live_pids"]:
             note.append("live pids " + ",".join(map(str, r["live_pids"])))
         if not r["authed"]:
             note.append("no %s" % AUTH_JSON)
         print("  %-30s %-32s %-8s %-8s %s"
-              % (r["name"][:30], (r["account"] or "-")[:32], r["verdict"],
+              % (_display_path(r["name"])[:30], (r["account"] or "-")[:32], r["verdict"],
                  r["backups"], "; ".join(note)))
     drift = [r for r in rs if r["verdict"] == "DRIFT"]
     print("helm cred: %d home%s, %d drift%s%s"
@@ -1016,13 +1092,13 @@ def _print_backup(args):
     for r in results:
         if r["action"] == "backup":
             print("  backed up %-32s <- %s  (%s)"
-                  % (r["account"], r["name"], _display_path(r["dest"])))
+                  % (r["account"], _display_path(r["name"]), _display_path(r["dest"])))
         elif r["action"] == "would-backup":
-            print("  WOULD BACK UP %-26s <- %s" % (r["account"], r["name"]))
+            print("  WOULD BACK UP %-26s <- %s" % (r["account"], _display_path(r["name"])))
         elif r["ok"]:
-            print("  %-32s %s (%s)" % (r["account"], r["reason"], r["name"]))
+            print("  %-32s %s (%s)" % (r["account"], r["reason"], _display_path(r["name"])))
         else:
-            print("  SKIP %-27s %s" % (r["name"], r["reason"]))
+            print("  SKIP %-27s %s" % (_display_path(r["name"]), r["reason"]))
     if apply:
         print("helm cred backup (APPLIED): %d snapshot%s written, %d already current "
               "(root %s, 0700 dirs / 0600 files — token bytes are copied, never printed)"
@@ -1099,7 +1175,7 @@ def _print_heal(args):
         return 2
     res = heal(rest[0] if rest else None, apply=apply)
     if as_json:
-        print(json.dumps(res, indent=2))
+        print(json.dumps(_public_paths(res), indent=2))
         return 0
     plans = res["plans"]
     if not plans:
@@ -1111,7 +1187,8 @@ def _print_heal(args):
         print("  %-30s holds %-32s %s" % (p["name"], p["holds"] or "-", p["status"]))
         print("      %s" % p["reason"])
         if p.get("pre_image"):
-            print("      pre-image of the evicted occupant: %s" % p["pre_image"])
+            print("      pre-image of the evicted occupant: %s"
+                  % _display_path(p["pre_image"]))
     bad = apply and any(p["status"] != "restored" for p in plans)
     return 1 if bad else 0
 

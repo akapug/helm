@@ -4,6 +4,7 @@ and the real ~/.cred-backups are never read or written, and every credential
 byte in here is an obvious fake string ("FAKE-…"): no test fixture, output or
 log line ever carries a real token."""
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -76,6 +77,23 @@ class CredBase(unittest.TestCase):
             rc = fn(*a, **kw)
         return rc, buf.getvalue(), err.getvalue()
 
+    def tree_state(self):
+        """Recursive content + metadata state, including nested dirs/symlinks."""
+        out = []
+        for root, dirs, files in os.walk(self.tmp):
+            for name in sorted(dirs + files):
+                p = os.path.join(root, name)
+                st = os.lstat(p)
+                rel = os.path.relpath(p, self.tmp)
+                digest = None
+                if stat.S_ISREG(st.st_mode):
+                    digest = hashlib.sha256(open(p, "rb").read()).hexdigest()
+                elif stat.S_ISLNK(st.st_mode):
+                    digest = os.readlink(p)
+                out.append((rel, stat.S_IMODE(st.st_mode), st.st_size,
+                            st.st_mtime_ns, digest))
+        return out
+
 
 class IdentityTest(CredBase):
     def test_identity_comes_from_content_not_the_dir_name(self):
@@ -123,18 +141,62 @@ class IdentityTest(CredBase):
         self.plant("a-b-com", "other@b.com")       # a /login lands here
         self.assertEqual(cred.account_of(d)["email"], "other@b.com")
 
+    def test_identity_read_refuses_repeated_concurrent_replacement(self):
+        d = self.plant("a-b-com", "a@b.com")
+        original = cred._read_account
+        n = [0]
+
+        def racing(real):
+            res = original(real)
+            n[0] += 1
+            with open(os.path.join(d, ".claude.json"), "w") as f:
+                json.dump({"oauthAccount": {"emailAddress":
+                          ("r" * n[0]) + "@example.test"}}, f)
+            return res
+
+        cred.cache_clear()
+        with mock.patch.object(cred, "_read_account", side_effect=racing):
+            got = cred.account_of(d)
+        self.assertFalse(got["ok"])
+        self.assertIn("changed during identity read", got["error"])
+
     def test_homes_row_identity_uses_the_same_reader(self):
         self.plant("cto-example-com", "owner@example.invalid")
         row = {r["name"]: r for r in homes.homes_list()}["cto-example-com"]
         self.assertEqual(row["identity"], "owner@example.invalid")
         self.assertFalse(row["canonical"])         # the pre-existing drift bit
 
+    def test_content_identity_flows_to_usage_and_command_mint(self):
+        from helm import transcripts
+        from helm.providers import NativeQuotaProvider
+        d = self.plant("cto-example-com", "David@MV.COM")
+        p = NativeQuotaProvider(history_path=os.path.join(self.tmp, "usage.jsonl"))
+        p.claude_root, p.codex_root = homes.ROOTS["claude"], homes.ROOTS["codex"]
+        p._active_homes = lambda: set()
+        expand = lambda x: ({"~/.claude": homes.DEFAULTS["claude"],
+                             "~/.codex": homes.DEFAULTS["codex"]}.get(x, x))
+        with mock.patch("helm.providers.os.path.expanduser", side_effect=expand):
+            account = p.accounts()[0]
+        self.assertEqual(account["name"], "owner@example.invalid")
+        with mock.patch.object(p, "_get_json", return_value={"limits": [{
+                "kind": "session", "percent": 12, "resets_at": None}]}):
+            usage, _ = p._probe_one(account)
+        self.assertEqual(usage["account"], "owner@example.invalid")
+        mint = os.path.join(self.tmp, "mints.jsonl")
+        with mock.patch.object(transcripts, "MINTS_PATH", mint), \
+                mock.patch.object(transcripts, "_provider", return_value=p), \
+                mock.patch("helm.providers.os.path.expanduser", side_effect=expand):
+            transcripts._log_mint({"i": "sid", "h": "claude", "cwd": self.tmp},
+                                  "owner@example.invalid", None)
+        row = json.loads(open(mint).read())
+        self.assertEqual((row["account"], row["home"]), ("owner@example.invalid", d))
+
 
 class BackupTest(CredBase):
     def test_roundtrip_reproduces_bytes_and_identity(self):
         d = self.plant("david-example-invalid", "owner@example.invalid")
         before = open(os.path.join(d, ".credentials.json"), "rb").read()
-        res = cred.backup(d)
+        res = cred.backup(d, apply=True)
         self.assertTrue(res["ok"])
         self.assertEqual(res["action"], "backup")
         self.assertEqual(res["account"], "owner@example.invalid")
@@ -148,10 +210,13 @@ class BackupTest(CredBase):
         self.assertTrue(r["ok"])
         self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(), before)
         self.assertEqual(cred.account_of(d)["email"], "owner@example.invalid")
+        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+        for name in (".credentials.json", ".claude.json"):
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(d, name)).st_mode), 0o600)
 
     def test_restore_preserves_the_rest_of_claude_json(self):
         d = self.plant("david-example-invalid", "owner@example.invalid")
-        snap = cred.backup(d)["dest"]
+        snap = cred.backup(d, apply=True)["dest"]
         doc = json.load(open(os.path.join(d, ".claude.json")))
         doc["oauthAccount"] = {"emailAddress": "someone@else.com"}
         doc["tipsHistory"] = {"keep": 1}
@@ -165,7 +230,7 @@ class BackupTest(CredBase):
 
     def test_permissions_are_0600_files_inside_0700_dirs(self):
         d = self.plant("david-example-invalid", "owner@example.invalid")
-        dest = cred.backup(d)["dest"]
+        dest = cred.backup(d, apply=True)["dest"]
         for name in ("credentials.json", "account.json", "meta.json"):
             mode = stat.S_IMODE(os.stat(os.path.join(dest, name)).st_mode)
             self.assertEqual(mode, 0o600, name)
@@ -174,17 +239,17 @@ class BackupTest(CredBase):
 
     def test_identical_snapshot_is_skipped(self):
         d = self.plant("david-example-invalid", "owner@example.invalid")
-        first = cred.backup(d)
-        again = cred.backup(d)
+        first = cred.backup(d, apply=True)
+        again = cred.backup(d, apply=True)
         self.assertEqual(again["action"], "skip")
         self.assertEqual(again["dest"], first["dest"])
         self.assertEqual(len(cred.snapshots("owner@example.invalid")), 1)
 
     def test_changed_credentials_make_a_new_snapshot(self):
         d = self.plant("david-example-invalid", "owner@example.invalid")
-        cred.backup(d)
+        cred.backup(d, apply=True)
         self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-ROTATED")
-        self.assertEqual(cred.backup(d)["action"], "backup")
+        self.assertEqual(cred.backup(d, apply=True)["action"], "backup")
         self.assertEqual(len(cred.snapshots("owner@example.invalid")), 2)
 
     def test_backup_fails_closed_on_unknown_identity(self):
@@ -192,7 +257,7 @@ class BackupTest(CredBase):
         os.makedirs(d)
         with open(os.path.join(d, ".credentials.json"), "w") as f:
             json.dump({"claudeAiOauth": {"refreshToken": FAKE}}, f)
-        res = cred.backup(d)
+        res = cred.backup(d, apply=True)
         self.assertFalse(res["ok"])
         self.assertEqual(res["action"], "skip")
         self.assertFalse(os.path.isdir(os.path.join(self.backups, "mystery")))
@@ -201,12 +266,28 @@ class BackupTest(CredBase):
         d = self.plant("david-example-invalid", "owner@example.invalid")
         for i in range(cred.KEEP + 3):
             self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-%d" % i)
-            cred.backup(d)
+            cred.backup(d, apply=True)
         snaps = cred.snapshots("owner@example.invalid")
         self.assertEqual(len(snaps), cred.KEEP)
         newest = json.load(open(os.path.join(snaps[-1]["path"], "credentials.json")))
         self.assertEqual(newest["claudeAiOauth"]["refreshToken"],
                          "FAKE-%d" % (cred.KEEP + 2))
+
+    def test_fold_collisions_never_mix_counts_idempotence_or_pruning(self):
+        plus = self.plant("plus-home", "a+b@example.com", token="FAKE-PLUS")
+        dash = self.plant("dash-home", "a-b@example.com", token="FAKE-DASH")
+        cred.backup(dash, apply=True)
+        for i in range(cred.KEEP + 2):
+            self.plant("plus-home", "a+b@example.com", token="FAKE-PLUS-%d" % i)
+            cred.backup(plus, apply=True)
+        self.assertEqual(len(cred.snapshots("a+b@example.com")), cred.KEEP)
+        dash_snaps = cred.snapshots("a-b@example.com")
+        self.assertEqual(len(dash_snaps), 1)
+        self.assertEqual(json.load(open(os.path.join(
+            dash_snaps[0]["path"], "credentials.json")))["claudeAiOauth"]["refreshToken"],
+                         "FAKE-DASH")
+        self.assertEqual(len(cred.snapshots_for_home_name("a-b-example-com")),
+                         cred.KEEP + 1)
 
     def test_unwritable_root_is_reported_never_raised(self):
         """keepalive's rotation calls backup — a full/blocked disk must not
@@ -216,7 +297,7 @@ class BackupTest(CredBase):
         with open(blocked, "w") as f:
             f.write("")
         with mock.patch.dict(os.environ, {"HELM_CRED_BACKUP_ROOT": blocked}):
-            res = cred.backup(d)
+            res = cred.backup(d, apply=True)
         self.assertFalse(res["ok"])
         self.assertIn("snapshot write failed", res["reason"])
 
@@ -227,11 +308,11 @@ class BackupTest(CredBase):
         finished pre-image."""
         a = self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-A")
         b = self.plant("cto-example-com", "owner@example.invalid", token="FAKE-B")
-        first = cred.backup(a)
+        first = cred.backup(a, apply=True)
         # freeze the clock so both claims want the SAME timestamp name
         with mock.patch.object(cred.time, "strftime",
                                lambda *a_, **k: os.path.basename(first["dest"])):
-            second = cred.backup(b)
+            second = cred.backup(b, apply=True)
         self.assertTrue(second["ok"], second)
         self.assertNotEqual(second["dest"], first["dest"])
         self.assertTrue(os.path.exists(os.path.join(first["dest"], "credentials.json")))
@@ -245,8 +326,20 @@ class BackupTest(CredBase):
         self.plant("david-example-invalid", "owner@example.invalid")
         self.plant("team-example-com", "hey@simbi.com")
         self.plant("no-creds-com", "no@creds.com", token=None)
-        done = {r["account"] for r in cred.backup_all() if r["action"] == "backup"}
+        done = {r["account"] for r in cred.backup_all(apply=True) if r["action"] == "backup"}
         self.assertEqual(done, {"owner@example.invalid", "hey@simbi.com"})
+
+    def test_every_mutating_cli_is_recursive_metadata_noop_without_apply(self):
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        cred.backup(cto, apply=True)
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        self.plant("nested/path/home", "nested@example.test")
+        before = self.tree_state()
+        for argv in (["backup", "--all"], ["switch-guard", "--home", "cto-example-com"],
+                     ["switch-guard", "--install"], ["heal"],
+                     ["backup", "--home"]):
+            self.out(cred.cmd_cred, argv)
+            self.assertEqual(self.tree_state(), before, argv)
 
 
 class RestoreAtomicityTest(CredBase):
@@ -257,7 +350,7 @@ class RestoreAtomicityTest(CredBase):
 
     def staged(self, token="FAKE-OLD"):
         d = self.plant("david-example-invalid", "owner@example.invalid", token=token)
-        snap = cred.backup(d)["dest"]
+        snap = cred.backup(d, apply=True)["dest"]
         self.plant("david-example-invalid", "intruder@example.invalid", token="FAKE-INTRUDER")
         return d, snap
 
@@ -299,6 +392,123 @@ class RestoreAtomicityTest(CredBase):
         self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(), creds)
         self.assertFalse([f for f in os.listdir(d) if "helm-tmp" in f])
 
+    def test_restore_refuses_when_preimage_changes_after_staging(self):
+        d, snap = self.staged()
+        auth = os.path.join(d, ".credentials.json")
+        cfg = open(os.path.join(d, ".claude.json"), "rb").read()
+        real = cred._stage_private
+
+        def racing(path, data, mode=0o600):
+            tmp = real(path, data, mode)
+            if path.endswith(".claude.json"):
+                with open(auth, "wb") as f:
+                    f.write(b"CONCURRENT-WRITER")
+            return tmp
+
+        with mock.patch.object(cred, "_stage_private", side_effect=racing):
+            res = cred.restore(snap, d)
+        self.assertFalse(res["ok"])
+        self.assertIn("changed during restore", res["error"])
+        self.assertEqual(open(auth, "rb").read(), b"CONCURRENT-WRITER")
+        self.assertEqual(open(os.path.join(d, ".claude.json"), "rb").read(), cfg)
+
+    def test_directory_mode_and_first_commit_failures_touch_nothing(self):
+        d, snap = self.staged()
+        def state():
+            return (stat.S_IMODE(os.stat(d).st_mode),
+                    tuple((name, open(os.path.join(d, name), "rb").read(),
+                           stat.S_IMODE(os.stat(os.path.join(d, name)).st_mode))
+                          for name in (".credentials.json", ".claude.json")),
+                    tuple(sorted(n for n in os.listdir(d) if "helm-tmp" in n)))
+        before = state()
+        real_chmod = os.chmod
+
+        def denied(path, mode, *a, **kw):
+            if path == d:
+                raise OSError(1, "synthetic")
+            return real_chmod(path, mode, *a, **kw)
+
+        with mock.patch.object(cred.os, "chmod", side_effect=denied):
+            self.assertFalse(cred.restore(snap, d)["ok"])
+        self.assertEqual(state(), before)
+
+        real_replace = os.replace
+        calls = [0]
+
+        def first_fails(src, dst, *a, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise OSError(5, "synthetic")
+            return real_replace(src, dst, *a, **kw)
+
+        with mock.patch.object(cred.os, "replace", side_effect=first_fails):
+            self.assertFalse(cred.restore(snap, d)["ok"])
+        self.assertEqual(state(), before)
+
+    def test_post_commit_fsync_failure_restores_exact_bytes_modes_and_absence(self):
+        d, snap = self.staged()
+        auth, cfg = (os.path.join(d, ".credentials.json"),
+                     os.path.join(d, ".claude.json"))
+        home_mode = stat.S_IMODE(os.stat(d).st_mode)
+        old = {p: (open(p, "rb").read(), 0o640 + i) for i, p in enumerate((auth, cfg))}
+        for p, (_, mode) in old.items():
+            os.chmod(p, mode)
+        real = cred._fsync_dir
+        calls = [0]
+
+        def flaky(path):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise OSError(5, "SENTINEL must not escape")
+            return real(path)
+
+        with mock.patch.object(cred, "_fsync_dir", flaky):
+            res = cred.restore(snap, d)
+        self.assertFalse(res["ok"])
+        for p, (blob, mode) in old.items():
+            self.assertEqual(open(p, "rb").read(), blob)
+            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), mode)
+        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), home_mode)
+
+        empty = os.path.join(homes.ROOTS["claude"], "empty-target")
+        os.makedirs(empty)
+        empty_mode = stat.S_IMODE(os.stat(empty).st_mode)
+        calls[0] = 0
+        with mock.patch.object(cred, "_fsync_dir", flaky):
+            res = cred.restore(snap, empty)
+        self.assertFalse(res["ok"])
+        self.assertFalse(os.path.lexists(os.path.join(empty, ".credentials.json")))
+        self.assertFalse(os.path.lexists(os.path.join(empty, ".claude.json")))
+        self.assertEqual(stat.S_IMODE(os.stat(empty).st_mode), empty_mode)
+
+    def test_snapshot_identity_digest_and_length_must_self_consist(self):
+        d, snap = self.staged()
+        before = open(os.path.join(d, ".credentials.json"), "rb").read()
+        meta = json.load(open(os.path.join(snap, "meta.json")))
+        meta["account"] = "colliding+account@example.test"
+        with open(os.path.join(snap, "meta.json"), "w") as f:
+            json.dump(meta, f)
+        res = cred.restore(snap, d)
+        self.assertFalse(res["ok"])
+        self.assertIn("metadata/content mismatch", res["error"])
+        self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(), before)
+
+    def test_symlink_inputs_are_refused_without_touching_targets(self):
+        d, snap = self.staged()
+        external = os.path.join(self.tmp, "external-secret")
+        outside = b'{"claudeAiOauth":{"refreshToken":"FAKE-OUTSIDE"}}'
+        with open(external, "wb") as f:
+            f.write(outside)
+        auth = os.path.join(d, ".credentials.json")
+        os.unlink(auth)
+        os.symlink(external, auth)
+        res = cred.restore(snap, d)
+        self.assertFalse(res["ok"])
+        self.assertFalse(cred.backup(d, apply=True)["ok"])
+        row = next(r for r in homes.homes_list() if r.get("path") == d)
+        self.assertIsNone(row["family"])
+        self.assertEqual(open(external, "rb").read(), outside)
+
     def test_unparseable_claude_json_is_refused_not_overwritten(self):
         """.claude.json holds the home's WHOLE state (projects, mcp, history).
         Rewriting it from {} would destroy that — refuse, like hooks.py does."""
@@ -327,7 +537,7 @@ class HealTest(CredBase):
     def drifted(self):
         """cto-example-com's NAME promises cto@example.invalid; a /login left owner@example.invalid."""
         cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
-        cred.backup(cto)                                   # the guard ran first
+        cred.backup(cto, apply=True)                                   # the guard ran first
         self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
         return cto
 
@@ -369,7 +579,7 @@ class HealTest(CredBase):
         """The plan/act window: heal re-probes before it writes."""
         d = self.drifted()
         before = open(os.path.join(d, ".credentials.json"), "rb").read()
-        seq = [[], [(77, "claude")]]           # free at plan time, held at act time
+        seq = [[], [], [(77, "claude")]]       # arrives after pre-image capture
         with mock.patch.object(cred, "holders_of",
                                lambda p, default=False: seq.pop(0) if seq else []):
             res = cred.heal(apply=True)
@@ -394,7 +604,7 @@ class HealTest(CredBase):
         snapshot's refresh token is STILL live in another home, restoring it
         here would byte-copy the family — reuse detection revokes both."""
         cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-SHARED")
-        cred.backup(cto)
+        cred.backup(cto, apply=True)
         self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
         self.plant("elsewhere-com", "cto@example.invalid", token="FAKE-SHARED")  # same bytes
         plan = cred.heal(apply=True)["plans"][0]
@@ -409,7 +619,7 @@ class HealTest(CredBase):
         only copy of a live credential. Refuse."""
         d = self.drifted()
         occupant = open(os.path.join(d, ".credentials.json"), "rb").read()
-        with mock.patch.object(cred, "backup", lambda p: {
+        with mock.patch.object(cred, "backup", lambda p, apply=False: {
                 "ok": False, "action": "skip", "account": "owner@example.invalid",
                 "reason": "snapshot write failed (OSError)"}):
             res = cred.heal(apply=True)
@@ -422,7 +632,7 @@ class HealTest(CredBase):
 
     def test_cli_exits_nonzero_when_a_heal_refused_mid_apply(self):
         self.drifted()
-        with mock.patch.object(cred, "backup", lambda p: {
+        with mock.patch.object(cred, "backup", lambda p, apply=False: {
                 "ok": False, "action": "skip", "account": "owner@example.invalid",
                 "reason": "snapshot write failed (OSError)"}):
             rc, out, _ = self.out(cred.cmd_cred, ["heal", "--apply"])
@@ -433,15 +643,53 @@ class HealTest(CredBase):
         self.plant("david-example-invalid", "owner@example.invalid")
         self.assertEqual(cred.heal()["plans"], [])
 
-    def test_holders_probe_reads_proc_env_not_the_name(self):
-        """The real probe, exercised against this very process."""
+    def fake_proc(self, pid, env, comm="claude", start=777):
+        root = os.path.join(self.tmp, "proc")
+        p = os.path.join(root, str(pid))
+        os.makedirs(p, exist_ok=True)
+        fields = ["S"] + ["0"] * 18 + [str(start), "0"]
+        with open(os.path.join(p, "stat"), "w") as f:
+            f.write("%d (%s) %s" % (pid, comm, " ".join(fields)))
+        with open(os.path.join(p, "comm"), "w") as f:
+            f.write(comm)
+        with open(os.path.join(p, "environ"), "wb") as f:
+            f.write(env)
+        return root, p
+
+    def test_holders_probe_reads_content_and_brackets_pid_identity(self):
         self._holders.stop()
         try:
             d = self.plant("david-example-invalid", "owner@example.invalid")
-            self.assertEqual(cred.holders_of(d), [])       # nothing pinned there
-            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
-                # our OWN pid is excluded by contract; a child would be seen
-                self.assertEqual(cred.holders_of(d), [])
+            root, _ = self.fake_proc(4242, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            with mock.patch.object(cred, "PROC_ROOT", root):
+                self.assertEqual(cred.holders_of(d), [(4242, "claude")])
+                with mock.patch.object(cred, "_proc_start", side_effect=[1, 2]):
+                    self.assertIsNone(cred.holders_of(d))  # PID reuse is uncertainty
+        finally:
+            self._holders.start()
+
+    def test_holders_permission_or_read_error_fails_closed(self):
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, p = self.fake_proc(4242, b"")
+            os.unlink(os.path.join(p, "environ"))
+            os.mkdir(os.path.join(p, "environ"))       # read fails while pid still exists
+            with mock.patch.object(cred, "PROC_ROOT", root):
+                self.assertIsNone(cred.holders_of(d))
+            os.rmdir(os.path.join(p, "environ"))
+            with open(os.path.join(p, "environ"), "wb") as f:
+                f.write(b"")
+            real_open = open
+
+            def denied(path, *a, **kw):
+                if str(path).endswith("/environ"):
+                    raise PermissionError("synthetic")
+                return real_open(path, *a, **kw)
+
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    mock.patch("builtins.open", side_effect=denied):
+                self.assertIsNone(cred.holders_of(d))
         finally:
             self._holders.start()
 
@@ -450,7 +698,7 @@ class DoctorTest(CredBase):
     def test_drift_row_names_the_account_and_the_verb(self):
         """With a snapshot of the NAMED account, the row names the repair verb."""
         cto = self.plant("cto-example-com", "cto@example.invalid")
-        cred.backup(cto)
+        cred.backup(cto, apply=True)
         self.plant("cto-example-com", "owner@example.invalid")
         msgs = [m for lvl, m in cred.doctor_rows() if lvl == "WARN"]
         self.assertTrue(any("credhome cto-example-com HOLDS owner@example.invalid (drift" in m
@@ -471,7 +719,7 @@ class DoctorTest(CredBase):
         """At the moment of the incident the BACKUPS column counts the ARRIVING
         account (0) — the owner must still see that the EVICTED one is safe."""
         cto = self.plant("cto-example-com", "cto@example.invalid")
-        cred.backup(cto)
+        cred.backup(cto, apply=True)
         self.plant("cto-example-com", "owner@example.invalid")
         row = {r["name"]: r for r in cred.rows()}["cto-example-com"]
         self.assertEqual((row["backups"], row["named_backups"]), (0, 1))
@@ -488,7 +736,7 @@ class DoctorTest(CredBase):
 
     def test_clean_estate_is_one_ok_row(self):
         d = self.plant("david-example-invalid", "owner@example.invalid")
-        cred.backup(d)
+        cred.backup(d, apply=True)
         rows = cred.doctor_rows()
         self.assertEqual([lvl for lvl, _ in rows], ["OK"])
         self.assertIn("every dir name matches", rows[0][1])
@@ -528,10 +776,10 @@ class CliTest(CredBase):
 
     def test_backup_all_and_switch_guard_report_the_account(self):
         self.plant("david-example-invalid", "owner@example.invalid")
-        rc, out, _ = self.out(cred.cmd_cred, ["backup", "--all"])
+        rc, out, _ = self.out(cred.cmd_cred, ["backup", "--all", "--apply"])
         self.assertEqual(rc, 0)
         self.assertIn("owner@example.invalid", out)
-        rc, out, _ = self.out(cred.cmd_cred, ["switch-guard", "--home", "david-example-invalid"])
+        rc, out, _ = self.out(cred.cmd_cred, ["switch-guard", "--home", "david-example-invalid", "--apply"])
         self.assertEqual(rc, 0)
         self.assertIn("protected", out)
         self.assertIn("claude /login", out)      # the exact command, human-run
@@ -540,7 +788,7 @@ class CliTest(CredBase):
         """SessionStart hook mode: stdout becomes session context — stay silent."""
         d = self.plant("david-example-invalid", "owner@example.invalid")
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
-            rc, out, err = self.out(cred.cmd_cred, ["backup", "--quiet"])
+            rc, out, err = self.out(cred.cmd_cred, ["backup", "--apply", "--quiet"])
         self.assertEqual((rc, out, err), (0, "", ""))
         self.assertEqual(len(cred.snapshots("owner@example.invalid")), 1)
 
@@ -553,7 +801,7 @@ class CliTest(CredBase):
 
     def test_heal_cli_is_dry_run_by_default(self):
         cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
-        cred.backup(cto)
+        cred.backup(cto, apply=True)
         self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
         rc, out, _ = self.out(cred.cmd_cred, ["heal"])
         self.assertEqual(rc, 0)
@@ -588,7 +836,7 @@ class GuardFreshnessTest(CredBase):
         self.assertEqual(events, {"SessionStart", "Stop"})
         self.assertEqual(len({s["name"] for s in cred.GUARD_SPECS}), 2)
         for s in cred.GUARD_SPECS:                    # hooks.py spec contract
-            self.assertEqual(s["args"], "cred backup --quiet")
+            self.assertEqual(s["args"], "cred backup --apply --quiet")
             self.assertIn("timeout", s)
         self.assertIsNone(dict(  # Stop takes no matcher (hooks.SPECS' law)
             (s["event"], s["matcher"]) for s in cred.GUARD_SPECS)["Stop"])
@@ -601,15 +849,15 @@ class GuardFreshnessTest(CredBase):
         configs.BACKUP_DIR = os.path.join(self.tmp, "config-backups")
         self.addCleanup(lambda: setattr(configs, "HOME_ROOTS", orig[0]))
         self.addCleanup(lambda: setattr(configs, "BACKUP_DIR", orig[1]))
-        rc, out, err = self.out(cred.cmd_cred, ["switch-guard", "--install"])
+        rc, out, err = self.out(cred.cmd_cred, ["switch-guard", "--install", "--apply"])
         self.assertEqual(rc, 0, err)
         sp = os.path.join(homes.ROOTS["claude"], "david-example-invalid", "settings.json")
         cfg = json.load(open(sp))
         for event in ("SessionStart", "Stop"):
             cmds = [h["command"] for g in cfg["hooks"][event] for h in g["hooks"]]
-            self.assertTrue(any("cred backup --quiet" in c for c in cmds), event)
+            self.assertTrue(any("cred backup --apply --quiet" in c for c in cmds), event)
         # idempotent
-        rc, out, _ = self.out(cred.cmd_cred, ["switch-guard", "--install"])
+        rc, out, _ = self.out(cred.cmd_cred, ["switch-guard", "--install", "--apply"])
         self.assertEqual(json.load(open(sp)), cfg)
 
     def test_a_spent_looking_snapshot_warns_before_apply(self):
@@ -620,7 +868,7 @@ class GuardFreshnessTest(CredBase):
             json.dump({"claudeAiOauth": {"refreshToken": "FAKE-CTO",
                                          "expiresAt": 1}}, f)          # long dead
         cred.cache_clear()
-        cred.backup(cto)
+        cred.backup(cto, apply=True)
         self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
         plan = cred.heal()["plans"][0]
         self.assertEqual(plan["status"], "ready")
@@ -636,7 +884,7 @@ class GuardFreshnessTest(CredBase):
             json.dump({"claudeAiOauth": {"refreshToken": "FAKE-CTO",
                                          "expiresAt": (time.time() + 3600) * 1000}}, f)
         cred.cache_clear()
-        cred.backup(cto)
+        cred.backup(cto, apply=True)
         self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
         plan = cred.heal()["plans"][0]
         self.assertFalse(plan["stale_pre_image"])
@@ -647,12 +895,12 @@ class SecrecyTest(CredBase):
     def test_no_output_path_ever_carries_a_credential_byte(self):
         """Every surface at once: list, backup, switch-guard, heal, doctor."""
         cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO-SECRET")
-        cred.backup(cto)
+        cred.backup(cto, apply=True)
         self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID-SECRET")
         self.plant("team-example-com", "hey@simbi.com", token="FAKE-SIMBI-SECRET")
         text = ""
-        for argv in (["list"], ["list", "--json"], ["backup", "--all"],
-                     ["switch-guard", "--home", "team-example-com"],
+        for argv in (["list"], ["list", "--json"], ["backup", "--all", "--apply"],
+                     ["switch-guard", "--home", "team-example-com", "--apply"],
                      ["heal"], ["heal", "--apply"]):
             _, out, err = self.out(cred.cmd_cred, argv)
             text += out + err
@@ -666,9 +914,34 @@ class SecrecyTest(CredBase):
                     body = open(os.path.join(snap["path"], f)).read()
                     self.assertNotIn("FAKE-", body, "%s/%s" % (snap["ts"], f))
 
+    def test_garbled_non_utf8_unreadable_and_exception_paths_never_echo_secrets(self):
+        sentinel = "sk-ant-oat01-" + "S" * 96
+        self.plant(sentinel, "path@example.test", token="FAKE-PATH-TOKEN")
+        d = self.plant("broken-example-test", "broken@example.test", token=sentinel)
+        with open(os.path.join(d, ".claude.json"), "wb") as f:
+            f.write(b"\xff\xfe" + sentinel.encode())
+        cred.cache_clear()
+        text = ""
+        for argv in (["list"], ["backup", "--all", "--apply"],
+                     ["backup", "--home", sentinel]):
+            _, out, err = self.out(cred.cmd_cred, argv)
+            text += out + err
+        with mock.patch.object(cred, "rows", side_effect=RuntimeError(sentinel)):
+            _, out, err = self.out(cred.cmd_cred, ["list"])
+            text += out + err + "\n".join(m for _, m in cred.doctor_rows())
+        secret_root = os.path.join(self.tmp, sentinel)
+        with mock.patch.dict(os.environ, {"HELM_CRED_BACKUP_ROOT": secret_root}):
+            h = self.plant("redact-example-test", "redact@example.test", token="FAKE-R")
+            cred.backup(h, apply=True)
+            self.plant("redact-example-test", "other@example.test", token="FAKE-O")
+            _, out, err = self.out(cred.cmd_cred, ["heal", "--apply"])
+            text += out + err
+        self.assertNotIn(sentinel, text)
+        self.assertNotIn("Traceback", text)
+
     def test_digest_is_a_prefix_not_the_token(self):
         d = self.plant("david-example-invalid", "owner@example.invalid")
-        meta = json.load(open(os.path.join(cred.backup(d)["dest"], "meta.json")))
+        meta = json.load(open(os.path.join(cred.backup(d, apply=True)["dest"], "meta.json")))
         self.assertEqual(len(meta["digest"]), 12)
         self.assertNotIn(FAKE, json.dumps(meta))
 
