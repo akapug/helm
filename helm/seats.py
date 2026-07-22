@@ -361,6 +361,17 @@ def deliverable(m, seat, room="main", scope=None):
                 or (bool(seat) and room == dm_lane(seat)))
     if _mention_re(seat).search(text):
         return True
+    if str(m.get("rfrom") or "") == seat:
+        # A REPLY to this seat's row is a direct address of its author — the
+        # same tier as an @mention, any room, before mute. This inverts the
+        # original "threading is invisible to the beacon" law deliberately:
+        # the owner's stated WHY for replies was "I'm tired of typing agent
+        # names to mention" (2026-07-22) — replying INSTEAD OF mentioning is
+        # the feature, so a reply that wakes nobody delivers the mechanism
+        # while dropping its purpose. rfrom is the parent's recorded author,
+        # stamped at post time; only the parent's author wakes, so a reply
+        # stays quieter than the mention it replaces ever was.
+        return True
     sc = scope if scope is not None else seat_scope(seat)
     if room in sc["mute"]:
         return False

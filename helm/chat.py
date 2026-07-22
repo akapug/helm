@@ -61,9 +61,13 @@ carries {rtext}: ts|from is not unique when one author posts twice inside a
 second, so exact text disambiguates without inventing an identity. One level
 only, builders.dev style: a reply renders with a compact quote of its parent,
 a parent renders its reply count, and an orphan parent (rotated out) renders
-as such — never a crash. Threading is INVISIBLE
-to the beacon: seats.deliverable never reads reply_to, so a reply wakes
-exactly what its text alone would have woken (a reply is not a mention).
+as such — never a crash. A REPLY WAKES ITS PARENT'S AUTHOR
+(seats.deliverable reads rfrom): replying is a direct address, the same tier
+as an @mention — the owner's stated reason for replies was "I'm tired of
+typing agent names to mention", so a reply that woke nobody delivered the
+mechanism while dropping its purpose (2026-07-22; inverted the original
+threading-is-invisible law). Only the parent's author wakes — a reply stays
+quieter than the mention it replaces.
 
 Signed replies bind the parent: the payload is a DISTINCT algorithm tag
 ("chat:reply:b2b:") over \\x1e-joined, injectively escaped parent fields +

@@ -2336,3 +2336,33 @@ class ChatDispatchTest(SeatsBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReplyWakesParentTest(unittest.TestCase):
+    """The owner's WHY was the spec: replies exist so he can stop typing
+    @names. A reply is therefore a direct address of the parent's author —
+    mention-tier, any room — and only of the parent's author."""
+
+    def _row(self, **kw):
+        r = {"text": "a reply", "from": "david"}
+        r.update(kw)
+        return r
+
+    def test_a_reply_wakes_the_parent_author_without_a_mention(self):
+        self.assertTrue(seats.deliverable(
+            self._row(rfrom="opus-integrator"), "opus-integrator", room="main"))
+
+    def test_a_reply_wakes_nobody_else(self):
+        self.assertFalse(seats.deliverable(
+            self._row(rfrom="opus-integrator"), "codex-3", room="side-room"))
+
+    def test_a_reply_to_your_own_row_does_not_self_wake(self):
+        self.assertFalse(seats.deliverable(
+            self._row(**{"from": "opus-integrator", "rfrom": "opus-integrator"}),
+            "opus-integrator", room="main"))
+
+    def test_mention_tier_means_before_mute(self):
+        with mock.patch.object(seats, "seat_scope",
+                               return_value={"mute": ["main"], "home": None}):
+            self.assertTrue(seats.deliverable(
+                self._row(rfrom="opus-integrator"), "opus-integrator", room="main"))

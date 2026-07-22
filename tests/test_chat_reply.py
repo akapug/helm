@@ -519,14 +519,21 @@ class ReplyWakeTest(ReplyBase):
     def deliv(self, row, seat, room="main"):
         return seats.deliverable(row, seat, room)
 
-    def test_replying_to_a_seat_does_not_wake_it(self):
+    def test_replying_to_a_seat_wakes_its_author(self):
+        # INVERTED 2026-07-22. This test previously pinned the opposite —
+        # "threading is invisible to the beacon" — which delivered the reply
+        # MECHANISM while dropping its PURPOSE: the owner's stated reason for
+        # replies was "I'm tired of typing agent names to mention". A reply is
+        # a direct address of the parent's author, mention-tier.
         seats.write_roster("codex", session="s-codex")
         p = chat.post("codex's own words", who="codex")
         r = chat.post("thanks, noted", who="alice", reply_to=p["id"])
-        self.assertFalse(self.deliv(r, "codex"))
-        # ...and the identical text without the thread is equally silent
+        self.assertTrue(self.deliv(r, "codex"))
+        # the identical text WITHOUT the thread stays silent — the wake is the
+        # thread's, and only the parent's author gets it
         plain = chat.post("thanks, noted", who="alice")
-        self.assertEqual(self.deliv(r, "codex"), self.deliv(plain, "codex"))
+        self.assertFalse(self.deliv(plain, "codex"))
+        self.assertFalse(self.deliv(r, "kimi"))
 
     def test_a_reply_that_mentions_still_wakes(self):
         seats.write_roster("codex", session="s-codex")
@@ -564,17 +571,18 @@ class ReplyWakeTest(ReplyBase):
         row["rfrom"] = "someone-else"
         self.assertTrue(seats.deliverable(row, "codex", "main"))
 
-    def test_deliver_any_end_to_end_stays_text_driven(self):
-        """Integration proof at the actual boundary hook: replying to a seat's
-        own row is silent, then the same threaded path wakes once its text
-        contains the exact mention."""
+    def test_deliver_any_end_to_end_reply_wakes_parent(self):
+        """Integration proof at the actual boundary hook: a bare reply to the
+        seat's own row DELIVERS (inverted 2026-07-22 — replying replaces
+        typing the mention), and a reply to someone else's row does not."""
         seats.join(session="s-codex", seat="codex", cwd="/tmp/reply-wake")
+        other = chat.post("alice parent", who="alice")
+        chat.post("threaded, but not to codex", who="bob", reply_to=other["id"])
+        self.assertIsNone(seats.deliver_any(session="s-codex", seat="codex"))
         p = chat.post("codex parent", who="codex")
         chat.post("quiet threaded answer", who="alice", reply_to=p["id"])
-        self.assertIsNone(seats.deliver_any(session="s-codex", seat="codex"))
-        chat.post("@codex threaded ping", who="alice", reply_to=p["id"])
         line = seats.deliver_any(session="s-codex", seat="codex")
-        self.assertIn("@codex threaded ping", line)
+        self.assertIn("quiet threaded answer", line)
 
 
 if __name__ == "__main__":
