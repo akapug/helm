@@ -86,3 +86,60 @@ can carry) and confirm the seat's own pin wins.
 
 *Green on all six + the pytest backstop = credhoming parity holds across the
 1.4.149 switch, orca-hosted and standalone alike.*
+
+---
+
+# EXPERIMENT — orca 1.4.149 credhoming: what actually happens
+
+Rows 1-6 above verify helm's *existing* guarantees survive the switch. This
+section is different: it is an OPEN EXPERIMENT the owner asked for. We stopped
+theorizing about orca's internals — run these after the upgrade and record the
+answers, because they decide whether helm should keep pinning
+`CLAUDE_CONFIG_DIR` per seat or DEFER to orca's per-account credhoming.
+
+## Why it matters (the two cases)
+
+A `/login` writes credentials INTO the config home the session is currently
+using — it never moves the session elsewhere (MEASURED 2026-07-21: the dir named
+`cto-example` ended up holding `david@mv`, creds overwritten, no backup).
+That plays out two ways:
+
+* **Case A — launched WITH a credhome** (`CLAUDE_CONFIG_DIR` pinned; every helm
+  seat). Pollution is CONTAINED to that one home. The pin is a blast-radius
+  container.
+* **Case B — launched WITHOUT one** (the shared default `~/.claude`). One
+  `/login` rewrites the home that EVERY un-pinned session reads — they all
+  silently change account on their next token refresh. Shared-fate.
+
+And the physics neither side can beat: a RUNNING process's environment is
+immutable, so no switcher — orca's included — can repoint a live session's
+config home. The only non-destructive move is re-resuming the SAME session
+against a different home (`helm session port --cred <home> <sid>`).
+
+## The matrix — run each, record the result
+
+| # | Case | Action | Question to answer |
+|---|------|--------|--------------------|
+| E1 | A (helm-pinned seat) | orca "switch account" on that pane | Does orca repoint it at all, or does helm's exec-line pin win? (expected: pin wins, orca is a no-op) |
+| E2 | A (helm-pinned seat) | `/login` in the pane | Does it still overwrite the PINNED home in place? Any new orca-side backup/versioning? |
+| E3 | B (un-pinned pane) | orca "switch account" | Does orca swap the pane to `claude-accounts/<uuid>/auth` cleanly, leaving `~/.claude` untouched? (the non-polluting pointer-swap) |
+| E4 | B (un-pinned pane) | `/login` | Confirm the shared-default blast radius: do OTHER un-pinned sessions change account on refresh? |
+| E5 | A or B | orca switch on a LIVE vs a NEW pane | Does orca apply the switch to the running pane (impossible per the physics — expect NEW panes only) or relaunch it? |
+| E6 | — | inspect | After a switch, is the previous account's cred still intact in its own `claude-accounts/<uuid>/auth` dir (recoverable), unlike `/login`? |
+
+## The decision the answers drive
+
+* If **E3 + E6 are clean** (orca swaps per-account dirs non-destructively and
+  keeps each account's creds intact), then orca's model is strictly better for
+  SWITCHING, and helm should be able to target orca's account dirs as valid
+  homes — one shared cred pool instead of two (`helm session port --cred`
+  accepting `~/.config/orca/claude-accounts/<uuid>/auth`).
+* But helm should KEEP per-seat pinning unless orca 1.4.149 also sub-isolates
+  panes WITHIN one account: helm homes per-SEAT (codex and codex-2 isolated on
+  one account), orca homes per-ACCOUNT. Deferring without sub-isolation would
+  force one-seat-per-account and collide with the single-open session law.
+* Either way `/login` stays the fallback, made safe by `helm cred`
+  (backup-before-switch, identity-read-from-CONTENT-not-dir-name, drift heal).
+
+*Record the answers inline here at the switch — this file is the durable home
+for what we learn.*
