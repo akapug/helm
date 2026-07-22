@@ -83,6 +83,27 @@ import re
 # even though they are JSON under a home root (the review's #2/#5 root cause).
 _DENY_FILES = {".credentials.json", "auth.json"}
 _RULE_RE = re.compile(r"/\.claude/rules/[^/]+\.md$")
+# DECLARATIVE config that lives one level down inside a config home, not
+# directly in it. The owner's report was "poking around my configs UI proves
+# it, but mostly they are uneditable from there" — measured: of 500 files
+# under the config homes, 457 were unrecognized, and the great majority of
+# those SHOULD be (48 credential stores, 108 .bak copies, 104 runtime state
+# files like history.jsonl / goals_1.sqlite / *-snapshot.json, 32 plugin
+# metadata blobs). Stripping those left exactly two categories of real
+# human-authored config that the gate simply had no pattern for:
+#   commands/<name>.md   — the owner's own slash commands
+#   rules/<name>.rules   — codex rule files
+# Both are declarative, validatable, and carry the same trust surface as
+# CLAUDE.md, which has always been editable here.
+_HOME_SUBDIR_RE = re.compile(r"/(commands/[^/]+\.md|rules/[^/]+\.rules)$")
+
+# DELIBERATELY STILL EXCLUDED — this is a security boundary, not an oversight.
+# The remaining 23 unrecognized-but-config-shaped files are EXECUTABLES:
+# <home>/*.py and <home>/*.sh hook and statusline scripts. Making those
+# editable would turn the config editor into a remote-code-execution surface —
+# the web UI writes them, the next hook invocation runs them as the owner. A
+# JSON/MD/TOML config can only misconfigure; a .sh hook can do anything. Edit
+# those with a real editor, where the act of doing so is explicit.
 
 
 def _real(p):
@@ -125,6 +146,14 @@ def _is_recognized_config(rp):
         return True
     if _RULE_RE.search(rp):
         return True
+    # home-scope DECLARATIVE config one level down (commands/, rules/): the
+    # subdir must sit directly in a recognized home root, so a stray
+    # commands/foo.md anywhere else on disk still fails the gate.
+    m = _HOME_SUBDIR_RE.search(rp)
+    if m:
+        holder = _real(os.path.dirname(os.path.dirname(rp)))
+        if any(holder == _real(h) for h in HOME_ROOTS) or _is_seat_home(holder):
+            return True
     # home/user-scope: the recognized basename sits DIRECTLY in a home root
     if base in _HOME_FILES:
         parent = _real(os.path.dirname(rp))
@@ -147,6 +176,10 @@ def _ext_type(path):
         return "toml"
     if base.endswith(".md"):
         return "md"
+    if base.endswith(".rules"):
+        # No parser to validate against, so it rides the text path — but it
+        # IS recognized, which is what makes it editable at all.
+        return "text"
     return "other"
 
 
