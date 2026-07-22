@@ -415,7 +415,12 @@ class SeatTest(unittest.TestCase):
         line = out.getvalue().strip()
         self.assertTrue(line.startswith("env -u ANTHROPIC_API_KEY "))
         self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8317", line)
-        self.assertIn("ANTHROPIC_AUTH_TOKEN=" + token, line)
+        # no-keys-in-argv (the 7bb422a xrev): the bearer is NEVER the literal —
+        # the line reads it from the 0600 token file at exec time, so only the
+        # PATH crosses stdout/argv, and the line is mint-order-immune.
+        self.assertNotIn(token, line)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=$(cat ", line)
+        self.assertIn(os.path.join(seat.seat_dir("codex"), "token"), line)
         self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol", line)
         self.assertIn("CLAUDE_CONFIG_DIR=" + os.path.join(seat.seat_dir("codex"), "claude"), line)
         self.assertIn("HELM_CHAT_NAME=codex", line)   # stable seat identity

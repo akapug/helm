@@ -17,6 +17,11 @@ import unittest
 from helm import codexhomes, seat
 
 
+def _read(path):
+    with open(path) as f:
+        return f.read()
+
+
 def _b64seg(obj):
     return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
 
@@ -213,16 +218,16 @@ class PerInstanceProxyTest(Slice6Base):
     def test_mint_instance_proxy_writes_own_config_and_token(self):
         seat._mint_instance_proxy("codex", "codex-2")
         home = seat._proxy_home("codex", "codex-2")
-        cfg = open(os.path.join(home, "config.yaml")).read()
+        cfg = _read(os.path.join(home, "config.yaml"))
         self.assertIn("port: %d" % seat._instance_port("codex", "codex-2"), cfg)
         # auth-dir points at the FAMILY pool — same OAuth account, no quota xN
         self.assertIn(os.path.join(seat.seat_dir("codex"), "auth"), cfg)
-        tok = open(os.path.join(home, "token")).read().strip()
+        tok = _read(os.path.join(home, "token")).strip()
         self.assertTrue(tok)
         self.assertNotEqual(tok, "test-token")     # instance token, not family
         # idempotent: re-mint keeps the same token (a live line stays valid)
         seat._mint_instance_proxy("codex", "codex-2")
-        self.assertEqual(open(os.path.join(home, "token")).read().strip(), tok)
+        self.assertEqual(_read(os.path.join(home, "token")).strip(), tok)
 
     def test_instance_token_isolated_from_family(self):
         seat._mint_instance_proxy("codex", "codex-2")
@@ -250,6 +255,81 @@ class PerInstanceProxyTest(Slice6Base):
     def test_split_seat(self):
         self.assertEqual(seat._split_seat("codex"), ("codex", "codex"))
         self.assertEqual(seat._split_seat("codex-3"), ("codex", "codex-3"))
+
+
+class ProxyFixRoundTest(Slice6Base):
+    """The codex xrev FIX round on 7bb422a: token never in argv/text, mint-order
+    immunity, per-instance spawn fate, birth-identity pid guard, and the
+    unsupported-family gate. Each test names the finding it closes."""
+
+    def test_launch_line_never_carries_the_literal_token(self):
+        # Finding 2 (no keys in argv/logs): the bearer is a file reference
+        # resolved at exec, never interpolated into the line.
+        seat._mint_instance_proxy("codex", "codex-2")
+        itok = _read(os.path.join(seat._proxy_home("codex", "codex-2"),
+                             "token")).strip()
+        line = seat.launch_line("codex", seat="codex-2")
+        self.assertNotIn(itok, line)                # instance token absent
+        self.assertNotIn("test-token", line)        # family token absent
+        self.assertIn("$(cat ", line)               # a read-at-exec reference
+        self.assertIn("instances/codex-2/token", line)
+
+    def test_launch_line_is_mint_order_immune(self):
+        # Finding 1 (first-mint stale token): a line rendered BEFORE the mint
+        # points at the instance path, so it resolves the token the mint writes.
+        pre = seat.launch_line("codex", seat="codex-2")     # pre-mint
+        seat._mint_instance_proxy("codex", "codex-2")
+        itok = _read(os.path.join(seat._proxy_home("codex", "codex-2"),
+                             "token")).strip()
+        path = pre.split("ANTHROPIC_AUTH_TOKEN=$(cat ")[1].split(" ")[0]
+        self.assertEqual(_read(path).strip(), itok)   # resolves instance
+        self.assertNotEqual(_read(path).strip(), "test-token")
+
+    def test_token_file_prefers_the_instance_path_for_instances(self):
+        self.assertTrue(seat._token_file("codex", "codex-2")
+                        .endswith(os.path.join("instances", "codex-2", "token")))
+        self.assertEqual(seat._token_file("codex"),
+                         os.path.join(seat.seat_dir("codex"), "token"))
+
+    def test_down_refuses_to_signal_a_reused_pid(self):
+        # Finding 4 (bare reusable PID): a live pid with a MISMATCHED birth
+        # identity is not our proxy — never signalled, record reaped.
+        home = seat._proxy_home("codex", "codex-2")
+        os.makedirs(home, exist_ok=True)
+        live = os.getpid()      # guaranteed alive, guaranteed NOT a proxy
+        seat._write_private(os.path.join(home, "proxy.pid"),
+                            "%d proc:forged-birth\n" % live, mode=0o600)
+        self.assertIsNone(seat._running_pid("codex", "codex-2"))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat._down("codex", seat="codex-2")
+        self.assertEqual(rc, 0)                 # we survived => not signalled
+        self.assertIn("reused", out.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(home, "proxy.pid")))
+
+    def test_running_pid_trusts_a_matching_birth_identity(self):
+        home = seat._proxy_home("codex", "codex-2")
+        os.makedirs(home, exist_ok=True)
+        live = os.getpid()
+        seat._write_private(os.path.join(home, "proxy.pid"),
+                            "%d %s\n" % (live, seat._pid_identity(live)),
+                            mode=0o600)
+        self.assertEqual(seat._running_pid("codex", "codex-2"), live)
+
+    def test_launch_refuses_instances_for_proxy_key_families(self):
+        # Finding 5 (unsupported family): kimi is proxy-key — `launch kimi -i 2`
+        # can never mint a working instance proxy, so refuse up front (rc 2).
+        os.makedirs(seat.seat_dir("kimi"), exist_ok=True)
+        seat._write_private(os.path.join(seat.seat_dir("kimi"), "config.yaml"),
+                            "port: 8318\n", mode=0o600)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["launch", "kimi", "-i", "2"])
+        self.assertEqual(rc, 2)
+        self.assertIn("mode=proxy", err.getvalue())
+
+    def test_proxy_family_bases_are_unique(self):
+        self.assertTrue(seat._family_port_bases_are_unique())
 
 
 if __name__ == "__main__":

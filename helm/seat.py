@@ -129,6 +129,19 @@ FAMILIES = {
              "probe_models": ("kimi-k3",)},
 }
 
+def _family_port_bases_are_unique():
+    """One collision-free owner for the port namespace: no two families share
+    a base port. The instance derivation (base+N) is per-family, so distinct
+    bases are the floor the whole scheme stands on; the interleave headroom
+    between a proxy family's base+N range and the next family's base is a
+    FAMILIES-table discipline (see `_instance_port`)."""
+    bases = [f["port"] for f in FAMILIES.values()]
+    return len(bases) == len(set(bases))
+
+
+assert _family_port_bases_are_unique(), \
+    "FAMILIES base ports must be distinct (the instance-port scheme's floor)"
+
 # CC's autocompact trigger = pct × (window − 20k). Against the CORRECT window it
 # otherwise fires with only a thin margin under a 32k-max_tokens turn; 78% lands
 # the trigger with real headroom (sol ≈ 265k, well under the ~340k reject point;
@@ -291,9 +304,13 @@ def _instance_port(family, seat=None):
     """A seat's OWN proxy port. Instance 1 keeps fam["port"] (8317 for codex —
     the port every minted launch.sh already points at). Instances N≥2 derive
     deterministically from the numeric seat suffix (codex-2 -> port+2), so the
-    mapping needs no allocation state and never collides with a sibling. The
-    codex block sits at 8317 + the kimi block at 8318, so codex-N lands at
-    8317+N — clear of both for any realistic N."""
+    mapping needs no allocation state. COLLISION INVARIANT: only mode=proxy
+    families mint instances (the launch gate refuses proxy-key families), so
+    instance ports come from ONE family's block at a time; a new proxy family
+    MUST be assigned a base far enough from every existing proxy family's
+    block that base+N ranges never interleave (codex occupies 8317+N; leave
+    headroom). `_family_port_bases_are_unique` asserts the bases themselves
+    are distinct; the interleave headroom is a FAMILIES-table discipline."""
     seat = seat or family
     base = FAMILIES[family]["port"]
     if seat == family:
@@ -304,14 +321,38 @@ def _instance_port(family, seat=None):
     return base  # a non-numeric seat name shares the family port (instance 1)
 
 
-def _running_pid(family, seat=None):
-    """The live proxy pid from the seat's pidfile, else None."""
+def _proxy_pid_record(family, seat=None):
+    """The pidfile as an authenticated record: {pid, identity} or None. The
+    pidfile carries the process-BIRTH identity beside the pid (`<pid>
+    <identity>`) so a later signal goes to the SAME process, never a reused
+    pid — the proxy-lifecycle twin of the headless-seat `_pid_identity` guard.
+    Legacy bare-`<pid>` files parse with identity=None (treated unverifiable:
+    never signalled, reported stale)."""
     try:
         with open(os.path.join(_proxy_home(family, seat), "proxy.pid")) as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
+            parts = f.read().split()
+        pid = int(parts[0])
+    except (OSError, ValueError, IndexError):
         return None
-    return pid if _pid_alive(pid) else None
+    return {"pid": pid, "identity": parts[1] if len(parts) > 1 else None}
+
+
+def _running_pid(family, seat=None):
+    """The live proxy pid, ONLY when it is verifiably the process the pidfile
+    recorded — birth identity must match, so a reused pid is never mistaken
+    for the live proxy (and never signalled by `_down`). None when dead,
+    reused, or unverifiable."""
+    rec = _proxy_pid_record(family, seat)
+    if not rec or not _pid_alive(rec["pid"]):
+        return None
+    ident = rec["identity"]
+    if ident in (None, "?"):
+        # identity never captured (legacy bare pid, or /proc unavailable at
+        # spawn — non-Linux degradation): fall back to the alive check alone,
+        # the pre-guard behavior. Distinct from a CAPTURED-then-MISMATCHED
+        # identity (a reused pid), which we refuse below.
+        return rec["pid"]
+    return rec["pid"] if _pid_identity(rec["pid"]) == ident else None
 
 
 def _port_open(port, timeout=0.5):
@@ -335,6 +376,22 @@ def _read_token(family, seat=None):
         except OSError:
             continue
     return None
+
+
+def _token_file(family, seat=None):
+    """The 0600 token file a launch line/script should READ AT EXEC TIME.
+    Resolves the bearer in the child shell, so the live token never transits
+    the script text, the printed stdout line, or any process argv (the
+    no-keys-in-argv gate). For an INSTANCE seat this is ALWAYS the instance's
+    own path (instances/<seat>/token) — never an existence-based fallback —
+    because launch.sh is written BEFORE `_mint_instance_proxy` runs; pointing
+    at the instance path means the script picks up the token the mint writes
+    a moment later, and stays correct across every later re-mint (the
+    first-mint stale-token finding). Instance 1 (seat == family) uses the
+    family file. An UNMINTED-instance launch line (printed for an operator
+    before `up`) resolves empty until the mint lands — a clean empty var, not
+    the wrong account."""
+    return os.path.join(_proxy_home(family, seat), "token")
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +576,15 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     model = model or fam["model"]
     seat = seat or family
     port = _instance_port(family, seat)
-    token = _read_token(family, seat)
+    # NO-keys-in-argv: the bearer is NEVER interpolated. The line reads it from
+    # the seat's 0600 token file at exec time (command substitution), so the
+    # script text / printed line / process argv carry only the PATH. This also
+    # makes the launch line mint-order-immune: it always resolves the CURRENT
+    # token, so a launch.sh written before `_mint_instance_proxy` still picks
+    # up the instance token the mint later writes (the first-mint stale-token
+    # finding). 2>/dev/null + a missing-file guard keep an unminted seat's
+    # failure a clean empty var, not a shell error line.
+    token_ref = "$(cat %s 2>/dev/null)" % shlex.quote(_token_file(family, seat))
     cfgdir = shlex.quote(os.path.join(_instance_dir(family, seat), "claude"))
     homing = (" HELM_CHAT_ROOM=%s" % shlex.quote(room)) if room else ""
     if room and room_source:
@@ -547,7 +612,7 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
             " DREGG_PROFILE=%s%s"
             " claude --dangerously-skip-permissions --model %s"
             % (child_stamp_unsets(),
-               port, token or "<seat-token-missing>",
+               port, token_ref,
                pin, cfgdir, shlex.quote(seat), homing,
                shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(seat),
                shlex.quote(seat), ctxenv, model))
@@ -1059,7 +1124,11 @@ def _up(family, quiet=False, seat=None):
         return 1
     finally:
         log.close()
-    _write_private(os.path.join(cfgd, "proxy.pid"), "%d\n" % p.pid)
+    # record pid + BIRTH identity so `_down`/`_running_pid` signal only THIS
+    # incarnation — a reused pid is never proxied-on or killed (Finding: bare
+    # reusable PID). Identity captured right after spawn, before any wait.
+    _write_private(os.path.join(cfgd, "proxy.pid"),
+                   "%d %s\n" % (p.pid, _pid_identity(p.pid) or "?"))
     for _ in range(30):  # up to ~6s for the port to open
         if p.poll() is not None or _port_open(port):
             break
@@ -1080,9 +1149,20 @@ def _down(family, seat=None):
     if fam is None:
         return 1
     seat = seat or family
-    pid = _running_pid(family, seat)
     pidfile = os.path.join(_proxy_home(family, seat), "proxy.pid")
+    pid = _running_pid(family, seat)
     if not pid:
+        # Distinguish a merely-dead proxy from a REUSED pid: a live process
+        # holding our recorded pid with a DIFFERENT birth identity is NOT our
+        # proxy — never signal it (the reused-pid SIGTERM finding). Reap the
+        # stale file, say so plainly.
+        rec = _proxy_pid_record(family, seat)
+        if rec and _pid_alive(rec["pid"]):
+            os.remove(pidfile)
+            print("helm seat: %s proxy pidfile stale — pid %d now belongs to "
+                  "an unrelated process (reused); NOT signalled, record reaped"
+                  % (seat, rec["pid"]))
+            return 0
         if os.path.exists(pidfile):
             os.remove(pidfile)  # stale
         print("helm seat: %s proxy not running" % seat)
@@ -1720,14 +1800,20 @@ def _spawn(seat_name, rest, _locked=False):
     # old launch.sh — the resume-verb ordering law), workdir=cwd so the trust
     # seed covers where the seat will actually run.
     _write_launch_assets(family, d, room, seat_name, workdir=cwd, multi=multi)
-    if os.path.exists(os.path.join(seat_dir(family), "config.yaml")) \
-            and not _running_pid(family):
-        if _up(family, quiet=True) == 0:
+    # per-instance proxy fate: an INSTANCE seat owns its OWN proxy
+    # (instances/<seat>/), so spawn checks/starts THAT seat's proxy — never
+    # the family's. `_running_pid(family)` here was the shared-fate seam the
+    # per-instance lane exists to remove: `spawn codex-2` with family 8317 up
+    # but codex-2's 8319 down would launch a dead seat. Gate on the seat's own
+    # config (instance minted) or, for instance 1, the family config.
+    seat_cfg = os.path.join(_proxy_home(family, seat_name), "config.yaml")
+    if os.path.exists(seat_cfg) and not _running_pid(family, seat_name):
+        if _up(family, quiet=True, seat=seat_name) == 0:
             print("  (proxy was down — auto-started)")
         else:
             print("helm seat: WARN — %s proxy not running and auto-start "
                   "failed; the seat errors until `helm seat up %s`"
-                  % (family, family), file=sys.stderr)
+                  % (seat_name, seat_name), file=sys.stderr)
     from . import pk
     rec = {"v": 1, "seat": seat_name, "worktree": cwd, "room": room or "main",
            "launch_sh": launch_sh, "ts": pk.now_ts()}
@@ -2033,6 +2119,20 @@ def cmd_seat(args):
                     print("helm seat: %s wants an integer" % flag, file=sys.stderr)
                     return 2
         seat = family if inst <= 1 else "%s-%d" % (family, inst)
+        # Per-instance proxies are a PROXY-family (OAuth-pool) feature only.
+        # proxy-key families (kimi) bake ONE key into the family config — there
+        # is no pool to point an instance config at, so `_mint_instance_proxy`
+        # skips config generation and `up <instance>` must refuse. Accepting
+        # `launch kimi -i 2` would print an instance line whose proxy can never
+        # come up (and its derived port can collide with a sibling family's
+        # block). Refuse up front: this is an unsupported-family gate, not a
+        # warn — the launch cannot produce a working instance.
+        if inst > 1 and fam["mode"] != "proxy":
+            print("helm seat: per-instance proxies need an OAuth-pool family "
+                  "(mode=proxy); %s is mode=%s — only `helm seat launch %s` "
+                  "(instance 1) is supported"
+                  % (family, fam["mode"], family), file=sys.stderr)
+            return 2
         # guards ride stderr (stdout stays the bare pasteable line), warn
         # never refuse: over-capacity burns one pool faster (fall-through
         # masks it) and a live same-named seat is a relaunch-vs-collision the
