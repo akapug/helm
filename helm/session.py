@@ -252,42 +252,73 @@ def _proc_snapshot(pid):
             "env": environ, "cwd": cwd}
 
 
-HEADLESS_FLAGS = ("-p", "--print", "--no-session-persistence")
+HEADLESS_FLAGS = ("-p", "--print")
+NONPERSISTENT_FLAG = "--no-session-persistence"
 
 
-def _is_headless(argv):
-    """True when this process is a HEADLESS ONE-SHOT rather than an agent pane.
-
-    Two populations share one binary. An AGENT PANE is interactive, long-lived,
-    and must hold a real resumable session — fleet law, and the thing this
-    census exists to protect. A HEADLESS ONE-SHOT (`claude -p`, and especially
-    `--no-session-persistence`, which says so outright) runs one prompt and
-    exits; it has no transcript BY DESIGN and cannot be rescued, because there
-    is nothing to resume.
-
-    They are indistinguishable by symptom — neither has a transcript on disk —
-    so the census has to read INTENT, and intent is DECLARED in argv. Measured
-    2026-07-22, twenty minutes after this census first certified the fleet: the
-    `remember` plugin ran `claude -p --output-format json
-    --no-session-persistence` to compress memory, and the estate flipped to a
-    memory-only FAIL advising `helm session rescue` on a process that had
-    already exited. Nothing had degraded; a third-party tool had made an API
-    call. A certification a background one-shot can invalidate is counting the
-    wrong population.
-
-    This narrows WHAT IS COUNTED, never what is allowed: a helm SEAT that shows
-    up headless is still a law violation, and it stays visible in `session ls`
-    tagged as such rather than being hidden.
-
-    Intent lives only in the OPTION region of argv: past the standard ``--``
-    terminator every token is positional (a boot prompt that happens to equal
-    ``-p`` is prose, not a flag), so scanning stops there."""
+def _argv_flag(argv, names, prefixes=()):
+    """Flag presence in the OPTION region of argv only: past the standard
+    ``--`` terminator every token is positional (a boot prompt that happens to
+    equal ``-p`` is prose, not a flag), so scanning stops there."""
     for a in argv:
         if a == "--":
             return False
-        if a in HEADLESS_FLAGS or a.startswith(("-p=", "--print=")):
+        if a in names or (prefixes and a.startswith(prefixes)):
             return True
     return False
+
+
+def _is_headless(argv):
+    """True when this process runs in PRINT MODE (`-p`/`--print`).
+
+    Headless is an INTERACTION MODE, not proof the process holds no session.
+    Claude Code supports `--resume` together with `--print`, and print mode
+    persists a transcript unless `--no-session-persistence` is also requested —
+    so `claude -p --resume <sid>` is a short-lived process operating on a
+    proven resumable session, every bit a holder while it lives. Whether a row
+    leaves the health arithmetic is decided by _sessionless_oneshot, which
+    reads this mode TOGETHER with the row's session-identity evidence."""
+    return _argv_flag(argv, HEADLESS_FLAGS, ("-p=", "--print="))
+
+
+def _is_nonpersistent(argv):
+    """True when argv declares `--no-session-persistence` outright — the one
+    flag that states sessionless intent rather than merely an interaction
+    mode. Kept as its own axis so print mode is never mistaken for it."""
+    return _argv_flag(argv, (NONPERSISTENT_FLAG,))
+
+
+def _sessionless_oneshot(r):
+    """True only for the rows the health arithmetic must NOT count: a
+    print-mode or explicitly nonpersistent run with NO explicit session
+    identity of its own.
+
+    Two populations share one binary. An AGENT PANE is interactive, long-lived,
+    and must hold a real resumable session — fleet law, and the thing this
+    census exists to protect. A SESSIONLESS ONE-SHOT runs one prompt and
+    exits; its missing transcript is the design working, not work at risk.
+    Measured 2026-07-22, twenty minutes after this census first certified the
+    fleet: the `remember` plugin ran `claude -p --output-format json
+    --no-session-persistence` to compress memory, and the estate flipped to a
+    memory-only FAIL advising `helm session rescue` on a process that had
+    already exited. That row is excluded on its explicit nonpersistence
+    evidence — and an ordinary background print worker whose only session hint
+    is inherited/attributed (its parent's SID) is excluded too, because it is
+    not a second holder of that session.
+
+    The line that must never move: a row with an EXPLICIT session identity —
+    a procStart-bound pid record or an unambiguous ``--resume`` in argv — is a
+    proven holder and stays in every count no matter how it interacts or how
+    soon it exits. `claude -p --resume <sid>` overlapping an interactive pane
+    IS a DOUBLE-OPEN, and excluding it on `-p` alone would hide a real
+    concurrent holder from the certifier while the launch guard (open_pids)
+    still sees it — two safety surfaces disagreeing about the same process.
+
+    This narrows WHAT IS COUNTED, never what is allowed: a helm SEAT that
+    shows up headless is still a law violation, and it stays visible in
+    `session ls` tagged as such rather than being hidden."""
+    return ((r.get("headless") or r.get("nonpersistent"))
+            and not (r.get("declared") or r.get("resume")))
 
 
 def _resume_sid(argv):
@@ -502,6 +533,7 @@ def _proc_claude_rows():
             "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
             "force": env.get(FORCE_VAR) == "1",
             "headless": _is_headless(snap.get("argv") or []),
+            "nonpersistent": _is_nonpersistent(snap.get("argv") or []),
         })
     return rows
 
@@ -509,13 +541,17 @@ def _proc_claude_rows():
 def live_sids(rows=None):
     """{sid: [pid,...]} of proven live copies. The procStart-bound pid record
     wins, then canonical resume/who evidence. An inherited stamp SID is only the
-    spawning ancestor and never enters this map. HEADLESS one-shots never enter
-    either: they hold no resumable session by design, so a one-shot carrying
-    its parent's SID must not manufacture a false DOUBLE-OPEN."""
+    spawning ancestor and never enters this map, and neither does a SESSIONLESS
+    one-shot whose only session hint is inherited/attributed — a background
+    worker carrying its parent's SID must not manufacture a false DOUBLE-OPEN.
+    But headless is only an interaction mode: a print-mode row with an explicit
+    ``--resume``/pid-record identity is a proven live holder and MUST enter, or
+    a real overlapping holder hides from the certifier while the launch guard
+    still sees it (see _sessionless_oneshot)."""
     out = {}
     for r in (rows if rows is not None else _proc_claude_rows()):
         sid = r.get("session") or r.get("resume")
-        if sid and not r.get("headless"):
+        if sid and not _sessionless_oneshot(r):
             out.setdefault(sid, []).append(r["pid"])
     return out
 
@@ -554,12 +590,14 @@ def memory_only_panes(rows=None, persisting=None):
     PASS nor memory-only — a check that passes on absent input reports the
     opposite of the truth.
 
-    HEADLESS one-shots are excluded because they are not panes at all. They
-    declare in argv that they want no session, so their missing transcript is
-    the design working, not work at risk (see _is_headless)."""
+    SESSIONLESS one-shots are excluded because they are not panes at all:
+    their missing transcript is the design working, not work at risk. But a
+    print-mode row with an EXPLICIT session identity stays — headless is an
+    interaction mode, and print mode persists unless nonpersistence was
+    requested outright (see _sessionless_oneshot)."""
     rows = rows if rows is not None else _proc_claude_rows()
     persisting = persisting if persisting is not None else _persisting_sids()
-    return [r for r in rows if r.get("session") and not r.get("headless")
+    return [r for r in rows if r.get("session") and not _sessionless_oneshot(r)
             and _sid_on_disk(r["session"], persisting) is False]
 
 
@@ -692,13 +730,15 @@ def _cmd_ls(args, certify=False):
     # at-risk count is only panes we RESOLVED and found transcript-less.
     disk = {r["pid"]: _sid_on_disk(r.get("session"), persisting)
             for r in rows if r.get("session")}
-    # HEADLESS one-shots are excluded from EVERY health count — memory-only,
-    # unknown, double-open — because they are not panes: no session BY DESIGN
-    # is neither an unresolved sid nor work at risk (see _is_headless). They
-    # stay rendered below; the exclusion narrows what is COUNTED, never what
-    # the operator can SEE.
+    # SESSIONLESS one-shots are excluded from EVERY health count — memory-only,
+    # unknown, double-open — because they are not panes. But the exclusion is
+    # decided by _sessionless_oneshot, never by `-p` alone: headless is an
+    # interaction mode, and a print-mode row with an explicit --resume/pid-
+    # record identity is a proven holder that stays in every count. Excluded
+    # rows stay rendered below; the exclusion narrows what is COUNTED, never
+    # what the operator can SEE.
     mo = memory_only_panes(rows, persisting)
-    unknown = [r for r in rows if not r.get("headless")
+    unknown = [r for r in rows if not _sessionless_oneshot(r)
                and (not r.get("session") or disk.get(r["pid"]) is None)]
     live = live_sids(rows)
     dbl = {s: ps for s, ps in live.items() if len(ps) > 1}
@@ -706,12 +746,18 @@ def _cmd_ls(args, certify=False):
     for r in sorted(rows, key=lambda x: x["pid"]):
         sid = r.get("session") or r.get("resume")
         why = (" (rescued)" if r["force"] else " (stamped)" if r["child"] else "")
-        if r.get("headless"):
+        if _sessionless_oneshot(r):
             # SHOWN, never hidden. Excluding it from the health counts above is
             # about what gets COUNTED; withholding it from the operator would
             # be about what can be SEEN, and a helm SEAT running headless is a
-            # law violation that has to stay visible to be caught.
-            state = "headless one-shot (-p; no session by design)"
+            # law violation that has to stay visible to be caught. The label
+            # never claims "no session by design" for plain print mode — print
+            # persists unless nonpersistence was requested outright; what this
+            # row lacks is a session identity of its own to certify.
+            state = ("headless one-shot (--no-session-persistence; "
+                     "sessionless by request)" if r.get("nonpersistent")
+                     else "headless one-shot (-p; no session identity of its "
+                          "own to certify)")
         elif not sid:
             reason = r.get("declared_reason")
             detail = "; pid record %s" % reason if reason else ""
@@ -724,6 +770,10 @@ def _cmd_ls(args, certify=False):
             state = "MEMORY-ONLY (stamped, no FORCE)"
         else:
             state = "MEMORY-ONLY (no transcript on disk)"
+        if r.get("headless") and not _sessionless_oneshot(r):
+            # a print-mode HOLDER — counted like any pane, tagged so the
+            # operator sees the interaction mode too
+            state += " [headless]"
         possible = len(r.get("possible_sessions") or [])
         res = ((" session=%s" % sid[:12]) if sid else
                (" session=? (%d cwd candidates)" % possible if possible else ""))

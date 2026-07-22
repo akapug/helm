@@ -1063,20 +1063,33 @@ class ProcCensusTest(unittest.TestCase):
 
 
 class HeadlessCensusTest(unittest.TestCase):
-    """A headless one-shot is not an agent pane, and the census must not count
-    it as one. Both populations share the symptom (no transcript on disk); only
-    argv carries the DECLARED intent that tells them apart."""
+    """A SESSIONLESS one-shot is not an agent pane, and the census must not
+    count it as one — but `headless` is only an INTERACTION MODE, never proof
+    of sessionlessness: print mode persists unless --no-session-persistence is
+    requested, and `claude -p --resume <sid>` is a proven live holder. What
+    leaves the health arithmetic is decided by _sessionless_oneshot (mode AND
+    no explicit session identity), never by -p alone."""
 
-    def test_the_live_remember_plugin_invocation_is_headless(self):
+    def test_the_live_remember_plugin_invocation_is_sessionless(self):
         # verbatim argv measured 2026-07-22 — the call that flipped a CERTIFIED
-        # estate to a memory-only FAIL twenty minutes later
+        # estate to a memory-only FAIL twenty minutes later. It is excluded on
+        # its EXPLICIT nonpersistence evidence, not on -p alone.
         argv = ["/home/owner/.local/bin/claude", "-p", "--output-format", "json",
                 "--no-session-persistence", "--exclude-dynamic-system-prompt"]
         self.assertTrue(session._is_headless(argv))
+        self.assertTrue(session._is_nonpersistent(argv))
+        self.assertTrue(session._sessionless_oneshot(
+            {"headless": True, "nonpersistent": True,
+             "declared": None, "resume": None}))
 
-    def test_no_session_persistence_alone_is_enough(self):
-        # it states the intent outright, with or without -p
-        self.assertTrue(session._is_headless(["claude", "--no-session-persistence"]))
+    def test_headless_and_nonpersistent_are_separate_axes(self):
+        # --no-session-persistence states sessionless intent outright; -p is
+        # merely an interaction mode — conflating them is the defect both
+        # reviewers converged on
+        self.assertFalse(session._is_headless(["claude", "--no-session-persistence"]))
+        self.assertTrue(session._is_nonpersistent(["claude", "--no-session-persistence"]))
+        self.assertTrue(session._is_headless(["claude", "-p", "hi"]))
+        self.assertFalse(session._is_nonpersistent(["claude", "-p", "hi"]))
 
     def test_an_interactive_pane_is_not_headless(self):
         for argv in (["claude", "--resume", "abc", "--dangerously-skip-permissions"],
@@ -1097,20 +1110,37 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertFalse(session._is_headless(["claude", "--", "-p"]))
         self.assertFalse(session._is_headless(
             ["claude", "--resume", "abc", "--", "--print"]))
-        # a real flag BEFORE the terminator still declares headless intent
+        self.assertFalse(session._is_nonpersistent(
+            ["claude", "--", "--no-session-persistence"]))
+        # a real flag BEFORE the terminator still declares the mode/intent
         self.assertTrue(session._is_headless(["claude", "-p", "--", "prompt"]))
+        self.assertTrue(session._is_nonpersistent(
+            ["claude", "--no-session-persistence", "--", "prompt"]))
 
-    def test_headless_rows_leave_the_memory_only_census(self):
+    def test_sessionless_rows_leave_the_memory_only_census(self):
+        # pid 1's only session hint is inherited/attributed — an ordinary
+        # background print worker, not a pane with work at risk
         rows = [{"pid": 1, "session": "sid-a", "headless": True},
                 {"pid": 2, "session": "sid-b", "headless": False}]
         got = session.memory_only_panes(rows=rows, persisting={})
         self.assertEqual([r["pid"] for r in got], [2])
 
-    def row(self, pid, session_id, headless):
-        return {"pid": pid, "resume": None, "declared": None,
+    def test_a_print_row_with_explicit_identity_stays_in_memory_only(self):
+        # a proven SID never leaves the count merely because the process will
+        # exit after one response
+        rows = [{"pid": 1, "session": "sid-a", "declared": "sid-a",
+                 "headless": True}]
+        got = session.memory_only_panes(rows=rows, persisting={})
+        self.assertEqual([r["pid"] for r in got], [1])
+
+    def row(self, pid, session_id, headless, **kw):
+        base = {"pid": pid, "resume": None, "declared": None,
                 "declared_reason": None, "session": session_id,
                 "possible_sessions": [], "child": False,
-                "ancestor_sid8": "", "force": False, "headless": headless}
+                "ancestor_sid8": "", "force": False, "headless": headless,
+                "nonpersistent": False}
+        base.update(kw)
+        return base
 
     def ls(self, rows, persisting, certify=False):
         fn = session.cmd_doctor_panes if certify else session.cmd_ls
@@ -1136,7 +1166,8 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertNotIn("UNKNOWN", out)
 
     def test_a_headless_row_never_manufactures_a_double_open(self):
-        # a one-shot carrying its parent's proven SID is not a second holder
+        # a one-shot CARRYING its parent's proven SID (inherited/attributed
+        # hint only — no --resume, no pid record) is not a second holder
         rows = [self.row(1, "sid-x", False), self.row(2, "sid-x", True)]
         self.assertEqual(session.live_sids(rows), {"sid-x": [1]})
         rc, out, err = self.ls(rows, {"sid-x": __file__}, certify=True)
@@ -1144,6 +1175,44 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertNotIn("DOUBLE-OPEN", out)
         self.assertIn("persisted", out)
         self.assertIn("headless one-shot", out)
+
+    def test_a_print_mode_resume_is_a_real_holder_and_double_open(self):
+        # BOTH reviewers' HIGH: `claude -p --resume X` operates on a proven
+        # resumable session; overlapping an interactive holder of X it IS a
+        # DOUBLE-OPEN, and excluding it on -p alone hides the violation
+        rows = [self.row(1, "sid-x", False),
+                self.row(2, "sid-x", True, resume="sid-x")]
+        self.assertEqual(session.live_sids(rows), {"sid-x": [1, 2]})
+        rc, out, err = self.ls(rows, {"sid-x": __file__}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("DOUBLE-OPEN", out)
+
+    def test_certifier_and_launch_guard_agree_on_a_print_resume_row(self):
+        # codex's probe: before the fix, live_sids={} while open_pids(SID)=[2]
+        # — the health certifier and the launch guard disagreed about the same
+        # process. One truth now.
+        rows = [self.row(2, "sid-x", True, resume="sid-x")]
+        self.assertEqual(session.live_sids(rows), {"sid-x": [2]})
+        self.assertEqual(session.open_pids("sid-x", rows), [2])
+
+    def test_nonpersistence_never_removes_a_proven_sid_from_holders(self):
+        # even `--no-session-persistence --resume X` still READS session X
+        # while it lives; a proven SID stays in holder arithmetic, fail closed
+        rows = [self.row(2, "sid-x", True, resume="sid-x", nonpersistent=True)]
+        self.assertEqual(session.live_sids(rows), {"sid-x": [2]})
+
+    def test_a_print_resume_holder_renders_its_session_not_a_design_claim(self):
+        # the old label "no session by design" was FALSE for print mode —
+        # print persists unless nonpersistence is requested outright
+        rc, out, err = self.ls(
+            [self.row(2, "sid-x", True, resume="sid-x")],
+            {"sid-x": __file__})
+        self.assertEqual(rc, 0, err)
+        self.assertIn("persisted", out)
+        self.assertIn("[headless]", out)
+        self.assertIn("session=sid-x", out)
+        self.assertNotIn("headless one-shot", out)
+        self.assertNotIn("no session by design", out)
 
     def test_an_unknown_row_still_never_enters_the_pass_bucket(self):
         # the headless exclusion must not weaken the tri-state guarantee
