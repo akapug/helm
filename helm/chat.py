@@ -1149,6 +1149,37 @@ def cmd_chat(args):
             if not to:
                 print("helm chat: --dm wants a seat name", file=sys.stderr)
                 return 2
+        # REFUSE an unrecognised flag instead of POSTING it.
+        #
+        # Everything not consumed above falls into the message body, so a
+        # misremembered flag does not fail — it publishes. Live 2026-07-22:
+        # six `--to <seat>` posts (there is no --to; the flag is --dm) went to
+        # #main as public messages whose body began "--to codex-orch", and the
+        # owner had to ask why his channel was full of them. `post --help`
+        # posted the literal string "--help" for the same reason.
+        #
+        # The cost is asymmetric and that is what decides it: refusing a real
+        # message costs one retype, while accepting a wrong flag broadcasts to
+        # everyone and cannot be unsent. A leading "--" is never message text
+        # anyone means; text that genuinely starts with a dash can still be
+        # sent via stdin, which skips this path entirely.
+        # Derived from what post ACTUALLY consumes above, never from what it
+        # looks like it should accept. `--text` was in an earlier draft of this
+        # list and is consumed NOWHERE — whitelisting it would have preserved
+        # the exact bug for the one seat that uses it.
+        KNOWN = ("--room", "--seat", "--dm", "--reply-to")
+        for a in args[1:]:
+            if a.startswith("--") and a not in KNOWN:
+                print("helm chat: unknown flag %s — REFUSING to post it as text."
+                      % a, file=sys.stderr)
+                print("  post accepts: %s" % ", ".join(KNOWN), file=sys.stderr)
+                if a in ("--to", "--recipient", "--text"):
+                    print("  to reach ONE seat privately use --dm %s; without it "
+                          "every post is PUBLIC to the room." % a, file=sys.stderr)
+                elif a in ("--help", "-h"):
+                    print("  usage: helm chat post <text...> [--room R] [--seat S] "
+                          "[--dm SEAT] [--reply-to <id|n>]", file=sys.stderr)
+                return 2
         text = " ".join(args[1:]).strip()
         if not text and not sys.stdin.isatty():
             text = sys.stdin.read().strip()

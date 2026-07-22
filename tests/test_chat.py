@@ -269,3 +269,62 @@ class RowIntegrityTest(ChatBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PostUnknownFlagTest(ChatBase):
+    """post REFUSES an unrecognised flag instead of publishing it.
+
+    Everything post does not consume falls into the message body, so a
+    misremembered flag does not fail — it BROADCASTS. Live 2026-07-22: six
+    `--to <seat>` posts (the flag is --dm) landed in #main as public messages
+    whose body began "--to codex-orch", and `post --help` had been posting the
+    literal string "--help" across the fleet for a day before anyone noticed."""
+
+    def _post(self, *args):
+        import contextlib
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = chat.cmd_chat(["post"] + list(args))
+        return rc, err.getvalue()
+
+    def _rows(self, room="main"):
+        return chat.read(room)[0]
+
+    def test_a_misremembered_addressing_flag_is_refused_not_posted(self):
+        rc, err = self._post("--to", "codex-orch", "hello")
+        self.assertEqual(rc, 2)
+        self.assertIn("--to", err)
+        self.assertEqual(self._rows(), [])          # nothing published
+
+    def test_the_refusal_names_the_real_addressing_flag(self):
+        _, err = self._post("--to", "someone", "hi")
+        self.assertIn("--dm", err)
+
+    def test_help_is_refused_rather_than_broadcast(self):
+        rc, err = self._post("--help")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+        self.assertEqual(self._rows(), [])
+
+    def test_text_is_refused_because_post_never_consumed_it(self):
+        # --text appeared in an early draft of the whitelist; it is consumed
+        # NOWHERE, so allowing it would have preserved the bug verbatim
+        rc, _ = self._post("--text", "@david", "hi")
+        self.assertEqual(rc, 2)
+        self.assertEqual(self._rows(), [])
+
+    def test_a_plain_message_still_posts(self):
+        rc, _ = self._post("--seat", "tester", "an ordinary message")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self._rows()), 1)
+        self.assertIn("an ordinary message", self._rows()[0]["text"])
+
+    def test_every_whitelisted_flag_is_genuinely_consumed(self):
+        # the whitelist must be derived from what post CONSUMES, never from
+        # what it looks like it should accept — that gap is the whole bug
+        src = open(chat.__file__.replace(".pyc", ".py")).read()
+        body = src.split("KNOWN = ")[1].split(")")[0]
+        for flag in ("--room", "--seat", "--dm", "--reply-to"):
+            self.assertIn(flag, body)
+            self.assertGreaterEqual(src.count('"%s"' % flag), 2,
+                                    "%s is whitelisted but not consumed" % flag)
