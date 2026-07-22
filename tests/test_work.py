@@ -3,14 +3,17 @@
 HELM_CHAT_DIR are tmp dirs, git global/system config nulled, every room is a
 scratch repo minted in setUp — the real repo and its worktrees are never
 touched (every `helm work` call pins --repo at the scratch root)."""
+import concurrent.futures
 import contextlib
 import io
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,12 +25,18 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_OWNER_NAMES", "HELM_CELL_BIN", "HELM_ADOPTED_DIR",
             "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID",
             "CLAUDECODE", "CLAUDE_CODE_SUBAGENT_MODEL", "ANTHROPIC_MODEL",
-            "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "HELM_WORK_INTEGRATOR")
+            "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "HELM_WORK_INTEGRATOR",
+            "HELM_TEST_HOOK_LOG")
 
 
 def _sh(cwd, *args):
     return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True,
                           timeout=30)
+
+
+def _bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
 
 
 class WorkBase(unittest.TestCase):
@@ -349,6 +358,25 @@ class GuardTest(WorkBase):
             _sh(self.root, "git", "symbolic-ref", "--short", "HEAD").stdout.strip(),
             "main")
 
+    def test_release_and_gc_branch_cleanup_still_work_with_guard(self):
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.work("claim", "released", "--seat", "s1")
+        self.assertEqual(rc, 0, err)
+        lease = out.split("\t")[2]
+        rc, _out, err = self.work("release", "released", "--seat", "s1",
+                                  "--lease", lease)
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(work._has_branch(self.root, "lane/released"))
+
+        path = self.room("collected")
+        _sh(self.root, "git", "worktree", "lock", path,
+            "--reason", "lease:deadbeef")
+        rc, _out, err = self.work("gc", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(work._has_branch(self.root, "lane/collected"))
+
     def test_ref_guard_leaves_lane_rooms_alone(self):
         """Branching INSIDE a lane room is the sanctioned workflow and must
         stay free — the rail guards the integrator's tree, nothing else."""
@@ -361,48 +389,265 @@ class GuardTest(WorkBase):
             _sh(room, "git", "symbolic-ref", "--short", "HEAD").stdout.strip(),
             "free-sub")
 
-    def test_install_is_all_or_nothing_on_a_foreign_ref_hook(self):
-        """Half a rail is the advisory guard we are replacing: the heal
-        without the refusal silently corrects and lets the next commit land on
-        main. A foreign hook of EITHER name aborts the whole install."""
+    def test_existing_hooks_are_preserved_composed_and_idempotent(self):
+        log = os.path.join(self.tmp, "hook log")
+        os.environ["HELM_TEST_HOOK_LOG"] = log
+        ref = work.hook_path(self.root, "reference-transaction")
+        post = work.hook_path(self.root)
+        os.makedirs(os.path.dirname(ref), exist_ok=True)
+        with open(ref, "w") as f:
+            f.write("#!/bin/sh\nprintf 'ref:%s\\n' \"$1\" >> "
+                    "\"$HELM_TEST_HOOK_LOG\"\n"
+                    "while IFS= read -r line; do printf 'in:%s\\n' \"$line\" "
+                    ">> \"$HELM_TEST_HOOK_LOG\"; done\nexit 0\n")
+        os.chmod(ref, 0o750)
+        with open(post, "w") as f:
+            f.write("#!/bin/sh\nprintf 'post:%s:%s:%s\\n' \"$1\" \"$2\" "
+                    "\"$3\" >> \"$HELM_TEST_HOOK_LOG\"\nexit 0\n")
+        os.chmod(post, 0o700)
+        originals = {ref: _bytes(ref), post: _bytes(post)}
+
+        rc, out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("preserved existing", out)
+        for path, mode in ((ref, 0o750), (post, 0o700)):
+            user = path + ".helm-user"
+            self.assertEqual(_bytes(user), originals[path])
+            self.assertEqual(stat.S_IMODE(os.stat(user).st_mode), mode)
+            self.assertTrue(os.access(path, os.X_OK))
+
+        r = _sh(self.root, "git", "checkout", "-b", "blocked")
+        self.assertEqual(r.returncode, 128, r.stderr)
+        self.assertIn("REFUSED", r.stderr)
+        with open(log) as f:
+            calls = f.read()
+        self.assertIn("ref:prepared", calls)
+        self.assertIn("refs/heads/blocked", calls)
+
+        before = {p: (_bytes(p), os.stat(p).st_mtime_ns)
+                  for p in (ref, post, ref + ".helm-user", post + ".helm-user")}
+        rc, out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("already up to date", out)
+        after = {p: (_bytes(p), os.stat(p).st_mtime_ns)
+                 for p in before}
+        self.assertEqual(after, before)
+
+    def test_install_rolls_back_every_path_after_partial_failure(self):
+        ref = work.hook_path(self.root, "reference-transaction")
+        post = work.hook_path(self.root)
+        os.makedirs(os.path.dirname(ref), exist_ok=True)
+        for path, text in ((ref, "ref-user"), (post, "post-user")):
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n# %s\nexit 0\n" % text)
+            os.chmod(path, 0o755)
+        originals = {p: _bytes(p) for p in (ref, post)}
+        real, calls = work._put_snapshot, []
+
+        def fail_third(path, snap):
+            calls.append(path)
+            if len(calls) == 3:
+                raise OSError("injected install failure")
+            return real(path, snap)
+
+        with mock.patch.object(work, "_put_snapshot", side_effect=fail_third):
+            rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 1)
+        self.assertIn("rolled back", err)
+        for path in (ref, post):
+            self.assertEqual(_bytes(path), originals[path])
+            self.assertFalse(os.path.lexists(path + ".helm-user"))
+
+    def test_non_executable_user_hook_stays_inactive(self):
+        log = os.path.join(self.tmp, "inactive.log")
+        os.environ["HELM_TEST_HOOK_LOG"] = log
+        post = work.hook_path(self.root)
+        os.makedirs(os.path.dirname(post), exist_ok=True)
+        with open(post, "w") as f:
+            f.write("#!/bin/sh\nprintf activated > \"$HELM_TEST_HOOK_LOG\"\n")
+        os.chmod(post, 0o644)
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(stat.S_IMODE(os.stat(post + ".helm-user").st_mode),
+                         0o644)
+        _sh(self.root, "git", "checkout", "--", "README")
+        self.assertFalse(os.path.exists(log))
+
+    def test_foreign_symlink_hook_is_preserved_and_composed(self):
+        log = os.path.join(self.tmp, "symlink.log")
+        os.environ["HELM_TEST_HOOK_LOG"] = log
+        post = work.hook_path(self.root)
+        actual = os.path.join(os.path.dirname(post), "actual-user-post")
+        os.makedirs(os.path.dirname(post), exist_ok=True)
+        with open(actual, "w") as f:
+            f.write("#!/bin/sh\nprintf symlink-user >> "
+                    "\"$HELM_TEST_HOOK_LOG\"\n")
+        os.chmod(actual, 0o755)
+        os.symlink(os.path.basename(actual), post)
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.islink(post + ".helm-user"))
+        self.assertEqual(os.readlink(post + ".helm-user"), os.path.basename(actual))
+        _sh(self.root, "git", "checkout", "--", "README")
+        with open(log) as f:
+            self.assertEqual(f.read(), "symlink-user")
+
+    def test_existing_branch_switch_and_symbolic_ref_are_refused(self):
+        env = dict(os.environ, HELM_WORK_INTEGRATOR="1")
+        r = subprocess.run(["git", "branch", "existing"], cwd=self.root,
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        r = _sh(self.root, "git", "commit", "--allow-empty", "-m", "forward")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tip = _sh(self.root, "git", "rev-parse", "main").stdout.strip()
+        r = _sh(self.root, "git", "update-ref", "refs/heads/main", "existing")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("non-fast-forward", r.stderr)
+        self.assertEqual(_sh(self.root, "git", "rev-parse", "main").stdout.strip(),
+                         tip)
+        for cmd in (("checkout", "existing"),
+                    ("symbolic-ref", "HEAD", "refs/heads/existing")):
+            r = _sh(self.root, "git", *cmd)
+            self.assertNotEqual(r.returncode, 0, r.stderr)
+            self.assertIn("HEAD must stay", r.stderr)
+            self.assertEqual(
+                _sh(self.root, "git", "symbolic-ref", "--short", "HEAD")
+                .stdout.strip(), "main")
+
+    def test_plumbing_cannot_delete_or_move_an_occupied_branch(self):
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        room = self.room("held")
+        old = _sh(self.root, "git", "rev-parse", "lane/held").stdout.strip()
+        for cmd in (("update-ref", "-d", "refs/heads/lane/held"),
+                    ("update-ref", "refs/heads/lane/held", "main")):
+            r = _sh(self.root, "git", *cmd)
+            self.assertNotEqual(r.returncode, 0, r.stderr)
+            self.assertIn("OCCUPIED", r.stderr)
+            self.assertEqual(
+                _sh(self.root, "git", "rev-parse", "lane/held").stdout.strip(),
+                old)
+        # Its own ordinary commit remains legal.
+        with open(os.path.join(room, "held.txt"), "w") as f:
+            f.write("ok\n")
+        self.assertEqual(_sh(room, "git", "add", "held.txt").returncode, 0)
+        r = _sh(room, "git", "commit", "-m", "held work")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_ref_guard_fails_closed_when_occupancy_registry_is_unreadable(self):
+        env = dict(os.environ, HELM_WORK_INTEGRATOR="1")
+        r = subprocess.run(["git", "branch", "other"], cwd=self.root,
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        fakebin = os.path.join(self.tmp, "fake-bin")
+        os.makedirs(fakebin)
+        fakegit = os.path.join(fakebin, "git")
+        realgit = shutil.which("git")
+        with open(fakegit, "w") as f:
+            f.write("#!/bin/sh\n"
+                    "if [ \"$1 $2\" = \"worktree list\" ]; then exit 9; fi\n"
+                    "exec \"%s\" \"$@\"\n" % realgit)
+        os.chmod(fakegit, 0o755)
         ref_hook = work.hook_path(self.root, "reference-transaction")
-        os.makedirs(os.path.dirname(ref_hook), exist_ok=True)
-        with open(ref_hook, "w") as f:
-            f.write("#!/bin/sh\n# somebody else's hook\nexit 0\n")
-        rc, _out, err = self.work("install-guard", "--apply")
-        self.assertEqual(rc, 1)
-        self.assertIn("not ours", err)
         with open(ref_hook) as f:
-            self.assertIn("somebody else", f.read())
-        # and the post-checkout half must NOT have been left behind
-        self.assertFalse(os.path.exists(work.hook_path(self.root)))
+            script = f.read()
+        with open(ref_hook, "w") as f:
+            f.write(script.replace("#!/bin/sh\n", "#!/bin/sh\nPATH='" + fakebin
+                                   + "':$PATH\n", 1))
+        os.chmod(ref_hook, 0o755)
+        old = _sh(self.root, "git", "rev-parse", "other").stdout.strip()
+        r = subprocess.run(["git", "update-ref", "refs/heads/other", "main"],
+                           cwd=self.root, capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("cannot verify worktree occupancy", r.stderr)
+        self.assertEqual(_sh(self.root, "git", "rev-parse", "other").stdout.strip(),
+                         old)
 
-    def test_a_foreign_post_checkout_also_installs_nothing(self):
-        """The mirror case, which a write-as-you-go install would fail: the
-        ref hook is written FIRST, so only a pre-flight scan keeps a foreign
-        post-checkout from leaving half a rail behind."""
-        heal = work.hook_path(self.root)
-        os.makedirs(os.path.dirname(heal), exist_ok=True)
-        with open(heal, "w") as f:
-            f.write("#!/bin/sh\n# somebody else's checkout hook\nexit 0\n")
+    def test_install_from_linked_worktree_targets_common_hooks_only(self):
+        linked = self.room("caller")
+        root = work.find_root(linked)
+        self.assertEqual(root, self.root)
+        rc, lines = work.install_guard(root, apply=True)
+        self.assertEqual(rc, 0, "\n".join(lines))
+        common = _sh(self.root, "git", "rev-parse", "--path-format=absolute",
+                     "--git-common-dir").stdout.strip()
+        for name, _var in work.GUARD_HOOKS:
+            self.assertEqual(os.path.dirname(work.hook_path(root, name)),
+                             os.path.join(common, "hooks"))
+            per_worktree = _sh(linked, "git", "rev-parse", "--path-format=absolute",
+                               "--git-dir").stdout.strip()
+            self.assertFalse(os.path.exists(os.path.join(per_worktree, "hooks", name)))
+
+    def test_repo_local_hooks_path_is_honored_but_external_path_is_refused(self):
+        local = os.path.join(self.root, ".git", "helm-hooks")
+        self.assertEqual(_sh(self.root, "git", "config", "core.hooksPath", local)
+                         .returncode, 0)
+        rc, _out, err = self.work("install-guard", "--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.exists(os.path.join(local, "reference-transaction")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".git", "hooks",
+                                                     "reference-transaction")))
+
+        other = os.path.join(self.tmp, "foreign hooks")
+        self.assertEqual(_sh(self.root, "git", "config", "core.hooksPath", other)
+                         .returncode, 0)
         rc, _out, err = self.work("install-guard", "--apply")
         self.assertEqual(rc, 1)
-        self.assertIn("not ours", err)
-        self.assertFalse(
-            os.path.exists(work.hook_path(self.root, "reference-transaction")))
-        with open(heal) as f:
-            self.assertIn("somebody else", f.read())
+        self.assertIn("outside this repo", err)
+        self.assertFalse(os.path.exists(other))
 
-    def test_install_guard_refuses_foreign_hook(self):
-        hook = work.hook_path(self.root)
-        os.makedirs(os.path.dirname(hook), exist_ok=True)
-        with open(hook, "w") as f:
-            f.write("#!/bin/sh\necho mine\n")
-        rc, _out, err = self.work("install-guard", "--apply")
-        self.assertEqual(rc, 1)
-        self.assertIn("not overwriting", err)
-        with open(hook) as f:
-            self.assertIn("echo mine", f.read())
+    def test_shell_quoting_handles_a_base_branch_with_apostrophe(self):
+        base = "odd'base"
+        self.assertEqual(_sh(self.root, "git", "branch", "-m", base).returncode, 0)
+        rc, lines = work.install_guard(self.root, apply=True)
+        self.assertEqual(rc, 0, "\n".join(lines))
+        r = _sh(self.root, "git", "commit", "--allow-empty", "-m", "on odd base")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = _sh(self.root, "git", "checkout", "-b", "blocked")
+        self.assertEqual(r.returncode, 128, r.stderr)
+        self.assertEqual(_sh(self.root, "git", "symbolic-ref", "--short", "HEAD")
+                         .stdout.strip(), base)
+
+    def test_guard_handles_repo_paths_with_spaces_newlines_and_symlink_callers(self):
+        moved = os.path.join(self.tmp, "repo space\nline")
+        os.rename(self.root, moved)
+        self.root = moved
+        alias = os.path.join(self.tmp, "repo-alias")
+        os.symlink(self.root, alias)
+        root = work.find_root(alias)
+        self.assertEqual(os.path.realpath(root), os.path.realpath(self.root))
+        rc, lines = work.install_guard(root, apply=True)
+        self.assertEqual(rc, 0, "\n".join(lines))
+        r = _sh(alias, "git", "checkout", "-b", "blocked")
+        self.assertEqual(r.returncode, 128, r.stderr)
+        self.assertIn("REFUSED", r.stderr)
+
+    def test_concurrent_installers_converge_to_one_complete_rail(self):
+        def install(_):
+            return work.install_guard(self.root, apply=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(install, range(16)))
+        self.assertTrue(all(rc == 0 for rc, _lines in results), results)
+        for name, _var in work.GUARD_HOOKS:
+            path = work.hook_path(self.root, name)
+            self.assertTrue(os.access(path, os.X_OK))
+            with open(path) as f:
+                self.assertIn(work.MANAGED_HOOK_MARKER, f.read())
+
+    def test_claim_lock_blocks_normal_raw_remove_and_prune(self):
+        rc, out, err = self.work("claim", "locked", "--seat", "s1")
+        self.assertEqual(rc, 0, err)
+        path = out.split("\t")[0]
+        r = _sh(self.root, "git", "worktree", "remove", "--force", path)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("locked", r.stderr.lower())
+        self.assertEqual(_sh(self.root, "git", "worktree", "prune").returncode, 0)
+        self.assertTrue(os.path.isdir(path))
 
 
 class WiringTest(unittest.TestCase):
