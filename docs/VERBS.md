@@ -444,7 +444,8 @@ conservative stuck-signal gated to action tools — reads carry error text as
 *data*; a loop-thrash hash chain over recent commands) plus the two
 verify-grounding artifacts: `command-log.jsonl` (test-runner invocations with
 their **real** exit codes — token + digest, never the raw command line) and
-`edit-targets.log` (basenames actually edited). Keyed by the payload's
+`edit-targets.log` (basenames actually edited) and `todos.json` (the seat
+todo mirror — see `helm todos`). Keyed by the payload's
 `session_id`, never a pane — sessions are helm's key. A pure-Python argv verb
 (no shell string ever interpolates tool content — the ancestor's
 apostrophe-breaks-`python -c` silent-noop class is structurally dead).
@@ -466,6 +467,49 @@ $ helm record status
   wiring: 2 of 2 claude homes (PostToolUse)
   session        age   passive dirty stuck loop  cmds edits
   a1b2c3d4       3m    4       0     0     1     2    5
+```
+
+### `helm todos [--all] [--json]`
+The seat todo mirror — **what each agent in the fleet is working on right
+now**, readable without asking it. The recorder's todo leg captures the
+seat's CURRENT list off `TodoWrite` *and* the `Task*` family (`TaskCreate` /
+`TaskUpdate` / the legacy `TaskUpdateTODO` — the tools the live fleet
+actually emits; create's id lives only in the tool_result string, so it is
+parsed from there) into `_global/.state/reflex-state/<session_id>/todos.json`,
+beside `counters.json`. Bounded (64 items, 120 chars each), atomic, no
+subprocess, and walled off behind its own `try` — a broken mirror can never
+cost the counters, command-log or edit-targets that back the stop-whisper.
+
+The bridge is **digest + pull, never a firehose** (decision-spirit #23, the
+attention budget). Todo state churns on nearly every turn, so:
+
+* **Pull is the surface.** `helm todos` is this seat's list; `helm todos
+  --all` is the fleet table (seat · in-progress · done/total · age, with
+  never-mirrored seats collapsed into one footer line); `--json` for tooling.
+  The same state rides `helm chat seats` and the roster row, so the delivery
+  roster now answers *who is working on what*, not just who is here. Reading
+  costs the reader nothing until they ask.
+* **Push is a rate-capped exception.** One room line lands only on a
+  transition a teammate would act on — a task **finished**, or an idle seat
+  picking up a **new** in-progress task — collapsed to the latest state, at
+  most once per 5 minutes per seat, and never at all when nothing materially
+  changed (a re-word, a reorder, a new *pending* item is the seat's own
+  bookkeeping). `HELM_TODO_POST=0` switches it off entirely.
+* **Never an @mention, never a DM.** Those pierce mute and *wake* seats; a
+  todo update must never wake the fleet. Every `@` is stripped from the
+  posted text, so a todo that merely contains "@someone" cannot become a
+  mention by accident.
+
+The owner's parity surface is the web tab's **fleet todos** panel (and
+`GET /api/todos`) — who is working on what, without a CLI.
+
+```console
+$ helm todos --all
+  seat              in-progress                                 done    age
+  goodtimes-claude  —                                            2/2      5s
+  helm-claude       wire helm todos + roster + web panel         2/4      5s
+  polyana-codex     Add the Scala gate to the cosmo matrix       0/2      5s
+  (1 seat with no mirrored todos — they fill on the next TodoWrite/Task* call)
 ```
 
 ### `helm mentor [observe <project> [--since 7d] | teach <project> "<id> | <steer>" [--signal S] [--pattern RE] [--marker PATH] [--teacher NAME] [--attest] | review <project> | log [--project P]]`

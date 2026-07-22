@@ -2,6 +2,24 @@
 
 ## Unreleased (0.2)
 
+- `helm todos` — the seat todo mirror: what every agent in the fleet is
+  working on right now, without asking it. The recorder gains a todo leg
+  that captures the CURRENT list off `TodoWrite` **and** the `Task*` family
+  (`TaskCreate`/`TaskUpdate`/`TaskUpdateTODO` — what the live fleet actually
+  emits; a create's id is parsed out of its tool_result string) into
+  `todos.json` beside `counters.json` — bounded, atomic, no subprocess, and
+  walled off behind its own `try` so a broken mirror can never cost the
+  counters/command-log/edit-targets that back the stop-whisper. DIGEST +
+  PULL by law: `helm todos` / `helm todos --all` / `GET /api/todos` / the
+  roster row + `helm chat seats` read it on demand, and PUSH is a
+  rate-capped exception — one room line per MEANINGFUL transition (a task
+  finished, or an idle seat picking up a new in-progress task), collapsed to
+  the latest state, at most once per 5 min per seat, nothing at all when
+  nothing materially changed, `HELM_TODO_POST=0` to silence. Never an
+  @mention, never a DM (those pierce mute and wake seats — every `@` is
+  stripped from the posted text). The owner's parity surface is the ledger
+  tab's **fleet todos** panel.
+
 - Stop-whisper slice 2 — the verify-grounding rungs: the contextual
   continuation ladder gains three signals read from record.py's own logs
   (one bounded read, fail-closed): a RED gate (a test-runner's latest run

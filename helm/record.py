@@ -19,6 +19,9 @@ State, under <helm home>/_global/.state/reflex-state/<session_id>/:
                       codes (token + digest, never the raw command line)
   edit-targets.log    verify-grounding: basenames actually edited (a real edit
                       vs prose that merely mentioned a filename)
+  todos.json          the seat todo mirror (todos.py): the CURRENT todo list
+                      off TodoWrite/Task*, pull-read by `helm todos` and the
+                      roster — digest+pull, never a firehose
 
 Laws:
   * SESSION-keyed from the payload's session_id, never pane/env — sessions are
@@ -49,6 +52,9 @@ PASSIVE = ("Read", "Grep", "Glob")   # error text here is DATA — never arms st
 EDITS = ("Edit", "Write", "NotebookEdit")
 FORWARD = EDITS + ("Agent", "Task")  # forward progress; + git commit below
 DIRTYING = EDITS + ("Bash",)         # the only tools worth a git-status probe
+# the todo-mirror tools (todos.TOOLS, spelled here so the hot path never
+# imports todos.py for the 99% of events that are not todo writes)
+TASK_TOOLS = ("TodoWrite", "TaskCreate", "TaskUpdate", "TaskUpdateTODO")
 HASH_WINDOW = 8                      # loop-thrash lookback (catches A-B-A-B too)
 LOG_MAX = 1024 * 1024                # command-log / edit-targets rotate here (-> .1)
 
@@ -244,6 +250,16 @@ def _record(event):
         if fp:
             _append(os.path.join(sd, "edit-targets.log"),
                     os.path.basename(str(fp)) + "\n")
+
+    # the seat todo mirror — purely additive, and walled off from every
+    # writer above: its own try/except means a broken mirror can never cost
+    # the counters, command-log or edit-targets that back the stop-whisper.
+    if tool in TASK_TOOLS and not failed:
+        try:
+            from . import todos
+            todos.capture(event, sid, tool, tin, resp)
+        except Exception:
+            pass
 
     c.update(v=1, ts=pk.now_ts())
     c["last-tool"] = tool

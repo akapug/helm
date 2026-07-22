@@ -679,6 +679,10 @@ details.cfgsec>summary:hover{color:var(--fg)}
         <div class="lrows" id="ledgerseats"><div class="empty">no seats joined yet — a session joins on its next start (helm hooks install wires it)</div></div>
       </div>
       <div class="lcard">
+        <h3>fleet todos <span class="lsub">who is working on what · pulled, never pushed</span></h3>
+        <div class="lrows" id="ledgertodos"><div class="empty">no seat has mirrored a todo yet</div></div>
+      </div>
+      <div class="lcard">
         <h3>signed-turn cells <span class="lsub">on the node · stale when signing is off</span></h3>
         <div class="llegend"><span><span class="ldot active"></span> active &lt;2m</span>
           <span><span class="ldot quiet"></span> quiet &lt;30m</span>
@@ -2702,8 +2706,9 @@ function rosterSeats(rep) {
     '<button class="seatrn" data-seat="' + esc(s.seat) + '" title="rename this seat — @newname delivers to the same agent">rename</button>' +
     '<span class="lage">' + (s.last_seen ? lago(s.last_seen) : "—") + '</span></div>' +
     '<div class="lmeta">' + [s.project ? esc(s.project) : '', seatHome(s),
-      s.preview ? '<span title="newest pending delivery">“' + esc(s.preview) + '”</span>' : '']
-      .filter(Boolean).join(' · ') + '</div></div>').join("");
+      s.todo && s.todo.active ? '<span title="current task — the todo mirror">\u25b6 ' + esc(s.todo.active) + '</span>' : '',
+      s.preview ? '<span title="newest pending delivery">\u201c' + esc(s.preview) + '\u201d</span>' : '']
+      .filter(Boolean).join(' \u00b7 ') + '</div></div>').join("");
   if (claims.length) {
     html += '<div class="lmeta" style="margin-top:6px">claims: ' + claims.map(c =>
       esc(c.resource) + ' → <b>' + esc(c.holder || "?") + '</b> (' + c.remaining + 's left)').join(" · ") + '</div>';
@@ -2721,6 +2726,25 @@ function rosterSeats(rep) {
       pollLedger();
     } catch (e) { toast("rename refused: " + e.message); }
   });
+}
+
+// The fleet todo panel: the owner's answer to "who is working on what",
+// without a CLI. Pure PULL — /api/todos reads the mirror the recorder fills;
+// nothing here ever pushes, mentions, or wakes a seat.
+function fleetTodos(rep) {
+  const rows = (((rep && rep.seats) || []).concat((rep && rep.orphans) || [])).filter(r => r.total);
+  if (!rows.length) {
+    $("#ledgertodos").innerHTML = '<div class="empty">no seat has mirrored a todo yet — this fills as agents write their todo lists</div>';
+    return;
+  }
+  rows.sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0) || (b.ts || 0) - (a.ts || 0));
+  $("#ledgertodos").innerHTML = rows.map(r =>
+    '<div class="lrow"><div class="lhead"><span class="ldot ' + (r.active ? "active" : "") + '"></span>' +
+    '<span class="mono">' + esc(r.seat) + '</span>' +
+    '<span class="lbadge' + (r.total && r.done === r.total ? " final" : " tent") + '">' + r.done + '/' + r.total + '</span>' +
+    '<span class="lage">' + (r.ts ? lago(r.ts) : "—") + '</span></div>' +
+    '<div class="lmeta">' + (r.active ? esc(r.active) : "<i>no task in progress</i>") +
+    (r.project ? ' · ' + esc(r.project) : '') + '</div></div>').join("");
 }
 
 // The "message a seat" picker is a real anchored popup rather than a browser
@@ -2790,6 +2814,8 @@ async function pollLedger() {
   // ONE roster read feeds both the delivery-roster panel and the seat picker.
   try { const rep = await j("/api/chat/roster"); rosterSeats(rep); seatPicker(rep); }
   catch (e) { /* roster + picker fail quiet — the tab stays usable */ }
+  // fleet todos: who is working on what (pull-only, fails quiet like the rest)
+  try { fleetTodos(await j("/api/todos")); } catch (e) { /* panel stays as-is */ }
   // The activity feed is LOCAL — it renders even when the cave node is down.
   try { const n = await j("/api/ledger/native"); nativeHead(n.chain || {}); nativeChat(n.chat); nativeRows(n); }
   catch (e) { /* activity card fails quiet — the cave projection still renders */ }

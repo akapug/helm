@@ -893,6 +893,17 @@ def _api_chat_roster(qs):
         return {"seats": [], "claims": [], "unavailable": True}, 200
 
 
+def _api_todos(qs):
+    """The owner's fleet-todo read: every seat and the task it is on right
+    now (todos.py — the pull half of the TodoWrite/Task* mirror). Read-only,
+    fail-open: any surprise answers empty, never a 500."""
+    try:
+        from . import todos
+        return todos.fleet(), 200
+    except Exception:
+        return {"seats": [], "orphans": [], "now": 0, "unavailable": True}, 200
+
+
 def _api_chat_seat(payload):
     """The seats panel's one mutation: bind a live agent to a memorable @name
     (seats.rename_seat — roster row + delivery state move together). Bearer-
@@ -1242,6 +1253,7 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/cmd": _api_cmd,
     "/api/chat": _api_chat,
     "/api/chat/roster": _api_chat_roster,
+    "/api/todos": _api_todos,
     "/api/ledger": _api_ledger,
     "/api/ledger/turn": _api_ledger_turn,
     "/api/ledger/native": _api_ledger_native,

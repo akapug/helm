@@ -1918,12 +1918,19 @@ def roster_report(room="main"):
         if hits:
             preview = _scrub(hits[-1][1].get("text") or "")[:PREVIEW_CHARS]
         ls = last_seen(seat, row)
+        # the seat's CURRENT task, pulled (never pushed) off the todo mirror
+        # — this is what turns "who is here" into "who is working on what".
+        try:
+            from . import todos as _todos
+            todo = _todos.seat_digest(row)
+        except Exception:
+            todo = None                  # fail-open: a roster read never 500s
         seats.append({"seat": seat, "session": row.get("session"),
                       "project": row.get("project"), "cwd": row.get("cwd"),
                       "home_room": row.get("home_room"),
                       "home_room_source": row.get("home_room_source"),
                       "last_seen": ls, "presence": presence_of(ls),
-                      "pending": pending, "preview": preview})
+                      "pending": pending, "preview": preview, "todo": todo})
     return {"room": room, "seats": seats, "claims": claims_list()}
 
 
@@ -2096,9 +2103,15 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             scope = "#" + s["home_room"] if s.get("home_room") else "all"
             source = " (%s)" % s["home_room_source"] \
                 if s.get("home_room_source") else ""
-            print("  %-*s  %-6s  pending %-3d %s · home %s%s" % (
+            # the todo cell rides the existing row (who is working on what) —
+            # `helm todos --all` is the full pull surface
+            t = s.get("todo") or {}
+            task = (" · %s (%d/%d)" % (t["active"][:44], t["done"], t["total"])
+                    if t.get("active") else
+                    " · %d/%d done" % (t["done"], t["total"]) if t else "")
+            print("  %-*s  %-6s  pending %-3d %s · home %s%s%s" % (
                 w, s["seat"], s["presence"], s["pending"],
-                (s.get("project") or ""), scope, source))
+                (s.get("project") or ""), scope, source, task))
         if hidden:
             print("  (%d absent seat%s hidden — --all shows them; unseen "
                   ">%dm reaps them)" % (hidden, "s"[:hidden != 1], REAP_S // 60))
