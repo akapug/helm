@@ -205,7 +205,11 @@ class CanonicalResolutionTest(unittest.TestCase):
         os.environ["HELM_SKILL_DECK"] = "/somewhere/tracked/repo/skills"
         old = os.environ.pop("HELM_SKILLS_CANONICAL", None)
         try:
-            self.assertEqual(skillsync.canonical(), skillsync.MC_CANONICAL)
+            # canonical() realpaths the default (mint vs sync must agree on the
+            # path string); the deck still never steers it.
+            self.assertEqual(
+                skillsync.canonical(),
+                os.path.realpath(skillsync.MC_CANONICAL))
         finally:
             if deck_old is None:
                 del os.environ["HELM_SKILL_DECK"]

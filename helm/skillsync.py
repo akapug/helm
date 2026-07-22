@@ -65,7 +65,11 @@ def canonical():
     c = _home.env("SKILLS_CANONICAL")
     if c:
         return os.path.realpath(os.path.expanduser(c))
-    return MC_CANONICAL
+    # Realpath the default too: MC_CANONICAL's .local/mc-instance-home resolves
+    # to the physical ~/.mc store, and mint (canonical()) vs sync (which
+    # realpaths) must agree on the path STRING or a wired home relinks off the
+    # raw path on the next sync (bit live 2026-07-21 18:06).
+    return os.path.realpath(MC_CANONICAL)
 
 
 def config_dirs(claude_root=None, default_claude=None, seats_root=None):
