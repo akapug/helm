@@ -27,8 +27,12 @@ ever wakes you.
 
 ## 2. The room
 
-- Speak: `helm chat post "<text>"`. Catch up: `helm chat read` (`--since N`,
-  `--follow`). Who is live + pending + claims: `helm chat seats`.
+- Speak: `helm chat post --room <room> "<text>"`. Catch up:
+  `helm chat read --room <room>` (`--since N`, `--follow`). Pass `--room`
+  explicitly: today a bare post from a project cwd resolves to `main`, not
+  your derived home room; once homing lands (lane/homing-as-prevented) the
+  bare default resolves to your home room — the explicit flag is right in
+  both worlds. Who is live + pending + claims: `helm chat seats`.
 - **Home room vs `--room R`**: launched in a project, you get its derived home
   room. `@you` mentions and DMs reach you from ANY room; home-room chatter
   wakes you; foreign-room chatter never does (noise law).
@@ -80,26 +84,39 @@ ever wakes you.
 The full CLI lives in the **orca-cli skill**
 (`agents/claudecode/skills/orca-cli/`) — load it, do not guess. The short
 version: orca is the metaharness — a daemon owns panes (terminals), and your
-session runs inside one. Panes are disposable: kill and respawn freely.
-Transcripts are sacred: they are the durable record and the training corpus
-(`helm corpus`) — never delete one. `/login` re-auths the credential HOME,
+session runs inside one. Panes are respawnable, not freely killable — a kill
+is a procedure, not a reflex: (1) enumerate the pane's in-process subagents,
+they die with their host (§6); (2) prove the session is safe to lose —
+`helm session ls` is tri-state and only **persisted** clears a kill;
+MEMORY-ONLY or UNKNOWN can still hold unpersisted work (UNKNOWN is never
+PASS). (3) Transcripts are sacred always: the durable record and the
+training corpus (`helm corpus`) — never delete one. Live incident class: the
+broken pane resolver spawned a duplicate seat, and a "panes are disposable"
+kill of the original would have taken its unpersisted session and its
+children with it. `/login` re-auths the credential HOME,
 not the pane: every pane pinned to that credhome switches account together,
 so an account swap in one pane is an account swap in all of them.
 
 ## 6. Subagents
 
 - Subagents are encouraged for orthogonal priorities — fan out.
-- **Codex-family seats**: before fanning out, check that per-instance proxies
-  have landed — `grep -q per-instance helm/seat.py` (rc 0 = landed;
-  lane/per-instance-codex-proxies). Shared-port subagent multiplication was
-  the silent-hang vector.
+- **Codex-family seats**: before fanning out, probe per-instance proxies at
+  runtime, from any cwd — `helm seat launch codex -i 2` prints the exact
+  launch line (never runs it). Landed (lane/per-instance-codex-proxies): the
+  N≥2 line carries the instance's OWN proxy port
+  (`ANTHROPIC_BASE_URL=…:<base+N>`, e.g. 8319 for codex-2). Not landed: the
+  line still carries the shared family port (8317) — do not multiply codex
+  subagents; shared-port multiplication was the silent-hang vector.
 - In-process subagents **die with their host pane**. Enumerate children
   before killing any pane — a kill takes the whole household.
 
 ## 7. Composition truth
 
 - Composition questions — who is running, which pid/seat/sid/home/pane — are
-  answered by running `helm fleet`, never from memory. Every column is a live
-  probe; quote its output, including to the owner.
+  answered by running the CLI, never from memory. Today's table is `helm who`
+  (pid → cred home, account, session, cwd; shared sessions flagged). The full
+  live-probed census `helm fleet` (lane/fleet-truth-verb) supersedes it once
+  landed — probe with the `helm <verb> --help` existence law and prefer it
+  when it answers. Quote the output, including to the owner.
 - `helm session ls` is tri-state: **persisted / MEMORY-ONLY / UNKNOWN**.
   UNKNOWN is never PASS — a failed probe is not an absence fact.
