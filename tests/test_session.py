@@ -1064,3 +1064,50 @@ class ProcCensusTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeadlessCensusTest(unittest.TestCase):
+    """A headless one-shot is not an agent pane, and the census must not count
+    it as one. Both populations share the symptom (no transcript on disk); only
+    argv carries the DECLARED intent that tells them apart."""
+
+    def test_the_live_remember_plugin_invocation_is_headless(self):
+        # verbatim argv measured 2026-07-22 — the call that flipped a CERTIFIED
+        # estate to a memory-only FAIL twenty minutes later
+        argv = ["/home/owner/.local/bin/claude", "-p", "--output-format", "json",
+                "--no-session-persistence", "--exclude-dynamic-system-prompt"]
+        self.assertTrue(session._is_headless(argv))
+
+    def test_no_session_persistence_alone_is_enough(self):
+        # it states the intent outright, with or without -p
+        self.assertTrue(session._is_headless(["claude", "--no-session-persistence"]))
+
+    def test_an_interactive_pane_is_not_headless(self):
+        for argv in (["claude", "--resume", "abc", "--dangerously-skip-permissions"],
+                     ["claude", "--continue"],
+                     ["claude", "--model", "opus"]):
+            self.assertFalse(session._is_headless(argv), argv)
+
+    def test_a_resumed_pane_whose_prompt_mentions_p_is_not_headless(self):
+        # the boot prompt is a positional ARG, never a flag — matching on
+        # substrings rather than exact tokens would misread a seat as headless
+        # and silently drop a real pane out of the census
+        self.assertFalse(session._is_headless(
+            ["claude", "--resume", "abc", "You are seat 'codex-3'; use -p sparingly"]))
+
+    def test_headless_rows_leave_the_memory_only_census(self):
+        rows = [{"pid": 1, "session": "sid-a", "headless": True},
+                {"pid": 2, "session": "sid-b", "headless": False}]
+        got = session.memory_only_panes(rows=rows, persisting={})
+        self.assertEqual([r["pid"] for r in got], [2])
+
+    def test_a_headless_row_is_still_rendered_not_hidden(self):
+        # excluding from the COUNT must never mean hiding from the OPERATOR:
+        # a helm seat running headless is a law violation and has to be visible
+        src = open(session.__file__.replace(".pyc", ".py")).read()
+        self.assertIn('state = "headless one-shot', src)
+
+    def test_an_unknown_row_still_never_enters_the_pass_bucket(self):
+        # the headless exclusion must not weaken the tri-state guarantee
+        rows = [{"pid": 3, "session": None, "headless": False}]
+        self.assertEqual(session.memory_only_panes(rows=rows, persisting={}), [])

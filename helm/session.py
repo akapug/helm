@@ -252,6 +252,36 @@ def _proc_snapshot(pid):
             "env": environ, "cwd": cwd}
 
 
+HEADLESS_FLAGS = ("-p", "--print", "--no-session-persistence")
+
+
+def _is_headless(argv):
+    """True when this process is a HEADLESS ONE-SHOT rather than an agent pane.
+
+    Two populations share one binary. An AGENT PANE is interactive, long-lived,
+    and must hold a real resumable session — fleet law, and the thing this
+    census exists to protect. A HEADLESS ONE-SHOT (`claude -p`, and especially
+    `--no-session-persistence`, which says so outright) runs one prompt and
+    exits; it has no transcript BY DESIGN and cannot be rescued, because there
+    is nothing to resume.
+
+    They are indistinguishable by symptom — neither has a transcript on disk —
+    so the census has to read INTENT, and intent is DECLARED in argv. Measured
+    2026-07-22, twenty minutes after this census first certified the fleet: the
+    `remember` plugin ran `claude -p --output-format json
+    --no-session-persistence` to compress memory, and the estate flipped to a
+    memory-only FAIL advising `helm session rescue` on a process that had
+    already exited. Nothing had degraded; a third-party tool had made an API
+    call. A certification a background one-shot can invalidate is counting the
+    wrong population.
+
+    This narrows WHAT IS COUNTED, never what is allowed: a helm SEAT that shows
+    up headless is still a law violation, and it stays visible in `session ls`
+    tagged as such rather than being hidden."""
+    return any(a in HEADLESS_FLAGS or a.startswith(("-p=", "--print="))
+               for a in argv)
+
+
 def _resume_sid(argv):
     """One unambiguous full UUID from argv. Bare/trailing ``--resume``, a flag
     consumed as its value, prefixes, and conflicting repeats are UNKNOWN — a
@@ -463,6 +493,7 @@ def _proc_claude_rows():
             "child": child,
             "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
             "force": env.get(FORCE_VAR) == "1",
+            "headless": _is_headless(snap.get("argv") or []),
         })
     return rows
 
@@ -506,11 +537,19 @@ def open_pids(sid, rows=None):
 
 
 def memory_only_panes(rows=None, persisting=None):
-    """Proven live panes with NO transcript on disk. UNKNOWN candidate rows are
-    deliberately excluded: they are neither persistence PASS nor memory-only."""
+    """Proven live AGENT PANES with NO transcript on disk. Two exclusions, and
+    they are different in kind:
+
+    UNKNOWN candidate rows are excluded because they are neither a persistence
+    PASS nor memory-only — a check that passes on absent input reports the
+    opposite of the truth.
+
+    HEADLESS one-shots are excluded because they are not panes at all. They
+    declare in argv that they want no session, so their missing transcript is
+    the design working, not work at risk (see _is_headless)."""
     rows = rows if rows is not None else _proc_claude_rows()
     persisting = persisting if persisting is not None else _persisting_sids()
-    return [r for r in rows if r.get("session")
+    return [r for r in rows if r.get("session") and not r.get("headless")
             and _sid_on_disk(r["session"], persisting) is False]
 
 
@@ -652,7 +691,13 @@ def _cmd_ls(args, certify=False):
     for r in sorted(rows, key=lambda x: x["pid"]):
         sid = r.get("session") or r.get("resume")
         why = (" (rescued)" if r["force"] else " (stamped)" if r["child"] else "")
-        if not sid:
+        if r.get("headless"):
+            # SHOWN, never hidden. Excluding it from the memory-only census is
+            # about what gets COUNTED; withholding it from the operator would
+            # be about what can be SEEN, and a helm SEAT running headless is a
+            # law violation that has to stay visible to be caught.
+            state = "headless one-shot (-p; no session by design)"
+        elif not sid:
             reason = r.get("declared_reason")
             detail = "; pid record %s" % reason if reason else ""
             state = "UNKNOWN (sid unresolved%s — verify by hand)" % detail + why
