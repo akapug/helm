@@ -54,6 +54,30 @@ stamped {dm: <recipient>} so only the EXACT-token recipient's beacon/boundary
 delivers it. No room ever sees it; it renders as a DM, not a room row; it
 signs like any post.
 
+Replies (PRD CHAT_REPLY): a row may carry {reply_to} — the PARENT ROW'S
+STABLE ID (chat._append's id law, reused; no second identity is invented) —
+plus {rts, rfrom}, the parent's (ts, from), exactly the shape reaction rows
+already use so ONE resolver serves both and a parent predating the id law is
+still addressable. One level only, builders.dev style: a reply renders with a
+compact quote of its parent, a parent renders its reply count, and an orphan
+parent (rotated out) renders as such — never a crash. Threading is INVISIBLE
+to the beacon: seats.deliverable never reads reply_to, so a reply wakes
+exactly what its text alone would have woken (a reply is not a mention).
+
+Signed replies bind the parent: the payload is a DISTINCT algorithm tag
+("chat:reply:b2b:") over \\x1e-joined (parent id, parent ts, parent from,
+text) — a separate tag, never an in-band prefix on the plain-post payload,
+because the text is attacker-chosen and an in-band prefix would let a plain
+post whose text reads `reply|<id>|hi` mint a reply's digest (a free
+re-parenting forgery). Plain posts stay BYTE-IDENTICAL to v2 — every row
+already on disk recomputes exactly as before. payload_for() is the ONE
+shape-dispatching recomputer (post/react/reply); `helm chat verify`
+re-derives it and compares against the `payload` the signed row records.
+HONEST SCOPE: helm cannot yet ask the node what payload a turn carried
+(cell.verify_anchor — "payload binding unavailable"), so verify proves the
+row's SELF-consistency (naive re-parenting or text edits are caught) and the
+turn hash is what will bind it remotely once dregg discloses payloads.
+
 The owner's orca pane sidecar is exactly: helm chat read --follow
 """
 import contextlib
@@ -73,8 +97,11 @@ DEFAULT_DIR = "/dev/shm/helm-chat"
 SIZE_CAP = 2 * 1024 * 1024  # per-room rotation threshold — RAM etiquette
 POLL_S = 2.0                # --follow poll cadence (the web panel matches)
 CHAT_TAG = "chat:b2b:"      # algorithm-tagged digest, premise.py's pattern
+REPLY_TAG = "chat:reply:b2b:"   # DISJOINT payload space for parent-bound rows
 CHAT_TOPIC = "helm.chat"    # the signed turn's event topic on the room node
 DM_PREFIX = "dm-"           # reserved room-name namespace: the private lanes
+FIELD_SEP = "\x1e"          # ASCII RS: fields cannot be slid into one another
+QUOTE_CHARS = 72            # the quoted parent's snippet budget (one line)
 
 
 def chat_dir():
@@ -206,9 +233,64 @@ def transport_status():
 def digest_payload(text):
     """chat:b2b:<blake2b-256 of the NFC text> — the whole signed claim (the
     text itself stays in the RAM room; the chain corroborates)."""
-    h = hashlib.blake2b(unicodedata.normalize("NFC", text or "").encode("utf-8"),
-                        digest_size=32)
-    return CHAT_TAG + h.hexdigest()
+    return CHAT_TAG + _b2b(text)
+
+
+def _b2b(s):
+    return hashlib.blake2b(unicodedata.normalize("NFC", s or "").encode("utf-8"),
+                           digest_size=32).hexdigest()
+
+
+def reply_digest(pid, pts, pfrom, text):
+    """chat:reply:b2b:<blake2b-256 of RS-joined (parent id, parent ts, parent
+    from, text)> — the signed claim of a REPLY: "this author, at this chain
+    index, asserts this text is a child of that exact row".
+
+    Why a distinct TAG and not a prefix inside the plain-post payload: the
+    text is attacker-chosen, so an in-band `reply|<id>|…` prefix on the SAME
+    tag would let an ordinary post whose text reads like that prefix produce
+    a reply's digest — free re-parenting. Disjoint tags make the two payload
+    spaces disjoint by construction (the `<alg>:<hash>` pattern premise.py
+    and ATTESTATION.md already canonize). The RS separator stops field
+    sliding, and BOTH parent identities ride it (the id, and the (ts, from)
+    pair) so the binding survives a parent that predates the id law."""
+    return REPLY_TAG + _b2b(FIELD_SEP.join([pid or "", pts or "", pfrom or "",
+                                            text or ""]))
+
+
+def _react_payload(row):
+    """A reaction row's payload string — react|unreact|tts|tfrom|emoji|reactor
+    (the v2 shape, unchanged; rebuilt here so ONE function knows it)."""
+    return "%s|%s|%s|%s|%s" % ("unreact" if row.get("un") else "react",
+                               row.get("tts") or "", row.get("tfrom") or "",
+                               row.get("react") or "", row.get("from") or "")
+
+
+def is_reply(m):
+    """Does this row point at a parent? (An unresolvable ref still carries
+    reply_to, a pre-id parent leaves only rts — either identity marks the
+    shape.) A reaction is never a reply: it has its own tts/tfrom pointer."""
+    return not m.get("react") and bool(m.get("reply_to") or m.get("rts"))
+
+
+def payload_for(row, text=None):
+    """THE ONE recomputer: the exact payload string a row's signed turn
+    carries, dispatched on ROW SHAPE (the rule already in force in v2 —
+    posts sign their text, reactions sign a react tuple). `text` is the
+    caller's payload text at post time; None ⇒ read it off the stored row,
+    which is what `verify` does.
+
+      reaction  -> chat:b2b: over react|unreact|tts|tfrom|emoji|reactor
+      reply     -> chat:reply:b2b: over the parent binding + the text
+      any other -> chat:b2b: over the text   (BYTE-IDENTICAL to v2 — every
+                   signed row already on disk recomputes exactly as before)"""
+    if row.get("react"):
+        return digest_payload(_react_payload(row))
+    body = row.get("text") if text is None else text
+    if is_reply(row):
+        return reply_digest(row.get("reply_to"), row.get("rts"),
+                            row.get("rfrom"), body)
+    return digest_payload(body)
 
 
 def _node_token():
@@ -355,7 +437,11 @@ def _signed_row(row, payload_text, profile, sign):
     degrades to the v1 unsigned row — the fallback law is drop the SIGNATURE,
     never the message. The signer gate comes FIRST: no cell binary => no
     node probe at all (the row is unsigned by configuration, not by
-    fault)."""
+    fault).
+
+    The payload is payload_for(row) — shape-dispatched, so the signer and
+    `helm chat verify` can never drift apart — and the signed row RECORDS it
+    ({payload}), making the parent binding re-derivable from the row alone."""
     try:
         from . import cell
         if sign is None:
@@ -363,11 +449,11 @@ def _signed_row(row, payload_text, profile, sign):
                 and node_head() is not None
         if not sign:
             return row
-        info, _err = _sign_send(digest_payload(payload_text),
-                                profile or cell.profile_name())
+        payload = payload_for(row, payload_text)
+        info, _err = _sign_send(payload, profile or cell.profile_name())
         if info:
             row.update(turn=info.get("turn_hash"), receipt=info.get("receipt_hash"),
-                       chain=info.get("chain_index"))
+                       chain=info.get("chain_index"), payload=payload)
     except Exception:
         pass
     return row
@@ -416,8 +502,49 @@ def _append(row, room):
     return row
 
 
+def resolve_ref(rows, ref):
+    """A user-facing message reference -> the parent ROW, or None. Accepts a
+    stable row id (exact, or an unambiguous >=4-char prefix — ids are 12 hex
+    chars, nobody types those in full) or a 1-based ordinal over the room's
+    message rows, negatives from the end (`-1` = latest, the same ordinal the
+    `react` verb already speaks). Reaction rows are never parents."""
+    msgs = [m for m in rows if not m.get("react")]
+    ref = str(ref or "").strip()
+    if not ref:
+        return None
+    # IDENTITY FIRST, ordinal only as the fallback: ids are hex, so ~6% of
+    # 6-char id prefixes are all-digits and a digits-first rule silently read
+    # them as message numbers (caught as a 1-in-16 flake in the full suite).
+    # Matching the id the user actually copied can never be the wrong answer.
+    hit = [m for m in msgs if m.get("id") == ref]
+    if not hit and len(ref) >= 4:
+        hit = [m for m in msgs if str(m.get("id") or "").startswith(ref)]
+    if len(hit) == 1:
+        return hit[0]
+    if hit:
+        return None                     # ambiguous prefix = no parent, no guess
+    if len(ref) <= 7 and ref.lstrip("-").isdigit() and ref.lstrip("-"):
+        n = int(ref)
+        if n and -len(msgs) <= n <= len(msgs):
+            return msgs[n - 1 if n > 0 else n]
+    return None
+
+
+def _parent_fields(room, ref):
+    """{reply_to, rts, rfrom} for a parent reference — the ONE place a ref
+    becomes a row-shaped pointer. An unresolvable ref (already rotated out,
+    or a typo) still records the literal ref: the reply lands, renders as an
+    orphan, and nothing crashes (fallback law — drop the LINK, never the
+    message)."""
+    p = resolve_ref(read(room)[0], ref)
+    if not p:
+        return {"reply_to": str(ref)}
+    return {"reply_to": p.get("id") or "", "rts": p.get("ts") or "",
+            "rfrom": p.get("from") or ""}
+
+
 def post(text, room="main", who=None, profile=None, sign=None, origin=None,
-         dm=None, ambient=False):
+         dm=None, ambient=False, reply_to=None):
     """Append one message; returns it. v2: shortcodes expand, and when the
     room node answers the digest rides a signed self-write turn FIRST — the
     row carries {turn, receipt, chain}. Node down -> plain v1 row (rendered
@@ -441,7 +568,13 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
     hands EVERY plain row in a team channel to every seat homed there. It is
     the class for machine status a teammate PULLS (the todo mirror), never
     the class for a word addressed to anyone; a mention or DM must not use
-    it (and does not: only the mirror passes ambient=True)."""
+    it (and does not: only the mirror passes ambient=True).
+
+    `reply_to` is a parent REFERENCE (row id, id prefix, or ordinal) resolved
+    against the room the row lands in: the row gains {reply_to, rts, rfrom}
+    and, when signed, a parent-bound digest. It changes NOTHING about who the
+    message wakes — seats.deliverable never reads it, so a reply reaches
+    exactly what its text alone would have reached."""
     _ensure_dir()
     from . import emoji
     text = emoji.expand(text)
@@ -453,6 +586,8 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
         row["origin"] = origin
     if ambient and not dm:
         row["ambient"] = 1
+    if reply_to:
+        row.update(_parent_fields(room, reply_to))
     _touch_poster_presence(row["from"])
     return _append(_signed_row(row, text, profile, sign), room)
 
@@ -511,9 +646,9 @@ def react(target, code, room="main", who=None, profile=None, sign=None):
            "tts": tts, "tfrom": tfrom}
     if on:
         row["un"] = True   # toggle OFF — the tombstone every renderer honors
-    payload = "%s|%s|%s|%s|%s" % ("unreact" if on else "react",
-                                  tts, tfrom, e, reactor)
-    return _append(_signed_row(row, payload, profile, sign), room), None
+    # the payload is derived from the ROW (payload_for -> _react_payload), so
+    # the signer and `helm chat verify` read one definition, never two
+    return _append(_signed_row(row, None, profile, sign), room), None
 
 
 def _react_state(rows):
@@ -596,6 +731,71 @@ def react_line(counts):
     return "  ".join("%s×%d" % (e, counts[e]) for e in sorted(counts))
 
 
+# ---------------------------------------------------------------------------
+# threading: ONE index, ONE resolver — every renderer (CLI, --follow, journal,
+# the web endpoint) resolves a parent the same way, so an orphan looks the same
+# everywhere and nothing anywhere has to trust reply_to blindly.
+# ---------------------------------------------------------------------------
+
+def tkey(m):
+    """A row's THREAD key: its stable id when it has one, else rkey. Never
+    rkey alone — two rows from one seat inside the same second share a ts|from,
+    so an rkey-keyed reply count leaks onto the sibling row (caught on the
+    first smoke run). Reaction targeting keeps rkey; threading is id-first."""
+    return m.get("id") or rkey(m)
+
+
+def index_rows(rows):
+    """{"by_id", "by_key", "replies"} for a room's rows. `replies` counts
+    RESOLVED children per parent tkey — an orphan reply is never counted
+    against a row that isn't there."""
+    idx = {"by_id": {}, "by_key": {}, "replies": {}}
+    for m in rows:
+        if m.get("react"):
+            continue
+        if m.get("id"):
+            idx["by_id"][m["id"]] = m
+        idx["by_key"].setdefault(rkey(m), m)   # first writer wins the collision
+    for m in rows:
+        p = parent_of(m, idx)
+        if p is not None:
+            k = tkey(p)
+            idx["replies"][k] = idx["replies"].get(k, 0) + 1
+    return idx
+
+
+def parent_of(m, idx):
+    """The row `m` replies to, or None (never posted here / rotated out). The
+    stable id wins; (rts, rfrom) is the fallback that reaches a parent from
+    BEFORE the id law — the same two-identity resolve reactions already do."""
+    if not is_reply(m):
+        return None
+    pid = m.get("reply_to")
+    p = idx["by_id"].get(pid) if pid else None
+    if p is None and m.get("rts"):
+        p = idx["by_key"].get("%s|%s" % (m.get("rts") or "",
+                                         m.get("rfrom") or ""))
+    return p
+
+
+def _snip(text, cap=QUOTE_CHARS):
+    """One line of a parent's text, clipped — a quote never reflows the pane."""
+    s = " ".join((text or "").split())
+    return s if len(s) <= cap else s[:cap - 1] + "…"
+
+
+def quote_of(m, idx):
+    """(author, snippet) of m's parent for the one-level quote, or None when
+    m is not a reply. An ORPHAN answers the remembered author (or "?") with an
+    explicit rotated-out snippet — it renders, it never raises."""
+    if not is_reply(m):
+        return None
+    p = parent_of(m, idx)
+    if p is None:
+        return (m.get("rfrom") or "?", "(parent rotated out)")
+    return (p.get("from") or "?", _snip(p.get("text") or ""))
+
+
 def mark_owner_unread(room="main"):
     """The owner posted (the web surface calls this): drop the marker carrying
     the message count at post time — the shipped reflex fires on its existence."""
@@ -621,9 +821,14 @@ def consume(room="main", total=None):
     return True
 
 
-def _fmt(m, hhmm=True):
+def _fmt(m, hhmm=True, idx=None):
     """One row, rendered. Signed rows (a recorded chain receipt) print clean;
-    everything else carries the visible [unsigned] tag (fallback law)."""
+    everything else carries the visible [unsigned] tag (fallback law).
+
+    With an `idx` (index_rows of the room) the one-level thread renders too: a
+    reply carries a compact ↳author "quote" of its parent, and a parent carries
+    ↩N, its reply count. Without one — a single-row echo, an old caller — the
+    line is byte-identical to before."""
     ts = str(m.get("ts") or "")
     stamp = (ts[11:16] or "--:--") if hhmm else (ts or "?")
     tag = "" if m.get("chain") is not None else " [unsigned]"
@@ -633,10 +838,48 @@ def _fmt(m, hhmm=True):
             "un-reacted" if m.get("un") else "reacted",
             m["react"], m.get("tfrom") or "?",
             str(m.get("tts") or "")[11:16] or "--:--", tag)
+    q = quote_of(m, idx) if idx else None
+    quote = ' ↳%s "%s"' % q if q else ""
+    n = (idx or {}).get("replies", {}).get(tkey(m), 0)
+    thread_tail = " ↩%d" % n if n else ""
     if m.get("dm"):     # a DM row is a DM everywhere it renders — never a
-        return "%s %s -> @%s (dm): %s%s" % (stamp, m.get("from") or "?",
-                                            m["dm"], m.get("text") or "", tag)
-    return "%s %s: %s%s" % (stamp, m.get("from") or "?", m.get("text") or "", tag)
+        return "%s %s%s -> @%s (dm): %s%s%s" % (stamp, m.get("from") or "?",
+                                                quote, m["dm"],
+                                                m.get("text") or "",
+                                                thread_tail, tag)
+    return "%s %s%s: %s%s%s" % (stamp, m.get("from") or "?", quote,
+                                m.get("text") or "", thread_tail, tag)
+
+
+def verify(room="main"):
+    """Re-derive every row's signed payload (payload_for — the shape
+    dispatcher) and check it against the payload the row RECORDS. Returns one
+    dict per row: {n, from, state, payload, stored, reply_to}, state one of
+
+      ok        signed, and the row still recomputes to the payload it signed
+      MISMATCH  signed, but the row NO LONGER recomputes — text or the parent
+                pointer was edited under the signature (naive re-parenting)
+      legacy    signed before rows recorded their payload — nothing to compare
+      unsigned  no chain receipt (the v1 path / no signer): nothing to verify
+
+    HONEST SCOPE: this is SELF-consistency, not remote re-verification —
+    cell.verify_anchor still cannot ask the node what payload a turn carried
+    ("payload binding unavailable"), so a forger who rewrites BOTH the row and
+    its stored payload is only caught once dregg discloses payloads. What the
+    reply tag buys today is that the signer's claim NAMES the parent, and this
+    is the one place a reader re-derives it."""
+    rows, _total = read(room)
+    out = []
+    for i, m in enumerate(rows, 1):
+        want = payload_for(m)
+        stored = m.get("payload")
+        state = ("unsigned" if m.get("chain") is None else
+                 "legacy" if not stored else
+                 "ok" if stored == want else "MISMATCH")
+        out.append({"n": i, "from": m.get("from") or "?", "state": state,
+                    "payload": want, "stored": stored,
+                    "reply_to": m.get("reply_to")})
+    return out
 
 
 def _follow(room, since=0):
@@ -644,9 +887,11 @@ def _follow(room, since=0):
     primitive it loops on is read() (unit-tested); the loop itself is not."""
     try:
         while True:
-            msgs, total = read(room, since)
+            rows, total = read(room)
+            idx = index_rows(rows)
+            msgs = rows[since if 0 <= since <= total else 0:]
             for m in msgs:
-                print(_fmt(m), flush=True)
+                print(_fmt(m, idx=idx), flush=True)
             consume(room, total)
             since = total
             time.sleep(POLL_S)
@@ -724,14 +969,18 @@ def log_flush(rooms=None):
 
 
 def _fmt_body(m):
-    """The log line's tail: sender + content + signature note, full fidelity."""
+    """The log line's tail: sender + content + signature note, full fidelity —
+    including a reply's parent pointer, so the durable journal never loses the
+    thread the RAM room showed."""
     tag = (" {chain %s}" % m["chain"]) if m.get("chain") is not None else " [unsigned]"
     if m.get("react"):
         return "%s %s %s -> %s@%s%s" % (m.get("from") or "?",
                                         "un-reacted" if m.get("un") else "reacted",
                                         m["react"], m.get("tfrom") or "?",
                                         m.get("tts") or "?", tag)
-    return "%s: %s%s" % (m.get("from") or "?", m.get("text") or "", tag)
+    ref = (" ↳%s@%s" % (m.get("rfrom") or "?", m.get("rts") or m.get("reply_to")
+                        or "?")) if is_reply(m) else ""
+    return "%s%s: %s%s" % (m.get("from") or "?", ref, m.get("text") or "", tag)
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +992,17 @@ SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "seat", "dm",
                                                # the delivery lane — seats.py
                                                # (verdict/reveal answer with
                                                # the 0.3 council deferral)
+
+
+def _pop_flag(args, name):
+    """Pop `<name> VALUE` out of a verb's argv -> the value (None when absent
+    or valueless) — the same flag shape --seat/--dm already use."""
+    if name not in args:
+        return None
+    i = args.index(name)
+    v = args[i + 1] if i + 1 < len(args) else None
+    del args[i:i + 2]
+    return v
 
 
 def _seat_flag(args):
@@ -759,7 +1019,8 @@ def _seat_flag(args):
 
 
 def cmd_chat(args):
-    """chat post <text...> [--seat S] [--dm SEAT] | read [--since N]
+    """chat post <text...> [--seat S] [--dm SEAT] [--reply-to <id|n>] |
+    reply <id|n> <text...> [--seat S] | verify [--room R] | read [--since N]
     [--follow] [--dm] | rooms | react <n> <emoji> [--seat S] | log-flush |
     dm <seat> <text...> [--seat S] | node up|down|status |
     meld invite|join|recv|say|status |
@@ -798,8 +1059,19 @@ def cmd_chat(args):
         return seats.cmd(
             verb, args[1:], room, room_explicit=room_given,
             room_source=room_source)
-    if verb == "post":
+    if verb in ("post", "reply"):
         seat = _seat_flag(args)
+        ref = _pop_flag(args, "--reply-to")
+        if verb == "reply":
+            # `reply <ref> <text...>` — the ref is positional, everything else
+            # (seat, dm, signing, room) is the post path, unchanged
+            if len(args) < 3:
+                print("usage: helm chat reply <id|n> <text...> [--room R] "
+                      "[--seat S]  (id = the parent row's id, n = its 1-based "
+                      "number, -1 = latest)", file=sys.stderr)
+                return 2
+            ref = args[1]
+            del args[1]
         to = None
         if "--dm" in args:      # post --dm SEAT = the dm verb, flag-shaped
             i = args.index("--dm")
@@ -813,19 +1085,24 @@ def cmd_chat(args):
             text = sys.stdin.read().strip()
         if not text:
             print("usage: helm chat post <text...> [--room R] [--seat S] "
-                  "[--dm SEAT]", file=sys.stderr)
+                  "[--dm SEAT] [--reply-to <id|n>]", file=sys.stderr)
             return 2
         if to:
             from . import seats
-            row, err = seats.dm(to, text, who=seat,
+            row, err = seats.dm(to, text, who=seat, reply_to=ref,
                                 session=home.session_id(), profile=seat)
             if err:
                 print("helm chat: " + err, file=sys.stderr)
                 return 1
-            print("helm chat [dm] %s" % _fmt(row))
+            print("helm chat [dm] %s"
+                  % _fmt(row, idx=index_rows(read(dm_room(row.get("dm")
+                                                          or to))[0])))
             return 0
-        print("helm chat [%s] %s"
-              % (room, _fmt(post(text, room, who=seat, profile=seat))))
+        row = post(text, room, who=seat, profile=seat, reply_to=ref)
+        # the echo carries the quote (and the parent's new count): the poster
+        # SEES which row it landed under — an unresolvable ref is visible as an
+        # orphan right here, not three surfaces later
+        print("helm chat [%s] %s" % (room, _fmt(row, idx=index_rows(read(room)[0]))))
         return 0
     if verb == "read":
         label = room
@@ -842,9 +1119,11 @@ def cmd_chat(args):
                 return 2
         if "--follow" in args:
             return _follow(room, since)
-        msgs, total = read(room, since)
-        for m in msgs:
-            print(_fmt(m))
+        rows, total = read(room)
+        idx = index_rows(rows)            # the WHOLE room indexes the thread:
+        msgs = rows[since if 0 <= since <= total else 0:]   # a quote resolves
+        for m in msgs:                    # to a parent older than --since
+            print(_fmt(m, idx=idx))
         if not msgs:
             print("helm chat [%s]: no messages — post one: helm chat post "
                   "<text>%s" % (label, " (or: helm chat dm <seat> <text>)"
@@ -878,6 +1157,24 @@ def cmd_chat(args):
         print("helm chat: log-flush appended %d row%s -> %s" % (
             n, "s"[:n != 1], journal_dir()))
         return 0
+    if verb == "verify":
+        rep = verify(room)
+        bad = [r for r in rep if r["state"] == "MISMATCH"]
+        n = {s: sum(1 for r in rep if r["state"] == s)
+             for s in ("ok", "MISMATCH", "legacy", "unsigned")}
+        for r in bad:
+            print("helm chat [%s] row %d (%s) MISMATCH: signed %s, recomputes "
+                  "%s%s" % (room, r["n"], r["from"], r["stored"], r["payload"],
+                            " — reply_to %s" % r["reply_to"]
+                            if r["reply_to"] else ""), file=sys.stderr)
+        print("helm chat [%s] verify: %d row%s — %d ok, %d mismatch, %d legacy "
+              "(signed pre-payload), %d unsigned" %
+              (room, len(rep), "s"[:len(rep) != 1], n["ok"], n["MISMATCH"],
+               n["legacy"], n["unsigned"]))
+        print("  (self-consistency only — the node cannot yet disclose a "
+              "turn's payload, so a signed row's REMOTE binding stays "
+              "'turn observed', never re-verified)")
+        return 1 if bad else 0
     if verb == "rooms":
         names = list_rooms()
         if not names:
@@ -889,7 +1186,7 @@ def cmd_chat(args):
             last = ("  last: " + _fmt(msgs[-1])) if msgs else ""
             print("  %s  %d msg%s%s%s" % (n, total, "s"[:total != 1], unread, last))
         return 0
-    print("helm chat: unknown subcommand '%s' (post|read|rooms|react|"
-          "log-flush|node|meld|roster|%s)" % (verb, "|".join(SEAT_VERBS)),
+    print("helm chat: unknown subcommand '%s' (post|reply|read|rooms|react|"
+          "verify|log-flush|node|meld|roster|%s)" % (verb, "|".join(SEAT_VERBS)),
           file=sys.stderr)
     return 2

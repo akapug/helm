@@ -203,6 +203,80 @@ class TestWebChat(unittest.TestCase):
         self.assertIn("david: anyone up?", out.getvalue())
         self.assertFalse(os.path.exists(chat.marker_path("main")))
 
+    # ── threading + the sidebar's activity signal (the owner surface) ──
+
+    def test_owner_reply_threads_through_the_endpoint(self):
+        """The web reply, end to end: POST carries reply_to, the row that comes
+        back off the poll carries the parent's id AND identity."""
+        self.req("/api/chat", {"text": "the parent post"})
+        parent = self.req("/api/chat?since=0")[1]["lines"][0]
+        status, d = self.req("/api/chat", {"text": "the threaded answer",
+                                           "reply_to": parent["id"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(d["msg"]["reply_to"], parent["id"])
+        rows = self.req("/api/chat?since=0")[1]["lines"]
+        self.assertEqual(rows[1]["reply_to"], parent["id"])
+        self.assertEqual((rows[1]["rts"], rows[1]["rfrom"]),
+                         (parent["ts"], parent["from"]))
+        self.assertEqual(rows[0].get("reply_to"), None)   # the parent is plain
+
+    def test_reply_to_a_rotated_out_parent_is_served_not_refused(self):
+        status, d = self.req("/api/chat", {"text": "orphan", "reply_to": "beef99"})
+        self.assertEqual(status, 200)
+        self.assertEqual(d["msg"]["reply_to"], "beef99")
+        self.assertNotIn("rts", d["msg"])
+
+    def test_a_reply_never_changes_who_the_row_wakes(self):
+        """The beacon law, asserted at the ENDPOINT: the row the web writes
+        decides identically with and without its parent pointer."""
+        from helm import seats
+        seats.write_roster("codex", session="s-codex")
+        self.req("/api/chat", {"text": "seed"})
+        p = self.req("/api/chat?since=0")[1]["lines"][0]
+        self.req("/api/chat", {"text": "no mention here", "reply_to": p["id"]})
+        row = self.req("/api/chat?since=0")[1]["lines"][1]
+        plain = {k: v for k, v in row.items()
+                 if k not in ("reply_to", "rts", "rfrom")}
+        self.assertFalse(seats.deliverable(row, "codex", "main"))
+        self.assertEqual(seats.deliverable(row, "codex", "main"),
+                         seats.deliverable(plain, "codex", "main"))
+
+    def test_poll_carries_the_live_roster_for_mention_completion(self):
+        from helm import seats
+        seats.write_roster("goodtimes-platform-codex", session="s-1")
+        seats.write_roster("helm-opus-integrator", session="s-2")
+        d = self.req("/api/chat")[1]
+        self.assertEqual(d["roster"],
+                         ["goodtimes-platform-codex", "helm-opus-integrator"])
+
+    def test_sidebar_rooms_carry_unread_mentions_age_and_seat_presence(self):
+        """The badge computation the owner UX rides: a quiet room and a busy
+        one are distinguishable WITHOUT opening either (the 4-row-vs-88-row
+        failure)."""
+        from helm import seats
+        seats.write_roster("noisy-seat", session="s-noisy")
+        chat.post("quiet corner", room="team-quiet", who="noisy-seat")
+        for i in range(8):
+            chat.post("@david row %d" % i, room="team-busy", who="noisy-seat")
+        rooms = {r["room"]: r for r in self.req("/api/chat")[1]["rooms"]}
+        self.assertEqual(rooms["team-quiet"]["owner_unread"], 1)
+        self.assertEqual(rooms["team-busy"]["owner_unread"], 8)
+        self.assertEqual(rooms["team-busy"]["owner_mentions"], 8)
+        self.assertEqual(rooms["team-quiet"]["owner_mentions"], 0)
+        self.assertTrue(rooms["team-busy"]["last"])          # the age source
+        seat = rooms["team-busy"]["seats"][0]
+        self.assertEqual(seat["seat"], "noisy-seat")
+        self.assertIn(seat["presence"], ("fresh", "quiet", "absent"))
+        self.assertIsInstance(seat["last_seen"], float)      # the age source
+
+    def test_read_ack_zeroes_only_the_room_the_owner_looked_at(self):
+        chat.post("in main", room="main", who="agent-a")
+        chat.post("elsewhere", room="team-x", who="agent-a")
+        self.req("/api/chat/read", {"room": "main"})
+        rooms = {r["room"]: r for r in self.req("/api/chat")[1]["rooms"]}
+        self.assertEqual(rooms["main"]["owner_unread"], 0)
+        self.assertEqual(rooms["team-x"]["owner_unread"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

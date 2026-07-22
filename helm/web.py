@@ -752,17 +752,26 @@ def _room_seats(room, rows, roster):
     beat (seats.last_seen /
     presence_of), so a fresh poster shows 'fresh', an idle one 'quiet';
     owner-rail rows are skipped (the owner is not a seat). Fail-open per
-    row; capped so a busy channel can't flood the sidebar."""
+    row; capped so a busy channel can't flood the sidebar.
+
+    Each row also carries `last_seen` (the raw beat, epoch seconds): the
+    sidebar renders it as an AGE ('3m'), because a coloured dot with no legend
+    and no clock cannot answer the owner's only question — is this seat working
+    right now, or has it been quiet for an hour? (owner UX pass 2026-07-21)"""
     from . import seats as _s
     seen, out = set(), []
+
+    def _row(seat):
+        ls = _s.last_seen(seat, roster[seat])
+        return {"seat": seat, "presence": _s.presence_of(ls), "last_seen": ls}
+
     for m in reversed(rows[-64:]):           # recent activity, newest first
         frm = str(m.get("from") or "")
         if not frm or m.get("react") or frm in seen or frm not in roster \
                 or not _s.room_in_scope(room, roster[frm]):
             continue
         seen.add(frm)
-        out.append({"seat": frm,
-                    "presence": _s.presence_of(_s.last_seen(frm, roster[frm]))})
+        out.append(_row(frm))
         if len(out) >= 6:
             return out
     for seat in sorted(roster):              # consumers who never posted
@@ -772,24 +781,26 @@ def _room_seats(room, rows, roster):
             continue
         if not _s.room_active(room, seat):  # bare EOF baselines are not presence
             continue
-        out.append({"seat": seat,
-                    "presence": _s.presence_of(_s.last_seen(seat, roster[seat]))})
+        out.append(_row(seat))
     return out
 
 
-def _rooms_summary():
+def _rooms_summary(roster=None):
     """The channel list for the web sidebar: one light row per room —
     {room, total, last (ts), owner_unread, owner_mentions, seats}. Folding the
     per-room owner signal here is what lets the nav badge SUM every channel,
     so a post in a NON-main room is never invisible to the owner (the real
     single-room hole). seats = the per-channel roster (_room_seats) so the
     sidebar shows who is present/active in each room, not just the room name.
-    A handful of small tmpfs reads; fail-open per room."""
+    A handful of small tmpfs reads; fail-open per room. `roster` is passed in
+    when the caller already read it (the poll needs the same names for the
+    composer's @mention completion — one read serves both)."""
     from . import chat, seats as _s
-    try:
-        roster = _s.roster()
-    except Exception:
-        roster = {}
+    if roster is None:
+        try:
+            roster = _s.roster()
+        except Exception:
+            roster = {}
     out = []
     for room in chat.list_rooms():
         try:
@@ -810,19 +821,26 @@ def _api_chat(qs):
     the transport truth (signed/unsigned + chain head — the panel's tick and
     strip) + the owner-unread signal (_owner_signal — the nav badge on EVERY
     tab) + `rooms` (the channel sidebar list, cross-room unread for the summed
-    badge). The panel polls this every ~2s; since past the end resets. Rows
-    include reaction rows; the client aggregates."""
+    badge) + `roster` (the live seat names — the composer's @mention completion
+    source, so a mention the owner types is an EXACT token seats.deliverable
+    will actually match). The panel polls this every ~2s; since past the end
+    resets. Rows include reaction rows AND reply rows ({reply_to, rts, rfrom});
+    the client aggregates both."""
     try:
         since = int(_q1(qs, "since", "0"))
     except ValueError:
         return {"error": "since wants an integer"}, 400
     try:
-        from . import chat
+        from . import chat, seats as _s
         room = _q1(qs, "room", "main")
+        try:
+            roster = _s.roster()
+        except Exception:
+            roster = {}
         rows, total = chat.read(room)   # one read serves the slice AND the signal
         out = {"room": room, "lines": rows[since if 0 <= since <= total else 0:],
                "total": total, "transport": chat.transport_status(),
-               "rooms": _rooms_summary()}
+               "rooms": _rooms_summary(roster), "roster": sorted(roster)}
         out.update(_owner_signal(room, rows))
         return out, 200
     except Exception:
@@ -852,14 +870,20 @@ def _chat_profile():
 
 def _api_chat_post(payload):
     """The owner's post: append (signed server-side when the room node
-    answers) + mark owner-unread. name defaults to david."""
+    answers) + mark owner-unread. name defaults to david.
+
+    Optional `reply_to` = the parent row's id (the panel's reply button holds
+    it): the row threads under that parent and, when signed, its digest BINDS
+    it. It changes nothing about delivery — a reply wakes exactly what its
+    text would have woken (seats.deliverable never reads reply_to)."""
     from . import chat
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip():
         return {"error": 'payload wants {"text": "..."} (non-empty)'}, 400
     room = str(payload.get("room") or "main")
     msg = chat.post(text.strip(), room, who=str(payload.get("name") or "david"),
-                    profile=_chat_profile(), origin="web")
+                    profile=_chat_profile(), origin="web",
+                    reply_to=str(payload.get("reply_to") or "") or None)
     chat.mark_owner_unread(room)
     return {"ok": True, "msg": msg, "total": chat.read(room)[1]}, 200
 

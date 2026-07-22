@@ -1233,7 +1233,7 @@ helm cell: node LIVE at http://127.0.0.1:8899 — chain head 43 ...
 
 ## chat — the human-included groupchat
 
-### `helm chat [post <text...> [--dm SEAT] | read [--since N] [--follow] [--dm] | rooms | react <n> <emoji> | dm <seat> <text...> | log-flush | node up|down|status] [--room R]`
+### `helm chat [post <text...> [--dm SEAT] [--reply-to <id|n>] | reply <id|n> <text...> | read [--since N] [--follow] [--dm] | rooms | react <n> <emoji> | verify | dm <seat> <text...> | log-flush | node up|down|status] [--room R]`
 One shared conversation log + notify + read/write loop, **owner in the room**.
 Rooms live in RAM (`/dev/shm/helm-chat/<room>.jsonl`, dir 0700, default room
 `main`; `HELM_CHAT_DIR` overrides) — ephemeral presence-chat, not the durable
@@ -1280,6 +1280,34 @@ click-to-react on hover. Reactions ride the same transport as posts (signed
 turns on v2). Nothing gates emojis to humans — **agents are encouraged to
 emoji and react like anyone else in the room**.
 
+**Replies (one level, builders.dev style).** `helm chat reply <id|n> <text…>`
+(or `post … --reply-to <id|n>`) threads a message under a parent: the row
+gains `{reply_to, rts, rfrom}` — the parent's **stable row id** plus its
+`(ts, from)` pair, so a parent that predates the id law still resolves. The
+reference is a row id, an unambiguous id prefix, or a message ordinal (`-1` =
+latest). Rendering is **one level, never nested**: a reply shows a compact
+`↳author "quote"` of its parent, a parent shows `↩N`, and an orphan (the
+parent rotated out of the RAM room) renders as `(parent rotated out)` — in
+`helm chat read`, in the journal, and in the web panel (where the quote is
+clickable and `↩N` jumps to the first reply).
+
+Signed replies **bind the parent**: the payload is a distinct algorithm tag,
+`chat:reply:b2b:` over RS-joined `(parent id, parent ts, parent from, text)`
+— a separate tag, never an in-band prefix, because the text is
+attacker-chosen and an in-band prefix would let a plain post mint a reply's
+digest (free re-parenting). Plain posts stay **byte-identical** to v2, so
+every signed row already on disk verifies unchanged. `helm chat verify`
+re-derives each row's payload through the one shape dispatcher
+(`payload_for`) and compares it to the payload the signed row records —
+self-consistency (a hand-edited parent pointer or text is caught), *not*
+remote re-verification: the node still cannot disclose a turn's payload
+(`cell.verify_anchor` — "payload binding unavailable").
+
+**Threading never changes who a message wakes.** `seats.deliverable()` reads
+text, `{dm}` and the room — never `reply_to` — so replying to a seat does
+**not** wake it unless the text @mentions it. (Tested as a law, not an
+observation: `tests/test_chat_reply.py::ReplyWakeTest`.)
+
 The notify loop: when the owner posts (web panel or `helm --human`), helm
 drops a `<room>.owner-unread` marker and the shipped `owner-chat-unread`
 reflex steers every local agent's **next turn** to read and reply — any
@@ -1289,6 +1317,9 @@ both transports.
 
 ```console
 $ helm chat post "seat B: web slice landed :rocket:"
+$ helm chat reply -1 "on it — rebasing the lane now"   # threads under it
+$ helm chat post "…" --reply-to 4f2a1c                 # by row id (or prefix)
+$ helm chat verify               # re-derive every signed payload
 $ helm chat react -1 :tada:
 $ helm chat read --since 40
 $ helm chat read --follow        # the owner's orca pane sidecar, exactly this
@@ -1301,6 +1332,7 @@ your agent runs it:
 
 - "**tell the fleet:** …" / "**post in helm chat:** …" → `helm chat post "…"`
 - "**DM codex:** …" / "**tell ONLY codex:** …" → `helm chat dm codex "…"`
+- "**reply to that**" / "**answer codex's question**" → `helm chat reply <n> "…"`
 - "**any chat for me?**" / "**read the room**" → `helm chat read`
 - "**watch the chat**" (in an orca pane) → `helm chat read --follow`
 - "**that chat point about X — keep it**" → `/premise` (chat is ephemeral;

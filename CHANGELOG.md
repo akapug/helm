@@ -24,6 +24,27 @@
   nobody. The owner's parity surface is the ledger tab's **fleet todos**
   panel; `/api/todos` carries the digest only (item lists ride
   `helm todos --all --json`) and caps unclaimed sessions at the 25 freshest.
+- Chat replies + the owner-surface UX pass. `helm chat reply <id|n> <text…>`
+  (and `post … --reply-to`) threads a message under a parent by REUSING the
+  stable row id — additive `{reply_to, rts, rfrom}`, no second identity, so
+  the (ts, from) fallback still reaches a parent that predates the id law.
+  Signed replies BIND the parent through a disjoint algorithm tag
+  (`chat:reply:b2b:` over RS-joined parent id + ts + from + text) — never an
+  in-band prefix on the plain-post payload, which attacker-chosen text could
+  forge into a free re-parenting. Plain posts stay byte-identical, so every
+  signed row already on disk verifies unchanged; `payload_for()` is the one
+  shape-dispatching recomputer and `helm chat verify` re-derives it (honest
+  scope: self-consistency, not remote re-verification — the node still cannot
+  disclose a turn's payload). Rendering is one level, builders.dev style — a
+  compact parent quote, a `↩N` count, graceful orphans — in `helm chat read`,
+  the journal, and the web panel. Threading does NOT touch beacon-wake:
+  `seats.deliverable()` never reads the pointer, so a reply wakes exactly what
+  its text alone would have woken (asserted as a law over the full scope
+  matrix). The web chat surface also gains: per-channel unread/mention badges
+  with last-activity age and dimmed quiet rooms, readable seat rows (age +
+  legend, distinguishing-tail truncation), collapse for long agent posts,
+  @mention completion from the live roster, an unread divider and
+  jump-to-latest.
 
 - Stop-whisper slice 2 — the verify-grounding rungs: the contextual
   continuation ladder gains three signals read from record.py's own logs

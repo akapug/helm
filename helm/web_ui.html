@@ -417,8 +417,8 @@ details.cfgsec>summary:hover{color:var(--fg)}
 
 /* ================= chat view (simple DOM — works from the Orca mobile browser) ================= */
 #chatcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;display:flex;height:calc(100dvh - 130px);min-height:300px}
-#chatrooms{flex:0 0 130px;display:flex;flex-direction:column;border-right:1px solid var(--line);padding:8px 6px;min-width:0}
-@media (max-width:560px){#chatrooms{flex-basis:92px}}
+#chatrooms{flex:0 0 172px;display:flex;flex-direction:column;border-right:1px solid var(--line);padding:8px 6px;min-width:0}
+@media (max-width:560px){#chatrooms{flex-basis:116px}}
 #chatroomlist{flex:1;overflow-y:auto;overflow-x:hidden}
 .crm{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:5px 8px;border-radius:8px;font-size:var(--f1);color:var(--mut);cursor:pointer}
 .crm:hover{background:var(--hover);color:var(--fg)}
@@ -453,6 +453,47 @@ details.cfgsec>summary:hover{color:var(--fg)}
 #chatname{flex:0 1 110px;min-width:70px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 10px;font-size:var(--f2)}
 #chattext{flex:1 1 200px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 12px;font-size:var(--f3)}
 #chattext:focus,#chatname:focus{border-color:var(--accent);outline:none}
+/* ---- threading + the owner UX pass (additive: nothing above is restyled) ---- */
+#chatmain{position:relative}
+.chatmsg .cquote{display:flex;gap:6px;align-items:baseline;font-size:var(--f1);color:var(--sub);border-left:2px solid var(--line2);padding:1px 0 1px 7px;margin:0 0 2px;cursor:pointer;max-width:100%}
+.chatmsg .cquote:hover{border-left-color:var(--accent);color:var(--fg)}
+.chatmsg .cquote b{font-weight:var(--w-med);flex:0 0 auto}
+.chatmsg .cquote span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chatmsg .cquote.orphan{cursor:default;font-style:italic;opacity:.7}
+.chatmsg.flash{background:var(--accent-soft);border-radius:8px}
+.chatmsg .creplies:not(:empty){display:inline-block;font-size:var(--f0);color:var(--sub);margin-left:7px;cursor:pointer}
+.chatmsg .creplies:hover{color:var(--accent)}
+.chatmsg .ctxt.clamp{max-height:14em;overflow:hidden;-webkit-mask-image:linear-gradient(180deg,#000 70%,transparent);mask-image:linear-gradient(180deg,#000 70%,transparent)}
+.chatmsg .cmore{border:none;background:none;color:var(--accent);font-size:var(--f0);cursor:pointer;padding:2px 0}
+.chatmsg .cmore:hover{text-decoration:underline}
+#chatdivider{display:flex;align-items:center;gap:8px;margin:10px 0;color:var(--bad);font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em}
+#chatdivider:before,#chatdivider:after{content:"";flex:1;height:1px;background:var(--bad);opacity:.5}
+#chatjump{position:absolute;right:16px;bottom:64px;z-index:3;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:var(--r-pill);padding:5px 12px;font-size:var(--f1);cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.25)}
+#chatjump:hover{border-color:var(--accent);color:var(--accent)}
+#chatreply{display:flex;align-items:center;gap:8px;padding:6px 12px;border-top:1px solid var(--line);font-size:var(--f1);color:var(--sub);min-width:0}
+#chatreply b{color:var(--fg);font-weight:var(--w-med);flex:0 0 auto}
+#chatreply .rqt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#chatreply button{margin-left:auto;border:none;background:none;color:var(--sub);cursor:pointer;font-size:var(--f2)}
+#chatreply button:hover{color:var(--bad)}
+#chatac{border-top:1px solid var(--line);max-height:170px;overflow-y:auto}
+#chatac .acr{display:flex;gap:8px;align-items:center;padding:5px 12px;font-size:var(--f2);cursor:pointer}
+#chatac .acr.on,#chatac .acr:hover{background:var(--hl)}
+#chatac .acr i{width:6px;height:6px;border-radius:50%;background:var(--line2);flex:0 0 auto}
+#chatac .acr.fresh i{background:var(--ok,#3fb96b)}
+#chatac .acr.quiet i{background:var(--warn,#d9a13b)}
+#chatac .acr .acage{margin-left:auto;color:var(--sub);font-size:var(--f0)}
+#chatlegend{font-size:var(--f0);color:var(--sub);padding:6px 2px 0;line-height:1.5;border-top:1px solid var(--line);margin-top:6px}
+#chatlegend i{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--line2);margin-right:3px}
+#chatlegend i.fresh{background:var(--ok,#3fb96b)}
+#chatlegend i.quiet{background:var(--warn,#d9a13b)}
+.crm .crage{font-size:var(--f0);color:var(--sub);font-variant-numeric:tabular-nums;flex:0 0 auto}
+.crm.hot .crname{color:var(--fg);font-weight:var(--w-med)}
+.crm.cold{opacity:.62}
+/* one seat per line, name ellipsized, age pinned right — a 172px rail must
+   still say WHICH seat and HOW LONG AGO (the truncation the owner flagged) */
+.crm .crseat{flex:1 1 100%;min-width:0}
+.crm .crseat>span{flex:0 1 auto;min-width:0}
+.crm .crseat b{margin-left:auto;flex:0 0 auto;font-weight:400;font-variant-numeric:tabular-nums;padding-left:4px}
 
 /* ================= ledger view (the turn ledger + seat activity, on helm's variables) ================= */
 #ledgerstrip{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;margin:14px 0 0;padding:9px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px;font-size:var(--f1);color:var(--mut);font-variant-numeric:tabular-nums}
@@ -624,9 +665,16 @@ details.cfgsec>summary:hover{color:var(--fg)}
       <div id="chatroomlist"><div class="crm on" data-room="main"><span class="crname">main</span></div></div>
       <input id="chatnewroom" placeholder="+ channel" autocomplete="off" maxlength="60"
              title="new channel — Enter switches to it; the first message creates it">
+      <div id="chatlegend" title="seat presence — the shared .seen beat (helm chat roster)">
+        <i class="fresh"></i>active &lt;2m · <i class="quiet"></i>idle &lt;15m · <i></i>quiet<br>
+        <span id="chatlegroom">a channel's number = unread since you last looked</span>
+      </div>
     </div>
     <div id="chatmain">
       <div id="chatlog"><div class="empty">no messages yet — you and the fleet meet here.<br>agents post with <code>helm chat post &lt;text&gt;</code> · watch with <code>helm chat read --follow</code></div></div>
+      <button id="chatjump" hidden>↓ latest</button>
+      <div id="chatreply" hidden></div>
+      <div id="chatac" hidden></div>
       <div id="chatbar">
         <input id="chatname" title="post as" autocomplete="off">
         <input id="chattext" placeholder="message the fleet — agents see it next turn… (:fire: works)" autocomplete="off">
@@ -2305,7 +2353,91 @@ const chatSlug = s => String(s || "").replace(/[^A-Za-z0-9_-]/g, "-")
 let CHAT_ROOM = chatSlug(localStorage.getItem("helm.chatroom")) || "main";
 let CHAT_ROOMS_LAST = []; // last poll's rooms — instant sidebar repaint on switch
 
+/* ---- threading + the UX pass state (all reset by chatSwitch / a since=0 repaint) ----
+   CHAT_BY_ID is the client's only row store (the DOM stays the render): id ->
+   row AND "ts|from" -> row, the same two-identity resolve chat.parent_of does,
+   so a quote survives a parent that predates the row-id law. */
+let CHAT_BY_ID = {}, CHAT_REPLYN = {}, CHAT_KIDS = {}, CHAT_REPLY_TO = null;
+let CHAT_ROSTER = [], CHAT_PRESENCE = {};   // @mention completion + seat ages
+let CHAT_DIVIDED = false, CHAT_AWAY = 0;    // the unread divider + jump button
+const CHAT_CLAMP_CHARS = 1200, CHAT_CLAMP_LINES = 14; // a ledger post must not bury the pane
+const CHAT_DIV_HTML = '<div id="chatdivider">new since you last looked</div>';
+
 function chatKey(m) { return (m.ts || "") + "|" + (m.from || ""); }
+// own age formatter: the ledger's lago() is a const defined LATER in this file
+// and the first pollChat() fires before it initializes (TDZ) — never share it
+const chatAgo = s => !s && s !== 0 ? "" : s < 60 ? Math.max(0, Math.round(s)) + "s"
+  : s < 3600 ? Math.round(s / 60) + "m" : s < 86400 ? Math.round(s / 3600) + "h"
+  : Math.round(s / 86400) + "d";
+const chatIso = t => { const e = Date.parse(t || ""); return isNaN(e) ? null : (Date.now() - e) / 1e3; };
+const chatSnip = s => { const one = String(s || "").replace(/\s+/g, " ").trim();
+  return one.length > 90 ? one.slice(0, 89) + "…" : one; };
+// keep the DISTINGUISHING tail: 'goodtimes-platform-codex' truncated from the
+// left still says '…platform-codex'; the full name rides the title tooltip
+const chatShort = s => String(s || "").length <= 15 ? String(s || "") : "…" + String(s).slice(-14);
+
+function chatIndex(m) {           // both identities point at the same row
+  if (m.id) CHAT_BY_ID[m.id] = m;
+  const k = chatKey(m);
+  if (!CHAT_BY_ID[k]) CHAT_BY_ID[k] = m;   // first writer wins a ts|from collision
+}
+
+function chatParent(m) {
+  if (m.react || !(m.reply_to || m.rts)) return null;
+  return CHAT_BY_ID[m.reply_to || ""] ||
+         CHAT_BY_ID[(m.rts || "") + "|" + (m.rfrom || "")] || null;
+}
+
+/* the one-level quote (builders.dev style — never nested): author + snippet,
+   clickable to jump. An ORPHAN (parent rotated out of the RAM room) renders as
+   an explicit, un-clickable note — the reply still reads, nothing throws. */
+function chatQuote(m) {
+  if (m.react || !(m.reply_to || m.rts)) return "";
+  const p = chatParent(m);
+  if (!p) return '<div class="cquote orphan" title="the message this replies to is no ' +
+    'longer in the room (rotated out)">↳ <b>' + esc(m.rfrom || "?") +
+    "</b> <span>— original rotated out</span></div>";
+  return '<div class="cquote" data-jump="' + esc(p.id || chatKey(p)) +
+    '" title="jump to the message this replies to">↳ <b>' + esc(String(p.from || "?")) +
+    "</b> <span>" + esc(chatSnip(p.text)) + "</span></div>";
+}
+
+function chatFind(p) {
+  const log = $("#chatlog");
+  return (p.id && log.querySelector('.chatmsg[data-id="' + CSS.escape(p.id) + '"]')) ||
+    log.querySelector('.chatmsg[data-key="' + CSS.escape(chatKey(p)) + '"]');
+}
+
+// a resolved reply bumps its parent's counter IN PLACE — the append-only poll
+// never re-renders an older row, so the count is applied, not recomputed
+function chatBumpReply(m) {
+  const p = chatParent(m);
+  if (!p) return;
+  const k = p.id || chatKey(p);
+  CHAT_REPLYN[k] = (CHAT_REPLYN[k] | 0) + 1;
+  (CHAT_KIDS[k] = CHAT_KIDS[k] || []).push(m.id || chatKey(m));
+  const el = chatFind(p), s = el && el.querySelector(".creplies");
+  if (!s) return;
+  s.textContent = "↩" + CHAT_REPLYN[k];
+  s.title = CHAT_REPLYN[k] + (CHAT_REPLYN[k] === 1 ? " reply" : " replies");
+}
+
+// anchored navigation, both directions: a quote jumps UP to its parent, a
+// parent's ↩N jumps DOWN to its first reply. One level, no nesting, no
+// re-render — the chronological log stays the log.
+function chatJumpTo(key) {
+  const log = $("#chatlog");
+  const el = log.querySelector('.chatmsg[data-id="' + CSS.escape(key) + '"]') ||
+             log.querySelector('.chatmsg[data-key="' + CSS.escape(key) + '"]');
+  if (!el) { toast("that message is no longer in this room"); return; }
+  el.scrollIntoView({block: "center"});
+  el.classList.add("flash");
+  setTimeout(() => el.classList.remove("flash"), 1200);
+}
+function chatJumpReplies(div) {
+  const kids = CHAT_KIDS[div.dataset.id || div.dataset.key] || [];
+  if (kids.length) chatJumpTo(kids[0]);
+}
 
 function chatRow(m) {
   const who = String(m.from || "?");
@@ -2314,11 +2446,20 @@ function chatRow(m) {
   const tick = (m.chain != null)
     ? '<span class="ctick" title="signed — chain #' + esc(String(m.chain)) + '">✓</span>' : "";
   const rbar = '<span class="rbar">' + CHAT_RSET.map(e =>
-    '<button class="rbtn" data-e="' + e + '">' + e + "</button>").join("") + "</span>";
+    '<button class="rbtn" data-e="' + e + '">' + e + "</button>").join("") +
+    '<button class="rbtn rbreply" title="reply to this message">↩</button></span>';
+  const txt = String(m.text || "");
+  // long ledger posts collapse: the pane stays scannable, the text stays one click away
+  const long = txt.length > CHAT_CLAMP_CHARS || txt.split("\n").length > CHAT_CLAMP_LINES;
+  chatIndex(m);
   return '<div class="chatmsg' + (owner ? " owner" : "") + '" data-key="' + esc(chatKey(m)) +
-    '" data-ts="' + esc(m.ts || "") + '" data-from="' + esc(who) + '"><span class="cwho">' + esc(who) +
-    '</span><span class="cts">' + esc(String(m.ts || "").slice(11, 16)) + '</span>' + tick + rbar +
-    '<div class="ctxt">' + esc(m.text || "") + '</div><div class="creacts"></div></div>';
+    '" data-id="' + esc(m.id || "") + '" data-ts="' + esc(m.ts || "") + '" data-from="' + esc(who) +
+    '">' + chatQuote(m) + '<span class="cwho">' + esc(who) +
+    '</span><span class="cts">' + esc(String(m.ts || "").slice(11, 16)) + '</span>' + tick +
+    '<span class="creplies"></span>' + rbar +
+    '<div class="ctxt' + (long ? " clamp" : "") + '">' + esc(txt) + "</div>" +
+    (long ? '<button class="cmore">show more ▾</button>' : "") +
+    '<div class="creacts"></div></div>';
 }
 
 function chatApplyReact(m) {
@@ -2351,29 +2492,74 @@ async function pollChat() {
   try {
     let d;
     const want = CHAT_ROOM; // the room this request is FOR — a mid-flight switch drops the render
-    try { d = await j("/api/chat?room=" + encodeURIComponent(want) + "&since=" + CHAT_SINCE); } catch (e) { return; } // fail-open: keep the page, keep quiet
+    const base = CHAT_SINCE; // absolute index of d.lines[0] — the divider needs it
+    try { d = await j("/api/chat?room=" + encodeURIComponent(want) + "&since=" + base); } catch (e) { return; } // fail-open: keep the page, keep quiet
     if (d.unavailable || !Array.isArray(d.lines)) { chatSignal(d); return; }
+    if (Array.isArray(d.roster)) CHAT_ROSTER = d.roster; // @mention completion source
     chatRooms(d.rooms); // sidebar rides every poll (room-agnostic — render before the staleness bail)
     if (CHAT_ROOM !== want) return; // switched while in flight — the next tick repolls the new room
     chatTransport(d.transport);
     const log = $("#chatlog");
     if (d.total < CHAT_SINCE) CHAT_SINCE = 0; // the room rotated — server resent everything
     if (d.lines.length) {
-      if (CHAT_SINCE === 0) { log.innerHTML = ""; CHAT_REACTS = {}; } // clear the empty-state (or the stale pre-rotation log)
+      if (CHAT_SINCE === 0) chatResetLog(); // clear the empty-state (or the stale pre-rotation log)
       const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
       const msgs = d.lines.filter(m => !m.react);
-      if (msgs.length) log.insertAdjacentHTML("beforeend", msgs.map(chatRow).join(""));
+      if (msgs.length) {
+        // the "new since you last looked" divider: placed ONCE, at the owner's
+        // server-side read cursor, and only when he wasn't watching it land —
+        // an initial paint (base 0) or rows that arrived on a hidden tab
+        const away = !$("#view-chat").classList.contains("on") || document.hidden;
+        const cut = d.owner_read | 0;
+        let html = "", abs = base;
+        for (const m of d.lines) {
+          if (m.react) { abs++; continue; }
+          if (!CHAT_DIVIDED && cut > 0 && abs >= cut && (base === 0 || away)) {
+            html += CHAT_DIV_HTML; CHAT_DIVIDED = true;
+          }
+          html += chatRow(m); abs++;
+        }
+        log.insertAdjacentHTML("beforeend", html);
+        msgs.forEach(chatBumpReply); // resolved children bump their parent's ↩N
+      }
       d.lines.filter(m => m.react).forEach(chatApplyReact);
       if (stick) log.scrollTop = log.scrollHeight;
+      else CHAT_AWAY += msgs.length;
+      chatJumpSync();
     }
     CHAT_SINCE = d.total;
     chatSignal(d);
   } finally { CHAT_POLLING = false; }
 }
 
+// the log is the row store: clearing it clears the index, the counts and the
+// divider together — one place, so a room switch and a rotation reset agree
+function chatResetLog() {
+  $("#chatlog").innerHTML = "";
+  CHAT_REACTS = {}; CHAT_BY_ID = {}; CHAT_REPLYN = {}; CHAT_KIDS = {};
+  CHAT_DIVIDED = false; CHAT_AWAY = 0;
+}
+
+/* jump-to-latest: scrolled off the bottom is the ONLY state where an arriving
+   message can go unseen inside an open room — the button says how many. */
+function chatJumpSync() {
+  const log = $("#chatlog"), b = $("#chatjump");
+  if (!b) return;
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
+  if (atBottom) CHAT_AWAY = 0;
+  b.hidden = atBottom;
+  b.textContent = CHAT_AWAY ? "↓ " + CHAT_AWAY + " new" : "↓ latest";
+}
+
 /* the channel sidebar — one row per room from the poll's `rooms` array.
    Fail-open: absent/empty (older server) degrades to just main + the live
-   room; a just-typed channel (no post yet, so no server row) still shows. */
+   room; a just-typed channel (no post yet, so no server row) still shows.
+
+   ACTIVITY IS THE POINT (owner-caught 2026-07-21: he sat on a 4-row room
+   while 88 rows landed in another with no signal): every room shows its
+   unread count, an @ flag when any of it addresses him, and the AGE of its
+   last message — so a quiet room reads quiet (dimmed) and the busy one is
+   impossible to miss. */
 function chatRooms(rooms) {
   CHAT_ROOMS_LAST = Array.isArray(rooms) ? rooms.filter(r => r && r.room) : [];
   const list = CHAT_ROOMS_LAST.slice();
@@ -2381,16 +2567,28 @@ function chatRooms(rooms) {
   if (!list.some(r => r.room === CHAT_ROOM)) list.push({room: CHAT_ROOM});
   list.sort((a, b) => a.room === "main" ? -1 : b.room === "main" ? 1
                     : a.room < b.room ? -1 : a.room > b.room ? 1 : 0);
+  CHAT_PRESENCE = {};
   $("#chatroomlist").innerHTML = list.map(r => {
-    const n = r.owner_unread | 0;
+    const n = r.owner_unread | 0, men = (r.owner_mentions | 0) > 0;
     const seats = Array.isArray(r.seats) ? r.seats : [];
-    return '<div class="crm' + (r.room === CHAT_ROOM ? " on" : "") +
-      '" data-room="' + esc(r.room) + '"><span class="crname">' + esc(r.room) + "</span>" +
-      (n ? '<span class="crn' + ((r.owner_mentions | 0) ? " mention" : "") + '">' + n + "</span>" : "") +
-      (seats.length ? '<span class="crseats">' + seats.map(s =>
-        '<span class="crseat ' + esc(s.presence || "") + '" title="' + esc(s.seat) +
-        " — " + esc(s.presence || "?") + '"><i></i><span>' + esc(s.seat) + "</span></span>"
-      ).join("") + "</span>" : "") +
+    seats.forEach(s => { if (s && s.seat) CHAT_PRESENCE[s.seat] = s; });
+    const age = chatIso(r.last);
+    const cold = !n && age != null && age > 1800;   // quiet: nothing new, nothing recent
+    const tip = "#" + r.room + " — " + (r.total | 0) + " message(s)" +
+      (age == null ? ", none yet" : ", last " + chatAgo(age) + " ago") +
+      (n ? "; " + n + " unread" + (men ? ", " + (r.owner_mentions | 0) + " @you" : "") : "; all read");
+    return '<div class="crm' + (r.room === CHAT_ROOM ? " on" : "") + (n ? " hot" : "") +
+      (cold ? " cold" : "") + '" data-room="' + esc(r.room) + '" title="' + esc(tip) +
+      '"><span class="crname">' + esc(r.room) + "</span>" +
+      (n ? '<span class="crn' + (men ? " mention" : "") + '">' + (men ? "@" : "") + n + "</span>" : "") +
+      (age == null ? "" : '<span class="crage">' + esc(chatAgo(age)) + "</span>") +
+      (seats.length ? '<span class="crseats">' + seats.map(s => {
+        const sa = s.last_seen ? chatAgo(Date.now() / 1e3 - s.last_seen) : "";
+        return '<span class="crseat ' + esc(s.presence || "") + '" title="' + esc(s.seat) +
+          " — " + esc(s.presence || "?") + (sa ? ", last seen " + esc(sa) + " ago" : "") +
+          '"><i></i><span>' + esc(chatShort(s.seat)) + "</span>" +
+          (sa ? "<b>" + esc(sa) + "</b>" : "") + "</span>";
+      }).join("") + "</span>" : "") +
       "</div>";
   }).join("");
 }
@@ -2400,7 +2598,8 @@ function chatSwitch(room) {
   if (!room || room === CHAT_ROOM) return;
   CHAT_ROOM = room;
   localStorage.setItem("helm.chatroom", room); // survive reload, like helm.chatname
-  CHAT_SINCE = 0; CHAT_REACTS = {}; // the rotation-reset path repaints the log from 0
+  CHAT_SINCE = 0; chatResetLog(); // the rotation-reset path repaints the log from 0
+  chatClearReply();               // a reply target never survives its room
   $("#chatlog").innerHTML = '<div class="empty">#' + esc(room) +
     " — no messages yet. the first post creates the channel.</div>";
   chatRooms(CHAT_ROOMS_LAST); // active row flips NOW; the poll refreshes counts
@@ -2468,13 +2667,71 @@ async function sendReact(div, e) {
   pollChat();
 }
 
+/* ---- reply target: the composer's parent pointer (the row's stable id) ---- */
+function chatSetReply(div) {
+  const id = div.dataset.id || "";
+  if (!id) { toast("that message predates row ids — reply by posting normally"); return; }
+  const p = CHAT_BY_ID[id] || CHAT_BY_ID[div.dataset.key] || {};
+  CHAT_REPLY_TO = id;
+  const strip = $("#chatreply");
+  strip.hidden = false;
+  strip.innerHTML = "replying to <b>" + esc(String(p.from || div.dataset.from || "?")) +
+    '</b><span class="rqt">' + esc(chatSnip(p.text)) +
+    '</span><button id="chatreplyx" title="cancel (Esc)">✕</button>';
+  $("#chatreplyx").onclick = chatClearReply;
+  $("#chattext").focus();
+}
+function chatClearReply() {
+  CHAT_REPLY_TO = null;
+  const strip = $("#chatreply");
+  strip.hidden = true; strip.innerHTML = "";
+}
+
+/* ---- @mention completion from the LIVE roster ----
+   Exact tokens only: the owner picks a name that exists, so the mention is one
+   seats.deliverable() will actually match (the miss-class that had a seat
+   answering '--help' to a mention it never got). */
+let CHAT_AC = [], CHAT_ACI = 0;
+function chatAcToken() {
+  const el = $("#chattext"), pos = el.selectionStart == null ? el.value.length : el.selectionStart;
+  const m = /(^|\s)@([A-Za-z0-9._-]*)$/.exec(el.value.slice(0, pos));
+  return m ? {frag: m[2], start: pos - m[2].length - 1, end: pos} : null;
+}
+function chatAcRender() {
+  const t = chatAcToken(), box = $("#chatac");
+  const f = t ? t.frag.toLowerCase() : null;
+  CHAT_AC = t ? CHAT_ROSTER.filter(s => s.toLowerCase().startsWith(f)).slice(0, 8) : [];
+  if (!CHAT_AC.length) { box.hidden = true; box.innerHTML = ""; return; }
+  if (CHAT_ACI >= CHAT_AC.length) CHAT_ACI = 0;
+  box.hidden = false;
+  box.innerHTML = CHAT_AC.map((s, i) => {
+    const p = CHAT_PRESENCE[s] || {};
+    const age = p.last_seen ? chatAgo(Date.now() / 1e3 - p.last_seen) : "";
+    return '<div class="acr ' + esc(p.presence || "") + (i === CHAT_ACI ? " on" : "") +
+      '" data-i="' + i + '"><i></i><span>@' + esc(s) + '</span><span class="acage">' +
+      esc(age) + "</span></div>";
+  }).join("");
+}
+function chatAcPick(i) {
+  const t = chatAcToken(), pick = CHAT_AC[i];
+  if (!t || !pick) return;
+  const el = $("#chattext"), v = el.value;
+  el.value = v.slice(0, t.start) + "@" + pick + " " + v.slice(t.end);
+  const c = t.start + pick.length + 2;
+  el.focus(); el.setSelectionRange(c, c);
+  CHAT_AC = []; $("#chatac").hidden = true; $("#chatac").innerHTML = "";
+}
+
 async function sendChat() {
   const text = $("#chattext").value.trim();
   if (!text) return;
   const name = $("#chatname").value.trim() || "david";
+  const reply_to = CHAT_REPLY_TO;   // captured before the strip clears
   localStorage.setItem("helm.chatname", name);
   $("#chattext").value = "";
-  try { await post("/api/chat", {room: CHAT_ROOM, text, name}); }
+  chatClearReply();
+  try { await post("/api/chat", reply_to ? {room: CHAT_ROOM, text, name, reply_to}
+                                         : {room: CHAT_ROOM, text, name}); }
   catch (e) { toast("chat post failed: " + e.message); $("#chattext").value = text; return; }
   pollChat();
 }
@@ -2484,10 +2741,44 @@ function initChat() {
   if (!CHAT_WIRED) {
     CHAT_WIRED = true;
     $("#chatsend").onclick = sendChat;
-    $("#chattext").addEventListener("keydown", ev => { if (ev.key === "Enter") sendChat(); });
-    $("#chatlog").addEventListener("click", ev => {   // click-to-react (delegated)
+    $("#chattext").addEventListener("input", () => { CHAT_ACI = 0; chatAcRender(); });
+    $("#chattext").addEventListener("keydown", ev => {
+      if (CHAT_AC.length) {          // the completion menu owns these keys first
+        if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+          CHAT_ACI = (CHAT_ACI + (ev.key === "ArrowDown" ? 1 : CHAT_AC.length - 1)) % CHAT_AC.length;
+          chatAcRender(); ev.preventDefault(); return;
+        }
+        if (ev.key === "Enter" || ev.key === "Tab") { chatAcPick(CHAT_ACI); ev.preventDefault(); return; }
+        if (ev.key === "Escape") { CHAT_AC = []; $("#chatac").hidden = true; ev.preventDefault(); return; }
+      }
+      if (ev.key === "Escape") { chatClearReply(); return; }
+      if (ev.key === "Enter") sendChat();
+    });
+    $("#chatac").addEventListener("click", ev => {
+      const r = ev.target.closest(".acr");
+      if (r) chatAcPick(+r.dataset.i);
+    });
+    $("#chatjump").onclick = () => {
+      const log = $("#chatlog");
+      log.scrollTop = log.scrollHeight; CHAT_AWAY = 0; chatJumpSync();
+    };
+    $("#chatlog").addEventListener("scroll", chatJumpSync);
+    $("#chatlog").addEventListener("click", ev => {   // react / reply / expand / jump (delegated)
+      const q = ev.target.closest(".cquote[data-jump]");
+      if (q) { chatJumpTo(q.dataset.jump); return; }
+      const n = ev.target.closest(".creplies");
+      if (n && n.textContent) { chatJumpReplies(n.closest(".chatmsg")); return; }
+      const more = ev.target.closest(".cmore");
+      if (more) {
+        const t = more.previousElementSibling;
+        const open = t.classList.toggle("clamp");
+        more.textContent = open ? "show more ▾" : "show less ▴";
+        return;
+      }
       const b = ev.target.closest(".rbtn");
-      if (b) sendReact(b.closest(".chatmsg"), b.dataset.e);
+      if (!b) return;
+      if (b.classList.contains("rbreply")) chatSetReply(b.closest(".chatmsg"));
+      else sendReact(b.closest(".chatmsg"), b.dataset.e);
     });
     $("#chatroomlist").addEventListener("click", ev => { // channel switch (delegated)
       const r = ev.target.closest(".crm");

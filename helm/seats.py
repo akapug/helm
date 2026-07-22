@@ -1192,7 +1192,8 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main"):
 _SEAT_TOKEN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")   # what an @mention can say
 
 
-def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None):
+def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None,
+       reply_to=None):
     """One TRUE 1:1 message -> (row, None) or (None, reason). The recipient
     is the EXACT seat token (premise exact-token-addressee-match): the only
     resolution ever applied is a casefold snap onto a live roster key —
@@ -1201,7 +1202,8 @@ def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None):
     private lane only (chat.post dm= — no room fanout by construction),
     signs like any post, and the recipient's beacon/boundary surfaces it
     first in the scan. A DM to a not-yet-joined seat waits in its lane; the
-    join baselines that lane at 0, so it delivers."""
+    join baselines that lane at 0, so it delivers. `reply_to` (a parent row id
+    or ordinal IN THAT LANE) threads the DM — chat.post owns the resolve."""
     to = (to or "").strip().lstrip("@")
     if not _SEAT_TOKEN.match(to):
         return None, ("recipient %r must be 1-64 chars of [A-Za-z0-9._-] — "
@@ -1215,7 +1217,7 @@ def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None):
     if str(sender).casefold() == to.casefold():
         return None, "a DM to yourself would never deliver (own posts don't)"
     return chat.post(text, who=sender, profile=profile, sign=sign,
-                     origin=origin, dm=to), None
+                     origin=origin, dm=to, reply_to=reply_to), None
 
 
 # ---------------------------------------------------------------------------
