@@ -1104,6 +1104,33 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertFalse(session._is_headless(
             ["claude", "--resume", "abc", "You are seat 'codex-3'; use -p sparingly"]))
 
+    SID_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    SID_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    def test_resume_sid_honors_the_option_terminator(self):
+        # codex round-2 HIGH 1, exact probe: a resume token entirely after
+        # `--` is positional prompt prose under the same option-region law as
+        # _argv_flag — it must never mint a proven session identity and enter
+        # live-holder/DOUBLE-OPEN arithmetic
+        argv = ["claude", "-p", "--", "--resume", self.SID_A]
+        self.assertTrue(session._is_headless(argv))
+        self.assertIsNone(session._resume_sid(argv))
+
+    def test_post_terminator_prose_never_drops_the_real_resume(self):
+        # the converse defect: a real pre-terminator resume plus a different
+        # post-terminator token must not read as two conflicting IDs that
+        # erase the real holder from the census
+        self.assertEqual(
+            session._resume_sid(["claude", "--resume", self.SID_A, "--",
+                                 "--resume", self.SID_B]),
+            self.SID_A)
+
+    def test_a_resume_consumed_by_the_terminator_stays_unknown(self):
+        # `--resume` whose would-be value is the terminator is a bare resume;
+        # the post-terminator UUID is prose, not its value
+        self.assertIsNone(session._resume_sid(
+            ["claude", "--resume", "--", self.SID_A]))
+
     def test_option_terminator_ends_the_flag_scan(self):
         # past the standard `--` terminator every token is positional: a boot
         # prompt exactly equal to -p/--print is prose there, never a flag
@@ -1152,21 +1179,36 @@ class HeadlessCensusTest(unittest.TestCase):
     def test_a_headless_row_is_still_rendered_not_hidden(self):
         # excluding from the COUNT must never mean hiding from the OPERATOR:
         # a helm seat running headless is a law violation and has to be visible
-        rc, out, err = self.ls([self.row(9, None, True)], {})
+        rc, out, err = self.ls([self.row(8, None, True, nonpersistent=True),
+                                self.row(9, None, True)], {})
         self.assertEqual(rc, 0, err)
-        self.assertIn("pid 9", out)
+        self.assertIn("pid 8", out)
         self.assertIn("headless one-shot", out)
+        self.assertIn("pid 9", out)
+        self.assertIn("[headless]", out)
 
-    def test_a_sessionless_headless_row_never_certifies_unknown(self):
-        # a headless row has no session BY DESIGN — it is not an unresolved
-        # pane, and doctor-panes --certify must not fail the estate over it
-        rc, out, err = self.ls([self.row(9, None, True)], {}, certify=True)
+    def test_an_explicitly_nonpersistent_row_never_certifies_unknown(self):
+        # only --no-session-persistence proves sessionless BY REQUEST — that
+        # row has no session by design, is not an unresolved pane, and
+        # doctor-panes --certify must not fail the estate over it
+        rc, out, err = self.ls([self.row(9, None, True, nonpersistent=True)],
+                               {}, certify=True)
         self.assertEqual(rc, 0, err)
         self.assertIn("headless one-shot", out)
         self.assertNotIn("UNKNOWN", out)
 
+    def test_plain_print_mode_without_identity_fails_closed_as_unknown(self):
+        # codex round-2 HIGH 2, exact probe: plain -p persists a transcript by
+        # default, so a -p row with no resolvable SID is an UNRESOLVED
+        # session, never "no session by design" — certify must refuse rc=0
+        rc, out, err = self.ls([self.row(9, None, True)], {}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("UNKNOWN", out)
+        self.assertIn("[headless]", out)
+        self.assertNotIn("headless one-shot", out)
+
     def test_a_headless_row_never_manufactures_a_double_open(self):
-        # a one-shot CARRYING its parent's proven SID (inherited/attributed
+        # a worker CARRYING its parent's proven SID (inherited/attributed
         # hint only — no --resume, no pid record) is not a second holder
         rows = [self.row(1, "sid-x", False), self.row(2, "sid-x", True)]
         self.assertEqual(session.live_sids(rows), {"sid-x": [1]})
@@ -1174,7 +1216,21 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertNotIn("DOUBLE-OPEN", out)
         self.assertIn("persisted", out)
-        self.assertIn("headless one-shot", out)
+        self.assertIn("[headless]", out)
+
+    def test_a_transcriptless_inherited_worker_alarms_its_holder_not_itself(self):
+        # holder-arithmetic exclusion and the render must AGREE: the worker's
+        # missing transcript is its holder's risk, so it is neither counted
+        # nor labeled MEMORY-ONLY — but this exclusion never becomes a
+        # sessionless claim (no "one-shot" label without nonpersistence)
+        rows = [self.row(2, "sid-x", True)]
+        self.assertEqual(session.memory_only_panes(rows=rows, persisting={}),
+                         [])
+        rc, out, err = self.ls(rows, {}, certify=True)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("inherited-session print worker", out)
+        self.assertNotIn("MEMORY-ONLY", out)
+        self.assertNotIn("headless one-shot", out)
 
     def test_a_print_mode_resume_is_a_real_holder_and_double_open(self):
         # BOTH reviewers' HIGH: `claude -p --resume X` operates on a proven
