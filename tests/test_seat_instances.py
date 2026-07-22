@@ -363,11 +363,25 @@ class ProxyFixRoundTest(Slice6Base):
         # family configs carry it top-level by hand; the generator must too.
         cfg = seat._config_yaml(8319, "/auth", "tok")
         self.assertIn("\nnonstream-keepalive-interval: 15\n", cfg)
-        self.assertNotIn("streaming:", cfg)      # NOT nested — see above
         kcfg = seat._config_yaml_key(8318, "tok", "moonshot",
                                      "https://api.moonshot.ai/v1", "kimi-k3",
                                      "sk-x")
         self.assertIn("\nnonstream-keepalive-interval: 15\n", kcfg)
+
+    def test_config_emits_streaming_survival_block(self):
+        # the owner's restart-loop class (2026-07-22): with the nonstream
+        # keepalive LOADED, EVERY request at ~90% context still died empty-200 —
+        # the STREAMING leg stalls before/during bytes at extreme payload sizes.
+        # StreamingConfig has ONLY two knobs (no timeout field exists in the
+        # schema): keepalive-seconds (SSE heartbeats keep a long stream alive)
+        # and bootstrap-retries (retry a stream stalled before its first byte).
+        for cfg in (seat._config_yaml(8319, "/auth", "tok"),
+                    seat._config_yaml_key(8318, "tok", "moonshot",
+                                          "https://api.moonshot.ai/v1",
+                                          "kimi-k3", "sk-x")):
+            self.assertIn("streaming:\n", cfg)
+            self.assertIn("  keepalive-seconds: 15\n", cfg)
+            self.assertIn("  bootstrap-retries: 2\n", cfg)
 
     def test_down_preserves_a_concurrent_replacements_pidfile(self):
         # atomic-ownership finding: _down kills the old proxy, then must unlink

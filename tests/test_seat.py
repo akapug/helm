@@ -295,7 +295,11 @@ class SeatTest(unittest.TestCase):
             '      - name: "kimi-k3"\n'
             '        alias: "kimi-k3"\n'
             # long-nonstream keepalive (compaction survival) rides every config
-            "nonstream-keepalive-interval: 15\n"))
+            "nonstream-keepalive-interval: 15\n"
+            # streaming-leg survival (the ~90%-context empty-200 class)
+            "streaming:\n"
+            "  keepalive-seconds: 15\n"
+            "  bootstrap-retries: 2\n"))
         self.assertNotIn("auth-dir", cfg)
 
     # -- key-flavor -> base-url dispatch (kimi coding vs Moonshot platform) --

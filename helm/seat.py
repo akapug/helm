@@ -529,7 +529,17 @@ def _config_yaml(port, auth_dir, token):
             '  secret-key: ""\n'
             "  disable-control-panel: true\n"
             # heartbeat during long non-streaming thinking passes — see docstring.
-            "nonstream-keepalive-interval: 15\n") % (port, auth_dir, token)
+            "nonstream-keepalive-interval: 15\n"
+            # the STREAMING leg too (owner-witnessed 2026-07-22: with the
+            # nonstream keepalive already loaded, EVERY request at ~90% context
+            # still died empty-200 — the stream stalls before/during bytes at
+            # extreme payload sizes). keepalive-seconds emits SSE heartbeats so
+            # a long stream stays alive; bootstrap-retries retries a stream
+            # that stalls before its first byte. StreamingConfig has ONLY these
+            # two knobs — no upstream/read timeout field exists in the schema.
+            "streaming:\n"
+            "  keepalive-seconds: 15\n"
+            "  bootstrap-retries: 2\n") % (port, auth_dir, token)
 
 
 def _config_yaml_key(port, token, provider, base_url, model, api_key):
@@ -557,6 +567,9 @@ def _config_yaml_key(port, token, provider, base_url, model, api_key):
             '        alias: "%s"\n'
             # same long-nonstream keepalive as _config_yaml (compaction survival)
             "nonstream-keepalive-interval: 15\n"
+            "streaming:\n"
+            "  keepalive-seconds: 15\n"
+            "  bootstrap-retries: 2\n"
             % (port, token, provider, base_url, api_key, model, model))
 
 
