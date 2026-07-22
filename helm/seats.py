@@ -285,11 +285,34 @@ def _git_project(cwd):
 
 def derive_home_room(cwd):
     """The seat's DEFAULT project room. Explicit env/CLI rooms are resolved by
-    join before this fallback. Project-less seats stay un-homed (legacy all-room
-    behavior); any identity that normalizes to reserved #main stays un-homed."""
+    resolve_homing before this fallback. Project-less seats stay un-homed
+    (legacy all-room behavior); any identity that normalizes to reserved #main
+    stays un-homed."""
     proj = _git_project(cwd)
     room = pk.slug(proj) if proj else None
     return None if not room or room == "main" else room
+
+
+def resolve_homing(cli_room=None, cwd=None):
+    """THE one home-room precedence — every writer resolves through here and
+    write_roster is the one enforcement gate behind it. The bug-class this
+    kills: multiple derivations of one truth scattered a live roster's homes
+    across 'main' (a defaulted mirror write), '<project>' (a cwd derivation)
+    and '<env room>' (the launch seam) for seats of the SAME team. Order:
+      1. an explicit CLI/operator room (cli_room)          -> explicit
+      2. HELM_CHAT_ROOM (the launch seam) — explicit unless the seam stamped
+         HELM_CHAT_ROOM_SOURCE=derived                     -> explicit/derived
+      3. the cwd's git-project room (derive_home_room)     -> derived
+    Returns (room, source); (None, None) = un-homed. Paired law (enforced in
+    write_roster): a derived value may NEVER overwrite an explicit/operator
+    one, so a re-join/resume/mirror can never downgrade a deliberate home."""
+    if cli_room:
+        return cli_room, "explicit"
+    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
+    if env_room:
+        return env_room, ("derived" if env_source == "derived" else "explicit")
+    room = derive_home_room(cwd)
+    return room, ("derived" if room else None)
 
 
 def owner_names():
@@ -492,7 +515,10 @@ def write_roster(seat, session=None, cwd=None, home_room=None,
     keeps its own delivery cursor (fan-out, never race-consume). home_room_source
     is `explicit` or `derived`: explicit joins may deliberately move a seat;
     derived joins follow a seat across projects only while its prior home was
-    also derived; they never undo an explicit/operator home or clear."""
+    also derived; they never undo an explicit/operator home or clear. An
+    UNLABELED home_room reads as derived — unknown provenance takes the
+    weakest tier, never the strongest (the old back-compat seam stamped it
+    explicit and let a spawn mirror downgrade a deliberate home)."""
     chat._ensure_dir()
     with _flocked(roster_path() + ".lock"):
         r = roster()
@@ -511,7 +537,11 @@ def write_roster(seat, session=None, cwd=None, home_room=None,
             else:
                 row.pop("home_room", None)
             row["home_room_source"] = "explicit"
-        elif home_room_source == "derived" and home_room:
+        elif home_room:
+            # derived — or UNLABELED (provenance unknown reads as derived, the
+            # weakest tier): fills a never-homed row or follows a still-derived
+            # one; it can never overwrite an explicit/operator home or clear,
+            # so a re-join/resume/mirror never downgrades a deliberate home.
             old, source = row.get("home_room"), row.get("home_room_source")
             if source == "derived" and home_room != old:
                 _baseline_rooms(
@@ -524,14 +554,6 @@ def write_roster(seat, session=None, cwd=None, home_room=None,
             if row.get("home_room") == home_room \
                     and source in (None, "derived"):
                 row["home_room_source"] = "derived"
-        elif home_room and home_room != row.get("home_room"):
-            # Back-compat for the old direct write_roster(..., home_room=) seam:
-            # a supplied room was always an explicit operator/launch choice.
-            old = row.get("home_room")
-            _baseline_rooms(
-                seat, row, _rooms_to_baseline(old, home_room))
-            row["home_room"] = home_room
-            row["home_room_source"] = "explicit"
         if session:
             row["session"] = str(session)
             sess = [s for s in row.get("sessions") or [] if s != str(session)]
@@ -1235,21 +1257,19 @@ def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
     (all live rooms for legacy un-homed seats; {home, main} for homed seats),
     so pre-join backlog never floods and later admitted rooms can backfill."""
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
-    # Homing precedence: an explicit CLI room beats the environment; the env
-    # beats derivation. Direct callers' non-main `room` remains explicit for
-    # back-compat. A derived join fills only a never-homed row, so SessionStart
-    # cannot silently undo an operator rehome/clear or move a co-named seat.
+    # Homing precedence lives in ONE function (resolve_homing: explicit CLI
+    # room > env seam > project derivation) — never re-derived here. Direct
+    # callers' non-main `room` remains explicit for back-compat; a caller
+    # that already resolved a derived room passes it through unchanged. A
+    # derived join fills only a never-homed row (write_roster's law), so
+    # SessionStart cannot silently undo an operator rehome/clear or move a
+    # co-named seat.
     direct_room = room_explicit or room != "main"
-    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
     if room_source == "derived":
         home_room, source = pk.slug(room), "derived"
-    elif direct_room:
-        home_room, source = pk.slug(room), "explicit"
-    elif env_room:
-        home_room = pk.slug(env_room)
-        source = "derived" if env_source == "derived" else "explicit"
     else:
-        home_room, source = derive_home_room(cwd), "derived"
+        home_room, source = resolve_homing(room if direct_room else None, cwd)
+        home_room = pk.slug(home_room) if home_room else None
     row = write_roster(seat, session=session, cwd=cwd, home_room=home_room,
                        home_room_source=source)
     effective_home = row.get("home_room")
@@ -1971,6 +1991,121 @@ def reap_roster(max_age=REAP_S, now=None):
         return []
 
 
+def _transcript_roots():
+    """Harness transcript stores on this host (claude + per-account homes,
+    codex + codex-homes) — ground truth for `this session existed here`."""
+    hm = os.path.expanduser("~")
+    return ([os.path.join(hm, ".claude", "projects")]
+            + sorted(glob.glob(os.path.join(hm, ".claude-homes", "*",
+                                            "projects")))
+            + [os.path.join(hm, ".codex", "sessions")]
+            + sorted(glob.glob(os.path.join(hm, ".codex-homes", "*",
+                                            "sessions"))))
+
+
+def _transcript_exists(sid, roots):
+    """Any transcript file naming the session under any harness store:
+    claude's <root>/<proj-slug>/<sid>.jsonl, codex's nested
+    rollout-<ts>-<sid>.jsonl."""
+    s = glob.escape(str(sid))
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        if glob.glob(os.path.join(root, "*", s + ".jsonl")):
+            return True
+        if glob.glob(os.path.join(root, "**", "*" + s + "*.jsonl"),
+                     recursive=True):
+            return True
+    return False
+
+
+def _live_process_evidence(sids, proc_dir="/proc"):
+    """True when any live process's cmdline/environ names one of the session
+    ids — or when the process table cannot be listed at all (FAIL-CLOSED: no
+    scan means no prune). Per-process read errors are normal churn (exited
+    pids, foreign-uid environ) and skip only that process."""
+    needles = [str(s).encode("utf-8") for s in sids if s]
+    if not needles:
+        return False
+    try:
+        pids = [n for n in os.listdir(proc_dir) if n.isdigit()]
+    except OSError:
+        return True
+    for pid in pids:
+        blob = b""
+        for leaf in ("cmdline", "environ"):
+            try:
+                with open(os.path.join(proc_dir, pid, leaf), "rb") as f:
+                    blob += f.read(1 << 20)
+            except OSError:
+                continue
+        if any(n in blob for n in needles):
+            return True
+    return False
+
+
+def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
+    """The MANUAL roster GC (`helm chat seat gc`) — a verb someone RUNS,
+    never automatic. reap_roster handles ordinary staleness; this handles
+    JUNK rows (the /tmp throwaway class) that keep re-appearing: rows whose
+    remembered sessions left NO transcript on this host and are referenced
+    by NO live process. REFUSAL IS THE DEFAULT — a row is kept on ANY live
+    evidence:
+      * a presence beat within REAP_S (.seen mtime / roster last_seen),
+      * a transcript for ANY remembered session, in ANY harness store,
+      * a live process naming ANY remembered session id,
+      * probe trouble of any kind (fail-closed).
+    Returns (rows, pruned): rows = [{seat, verdict: keep|prune, why}] for the
+    whole roster; dry-run (apply=False) prunes NOTHING. apply=True deletes
+    only the prune rows (freshness re-checked under the roster lock) plus
+    their derived seat state (_unlink_seat_state — cursors, .seen, latches,
+    the RAM DM lane)."""
+    now = time.time() if now is None else now
+    roots = _transcript_roots() if roots is None else roots
+    rows = []
+    for s, row in sorted(roster().items()):
+        sids = [x for x in [row.get("session")]
+                + list(row.get("sessions") or []) if x]
+        ls = last_seen(s, row)
+        why = None
+        if ls and now - ls < REAP_S:
+            why = "presence beat %dm ago" % max(0, int((now - ls) / 60))
+        if why is None:
+            try:
+                hit = next((sid for sid in sids
+                            if _transcript_exists(sid, roots)), None)
+            except Exception as e:            # fail-closed, loudly
+                why = "transcript probe failed (%s)" % e
+                hit = None
+            if hit:
+                why = "transcript exists for session %.12s" % hit
+        if why is None and _live_process_evidence(sids, proc_dir):
+            why = "a live process references a remembered session"
+        rows.append({
+            "seat": s, "verdict": "keep" if why else "prune",
+            "why": why or (
+                "no transcript for %d remembered session%s, no live "
+                "process, no fresh presence"
+                % (len(sids), "s"[:len(sids) != 1]) if sids else
+                "no remembered sessions, no live process, no fresh presence")})
+    pruned = []
+    if apply:
+        victims = {r["seat"] for r in rows if r["verdict"] == "prune"}
+        if victims:
+            with _flocked(roster_path() + ".lock"):
+                r = roster()
+                for s in list(r):
+                    ls = last_seen(s, r[s])
+                    if s in victims and not (ls and time.time() - ls < REAP_S):
+                        del r[s]              # re-checked fresh? refuse.
+                        pruned.append(s)
+                if pruned:
+                    pk.write_json(roster_path(), r)
+            for s in pruned:
+                _unlink_seat_state(s)
+    return rows, pruned
+
+
 def roster_report(room="main"):
     """{"seats": [...], "claims": [...]} — fail-open by caller. Pending is
     computed from each seat's cursor WITHOUT moving it. One GC leg rides the
@@ -2115,9 +2250,37 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             ok, msg = rehome_seat(args[1], args[2])
             print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
             return 0 if ok else 1
+        if args[:1] == ["gc"]:
+            rest = args[1:]
+            if any(a != "--apply" for a in rest):
+                print("usage: helm chat seat gc [--apply]   (dry-run default; "
+                      "prunes only roster rows with NO live evidence — no "
+                      "transcript, no live process, no fresh presence)",
+                      file=sys.stderr)
+                return 2
+            rows, pruned = gc_roster(apply="--apply" in rest)
+            if not rows:
+                print("helm chat: roster empty — nothing to gc")
+                return 0
+            w = max(len(r["seat"]) for r in rows)
+            for r in rows:
+                print("  %-5s %-*s  %s"
+                      % (r["verdict"].upper(), w, r["seat"], r["why"]))
+            n = sum(r["verdict"] == "prune" for r in rows)
+            if "--apply" in rest:
+                print("helm chat: pruned %d roster row%s (+ derived seat "
+                      "state); %d kept on live evidence"
+                      % (len(pruned), "s"[:len(pruned) != 1],
+                         len(rows) - len(pruned)))
+            else:
+                print("helm chat: %d row%s would be pruned — dry-run "
+                      "(`helm chat seat gc --apply` prunes)"
+                      % (n, "s"[:n != 1]))
+            return 0
         print("usage: helm chat seat rename <sid|oldname> <newname> | "
               "seat mute|unmute <room> [--seat S] | seat mutes [--seat S] | "
-              "rehome <sid|name> <room|main|none>", file=sys.stderr)
+              "seat gc [--apply] | rehome <sid|name> <room|main|none>",
+              file=sys.stderr)
         return 2
     if verb == "stop-guard":
         try:

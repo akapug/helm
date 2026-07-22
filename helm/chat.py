@@ -1090,7 +1090,7 @@ def cmd_chat(args):
     join|deliver|stop-guard [--hook-json] | wait [--any] [--follow] [--seat S]
     | seats [--all] | seat rename <sid|oldname> <newname>
     | seat mute|unmute <room> [--seat S] | seat mutes [--seat S]
-    | claim|release <resource> | claims  [--room R]"""
+    | seat gc [--apply] | claim|release <resource> | claims  [--room R]"""
     args = list(args or [])
     # HELM_CHAT_ROOM homes a seat in a team channel (slice 3): every no---room
     # verb — posts, reads, join, deliver, the hooks pass no --room — defaults

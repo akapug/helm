@@ -798,18 +798,14 @@ def _env_file_value(path, key):
 
 
 def _resolve_homing(explicit_room=None):
-    """(room, source) for seat add/launch. CLI wins, then the inherited
-    launch seam, then the current git project. Only a derived choice carries
-    the marker; explicit choices clear any inherited derived provenance."""
-    if explicit_room is not None:
-        return explicit_room, None
-    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
-    if env_room:
-        source = "derived" if env_source == "derived" else None
-        return env_room, source
+    """(room, source) for seat add/launch — seats.resolve_homing is THE one
+    precedence (CLI wins, then the inherited launch seam, then the current
+    git project; never a private re-derivation). Only a derived choice
+    carries the marker into launch assets; explicit choices clear any
+    inherited derived provenance."""
     from . import seats
-    room = seats.derive_home_room(os.getcwd())
-    return room, "derived" if room else None
+    room, source = seats.resolve_homing(explicit_room, os.getcwd())
+    return room, ("derived" if source == "derived" else None)
 
 
 def _add_proxy_key(family, fam, args, room=None, room_source=None):
@@ -1240,42 +1236,6 @@ def _multi_from_launch(path):
         return False
 
 
-def _multi_from_launch(path):
-    """Recover the seat's mixed-model shape from launch.sh. --multi's durable
-    marker is the ABSENCE of the blunt CLAUDE_CODE_SUBAGENT_MODEL pin; every
-    single-model launch assigns it. Missing/unreadable assets default safely to
-    the normal pinned shape."""
-    try:
-        with open(path) as f:
-            return "CLAUDE_CODE_SUBAGENT_MODEL=" not in f.read()
-    except OSError:
-        return False
-
-
-def _multi_from_launch(path):
-    """Recover the seat's mixed-model shape from launch.sh. --multi's durable
-    marker is the ABSENCE of the blunt CLAUDE_CODE_SUBAGENT_MODEL pin; every
-    single-model launch assigns it. Missing/unreadable assets default safely to
-    the normal pinned shape."""
-    try:
-        with open(path) as f:
-            return "CLAUDE_CODE_SUBAGENT_MODEL=" not in f.read()
-    except OSError:
-        return False
-
-
-def _multi_from_launch(path):
-    """Recover the seat's mixed-model shape from launch.sh. --multi's durable
-    marker is the ABSENCE of the blunt CLAUDE_CODE_SUBAGENT_MODEL pin; every
-    single-model launch assigns it. Missing/unreadable assets default safely to
-    the normal pinned shape."""
-    try:
-        with open(path) as f:
-            return "CLAUDE_CODE_SUBAGENT_MODEL=" not in f.read()
-    except OSError:
-        return False
-
-
 def _resume(seat_name, rest):
     """seat resume <seat> — relaunch the seat's pane at its drain point via
     the detected metaharness: the pane runs the seat's freshly re-minted
@@ -1366,9 +1326,11 @@ def onboarding_prompt(seat_name, room=None):
     spawn paths (only the delivery differs). One line, no newlines (it rides
     `terminal send`/`pane run` as a single keystroke burst) and no secrets
     (it crosses the adapter seam). Content law: arm the beacon FIRST (the only
-    idle wake), read the home room, announce, take @<seat> work."""
-    r = room or "main"
-    flag = "" if r == "main" else " --room %s" % shlex.quote(r)
+    idle wake), read the home room, announce, take @<seat> work. room=None is
+    NOT 'main': the home derives at SessionStart join (seats.resolve_homing)
+    — the prompt says so instead of inventing a room the roster never wrote."""
+    r = room or "derived at join — `helm chat seats` shows it"
+    flag = "" if not room or room == "main" else " --room %s" % shlex.quote(room)
     return ("You are helm fleet seat '%(s)s' (home room %(r)s). Self-onboard "
             "now, in order: (1) ARM YOUR INBOX BEACON before anything else — "
             "Monitor(command: \"helm chat wait --seat %(s)s --follow\", "
@@ -1496,8 +1458,14 @@ def _register_spawn(seat_name, d, rec):
         return False
     try:
         from . import seats as _seats
-        _seats.write_roster(seat_name, cwd=rec.get("worktree"),
-                            home_room=rec.get("room"))
+        # Provenance rides into the mirror: a derived room stays derived (it
+        # may NEVER overwrite an explicit/operator home — write_roster's law);
+        # no room writes NO home (join derives the real one at SessionStart).
+        _seats.write_roster(
+            seat_name, cwd=rec.get("worktree"), home_room=rec.get("room"),
+            home_room_source=None if not rec.get("room")
+            else "derived" if rec.get("room_source") == "derived"
+            else "explicit")
     except Exception as e:
         print("helm seat: chat-roster mirror skipped (%s) — spawn.json is "
               "still authoritative for `helm seat where`" % e, file=sys.stderr)
@@ -1545,7 +1513,7 @@ def _spawn_plan(seat_name, d, launch_sh, room, cwd, onboard, ad):
               % ad.name)
     print("  register: %s {harness, %s, worktree=%s, room=%s}"
           % (_spawn_path(d), "pid" if ad is None else "handle", cwd,
-             room or "main"))
+             room or "(derived at join)"))
     print("  onboarding first-prompt:\n    " + onboard)
     return 0
 
@@ -1597,7 +1565,15 @@ def _spawn(seat_name, rest, _locked=False):
               "[--cwd DIR] [--print]" % arg_err, file=sys.stderr)
         return 2
     room, cwd, dry_run = parsed
-    room = room if room is not None else _room_from_launch(launch_sh)
+    # Room provenance rides with the room (roster-scatter class): an explicit
+    # --room / launch.sh HELM_CHAT_ROOM is explicit; a launch.sh room the
+    # seam stamped derived stays derived; NO room stays None — the roster
+    # mirror must not invent a 'main' home the SessionStart join would never
+    # have written (seats.resolve_homing derives the real one from cwd).
+    room_source = "explicit" if room is not None else None
+    if room is None:
+        room, room_source = _homing_from_launch(launch_sh)
+        room_source = room_source or ("explicit" if room else None)
     multi = _multi_from_launch(launch_sh)
     onboard = onboarding_prompt(seat_name, room)
     from . import harness
@@ -1632,8 +1608,9 @@ def _spawn(seat_name, rest, _locked=False):
                   "failed; the seat errors until `helm seat up %s`"
                   % (family, family), file=sys.stderr)
     from . import pk
-    rec = {"v": 1, "seat": seat_name, "worktree": cwd, "room": room or "main",
-           "launch_sh": launch_sh, "ts": pk.now_ts()}
+    rec = {"v": 1, "seat": seat_name, "worktree": cwd, "room": room,
+           "room_source": room_source, "launch_sh": launch_sh,
+           "ts": pk.now_ts()}
     if ad is None:
         try:
             pid = _headless_spawn(launch_sh, onboard, cwd,
@@ -1735,7 +1712,7 @@ def _where(seat_name, rest):
                               "detected here)" % rec.get("harness"))
     print("%s: %s %s — %s; worktree %s, room %s, spawned %s"
           % (seat_name, rec.get("harness"), ref, state, rec.get("worktree"),
-             rec.get("room"), rec.get("ts")))
+             rec.get("room") or "(derived at join)", rec.get("ts")))
     return 0
 
 

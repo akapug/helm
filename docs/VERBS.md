@@ -1634,6 +1634,14 @@ frames; this lane is called *delivery*.)
   all-room scope. Newly admitted rooms baseline at current EOF, so destination
   history and traffic accumulated while the seat was away never replay. The
   operator choice survives later project-derived SessionStart joins.
+- **`helm chat seat gc [--apply]`** — the MANUAL roster junk pruner (a verb
+  someone runs, never automatic; dry-run default). Prunes only rows with NO
+  live evidence: no presence beat within the reap window, no transcript for
+  ANY remembered session in any harness store, and no live process naming
+  one — the `/tmp` throwaway class. Refusal is the default and every probe
+  fails CLOSED (an unreadable process table prunes nothing). `--apply`
+  removes the row plus its derived seat state (cursors, `.seen`, stop
+  latches, the RAM DM lane).
 - **`helm chat claim <resource> [--ttl N] [--lease ID]` /
   `release <resource> --lease ID` / `claims`** — the advisory TTL lease
   (meld claims, minus the cap-gate): refused while another holder's lease is

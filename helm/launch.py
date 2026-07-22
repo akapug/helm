@@ -19,7 +19,7 @@ import re
 import socket
 import sys
 
-from . import home, homes, hooks, seats
+from . import homes, hooks, seats
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -108,11 +108,11 @@ def cmd_launch(args):
         home_path = targets[0][1]
         home_note(home_path, opts["home"])
     seat = opts["seat"] or os.environ.get("HELM_CHAT_NAME") or stable_seat()
-    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
-    room = opts["room"] or env_room or seats.derive_home_room(os.getcwd())
-    room_source = ("derived" if room and opts["room"] is None
-                   and (not env_room or env_source == "derived") else None)
-    room_explicit = opts["room"] is not None or bool(env_room and not room_source)
+    # seats.resolve_homing is THE one precedence (CLI --room > env seam >
+    # project derivation) — launch never re-derives its own copy.
+    room, source = seats.resolve_homing(opts["room"], os.getcwd())
+    room_source = "derived" if source == "derived" else None
+    room_explicit = source == "explicit"
     if opts["install"]:
         for name, path in ([(opts["home"], home_path)] if home_path
                            else hooks.claude_homes()):

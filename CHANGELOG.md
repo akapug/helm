@@ -2,6 +2,26 @@
 
 ## Unreleased (0.2)
 
+- Home-room scatter, as-prevented (owner mandate: "how they got scattered —
+  needs to be as-prevented"). A live roster held THREE `home_room` truths for
+  one team — `main` (the spawn mirror defaulted `room or "main"` and
+  `write_roster`'s unlabeled seam stamped it *explicit*), `<project>` (cwd
+  derivation), `<env room>` (the launch seam) — because four writers each
+  re-derived the precedence privately. Now `seats.resolve_homing()` is THE
+  one precedence (explicit CLI/operator room > `HELM_CHAT_ROOM` env, honoring
+  the seam's `derived` stamp > cwd git-project derivation) and every writer
+  (`seats.join`, `helm launch`, `helm seat add/launch/spawn`'s
+  `_resolve_homing`, the spawn-register roster mirror) resolves through it;
+  `write_roster` is the one enforcement gate and now tracks provenance on
+  every path: an UNLABELED `home_room` reads as *derived* (unknown provenance
+  takes the weakest tier), and a derived value can NEVER overwrite an
+  explicit/operator home — a re-join/resume/mirror never downgrades a
+  deliberate choice. The spawn record carries `room_source`, and a room-less
+  spawn writes NO home instead of inventing `main` (the SessionStart join
+  derives the real one). Plus `helm chat seat gc [--apply]` — the MANUAL
+  roster junk pruner (dry-run default, never automatic): prunes only rows
+  with no presence beat in the reap window, no transcript for any remembered
+  session, and no live process naming one; every probe fails CLOSED.
 - `helm todos` — the seat todo mirror: what every agent in the fleet is
   working on right now, without asking it. The recorder gains a todo leg
   that captures the CURRENT list off `TodoWrite` **and** the `Task*` family

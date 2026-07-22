@@ -302,6 +302,45 @@ class AdapterSpawnTest(SpawnBase):
         self.assertEqual(rc, 0, err)
         self.assertIs(wla.call_args.kwargs["multi"], False)
 
+    def test_room_less_spawn_mirror_never_invents_a_main_home(self):
+        """The 'main' scatter writer, as-prevented: no --room, no launch.sh
+        room -> the spawn record carries room=None and the roster mirror
+        writes NO home (the SessionStart join derives the real one)."""
+        d, _ = self._mint()                        # launch.sh without a room
+        fake = FakeAdapter()
+        rc, _, err, _, _ = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 0, err)
+        rec = json.load(open(os.path.join(d, "spawn.json")))
+        self.assertIsNone(rec["room"])             # never a defaulted 'main'
+        self.assertIsNone(rec["room_source"])
+        from helm import seats
+        row = seats.roster().get("codex") or {}
+        self.assertNotIn("home_room", row)
+        self.assertNotIn("home_room_source", row)
+
+    def test_derived_launch_room_mirror_cannot_downgrade_operator_home(self):
+        """A launch.sh room the seam stamped derived stays derived through the
+        spawn mirror — it must NEVER clobber a deliberate (explicit) home."""
+        from helm import seats
+        seats.join(session="s-pin", seat="codex", cwd="/tmp/p",
+                   room="team-ops")               # the deliberate home
+        d = seat._instance_dir("codex", "codex")
+        os.makedirs(d, exist_ok=True)
+        launch = os.path.join(d, "launch.sh")
+        with open(launch, "w") as f:
+            f.write("#!/bin/sh\nexec env FAKE=1 HELM_CHAT_ROOM=proj-x "
+                    "HELM_CHAT_ROOM_SOURCE=derived "
+                    "CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol claude \"$@\"\n")
+        os.chmod(launch, 0o700)
+        rc, _, err, _, _ = self._spawn(["codex"], FakeAdapter())
+        self.assertEqual(rc, 0, err)
+        rec = json.load(open(os.path.join(d, "spawn.json")))
+        self.assertEqual((rec["room"], rec["room_source"]),
+                         ("proj-x", "derived"))    # provenance recorded
+        row = seats.roster()["codex"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("team-ops", "explicit"))  # never downgraded
+
     def test_spawn_remints_legacy_launch_before_adapter_launch(self):
         """A pre-child-stamp launch.sh must be replaced from current code
         before the adapter starts it, or the child is born MEMORY-ONLY."""
