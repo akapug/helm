@@ -1062,10 +1062,6 @@ class ProcCensusTest(unittest.TestCase):
         self.assertEqual(rows, [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class HeadlessCensusTest(unittest.TestCase):
     """A headless one-shot is not an agent pane, and the census must not count
     it as one. Both populations share the symptom (no transcript on disk); only
@@ -1095,19 +1091,68 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertFalse(session._is_headless(
             ["claude", "--resume", "abc", "You are seat 'codex-3'; use -p sparingly"]))
 
+    def test_option_terminator_ends_the_flag_scan(self):
+        # past the standard `--` terminator every token is positional: a boot
+        # prompt exactly equal to -p/--print is prose there, never a flag
+        self.assertFalse(session._is_headless(["claude", "--", "-p"]))
+        self.assertFalse(session._is_headless(
+            ["claude", "--resume", "abc", "--", "--print"]))
+        # a real flag BEFORE the terminator still declares headless intent
+        self.assertTrue(session._is_headless(["claude", "-p", "--", "prompt"]))
+
     def test_headless_rows_leave_the_memory_only_census(self):
         rows = [{"pid": 1, "session": "sid-a", "headless": True},
                 {"pid": 2, "session": "sid-b", "headless": False}]
         got = session.memory_only_panes(rows=rows, persisting={})
         self.assertEqual([r["pid"] for r in got], [2])
 
+    def row(self, pid, session_id, headless):
+        return {"pid": pid, "resume": None, "declared": None,
+                "declared_reason": None, "session": session_id,
+                "possible_sessions": [], "child": False,
+                "ancestor_sid8": "", "force": False, "headless": headless}
+
+    def ls(self, rows, persisting, certify=False):
+        fn = session.cmd_doctor_panes if certify else session.cmd_ls
+        with mock.patch.object(session, "_proc_claude_rows", return_value=rows), \
+             mock.patch.object(session, "_persisting_sids",
+                               return_value=persisting):
+            return run(fn, [])
+
     def test_a_headless_row_is_still_rendered_not_hidden(self):
         # excluding from the COUNT must never mean hiding from the OPERATOR:
         # a helm seat running headless is a law violation and has to be visible
-        src = open(session.__file__.replace(".pyc", ".py")).read()
-        self.assertIn('state = "headless one-shot', src)
+        rc, out, err = self.ls([self.row(9, None, True)], {})
+        self.assertEqual(rc, 0, err)
+        self.assertIn("pid 9", out)
+        self.assertIn("headless one-shot", out)
+
+    def test_a_sessionless_headless_row_never_certifies_unknown(self):
+        # a headless row has no session BY DESIGN — it is not an unresolved
+        # pane, and doctor-panes --certify must not fail the estate over it
+        rc, out, err = self.ls([self.row(9, None, True)], {}, certify=True)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("headless one-shot", out)
+        self.assertNotIn("UNKNOWN", out)
+
+    def test_a_headless_row_never_manufactures_a_double_open(self):
+        # a one-shot carrying its parent's proven SID is not a second holder
+        rows = [self.row(1, "sid-x", False), self.row(2, "sid-x", True)]
+        self.assertEqual(session.live_sids(rows), {"sid-x": [1]})
+        rc, out, err = self.ls(rows, {"sid-x": __file__}, certify=True)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("DOUBLE-OPEN", out)
+        self.assertIn("persisted", out)
+        self.assertIn("headless one-shot", out)
 
     def test_an_unknown_row_still_never_enters_the_pass_bucket(self):
         # the headless exclusion must not weaken the tri-state guarantee
         rows = [{"pid": 3, "session": None, "headless": False}]
         self.assertEqual(session.memory_only_panes(rows=rows, persisting={}), [])
+        rc, out, err = self.ls([self.row(3, None, False)], {}, certify=True)
+        self.assertEqual(rc, 1)
+        self.assertIn("UNKNOWN", out)
+
+
+if __name__ == "__main__":
+    unittest.main()

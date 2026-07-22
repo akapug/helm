@@ -277,9 +277,17 @@ def _is_headless(argv):
 
     This narrows WHAT IS COUNTED, never what is allowed: a helm SEAT that shows
     up headless is still a law violation, and it stays visible in `session ls`
-    tagged as such rather than being hidden."""
-    return any(a in HEADLESS_FLAGS or a.startswith(("-p=", "--print="))
-               for a in argv)
+    tagged as such rather than being hidden.
+
+    Intent lives only in the OPTION region of argv: past the standard ``--``
+    terminator every token is positional (a boot prompt that happens to equal
+    ``-p`` is prose, not a flag), so scanning stops there."""
+    for a in argv:
+        if a == "--":
+            return False
+        if a in HEADLESS_FLAGS or a.startswith(("-p=", "--print=")):
+            return True
+    return False
 
 
 def _resume_sid(argv):
@@ -501,11 +509,13 @@ def _proc_claude_rows():
 def live_sids(rows=None):
     """{sid: [pid,...]} of proven live copies. The procStart-bound pid record
     wins, then canonical resume/who evidence. An inherited stamp SID is only the
-    spawning ancestor and never enters this map."""
+    spawning ancestor and never enters this map. HEADLESS one-shots never enter
+    either: they hold no resumable session by design, so a one-shot carrying
+    its parent's SID must not manufacture a false DOUBLE-OPEN."""
     out = {}
     for r in (rows if rows is not None else _proc_claude_rows()):
         sid = r.get("session") or r.get("resume")
-        if sid:
+        if sid and not r.get("headless"):
             out.setdefault(sid, []).append(r["pid"])
     return out
 
@@ -682,9 +692,14 @@ def _cmd_ls(args, certify=False):
     # at-risk count is only panes we RESOLVED and found transcript-less.
     disk = {r["pid"]: _sid_on_disk(r.get("session"), persisting)
             for r in rows if r.get("session")}
+    # HEADLESS one-shots are excluded from EVERY health count — memory-only,
+    # unknown, double-open — because they are not panes: no session BY DESIGN
+    # is neither an unresolved sid nor work at risk (see _is_headless). They
+    # stay rendered below; the exclusion narrows what is COUNTED, never what
+    # the operator can SEE.
     mo = memory_only_panes(rows, persisting)
-    unknown = [r for r in rows if not r.get("session")
-               or disk.get(r["pid"]) is None]
+    unknown = [r for r in rows if not r.get("headless")
+               and (not r.get("session") or disk.get(r["pid"]) is None)]
     live = live_sids(rows)
     dbl = {s: ps for s, ps in live.items() if len(ps) > 1}
     print("helm session ls — %d live claude panes" % len(rows))
@@ -692,7 +707,7 @@ def _cmd_ls(args, certify=False):
         sid = r.get("session") or r.get("resume")
         why = (" (rescued)" if r["force"] else " (stamped)" if r["child"] else "")
         if r.get("headless"):
-            # SHOWN, never hidden. Excluding it from the memory-only census is
+            # SHOWN, never hidden. Excluding it from the health counts above is
             # about what gets COUNTED; withholding it from the operator would
             # be about what can be SEEN, and a helm SEAT running headless is a
             # law violation that has to stay visible to be caught.
