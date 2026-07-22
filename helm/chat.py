@@ -86,6 +86,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import unicodedata
@@ -1149,37 +1150,46 @@ def cmd_chat(args):
             if not to:
                 print("helm chat: --dm wants a seat name", file=sys.stderr)
                 return 2
-        # REFUSE an unrecognised flag instead of POSTING it.
+        # REFUSE an unrecognised LEADING flag instead of POSTING it.
         #
-        # Everything not consumed above falls into the message body, so a
+        # Everything post does not consume falls into the message body, so a
         # misremembered flag does not fail — it publishes. Live 2026-07-22:
-        # six `--to <seat>` posts (there is no --to; the flag is --dm) went to
-        # #main as public messages whose body began "--to codex-orch", and the
-        # owner had to ask why his channel was full of them. `post --help`
-        # posted the literal string "--help" for the same reason.
+        # six `--to <seat>` posts went to #main as public messages, `post
+        # --help` posted the literal string "--help" fleet-wide for a day, and
+        # `-h` (single dash) broadcast the same way.
         #
-        # The cost is asymmetric and that is what decides it: refusing a real
-        # message costs one retype, while accepting a wrong flag broadcasts to
-        # everyone and cannot be unsent. A leading "--" is never message text
-        # anyone means; text that genuinely starts with a dash can still be
-        # sent via stdin, which skips this path entirely.
-        # Derived from what post ACTUALLY consumes above, never from what it
-        # looks like it should accept. `--text` was in an earlier draft of this
-        # list and is consumed NOWHERE — whitelisting it would have preserved
-        # the exact bug for the one seat that uses it.
+        # SCOPE (xrev-corrected): only the LEADING OPTION POSITIONS are
+        # policed — scanning the whole body made ordinary prose about CLI
+        # flags unsendable ("please use --force carefully" was refused). The
+        # scan stops at the first token that is not flag-shaped, and an
+        # explicit `--` ends options POSIX-style so even a body that BEGINS
+        # with a flag-shaped token can be sent deliberately. Flag-shape is
+        # -{1,2}<letter>, so prose starters like "-" bullets, "->" arrows and
+        # em-dashes are body, never flags.
         KNOWN = ("--room", "--seat", "--dm", "--reply-to")
-        for a in args[1:]:
-            if a.startswith("--") and a not in KNOWN:
-                print("helm chat: unknown flag %s — REFUSING to post it as text."
-                      % a, file=sys.stderr)
-                print("  post accepts: %s" % ", ".join(KNOWN), file=sys.stderr)
-                if a in ("--to", "--recipient", "--text"):
-                    print("  to reach ONE seat privately use --dm %s; without it "
-                          "every post is PUBLIC to the room." % a, file=sys.stderr)
-                elif a in ("--help", "-h"):
-                    print("  usage: helm chat post <text...> [--room R] [--seat S] "
-                          "[--dm SEAT] [--reply-to <id|n>]", file=sys.stderr)
-                return 2
+        k = 1
+        while k < len(args):
+            a = args[k]
+            if a == "--":               # end of options; the rest is body
+                del args[k]
+                break
+            if not re.match(r"^-{1,2}[A-Za-z]", a):
+                break                    # body begins
+            # every KNOWN flag was consumed above, so any surviving
+            # flag-shaped leading token is unrecognised by construction
+            print("helm chat: unknown flag %s — REFUSING to post it as text."
+                  % a, file=sys.stderr)
+            print("  post accepts: %s" % ", ".join(KNOWN), file=sys.stderr)
+            if a in ("--to", "--recipient", "--text"):
+                print("  to reach ONE seat privately use --dm <seat>; without "
+                      "it every post is PUBLIC to the room.", file=sys.stderr)
+            elif a in ("--help", "-h"):
+                print("  usage: helm chat post <text...> [--room R] [--seat S] "
+                      "[--dm SEAT] [--reply-to <id|n>]", file=sys.stderr)
+            else:
+                print("  to send a message that STARTS with a flag-shaped "
+                      "token, put `--` before it.", file=sys.stderr)
+            return 2
         text = " ".join(args[1:]).strip()
         if not text and not sys.stdin.isatty():
             text = sys.stdin.read().strip()

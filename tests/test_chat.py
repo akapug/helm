@@ -267,18 +267,13 @@ class RowIntegrityTest(ChatBase):
         self.assertEqual(rows[0]["text"], "padding")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PostUnknownFlagTest(ChatBase):
-    """post REFUSES an unrecognised flag instead of publishing it.
-
-    Everything post does not consume falls into the message body, so a
-    misremembered flag does not fail — it BROADCASTS. Live 2026-07-22: six
-    `--to <seat>` posts (the flag is --dm) landed in #main as public messages
-    whose body began "--to codex-orch", and `post --help` had been posting the
-    literal string "--help" across the fleet for a day before anyone noticed."""
+    """post REFUSES an unrecognised LEADING flag instead of publishing it —
+    and ONLY leading flags: the body is prose and may talk about flags freely.
+    All three xrev findings on the first cut are pinned here: whole-body
+    scanning made flag-prose unsendable, single-dash flags still broadcast,
+    and the tests sat after the __main__ guard where direct unittest
+    execution never discovered them (this class now precedes it)."""
 
     def _post(self, *args):
         import contextlib
@@ -294,37 +289,48 @@ class PostUnknownFlagTest(ChatBase):
         rc, err = self._post("--to", "codex-orch", "hello")
         self.assertEqual(rc, 2)
         self.assertIn("--to", err)
-        self.assertEqual(self._rows(), [])          # nothing published
+        self.assertEqual(self._rows(), [])
 
-    def test_the_refusal_names_the_real_addressing_flag(self):
-        _, err = self._post("--to", "someone", "hi")
-        self.assertIn("--dm", err)
+    def test_single_dash_flags_are_refused_too(self):
+        # xrev: startswith("--") left `-h` and `-x` broadcasting
+        for flag in ("-h", "-x"):
+            rc, _ = self._post(flag)
+            self.assertEqual(rc, 2, flag)
+        self.assertEqual(self._rows(), [])
 
-    def test_help_is_refused_rather_than_broadcast(self):
+    def test_help_gets_usage_not_a_broadcast(self):
         rc, err = self._post("--help")
         self.assertEqual(rc, 2)
         self.assertIn("usage:", err)
         self.assertEqual(self._rows(), [])
 
-    def test_text_is_refused_because_post_never_consumed_it(self):
-        # --text appeared in an early draft of the whitelist; it is consumed
-        # NOWHERE, so allowing it would have preserved the bug verbatim
-        rc, _ = self._post("--text", "@david", "hi")
-        self.assertEqual(rc, 2)
-        self.assertEqual(self._rows(), [])
+    def test_prose_about_flags_is_sendable(self):
+        # xrev: the first cut scanned the WHOLE body, so ordinary dev chat
+        # about CLI flags was unsendable outside stdin
+        rc, _ = self._post("--seat", "tester", "please", "use", "--force", "carefully")
+        self.assertEqual(rc, 0)
+        self.assertIn("--force", self._rows()[0]["text"])
+
+    def test_double_dash_delimiter_sends_a_flag_shaped_body(self):
+        rc, _ = self._post("--seat", "tester", "--", "--to", "is", "not", "a", "flag")
+        self.assertEqual(rc, 0)
+        self.assertTrue(self._rows()[0]["text"].startswith("--to"))
+
+    def test_prose_dash_starters_are_body_not_flags(self):
+        # "-" bullets and "->" arrows are not flag-shaped
+        rc, _ = self._post("--seat", "tester", "->", "see", "the", "board")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_the_refusal_names_the_real_addressing_flag(self):
+        _, err = self._post("--to", "someone", "hi")
+        self.assertIn("--dm", err)
 
     def test_a_plain_message_still_posts(self):
         rc, _ = self._post("--seat", "tester", "an ordinary message")
         self.assertEqual(rc, 0)
         self.assertEqual(len(self._rows()), 1)
-        self.assertIn("an ordinary message", self._rows()[0]["text"])
 
-    def test_every_whitelisted_flag_is_genuinely_consumed(self):
-        # the whitelist must be derived from what post CONSUMES, never from
-        # what it looks like it should accept — that gap is the whole bug
-        src = open(chat.__file__.replace(".pyc", ".py")).read()
-        body = src.split("KNOWN = ")[1].split(")")[0]
-        for flag in ("--room", "--seat", "--dm", "--reply-to"):
-            self.assertIn(flag, body)
-            self.assertGreaterEqual(src.count('"%s"' % flag), 2,
-                                    "%s is whitelisted but not consumed" % flag)
+
+if __name__ == "__main__":
+    unittest.main()
