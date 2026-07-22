@@ -331,6 +331,81 @@ class ReactTest(V2Base):
         self.assertIn("reacted 🚀", out.getvalue())
 
 
+class ReactToggleTest(V2Base):
+    """The confirmed multi-bug (four identical ❤️ rows from one owner click):
+    toggle idempotency + reactor identity attestation."""
+
+    def _counts(self, m):
+        rows, _total = chat.read()
+        _msgs, reacts = chat.thread(rows)
+        return reacts.get(chat.rkey(m), {})
+
+    def test_double_react_nets_to_at_most_one(self):
+        m = chat.post("hi", who="a1")
+        chat.react(1, ":tada:", who="david")
+        self.assertEqual(self._counts(m), {"🎉": 1})    # first click adds
+        row, err = chat.react(1, ":tada:", who="david")  # the retry/re-click
+        self.assertIsNone(err)
+        self.assertTrue(row["un"])                       # a tombstone, not a dup
+        self.assertEqual(self._counts(m), {})            # toggle-off removes
+        chat.react(1, ":tada:", who="david")             # third click re-adds
+        self.assertEqual(self._counts(m), {"🎉": 1})     # never more than one
+
+    def test_two_seats_counted_and_attributed_distinctly(self):
+        m = chat.post("hi", who="a1")
+        chat.react(1, ":fire:", who="codex-a")
+        chat.react(1, ":fire:", who="opus-b")
+        self.assertEqual(self._counts(m), {"🔥": 2})     # distinct reactors stack
+        rows, _t = chat.read()
+        self.assertEqual([r["from"] for r in rows if r.get("react")],
+                         ["codex-a", "opus-b"])          # attribution preserved
+        chat.react(1, ":fire:", who="codex-a")           # one seat toggles off
+        self.assertEqual(self._counts(m), {"🔥": 1})     # the other still counts
+
+    def test_render_collapses_legacy_duplicates(self):
+        # the exact bad data in the wild: FOUR identical add rows from one click
+        m = chat.post("hi", who="a1")
+        for _ in range(4):
+            chat._append({"ts": "2026-07-21T10:00:00", "from": "david",
+                          "react": "❤️", "tts": m["ts"], "tfrom": "a1"}, "main")
+        self.assertEqual(self._counts(m), {"❤️": 1})    # legend self-heals on read
+        chat.react(1, "❤️", who="david")                 # next click sees ON ->
+        self.assertEqual(self._counts(m), {})            # one tombstone clears all 4
+
+    def test_signed_react_binds_the_reactor_identity(self):
+        m = chat.post("hi", who="a1")
+        with mock.patch.object(chat, "_sign_send", return_value=(SENT, None)) as ss:
+            row, err = chat.react(1, ":tada:", who="a2", profile="a2", sign=True)
+        self.assertIsNone(err)
+        self.assertEqual((row["from"], row["chain"]), ("a2", 7))
+        # the digest binds WHO reacted, not just what — forgery-evident
+        ss.assert_called_once_with(
+            chat.digest_payload("react|%s|a1|🎉|a2" % m["ts"]), "a2")
+        self.assertNotIn("[unsigned]", chat._fmt(row))
+        # fail-open: the unsigned path still lands, visibly unattested
+        row2, err2 = chat.react(1, ":fire:", who="a3")
+        self.assertIsNone(err2)
+        self.assertNotIn("chain", row2)
+        self.assertIn("[unsigned]", chat._fmt(row2))
+
+    def test_cli_react_and_post_honor_seat(self):
+        chat.post("hi", who="a1")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                chat.cmd_chat(["react", "1", ":tada:", "--seat", "codex-a"]), 0)
+            self.assertEqual(
+                chat.cmd_chat(["post", "seated", "--seat", "codex-a"]), 0)
+        rows, _t = chat.read()
+        self.assertEqual(rows[1]["from"], "codex-a")     # the react row
+        self.assertEqual(rows[2]["from"], "codex-a")     # the post row
+        self.assertIn("codex-a reacted 🎉", out.getvalue())
+        # toggle-off renders as an un-react, still attributed
+        with contextlib.redirect_stdout(out):
+            chat.cmd_chat(["react", "1", ":tada:", "--seat", "codex-a"])
+        self.assertIn("codex-a un-reacted 🎉", out.getvalue())
+
+
 class LogFlushTest(V2Base):
     def _log_files(self):
         d = chat.journal_dir()

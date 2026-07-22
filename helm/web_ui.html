@@ -2318,12 +2318,17 @@ function chatRow(m) {
 }
 
 function chatApplyReact(m) {
-  // a reaction row: tally it under its target (skip when the target rotated out)
+  // a reaction row: last-row-wins per (reactor, emoji) — mirrors chat.py's
+  // _react_state toggle semantics. Duplicated historical rows collapse to one
+  // and an {un: true} tombstone clears the pair (skip when the target rotated out)
   const k = (m.tts || "") + "|" + (m.tfrom || "");
-  (CHAT_REACTS[k] = CHAT_REACTS[k] || {})[m.react] = (CHAT_REACTS[k] || {})[m.react] + 1 || 1;
+  const by = (CHAT_REACTS[k] = CHAT_REACTS[k] || {});
+  (by[m.react] = by[m.react] || {})[m.from || "?"] = !m.un;
   const div = $("#chatlog").querySelector('.chatmsg[data-key="' + CSS.escape(k) + '"]');
   if (!div) return;
-  div.querySelector(".creacts").innerHTML = Object.entries(CHAT_REACTS[k])
+  div.querySelector(".creacts").innerHTML = Object.entries(by)
+    .map(([e, who]) => [e, Object.values(who).filter(Boolean).length])
+    .filter(([, n]) => n > 0)
     .map(([e, n]) => "<span>" + esc(e) + "×" + n + "</span>").join("");
 }
 

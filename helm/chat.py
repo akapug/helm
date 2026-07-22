@@ -34,7 +34,12 @@ high-water mark, disable with HELM_CHAT_LOG=0. Never called from send/read.
 
 Emojis (PRD addendum): shortcodes expand at post time on every surface
 (:fire: -> 🔥, emoji.py), reactions ride the same transport as typed rows
-{react, tts, tfrom} rendered inline under their target.
+{react, tts, tfrom} rendered inline under their target. Reacting is a TOGGLE
+per (reactor, emoji, target): the second identical react appends a tombstone
+row ({un: true}) instead of a duplicate, and every renderer aggregates
+last-row-wins per reactor — so historical duplicate rows self-heal to one on
+read. The reactor's identity rides the signed digest (react|tts|tfrom|emoji|
+reactor) when a signer is available; unsigned reacts still land, tagged.
 
 The notify loop: the owner's post (web panel or `helm --human`) drops
 <room>.owner-unread (the message count at post time); the shipped
@@ -425,10 +430,20 @@ def _touch_poster_presence(name):
 
 
 def react(target, code, room="main", who=None, profile=None, sign=None):
-    """Attach a reaction. target: 1-based message ordinal (negatives count
+    """TOGGLE a reaction. target: 1-based message ordinal (negatives count
     from the end) or an explicit (ts, from) pair (the web panel's form).
     `code` is a :shortcode: or a raw emoji. Returns (row, None) or
-    (None, reason). Rides the same transport as a post."""
+    (None, reason). Rides the same transport as a post.
+
+    Idempotent toggle: re-reacting with the same (reactor, emoji) on the same
+    target appends a TOMBSTONE row ({un: true}) — first click adds, second
+    removes, never a duplicate (the standard reaction UX; a UI re-render or
+    retry can no longer mint phantom counts). The reactor is `who` (the seat
+    threaded through by the caller — web/TUI name themselves, the CLI passes
+    --seat) with whoname() only as the ambient agent fallback, and the signed
+    digest binds that identity: react|tts|tfrom|emoji|reactor. Fail-open —
+    no signer just means the row renders [unsigned], attested vs not stays
+    distinguishable."""
     e = (code or "").strip()
     from . import emoji
     if not any(ord(c) > 127 for c in e):   # shortcode form -> expand it
@@ -447,10 +462,28 @@ def react(target, code, room="main", who=None, profile=None, sign=None):
         t = msgs[target - 1 if target > 0 else target]
         tts, tfrom = t.get("ts"), t.get("from")
     _ensure_dir()
-    row = {"ts": pk.now_ts(), "from": who or whoname(), "react": e,
+    reactor = who or whoname()
+    on = _react_state(rows).get(("%s|%s" % (tts, tfrom), reactor, e))
+    row = {"ts": pk.now_ts(), "from": reactor, "react": e,
            "tts": tts, "tfrom": tfrom}
-    payload = "react|%s|%s|%s" % (tts, tfrom, e)
+    if on:
+        row["un"] = True   # toggle OFF — the tombstone every renderer honors
+    payload = "%s|%s|%s|%s|%s" % ("unreact" if on else "react",
+                                  tts, tfrom, e, reactor)
     return _append(_signed_row(row, payload, profile, sign), room), None
+
+
+def _react_state(rows):
+    """(target-key, reactor, emoji) -> True while the reaction is ON — the
+    LAST row wins. Any pile of duplicated add rows (the pre-toggle bug's
+    residue) is still just ON, and one tombstone turns the whole pile OFF:
+    render self-heals the historical data instead of migrating it."""
+    state = {}
+    for m in rows:
+        if m.get("react"):
+            state[("%s|%s" % (m.get("tts") or "", m.get("tfrom") or ""),
+                   m.get("from") or "", m["react"])] = not m.get("un")
+    return state
 
 
 def _rotate(path, cap=None):
@@ -504,14 +537,15 @@ def rkey(m):
 
 def thread(rows):
     """rows -> (messages, reacts) where reacts["ts|from"] = {emoji: count} —
-    the aggregation the TUI and any batch renderer draws under each message."""
+    the aggregation the TUI and any batch renderer draws under each message.
+    Counts are per-REACTOR (dedup by (from, emoji), tombstones drop the pair):
+    duplicate historical rows collapse to one and toggled-off reacts vanish."""
     msgs = [m for m in rows if not m.get("react")]
     reacts = {}
-    for m in rows:
-        if m.get("react"):
-            k = "%s|%s" % (m.get("tts") or "", m.get("tfrom") or "")
+    for (k, _reactor, e), on in _react_state(rows).items():
+        if on:
             reacts.setdefault(k, {})
-            reacts[k][m["react"]] = reacts[k].get(m["react"], 0) + 1
+            reacts[k][e] = reacts[k].get(e, 0) + 1
     return msgs, reacts
 
 
@@ -551,8 +585,10 @@ def _fmt(m, hhmm=True):
     stamp = (ts[11:16] or "--:--") if hhmm else (ts or "?")
     tag = "" if m.get("chain") is not None else " [unsigned]"
     if m.get("react"):
-        return "%s %s reacted %s -> %s@%s%s" % (
-            stamp, m.get("from") or "?", m["react"], m.get("tfrom") or "?",
+        return "%s %s %s %s -> %s@%s%s" % (
+            stamp, m.get("from") or "?",
+            "un-reacted" if m.get("un") else "reacted",
+            m["react"], m.get("tfrom") or "?",
             str(m.get("tts") or "")[11:16] or "--:--", tag)
     return "%s %s: %s%s" % (stamp, m.get("from") or "?", m.get("text") or "", tag)
 
@@ -645,9 +681,10 @@ def _fmt_body(m):
     """The log line's tail: sender + content + signature note, full fidelity."""
     tag = (" {chain %s}" % m["chain"]) if m.get("chain") is not None else " [unsigned]"
     if m.get("react"):
-        return "%s reacted %s -> %s@%s%s" % (m.get("from") or "?", m["react"],
-                                             m.get("tfrom") or "?",
-                                             m.get("tts") or "?", tag)
+        return "%s %s %s -> %s@%s%s" % (m.get("from") or "?",
+                                        "un-reacted" if m.get("un") else "reacted",
+                                        m["react"], m.get("tfrom") or "?",
+                                        m.get("tts") or "?", tag)
     return "%s: %s%s" % (m.get("from") or "?", m.get("text") or "", tag)
 
 
@@ -662,9 +699,22 @@ SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "seat",
                                                # the 0.3 council deferral)
 
 
+def _seat_flag(args):
+    """Pop `--seat S` out of a verb's argv: the caller's DECLARED identity,
+    threaded into who= AND profile= so the row records the true reactor and
+    the signer attests it (same identity plumbing as a post). None when
+    absent — the ambient whoname() fallback stays for un-seated calls."""
+    if "--seat" not in args:
+        return None
+    i = args.index("--seat")
+    v = args[i + 1] if i + 1 < len(args) else None
+    del args[i:i + 2]
+    return v
+
+
 def cmd_chat(args):
-    """chat post <text...> | read [--since N] [--follow] | rooms |
-    react <n> <emoji> | log-flush | node up|down|status |
+    """chat post <text...> [--seat S] | read [--since N] [--follow] | rooms |
+    react <n> <emoji> [--seat S] | log-flush | node up|down|status |
     meld invite|join|recv|say|status |
     join|deliver|stop-guard [--hook-json] | wait [--any] [--follow] [--seat S]
     | seats [--all] | seat rename <sid|oldname> <newname>
@@ -696,13 +746,16 @@ def cmd_chat(args):
         from . import seats
         return seats.cmd(verb, args[1:], room)
     if verb == "post":
+        seat = _seat_flag(args)
         text = " ".join(args[1:]).strip()
         if not text and not sys.stdin.isatty():
             text = sys.stdin.read().strip()
         if not text:
-            print("usage: helm chat post <text...> [--room R]", file=sys.stderr)
+            print("usage: helm chat post <text...> [--room R] [--seat S]",
+                  file=sys.stderr)
             return 2
-        print("helm chat [%s] %s" % (room, _fmt(post(text, room))))
+        print("helm chat [%s] %s"
+              % (room, _fmt(post(text, room, who=seat, profile=seat))))
         return 0
     if verb == "read":
         since = 0
@@ -722,16 +775,18 @@ def cmd_chat(args):
         consume(room, total)
         return 0
     if verb == "react":
+        seat = _seat_flag(args)
         if len(args) < 3:
             print("usage: helm chat react <n> <:shortcode:|emoji> [--room R] "
-                  "(n counts messages, 1-based; -1 = latest)", file=sys.stderr)
+                  "[--seat S] (n counts messages, 1-based; -1 = latest; "
+                  "same react again toggles it off)", file=sys.stderr)
             return 2
         try:
             n = int(args[1])
         except ValueError:
             print("helm chat: react wants a message number", file=sys.stderr)
             return 2
-        row, err = react(n, args[2], room)
+        row, err = react(n, args[2], room, who=seat, profile=seat)
         if err:
             print("helm chat: " + err, file=sys.stderr)
             return 1
