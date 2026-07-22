@@ -1151,6 +1151,63 @@ class HeadlessCensusTest(unittest.TestCase):
                                  "--resume", "--resume=bad"]),
             self.SID_A)
 
+    def test_short_resume_alias_attributes_the_holder(self):
+        # codex advisory HIGH: the real CLI resumes via `-r <sid>`, attached
+        # `-r<sid>`, and cluster `-pr <sid>` (commander splits boolean shorts
+        # off before a value-taking one) — all measured against the binary.
+        # A holder spawned through the short alias must not silently vanish.
+        self.assertEqual(
+            session._resume_sid(["claude", "-r", self.SID_A]), self.SID_A)
+        self.assertEqual(
+            session._resume_sid(["claude", "-r" + self.SID_A]), self.SID_A)
+        self.assertEqual(
+            session._resume_sid(["claude", "-pr", self.SID_A]), self.SID_A)
+        # `-pr` is print mode too, and `-cp` splits into --continue --print
+        self.assertTrue(session._is_headless(["claude", "-pr", self.SID_A]))
+        self.assertTrue(session._is_headless(["claude", "-cp"]))
+        # `-c` alone continues; it is neither print mode nor a resume
+        self.assertFalse(session._is_headless(["claude", "-c"]))
+        self.assertIsNone(session._resume_sid(["claude", "-c"]))
+
+    def test_short_resume_alias_is_fail_closed(self):
+        # the lane's poison law holds for the alias exactly as for the long
+        # form: bare/trailing, invalid value, and mixed valid+invalid all
+        # yield UNKNOWN. `-r=X` carries the LITERAL value `=X` (the CLI does
+        # not strip `=` on short flags — measured: rejected as not a UUID),
+        # and `-rp` resumes by TITLE "p", unresolvable from argv.
+        for argv in (["claude", "-r"],
+                     ["claude", "-r", self.SID_A, "-r"],
+                     ["claude", "-r=" + self.SID_A],
+                     ["claude", "-rp"],
+                     ["claude", "-r", self.SID_A, "--resume=bad"],
+                     ["claude", "-r", self.SID_A, "-r", self.SID_B]):
+            self.assertIsNone(session._resume_sid(argv), argv)
+        # same value through both spellings is agreement, not conflict
+        self.assertEqual(
+            session._resume_sid(["claude", "-r", self.SID_A,
+                                 "--resume", self.SID_A]),
+            self.SID_A)
+
+    def test_unmapped_short_clusters_stay_opaque(self):
+        # `-d [filter]` swallows its cluster remainder, so `-dr` is a debug
+        # filter "r" — it must neither mint a resume nor poison a real one
+        self.assertIsNone(session._resume_sid(["claude", "-dr"]))
+        self.assertEqual(
+            session._resume_sid(["claude", "-dr", "--resume", self.SID_A]),
+            self.SID_A)
+        self.assertFalse(session._is_headless(["claude", "-dp"]))
+
+    def test_short_aliases_are_prose_past_the_terminator(self):
+        # the option-region law is alias-blind: post-terminator `-r`/`-pr`
+        # tokens are prompt prose, never identity and never poison
+        self.assertIsNone(session._resume_sid(
+            ["claude", "-p", "--", "-r", self.SID_A]))
+        self.assertEqual(
+            session._resume_sid(["claude", "-r", self.SID_A, "--",
+                                 "-r", self.SID_B, "-r"]),
+            self.SID_A)
+        self.assertFalse(session._is_headless(["claude", "--", "-pr"]))
+
     def test_option_terminator_ends_the_flag_scan(self):
         # past the standard `--` terminator every token is positional: a boot
         # prompt exactly equal to -p/--print is prose there, never a flag

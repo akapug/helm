@@ -255,12 +255,57 @@ def _proc_snapshot(pid):
 HEADLESS_FLAGS = ("-p", "--print")
 NONPERSISTENT_FLAG = "--no-session-persistence"
 
+# The claude CLI's short aliases, measured against the real binary 2026-07-22:
+# `-r <sid>` and `-r<sid>` both resume (commander attaches the token
+# remainder as the value, so `-r=<sid>` carries the LITERAL value `=<sid>` —
+# rejected: "Provided value \"=<sid>\" is not a UUID"), and commander splits
+# boolean shorts off a cluster before a value-taking one, so `-pr <sid>`
+# resumes in print mode. Booleans commander splits off; value-takers consume
+# the cluster remainder. Shorts absent from both maps (`-d [filter]`,
+# `-w [name]`, `-n <name>`) swallow the remainder themselves, so their
+# clusters stay OPAQUE — `-dr` is a debug filter, never a resume.
+_SHORT_BOOL = {"c": "--continue", "p": "--print"}
+_SHORT_VALUED = {"r": "--resume"}
+
+
+def _expand_options(argv):
+    """argv with every OPTION-region short cluster rewritten to canonical
+    long form, exactly as commander parses it: leading boolean shorts split
+    off one by one, then a value-taking short absorbs the remainder as its
+    attached value (`-pr X` -> `--print --resume X`; `-rX` -> `--resume=X`;
+    `-r=X` -> the literal value `=X`, invalid, poisoning downstream). A
+    cluster led by an unmapped short stays verbatim — its remainder belongs
+    to THAT flag, and minting a resume or a mode out of it would attribute
+    identity the CLI never granted. Past the standard ``--`` terminator every
+    token is positional prose and passes through untouched, so the scanners'
+    option-region law is preserved verbatim."""
+    out = []
+    for i, arg in enumerate(argv):
+        if arg == "--":
+            out.extend(argv[i:])
+            break
+        if len(arg) > 1 and arg[0] == "-" and arg[1] != "-":
+            rest = arg[1:]
+            while rest and rest[0] in _SHORT_BOOL:
+                out.append(_SHORT_BOOL[rest[0]])
+                rest = rest[1:]
+            if rest and rest[0] in _SHORT_VALUED:
+                long = _SHORT_VALUED[rest[0]]
+                out.append(long if len(rest) == 1 else long + "=" + rest[1:])
+            elif rest:
+                out.append("-" + rest)
+            continue
+        out.append(arg)
+    return out
+
 
 def _argv_flag(argv, names, prefixes=()):
     """Flag presence in the OPTION region of argv only: past the standard
     ``--`` terminator every token is positional (a boot prompt that happens to
-    equal ``-p`` is prose, not a flag), so scanning stops there."""
-    for a in argv:
+    equal ``-p`` is prose, not a flag), so scanning stops there. Short
+    clusters are expanded first, so `-pr <sid>` declares print mode exactly
+    as `-p` does — the short alias of a flag is the flag."""
+    for a in _expand_options(argv):
         if a == "--":
             return False
         if a in names or (prefixes and a.startswith(prefixes)):
@@ -358,18 +403,24 @@ def _inherited_hint_worker(r):
 
 
 def _resume_sid(argv):
-    """One unambiguous full UUID from the OPTION region of argv. The scan
-    honors the standard ``--`` terminator under the same law as _argv_flag:
-    past it every token is positional prose, so `claude -p -- --resume <uuid>`
-    carries prompt text, never a session identity — and post-terminator prose
-    can never conflict away a real pre-terminator resume. Within the option
-    region the parse is FAIL-CLOSED over every ``--resume`` occurrence: a
-    bare/trailing ``--resume``, a flag consumed as its value, a prefix or
-    otherwise invalid value, and conflicting repeats each poison the WHOLE
-    parse — a valid occurrence beside an invalid one is contradictory
-    evidence, not a majority vote. A false holder is worse than falling
-    through to another rung."""
+    """One unambiguous full UUID from the OPTION region of argv. Short
+    aliases are expanded first (`-r <sid>`, attached `-r<sid>`, and cluster
+    forms like `-pr <sid>` all resume — measured against the real CLI), so a
+    holder spawned through the short alias never silently vanishes from the
+    census. The scan honors the standard ``--`` terminator under the same law
+    as _argv_flag: past it every token is positional prose, so `claude -p --
+    --resume <uuid>` carries prompt text, never a session identity — and
+    post-terminator prose can never conflict away a real pre-terminator
+    resume. Within the option region the parse is FAIL-CLOSED over every
+    resume occurrence, short or long: a bare/trailing ``--resume``/``-r``, a
+    flag consumed as its value, a prefix or otherwise invalid value (`-r=X`
+    carries the literal value `=X`; `-rp` resumes by TITLE "p", unresolvable
+    from argv), and conflicting repeats each poison the WHOLE parse — a valid
+    occurrence beside an invalid one is contradictory evidence, not a
+    majority vote. A false holder is worse than falling through to another
+    rung."""
     found = []
+    argv = _expand_options(argv)
     for i, arg in enumerate(argv):
         if arg == "--":
             break
