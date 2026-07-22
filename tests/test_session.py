@@ -965,6 +965,15 @@ class ProcSnapshotTest(unittest.TestCase):
         with mock.patch.object(session, "_proc_matches", return_value=False):
             self.assertIsNone(session._proc_snapshot(41))
 
+    def test_snapshot_captures_stdin_redirection(self):
+        # fd/0 is the print-mode evidence _proc_claude_rows composes into
+        # `headless`; unreadable fd stays None (proves nothing)
+        base = self.plant()
+        self.assertIsNone(session._proc_snapshot(41)["stdin"])
+        os.makedirs(os.path.join(base, "fd"))
+        os.symlink("pipe:[777]", os.path.join(base, "fd", "0"))
+        self.assertEqual(session._proc_snapshot(41)["stdin"], "pipe:[777]")
+
     def test_environment_change_breaks_process_bracket(self):
         self.plant()
         snap = session._proc_snapshot(41)
@@ -1061,6 +1070,30 @@ class ProcCensusTest(unittest.TestCase):
                          {41: (self.NEW, "record-ok", "/cfg")}, matches=False)
         self.assertEqual(rows, [])
 
+    def test_a_piped_spawn_without_p_is_still_a_sessionless_oneshot(self):
+        # the CLI enters print mode by itself when stdin is not a terminal,
+        # so the census composes the argv scan with the proven stdin
+        # redirection: the legit piped one-shot that omitted -p keeps its
+        # certification green even after headless joined the sessionless
+        # conjunct
+        snap = self.snap(argv=["claude", "--no-session-persistence"])
+        snap["stdin"] = "pipe:[4242]"
+        row = self.rows([snap], {41: (None, "record-missing", "/cfg")})[0]
+        self.assertTrue(row["headless"])
+        self.assertTrue(row["nonpersistent"])
+        self.assertTrue(session._sessionless_oneshot(row))
+
+    def test_a_tty_pane_with_the_inert_flag_stays_a_pane(self):
+        # the other direction of the same conjunct: on a live terminal the
+        # flag is inert, print mode never engages, and the row must stay in
+        # the census as an unresolved pane rather than certify sessionless
+        snap = self.snap(argv=["claude", "--no-session-persistence"])
+        snap["stdin"] = "/dev/pts/7"
+        row = self.rows([snap], {41: (None, "record-missing", "/cfg")})[0]
+        self.assertFalse(row["headless"])
+        self.assertTrue(row["nonpersistent"])
+        self.assertFalse(session._sessionless_oneshot(row))
+
 
 class HeadlessCensusTest(unittest.TestCase):
     """A SESSIONLESS one-shot is not an agent pane, and the census must not
@@ -1090,6 +1123,48 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertTrue(session._is_nonpersistent(["claude", "--no-session-persistence"]))
         self.assertTrue(session._is_headless(["claude", "-p", "hi"]))
         self.assertFalse(session._is_nonpersistent(["claude", "-p", "hi"]))
+
+    def test_the_inert_flag_outside_print_mode_never_certifies(self):
+        # fable review MED: the CLI documents --no-session-persistence
+        # '(only works with --print)' — in an interactive pane the flag is
+        # INERT and a real session persists, so the flag alone must never
+        # green the row. Sessionless is proven only by flag AND print mode.
+        self.assertFalse(session._sessionless_oneshot(
+            {"headless": False, "nonpersistent": True, "identity": "unknown",
+             "declared": None, "resume": None}))
+
+    def test_stdin_redirection_is_print_mode_evidence(self):
+        # measured 2026-07-22: `claude </dev/null` with no flags errors 'when
+        # using --print' — the CLI enters print mode on its own when stdin is
+        # not a terminal, so a piped spawn that omitted -p is still headless.
+        # An absent/unreadable target proves nothing and fails interactive —
+        # the direction that refuses certification, never the one that greens.
+        for target in ("pipe:[4242]", "socket:[9]", "/dev/null", "/tmp/in"):
+            self.assertTrue(session._stdin_redirected(target), target)
+        for target in ("/dev/pts/4", "/dev/tty2", "/dev/console", "", None):
+            self.assertFalse(session._stdin_redirected(target), target)
+
+    def test_a_flag_in_a_value_position_declares_nothing(self):
+        # fable review LOW: commander hands a required option-argument the
+        # next token even when flag-shaped, so in `--append-system-prompt
+        # --no-session-persistence` the flag is PROMPT TEXT. Reading it as
+        # declared nonpersistence would green a session the CLI persists —
+        # the same ambiguity _resume_sid poisons, held to the same
+        # fail-closed law here.
+        self.assertFalse(session._is_nonpersistent(
+            ["claude", "-p", "--append-system-prompt",
+             "--no-session-persistence"]))
+        self.assertFalse(session._is_headless(
+            ["claude", "--append-system-prompt", "--print"]))
+        # with the option's value filled, the following flag is real again
+        self.assertTrue(session._is_nonpersistent(
+            ["claude", "-p", "--append-system-prompt", "be brief",
+             "--no-session-persistence"]))
+        # a MEASURED boolean cannot consume its neighbor, and the flag right
+        # after it stays declared (the remember-plugin shape must keep green)
+        self.assertTrue(session._is_nonpersistent(
+            ["claude", "-p", "--no-session-persistence"]))
+        self.assertTrue(session._is_headless(["claude", "-c", "--print"]))
 
     def test_an_interactive_pane_is_not_headless(self):
         for argv in (["claude", "--resume", "abc", "--dangerously-skip-permissions"],
@@ -1286,6 +1361,19 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertIn("headless one-shot", out)
         self.assertNotIn("UNKNOWN", out)
 
+    def test_an_interactive_pane_with_the_inert_flag_fails_closed(self):
+        # fable review MED, exact probe row: interactive `claude
+        # --no-session-persistence` has the flag INERT and a real persisted
+        # session — before the fix it certified rc=0 under the false label
+        # 'headless one-shot'. It is an UNRESOLVED session, and the render
+        # says why the operator's flag did nothing.
+        rc, out, err = self.ls([self.row(9, None, False, nonpersistent=True)],
+                               {}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("UNKNOWN", out)
+        self.assertIn("inert outside print mode", out)
+        self.assertNotIn("headless one-shot", out)
+
     def test_plain_print_mode_without_identity_fails_closed_as_unknown(self):
         # codex round-2 HIGH 2, exact probe: plain -p persists a transcript by
         # default, so a -p row with no resolvable SID is an UNRESOLVED
@@ -1313,15 +1401,35 @@ class HeadlessCensusTest(unittest.TestCase):
 
     def test_a_transcriptless_inherited_worker_alarms_its_holder_not_itself(self):
         # holder-arithmetic exclusion and the render must AGREE: the worker's
-        # missing transcript is its holder's risk, so it is neither counted
-        # nor labeled MEMORY-ONLY — but this exclusion never becomes a
+        # missing transcript is its HOLDER's risk, so the worker is neither
+        # counted nor labeled MEMORY-ONLY — the alarm (and the certify FAIL)
+        # lands on the holder row, and the exclusion never becomes a
         # sessionless claim (no "one-shot" label without nonpersistence)
+        holder = self.row(1, "sid-x", False)
+        worker = self.row(2, "sid-x", True, identity="unknown")
+        self.assertEqual(
+            [r["pid"] for r in session.memory_only_panes(
+                rows=[holder, worker], persisting={})],
+            [1])
+        rc, out, err = self.ls([holder, worker], {}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("MEMORY-ONLY", out)
+        self.assertIn("inherited-session print worker", out)
+        self.assertNotIn("headless one-shot", out)
+
+    def test_an_inherited_hint_with_no_live_holder_fails_closed(self):
+        # fable review (composition lens): "risk belongs to its holder" names
+        # NOBODY when no holder row exists in the census. The shape is
+        # impossible today — _proc_claude_rows only sets `session` from
+        # canonical rungs — and an impossible shape must fail closed as
+        # UNKNOWN, not certify a transcriptless live session green.
         rows = [self.row(2, "sid-x", True, identity="unknown")]
         self.assertEqual(session.memory_only_panes(rows=rows, persisting={}),
                          [])
         rc, out, err = self.ls(rows, {}, certify=True)
-        self.assertEqual(rc, 0, err)
-        self.assertIn("inherited-session print worker", out)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("UNKNOWN", out)
+        self.assertIn("no live holder", out)
         self.assertNotIn("MEMORY-ONLY", out)
         self.assertNotIn("headless one-shot", out)
 

@@ -244,12 +244,16 @@ def _proc_snapshot(pid):
         cwd = os.readlink(os.path.join(base, "cwd"))
     except OSError:
         cwd = None
+    try:
+        stdin = os.readlink(os.path.join(base, "fd", "0"))
+    except OSError:
+        stdin = None
     if not _proc_matches(pid, start, cmdline, environ_raw, cwd):
         return None
     return {"pid": pid, "uid": uid, "start": start, "cmdline": cmdline,
             "environ": environ_raw,
             "argv": cmdline.decode("utf-8", "replace").split("\0"),
-            "env": environ, "cwd": cwd}
+            "env": environ, "cwd": cwd, "stdin": stdin}
 
 
 HEADLESS_FLAGS = ("-p", "--print")
@@ -299,16 +303,38 @@ def _expand_options(argv):
     return out
 
 
+# Long flags this module has MEASURED as boolean (never consuming the next
+# token). Every other option is presumed capable of consuming its neighbor,
+# because commander hands a required option-argument the next token even when
+# that token is flag-shaped.
+_MEASURED_BOOL_FLAGS = frozenset(
+    ("--print", "--continue", NONPERSISTENT_FLAG))
+
+
 def _argv_flag(argv, names, prefixes=()):
     """Flag presence in the OPTION region of argv only: past the standard
     ``--`` terminator every token is positional (a boot prompt that happens to
     equal ``-p`` is prose, not a flag), so scanning stops there. Short
     clusters are expanded first, so `-pr <sid>` declares print mode exactly
-    as `-p` does — the short alias of a flag is the flag."""
-    for a in _expand_options(argv):
+    as `-p` does — the short alias of a flag is the flag.
+
+    A flag-shaped token in the VALUE position of the option before it is
+    evidence of NOTHING: `--append-system-prompt --no-session-persistence`
+    hands the flag to commander as prompt text, and reading it as declared
+    nonpersistence would certify green a session the CLI persists. The same
+    ambiguity poisons _resume_sid fail-closed; here fail-closed means the
+    occurrence never counts — only a token whose predecessor provably cannot
+    consume it (a positional, a measured boolean, or an ``=``-attached form)
+    declares the flag."""
+    argv = _expand_options(argv)
+    for i, a in enumerate(argv):
         if a == "--":
             return False
         if a in names or (prefixes and a.startswith(prefixes)):
+            prev = argv[i - 1] if i else ""
+            if (len(prev) > 1 and prev[0] == "-" and "=" not in prev
+                    and prev not in _MEASURED_BOOL_FLAGS):
+                continue
             return True
     return False
 
@@ -322,8 +348,27 @@ def _is_headless(argv):
     so `claude -p --resume <sid>` is a short-lived process operating on a
     proven resumable session, every bit a holder while it lives. Whether a row
     leaves the health arithmetic is decided by _sessionless_oneshot, which
-    reads this mode TOGETHER with the row's session-identity evidence."""
+    reads this mode TOGETHER with the row's session-identity evidence.
+
+    Argv is one rung of the mode evidence, not the whole of it: the CLI also
+    enters print mode ON ITS OWN whenever stdin is not a terminal (measured
+    2026-07-22: `claude </dev/null` with no flags errors 'when using
+    --print'), so _proc_claude_rows composes this scan with the process's
+    proven stdin redirection (_stdin_redirected)."""
     return _argv_flag(argv, HEADLESS_FLAGS, ("-p=", "--print="))
+
+
+def _stdin_redirected(target):
+    """True when a /proc fd/0 readlink target PROVES stdin is not a terminal
+    — the condition under which the claude CLI enters print mode with no `-p`
+    at all (see _is_headless). A pipe/socket/file/`/dev/null` stdin is that
+    proof; a pty/tty is a live terminal; and an absent or unreadable target
+    proves nothing, failing toward interactive — the direction that refuses
+    to certify, never the one that greens."""
+    if not target:
+        return False
+    return not (target.startswith("/dev/pts/") or target.startswith("/dev/tty")
+                or target == "/dev/console")
 
 
 def _is_nonpersistent(argv):
@@ -351,14 +396,23 @@ def _own_session_identity(r):
 
 def _sessionless_oneshot(r):
     """True only when the row PROVES sessionless intent: explicit
-    `--no-session-persistence` with no explicit session identity of its own.
-    These rows leave every health count AND certify green — their missing
-    transcript is the design working, not work at risk. Measured 2026-07-22,
-    twenty minutes after this census first certified the fleet: the `remember`
-    plugin ran `claude -p --output-format json --no-session-persistence` to
-    compress memory, and the estate flipped to a memory-only FAIL advising
-    `helm session rescue` on a process that had already exited. That row is
-    excluded on its EXPLICIT nonpersistence evidence.
+    `--no-session-persistence` IN PRINT MODE with no explicit session
+    identity of its own. These rows leave every health count AND certify
+    green — their missing transcript is the design working, not work at risk.
+    Measured 2026-07-22, twenty minutes after this census first certified the
+    fleet: the `remember` plugin ran `claude -p --output-format json
+    --no-session-persistence` to compress memory, and the estate flipped to a
+    memory-only FAIL advising `helm session rescue` on a process that had
+    already exited. That row is excluded on its EXPLICIT nonpersistence
+    evidence.
+
+    The flag alone is NOT that proof: the CLI documents it '(only works with
+    --print)', so in an interactive pane it is INERT and a real session
+    persists. The print-mode conjunct is the row's `headless` bit, which
+    _proc_claude_rows derives from argv OR from proven stdin redirection —
+    the CLI enters print mode on its own when stdin is not a terminal — so a
+    piped spawn that omitted `-p` still certifies, while an interactive pane
+    mislaunched with the inert flag falls through to UNKNOWN fail-closed.
 
     Plain `-p` is NOT that proof. Print mode persists a transcript by default,
     so a `-p` row whose SID cannot be resolved is an UNRESOLVED session, not
@@ -375,7 +429,8 @@ def _sessionless_oneshot(r):
     This narrows WHAT IS COUNTED, never what is allowed: a helm SEAT that
     shows up headless is still a law violation, and it stays visible in
     `session ls` tagged as such rather than being hidden."""
-    return bool(r.get("nonpersistent") and not _own_session_identity(r))
+    return bool(r.get("nonpersistent") and r.get("headless")
+                and not _own_session_identity(r))
 
 
 def _inherited_hint_worker(r):
@@ -630,7 +685,8 @@ def _proc_claude_rows():
             "child": child,
             "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
             "force": env.get(FORCE_VAR) == "1",
-            "headless": _is_headless(snap.get("argv") or []),
+            "headless": (_is_headless(snap.get("argv") or [])
+                         or _stdin_redirected(snap.get("stdin"))),
             "nonpersistent": _is_nonpersistent(snap.get("argv") or []),
         })
     return rows
@@ -843,8 +899,21 @@ def _cmd_ls(args, certify=False):
     # holder that stays in every count. Excluded rows stay rendered below;
     # exclusion narrows what is COUNTED, never what the operator can SEE.
     mo = memory_only_panes(rows, persisting)
+    # An inherited-hint worker's transcript alarm belongs to its HOLDER — but
+    # only a holder actually PRESENT in the census can carry it. A
+    # transcriptless hint row with no live holder anywhere (impossible today:
+    # _proc_claude_rows only sets `session` from canonical rungs) is an
+    # impossible shape, and impossible shapes fail closed as UNKNOWN rather
+    # than green — nobody else is left to alarm.
+    holders = {r["session"] for r in rows
+               if r.get("session") and _own_session_identity(r)}
+    orphan_hint = {r["pid"] for r in rows
+                   if _inherited_hint_worker(r) and r.get("session")
+                   and disk.get(r["pid"]) is False
+                   and r["session"] not in holders}
     unknown = [r for r in rows if not _sessionless_oneshot(r)
-               and (not r.get("session") or disk.get(r["pid"]) is None)]
+               and (not r.get("session") or disk.get(r["pid"]) is None
+                    or r["pid"] in orphan_hint)]
     live = live_sids(rows)
     dbl = {s: ps for s, ps in live.items() if len(ps) > 1}
     print("helm session ls — %d live claude panes" % len(rows))
@@ -864,11 +933,25 @@ def _cmd_ls(args, certify=False):
         elif not sid:
             reason = r.get("declared_reason")
             detail = "; pid record %s" % reason if reason else ""
+            # an interactive pane mislaunched with the inert flag lands here:
+            # the flag proves nothing outside print mode, so its session is
+            # UNRESOLVED, never sessionless — say why so the operator can fix
+            # the launch instead of trusting a label
+            if r.get("nonpersistent") and not r.get("headless"):
+                detail += ("; --no-session-persistence is inert outside "
+                           "print mode")
             state = "UNKNOWN (sid unresolved%s — verify by hand)" % detail + why
         elif disk[r["pid"]] is True:
             state = "persisted" + why
         elif disk[r["pid"]] is None:
             state = "UNKNOWN (transcript census incomplete — verify by hand)" + why
+        elif r["pid"] in orphan_hint:
+            # the render must agree with the UNKNOWN count above: with no
+            # live holder present, "risk belongs to its holder" would name
+            # nobody, and certifying green on an impossible shape is the
+            # dangerous direction
+            state = ("UNKNOWN (inherited session hint with no live holder "
+                     "in the census — verify by hand)")
         elif _inherited_hint_worker(r):
             # transcript absent, but this worker's only SID evidence is
             # inherited/attributed — the persistence alarm belongs to the pane
