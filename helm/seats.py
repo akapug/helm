@@ -351,7 +351,13 @@ def deliverable(m, seat, room="main", scope=None):
     if not text or m.get("react") or m.get("ambient"):
         return False
     frm = str(m.get("from") or "")
-    if frm == seat:
+    if frm.casefold() == str(seat or "").casefold():
+        # Own-post suppression casefolds like EVERY seat-identity match here
+        # (roster keys, mentions, dm, rfrom): after a case-only rename
+        # (kimi -> Kimi) the seat's pre-rename rows still carry the old
+        # casing, and an exact-case check would let the seat wake on its own
+        # reply — the precise identity transition the rfrom rule below
+        # protects (codex + codex-2 xrev of c2f4856, 2026-07-21).
         return False
     if m.get("dm"):
         # exact-token recipient (casefold only), OR the row sits in the

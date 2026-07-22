@@ -621,9 +621,11 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
     `reply_to` is a parent REFERENCE (row id, id prefix, or ordinal) resolved
     against the room the row lands in: the row gains {reply_to, rts, rfrom}
     (plus rtext for a pre-id parent) and, when signed, a parent-bound digest.
-    It changes NOTHING about who the
-    message wakes — seats.deliverable never reads it, so a reply reaches
-    exactly what its text alone would have reached."""
+    A reply WAKES the parent row's author (seats.deliverable reads rfrom,
+    casefold, mention-tier — before mute, any room): replying is a direct
+    address, the owner's stated substitute for typing @names. Only the
+    parent's author wakes; every other seat sees exactly what the text
+    alone would have reached."""
     _ensure_dir()
     from . import emoji
     text = emoji.expand(text)

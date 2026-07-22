@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """helm chat replies — the parent pointer, the parent-bound signed digest, the
-one-level render, and the law that threading changes NOTHING about who a
-message wakes. Hermetic: tmp HELM_HOME + HELM_CHAT_DIR, transport disabled
+one-level render, and the law that a reply WAKES its parent's author (rfrom,
+casefold, mention-tier) and nobody else. Hermetic: tmp HELM_HOME +
+HELM_CHAT_DIR, transport disabled
 (the signing seam is mocked, like test_chat_v2)."""
 import contextlib
 import io

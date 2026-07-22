@@ -2381,6 +2381,27 @@ class ReplyWakesParentTest(unittest.TestCase):
             self._row(**{"from": "Kimi", "rfrom": "kimi"}), "Kimi",
             room="main"))
 
+    def test_cross_case_self_reply_does_not_self_wake(self):
+        # BOTH reviewers' MED (codex + codex-2 xrev of c2f4856): the test
+        # above uses from='Kimi' — exact-case — so it never exercised the
+        # real rename path. After a case-only rename kimi -> Kimi, the
+        # seat's own pre-rename reply carries from='kimi': the own-post
+        # suppression must casefold like rfrom does, or the seat wakes on
+        # its own reply — the exact transition this fix targets.
+        self.assertFalse(seats.deliverable(
+            self._row(**{"from": "kimi", "rfrom": "kimi", "text": "self reply"}),
+            "Kimi", room="main"))
+        self.assertFalse(seats.deliverable(
+            self._row(**{"from": "Kimi", "rfrom": "Kimi", "text": "self reply"}),
+            "kimi", room="main"))
+
+    def test_cross_case_own_post_with_self_mention_does_not_self_wake(self):
+        # Same normalization beyond replies: a pre-rename own post that
+        # happens to @mention the seat's new casing is still its OWN post.
+        self.assertFalse(seats.deliverable(
+            self._row(**{"from": "kimi", "text": "@Kimi noted"}),
+            "Kimi", room="main"))
+
     def test_empty_rfrom_never_matches_an_empty_seat(self):
         self.assertFalse(seats.deliverable(
             self._row(room="side-room"), "", room="side-room"))
