@@ -1210,7 +1210,7 @@ def resolve_recipient(to):
 
 
 def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None,
-       reply_to=None, message_id=None):
+       reply_to=None):
     """One TRUE 1:1 message -> (row, None) or (None, reason). The recipient
     is the EXACT seat token (premise exact-token-addressee-match): the only
     resolution ever applied is a casefold snap onto a live roster key —
@@ -1228,8 +1228,7 @@ def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None,
     if str(sender).casefold() == to.casefold():
         return None, "a DM to yourself would never deliver (own posts don't)"
     return chat.post(text, who=sender, profile=profile, sign=sign,
-                     origin=origin, dm=to, reply_to=reply_to,
-                     message_id=message_id), None
+                     origin=origin, dm=to, reply_to=reply_to), None
 
 
 # ---------------------------------------------------------------------------
@@ -1537,19 +1536,20 @@ def _dispatch_candidate():
             return None
         tip = str(r.get("tip") or r.get("ref") or "<reviewed-tip>")
         lane = _clip(_scrub(str(r.get("lane") or "")), 32)
-        if kind == "bind":
-            return ("dispatch:%s:needs-tip-binding" % r.get("id"),
-                    "dispatch %s to @%s (%s) NEEDS TIP BINDING — migrate the "
-                    "legacy ref-less row with: helm dispatch bind %s <tip> "
-                    "--repo <path>" % (r.get("id"), r.get("recipient"), lane,
-                                       r.get("id")))
-        if kind == "retry":
-            return ("dispatch:%s:%s:%s" % (r.get("id"), r.get("status"), tip),
-                    "dispatch %s to @%s (%s) NEEDS DELIVERY RETRY — the send "
-                    "did not become a verdict obligation; rerun the original "
-                    "`helm dispatch send ... --key %s` before stopping"
+        if kind == "redispatch":
+            return ("dispatch:%s:needs-redispatch" % r.get("id"),
+                    "dispatch %s to @%s (%s) NEEDS REDISPATCH — this historical "
+                    "row lacks an exact tip so no verdict can ever close it; "
+                    "redispatch the work with `helm dispatch send ... --ref "
+                    "<tip>` (the old row stays visible as history)"
+                    % (r.get("id"), r.get("recipient"), lane))
+        if kind == "confirm":
+            return ("dispatch:%s:needs-confirmation" % r.get("id"),
+                    "dispatch %s to @%s (%s) delivery is NEEDS CONFIRMATION — "
+                    "confirm at @%s that the hand-off actually arrived; do NOT "
+                    "resend automatically (one operation = at most one send)"
                     % (r.get("id"), r.get("recipient"), lane,
-                       _clip(_scrub(str(r.get("dispatch_key") or "<key>")), 24)))
+                       r.get("recipient")))
         return ("dispatch:%s:%s:%s" % (r.get("id"), r.get("status"), tip),
                 "dispatch %s to @%s (%s) NEEDS CHECK-IN (OVERDUE) and is "
                 "PENDING VERDICT — verify at the exact recipient; do NOT "

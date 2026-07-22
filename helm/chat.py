@@ -86,7 +86,6 @@ import contextlib
 import hashlib
 import json
 import os
-import stat
 import sys
 import time
 import unicodedata
@@ -515,7 +514,7 @@ def _room_lock(room):
             fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         except OSError:
             lf = None
-        yield lf is not None
+        yield
     finally:
         if lf is not None:
             try:
@@ -525,123 +524,19 @@ def _room_lock(room):
             lf.close()
 
 
-def _chat_tail(fd, size):
-    if not size or os.pread(fd, 1, size - 1) == b"\n":
-        return size
-    end = size
-    while end:
-        start = max(0, end - 8192)
-        data = os.pread(fd, end - start, start)
-        at = data.rfind(b"\n")
-        if at >= 0:
-            return start + at + 1
-        end = start
-    return 0
-
-
-def _chat_rows(fd, size):
-    raw = os.pread(fd, size, 0).decode("utf-8", errors="replace")
-    return [m for m in map(_msg, (x for x in raw.split("\n") if x)) if m]
-
-
-def _idempotency_path():
-    return os.path.join(home.global_dir(), "chat-message-idempotency.jsonl")
-
-
-def _idempotency_core(row):
-    return {key: row.get(key) for key in ("from", "text", "dm", "reply_to")}
-
-
-def _idempotency_get(message_id):
-    from . import eventledger
-    rows, unavailable = eventledger.latest_checked(_idempotency_path())
-    if unavailable:
-        raise OSError("chat idempotency ledger unavailable: %s" % unavailable)
-    return rows.get(str(message_id))
-
-
-def _idempotency_put(message_id, state, core, row=None):
-    from . import eventledger
-    event = {"id": str(message_id), "state": state, "core": core,
-             "row": row, "ts": pk.now_ts()}
-    if not eventledger.append(_idempotency_path(), event):
-        raise OSError("chat idempotency state %s was not durable" % state)
-
-
-def _append(row, room, idempotent=False, prepare=None):
-    """Serialized, durable room append with persistent message-id idempotency.
-
-    Compound writes persist INTENT before signing, PREPARED (including the
-    signed receipt) before the rotating room write, and DELIVERED afterward.
-    Thus local write/fsync failure retries never sign twice, and room rotation
-    cannot expire the message-id dedup record.
-    """
+def _append(row, room):
+    """ONE serialized write path for every room writer: id-stamp, append the
+    whole row in one write, flush, then rotate — all under the room lock.
+    The stable per-row id is what delivery cursors key on (codex H5); rows
+    predating it (or hand-written) simply have no id and never match one."""
     row.setdefault("id", os.urandom(6).hex())
     path = room_path(room)
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    with _room_lock(room) as held:
-        if idempotent and not held:
-            raise OSError("chat room lock unavailable for idempotent append")
-        core = _idempotency_core(row) if idempotent else None
-        record = _idempotency_get(row["id"]) if idempotent else None
-        if record:
-            if record.get("core") != core:
-                raise ValueError("chat idempotency id collision: %s" % row["id"])
-            if record.get("state") == "delivered" and record.get("row"):
-                return record["row"]
-        new_file = not os.path.exists(path)
-        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT
-                     | getattr(os, "O_CLOEXEC", 0)
-                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                raise OSError("chat room is not a regular file")
-            os.fchmod(fd, 0o600)
-            before = _chat_tail(fd, st.st_size)
-            if before != st.st_size:
-                os.ftruncate(fd, before)
-                os.fsync(fd)
-            if idempotent:
-                existing = next((r for r in _chat_rows(fd, before)
-                                 if r.get("id") == row["id"]), None)
-                if existing:
-                    if _idempotency_core(existing) != core:
-                        raise ValueError("chat idempotency id collision: %s" % row["id"])
-                    _idempotency_put(row["id"], "delivered", core, existing)
-                    return existing
-                if not record:
-                    _idempotency_put(row["id"], "intent", core)
-                if record and record.get("state") == "prepared" and record.get("row"):
-                    row = record["row"]
-                else:
-                    row = prepare(row) if prepare else row
-                    _idempotency_put(row["id"], "prepared", core, row)
-            else:
-                row = prepare(row) if prepare else row
-            payload = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
-            if os.write(fd, payload) != len(payload):
-                os.ftruncate(fd, before)
-                os.fsync(fd)
-                raise OSError("partial chat append rolled back")
-            try:
-                os.fsync(fd)
-            except OSError:
-                os.ftruncate(fd, before)
-                os.fsync(fd)
-                raise
-            if os.pread(fd, len(payload), before) != payload:
-                os.ftruncate(fd, before)
-                os.fsync(fd)
-                raise OSError("chat append failed replay verification")
-            if new_file:
-                from . import eventledger
-                eventledger._fsync_dir(os.path.dirname(path))
-        finally:
-            os.close(fd)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)  # dm/ lane
+    with _room_lock(room):
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.flush()
         _rotate(path)
-        if idempotent:
-            _idempotency_put(row["id"], "delivered", core, row)
     return row
 
 
@@ -693,7 +588,7 @@ def _parent_fields(room, ref):
 
 
 def post(text, room="main", who=None, profile=None, sign=None, origin=None,
-         dm=None, ambient=False, reply_to=None, message_id=None):
+         dm=None, ambient=False, reply_to=None):
     """Append one message; returns it. v2: shortcodes expand, and when the
     room node answers the digest rides a signed self-write turn FIRST — the
     row carries {turn, receipt, chain}. Node down -> plain v1 row (rendered
@@ -724,17 +619,11 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
     (plus rtext for a pre-id parent) and, when signed, a parent-bound digest.
     It changes NOTHING about who the
     message wakes — seats.deliverable never reads it, so a reply reaches
-    exactly what its text alone would have reached.
-
-    `message_id` is the retry seam for compound operations such as `helm
-    dispatch send`: under the room lock the same id+payload returns the existing
-    row, while an id collision with different content raises."""
+    exactly what its text alone would have reached."""
     _ensure_dir()
     from . import emoji
     text = emoji.expand(text)
     row = {"ts": pk.now_ts(), "from": who or whoname(), "text": text}
-    if message_id:
-        row["id"] = str(message_id)
     if dm:
         row["dm"] = dm
         room = dm_room(dm)
@@ -745,9 +634,6 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
     if reply_to:
         row.update(_parent_fields(room, reply_to))
     _touch_poster_presence(row["from"])
-    if message_id:
-        return _append(row, room, idempotent=True,
-                       prepare=lambda r: _signed_row(r, text, profile, sign))
     return _append(_signed_row(row, text, profile, sign), room)
 
 
