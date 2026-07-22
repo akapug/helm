@@ -906,6 +906,29 @@ PENDING_STALE_S = 600  # unlanded rows must have AGED to whisper — a fresh set
                        # was just pointed at by the inbox block (echo ≠ context)
 
 
+def _ask_candidate():
+    """The OWNER-ASK rung — TOP of the salience ladder. One cheap local read
+    of the owner-ask ledger (ownerasks.py): any row not yet REPORTED to the
+    owner (open OR done-but-unreported — `done` without `report` stays open,
+    owner-surface-is-the-bar) whispers the OLDEST such ask, never the list
+    (one ask per whisper — no wallpaper). The fp carries the row's status as
+    its level, so an open→done transition re-fires exactly once. Fail-closed
+    to None: ledger trouble = silence."""
+    try:
+        from . import ownerasks
+        r = ownerasks.oldest_unreported()
+        if not r:
+            return None
+        return ("ask:%s:%s" % (r.get("id"), r.get("status")),
+                "owner ask %s is %s: '%s' — report it to the owner (then: "
+                "helm asks report %s <chat-post-id>)"
+                % (r.get("id"),
+                   "done-UNREPORTED" if r.get("status") == "done" else "open",
+                   _clip(_scrub(str(r.get("ask") or "")), 48), r.get("id")))
+    except Exception:
+        return None
+
+
 def _whisper_candidates(session, pending, inbox_blocked):
     """[(fp, line)] of LIVE whisper signals, salience-ordered. Signals are
     cheap local reads only (reflex law): the session's record.py counters +
@@ -913,6 +936,9 @@ def _whisper_candidates(session, pending, inbox_blocked):
     bucket so a worsening streak re-fires (reflex escalate law) and a new
     pending set re-arms."""
     out = []
+    ask = _ask_candidate()   # owner-ask rung: unsurfaced owner debt outranks all
+    if ask:
+        out.append(ask)
     c = {}
     if session:
         try:

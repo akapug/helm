@@ -1171,7 +1171,11 @@ frames; this lane is called *delivery*.)
   hook JSON's `stop_hook_active` flag is honored the same way); **BLOCK** on
   live claim leases held by the stopping session (release or finish — the
   resources are named); **WHISPER** — the contextual continuation lane
-  (stop-whisper): ONE budgeted line (240B) from the live signals — stuck
+  (stop-whisper): ONE budgeted line (240B) from the live signals — an
+  UNREPORTED owner ask (top of the ladder: the owner-ask ledger's OLDEST row
+  not yet `reported` — open or done-but-unreported — named one at a time with
+  its `helm asks report` pointer; fp carries the row's status, so open→done
+  re-fires once), stuck
   session (`stuck-streak`≥3: surface the blocker), unlanded owner/mention
   rows aged >10m past their inbox block (land or route them), uncommitted
   drift (`dirty-streak`≥8: bank the green slice) — highest salience wins,
@@ -1366,6 +1370,22 @@ $ helm work claim webui            # path  branch  lease  ttl — keep the lease
 $ helm work release webui --lease 5f3c9a2d41b0e6f2      # dirty? --park saves it
 $ helm work gc                     # the verdict table, dry; --apply enforces
 ```
+
+### `helm asks add <text> [--source S] | done <id> <evidence> | report <id> <chat-post-id> | list [--open] [--json]`
+The OWNER-ASK LEDGER — the durable fix for dropped owner asks (root cause:
+asks lived in memory-only panes + siloed scratch, and report-back went to
+AGENTS, not the owner). One append-only jsonl at
+`~/.helm/_global/owner-asks.jsonl`: every mutation appends a full snapshot
+row `{id, ts, ask, source, status, done_ref, report_ref, last_updated}`
+(last line per id wins — O(1) single-write appends, history never lost, no
+rotation: durable record, not telemetry). This is the canonical fleet
+owner-ask list; agents SELF-ADD the moment the owner asks (a2a-self-add
+culture). **`done` does not close a row** — `report <id> <chat-post-id>` is
+the ONLY closer, and its argument is the chat post that told the OWNER
+(owner-surface-is-the-bar: work merely finished is invisible work). Any row
+not yet `reported` rides the stop-whisper's TOP rung (see `stop-guard`
+above) until the owner has actually heard it. Fail-open: an unwritable
+ledger never raises, and a failed `add` says NOT RECORDED loudly.
 
 ## ops — health, evolution, the browser
 
