@@ -603,9 +603,10 @@ class RosterAndWebTest(TodosBase):
         self.assertTrue(body["unavailable"])
 
     def test_web_ui_renders_the_panel(self):
-        html = open(os.path.join(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))), "helm", "web_ui.html"),
-            encoding="utf-8").read()
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "helm", "web_ui.html")
+        with open(path, encoding="utf-8") as f:
+            html = f.read()
         self.assertIn('id="ledgertodos"', html)
         self.assertIn("fleetTodos", html)
         self.assertIn("/api/todos", html)
