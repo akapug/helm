@@ -16,7 +16,8 @@ add:
                    unrepresentable.
   * do-not-disturb — `git worktree lock --reason lease:<id8>` (git-native:
                    even raw prune/remove refuses while locked).
-  * housekeeping — `work gc`, dry-run default (gc.py culture). The ONLY
+  * housekeeping — `work gc`, dry-run default (gc.py culture). LOCKED or
+                   OCCUPIED (any live process cwd) rooms are immune. The ONLY
                    write to authored bytes anywhere here is a RESCUE COMMIT
                    onto the lane's own branch — lost-and-found, never the
                    dumpster; no code path discards uncommitted work.
@@ -132,6 +133,50 @@ def worktrees(root):
     return rows
 
 
+def _occupants(path):
+    """Live PIDs whose cwd is `path` or beneath it. Linux /proc is the
+    authoritative sibling-pane proof: deleting such a worktree strands that
+    process at a `(deleted)` cwd and drops an interactive pane to a bare shell.
+    If the census itself is unavailable, return an `unknown` sentinel so every
+    removal path fails closed rather than guessing the room is empty."""
+    root = os.path.realpath(path).rstrip(os.sep)
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return ["unknown"]
+    out = []
+    for pid in names:
+        if not pid.isdigit():
+            continue
+        try:
+            cwd = os.path.realpath(os.path.join("/proc", pid, "cwd")).rstrip(os.sep)
+        except OSError:
+            continue
+        if cwd == root or cwd.startswith(root + os.sep):
+            out.append(pid)
+    return sorted(out, key=lambda p: int(p) if p.isdigit() else -1)
+
+
+def _removal_blocker(root, path, lane=None, stale_lease_ok=False):
+    """Current-state refusal reason, or None when removal may proceed. Called
+    at enact time (and again immediately before remove after any rescue commit)
+    so a scan cannot authorize deleting a newly leased/locked/occupied room."""
+    cur = next((w for w in worktrees(root) if w["path"] == path), None)
+    if cur is None:
+        return "no longer a registered worktree"
+    if lane:
+        held = _live().get(resource(root, lane))
+        if held:
+            return "lease live — %s holds it" % held["holder"]
+    occupied = _occupants(path)
+    if occupied:
+        return "OCCUPIED by cwd pid(s) %s" % ",".join(occupied)
+    if cur["locked"] and not (stale_lease_ok
+                              and cur["reason"].startswith("lease:")):
+        return "LOCKED: %s" % (cur["reason"] or "no reason")
+    return None
+
+
 def lane_rows(root):
     """The project's lane rooms: registry rows under `<root>-wt/`, +lane."""
     box = root.rstrip(os.sep) + "-wt" + os.sep
@@ -227,6 +272,11 @@ def release_lane(root, lane, seat, lease=None, session=None, park=False):
     res, path, branch = resource(root, lane), lane_path(root, lane), lane_branch(lane)
     lines = []
     room = path in {w["path"] for w in worktrees(root)}
+    occupied = _occupants(path) if room else []
+    if occupied:
+        return 1, ["helm work: %s is OCCUPIED by cwd pid(s) %s — room and "
+                   "lease kept; move every live pane/process out before release"
+                   % (path, ",".join(occupied))]
     if room and _dirty(path):
         if not park:
             return 1, ["helm work: %s is DIRTY — two exits, no third: commit "
@@ -277,11 +327,16 @@ def gc_scan(root):
         lane = w["lane"]
         held = live.get(resource(root, lane))
         branch = (w["branch"] or "")[len("refs/heads/"):] or None
+        occupied = _occupants(w["path"])
         r = {"lane": lane, "path": w["path"], "branch": branch,
-             "locked": w["locked"], "merged": False}
+             "locked": w["locked"], "lock_reason": w["reason"],
+             "occupied": occupied, "merged": False}
         if held:
             r.update(verdict="keep", why="lease live — %s holds it, %ds left"
                      % (held["holder"], held["remaining"]))
+        elif occupied:
+            r.update(verdict="keep", why="OCCUPIED by cwd pid(s) %s — never remove"
+                     % ",".join(occupied))
         elif w["locked"] and not w["reason"].startswith("lease:"):
             r.update(verdict="keep", why="locked out-of-band (%s)"
                      % (w["reason"] or "no reason"))
@@ -301,9 +356,15 @@ def gc_scan(root):
 
 def gc_enact(root, row):
     """Enforce ONE non-keep row -> [lines]. Rescue-first: a failed rescue
-    commit SKIPS the removal loudly — the room outlives any error."""
+    commit SKIPS the removal loudly — the room outlives any error. Re-check
+    lease, lock and cwd occupancy at enact time: a safe scan can go stale before
+    the destructive syscall, and a sibling pane may enter the room meanwhile."""
     if row["verdict"] == "keep":
         return []
+    blocked = _removal_blocker(root, row["path"], row["lane"],
+                               stale_lease_ok=True)
+    if blocked:
+        return ["SKIPPED %s (%s) — kept" % (row["path"], blocked)]
     lines = []
     if row["verdict"] == "rescue":
         rc, _out, err = _wip_commit(
@@ -312,6 +373,10 @@ def gc_enact(root, row):
             return ["SKIPPED %s (rescue commit failed: %s) — room kept"
                     % (row["path"], err)]
         lines.append("rescued dirty work -> %s" % row["branch"])
+    blocked = _removal_blocker(root, row["path"], row["lane"],
+                               stale_lease_ok=True)
+    if blocked:
+        return lines + ["SKIPPED %s (%s) — kept" % (row["path"], blocked)]
     _git(root, "worktree", "unlock", row["path"])   # stale lease tag, if any
     rc, _out, err = _git(root, "worktree", "remove", row["path"])
     if rc != 0:

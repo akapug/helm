@@ -2,8 +2,10 @@
 """helm tidy — hermetic tests against a FAKE estate (tmp config dirs) and a
 scratch git repo. Mirrors test_skillsync's estate shape and test_work's repo
 harness. Proves the laws the task pins: dry-run purity, idempotence,
-backup-integrity, superset-refusal, fail-closed, locked-worktree immunity,
-rescue-dirty-first, never-remove-unmerged."""
+backup-integrity, rollback-after-mutation, superset-refusal, fail-closed,
+locked/occupied-worktree immunity, rescue-dirty-first, never-remove-unmerged."""
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -11,11 +13,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-envtidy-home-"))
 
-from helm import envtidy, hooks as hooks_mod, skillsync  # noqa: E402
+from helm import envtidy, hooks as hooks_mod, skillsync, work  # noqa: E402
 
 
 def _cmd(tup):
@@ -141,6 +144,36 @@ class EstateBase(unittest.TestCase):
         shelf = os.path.join(self.backup, "partial-com")
         self.assertTrue(os.path.isdir(shelf) and os.listdir(shelf))
 
+    def test_hooks_mid_write_failure_restores_original_or_absence(self):
+        """A writer can fail after changing bytes. Both kinds of pre-image —
+        an existing file and no file — must be restored exactly."""
+        partial_path = os.path.join(self.partial, "settings.json")
+        with open(partial_path, "rb") as f:
+            original = f.read()
+
+        def mutate_then_fail(path, _text):
+            with open(path, "w") as f:
+                f.write('{"failed-after-mutation": true}\n')
+            raise OSError("injected after mutation")
+
+        with mock.patch.object(envtidy.pk, "atomic_write",
+                               side_effect=mutate_then_fail):
+            verdict, _detail = envtidy.apply_hooks_home(
+                envtidy.plan_hooks_home("partial-com", self.partial), self.backup)
+        self.assertEqual(verdict, "FAIL")
+        with open(partial_path, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+        bare_path = os.path.join(self.croot, "bare-com", "settings.json")
+        self.assertFalse(os.path.exists(bare_path))
+        with mock.patch.object(envtidy.pk, "atomic_write",
+                               side_effect=mutate_then_fail):
+            verdict, _detail = envtidy.apply_hooks_home(
+                envtidy.plan_hooks_home("bare-com", os.path.dirname(bare_path)),
+                self.backup)
+        self.assertEqual(verdict, "FAIL")
+        self.assertFalse(os.path.exists(bare_path))
+
     def test_hooks_idempotent(self):
         envtidy.hooks_sync(dirs=self.dirs, backup_root=self.backup, apply=True)
         r = envtidy.hooks_sync(dirs=self.dirs, backup_root=self.backup, apply=True)
@@ -187,6 +220,30 @@ class EstateBase(unittest.TestCase):
             # idempotent second apply: nothing left to add
             r2 = envtidy.mcp_sync(dirs=self.dirs, backup_root=self.backup, apply=True)
             self.assertEqual(r2["changed"], [])
+        finally:
+            del os.environ["HELM_MCPS_CANONICAL"]
+
+    def test_mcp_mid_write_failure_restores_original(self):
+        state = os.path.join(self.whole, ".claude.json")
+        _write(state, {"mcpServers": {"pre-existing": {"command": "keep-me"}}})
+        with open(state, "rb") as f:
+            original = f.read()
+        os.environ["HELM_MCPS_CANONICAL"] = self._mcp_canon(
+            {"foo-mcp": {"command": "foo"}})
+
+        def mutate_then_fail(path, _text):
+            with open(path, "w") as f:
+                f.write('{"mcpServers": {}}\n')
+            raise OSError("injected after mutation")
+
+        try:
+            plan = envtidy.plan_mcp_home("whole-com", self.whole)
+            with mock.patch.object(envtidy.pk, "atomic_write",
+                                   side_effect=mutate_then_fail):
+                verdict, _detail = envtidy.apply_mcp_home(plan, self.backup)
+            self.assertEqual(verdict, "FAIL")
+            with open(state, "rb") as f:
+                self.assertEqual(f.read(), original)
         finally:
             del os.environ["HELM_MCPS_CANONICAL"]
 
@@ -330,6 +387,81 @@ class WorktreeGcTest(WorktreeBase):
         self.assertTrue(os.path.exists(self.wt_lock))        # never touched
         self.assertIn("worktree-wflock", self._branches())
 
+    def test_occupied_worktree_is_immune(self):
+        """A live pane/process cwd'd in a worktree is a hard keep even when the
+        tree is clean + merged. Deleting it strands that process at `(deleted)`."""
+        if not os.path.isdir("/proc"):
+            self.skipTest("cwd occupancy proof requires /proc")
+        self._seed()
+        proc = subprocess.Popen(["sleep", "30"], cwd=self.wt_rm)
+        try:
+            r = envtidy.worktree_gc(root=self.root, apply=True)
+            row = next(w for w in r["worktree_rows"] if w["path"] == self.wt_rm)
+            self.assertEqual(row["verdict"], "keep")
+            self.assertTrue(row["occupied"])
+            self.assertTrue(os.path.isdir(self.wt_rm))
+            self.assertNotIn("(deleted)", os.readlink("/proc/%d/cwd" % proc.pid))
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_enact_rechecks_occupancy_after_scan(self):
+        if not os.path.isdir("/proc"):
+            self.skipTest("cwd occupancy proof requires /proc")
+        self._seed()
+        row = next(w for w in envtidy._worktree_rows(self.root, "main")
+                   if w["path"] == self.wt_rm)
+        self.assertEqual(row["verdict"], "remove")
+        proc = subprocess.Popen(["sleep", "30"], cwd=self.wt_rm)
+        try:
+            lines = envtidy._enact_worktree(self.root, row, True)
+            self.assertTrue(any("OCCUPIED" in line for line in lines))
+            self.assertTrue(os.path.isdir(self.wt_rm))
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_enact_rechecks_occupancy_after_rescue(self):
+        if not os.path.isdir("/proc"):
+            self.skipTest("cwd occupancy proof requires /proc")
+        self._seed()
+        with open(os.path.join(self.wt_rm, "late.txt"), "w") as f:
+            f.write("rescue first\n")
+        row = next(w for w in envtidy._worktree_rows(self.root, "main")
+                   if w["path"] == self.wt_rm)
+        self.assertEqual(row["verdict"], "rescue+remove")
+        procs = []
+        original = work._wip_commit
+
+        def rescue_then_enter(path, msg):
+            result = original(path, msg)
+            procs.append(subprocess.Popen(["sleep", "30"], cwd=path))
+            return result
+
+        try:
+            with mock.patch.object(work, "_wip_commit",
+                                   side_effect=rescue_then_enter):
+                lines = envtidy._enact_worktree(self.root, row, True)
+            self.assertTrue(any("OCCUPIED" in line for line in lines))
+            self.assertTrue(os.path.isdir(self.wt_rm))
+            self.assertEqual(_sh(self.wt_rm, "git", "status", "--porcelain").stdout,
+                             "")
+        finally:
+            for proc in procs:
+                proc.terminate()
+                proc.wait()
+
+    def test_enact_rechecks_lock_after_scan(self):
+        self._seed()
+        row = next(w for w in envtidy._worktree_rows(self.root, "main")
+                   if w["path"] == self.wt_rm)
+        self.assertEqual(row["verdict"], "remove")
+        _sh(self.root, "git", "worktree", "lock", self.wt_rm,
+            "--reason", "review started after scan")
+        lines = envtidy._enact_worktree(self.root, row, True)
+        self.assertTrue(any("LOCKED" in line for line in lines))
+        self.assertTrue(os.path.isdir(self.wt_rm))
+
     def test_rescue_dirty_first_then_keep(self):
         self._seed()
         envtidy.worktree_gc(root=self.root, apply=True)
@@ -368,6 +500,46 @@ class WorktreeGcTest(WorktreeBase):
         self.assertFalse(r["apply"])
         # dry umbrella removed nothing
         self.assertIn("worktree-merged", self._branches())
+
+
+class CliSafetyTest(unittest.TestCase):
+    def test_every_mutating_verb_defaults_to_dry_run(self):
+        """The public dispatchers, not only the Python helpers, must require
+        the explicit --apply capability before they pass apply=True."""
+        hooks = {"changed": [], "failed": [], "steady": 0,
+                 "backup_root": "/backup"}
+        with mock.patch.object(envtidy, "hooks_sync", return_value=hooks) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(envtidy.cmd_hooks_sync([]), 0)
+        run.assert_called_once_with(apply=False)
+
+        mcp = {"changed": [], "failed": [], "steady": 0,
+               "backup_root": "/backup"}
+        with mock.patch.object(envtidy, "mcp_sync", return_value=mcp) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(envtidy.cmd_mcp(["sync"]), 0)
+        run.assert_called_once_with(apply=False)
+
+        worktrees = {"root": "/repo", "base": "main", "apply": False,
+                     "lane_rows": [], "lane_lines": {}, "worktree_rows": [],
+                     "worktree_lines": {}, "orphans": [], "orphan_lines": {}}
+        with mock.patch.object(envtidy, "worktree_gc", return_value=worktrees) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(envtidy.cmd_worktree(["gc"]), 0)
+        run.assert_called_once_with(root=None, apply=False)
+
+        report = {"apply": False, "backup_root": "/backup",
+                  "census": {"homes": [], "hooks_variance": {
+                      "missing_by_hook": {}, "strays_by_home": {}},
+                      "mcp_variance": {"universal_effective": [],
+                                       "canonical_names": [],
+                                       "missing_by_home": {}},
+                      "worktrees": {"note": "not inside a git repo"}},
+                  "hooks": hooks, "mcp": mcp, "worktree": worktrees}
+        with mock.patch.object(envtidy, "tidy", return_value=report) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(envtidy.cmd_tidy([]), 0)
+        run.assert_called_once_with(root=None, apply=False)
 
 
 if __name__ == "__main__":

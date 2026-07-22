@@ -142,6 +142,24 @@ class ReleaseTest(WorkBase):
         self.assertEqual(show.stdout, "do not lose me\n")   # lost-and-found
         self.assertIn("awaits integration", out)  # unmerged branch stays, told
 
+    def test_release_occupied_room_keeps_room_and_lease(self):
+        if not os.path.isdir("/proc"):
+            self.skipTest("cwd occupancy proof requires /proc")
+        rc, out, _err = self.work("claim", "demo", "--seat", "s1")
+        path, _branch, lease, _ttl = out.strip().split("\t")
+        proc = subprocess.Popen(["sleep", "30"], cwd=path)
+        try:
+            rc, _out, err = self.work("release", "demo", "--seat", "s1",
+                                      "--lease", lease)
+            self.assertEqual(rc, 1)
+            self.assertIn("OCCUPIED", err)
+            self.assertTrue(os.path.isdir(path))
+            self.assertEqual(len(seats.claims_list()), 1)
+            self.assertNotIn("(deleted)", os.readlink("/proc/%d/cwd" % proc.pid))
+        finally:
+            proc.terminate()
+            proc.wait()
+
     def test_release_wrong_lease_removes_nothing(self):
         rc, out, _err = self.work("claim", "demo", "--seat", "s1")
         path = out.split("\t")[0]
@@ -190,6 +208,34 @@ class GcTest(WorkBase):
         self.assertEqual(show.stdout, "precious uncommitted bytes\n")
         self.assertTrue(work._has_branch(self.root, "lane/messy"))
         self.assertIn("rescued", out)
+
+    def test_apply_never_removes_an_occupied_room(self):
+        if not os.path.isdir("/proc"):
+            self.skipTest("cwd occupancy proof requires /proc")
+        proc = subprocess.Popen(["sleep", "30"], cwd=self.clean)
+        try:
+            rc, out, err = self.work("gc", "--apply")
+            self.assertEqual(rc, 0, err)
+            self.assertIn("OCCUPIED", out)
+            self.assertTrue(os.path.isdir(self.clean))
+            self.assertNotIn("(deleted)", os.readlink("/proc/%d/cwd" % proc.pid))
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    def test_enact_rechecks_occupancy_after_scan(self):
+        if not os.path.isdir("/proc"):
+            self.skipTest("cwd occupancy proof requires /proc")
+        row = next(r for r in work.gc_scan(self.root) if r["path"] == self.clean)
+        self.assertEqual(row["verdict"], "remove")
+        proc = subprocess.Popen(["sleep", "30"], cwd=self.clean)
+        try:
+            lines = work.gc_enact(self.root, row)
+            self.assertTrue(any("OCCUPIED" in line for line in lines))
+            self.assertTrue(os.path.isdir(self.clean))
+        finally:
+            proc.terminate()
+            proc.wait()
 
     def test_gc_orphans_feeds_the_helm_gc_report_row(self):
         got = work.gc_orphans(self.root)

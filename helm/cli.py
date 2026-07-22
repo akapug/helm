@@ -212,7 +212,7 @@ _VERB_HELP = {
     "web": "web [--port N] — the same, warm, in a browser",
     "env": "env census [--json] — READ-ONLY estate picture: every claude config dir's hooks + MCPs, the variance vs canonical, and the orphan-worktree snapshot (replaces poking the configs UI by hand)",
     "mcp": "mcp sync [--apply] — reconcile canonical MCP servers into every home (dry-run default; additive + fail-closed; backup-first, superset-refusal)",
-    "worktree": "worktree gc [--apply] — prune orphan worktree-* branches + landed worktrees (dry-run default; rescue-dirty-first, locked-immune, unmerged-blocked; composes `helm work gc` for lane rooms)",
+    "worktree": "worktree gc [--apply] — prune orphan worktree-* branches + landed worktrees (dry-run default; rescue-dirty-first, locked/occupied-immune, unmerged-blocked; composes `helm work gc` for lane rooms)",
     "tidy": "tidy [--apply] — the umbrella: census + hooks sync + mcp sync + worktree gc, all dry-run; one consolidated report (--apply runs them all backup-first)",
 }
 

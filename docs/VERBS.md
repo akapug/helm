@@ -1191,10 +1191,13 @@ duplicated) and adds the estate-wide sweep the lane gc does not cover:
 registered worktrees (`wf_*`, `agent-*`) and orphan branch stubs. The rules the
 survey pins: **RESCUE-DIRTY-FIRST** (an uncommitted worktree is
 `git commit --no-verify`'d onto its OWN branch before any removal — never the
-dumpster), **NEVER touch a LOCKED worktree** (active review), and **never remove
-work that is ahead of the base** (unmerged unique commits = blocked, not
-prunable; a merged orphan stub gets `git branch -d`, which itself refuses
-unmerged — `-D` is never used). Dry-run classifies every row with its reason.
+dumpster), **NEVER touch a LOCKED worktree** (active review) or an **OCCUPIED
+worktree** (any live process has its cwd there — removing it would strand that
+pane at a `(deleted)` cwd), and **never remove work that is ahead of the base**
+(unmerged unique commits = blocked, not prunable; a merged orphan stub gets
+`git branch -d`, which itself refuses unmerged — `-D` is never used). Dry-run
+classifies every row with its reason, and apply re-checks lock + occupancy just
+before removal so scan/enact races also fail closed.
 
 ### `helm tidy [--apply]`
 The umbrella: census + hooks sync + mcp sync + worktree gc, all in DRY-RUN, one

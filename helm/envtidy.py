@@ -32,9 +32,9 @@ Worktree gc COMPOSES `helm work gc` for the lease-aware lane rooms (never
 re-implements its rescue logic) and adds the estate-wide sweep the lane gc
 does not cover: orphan `worktree-*` branch stubs and stray registered
 worktrees (wf_*, agent-*). RESCUE-DIRTY-FIRST (commit --no-verify onto the
-worktree's own branch before any removal), NEVER touch a LOCKED worktree
-(active review), and NEVER remove work that is ahead of the base (unmerged
-unique commits) — ahead>0 is blocked, not prunable.
+worktree's own branch before any removal), NEVER touch a LOCKED or OCCUPIED
+(any live process cwd) worktree, and NEVER remove work that is ahead of the
+base (unmerged unique commits) — ahead>0 is blocked, not prunable.
 """
 import difflib
 import glob
@@ -317,8 +317,8 @@ def _worktree_census(root):
         return {
             "root": root, "base": base,
             "registered": [{k: r[k] for k in
-                            ("path", "branch", "locked", "dirty", "merged",
-                             "verdict", "why")} for r in wts],
+                            ("path", "branch", "locked", "occupied", "dirty",
+                             "merged", "verdict", "why")} for r in wts],
             "orphan_branches": orphans,
             "lane_rooms": [{"lane": r["lane"], "verdict": r["verdict"],
                             "why": r["why"]} for r in lanes]}
@@ -343,8 +343,15 @@ def _backup(backup_root, label, path):
 
 
 def _restore(backup, path):
+    """Restore the exact pre-image. A missing backup means the file did not
+    exist before mutation, so rollback removes any failed after-image."""
     if backup and os.path.isfile(backup):
         shutil.copy2(backup, path)
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 def _log(backup_root, line):
@@ -417,7 +424,8 @@ def apply_hooks_home(plan, backup_root):
     try:
         pk.atomic_write(sp, plan["new_raw"])
     except OSError as e:
-        return "FAIL", "write failed: %s" % e
+        _restore(backup, sp)
+        return "FAIL", "write failed: %s — pre-image restored" % e
     got, err = _read_json(sp)
     ok = err is None and isinstance(got, dict)
     if ok:
@@ -510,7 +518,8 @@ def apply_mcp_home(plan, backup_root):
     try:
         pk.atomic_write(statefile, json.dumps(out, indent=2) + "\n")
     except OSError as e:
-        return "FAIL", "write failed: %s" % e
+        _restore(backup, statefile)
+        return "FAIL", "write failed: %s — pre-image restored" % e
     got, gerr = _read_json(statefile)
     after = set((got.get("mcpServers") or {}).keys()) if isinstance(got, dict) else set()
     if gerr or not before <= after or not set(plan["adds"]) <= after:
@@ -552,8 +561,8 @@ def mcp_sync(dirs=None, backup_root=None, apply=False):
 def _worktree_rows(root, base):
     """Registered worktrees (minus the main checkout and the lease-aware lane
     rooms, which `helm work gc` owns), each classified. rescue/remove are the
-    two enact flags; a LOCKED worktree is immune; ahead>0 (unmerged) is blocked,
-    never removed."""
+    two enact flags; a LOCKED or OCCUPIED worktree is immune; ahead>0 (unmerged)
+    is blocked, never removed."""
     from . import work
     wts = work.worktrees(root)
     main = wts[0]["path"] if wts else None
@@ -565,10 +574,15 @@ def _worktree_rows(root, base):
         branch = (w["branch"] or "")[len("refs/heads/"):] or None
         dirty = work._dirty(w["path"])
         merged = bool(branch) and work._merged(root, branch)
+        occupied = work._occupants(w["path"])
         r = {"path": w["path"], "branch": branch, "locked": w["locked"],
-             "dirty": dirty, "merged": merged, "rescue": False, "remove": False}
+             "occupied": occupied, "dirty": dirty, "merged": merged,
+             "rescue": False, "remove": False}
         if w["locked"]:
             r["verdict"], r["why"] = "keep", "LOCKED (active review) — never touch"
+        elif occupied:
+            r["verdict"], r["why"] = "keep", \
+                "OCCUPIED by cwd pid(s) %s — never remove" % ",".join(occupied)
         elif merged and not dirty:
             r.update(verdict="remove", remove=True,
                      why="clean + merged — remove worktree + delete branch")
@@ -613,10 +627,15 @@ def _orphan_branches(root, base, pattern=None):
 
 def _enact_worktree(root, r, apply):
     """Enforce ONE registered-worktree row. Rescue-first: a failed rescue
-    SKIPS the removal loudly — the worktree outlives any error."""
+    SKIPS the removal loudly — the worktree outlives any error. Apply re-checks
+    lock + cwd occupancy so a pane entering after the scan is still immune."""
     from . import work
     if not (r["rescue"] or r["remove"]):
         return []
+    if apply:
+        blocked = work._removal_blocker(root, r["path"])
+        if blocked:
+            return ["SKIPPED %s (%s) — kept" % (r["path"], blocked)]
     lines = []
     if r["rescue"] and apply:
         rc, _o, err = work._wip_commit(
@@ -628,6 +647,9 @@ def _enact_worktree(root, r, apply):
         lines.append("would rescue-commit dirty work -> %s" % (r["branch"] or "?"))
     if r["remove"]:
         if apply:
+            blocked = work._removal_blocker(root, r["path"])
+            if blocked:
+                return lines + ["SKIPPED %s (%s) — kept" % (r["path"], blocked)]
             work._git(root, "worktree", "unlock", r["path"])
             rc, _o, err = work._git(root, "worktree", "remove", r["path"])
             if rc != 0:
@@ -645,7 +667,7 @@ def _enact_worktree(root, r, apply):
 def worktree_gc(root=None, apply=False):
     """The estate worktree sweep. COMPOSES `helm work gc` for lane rooms, adds
     the orphan-stub + stray-worktree sweep the lane gc does not cover. Dry-run
-    by default; rescue-dirty-first; locked-immune; unmerged-blocked."""
+    by default; rescue-dirty-first; locked/occupied-immune; unmerged-blocked."""
     from . import work
     root = root or work.find_root()
     if not root:
@@ -843,7 +865,7 @@ def _print_worktree(r, out=sys.stdout):
 
 def cmd_worktree(args):
     """worktree gc [--apply] — prune orphan worktree-* branches + landed
-    worktrees (dry-run default; rescue-dirty-first, locked-immune,
+    worktrees (dry-run default; rescue-dirty-first, locked/occupied-immune,
     unmerged-blocked; composes `helm work gc` for lane rooms)."""
     args = list(args or [])
     if not args or args[0] != "gc":
