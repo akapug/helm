@@ -1015,6 +1015,41 @@ class ProcSnapshotTest(PlantedProcBase):
         with mock.patch.object(session, "_proc_bytes", side_effect=read):
             self.assertEqual(session._proc_snapshot(41), ("absent", None))
 
+    def _recheck_failing(self, err):
+        """A _proc_bytes whose cmdline RE-read (the bracket recheck) raises;
+        every first-pass read stays real."""
+        calls = {"cmdline": 0}
+        real = session._proc_bytes
+
+        def read(pid, name):
+            if name == "cmdline":
+                calls["cmdline"] += 1
+                if calls["cmdline"] >= 2:
+                    raise err
+            return real(pid, name)
+        return read
+
+    def test_recheck_eacces_while_pid_persists_is_unknown_not_absence(self):
+        # fable review MED, first site: comm proved claude and every
+        # first-pass read succeeded; the bracket RECHECK then raised EACCES
+        # while the pid persists. 'Reads FAILED on a persisting pid' is a
+        # failed PROBE — ("unknown", stub) — never conflated with 'reads
+        # showed a DIFFERENT process' (genuine absence of the bracket).
+        self.plant()
+        read = self._recheck_failing(OSError(errno.EACCES, "denied"))
+        with mock.patch.object(session, "_proc_bytes", side_effect=read):
+            status, stub = session._proc_snapshot(41)
+        self.assertEqual(status, "unknown")
+        self.assertEqual((stub["pid"], stub["start"]), (41, "424242"))
+
+    def test_recheck_gone_stays_genuine_absence(self):
+        # the process left between the first pass and the recheck:
+        # ENOENT/ESRCH is EXIT, still ("absent", None)
+        self.plant()
+        read = self._recheck_failing(OSError(errno.ESRCH, "gone"))
+        with mock.patch.object(session, "_proc_bytes", side_effect=read):
+            self.assertEqual(session._proc_snapshot(41), ("absent", None))
+
     def test_foreign_uid_pid_stays_structurally_not_ours(self):
         # same-uid scoping holds: an unreadable FOREIGN pid must not spam
         # UNKNOWN rows for every system process — it is structurally not ours
@@ -1022,6 +1057,45 @@ class ProcSnapshotTest(PlantedProcBase):
         with mock.patch.object(session.os, "geteuid",
                                return_value=os.geteuid() + 1):
             self.assertEqual(session._proc_snapshot(41), ("absent", None))
+
+
+class CensusRebracketTest(PlantedProcBase):
+    """fable review MED, second site: the census's mid-loop rebracket. A
+    recheck read that fails (EACCES/EIO) while the pid persists must surface
+    the row as a probe_failed UNKNOWN stub — never a silent drop that reads
+    as proven absence — while ENOENT/ESRCH (the process left mid-scan) stays
+    genuine absence. Real planted /proc; only the rebracket's cmdline re-read
+    (the third) is made to fail, so the snapshot and ITS recheck both pass
+    and the failure lands exactly on the mid-loop site."""
+
+    def _census(self, err):
+        calls = {"cmdline": 0}
+        real = session._proc_bytes
+
+        def read(pid, name):
+            if name == "cmdline":
+                calls["cmdline"] += 1
+                if calls["cmdline"] >= 3:
+                    raise err
+            return real(pid, name)
+        with mock.patch.object(session, "_proc_bytes", side_effect=read), \
+             mock.patch.object(who, "scan", return_value=[]):
+            return session._proc_claude_census()
+
+    def test_rebracket_eacces_surfaces_probe_failed_row_not_a_drop(self):
+        self.plant(env=b"HOME=/nonexistent-home\0")
+        c = self._census(OSError(errno.EACCES, "denied"))
+        [row] = c["rows"]
+        self.assertEqual(row["pid"], 41)
+        self.assertTrue(row["probe_failed"])
+        self.assertIsNone(row["session"])
+        self.assertFalse(c["census_partial"])
+
+    def test_rebracket_gone_stays_genuine_absence(self):
+        self.plant(env=b"HOME=/nonexistent-home\0")
+        c = self._census(OSError(errno.ESRCH, "gone"))
+        self.assertEqual(c["rows"], [])
+        self.assertFalse(c["census_partial"])
 
 
 class ProcCensusTest(unittest.TestCase):
@@ -1049,8 +1123,9 @@ class ProcCensusTest(unittest.TestCase):
                 status, snap, pid = "ok", s, s["pid"]
             by_pid[pid] = snap
             statuses[pid] = status
-        who_scan = (mock.Mock(side_effect=OSError) if who_fail
-                    else mock.Mock(return_value=who_rows or []))
+        who_scan = (mock.Mock(side_effect=OSError if who_fail is True
+                              else who_fail)
+                    if who_fail else mock.Mock(return_value=who_rows or []))
         with mock.patch.object(session.os, "listdir",
                                return_value=[str(p) for p in by_pid]), \
              mock.patch.object(session, "_proc_snapshot",
@@ -1121,6 +1196,18 @@ class ProcCensusTest(unittest.TestCase):
         row = self.rows([snap], {41: (self.NEW, "record-ok", "/cfg")})[0]
         self.assertIsNone(row["session"])
         self.assertEqual(row["declared_reason"], "config-untrusted")
+
+    def test_malformed_who_state_degrades_to_who_failed_not_crash(self):
+        # fable review LOW: who.scan parses external JSON/state — a
+        # KeyError/TypeError from a malformed row is as plausible as
+        # OSError/ValueError and must degrade to who_failed (the broad-catch
+        # pattern fleet._roster uses), never crash the whole census
+        for err in (KeyError("pid"), TypeError("row is not a dict")):
+            c = self.census([self.snap()],
+                            {41: (None, "record-missing", "/cfg")},
+                            who_fail=err)
+            self.assertTrue(c["who_failed"])
+            self.assertEqual(len(c["rows"]), 1)
 
     def test_final_process_identity_recheck_drops_raced_row(self):
         rows = self.rows([self.snap()],

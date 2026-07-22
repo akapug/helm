@@ -79,7 +79,7 @@ class FleetRowsTest(unittest.TestCase):
                 p.stop()
 
     def _rows(self, *a, **kw):
-        table, daemons, _failed, _partial = self._rows_full(*a, **kw)
+        table, daemons, _flags = self._rows_full(*a, **kw)
         return table, daemons
 
     def _render_rc(self, *a, args=(), **kw):
@@ -605,10 +605,10 @@ class CensusCompletenessTest(FleetRowsTest):
     sub-declared/resume row sid-UNKNOWN."""
 
     def test_census_failure_cannot_certify_an_empty_estate(self):
-        table, daemons, failed, _partial = self._rows_full(
+        table, daemons, flags = self._rows_full(
             {}, (), census_failed=True)
         self.assertEqual(table, [])
-        self.assertTrue(failed)
+        self.assertTrue(flags["census_failed"])
         out, rc = self._render_rc({}, (), census_failed=True)
         self.assertEqual(rc, 1)
         self.assertIn("CENSUS FAILED", out)
@@ -672,13 +672,13 @@ class PerPidProbeFailureTest(FleetRowsTest):
 
     def test_probe_failed_row_is_unknown_and_fails_the_exit_status(self):
         census = [pfrow(41)]
-        table, _daemons, failed, partial = self._rows_full({}, census)
+        table, _daemons, flags = self._rows_full({}, census)
         r = table[0]
         self.assertTrue(r["probe_failed"])
         self.assertTrue(r["unknown"])
         self.assertIsNone(r["sid"])
-        self.assertFalse(failed)
-        self.assertFalse(partial)
+        self.assertFalse(flags["census_failed"])
+        self.assertFalse(flags["census_partial"])
         out, rc = self._render_rc({}, census)
         self.assertEqual(rc, 1)
         self.assertIn("pid 41", out)
@@ -817,6 +817,119 @@ class SidParserTest(unittest.TestCase):
     def test_agreeing_repeats_still_resolve(self):
         self.assertEqual(session._resume_sid(
             ["claude", "--resume", SID_A, "--resume=" + SID_A]), SID_A)
+
+
+class PaneAmbiguityTest(FleetRowsTest):
+    """fable review HIGH: the shared-cwd ambiguity set must contain every
+    sibling claude row not PROVEN pane-less. An unknown-host sibling (its
+    walk failed — it is not refuted, and may be daemon-hosted in that very
+    terminal) makes the cwd join ambiguous; only a proven-HEADLESS sibling
+    (walked to init, proven in no pane) is excludable. Guessing here is the
+    founding failure: text injected into the wrong pane."""
+
+    TERMS = ([{"handle": "term_1", "worktreePath": "/w/x"}], False)
+
+    def _panes(self, sibling_state):
+        census = [srow(10, SID_A, "declared", root="/r", cwd="/w/x"),
+                  srow(11, SID_B, "declared", root="/r", cwd="/w/x")]
+        states = {10: ("daemon", 99), 11: sibling_state}
+        rows, _ = self._rows({10: {}, 11: {}}, census, {99: "s1"},
+                             daemon_for=lambda pid, ds, unp: states[pid],
+                             terminals=self.TERMS)
+        return {r["pid"]: r for r in rows}
+
+    def test_unknown_host_sibling_makes_the_pane_join_ambiguous(self):
+        by = self._panes(("unknown", None))
+        self.assertIsNone(by[10]["pane"])
+
+    def test_proven_headless_sibling_stays_excludable(self):
+        # the affirmative counterpart: a sibling PROVEN in no pane cannot
+        # make the join ambiguous — the hosted row keeps its unique handle
+        by = self._panes(("headless", None))
+        self.assertEqual(by[10]["pane"], "term_1")
+
+
+class EstateProbeExitTest(FleetRowsTest):
+    """fable review MED (both lenses): every estate-wide failed probe — who
+    scan, daemon scan, terminal list — must reach the machine-readable
+    verdict exactly like census_failed/census_partial: exit 1 and a named
+    --json completeness bit. A scripted consumer keying on rc or the JSON
+    estate bits must never read PASS while that truth went unprobed."""
+
+    def _bits(self, *a, **kw):
+        out, rc = self._render_rc(*a, args=("--json",), **kw)
+        return json.loads(out), rc
+
+    def test_who_failure_gates_exit_code_and_json(self):
+        census = [srow(4, root="/r")]
+        _out, rc = self._render_rc({4: {}}, census, who_failed=True)
+        self.assertEqual(rc, 1)
+        data, rc = self._bits({4: {}}, census, who_failed=True)
+        self.assertEqual(rc, 1)
+        self.assertTrue(data["who_failed"])
+        # healthy counterpart still certifies the affirmative bit
+        data, rc = self._bits({4: {}}, census)
+        self.assertEqual(rc, 0)
+        self.assertFalse(data["who_failed"])
+
+    def test_daemon_scan_failure_gates_exit_code_and_json(self):
+        census = [srow(3, SID_A, "declared", root="/r")]
+        boom = lambda p, ds, unp: self.fail("walk must not run")  # noqa: E731
+        _out, rc = self._render_rc({3: {}}, census, daemons_failed=True,
+                                   daemon_for=boom)
+        self.assertEqual(rc, 1)
+        data, rc = self._bits({3: {}}, census, daemons_failed=True,
+                              daemon_for=boom)
+        self.assertEqual(rc, 1)
+        self.assertTrue(data["daemons_failed"])
+        data, rc = self._bits({3: {}}, census)
+        self.assertEqual(rc, 0)
+        self.assertFalse(data["daemons_failed"])
+
+    def test_terminal_list_failure_gates_exit_code_and_json(self):
+        census = [srow(3, SID_A, "declared", root="/r")]
+        hosted = dict(daemons={99: "1"}, terminals=([], True))
+        _out, rc = self._render_rc({3: {}}, census, **hosted)
+        self.assertEqual(rc, 1)
+        data, rc = self._bits({3: {}}, census, **hosted)
+        self.assertEqual(rc, 1)
+        self.assertTrue(data["terms_failed"])
+        data, rc = self._bits({3: {}}, census, daemons={99: "1"})
+        self.assertEqual(rc, 0)
+        self.assertFalse(data["terms_failed"])
+
+    def test_text_render_names_the_failed_estate_probes(self):
+        out, rc = self._render_rc({4: {}}, [srow(4, root="/r")],
+                                  who_failed=True, daemons_failed=True)
+        self.assertEqual(rc, 1)
+        self.assertIn("estate-wide probe(s) FAILED", out)
+        self.assertIn("who scan", out)
+        self.assertIn("daemon scan", out)
+        self.assertIn("never proven blanks", out)
+
+
+class ProbeOrderingTest(unittest.TestCase):
+    """fable review LOW: the daemon scan runs AFTER the census bracket. A
+    daemon that starts between the two scans — whose freshly-spawned claude
+    IS censused — is then in the set, so the ppid walk cannot pass through
+    the missing pid to init and read a false proven-HEADLESS (a ghost
+    warning for a process with a live pane)."""
+
+    def test_daemon_scan_runs_after_the_census(self):
+        order = []
+
+        def census():
+            order.append("census")
+            return {}, False, False, False
+
+        def daemon_pids():
+            order.append("daemons")
+            return {}, set(), False
+        with mock.patch.object(fleet, "_census", census), \
+             mock.patch.object(fleet, "_daemon_pids", daemon_pids), \
+             mock.patch.object(fleet, "_roster", lambda: ({}, False)):
+            fleet.rows()
+        self.assertEqual(order, ["census", "daemons"])
 
 
 class PaneMappingTest(unittest.TestCase):

@@ -33,7 +33,11 @@ estate-wide bits: a mandatory probe that failed AFTER comm proved claude
 arrives as a probe_failed UNKNOWN row (rendered, counted, exit 1 — never
 dropped as proven absence), and one that failed BEFORE comm could prove or
 refute claude arrives as census_partial — the estate total prints as a
-floor ("at least N, CENSUS PARTIAL") and the verb exits 1.
+floor ("at least N, CENSUS PARTIAL") and the verb exits 1. EVERY estate-wide
+failed probe — who scan, daemon scan, terminal list — travels the same way
+as census_failed/census_partial: a named completeness bit in the --json
+envelope and exit 1, so a machine consumer keying on rc or the estate bits
+can never read PASS while that truth went unprobed.
 
 The one display probe that DOES re-read /proc after the census — the
 daemon/host ppid walk — is only composed in after a FINAL generation
@@ -277,11 +281,15 @@ def _seat_for(pid, env, roster, roster_err):
 
 
 def rows():
+    census, census_failed, who_failed, census_partial = _census()
+    # the daemon scan runs AFTER the census bracket: a daemon that started
+    # between the two scans — whose freshly-spawned claude IS censused — is
+    # then in the set, so the ppid walk can never pass through the missing
+    # pid to init and read a false proven-HEADLESS for a live-pane process
     daemons, unproven, daemons_failed = _daemon_pids()
     roster, roster_err = _roster()
     stamp_keys = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
                   "CLAUDE_CODE_BRIDGE_SESSION_ID")
-    census, census_failed, who_failed, census_partial = _census()
     live = session.live_sids(list(census.values()))
     tilde = lambda p: p.replace(os.path.expanduser("~"), "~")  # noqa: E731
     out, raw_cwds = [], {}
@@ -342,10 +350,19 @@ def rows():
                      else "helm" if deck else "-"),
         })
     hosted = [r for r in out if r["daemon_state"] == "daemon"]
+    terms_failed = False
     if hosted:
         terminals, terms_failed = _orca_terminals()
         counts = {}
-        for r in hosted:
+        # the ambiguity set spans EVERY sibling claude row not PROVEN
+        # pane-less: an unknown-host sibling is not refuted daemon-hosted —
+        # it may sit in that very terminal — so it makes the cwd join
+        # ambiguous; only a proven-HEADLESS sibling (walked to init) is
+        # excludable. Guessing here is the founding failure (text injected
+        # into the wrong pane).
+        for r in out:
+            if r["daemon_state"] == "headless":
+                continue
             c = raw_cwds[r["pid"]]
             counts[c] = counts.get(c, 0) + 1
         shared = {c for c, n in counts.items() if c and n > 1}
@@ -364,19 +381,27 @@ def rows():
             continue
         r["daemon"], r["daemon_state"], r["pane"] = None, "unknown", None
         r["unknown"] = True
-    return out, sorted(daemons), census_failed, census_partial
+    return out, sorted(daemons), {
+        "census_failed": census_failed, "census_partial": census_partial,
+        "who_failed": who_failed, "daemons_failed": daemons_failed,
+        "terms_failed": terms_failed}
 
 
 def cmd_fleet(args):
     """fleet [--json] — every live claude process, composition truth."""
-    table, daemons, census_failed, census_partial = rows()
+    table, daemons, flags = rows()
     probe_failed = [r for r in table if r["probe_failed"]]
-    rc = 1 if census_failed or census_partial or probe_failed else 0
+    # EVERY completeness bit gates the exit code: a failed who scan, daemon
+    # scan, or terminal list is an estate-wide failed probe exactly like a
+    # failed/partial census — a scripted consumer keying on rc (or on the
+    # JSON estate bits) must never read PASS while that truth went unprobed
+    rc = 1 if probe_failed or any(flags.values()) else 0
     if "--json" in args:
-        print(json.dumps({"rows": table, "daemons": daemons,
-                          "census_failed": census_failed,
-                          "census_partial": census_partial}, indent=2))
+        print(json.dumps({"rows": table, "daemons": daemons, **flags},
+                         indent=2))
         return rc
+    census_failed, census_partial = (flags["census_failed"],
+                                     flags["census_partial"])
     if census_failed:
         print("helm fleet — CENSUS FAILED: /proc could not be enumerated. "
               "The estate is UNKNOWN, not empty — zero rows is a failed "
@@ -416,6 +441,13 @@ def cmd_fleet(args):
     if unknowns:
         print("  ? %d row(s) carry UNKNOWN columns — failed probes, not "
               "absence; verify by hand before acting" % len(unknowns))
+    estate = [name for name, bit in (("who scan", flags["who_failed"]),
+                                     ("daemon scan", flags["daemons_failed"]),
+                                     ("terminal list", flags["terms_failed"]))
+              if bit]
+    if estate:
+        print("  ! estate-wide probe(s) FAILED: %s — the affected columns "
+              "are UNKNOWN, never proven blanks" % ", ".join(estate))
     if probe_failed:
         print("  ! pid(s) %s PROVED claude but a mandatory census probe "
               "FAILED — facts unprovable (UNKNOWN), never proven absence"

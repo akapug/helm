@@ -191,15 +191,21 @@ def _proc_start(pid):
 def _proc_matches(pid, start, cmdline, environ=None, cwd=None):
     """The same pid generation and process image still brackets the reads.
     starttime catches exit/PID reuse; cmdline+environ catch exec; cwd prevents
-    inference from composing two working-directory moments."""
+    inference from composing two working-directory moments. Tri-state:
+    True = the bracket is proven intact; False = a read PROVED a different
+    generation, or the pid left mid-recheck (ENOENT/ESRCH) — genuine absence
+    of the bracketed generation; None = a mandatory recheck read FAILED
+    (EACCES/EIO/...) while the pid persists — a failed PROBE, which a caller
+    must surface as UNKNOWN, never treat as proven absence."""
     try:
-        if _proc_start(pid) != start or _proc_bytes(pid, "cmdline") != cmdline:
+        if (_starttime_from_stat(_proc_bytes(pid, "stat")) != start
+                or _proc_bytes(pid, "cmdline") != cmdline):
             return False
         if environ is not None and _proc_bytes(pid, "environ") != environ:
             return False
         return cwd is None or os.readlink(os.path.join(PROC, str(pid), "cwd")) == cwd
-    except OSError:
-        return False
+    except OSError as e:
+        return False if _gone(e) else None
 
 
 def _selected_environ(raw):
@@ -294,7 +300,13 @@ def _proc_snapshot(pid):
         cwd = os.readlink(os.path.join(base, "cwd"))
     except OSError:
         cwd = None
-    if not _proc_matches(pid, start, cmdline, environ_raw, cwd):
+    match = _proc_matches(pid, start, cmdline, environ_raw, cwd)
+    if match is None:
+        # the bracket RECHECK failed while the pid persists: comm already
+        # PROVED claude, so the pid is KNOWN and its facts are unprovable —
+        # UNKNOWN, never a silent drop that certifies absence
+        return "unknown", {"pid": pid, "uid": uid, "start": start}
+    if not match:
         return "absent", None
     return "ok", {"pid": pid, "uid": uid, "start": start, "cmdline": cmdline,
                   "environ": environ_raw,
@@ -499,7 +511,11 @@ def _proc_claude_census():
         from . import who
         who_rows = {r["pid"]: r for r in who.scan(accounts=[])
                     if r.get("provider") == "anthropic" and not r.get("child")}
-    except (OSError, ValueError):
+    except Exception:
+        # broad on purpose (same pattern as fleet._roster): who.scan parses
+        # external JSON/state, so a malformed row can raise KeyError/TypeError
+        # just as plausibly as OSError/ValueError — every shape of failure
+        # must degrade to who_failed, never crash the whole census
         who_rows, who_failed = {}, True
     cwd_candidates = {}
     rows = []
@@ -527,8 +543,18 @@ def _proc_claude_census():
             if key not in cwd_candidates:
                 cwd_candidates[key] = _cwd_session_ids(*key)
             possible = cwd_candidates[key]
-        if not _proc_matches(pid, snap["start"], snap["cmdline"],
-                             snap["environ"], snap["cwd"]):
+        match = _proc_matches(pid, snap["start"], snap["cmdline"],
+                              snap["environ"], snap["cwd"])
+        if match is None:
+            # the mid-loop rebracket FAILED while the pid persists (EACCES/
+            # EIO): comm proved claude at snapshot time, so the row must
+            # surface as a probe_failed UNKNOWN stub — a silent drop here
+            # would read as proven absence, the exact class this census
+            # legislates against
+            unknown_stubs.append({"pid": pid, "uid": snap["uid"],
+                                  "start": snap["start"]})
+            continue
+        if not match:
             continue
         session_id = declared or resume or attributed
         rows.append({
