@@ -732,14 +732,49 @@ def _proc_uid(pid_dir):
     return os.stat(pid_dir).st_uid
 
 
+# Every comm a claude-harness process wears. Live census (this box,
+# 2026-07-22): claude hosts show comm `claude`; the node processes a session
+# spawns (MCP servers, workers) show `node` / `node-MainThread` (a
+# worker-thread rename; /proc comm is 15 bytes) — and a claude launched
+# without its argv0 rename would itself read `node`. DELIBERATELY conservative
+# in the safe direction: membership means a ptrace-protected pid stays
+# UNCERTAINTY, so listing too much only costs heal coverage, while listing too
+# little is what could evict a live session. `claude`-prefixed comms are
+# family wholesale (claude-code, claude-<anything>) for the same reason.
+_CLAUDE_FAMILY_COMMS = frozenset({"claude", "node", "node-MainThread"})
+
+
+def _comm_claude_family(comm):
+    return comm in _CLAUDE_FAMILY_COMMS or comm.startswith("claude")
+
+
+def _protected_not_holder(pdir):
+    """POLICY for the ptrace-protected residue (systemd --user with CapPrm,
+    non-dumpable ssh-agent, sandbox children, git helpers — ~239 same-uid pids
+    on the live box): their environ is EACCES forever, but /proc/<pid>/comm is
+    world-readable (0444) even for non-dumpable processes. A same-uid pid
+    whose comm is readable and NOT claude-family is structurally not a holder
+    — a claude session cannot wear `systemd`'s comm. A claude-family comm, or
+    a comm that cannot be read, stays uncertainty: the caller returns None and
+    every mutation refuses (fail closed exactly where a live session could be
+    evicted)."""
+    try:
+        with open(os.path.join(pdir, "comm")) as fh:
+            comm = fh.read().strip()
+    except OSError:
+        return False
+    return not _comm_claude_family(comm)
+
+
 def _unprovable_note():
     """cannot-probe, precisely: the platform has no /proc at all, or a
     SAME-UID process defeated the scan. The old single string blamed a
     missing /proc even on hosts where /proc was right there."""
     if not os.path.isdir(PROC_ROOT):
         return "no /proc on this platform — cannot prove the home is free"
-    return ("a same-uid process could not be proven free "
-            "(per-pid read failed while the pid persisted)")
+    return ("a same-uid process could not be proven free (a probe read failed "
+            "while the pid persisted, or a ptrace-protected pid wears a "
+            "claude-family comm)")
 
 
 def holders_of(path, default=False):
@@ -753,7 +788,10 @@ def holders_of(path, default=False):
     Each same-uid pid is bracketed by its starttime so PID reuse cannot mix
     one process's environ with another's comm. A process that vanishes
     mid-scan is absence; a SAME-UID read error while the pid remains is
-    uncertainty, never evidence of absence."""
+    uncertainty — UNLESS the pid's world-readable comm proves it outside the
+    claude family (_protected_not_holder), which is the only thing that keeps
+    heal alive on a real desktop where systemd --user, ssh-agent and sandbox
+    children hold EACCES environs forever."""
     if not os.path.isdir(PROC_ROOT):
         return None
     real = os.path.realpath(path)
@@ -771,8 +809,15 @@ def holders_of(path, default=False):
             if _proc_uid(pdir) != uid:
                 continue
             start = _proc_start(pdir)
-            with open(os.path.join(pdir, "environ"), "rb") as fh:
-                env = fh.read()
+            try:
+                with open(os.path.join(pdir, "environ"), "rb") as fh:
+                    env = fh.read()
+            except OSError:
+                if not os.path.exists(pdir):
+                    continue                    # vanished mid-scan: absence
+                if _protected_not_holder(pdir):
+                    continue     # ptrace-protected, comm proves non-claude
+                return None
             with open(os.path.join(pdir, "comm")) as fh:
                 comm = fh.read().strip()
             if _proc_start(pdir) != start or _proc_uid(pdir) != uid:

@@ -770,6 +770,88 @@ class HealTest(CredBase):
         finally:
             self._holders.start()
 
+    def deny_environ(self, *pids):
+        """The kernel's shape for a ptrace-protected same-uid pid: environ is
+        EACCES while comm (0444, world-readable even for non-dumpable
+        processes) still answers."""
+        real_open = open
+        markers = tuple(os.sep + str(p) + os.sep + "environ" for p in pids)
+        def denied(path, *a, **kw):
+            if str(path).endswith(markers):
+                raise PermissionError("synthetic ptrace-protected environ")
+            return real_open(path, *a, **kw)
+        return mock.patch("builtins.open", side_effect=denied)
+
+    def test_protected_non_claude_comm_is_structurally_not_a_holder(self):
+        """The live residue the uid-scoping fix surfaced: ~239 same-uid pids
+        (systemd --user, git helpers, ssh-agent, sandbox children) hold EACCES
+        environs FOREVER, keeping heal at cannot-probe for good. Their
+        world-readable comm proves they are not claude-harness processes — a
+        claude session cannot wear `systemd`'s comm — so they are structurally
+        not holders, never uncertainty."""
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, _ = self.fake_proc(4242, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            for pid, comm in ((9001, "systemd"), (9002, "git"), (9003, "ssh-agent")):
+                self.fake_proc(pid, b"", comm=comm)
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    self.deny_environ(9001, 9002, 9003):
+                self.assertEqual(cred.holders_of(d), [(4242, "claude")])
+        finally:
+            self._holders.start()
+
+    def test_protected_claude_family_comm_stays_uncertainty(self):
+        """The pin's other half: a non-dumpable pid that COULD be a claude
+        host (comm `claude`, or the node comms a claude estate actually shows)
+        keeps the scan at None — fail closed where a live session could be
+        evicted."""
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            for pid, comm in ((9001, "claude"), (9002, "node"),
+                              (9003, "node-MainThread"), (9004, "claude-code")):
+                root, p = self.fake_proc(pid, b"", comm=comm)
+                with mock.patch.object(cred, "PROC_ROOT", root), self.deny_environ(pid):
+                    self.assertIsNone(cred.holders_of(d), comm)
+                shutil.rmtree(p)
+        finally:
+            self._holders.start()
+
+    def test_protected_pid_with_unreadable_comm_stays_uncertainty(self):
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, _ = self.fake_proc(9001, b"", comm="systemd")
+            real_open = open
+            suffixes = tuple(os.path.join("9001", f) for f in ("environ", "comm"))
+            def denied(path, *a, **kw):
+                if str(path).endswith(suffixes):
+                    raise PermissionError("synthetic")
+                return real_open(path, *a, **kw)
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    mock.patch("builtins.open", side_effect=denied):
+                self.assertIsNone(cred.holders_of(d))
+        finally:
+            self._holders.start()
+
+    def test_heal_reaches_ready_through_ptrace_protected_system_pids(self):
+        """End-to-end pin of the policy on the live-box shape: with only
+        protected NON-claude pids in the table, a free drifted home plans
+        `ready` instead of the forever cannot-probe it planned before."""
+        self._holders.stop()
+        try:
+            self.drifted()
+            root, _ = self.fake_proc(9001, b"", comm="systemd")
+            self.fake_proc(9002, b"", comm="git")
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    self.deny_environ(9001, 9002):
+                plan = cred.heal()["plans"][0]
+            self.assertEqual(plan["status"], "ready", plan)
+            self.assertEqual(plan["holders"], [])
+        finally:
+            self._holders.start()
+
     def test_heal_dry_run_reaches_ready_through_the_real_probe(self):
         """End-to-end pin of the bug: a free drifted home with a snapshot must
         plan `ready` even though the process table holds foreign-uid pids —
