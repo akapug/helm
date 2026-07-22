@@ -875,6 +875,72 @@ helm creds crosscheck — local-session scan vs header truth (drift = a health s
     commingled — 4 accounts share this store; not a per-account cross-check
 ```
 
+### `helm cred [list | backup [--all] | switch-guard [--install] | heal [--apply]]`
+**The safe `/login`.** Hitting a session limit and running `/login` must never
+be a scary act. It cannot be redirected — a live session's `CLAUDE_CONFIG_DIR`
+is fixed, so the new account lands in the config dir that session is pinned to
+while the directory keeps its old NAME. `helm cred` makes that write
+**truthful, non-destructive and reversible**.
+
+Identity here always comes from CONTENT: `<dir>/.claude.json`'s `oauthAccount`
+block (email / uuid / org — metadata; the tokens live in `.credentials.json`
+and are never read aloud), cached by mtime. helm never infers an account from a
+directory name, and an unreadable `.claude.json` yields **no account claim at
+all** rather than a guess.
+
+| sub-verb | what it does |
+| --- | --- |
+| `list` (default) | DIR NAME &#124; ACTUAL ACCOUNT &#124; verdict (`AGREE` / `DRIFT` / `UNKNOWN` / `N/A`) &#124; backup depth. Pure read — the owner-visible truth surface. |
+| `backup [--all] [--home H] [--quiet]` | Snapshot a home's `.credentials.json` bytes + its `oauthAccount` block into `~/.cred-backups/<folded-email>/<ts>/` (dirs `0700`, files `0600`, owner-only from creation). Skips when an identical snapshot already exists; keeps the newest 20 per account. `--quiet` is hook mode: prints nothing, ever. |
+| `switch-guard [--home H]` | **Run this before a `/login`.** Backs the home's current account up, then prints the exact login command. Whatever `/login` evicts is now recoverable. `--install` wires the same backup as a `SessionStart` hook in every claude home, so a pre-image exists even when nobody remembered. |
+| `heal [<home>] [--apply]` | Put the correctly-named account back into a DRIFTED home from its newest snapshot. **Dry-run by default.** |
+
+`heal` refuses more than it acts, on purpose:
+
+* **held** — any live process pinned to that config dir (probed through
+  `/proc/<pid>/environ`, agent processes named first). A live session is never
+  evicted; the probe is re-run immediately before the write, so a holder that
+  arrives mid-heal still wins.
+* **cannot-probe** — no `/proc` to prove the home is free. Fail closed.
+* **no-backup** — nothing to restore; the account can only come back through a
+  fresh login, and helm says so instead of inventing a restore.
+* **revocation-risk** — the snapshot's refresh token is still LIVE in another
+  home. Restoring it would leave byte-copies of one token family in two homes,
+  and reuse detection revokes the whole family (see `helm homes verify`). helm
+  prints the fresh-login command instead.
+
+An applied heal snapshots the CURRENT occupant first (the undo is itself
+undoable), restores, then VERIFIES the home now reads as the expected account —
+rolling back if it does not. Restored credentials can still be stale (refresh
+tokens rotate); when claude rejects them the fix is one fresh login, and the
+identity is right either way.
+
+Secrets never surface: credential bytes are copied and compared, never printed,
+logged, or placed in an error string. The only derived value ever written is a
+12-hex sha256 prefix — a content fingerprint, the same idiom as the
+shared-family audit.
+
+`helm doctor` carries two rows from here: a loud `credhome <name> HOLDS
+<other-account> (drift)` WARN naming `helm cred heal`, and a `no cred backup
+for <account>` WARN — an account with no snapshot cannot be put back after the
+next eviction. `helm launch --home H` prints the account that home ACTUALLY
+holds before it execs, so asking for a home by name can no longer silently hand
+you a different account.
+
+```console
+$ helm cred list
+helm cred — identity read from CONTENT (.claude.json oauthAccount), never from the dir name:
+  DIR NAME                       ACTUAL ACCOUNT                   VERDICT  BACKUPS  NOTE
+  cto-example-com                you@example.com                  DRIFT    2        this account's home is you-example-com; alias: cto; live pids 57699
+  you-example-com                you@example.com                  AGREE    2
+helm cred: 2 homes, 1 drift — `helm cred heal` (dry-run) shows the repair
+
+$ helm cred switch-guard --home you-example-com
+helm cred switch-guard: you@example.com is protected (snapshot /home/you/.cred-backups/you-example-com/20260722T032630Z)
+  now safe to run:  CLAUDE_CONFIG_DIR=/home/you/.claude-homes/you-example-com claude /login
+  after the login:  `helm cred list` shows what this home now holds; `helm cred heal` puts you@example.com back when no session holds it.
+```
+
 ### `helm swap <home-or-account>`
 A seat ran dry mid-work: find its live sessions, pick the healthiest other
 account of the same provider, and print the exact resume-under-that-account

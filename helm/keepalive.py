@@ -35,7 +35,7 @@ import sys
 import time
 import urllib.request
 
-from . import catalog
+from . import catalog, cred
 
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -115,28 +115,38 @@ def refresh_home(home_path, early_horizon_s=60, force=False):
     every outcome is logged. NEVER touches a home with a live holder."""
     home_path = os.path.realpath(os.path.expanduser(home_path))
     name = os.path.basename(home_path)
+    # The dir NAME is a label, not an identity — a past `/login` can leave any
+    # account behind it. Every record below carries the account read from the
+    # home's CONTENT (cred.account_of), so this audit log can never say
+    # "refreshed cto-example" about someone else's token. Unreadable identity logs
+    # as null; it is NEVER inferred from the name.
+    account = cred.account_of(home_path)["email"]
+
+    def rec(event):
+        return _log({"home": name, "account": account, **event})
+
     cred_path = os.path.join(home_path, ".credentials.json")
     if not os.path.exists(cred_path):
-        return _log({"home": name, "action": "skip", "reason": "no credentials file"})
+        return rec({"action": "skip", "reason": "no credentials file"})
 
     pid = _live_holder_pid(home_path)
     if pid:
-        return _log({"home": name, "action": "skip",
+        return rec({"action": "skip",
                      "reason": f"live holder pid {pid} — one refresher per home, the agent owns it"})
 
     try:
         val, oauth = _read_oauth(cred_path)
     except (OSError, ValueError) as e:
-        return _log({"home": name, "action": "error", "reason": f"unreadable cred file: {e}"})
+        return rec({"action": "error", "reason": f"unreadable cred file: {e}"})
     refresh_token = oauth.get("refreshToken")
     if not refresh_token:
-        return _log({"home": name, "action": "needs_reauth", "reason": "no refreshToken present"})
+        return rec({"action": "needs_reauth", "reason": "no refreshToken present"})
 
     expires_at = oauth.get("expiresAt")  # ms epoch
     now_ms = int(time.time() * 1000)
     due = force or expires_at is None or expires_at <= now_ms + early_horizon_s * 1000
     if not due:
-        return _log({"home": name, "action": "skip",
+        return rec({"action": "skip",
                      "reason": f"not due (expires in {(expires_at - now_ms) // 60000} min)"})
 
     # ---- the refresh grant (rotation!) ----
@@ -151,15 +161,21 @@ def refresh_home(home_path, early_horizon_s=60, force=False):
             j = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         e.close()  # an HTTPError IS a response object — close its fp deterministically
-        return _log({"home": name, "action": "needs_reauth",
+        return rec({"action": "needs_reauth",
                      "reason": f"refresh HTTP {e.code} — refresh token dead, one-time re-login needed"})
     except Exception as e:
-        return _log({"home": name, "action": "error", "reason": f"refresh transport: {e}"})
+        return rec({"action": "error", "reason": f"refresh transport: {e}"})
 
     new_access = j.get("access_token")
     if not new_access:
-        return _log({"home": name, "action": "error", "reason": "refresh response had no access_token"})
+        return rec({"action": "error", "reason": "refresh response had no access_token"})
     expires_in = j.get("expires_in") or 28800
+
+    # ---- pre-image FIRST (every mutating cred path backs up first) ----
+    # Fail-closed and silent: a home whose account cannot be read is skipped,
+    # never filed under a guessed name; a failed snapshot never blocks the
+    # rotation (an unrotated family is the worse outcome).
+    snap = cred.backup(home_path)
 
     # ---- persist the rotation (REQUIRED — else the family burns) ----
     oauth["accessToken"] = new_access
@@ -178,10 +194,11 @@ def refresh_home(home_path, early_horizon_s=60, force=False):
             os.unlink(tmp)
         except OSError:
             pass
-        return _log({"home": name, "action": "error", "reason": f"write-back failed: {e}"})
-    return _log({"home": name, "action": "refreshed",
-                 "rotated_refresh_token": bool(j.get("refresh_token")),
-                 "new_expiry_in_h": round(expires_in / 3600, 1)})
+        return rec({"action": "error", "reason": f"write-back failed: {e}"})
+    return rec({"action": "refreshed",
+                "rotated_refresh_token": bool(j.get("refresh_token")),
+                "new_expiry_in_h": round(expires_in / 3600, 1),
+                "pre_image": snap.get("dest")})   # a path, never a token byte
 
 
 def sweep(early_h=24):

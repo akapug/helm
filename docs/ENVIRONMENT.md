@@ -78,6 +78,7 @@ overrides are in effect.
 | `HELM_ALLOCATION_RULES` | `~/.config/helm/allocation.json` (legacy `~/.config/sesh/` honored) | allocation ranking — operator prefer/avoid rules per model substring | `SESH_ALLOCATION_RULES` |
 | `HELM_PROBE_LOOP` | — (`1` starts the background re-probe loop lazily on the first history read) | the native provider's burn-history collector | `SESH_PROBE_LOOP` |
 | `HELM_ALLOC_MODELS` | `fable,opus,gpt-5.5` | the web quota view — which model chips the allocate panel offers | `SESH_ALLOC_MODELS` |
+| `HELM_CRED_BACKUP_ROOT` | `~/.cred-backups` | `helm cred backup` / `switch-guard` / `heal` — the credential snapshot root (`0700` dirs, `0600` files). Point it at an encrypted volume if you want the snapshots there; the override is also how tests keep the real root untouched | — |
 
 ## the web app
 

@@ -78,6 +78,24 @@ def build_env(base, seat, home_path=None, room=None, room_source=None):
     return env
 
 
+def home_note(home_path, asked):
+    """The anti-drift line: `--home cto-example` names a DIRECTORY, and a past
+    `/login` may have put a different account inside it. Print who the home
+    ACTUALLY holds (cred.account_of reads the content) before exec — the
+    operator asked for an account, not a path. Never blocks the launch."""
+    from . import cred
+    verdict, acct = cred.verdict_for(home_path)
+    if verdict == "UNKNOWN":
+        print("[helm launch] home %s: account unreadable (%s) — launching anyway"
+              % (asked, acct["error"]), file=sys.stderr)
+        return
+    print("[helm launch] home %s HOLDS %s%s"
+          % (asked, acct["email"],
+             "  ** DRIFT: this dir's name promises another account; that account's "
+             "home is %s (`helm cred list`) **" % homes.canonical_name(acct["email"])
+             if verdict == "DRIFT" else ""), file=sys.stderr)
+
+
 def cmd_launch(args):
     """launch [--seat S] [--home H] [--room R] [--no-install] [--] [args…]"""
     opts, claude_args = parse_args(args)
@@ -88,6 +106,7 @@ def cmd_launch(args):
             print("helm launch: " + err, file=sys.stderr)
             return 1
         home_path = targets[0][1]
+        home_note(home_path, opts["home"])
     seat = opts["seat"] or os.environ.get("HELM_CHAT_NAME") or stable_seat()
     env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
     room = opts["room"] or env_room or seats.derive_home_room(os.getcwd())

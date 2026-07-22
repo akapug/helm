@@ -64,6 +64,31 @@
   multiple exact matches render an orphan. It also escaped literal RS bytes
   inside digest fields, preventing author/text field sliding from preserving
   a signed digest after an edit.
+- The SAFE `/login` — `helm cred`. Hitting a session limit and running
+  `/login` must not be a problem to do, and it cannot be redirected (a live
+  session's CLAUDE_CONFIG_DIR is fixed), so the write is made truthful,
+  non-destructive and reversible instead. Identity now comes from CONTENT
+  (`cred.account_of` reads `<home>/.claude.json`'s oauthAccount, mtime-cached,
+  fail-closed — an unreadable file claims NO account rather than guessing from
+  the directory name), and `homes.py`'s identity reader, `helm launch --home`,
+  the keepalive audit log and `helm doctor` all read it, so a dir name can no
+  longer speak for an account. `helm cred list` is the owner-visible truth
+  surface (DIR NAME | ACTUAL ACCOUNT | verdict); `helm cred backup [--all]`
+  snapshots credentials + identity into `~/.cred-backups/<folded-email>/<ts>/`
+  (0700 dirs, 0600 files, idempotent, newest-20 retention);
+  `helm cred switch-guard [--install]` is the pre-login guard (explicit verb,
+  or wired as a SessionStart hook in every claude home); `helm cred heal`
+  restores a drifted home — DRY-RUN BY DEFAULT, backing up the current
+  occupant first, verifying after, and refusing when a live session holds the
+  home (`/proc` probe, re-checked immediately before the write), when there is
+  no `/proc` to prove it free, when no snapshot exists, or when the restore
+  would leave byte-copies of one refresh token in two homes (the revocation
+  bomb). Secrets never surface: credential bytes are copied and compared,
+  never printed, logged, or placed in an error string; the only derived value
+  written is a 12-hex sha256 fingerprint. doctor gains the loud drift row and
+  a `no cred backup for <account>` row. Keepalive — the one place helm writes
+  credential files — now snapshots a pre-image before every rotation and logs
+  the ACCOUNT beside the home name.
 
 - Stop-whisper slice 2 — the verify-grounding rungs: the contextual
   continuation ladder gains three signals read from record.py's own logs

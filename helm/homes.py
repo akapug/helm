@@ -65,10 +65,12 @@ def _read_json(path):
 
 
 def _claude_identity(home):
-    """oauthAccount email from a home's .claude.json — identity METADATA, never tokens."""
-    oa = (_read_json(os.path.join(home, ".claude.json")) or {}).get("oauthAccount") or {}
-    email = oa.get("emailAddress")
-    return email if isinstance(email, str) and email else None
+    """oauthAccount email from a home's .claude.json — identity METADATA, never
+    tokens. ONE content reader for the whole repo: cred.account_of (mtime-cached,
+    fail-closed) so `helm cred`, this row, launch and doctor can never disagree
+    about who a home holds."""
+    from . import cred          # function-level: cred imports homes
+    return cred.account_of(home)["email"]
 
 
 def _codex_identity(home):

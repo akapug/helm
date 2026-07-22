@@ -47,6 +47,11 @@ The pillars:
   reset windows, use-it-or-lose-it verdicts); `helm swap` rescues a seat that
   ran dry with exact resume-under-a-healthier-account commands; `helm homes`
   manages credential homes safely (helm prepares, you run every login).
+  **`helm cred`** makes `/login` safe: it reads which account each credential
+  home ACTUALLY holds from the home's own content (never from the directory
+  name), snapshots credentials at `0600` so a login that lands in a pinned
+  session's home is reversible, and heals a drifted home — dry-run by default,
+  refusing while any live session holds it.
 - **Attested truths** — `helm premise` captures a certainty into the store
   *and* commits a signed digest to a verifiable ledger; `helm premise-check`
   re-verifies it and quotes the finality tier. Belief history supersedes as a

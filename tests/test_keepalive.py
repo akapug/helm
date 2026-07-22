@@ -125,6 +125,29 @@ class KeepaliveTest(unittest.TestCase):
         for secret in ("NEW-A", "NEW-R", "OLD-R"):
             self.assertNotIn(secret, log_text)
 
+    def test_log_names_the_ACCOUNT_and_a_pre_image_precedes_the_rotation(self):
+        """The audit log's worst old bug: it recorded the DIR NAME, so a home
+        holding another account logged `refreshed cto-example` about someone else's
+        token. The account now rides every record, read from the home's own
+        .claude.json (cred.py) — and the pre-image lands BEFORE the write."""
+        d = self._plant_home("cto-example", {"refreshToken": "OLD-R", "expiresAt": 0})
+        with open(os.path.join(d, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {"emailAddress": "owner@example.invalid"}}, f)
+        backups = os.path.join(self.tmp, "cred-backups")
+        resp = _FakeResp({"access_token": "NEW-A", "refresh_token": "NEW-R",
+                          "expires_in": 3600})
+        with mock.patch.dict(os.environ, {"HELM_CRED_BACKUP_ROOT": backups}), \
+                mock.patch("urllib.request.urlopen", return_value=resp):
+            res = keepalive.refresh_home(d)
+        self.assertEqual(res["home"], "cto-example")            # the label survives
+        self.assertEqual(res["account"], "owner@example.invalid")   # …beside the TRUTH
+        pre = os.path.join(res["pre_image"], "credentials.json")
+        with open(pre) as fh:                              # the PRE-rotation bytes
+            self.assertEqual(json.load(fh)["claudeAiOauth"]["refreshToken"], "OLD-R")
+        self.assertEqual(stat.S_IMODE(os.stat(pre).st_mode), 0o600)
+        with open(keepalive.LOG_PATH) as fh:
+            self.assertNotIn("OLD-R", fh.read())           # still token-free
+
     def test_refresh_http_error_means_reauth_and_no_write(self):
         d = self._plant_home("expired-home", {"refreshToken": "OLD-R", "expiresAt": 0})
         with open(os.path.join(d, ".credentials.json")) as fh:

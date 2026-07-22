@@ -342,6 +342,17 @@ def check_cred_families():
     return out
 
 
+def check_cred_drift():
+    """The name-vs-account audit (cred.py): a credential home whose dir NAME
+    promises one account while its .claude.json holds ANOTHER — what a
+    mid-session `/login` leaves behind. Loud, because every name-keyed verb
+    (launch, hooks --home, keepalive's log, attribution) silently believes the
+    name. Plus the reversibility gate: an account with no credential snapshot
+    cannot be put back after the next eviction."""
+    from . import cred
+    return cred.doctor_rows()
+
+
 def _git_install_hint(os_release="/etc/os-release", platform=None):
     """The exact git install command for this box — best-effort distro guess
     from /etc/os-release (ID first, ID_LIKE folded in)."""
@@ -410,7 +421,7 @@ CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
           "check_projection_registry",
           "check_adopted_store", "check_know_your_user", "check_cv",
           "check_inject_coverage", "check_env", "check_physics_currency", "check_record",
-          "check_chat_node", "check_cred_families", "check_git",
+          "check_chat_node", "check_cred_families", "check_cred_drift", "check_git",
           "check_metaharness")
 
 
