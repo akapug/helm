@@ -79,13 +79,12 @@ class ScanTest(SessionBase):
         # child's own session and must never invent holders/double-opens.
         self.assertNotIn("85935aed", sids)
 
-    def test_who_holder_keeps_only_one_valid_candidate_for_safety(self):
+    def test_who_holder_accepts_only_fresh_exact_identity(self):
         sid = "33333333-3333-3333-3333-333333333333"
         self.assertEqual(session._who_holder_sid({
-            "session": None, "session_candidates": [sid]}), sid)
+            "session": sid, "session_candidates": []}), sid)
         self.assertIsNone(session._who_holder_sid({
-            "session": None, "session_candidates": [sid,
-                "44444444-4444-4444-4444-444444444444"]}))
+            "session": None, "session_candidates": [sid]}))
         self.assertIsNone(session._who_holder_sid({
             "session": "not-a-session", "session_candidates": []}))
 
@@ -195,6 +194,34 @@ class ScanTest(SessionBase):
         # `not child => persisted` rule mislabeled this safe: the dangerous way)
         self.assertIn("MEMORY-ONLY (no transcript on disk)", line["57699"])
         self.assertIn("DOUBLE-OPEN", out)  # deadbeef open in 622078 + 700
+
+    def test_doctor_panes_fails_bad_states_and_passes_clear_inventory(self):
+        with mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("cccc2222-rescued")):
+            bad_rc, bad_out, bad_err = run(session.cmd_doctor_panes, [])
+        self.assertEqual(bad_rc, 1, bad_err)
+        self.assertIn("MEMORY-ONLY", bad_out)
+
+        with mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("aaaa1111-integrator",
+                                               "deadbeef-memory-only",
+                                               "cccc2222-rescued")):
+            clear_rc, clear_out, clear_err = run(session.cmd_doctor_panes, [])
+        self.assertEqual(clear_rc, 0, clear_err)
+        self.assertNotIn("MEMORY-ONLY", clear_out)
+        self.assertNotIn("DOUBLE-OPEN", clear_out)
+        self.assertNotIn("UNKNOWN", clear_out)
+
+        self.panes.append({"pid": 700, "resume": "aaaa1111-integrator",
+                           "session": "aaaa1111-integrator", "child": False,
+                           "ancestor_sid8": "", "force": False})
+        with mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("aaaa1111-integrator",
+                                               "deadbeef-memory-only",
+                                               "cccc2222-rescued")):
+            double_rc, double_out, double_err = run(session.cmd_doctor_panes, [])
+        self.assertEqual(double_rc, 1, double_err)
+        self.assertIn("DOUBLE-OPEN", double_out)
 
 
 class LawTest(SessionBase):
@@ -392,8 +419,10 @@ class LawTest(SessionBase):
         cv.assert_not_called()
         event.assert_not_called()
 
-    def test_doctor_propagates_cv_failure(self):
+    def test_doctor_propagates_cv_failure_for_persisted_session(self):
         with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("aaaa1111-integrator")), \
              mock.patch.object(session, "_cv", return_value=(1, "", "bad session")):
             rc, out, err = run(session.cmd_doctor, ["aaaa1111"])
         self.assertEqual(rc, 1)
@@ -433,6 +462,22 @@ class LawTest(SessionBase):
         self.assertEqual(rc, 0, err)
         self.assertIn("bridged-child", out)
         self.assertIn("rescue", out)
+
+    def test_doctor_live_memory_only_needs_neither_catalog_nor_cv(self):
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        rows = [{"pid": 901, "child": False, "force": False, "resume": None,
+                 "declared": sid, "session": sid, "possible_sessions": [],
+                 "ancestor_sid8": ""}]
+        with mock.patch.object(session, "_proc_claude_rows", return_value=rows), \
+             mock.patch.object(session, "_persisting_sids", return_value={}), \
+             mock.patch.object(session, "_resolve_sid") as resolve, \
+             mock.patch.object(session, "_cv") as cv:
+            rc, out, err = run(session.cmd_doctor, ["aaaaaaaa"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("memory-only", out)
+        self.assertIn("skipped (no transcript on disk)", out)
+        resolve.assert_not_called()
+        cv.assert_not_called()
 
     def test_doctor_calls_a_persisting_pane_live(self):
         rows = [{"pid": 901, "child": True, "force": True, "resume": None,
@@ -498,8 +543,11 @@ class LawTest(SessionBase):
         self.assertIn("UNKNOWN", err)
         cv.assert_not_called()
 
-    def test_cv_absent_degrades_clean(self):
-        with self._sid("aaaa1111-integrator"), self.cv_absent():
+    def test_cv_absent_degrades_clean_for_persisted_session(self):
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "_persisting_sids", return_value=
+                               self.persisting("aaaa1111-integrator")), \
+             self.cv_absent():
             rc, _o, err = run(session.cmd_doctor, ["aaaa1111"])
         self.assertEqual(rc, 1)
         self.assertIn("cv not installed", err)
@@ -531,18 +579,27 @@ class RescueTest(SessionBase):
         self.assertEqual(rc, 1)
         self.assertIn("no live claude pid", err)
 
-    def test_rescue_pid_uses_declared_identity_when_inference_missed(self):
-        row = {"pid": 901, "child": False, "force": False, "resume": None,
-               "declared": "deadbeef-memory-only",
-               "session": "deadbeef-memory-only", "possible_sessions": [],
-               "ancestor_sid8": ""}
-        with mock.patch.object(session, "_proc_claude_rows", return_value=[row]), \
-             mock.patch.object(session, "cmd_doctor", return_value=0), \
-             mock.patch.object(session, "open_pids", return_value=[901]):
-            rc, out, err = run(session.cmd_rescue, ["901"])
-        self.assertEqual(rc, 1, err)
-        self.assertIn("pid 901 -> sid deadbeef", out)
-        self.assertIn("HARVEST", out)
+    def test_rescue_pid_uses_declared_identity_without_catalog_or_transcript(self):
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        for child in (False, True):
+            with self.subTest(child=child):
+                row = {"pid": 901, "child": child, "force": False,
+                       "resume": None, "declared": sid, "session": sid,
+                       "possible_sessions": [], "ancestor_sid8": "85935aed"}
+                with mock.patch.object(session, "_proc_claude_rows",
+                                       return_value=[row]), \
+                     mock.patch.object(session, "_persisting_sids", return_value={}), \
+                     mock.patch.object(session, "_resolve_sid") as resolve, \
+                     mock.patch.object(session, "_cv") as cv:
+                    rc, out, err = run(session.cmd_rescue, ["901"])
+                self.assertEqual(rc, 1, err)
+                self.assertIn("pid 901 -> sid aaaaaaaa", out)
+                self.assertIn("memory-only", out)
+                self.assertIn("HARVEST", out)
+                self.assertIn("SELF-RECAP", out)
+                self.assertNotIn("claude --resume", out)
+                resolve.assert_not_called()
+                cv.assert_not_called()
 
 
 class ExpertsTest(SessionBase):
@@ -783,6 +840,32 @@ class DeclaredSidTest(unittest.TestCase):
         self.assertEqual(session._sid_from_session_file(self.pid, other),
                          "bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
 
+    def test_config_home_rejects_caller_tilde_relative_and_writable_paths(self):
+        self.write()
+        self.assertIsNone(session._sid_from_session_file(self.pid, "~/.claude"))
+        self.assertIsNone(session._sid_from_session_file(self.pid, "relative"))
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp + "\0x"))
+
+        os.chmod(self.tmp, 0o777)
+        try:
+            self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        finally:
+            os.chmod(self.tmp, 0o700)
+
+        sessions = os.path.join(self.tmp, "sessions")
+        os.chmod(sessions, 0o777)
+        try:
+            self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        finally:
+            os.chmod(sessions, 0o755)
+
+        record = os.path.join(sessions, "%d.json" % self.pid)
+        os.chmod(record, 0o666)
+        try:
+            self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        finally:
+            os.chmod(record, 0o600)
+
     def test_config_home_alias_resolves_but_sessions_symlink_does_not(self):
         self.write()
         alias = self.tmp + "-alias"
@@ -945,6 +1028,18 @@ class ProcCensusTest(unittest.TestCase):
         row = self.rows([snap], {41: (None, "record-missing", "/cfg")})[0]
         self.assertIsNone(row["session"])
         self.assertEqual(row["identity"], "unknown")
+
+    def test_stale_who_candidate_stays_possible_without_false_sid(self):
+        snap = self.snap(argv=["claude", "--continue"])
+        wr = [{"pid": 41, "provider": "anthropic", "child": False,
+               "session": None, "session_candidates": [self.NEW]}]
+        row = self.rows([snap], {41: (None, "record-missing", "/cfg")},
+                        who_rows=wr, candidates=[self.NEW])[0]
+        self.assertIsNone(row["session"])
+        self.assertEqual(row["identity"], "unknown")
+        self.assertEqual(row["possible_sessions"], [self.NEW])
+        self.assertEqual(session.live_sids([row]), {})
+        self.assertEqual(session.open_pids(self.NEW, [row]), [41])
 
     def test_failed_rungs_still_collect_deterministic_cwd_candidates(self):
         snap = self.snap(argv=["claude", "--continue"])

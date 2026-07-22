@@ -732,11 +732,13 @@ PID-keyed Claude Code records are used only when their canonical UUID and
 
 ### `helm session doctor <sid> | checkpoint <sid> [--window N] | rescue <pid|sid>`
 `doctor` classifies a session (normal / forked / compacted / live /
-MEMORY-ONLY / UNKNOWN) + the live-pane state. `checkpoint` mints a NEW resumable
-id
-(`cv prune --thinking`, original untouched) so a maxed/forked session becomes
-branchable. `rescue` is the full pipeline for a memory-only pane: harvest
-side-channels first, then print the incantation.
+MEMORY-ONLY / UNKNOWN) + the live-pane state. A proven live memory-only SID is
+diagnosed directly even though its missing transcript gives `cv` and the catalog
+nothing to open. `checkpoint` mints a NEW resumable id (`cv prune --thinking`,
+original untouched) so a maxed/forked session becomes branchable. `rescue` tells
+stamped and unstamped transcriptless panes to harvest side-channels and write a
+self-recap while still live; it never invents a resume line for a missing
+transcript.
 
 ### `helm session port --cred <home> <sid> | resume <sid> [--launch]`
 Cred-switch resume PREP (`port`: verifies the target home's projects/trust,

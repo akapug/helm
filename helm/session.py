@@ -134,14 +134,10 @@ def _cv_launch(sid):
 # ---------------------------------------------------------------------------
 
 def _who_holder_sid(row):
-    """Safety attribution from ``helm who``: only canonical Claude UUIDs count.
-    Exact wins; one sole valid cwd candidate remains a possible holder."""
+    """Only ``helm who``'s fresh exact attribution is identity. Historical cwd
+    candidates remain possible holders; promoting a sole stale file invents a SID."""
     exact = row.get("session")
-    if isinstance(exact, str) and _SID_RE.fullmatch(exact):
-        return exact
-    candidates = [sid for sid in row.get("session_candidates") or []
-                  if isinstance(sid, str) and _SID_RE.fullmatch(sid)]
-    return candidates[0] if len(candidates) == 1 else None
+    return exact if isinstance(exact, str) and _SID_RE.fullmatch(exact) else None
 
 
 def _cwd_session_ids(home_dir, cwd):
@@ -273,20 +269,38 @@ def _resume_sid(argv):
     return unique[0] if len(unique) == 1 else None
 
 
+def _safe_owned_dir(value, uid):
+    return (stat.S_ISDIR(value.st_mode) and value.st_uid == uid
+            and not value.st_mode & stat.S_IWOTH)
+
+
+def _safe_owned_record(value, uid):
+    return (stat.S_ISREG(value.st_mode) and value.st_uid == uid
+            and value.st_nlink == 1
+            and not value.st_mode & stat.S_IWOTH
+            and value.st_size <= _SESSION_RECORD_MAX)
+
+
 def _config_root(config_dir, home_dir, uid):
-    """Canonical process config home. The home itself may be a normal credhome
-    alias. Child paths are checked separately so a missing record store does not
-    suppress later cwd inference from the trusted home."""
-    raw = config_dir or os.path.join(home_dir or os.path.expanduser("~"), ".claude")
-    raw = os.path.expanduser(raw)
-    if not os.path.isabs(raw):
+    """Canonical process config home. Explicit config paths must already be
+    absolute; ``~`` is never expanded through the inspecting process's HOME.
+    Child paths are checked separately so a missing record store does not
+    suppress later cwd inference from a trusted home."""
+    if config_dir:
+        raw = config_dir
+    else:
+        base = home_dir if home_dir is not None else os.path.expanduser("~")
+        if not isinstance(base, str) or not os.path.isabs(base):
+            return None
+        raw = os.path.join(base, ".claude")
+    if not isinstance(raw, str) or "\0" in raw or not os.path.isabs(raw):
         return None
-    root = os.path.realpath(raw)
     try:
+        root = os.path.realpath(raw)
         rst = os.stat(root)
-    except OSError:
+    except (OSError, ValueError):
         return None
-    return root if stat.S_ISDIR(rst.st_mode) and rst.st_uid == uid else None
+    return root if _safe_owned_dir(rst, uid) else None
 
 
 def _record_unchanged(path, before):
@@ -294,10 +308,10 @@ def _record_unchanged(path, before):
         current = os.lstat(path)
     except OSError:
         return False
-    return (not stat.S_ISLNK(current.st_mode)
-            and (current.st_dev, current.st_ino, current.st_size,
+    return (_safe_owned_record(current, before.st_uid)
+            and (current.st_dev, current.st_ino, current.st_mode, current.st_size,
                  current.st_mtime_ns, current.st_ctime_ns)
-            == (before.st_dev, before.st_ino, before.st_size,
+            == (before.st_dev, before.st_ino, before.st_mode, before.st_size,
                 before.st_mtime_ns, before.st_ctime_ns))
 
 
@@ -313,8 +327,7 @@ def _read_session_record(root, pid, uid, proc_start):
         return None, "record-missing"
     except OSError:
         return None, "record-unreadable"
-    if stat.S_ISLNK(sst.st_mode) or not stat.S_ISDIR(sst.st_mode) \
-            or sst.st_uid != uid:
+    if not _safe_owned_dir(sst, uid):
         return None, "record-unsafe"
     try:
         lst = os.lstat(path)
@@ -322,9 +335,7 @@ def _read_session_record(root, pid, uid, proc_start):
         return None, "record-missing"
     except OSError:
         return None, "record-unreadable"
-    if (stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode)
-            or lst.st_uid != uid or lst.st_nlink != 1
-            or lst.st_size > _SESSION_RECORD_MAX):
+    if not _safe_owned_record(lst, uid):
         return None, "record-unsafe"
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) \
         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
@@ -332,8 +343,7 @@ def _read_session_record(root, pid, uid, proc_start):
         fd = os.open(path, flags)
         try:
             before = os.fstat(fd)
-            if (not stat.S_ISREG(before.st_mode) or before.st_uid != uid
-                    or before.st_nlink != 1 or before.st_size > _SESSION_RECORD_MAX):
+            if not _safe_owned_record(before, uid):
                 return None, "record-unsafe"
             raw = b""
             while len(raw) <= _SESSION_RECORD_MAX:
@@ -346,12 +356,12 @@ def _read_session_record(root, pid, uid, proc_start):
             os.close(fd)
     except OSError:
         return None, "record-unreadable"
-    before_id = (before.st_dev, before.st_ino, before.st_size,
+    before_id = (before.st_dev, before.st_ino, before.st_mode, before.st_size,
                  before.st_mtime_ns, before.st_ctime_ns)
-    after_id = (after.st_dev, after.st_ino, after.st_size,
+    after_id = (after.st_dev, after.st_ino, after.st_mode, after.st_size,
                 after.st_mtime_ns, after.st_ctime_ns)
-    if len(raw) > _SESSION_RECORD_MAX or before_id != after_id \
-            or not _record_unchanged(path, before):
+    if (not _safe_owned_record(after, uid) or len(raw) > _SESSION_RECORD_MAX
+            or before_id != after_id or not _record_unchanged(path, before)):
         return None, "record-replaced"
     try:
         rec = json.loads(raw.decode("utf-8"))
@@ -668,7 +678,7 @@ def _cmd_ls(args, certify=False):
     if unknown:
         print("? %d pane(s) have UNKNOWN sid/persistence — no safety or absence "
               "claim is certified." % len(unknown))
-    return 1 if certify and unknown else 0
+    return 1 if certify and (unknown or mo or dbl) else 0
 
 
 def cmd_ls(args):
@@ -683,31 +693,27 @@ def cmd_doctor_panes(args):
     return _cmd_ls(args, certify=True)
 
 
-def cmd_doctor(args):
-    """session doctor <sid> — classify a session: normal / forked / compacted /
-    bridged-child / maxed-at-wall, and which lane applies. Wraps cv doctor +
-    the catalog + the live-pane scan."""
-    if not args:
-        print("usage: helm session doctor <sid-prefix>", file=sys.stderr)
-        return 2
-    sid, err = _resolve_sid(args[0])
-    if not sid:
-        print("helm session doctor: " + err, file=sys.stderr)
-        return 1
-    rc, out, cerr = _cv("doctor", sid, "--json")
-    if rc != 0:
-        print("helm session doctor: cv doctor failed: " + (cerr or out),
-              file=sys.stderr)
-        return 1
+def _live_sid(prefix, rows):
+    matches = sorted({r["session"] for r in rows
+                      if r.get("session") and _sid_matches(r["session"], prefix)})
+    if len(matches) == 1:
+        return matches[0], None
+    if matches:
+        return None, "%d live sessions match '%s'" % (len(matches), prefix)
+    return None, None
+
+
+def _doctor_sid(sid, rows):
+    """Render one already-resolved SID. A proven transcriptless live pane does
+    not depend on catalog/cv mechanics that require the missing transcript."""
     kinds = []
-    rows = _proc_claude_rows()
     exact, uncertain = _matching_rows(sid, rows)
     pids = sorted({r["pid"] for r in exact + uncertain})
+    disk_state = None
     if exact:
         # PERSISTENCE IS TRANSCRIPT-TRUTH, not the env stamp. The stamp is a
         # reason to inspect; only a still-present transcript is the verdict.
-        persisting = _persisting_sids()
-        disk_state = _sid_on_disk(sid, persisting)
+        disk_state = _sid_on_disk(sid, _persisting_sids())
         if disk_state is None:
             kinds.append("UNKNOWN (transcript census incomplete)")
         elif disk_state is False:
@@ -716,6 +722,13 @@ def cmd_doctor(args):
                          else "memory-only (no transcript on disk)")
         else:
             kinds.append("live")
+    out = ""
+    if disk_state is not False:
+        rc, out, cerr = _cv("doctor", sid, "--json")
+        if rc != 0:
+            print("helm session doctor: cv doctor failed: " + (cerr or out),
+                  file=sys.stderr)
+            return 1
     if uncertain:
         kinds.append("UNKNOWN (sid is only a cwd candidate in pid(s) %s)"
                      % sorted(r["pid"] for r in uncertain))
@@ -739,7 +752,9 @@ def cmd_doctor(args):
     elif pids:
         print("  live in pid(s): %s — LAW 1: close before any resume" % pids)
     if out.strip():
-        print("  cv doctor: " + (out.strip().splitlines()[0] if out else ""))
+        print("  cv doctor: " + out.strip().splitlines()[0])
+    elif disk_state is False:
+        print("  cv doctor: skipped (no transcript on disk)")
     # Key the lane on MEMORY-ONLY, not on "bridged": a stamped child and an
     # unstamped transcript-less pane are the same emergency (context dies with
     # the process) and both must route to rescue. Keying on the narrower token
@@ -752,6 +767,26 @@ def cmd_doctor(args):
             else "checkpoint/port as needed")
     print("  lane: %s" % lane)
     return 0
+
+
+def cmd_doctor(args):
+    """session doctor <sid> — classify a session from transcript truth plus cv
+    metadata. A unique proven live SID can be diagnosed before it has a catalog
+    row, which is essential for transcriptless memory-only panes."""
+    if not args:
+        print("usage: helm session doctor <sid-prefix>", file=sys.stderr)
+        return 2
+    rows = _proc_claude_rows()
+    sid, err = _live_sid(args[0], rows)
+    if err:
+        print("helm session doctor: " + err, file=sys.stderr)
+        return 1
+    if not sid:
+        sid, err = _resolve_sid(args[0])
+    if not sid:
+        print("helm session doctor: " + err, file=sys.stderr)
+        return 1
+    return _doctor_sid(sid, rows)
 
 
 def cmd_checkpoint(args):
@@ -893,16 +928,17 @@ def cmd_port(args):
 
 
 def cmd_rescue(args):
-    """session rescue <pid|sid> — the full pipeline: doctor -> harvest note ->
-    checkpoint/port-preflight -> PRINT incantation. Laws 1+2 enforced."""
+    """session rescue <pid|sid> — diagnose from the live census, then harvest
+    before close. Transcriptless panes never get a fabricated resume line."""
     if not args:
         print("usage: helm session rescue <pid|sid-prefix>", file=sys.stderr)
         return 2
     target = args[0]
+    rows = _proc_claude_rows()
     sid = None
-    if target.isdigit():  # a live pid: resolve its sid from the scan
+    if target.isdigit():  # a live pid: resolve its sid from the same census
         pid = int(target)
-        row = next((r for r in _proc_claude_rows() if r["pid"] == pid), None)
+        row = next((r for r in rows if r["pid"] == pid), None)
         if not row:
             print("helm session rescue: no live claude pid %s" % pid, file=sys.stderr)
             return 1
@@ -918,21 +954,26 @@ def cmd_rescue(args):
         print("pid %d -> sid %s (child-stamped: %s, FORCED: %s)"
               % (pid, sid[:12], row["child"], row["force"]))
     else:
-        sid, err = _resolve_sid(target)
+        sid, err = _live_sid(target, rows)
+        if err:
+            print("helm session rescue: " + err, file=sys.stderr)
+            return 1
+        if not sid:
+            sid, err = _resolve_sid(target)
         if not sid:
             print("helm session rescue: " + err, file=sys.stderr)
             return 1
-    rc = cmd_doctor([sid])
+    rc = _doctor_sid(sid, rows)
     if rc != 0:
         return rc
-    live = open_pids(sid)
+    live = open_pids(sid, rows)
     print("rescue plan for %s:" % sid[:12])
     print("  1. HARVEST side channels FIRST (pane scrollback, journals, "
           "/dev/shm/helm-chat) — they die with the pane/reboot.")
     print("  2. Write the pane's SELF-RECAP (the fidelity anchor).")
     if live:
-        print("  3. LAW 1: close live pid(s) %s BEFORE resuming; NOT printing "
-              "the incantation while it is open." % live)
+        print("  3. LAW 1: close live pid(s) %s after harvest; NOT printing "
+              "an incantation while it is open." % live)
         return 1
     print("  3. Resume: " + _print_incantation(sid))
     return 0
