@@ -355,6 +355,51 @@ class LawTest(SessionBase):
         self.assertEqual(out, "")
         self.assertIn("bad session", err)
 
+    def _doctor(self, on_disk, rows):
+        """Run doctor for a live sid with a controlled transcript census."""
+        with self._sid("aaaa1111-integrator"), \
+             mock.patch.object(session, "open_pids", return_value=[901]), \
+             mock.patch.object(session, "_persisting_sids",
+                               return_value=on_disk), \
+             mock.patch.object(session, "_proc_claude_rows",
+                               return_value=rows), \
+             self.cv_ok("{}"):
+            return run(session.cmd_doctor, ["aaaa1111"])
+
+    def test_doctor_flags_an_UNSTAMPED_transcriptless_pane(self):
+        """The under-flag, and the reason this fix exists: doctor keyed on the
+        env stamp (`child and not force`), so a TOP-LEVEL pane carrying no
+        stamp and writing NO transcript reported as plain 'live'. Persistence
+        is transcript-truth — the stamp is only ever the REASON, never the
+        verdict — and that law landed in `ls` without being propagated here."""
+        rows = [{"pid": 901, "child": False, "force": False, "resume": None,
+                 "declared": None, "session": "aaaa1111-integrator",
+                 "possible_sessions": [], "ancestor_sid8": ""}]
+        rc, out, err = self._doctor({}, rows)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("memory-only", out)
+        self.assertIn("rescue", out)          # and it routes to rescue
+
+    def test_doctor_still_names_the_stamped_case_precisely(self):
+        rows = [{"pid": 901, "child": True, "force": False, "resume": None,
+                 "declared": None, "session": "aaaa1111-integrator",
+                 "possible_sessions": [], "ancestor_sid8": ""}]
+        rc, out, err = self._doctor({}, rows)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("bridged-child", out)
+        self.assertIn("rescue", out)
+
+    def test_doctor_calls_a_persisting_pane_live(self):
+        rows = [{"pid": 901, "child": True, "force": True, "resume": None,
+                 "declared": None, "session": "aaaa1111-integrator",
+                 "possible_sessions": [], "ancestor_sid8": ""}]
+        rc, out, err = self._doctor(
+            {"aaaa1111-integrator": "/tmp/x.jsonl"}, rows)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("live", out)
+        self.assertNotIn("memory-only", out)
+        self.assertIn("checkpoint", out)      # not the rescue lane
+
     def test_cv_absent_degrades_clean(self):
         with self._sid("aaaa1111-integrator"), self.cv_absent():
             rc, _o, err = run(session.cmd_doctor, ["aaaa1111"])

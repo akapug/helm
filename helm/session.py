@@ -480,9 +480,21 @@ def cmd_doctor(args):
     kinds = []
     pids = open_pids(sid)
     if pids:
-        stamped = [p for p in _proc_claude_rows()
-                   if p["pid"] in pids and p["child"] and not p["force"]]
-        kinds.append("bridged-child (memory-only)" if stamped else "live")
+        # PERSISTENCE IS TRANSCRIPT-TRUTH, not the env stamp — the same law
+        # `ls` enforces. This path used to read `child and not force`, which
+        # is only ever the REASON a pane might be memory-only, never the
+        # verdict: a TOP-LEVEL pane carrying no stamp at all and writing no
+        # transcript reported as plain "live". That is the UNDER-flag, the
+        # dangerous direction, and it survived here because the fix landed in
+        # `ls` and was never propagated to its class.
+        persisting = _persisting_sids()
+        if not _sid_on_disk(sid, persisting):
+            stamped = any(p["child"] and not p["force"]
+                          for p in _proc_claude_rows() if p["pid"] in pids)
+            kinds.append("bridged-child (memory-only)" if stamped
+                         else "memory-only (no transcript on disk)")
+        else:
+            kinds.append("live")
     try:
         d = json.loads(out) if out.strip() else {}
     except ValueError:
@@ -500,7 +512,13 @@ def cmd_doctor(args):
             pids, " — LAW 1: close before any resume" if pids else ""))
     if out.strip():
         print("  cv doctor: " + (out.strip().splitlines()[0] if out else ""))
-    lane = ("rescue (memory-only — harvest first)" if any("bridged" in k for k in kinds)
+    # Key the lane on MEMORY-ONLY, not on "bridged": a stamped child and an
+    # unstamped transcript-less pane are the same emergency (context dies with
+    # the process) and both must route to rescue. Keying on the narrower token
+    # would send the unstamped case to checkpoint, which needs a transcript
+    # that by definition is not there.
+    lane = ("rescue (memory-only — harvest first)"
+            if any("memory-only" in k for k in kinds)
             else "checkpoint/port as needed")
     print("  lane: %s" % lane)
     return 0
