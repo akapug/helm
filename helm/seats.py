@@ -637,7 +637,9 @@ def rename_seat(old, new):
         _move_seat_state(seat, new)
     return True, ("seat %s -> %s: @%s now delivers to it. If it armed a "
                   "beacon on the old name, re-arm: Monitor(command: \"helm "
-                  "chat wait --seat %s --follow\", persistent: true). A seat "
+                  "chat wait --seat %s --follow\", persistent: true) — if Monitor "
+                  "is not in your surface it is DEFERRED: ToolSearch(query: "
+                  "\"select:Monitor\") first. A seat "
                   "launched with HELM_CHAT_NAME=%s re-registers the old name "
                   "on its next session — relaunch to make the rename stick "
                   "there." % (seat, new, new, new, seat))
@@ -1277,10 +1279,16 @@ def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
             "ACTION: arm your inbox beacon so "
             "you wake on an @%s mention or a DM even while idle "
             "— Monitor(command: \"helm chat wait --seat %s --follow\", "
-            "persistent: true). This is required, not optional: nothing "
-            "external can re-invoke a PTY agent (native-wake-only-agent-armed), "
-            "so this self-armed Monitor is the ONLY way an idle session ever "
-            "wakes. Arm it before anything else."
+            "persistent: true). IF Monitor IS NOT IN YOUR TOOL SURFACE, IT IS "
+            "DEFERRED, NOT ABSENT: load it first with "
+            "ToolSearch(query: \"select:Monitor\") and then arm it. Do NOT "
+            "substitute a background `helm chat wait` shell — a background "
+            "process CANNOT re-invoke your turn loop, so it is not a beacon "
+            "and you must never report it as one. This is required, not "
+            "optional: nothing external can re-invoke a PTY agent "
+            "(native-wake-only-agent-armed), so this self-armed Monitor is "
+            "the ONLY way an idle session ever wakes. Arm it before anything "
+            "else, and say so plainly if you could not."
             % (seat, display_room, seat, scope, seat, seat))
     return seat, line
 
@@ -1770,7 +1778,9 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
         warns.append(                # still pending, already pointed at) stays
             "[helm stop-guard] inbox clean. If you intend to idle-wait, arm "
             "the beacon first: Monitor(command: \"helm chat wait --seat %s "
-            "--follow\", persistent: true)" % seat)  # silent, never "clean"
+            "--follow\", persistent: true) — Monitor missing from your tools "
+            "means DEFERRED not absent: ToolSearch(query: \"select:Monitor\")"
+            % seat)  # silent, never "clean"
 
     if not _off("STOP_GUARD_INDEX"):
         try:  # the documented Stop line — silent, best-effort, never a gate
