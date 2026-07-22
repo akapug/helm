@@ -7,7 +7,7 @@ description: >
   lessons, and the ambition grade.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
@@ -25,7 +25,7 @@ monitoring while useful work remained.
 
 ## Procedure
 
-1. **Reconstruct baseline.** Read the task list, active PRD, issue, MC convs, and
+1. **Reconstruct baseline.** Read the task list, active PRD, issue, helm chat, and
    recent commits. Name the largest tractable work available at session start.
 2. **State drove.** What did you actually attempt or ship?
 3. **State settled.** Did you park, monitor, or stop? If yes, was it justified by
@@ -35,13 +35,11 @@ monitoring while useful work remained.
    - `settled-early`: shipped real work but stopped short without a hard block.
    - `descended-to-monitoring`: watched/parked while tractable bigger work
      remained.
-5. **Record evidence.** Commits, tests, MC seq/hash, release artifacts, and
-   dogfood results.
+5. **Record evidence.** Commits, tests, helm chat/session refs, release
+   artifacts, and dogfood results.
 6. **Name punts and regressions.** If none, justify against the baseline.
 7. **Route lessons.** Durable behavior goes through `/learn`; one-off facts go
    to memory or the relevant task.
-8. **Emit promotion provenance.** After the diary artifact is written or posted,
-   run `python3 agents/claudecode/hooks/lib/promotion_provenance.py --store <diary-path-or-conv:ref> --summary "/diary: <session/outcome>" --source <mc seq/hash or transcript ref>`.
 
 ## Entry Shape
 
@@ -59,7 +57,7 @@ next:
 ```
 
 Write it to the project's chosen diary/log surface. If none exists, post a
-compact message on the relevant MC conv and propose a durable location rather than
+compact message in helm chat and propose a durable location rather than
 inventing hidden storage.
 
 ## Honesty Contract
@@ -72,10 +70,8 @@ that visible.
 
 - Baseline is reconstructed from real task state.
 - Ambition grade is exactly one of the three allowed values.
-- Evidence cites commits, commands, or MC messages.
+- Evidence cites commits, commands, or helm chat messages.
 - Punts and lessons are explicit.
-- A `promoted` record points from the source record/transcript to the diary
-  artifact.
 
 ## Cross-Refs
 

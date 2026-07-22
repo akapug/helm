@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Deterministic guard tests for scripts/mc-session.sh. The load-bearing safety invariant: a copy/convert
+# Deterministic guard tests for scripts/helm-session.sh. The load-bearing safety invariant: a copy/convert
 # runs as a DRY-RUN (cv gets `--out`) unless --apply is passed. Tested with a fake cv (no real cv/systemd
-# needed → CI-portable). Discovered by run-agent-hook-tests.sh via agents/**/tests/test-*.sh.
+# needed → CI-portable). Discovered via agents/**/tests/test-*.sh.
 set -uo pipefail
 
 REPO="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)")"
-SUT="$REPO/scripts/mc-session.sh"
+SUT="$REPO/scripts/helm-session.sh"
 fails=0
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
@@ -21,7 +21,7 @@ esac
 STUBEOF
 chmod +x "$STUB"
 
-run() { : > "$tmp/cvlog"; MC_SESSION_CV_BIN="$STUB" MC_SESSION_SCRATCH="$tmp/scratch" "$SUT" "$@" >"$tmp/out" 2>"$tmp/err"; echo $?; }
+run() { : > "$tmp/cvlog"; HELM_SESSION_CV_BIN="$STUB" HELM_SESSION_SCRATCH="$tmp/scratch" "$SUT" "$@" >"$tmp/out" 2>"$tmp/err"; echo $?; }
 fail() { echo "FAIL: $1"; fails=$((fails+1)); }
 
 # 1. dry-run (no --apply): cv port MUST get --out (real storage untouched)
@@ -41,7 +41,7 @@ rc="$(run port-harness sess123 --to codex)"
 grep -q '^convert sess123 .*--out' "$tmp/cvlog" || fail "port-harness dry-run must pass --out"
 
 # 4. arg validation (no cv needed)
-val() { MC_SESSION_CV_BIN="$STUB" "$SUT" "$@" >/dev/null 2>&1; echo $?; }
+val() { HELM_SESSION_CV_BIN="$STUB" "$SUT" "$@" >/dev/null 2>&1; echo $?; }
 [ "$(val)" = 2 ]                              || fail "no args -> exit 2"
 [ "$(val bogus sess)" = 2 ]                   || fail "unknown cmd -> exit 2"
 [ "$(val rehome)" = 2 ]                       || fail "rehome missing id -> exit 2"
@@ -56,7 +56,7 @@ STUB2="$tmp/cv2"; cat > "$STUB2" <<'S2'
 case "$1" in show) exit 0;; esac
 S2
 chmod +x "$STUB2"
-MC_SESSION_CV_BIN="$STUB2" MC_SESSION_SCRATCH="$tmp/s" "$SUT" rehome ghost --to-dir /x >/dev/null 2>"$tmp/err2"; rc=$?
+HELM_SESSION_CV_BIN="$STUB2" HELM_SESSION_SCRATCH="$tmp/s" "$SUT" rehome ghost --to-dir /x >/dev/null 2>"$tmp/err2"; rc=$?
 [ "$rc" = 4 ] || fail "missing source session -> exit 4 (got $rc)"
 
 # 6. original-untouched rail is NON-VACUOUS: cv show returns JSON but no cwd -> --apply FAILS LOUD (exit 7),
@@ -69,7 +69,7 @@ case "$1" in
 esac
 S3
 chmod +x "$STUB3"
-MC_SESSION_CV_BIN="$STUB3" MC_SESSION_SCRATCH="$tmp/s3" "$SUT" rehome nocwd --to-dir /x --apply >/dev/null 2>"$tmp/err3"; rc=$?
+HELM_SESSION_CV_BIN="$STUB3" HELM_SESSION_SCRATCH="$tmp/s3" "$SUT" rehome nocwd --to-dir /x --apply >/dev/null 2>"$tmp/err3"; rc=$?
 [ "$rc" = 7 ] || fail "unreadable source cwd on --apply -> exit 7, not vacuous pass (got $rc)"
 grep -qi 'cannot read source .* cwd' "$tmp/err3" || fail "unreadable cwd must name the untouched-rail refusal"
 
@@ -84,21 +84,21 @@ WTREE="$tmp/wt-expert"; git -C "$GITROOT" worktree add -q "$WTREE" -b expert-hom
 RSTUB="$tmp/cvr"; cat > "$RSTUB" <<'RS'
 #!/usr/bin/env bash
 verb="$1"; shift
-echo "$verb $*" >> "$MC_SESSION_CVLOG"
+echo "$verb $*" >> "$HELM_SESSION_CVLOG"
 todir=""; out=""
 while [ $# -gt 0 ]; do case "$1" in --to-dir) todir="$2"; shift 2;; --out) out="$2"; shift 2;; *) shift;; esac; done
 case "$verb" in
   show) echo '{"cwd":"/orig/cwd"}' ;;
   port)
     slug="$(printf '%s' "$todir" | sed 's#[/.]#-#g')"
-    root="${out:-$MC_SESSION_PROJECTS_DIR}"
+    root="${out:-$HELM_SESSION_PROJECTS_DIR}"
     mkdir -p "$root/$slug"; : > "$root/$slug/deadbeef.jsonl"
     echo "wrote $root/$slug/deadbeef.jsonl (deadbeef)" ;;
 esac
 RS
 chmod +x "$RSTUB"
 PROJ="$tmp/projects"; mkdir -p "$PROJ"
-rrun() { : > "$tmp/cvlog"; MC_SESSION_CV_BIN="$RSTUB" MC_SESSION_CVLOG="$tmp/cvlog" MC_SESSION_SCRATCH="$tmp/rscratch" MC_SESSION_PROJECTS_DIR="$PROJ" "$SUT" "$@" >"$tmp/out" 2>"$tmp/err"; echo $?; }
+rrun() { : > "$tmp/cvlog"; HELM_SESSION_CV_BIN="$RSTUB" HELM_SESSION_CVLOG="$tmp/cvlog" HELM_SESSION_SCRATCH="$tmp/rscratch" HELM_SESSION_PROJECTS_DIR="$PROJ" "$SUT" "$@" >"$tmp/out" 2>"$tmp/err"; echo $?; }
 
 # 7. resurrect REFUSES a non-worktree PROJECT_DIR (exit 8): the shared/main checkout, a plain dir, a missing dir.
 rc="$(run resurrect sess123 --project-dir "$GITROOT" --apply)"
@@ -119,27 +119,27 @@ rc="$(rrun resurrect sess123 --project-dir "$WTREE" --apply)"
 [ -d "$WTREE/.remember" ] || fail "resurrect --apply must pre-create .remember (mv-steal defuse)"
 grep -q "CLAUDE_PROJECT_DIR='$WTREE'" "$tmp/err" || fail "resurrect --apply must emit the CLAUDE_PROJECT_DIR resume line"
 
-# 9. channel-verify targets the CAPTAIN-BUFFER SIGNATURE, not raw emptiness (pY xrev): it must NOT
-#    false-reject a re-resurrect into a permanent home holding the expert's OWN memory, and MUST catch the
-#    shared captain buffer copied in — comparing the whole injected set against the main checkout's.
-mkdir -p "$GITROOT/.remember"; printf 'captain now-buffer\n' > "$GITROOT/.remember/now.md"   # the shared poison
+# 9. channel-verify targets the SHARED-BUFFER SIGNATURE, not raw emptiness: it must NOT false-reject a
+#    re-resurrect into a permanent home holding the expert's OWN memory, and MUST catch the shared
+#    main-checkout buffer copied in — comparing the whole injected set against the main checkout's.
+mkdir -p "$GITROOT/.remember"; printf 'shared now-buffer\n' > "$GITROOT/.remember/now.md"   # the shared poison
 # 9a. expert's OWN distinct now.md -> apply SUCCEEDS (this is the re-resurrect-into-a-permanent-home case).
 printf 'rsh-expert own memory\n' > "$WTREE/.remember/now.md"
 rc="$(rrun resurrect sess123 --project-dir "$WTREE" --apply)"
 [ "$rc" = 0 ] || fail "resurrect into a home with the expert's OWN now.md -> exit 0, no false-reject (got $rc)"
-# 9b. now.md byte-identical to the SHARED captain buffer -> exit 9 (poison detected).
+# 9b. now.md byte-identical to the SHARED main-checkout buffer -> exit 9 (poison detected).
 cp "$GITROOT/.remember/now.md" "$WTREE/.remember/now.md"
 rc="$(rrun resurrect sess123 --project-dir "$WTREE" --apply)"
-[ "$rc" = 9 ] || fail "resurrect with now.md == shared captain buffer -> exit 9 (got $rc)"
-grep -qi 'captain buffer' "$tmp/err" || fail "exit-9 must name the captain-buffer poison"
+[ "$rc" = 9 ] || fail "resurrect with now.md == shared main-checkout buffer -> exit 9 (got $rc)"
+grep -qi 'main-checkout buffer' "$tmp/err" || fail "exit-9 must name the shared-buffer poison"
 # 9c. the check globs the WHOLE injected set, not just now.md: a today-*.md matching the shared aborts too.
 rm -f "$WTREE/.remember/now.md"
-printf 'captain today\n' > "$GITROOT/.remember/today-2026-07-03.md"
-printf 'captain today\n' > "$WTREE/.remember/today-2026-07-03.md"
+printf 'shared today\n' > "$GITROOT/.remember/today-2026-07-03.md"
+printf 'shared today\n' > "$WTREE/.remember/today-2026-07-03.md"
 rc="$(rrun resurrect sess123 --project-dir "$WTREE" --apply)"
 [ "$rc" = 9 ] || fail "resurrect with today-*.md == shared buffer -> exit 9 (globs the injected set) (got $rc)"
 
-# 11. NATIVE-MEMORY re-key verify (Q47 a.1): resurrect asserts the ported transcript lands in the WORKTREE
+# 11. NATIVE-MEMORY re-key verify: resurrect asserts the ported transcript lands in the WORKTREE
 #     slug dir (native memory follows the worktree by construction), else fail loud (exit 10).
 rm -rf "$PROJ"; mkdir -p "$PROJ"; rm -f "$WTREE/.remember/"*.md 2>/dev/null   # clear 9c poison so we reach the port
 # 11a. happy path: apply keys the transcript into the worktree slug dir + announces the re-key.
@@ -155,12 +155,12 @@ verb="$1"; shift; out=""
 while [ $# -gt 0 ]; do case "$1" in --out) out="$2"; shift 2;; *) shift;; esac; done
 case "$verb" in
   show) echo '{"cwd":"/orig/cwd"}' ;;
-  port) root="${out:-$MC_SESSION_PROJECTS_DIR}"; mkdir -p "$root/-wrong-shared-slug"; : > "$root/-wrong-shared-slug/deadbeef.jsonl"; echo "wrote $root/-wrong-shared-slug/deadbeef.jsonl (deadbeef)" ;;
+  port) root="${out:-$HELM_SESSION_PROJECTS_DIR}"; mkdir -p "$root/-wrong-shared-slug"; : > "$root/-wrong-shared-slug/deadbeef.jsonl"; echo "wrote $root/-wrong-shared-slug/deadbeef.jsonl (deadbeef)" ;;
 esac
 BS
 chmod +x "$BADSTUB"
 rm -rf "$PROJ"; mkdir -p "$PROJ"; rm -f "$WTREE/.remember/"*.md 2>/dev/null
-MC_SESSION_CV_BIN="$BADSTUB" MC_SESSION_CVLOG="$tmp/cvlog" MC_SESSION_SCRATCH="$tmp/rscratch" MC_SESSION_PROJECTS_DIR="$PROJ" "$SUT" resurrect sess123 --project-dir "$WTREE" --apply >/dev/null 2>"$tmp/err"; rc=$?
+HELM_SESSION_CV_BIN="$BADSTUB" HELM_SESSION_CVLOG="$tmp/cvlog" HELM_SESSION_SCRATCH="$tmp/rscratch" HELM_SESSION_PROJECTS_DIR="$PROJ" "$SUT" resurrect sess123 --project-dir "$WTREE" --apply >/dev/null 2>"$tmp/err"; rc=$?
 [ "$rc" = 10 ] || fail "native-mem: transcript in the wrong slug -> exit 10 (got $rc)"
 grep -qi 'did not land in the worktree native-memory slug' "$tmp/err" || fail "exit-10 must name the native-mem re-key failure"
 # 11c. FRESH worktree (slug dir does NOT pre-exist) must NOT false-fail — the port creates it, verify passes.
@@ -172,5 +172,5 @@ rc="$(rrun resurrect sess123 --project-dir "$WT2" --apply)"
 # 10. resurrect missing --project-dir -> exit 2 (mandatory).
 [ "$(val resurrect sess123)" = 2 ] || fail "resurrect missing --project-dir -> exit 2"
 
-if [ "$fails" -eq 0 ]; then echo "mc-session guard tests: PASS"; else echo "mc-session guard tests: $fails FAILURE(S)"; fi
+if [ "$fails" -eq 0 ]; then echo "helm-session guard tests: PASS"; else echo "helm-session guard tests: $fails FAILURE(S)"; fi
 exit "$fails"

@@ -6,21 +6,22 @@ description: Run /com, the council-of-models primitive for intra-agent, intra-tu
 # /com - Council Of Models
 
 `/com` is a stored primitive for a panel of models inside one agent turn. It is
-not an A2A council, huddle, telepathy, or mindmeld. Those coordinate multiple
-agent sessions through shared comms. `/com` runs proposer models over one focused
-brief, then the acting agent synthesizes the answer at the end of the same turn.
+not an A2A council or huddle. Those coordinate multiple agent sessions through
+shared comms (helm chat / the cell substrate). `/com` runs proposer models over
+one focused brief, then the acting agent synthesizes the answer at the end of
+the same turn.
 
 ## Invariants
 
-- Use the configured proposer set from `agents/shared/com.toml`, overlaid by
-  `~/.buildr/com.toml` when present. If config is missing or malformed, fail open
-  to the built-in `duo` preset: one Claude proposer and one Codex proposer.
+- Use the built-in preset table (see Presets below). If a requested preset is
+  missing or malformed, fail open to the built-in `duo` preset: one Claude
+  proposer and one Codex proposer.
 - Give proposers a focused brief: the user question, the minimal local facts they
   need, and the requested output shape. Do not replay the full conversation,
   tool logs, or hidden/system context.
 - Proposers are tool-less. Claude proposers run as Task subagents with the model
-  pinned and `tools: []`. Codex/OpenCode proposers run through
-  `packs/herdr/scripts/com-run.sh`.
+  pinned and `tools: []`. Codex/OpenCode proposers run headless through their
+  CLIs' one-shot exec mode (see Run Loop step 4).
 - The acting agent is always the aggregator. Do not spawn a separate aggregator
   model, do not nest `/com`, and do not call raw provider APIs.
 - Synthesize from proposer blocks at the tail of the current turn. Keep proposer
@@ -31,28 +32,36 @@ brief, then the acting agent synthesizes the answer at the end of the same turn.
 ## Run Loop
 
 1. Parse invocation options:
-   - `--preset NAME`: select `com.presets.NAME`; otherwise use
-     `com.default_preset`.
+   - `--preset NAME`: select the named preset from the Presets section;
+     otherwise use the default (`duo`).
    - `--record`: record the panel digest and synthesis even when the preset has
      `record = false`.
    - `--no-record`: keep the panel ephemeral even when the preset records.
-2. Load the preset. Ignore disabled presets. If the named preset is missing,
-   say `COM DEGRADED: preset unavailable` and use `duo`.
+2. Load the preset. If the named preset is missing, say
+   `COM DEGRADED: preset unavailable` and use `duo`.
 3. Build one focused brief for all proposers:
    - task/question;
-   - relevant files, commits, or BB seqs already read;
+   - relevant files, commits, or helm store/chat anchors already read;
    - explicit constraints and output contract;
    - instruction to answer independently and avoid deference to other models.
 4. Run proposers independently:
    - `driver = "claude"`: start a Task subagent with `model` from the preset,
      `tools: []`, and the focused brief. If model pinning or tool restriction is
      unavailable, return a labeled unavailable/degraded block.
-   - `driver = "codex"` or `driver = "opencode"`: write the focused brief to a
-     temp file and run:
+   - `driver = "codex"`: write the focused brief to a temp file and run the
+     codex CLI headless (verified path, probe 2026-06-27, codex-cli 0.142.3):
 
 ```bash
-packs/herdr/scripts/com-run.sh --driver <driver> --model <model> --cd "$PWD" --brief-file "$brief_file"
+codex exec --cd "$PWD" -s read-only --skip-git-repo-check --ephemeral \
+  --model <model> -o "$answer_file" "$(cat "$brief_file")" </dev/null
 ```
+
+     Read the answer from the `-o` file only; stdout is a noisy event log,
+     never parse it.
+   - `driver = "opencode"`: unverified best-effort,
+     `opencode run -m <provider/model>` over the same brief. On any failure
+     (tool missing, nonzero exit, timeout, empty answer) return a labeled
+     unavailable block rather than aborting the panel.
 
 5. Normalize each result as:
 
@@ -71,14 +80,14 @@ packs/herdr/scripts/com-run.sh --driver <driver> --model <model> --cd "$PWD" --b
 
 ## Presets
 
-Default preset names are defined in `agents/shared/com.toml`:
+Built-in presets:
 
-- `duo`: default cross-family panel, Claude plus Codex.
+- `duo` (default): cross-family panel, one Claude proposer (`opus` as the Task
+  model) plus one Codex proposer (`gpt-5.5`).
 - `claude-trio`: same-family fallback when Codex is unavailable or not worth the
-  spend.
+  spend — `opus`, `sonnet`, `opus` as three independent Task subagents.
 
-Runtime overlays may add more presets. Treat unknown drivers as unavailable
-rather than inventing a path.
+Treat unknown drivers as unavailable rather than inventing a path.
 
 ## Output Shape
 

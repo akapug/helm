@@ -19,8 +19,8 @@ decision.
 
 ## Inputs
 
-- Optional baseline ref: tag, commit, branch, or MC message.
-- Active plan: PRD, issue, task, user message, or MC message.
+- Optional baseline ref: tag, commit, branch, or helm chat message.
+- Active plan: PRD, issue, task, user message, or helm chat message.
 
 If no baseline exists, say so and offer a first-baseline procedure. Do not invent
 an approval point.
@@ -28,7 +28,7 @@ an approval point.
 ## Steps
 
 1. **Resolve baseline.** Identify the approved ref and the plan it represented.
-   Cite commit, tag, file, or MC seq/hash.
+   Cite commit, tag, file, or helm chat message id.
 2. **Read current intent.** Hydrate the current active plan or user request.
 3. **Diff code and docs.**
 
@@ -79,7 +79,7 @@ OPEN DECISIONS:
 
 - Baseline and active intent are cited.
 - Every changed area is classified.
-- Drift/slop findings have file, commit, or MC anchors.
+- Drift/slop findings have file, commit, or helm chat anchors.
 - The report gives concrete re-approve, revise, or revert recommendations.
 
 ## Cross-Refs

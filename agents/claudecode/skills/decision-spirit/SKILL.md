@@ -117,7 +117,7 @@ while continuing with the best reversible probe path.
 16. **Architecture preflight before code — and walk the NOUNS through TIME.** Name the
     state owner, extension point, invariant, fallback path, and existing primitive
     before implementing. Then LIFECYCLE-WALK every object the feature touches
-    (lane/record/claim/obligation/session/alert — prd/AGENT_JOURNEYS.md) through its
+    (lane/record/claim/obligation/session/alert) through its
     FULL life including stuck/terminal states; state the feature's behavior at each
     stage. Features designed as verbs on the primary case ship holes that are just
     the same object LATER in its own life (owner canon 2026-07-08: stale-claim x
@@ -154,7 +154,7 @@ while continuing with the best reversible probe path.
     bad premise) or strands it (irreversible-early); using order as cover to skip the finish is a punt.
 
 20. **Seam coherence - validate from each side AND the whole.** When composing across
-    lanes (mc + its sibling projects), every seam must cohere THREE
+    projects or components, every seam must cohere THREE
     ways at once: from component A's own invariants, from B's own invariants, AND as the
     combined whole. A merge elegant holistically but breaking ONE component's internal
     logic is a BAD seam - it rots, surprises, and blocks that component's independent
@@ -211,7 +211,7 @@ while continuing with the best reversible probe path.
     don't; no agent feels their absence). CLI parity is the floor, never the finish.
     Spec/review question for any feature a human will touch: "what is the owner's
     surface, and when does the owner test it?" — owner-tested is the acceptance
-    gate. Track owner-surfaces as first-class rows (prd/HUMAN_SURFACE_LEDGER.md).
+    gate. Track owner-surfaces as first-class rows on the integration board.
     Bug class: `human-surface-never-rowed`.
 
 22. **Memory is the coordination read-path; disk is a write-behind log.** Hot coordination

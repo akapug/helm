@@ -4,16 +4,16 @@ description: >
   The "use your head" check - the senior-dev obvious-knowledge a teammate shouldn't have to explain.
   The user's lever for "you're missing something obvious; let's see if you can common-sense it." Fires
   when the user says "/commonsense", "use common sense", "use your head", "you're missing something
-  obvious", "a senior dev would know this", "don't punt", "that's a cop-out"; or when the anti-punt Stop
-  hook (guard-time-words.sh) flags a punt-tell. Loads two things at once: (1) the anti-punt + anti-narrow
+  obvious", "a senior dev would know this", "don't punt", "that's a cop-out". Loads two things at once:
+  (1) the anti-punt + anti-narrow
   reflexes (no fatigue/clock; size is orchestrated not shrunk; risky=do-it-carefully-now; compiles!=done;
   decide-don't-ask; generate the full option space + the user's own resources before converging on one
   path or a false binary); (2) the senior-dev common-sense CORPUS below. It is SELF-EXTENDING: when you
-  whiffed on something obvious, after fixing it sub-trigger /learn to add that item durably (a reflex, a
-  project CLAUDE.md rule, or this corpus) so the next miss never happens.
+  whiffed on something obvious, after fixing it sub-trigger /learn to add that item durably (a helm store
+  entry, a project CLAUDE.md rule, or this corpus) so the next miss never happens.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "2.0.0"
 ---
 
@@ -34,10 +34,10 @@ let me just" OR a "the options are A or B" coming on.
 
 1. **"It's late / do it tomorrow / needs fresh energy" — OR "I'm deep in a long session / context is
    heavy, defer this big task to fresh context."** You have NO fatigue, NO time-of-day, AND
-   CONTEXT-DEPTH IS NOT A GATE EITHER. mc sessions run days-to-weeks; "late in a long session /
-   fatigued context" is the SAME punt as "fresh energy" (owner ruling 2026-06-09). When context fills, you
-   MANAGE it with tools and proceed: archive to the kanban (archive-tasklist.py snapshots the live session tasklist; open-tasks-digest.py rolls up open work), checkpoint to
-   memory, dispatch subagents for big-LoC work, prune + re-triage the tasklist, /compact deliberately.
+   CONTEXT-DEPTH IS NOT A GATE EITHER. helm sessions run days-to-weeks; "late in a long session /
+   fatigued context" is the SAME punt as "fresh energy" (owner ruling 2026-06-09, MC-era, kept as history).
+   When context fills, you MANAGE it with tools and proceed: archive open work to the integration board,
+   checkpoint to memory, dispatch subagents for big-LoC work, prune + re-triage the tasklist, /compact deliberately.
    A big task is never deferred for "fresh context" — it's decomposed + tooled. Capacity = real
    resources remaining (with the builders.dev pack: live usage budget), not hours, not token-context.
 2. **"This is big / a marathon → ship a smaller version now."** Size is never a gate. Decompose into a
@@ -66,7 +66,7 @@ let me just" OR a "the options are A or B" coming on.
 - **A real, OBSERVED resource limit** - not a fabricated one. In the core/public build that means a
   concrete wall you can point at (the task literally can't proceed without an input you lack). Never
   invent a "budget" you can't measure; just don't fabricate a limit. (Cred/usage tooling lives in the
-  fleet layer above mc cells - not a cell concern.)
+  fleet layer above helm seats - not a seat concern.)
 - **Genuine human-only call** - the short list in #5.
 
 If your reason to stop/defer/shrink isn't one of those, it's a punt. Reframe and proceed.
@@ -87,10 +87,9 @@ senior dev *on this codebase* knows.
 - Reproduce the real symptom on real, non-empty input before you call anything fixed.
 - A service misbehaving (errors / hangs / 5xx / weird responses) → check the vendor's STATUS PAGE
   first - a known outage isn't your bug; cheapest probe before debugging your own code.
-  (api-status reflex, #139 - `check-anthropic-status` for the Claude API.)
 
 **Build on what's there**
-- Check if it already EXISTS before building it (grep the repo, our skills, the bb). Most asks extend
+- Check if it already EXISTS before building it (grep the repo, our skills, the helm store). Most asks extend
   something. (reuse > author.)
 - Match the surrounding code's style/idiom - don't import a new one into a file that has a convention.
 - Ship the full intended version, not a stub/TODO/placeholder; a 2-line typo/missing-import → fix it
@@ -105,7 +104,7 @@ senior dev *on this codebase* knows.
 - A verify blocked by "needs a real login / session / cred" is almost never a real block -
   SELF-PROVISION the auth: mint a token, reuse a local cookie/session already on disk, or create
   test-data, and finish the test yourself. Punting a verify to the human when the auth is
-  local-or-mintable IS the punt. (self-provision-auth reflex, #138.)
+  local-or-mintable IS the punt.
 
 **Scope & safety**
 - Generate the full option space + the user's own resources before converging or presenting a binary
@@ -128,9 +127,10 @@ senior dev *on this codebase* knows.
 miss itself is the lesson - don't just fix the instance, make it durable so future-you can't miss it:
 
 After resolving, **sub-trigger `/learn`** with the new common-sense item, and let `/learn` route it to
-the right RSH layer by scope:
-- **Universal obvious-truth that must fire mid-decision** → a reflex line in `dev-process.md` (R), or add
-  it to the Part-2 corpus above (S) if it's a "scan" item rather than a per-turn one.
+the right layer by scope:
+- **Universal obvious-truth that must fire mid-decision** → a `helm store` entry (premise/heuristic with
+  symptom keywords, resolve-tested), or add it to the Part-2 corpus above if it's a "scan" item rather
+  than a per-turn one.
 - **Project-specific obvious-truth** ("on THIS codebase, X is always true") → a rule in that project's
   `CLAUDE.md` (the closest-to-cwd layer Claude Code loads), not the universal skill.
 - **A mechanic / procedure** → the relevant skill.
@@ -146,8 +146,8 @@ check concrete rather than exhortative, and can rank which corpus items you most
 gated (only if gbrain is present); the core skill stands alone without it.
 
 Note: **gbrain is the memory layer of [gstack](https://github.com/garrytan/gstack)**, the parent
-methodology toolkit (mc's peer) - so "g" here means gbrain-the-memory-engine specifically, not the
-whole gstack toolkit. mc borrows gbrain's *retrieval* mechanics for this crossover; gstack itself is
+methodology toolkit (helm's peer) - so "g" here means gbrain-the-memory-engine specifically, not the
+whole gstack toolkit. helm borrows gbrain's *retrieval* mechanics for this crossover; gstack itself is
 a recommended companion, not a bundled backend.
 
 ## Cross-refs
@@ -155,5 +155,4 @@ a recommended companion, not a bundled backend.
   stop-or-defer.
 - `/fix` - the diagnose-first moves (Part 2 "Diagnose") in full: read history, name the bug class, one
   hypothesis, verify the real symptom.
-- `guard-time-words.sh` (H, Stop hook) - flags punt-tells + wall-clock estimates in your last turn.
-- `/learn` - Part 3's extension path; lands new common-sense items into the right R/S/H or project layer.
+- `/learn` - Part 3's extension path; lands new common-sense items into the helm store or project layer.
