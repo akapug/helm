@@ -2079,7 +2079,10 @@ def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
     scan-flagged row only after the FULL evidence probe re-runs fresh under
     the roster lock (TOCTOU: a transcript flushing or a presence beat
     landing between scan and apply must win), then unlinks its derived seat
-    state (_unlink_seat_state — cursors, .seen, latches, the RAM DM lane)."""
+    state (_unlink_seat_state — cursors, .seen, latches, the RAM DM lane)
+    UNDER THE SAME LOCK: row delete + state unlink are one atomic critical
+    section, so a rejoin can only land before (and be re-probed as keep
+    evidence) or after (and keep its fresh state) — never in between."""
     now = time.time() if now is None else now
     rows = []
     for s, row in sorted(roster().items()):
@@ -2116,8 +2119,15 @@ def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
                     pruned.append(s)
                 if pruned:
                     pk.write_json(roster_path(), r)
-            for s in pruned:
-                _unlink_seat_state(s)
+                # unlink INSIDE the same lock (codex-2): row delete + state
+                # unlink are ONE critical section. Unlinking after release
+                # left a gap where a SessionStart rejoin recreated the row
+                # plus fresh .seen/cursors/DM lane — and this old invocation
+                # then destroyed the NEW seat's state (live seat reading as
+                # absent with its queued DMs gone). _unlink_seat_state takes
+                # no locks of its own (plain os.remove), so no inversion.
+                for s in pruned:
+                    _unlink_seat_state(s)
     return rows, pruned
 
 

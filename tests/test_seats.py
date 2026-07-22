@@ -2615,6 +2615,65 @@ class RosterGcTest(SeatsBase):
         self.assertIn("late", seats.roster())
         self.assertTrue(os.path.exists(seats.seen_path("late")))
 
+    def test_gc_unlink_rides_the_roster_lock_no_rejoin_gap(self):
+        """codex-2 HIGH (exact-SHA probe): the row delete committed under the
+        roster lock but the derived-state unlink ran AFTER release. A
+        SessionStart rejoin slipping into that gap recreated the row plus
+        fresh .seen/cursor/DM state — and the old gc invocation then
+        unlinked the NEW seat's state (a live seat instantly reading absent,
+        its queued DMs and cursors destroyed). Row delete + unlink are now
+        ONE locked critical section: a lock-respecting rejoin can only land
+        after gc finishes, and everything it creates survives."""
+        self._row("phoenix", session="sid-phx-old-1")
+        roots, proc = self._empty_dirs()
+        key = seats._seat_key("phoenix")
+        dm = chat.room_path(chat.DM_PREFIX + key)
+        cursor = seats.cursor_path("main", "phoenix", "sid-phx-new-2")
+
+        def rejoin():                 # what SessionStart recreates
+            seats.write_roster("phoenix", session="sid-phx-new-2")
+            seats.touch_seen("phoenix")
+            os.makedirs(os.path.dirname(dm), exist_ok=True)
+            with open(dm, "w") as f:  # the freshly queued DM lane
+                f.write('{"text": "for the new seat"}\n')
+            with open(cursor, "w") as f:
+                f.write('{"off": 0}')
+
+        state = {"deferred": False}
+        real_unlink = seats._unlink_seat_state
+
+        def racing_unlink(seat):
+            # A lock-RESPECTING rejoin racing the unlink boundary: probe the
+            # roster flock non-blocking from a second open file description
+            # (flock conflicts across OFDs even in one process). Unfixed —
+            # unlink after release — the lock is FREE here, the rejoin lands
+            # first, then gc destroys its fresh state. Fixed — unlink under
+            # the lock — the probe refuses and the rejoin can only land
+            # after gc returns.
+            import fcntl
+            with open(seats.roster_path() + ".lock", "a") as f:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    state["deferred"] = True   # gc still holds the lock
+                else:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    rejoin()
+            real_unlink(seat)
+
+        with mock.patch.object(seats, "_unlink_seat_state", racing_unlink):
+            rows, pruned = seats.gc_roster(apply=True, roots=roots,
+                                           proc_dir=proc)
+        self.assertEqual(pruned, ["phoenix"])
+        self.assertTrue(state["deferred"])     # the boundary was closed
+        rejoin()                               # the rejoin lands AFTER gc
+        row = seats.roster().get("phoenix")    # …and ALL its state survives
+        self.assertIsNotNone(row)
+        self.assertEqual(row.get("session"), "sid-phx-new-2")
+        self.assertTrue(os.path.exists(seats.seen_path("phoenix")))
+        self.assertTrue(os.path.exists(cursor))
+        self.assertTrue(os.path.exists(dm))
+
     def test_gc_process_read_oserror_keeps_the_row(self):
         """codex-2 HIGH (finding 3): a same-uid process whose cmdline/environ
         cannot be read is probe TROUBLE, not absence — the row stays."""
