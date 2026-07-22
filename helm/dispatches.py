@@ -31,7 +31,8 @@ MAX_DEADLINE_S = 31 * 24 * 60 * 60
 # live ledger is 09:13Z. Compat branches replay ONLY rows stamped before this
 # boundary, so an event appended after landing can never drive the removed
 # machinery — replay distinguishes an old retarget from a fresh one by when
-# it claims to have been written (fail-closed: a missing ts is never compat).
+# it claims to have been written (fail-closed: a missing or NON-STRING ts is never compat — the
+# same type-corruption guard seq gets).
 LEGACY_COMPAT_BOUNDARY = "2026-07-22T12:00:00Z"
 _ID = re.compile(r"[0-9a-f]{8,64}\Z")
 _TIP = re.compile(r"[0-9a-f]{40,64}\Z")
@@ -160,6 +161,8 @@ def _new_state(row):
         return None
     tip = str(row.get("tip") or "").lower()
     exact = tip if _TIP.fullmatch(tip) else None
+    genesis_ts = row.get("ts")
+    closable = isinstance(genesis_ts, str) and genesis_ts < LEGACY_COMPAT_BOUNDARY
     out = {"v": row.get("v") or 1, "id": str(row["id"]),
            "event": "dispatch", "seq": int(row.get("seq") or 0),
            "ts": row.get("ts"), "recipient": row.get("recipient"),
@@ -170,12 +173,13 @@ def _new_state(row):
            "repo_id": row.get("repo_id"),
            "operation_key": row.get("dispatch_key"),
            "message_hash": row.get("message_hash"),
-           "status": "verdict" if status == "verdict" else "open",
+           "status": "verdict" if status == "verdict" and closable else "open",
            "delivery": "observed" if row.get("delivery_ref") else "needs-confirmation",
            "delivery_ref": row.get("delivery_ref"),
            "verdict_ref": row.get("verdict_ref"),
            "reviewed_tip": row.get("reviewed_tip"),
-           "migration": None if exact else "needs-redispatch"}
+           "migration": None if exact or status == "verdict" and closable
+           else "needs-redispatch"}
     if out["status"] == "verdict" and not out["verdict_ref"]:
         return None
     return out
@@ -196,13 +200,15 @@ def _apply(state, row):
     # Compat replays ONLY rows stamped before the reduced core landed: an
     # event appended today can never drive the removed machinery, however
     # well-shaped. Missing ts is never compat (fail-closed, "~" sorts high).
-    compat = legacy and str(row.get("ts") or "~") < LEGACY_COMPAT_BOUNDARY
+    ts = row.get("ts")
+    compat = legacy and isinstance(ts, str) and ts < LEGACY_COMPAT_BOUNDARY
     # Historical full-snapshot compatibility.
     if event is None:
         if compat and row.get("status") == "verdict" and row.get("verdict_ref"):
             out = dict(state)
             out.update(status="verdict", verdict_ref=row.get("verdict_ref"),
-                       reviewed_tip=row.get("reviewed_tip") or state.get("tip"))
+                       reviewed_tip=row.get("reviewed_tip") or state.get("tip"),
+                       migration=None)
             return out
         return state
     if event == "retarget" and compat \
@@ -239,7 +245,7 @@ def _apply(state, row):
         if not state.get("tip") or reviewed == state.get("tip"):
             out = dict(state)
             out.update(status="verdict", reviewed_tip=reviewed or None,
-                       verdict_ref=row.get("verdict_ref"),
+                       verdict_ref=row.get("verdict_ref"), migration=None,
                        seq=_int_seq(row.get("seq"), state.get("seq", 0)))
             return out
     if compat and row.get("delivery_ref") and state["status"] == "open":

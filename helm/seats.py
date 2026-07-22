@@ -1523,8 +1523,8 @@ def _dispatch_candidate():
 
     The whisper says CHECK IN, never reassign — an overdue row means the
     deadline passed, not that the seat is dead, and tonight a lane quiet 47
-    minutes turned out to be a long turn. The fp carries status so an
-    open->acked transition re-fires exactly once. Fail-closed to None."""
+    minutes turned out to be a long turn. The fp carries status/delivery so a
+    state transition re-fires exactly once. Fail-closed to None."""
     try:
         from . import dispatches
         r, kind, unavailable = dispatches.stop_candidate()

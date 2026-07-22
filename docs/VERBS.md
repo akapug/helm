@@ -1440,10 +1440,11 @@ frames; this lane is called *delivery*.)
   not yet `reported` — open or done-but-unreported — named one at a time with
   its `helm asks report` pointer; fp carries the row's status, so open→done
   re-fires once), then dispatch state reloaded from disk on each stop: ledger
-  **UNAVAILABLE / obligations UNKNOWN** first, then the oldest compatibility
-  row that **NEEDS TIP BINDING**, then the oldest **NEEDS DELIVERY RETRY**
-  posting/aborted row, then the oldest overdue **NEEDS CHECK-IN /
-  PENDING VERDICT** row with its exact-tip verdict command (advisory only and
+  **UNAVAILABLE / obligations UNKNOWN** first, then the oldest historical row
+  that **NEEDS REDISPATCH**, then the oldest **NEEDS CONFIRMATION** row
+  (delivery unproven — verify at the recipient, never resend), then the
+  oldest overdue **NEEDS CHECK-IN / PENDING VERDICT** row with its exact-tip
+  verdict command (advisory only and
   never an automatic reassignment), stuck
   session (`stuck-streak`≥3: surface the blocker), a RED gate (record.py's
   command-log shows a test-runner whose LATEST run exited nonzero — fix or
@@ -1697,60 +1698,52 @@ an unsafe/unreadable ledger is **UNAVAILABLE / owner debt UNKNOWN** on both
 `list` (nonzero) and stop-whisper, never silently rendered as zero. Mutations
 still never traceback, and a failed `add` says NOT RECORDED loudly.
 
-### `helm dispatch send <recipient> <lane> <message...> --ref TIP [--key K] | add <recipient> <lane> --ref TIP | ack <id> <ref> | bind <id> <tip> [--repo PATH] | retarget <id> <old-tip> <new-tip> | verdict <id> <reviewed-tip> <evidence> | list [--open|--overdue|--needs-retry] [--json]`
+### `helm dispatch send <recipient> <lane> <message...> --ref TIP [--key K] | add <recipient> <lane> --ref TIP | verdict <id> <full-reviewed-tip> <evidence> | list [--open|--overdue] [--json]`
 
 The DISPATCH ledger is the durable obligation behind work handed to another
-seat. Prefer **`send`**, the atomic first-class path: it appends a `posting`
-event before an exact-token DM, gives that DM a deterministic message id, then
-appends `pending`. The optional `--key` is namespaced by the canonical sender +
-Git repository; without one Helm derives it from every semantic request field.
-Retries compare recipient, lane, exact tip, note, deadline, repository, sender,
-and message digest before reusing one logical ledger id and one DM id. Chat
-checks that id under the room lock **before signing** and in a non-rotating,
-disk-backed message-id ledger (`intent` → signed `prepared` → `delivered`). A
-local write/fsync failure retries the prepared receipt without signing twice;
-room rotation cannot expire dedup. The room writer repairs a torn tail, then
-one-write appends + fsyncs + rereads the exact bytes before reporting the DM
-delivered. Ledger staging failure sends nothing; DM failure records **NEEDS
-DELIVERY RETRY** on the same row and outranks overdue rows in stop-whisper; a
-crash after the DM is reconciled by retry without a duplicate local message.
-`add` records a handoff performed by another transport, but still requires
-`--ref`: no new PENDING row may be born without the exact tip its verdict must
-name, and `add` is not a two-step replacement for `send`. Rows emitted by the
-short-lived v2 ref-less API remain visible as **NEEDS TIP BINDING** rather than
-disappearing; `bind <id> <tip> --repo <path>` compare-and-swap appends their
-exact repository/original-tip binding, after which the normal verdict closes.
+seat. The shipping surface is deliberately small — three events, immutable
+rows, no exactly-once machinery:
 
-Rows are append-only full snapshots in
-`~/.helm/_global/dispatches.jsonl`, separate from owner asks while sharing the
-same hardened event-ledger primitive: stable flock, incomplete-tail repair
-before append, one bounded `O_APPEND` write, file + first-directory-entry fsync,
-partial-write rollback, 0600 private regular files, symlink/hardlink refusal,
-and replay that skips malformed/non-UTF8/truncated or invalid duplicate
-transitions without erasing the preceding good obligation. An absent ledger is
-known-empty; an unsafe/unreadable ledger is **UNAVAILABLE / obligations UNKNOWN**
-(CLI nonzero and stop-whisper loud), never silently rendered as zero. **POSTING and ACK are not
-done.** Delivered rows say **PENDING VERDICT**; ACK records pickup and remains
-open. Only `verdict` closes, and it resolves the supplied reviewed tip in the
-original Git repository and requires it to equal the row's current exact
-commit.
+* **`send`** persists the obligation FIRST, then attempts exactly one DM. The
+  optional `--key` names the operation (namespaced by canonical sender + Git
+  repository; derived from the semantic request fields when omitted). **One
+  operation sends at most once, ever**: retrying an existing operation never
+  re-DMs — a prior attempt whose delivery evidence is missing is AMBIGUOUS,
+  not absent, and resending is exactly the duplicate-message hazard the
+  reduced core refuses to automate away. Ambiguous delivery stays open as
+  **NEEDS CONFIRMATION**: verify at the recipient, never resend blind.
+* **`add`** records a handoff performed by another transport; it still
+  requires `--ref`, so no new row is ever born without the exact tip its
+  verdict must name. Its delivery starts NEEDS CONFIRMATION.
+* **`verdict`** is the ONLY closer. It takes the full exact reviewed commit
+  id and refuses unless it equals the row's dispatched tip — a stale verdict
+  can never close moved work. Identical verdict retries are idempotent;
+  conflicting ones are refused.
 
-When a lane advances, `retarget` compare-and-swaps `<old-tip>` to a strict
-forward descendant `<new-tip>`. It preserves `original_ref`/`original_tip` in
-the replay history and rejects stale, backward, divergent, ambiguous, and
-foreign refs. Replay reopens the bound repository and revalidates exact
-from/to plus ancestry, so a hand-forged but well-shaped divergent snapshot
-cannot become canonical. Retarget and verdict serialize on the same lock, so a
-verdict for the old tip can never race through after a retarget. Legacy rows acquire their
-repository/tip binding only when their existing ref is a stable hexadecimal
-object id that resolves uniquely in the caller's repository; mutable symbolic
-legacy refs are refused. Valid old no-seq/no-event open→acked/verdict and
-acked→verdict snapshots still replay, so upgrading never resurrects closed debt.
+There is **no ack, bind, or retarget** — those verbs are gone. Historical
+ref-less rows (the short-lived v2 schema) stay visible as **NEEDS
+REDISPATCH**: redispatch the work with an exact `--ref`; the old row remains
+as history. Rows the old schemas already wrote keep replaying truthfully, but
+only rows stamped before the reduced core landed (`LEGACY_COMPAT_BOUNDARY`)
+can drive those historical transitions — an event appended today, however
+well-shaped (including non-string timestamps), is inert at replay, and a
+type-corrupt row is skipped without blinding the ledger.
+
+Rows are append-only events in `~/.helm/_global/dispatches.jsonl`, separate
+from owner asks while sharing the same hardened event-ledger primitive:
+stable flock, incomplete-tail repair before append, one bounded `O_APPEND`
+write, file + directory-entry fsync, partial-write rollback, 0600 private
+regular files, symlink/hardlink refusal, and per-row fail-safe replay. An
+absent ledger is known-empty; an unsafe/unreadable ledger is **UNAVAILABLE /
+obligations UNKNOWN** (CLI nonzero and stop-whisper loud), never silently
+rendered as zero.
 
 Deadlines are advisory. An overdue row says **NEEDS CHECK-IN** and rides the
-stop-whisper after owner asks; it never reassigns work because a long turn is
-observationally identical to a dead seat. UTC timestamps use calendar
-semantics; future or malformed timestamps read as NEW, never false-overdue.
+stop-whisper after owner asks; it never reassigns work, because a long turn
+is observationally identical to a dead seat. The stop-whisper ranks
+redispatch needs, then unconfirmed delivery, then overdue check-ins. UTC
+timestamps use calendar semantics; future or malformed timestamps read as
+NEW, never false-overdue.
 
 ## ops — health, evolution, the browser
 

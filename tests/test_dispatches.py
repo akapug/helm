@@ -369,6 +369,49 @@ class HistoricalCompatTest(DispatchBase):
         self.assertEqual(got["reviewed_tip"], self.b)
         self.assertNotIn("4f65d90d", [r["id"] for r in dispatches.open_rows()])
 
+    def test_non_string_ts_never_passes_the_compat_boundary(self):
+        # fable adversarial r3: ts=1 stringifies below the boundary — the
+        # type-corruption class seq already guards must cover ts too.
+        self._legacy_open("ce1e7dd0", self.a[:7], lane="legacy")
+        for bad_ts in (1, 123456, 0.5, True):
+            move = {"id": "ce1e7dd0", "event": "retarget", "tip": self.b,
+                    "ref": self.b, "ts": bad_ts}
+            self.assertTrue(eventledger.append(dispatches.ledger_path(), move))
+        got = dispatches.rows()["ce1e7dd0"]
+        self.assertIsNone(got["tip"])
+        self.assertEqual(got["migration"], "needs-redispatch")
+        blocked, why = dispatches.mark_verdict("ce1e7dd0", self.b, "evidence")
+        self.assertIsNone(blocked)
+        self.assertIn("redispatch", why)
+
+    def test_post_boundary_legacy_genesis_cannot_fabricate_a_closed_row(self):
+        # fable adversarial r3 (LOW): a legacy-shaped FIRST row appended after
+        # the boundary must not invent an already-closed obligation.
+        ts = dispatches.pk.now_ts()
+        fab = {"id": "1a" * 16, "ts": ts, "recipient": "codex-3",
+               "lane": "fabricated", "ref": self.a[:7], "note": None,
+               "deadline_s": 60, "source": "old", "status": "verdict",
+               "verdict_ref": "fabricated-evidence", "last_updated": ts}
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), fab))
+        got = dispatches.rows()["1a" * 16]
+        self.assertEqual(got["status"], "open")     # visible, but never closed
+        self.assertEqual(got["migration"], "needs-redispatch")
+        # the same genesis stamped BEFORE the boundary is honest history: closed
+        old = dict(fab, id="2b" * 16, ts=OLD_TS, last_updated=OLD_TS)
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), old))
+        self.assertEqual(dispatches.rows()["2b" * 16]["status"], "verdict")
+
+    def test_closed_rows_never_carry_needs_redispatch(self):
+        # live row a8a0eadb read verdict+needs-redispatch simultaneously —
+        # contradictory in --json even though every consumer filtered right.
+        base = self._legacy_open("3c" * 4, self.a[:7])
+        closed = dict(base, status="verdict", verdict_ref="safe",
+                      last_updated=OLD_TS)
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), closed))
+        got = dispatches.rows()["3c" * 4]
+        self.assertEqual(got["status"], "verdict")
+        self.assertIsNone(got["migration"])
+
     def test_garbage_seq_rows_never_crash_replay_or_blind_good_rows(self):
         # codex round-1 HIGH: a valid legacy row with seq='not-an-int' made
         # snapshot() raise, turning EVERY obligation into "no usable
