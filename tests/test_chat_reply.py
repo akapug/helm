@@ -600,5 +600,36 @@ class ReplyWakeTest(ReplyBase):
         self.assertIn("quiet threaded answer", line)
 
 
+class ReplyDocsContractTest(unittest.TestCase):
+    """The superseded law must be DEAD in every contract surface, not just the
+    code (codex round-2 xrev of 2efe3f8: docs/VERBS.md + docs/WEB.md still
+    taught 'threading never changes who a message wakes' after the inversion
+    shipped). A doc that contradicts the beacon is an executable-looking trap
+    for the next regression, so the docs are pinned like code."""
+
+    DOCS = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "docs")
+
+    def doc(self, name):
+        with open(os.path.join(self.DOCS, name)) as f:
+            return f.read()
+
+    def test_the_retired_law_phrase_is_gone_from_the_doc_contracts(self):
+        for name in ("VERBS.md", "WEB.md"):
+            text = self.doc(name).casefold()
+            self.assertNotIn("never changes who", text, name)
+            self.assertNotIn("never change who", text, name)
+            self.assertNotIn("threading is invisible", text, name)
+
+    def test_verbs_states_the_live_law_and_points_at_its_test(self):
+        text = self.doc("VERBS.md")
+        self.assertIn("A reply wakes its parent's author.", text)
+        self.assertIn("`rfrom`", text)
+        self.assertIn("tests/test_chat_reply.py::ReplyWakeTest", text)
+
+    def test_web_api_doc_states_the_live_wake_behavior(self):
+        self.assertIn("wakes the parent row's author", self.doc("WEB.md"))
+
+
 if __name__ == "__main__":
     unittest.main()
