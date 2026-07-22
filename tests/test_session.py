@@ -514,5 +514,81 @@ class CliWiringTest(unittest.TestCase):
         self.assertNotIn("Traceback", err)
 
 
+class DeclaredSidTest(unittest.TestCase):
+    """The authoritative resolution rung: Claude Code's own pid-keyed
+    sessions/<pid>.json. Tested against THIS process and the LIVE kernel, so a
+    wrong /proc/<pid>/stat field index fails here instead of silently
+    resolving every pane to None (the shape that hid two UNKNOWN panes, and
+    with them a real law-1 double-open, behind a 131-candidate guess)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.pid = os.getpid()
+        os.makedirs(os.path.join(self.tmp, "sessions"))
+
+    def real_starttime(self):
+        with open("/proc/%d/stat" % self.pid, "rb") as f:
+            tail = f.read().decode("utf-8", "replace").rpartition(")")[2]
+        return tail.split()[19]
+
+    def write(self, **over):
+        rec = {"pid": self.pid, "sessionId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+               "procStart": self.real_starttime()}
+        rec.update(over)
+        path = os.path.join(self.tmp, "sessions", "%d.json" % rec.get("pid", self.pid))
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        return path
+
+    def test_resolves_against_live_proc_starttime(self):
+        self.write()
+        self.assertEqual(session._sid_from_session_file(self.pid, self.tmp),
+                         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+    def test_refuses_recycled_pid(self):
+        # Same pid, a DIFFERENT boot-relative start: the record describes a
+        # dead process whose pid the kernel handed to someone else.
+        self.write(procStart=str(int(self.real_starttime()) + 1))
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+    def test_refuses_record_naming_another_pid(self):
+        self.write(pid=self.pid + 1)
+        # Written under our own filename, but the body disowns us.
+        os.rename(os.path.join(self.tmp, "sessions", "%d.json" % (self.pid + 1)),
+                  os.path.join(self.tmp, "sessions", "%d.json" % self.pid))
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+    def test_absent_and_malformed_are_quiet_misses(self):
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+        with open(os.path.join(self.tmp, "sessions", "%d.json" % self.pid), "w") as f:
+            f.write("{not json")
+        self.assertIsNone(session._sid_from_session_file(self.pid, self.tmp))
+
+    def test_missing_procstart_still_resolves(self):
+        # Older records predate the field; pid-match alone is the weaker
+        # guard, but refusing outright would regress those panes to UNKNOWN.
+        self.write(procStart=None)
+        self.assertEqual(session._sid_from_session_file(self.pid, self.tmp),
+                         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+    def test_declared_outranks_resume_argv_in_the_ladder(self):
+        # `--resume X` names where a pane STARTED; the record names what it
+        # holds NOW. A pane resumed then branched must report the live sid.
+        with mock.patch.object(session, "_sid_from_session_file",
+                               return_value="live1111-session"), \
+             mock.patch.object(session, "_stamp_vars", return_value=()), \
+             mock.patch.object(session, "_who_holder_sid", return_value=None):
+            rows = {r["pid"]: r for r in session._proc_claude_rows()}
+        if not rows:
+            self.skipTest("no live claude pane to resolve on this host")
+        # Unconditional over every row: a truthy declared rung WINS outright,
+        # and having resolved it we never fall through to cwd guessing.
+        for r in rows.values():
+            self.assertEqual(r["declared"], "live1111-session")
+            self.assertEqual(r["session"], "live1111-session")
+            self.assertEqual(r["possible_sessions"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -154,11 +154,17 @@ def _cwd_session_ids(home_dir, cwd):
 
 
 def _proc_claude_rows():
-    """Every live pid whose argv[0] names claude. Row: {pid, resume, session,
-    possible_sessions, child, ancestor_sid8, force}. The stamp + --resume come from
-    /proc/<pid>/{environ,cmdline} directly. Fresh top-level sessions have no
-    --resume argv, so exact attribution composes the existing ``helm who``
-    layer; ambiguous candidates stay unresolved."""
+    """Every live pid whose argv[0] names claude. Row: {pid, resume, declared,
+    session, possible_sessions, child, ancestor_sid8, force}. The stamp +
+    --resume come from /proc/<pid>/{environ,cmdline} directly.
+
+    Resolution is a LADDER, most authoritative first: ``declared`` (Claude
+    Code's own sessions/<pid>.json) -> ``resume`` argv -> ``helm who``
+    attribution -> ambiguous cwd candidates, which stay unresolved. Before the
+    declared rung existed, a pane launched with `--continue` or a bare trailing
+    `--resume` had NO authoritative rung at all and fell through to guessing;
+    panes in a busy project dir then reported UNKNOWN against a hundred-plus
+    candidates while their sid sat in a pid-keyed file the whole time."""
     try:
         from . import who
         who_rows = {r["pid"]: r for r in who.scan(accounts=[])
@@ -182,7 +188,8 @@ def _proc_claude_rows():
                 for kv in f.read().decode("utf-8", "replace").split("\0"):
                     k, sep, v = kv.partition("=")
                     if sep and k in _stamp_vars() + (  # noqa: E731
-                            "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE",):
+                            "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE",
+                            "CLAUDE_CONFIG_DIR"):
                         env[k] = v
         except OSError:
             pass
@@ -194,9 +201,13 @@ def _proc_claude_rows():
                 resume = a.split("=", 1)[1]
         child = env.get("CLAUDE_CODE_CHILD_SESSION") == "1"
         wr = who_rows.get(int(pid), {})
+        # Claude Code's own pid-keyed record outranks every inference below —
+        # it names the sid the pane holds NOW, not the one it started from.
+        # It resolves child-stamped panes too, which the who layer skips.
+        declared = _sid_from_session_file(int(pid), env.get("CLAUDE_CONFIG_DIR"))
         attributed = None if child else _who_holder_sid(wr)
         possible = []
-        if not (child or resume or attributed) and wr:
+        if not (child or declared or resume or attributed) and wr:
             key = (wr.get("home"), wr.get("cwd"))
             if key not in cwd_candidates:
                 cwd_candidates[key] = _cwd_session_ids(*key)
@@ -204,7 +215,8 @@ def _proc_claude_rows():
         rows.append({
             "pid": int(pid),
             "resume": resume,
-            "session": resume or attributed,
+            "declared": declared,
+            "session": declared or resume or attributed,
             "possible_sessions": possible,
             "child": child,
             "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
@@ -352,6 +364,40 @@ def _persisting_sids():
     except Exception:
         pass
     return out
+
+
+def _sid_from_session_file(pid, config_dir):
+    """The AUTHORITATIVE sid for a live pane: Claude Code itself writes
+    <CLAUDE_CONFIG_DIR>/sessions/<pid>.json holding {"pid", "sessionId",
+    "procStart", ...}. Every other resolution path is inference — `--resume`
+    argv names the sid a pane STARTED from (absent entirely for `--continue`
+    and for a bare trailing `--resume`), and the cwd-candidate walk is a guess
+    that stays unresolved whenever a project dir holds more than one sid.
+
+    A pid-keyed file is only safe with a recycled-PID guard, so verify
+    ``procStart`` against /proc/<pid>/stat field 22 (starttime, in clock ticks
+    since boot) and refuse the record on mismatch. Same identity discipline the
+    spawn verb needed: a pid alone never proves it is the SAME process."""
+    path = os.path.join(config_dir or os.path.expanduser("~/.claude"),
+                        "sessions", "%d.json" % pid)
+    try:
+        with open(path) as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if rec.get("pid") != pid:
+        return None
+    want = str(rec.get("procStart") or "")
+    if want:
+        try:
+            with open("/proc/%d/stat" % pid, "rb") as f:
+                # comm (field 2) may contain spaces/parens — split past it.
+                fields = f.read().decode("utf-8", "replace").rpartition(")")[2].split()
+            if fields[19] != want:  # field 22 == index 19 after the comm split
+                return None
+        except (OSError, IndexError):
+            return None
+    return rec.get("sessionId") or None
 
 
 def _sid_on_disk(sid, persisting):
