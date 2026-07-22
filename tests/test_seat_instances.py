@@ -263,25 +263,42 @@ class ProxyFixRoundTest(Slice6Base):
     unsupported-family gate. Each test names the finding it closes."""
 
     def test_launch_line_never_carries_the_literal_token(self):
-        # Finding 2 (no keys in argv/logs): the bearer is a file reference
-        # resolved at exec, never interpolated into the line.
+        # no-keys-in-argv (the round-2 re-review): launch_line carries NO token
+        # at all — neither the literal NOR a NAME=value for the external env
+        # binary. The bearer is exported separately by `_token_export`.
         seat._mint_instance_proxy("codex", "codex-2")
         itok = _read(os.path.join(seat._proxy_home("codex", "codex-2"),
                              "token")).strip()
         line = seat.launch_line("codex", seat="codex-2")
         self.assertNotIn(itok, line)                # instance token absent
         self.assertNotIn("test-token", line)        # family token absent
-        self.assertIn("$(cat ", line)               # a read-at-exec reference
-        self.assertIn("instances/codex-2/token", line)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", line)   # no env NAME=value
 
-    def test_launch_line_is_mint_order_immune(self):
-        # Finding 1 (first-mint stale token): a line rendered BEFORE the mint
-        # points at the instance path, so it resolves the token the mint writes.
-        pre = seat.launch_line("codex", seat="codex-2")     # pre-mint
+    def test_token_export_is_a_builtin_no_argv(self):
+        # the bearer reaches claude via `export` (a shell builtin — no external
+        # process, no argv), read from the 0600 file at exec. The paste-line is
+        # export-prefix + launch_line, and the env part holds no secret.
         seat._mint_instance_proxy("codex", "codex-2")
         itok = _read(os.path.join(seat._proxy_home("codex", "codex-2"),
                              "token")).strip()
-        path = pre.split("ANTHROPIC_AUTH_TOKEN=$(cat ")[1].split(" ")[0]
+        exp = seat._token_export("codex", "codex-2")
+        self.assertTrue(exp.startswith("ANTHROPIC_AUTH_TOKEN=$(cat "))
+        self.assertIn("export ANTHROPIC_AUTH_TOKEN", exp)
+        self.assertIn("instances/codex-2/token", exp)
+        self.assertNotIn(itok, exp)                 # a path, never the value
+        full = exp + seat.launch_line("codex", seat="codex-2")
+        self.assertNotIn(itok, full)                # nowhere in the whole line
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN=",
+                         full.split("env ", 1)[1])  # env argv carries no secret
+
+    def test_token_export_is_mint_order_immune(self):
+        # first-mint (round-1 finding): the export rendered BEFORE the mint
+        # points at the instance path, so it resolves the token the mint writes.
+        pre = seat._token_export("codex", "codex-2")        # pre-mint
+        seat._mint_instance_proxy("codex", "codex-2")
+        itok = _read(os.path.join(seat._proxy_home("codex", "codex-2"),
+                             "token")).strip()
+        path = pre.split("$(cat ")[1].split(" ")[0]
         self.assertEqual(_read(path).strip(), itok)   # resolves instance
         self.assertNotEqual(_read(path).strip(), "test-token")
 
@@ -315,6 +332,26 @@ class ProxyFixRoundTest(Slice6Base):
                             "%d %s\n" % (live, seat._pid_identity(live)),
                             mode=0o600)
         self.assertEqual(seat._running_pid("codex", "codex-2"), live)
+
+    def test_unauthenticated_pid_record_fails_closed(self):
+        # round-2 finding: a BARE pid (legacy, no identity) or a '?' (failed
+        # capture) must NOT be trusted on the alive check alone — that is the
+        # reused-pid SIGTERM hazard. `_running_pid` returns None (stale/refused)
+        # and `_down` never signals the number. Probe with our OWN live pid.
+        for body in ("%d\n", "%d ?\n"):                    # bare, then '?'
+            home = seat._proxy_home("codex", "codex-2")
+            os.makedirs(home, exist_ok=True)
+            live = os.getpid()      # alive, NOT a proxy
+            seat._write_private(os.path.join(home, "proxy.pid"),
+                                body % live, mode=0o600)
+            self.assertIsNone(seat._running_pid("codex", "codex-2"),
+                              "unauthenticated record must fail closed: %r" % body)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                rc = seat._down("codex", seat="codex-2")
+            self.assertEqual(rc, 0)             # we survived => not signalled
+            self.assertFalse(os.path.exists(os.path.join(home, "proxy.pid")))
 
     def test_launch_refuses_instances_for_proxy_key_families(self):
         # Finding 5 (unsupported family): kimi is proxy-key — `launch kimi -i 2`

@@ -413,7 +413,9 @@ class SeatTest(unittest.TestCase):
             rc = seat.cmd_seat(["launch", "codex"])
         self.assertEqual(rc, 0)
         line = out.getvalue().strip()
-        self.assertTrue(line.startswith("env -u ANTHROPIC_API_KEY "))
+        # paste-line = token export (builtin, no argv) + env/claude command
+        self.assertTrue(line.startswith("ANTHROPIC_AUTH_TOKEN=$(cat "), line)
+        self.assertIn("; export ANTHROPIC_AUTH_TOKEN; env -u ANTHROPIC_API_KEY ", line)
         self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8317", line)
         # no-keys-in-argv (the 7bb422a xrev): the bearer is NEVER the literal —
         # the line reads it from the 0600 token file at exec time, so only the
@@ -670,8 +672,12 @@ class SeatTest(unittest.TestCase):
     def test_double_start_refused_no_spawn(self):
         self._plant("home-a")
         self.assertEqual(self._add()[0], 0)
+        # a live pid + its MATCHING birth identity = a verifiably-running proxy
+        # (the pidfile shape `_up` writes post-fix; a bare pid is now refused
+        # as unauthenticated, so this record must carry the identity to count).
+        live = os.getpid()
         with open(os.path.join(seat.seat_dir("codex"), "proxy.pid"), "w") as f:
-            f.write("%d\n" % os.getpid())  # an alive pid: this test process
+            f.write("%d %s\n" % (live, seat._pid_identity(live)))
         booby = seat.subprocess.Popen
         seat.subprocess.Popen = lambda *a, **k: self.fail("Popen called on double-start")
         try:
@@ -765,7 +771,8 @@ class SeatBornWiredTest(unittest.TestCase):
             rc = seat.cmd_seat(["launch", "codex"])
         self.assertEqual(rc, 0)
         line = out.getvalue().strip()
-        self.assertTrue(line.startswith("env -u ANTHROPIC_API_KEY"), line)
+        self.assertTrue(line.startswith("ANTHROPIC_AUTH_TOKEN=$(cat "), line)
+        self.assertIn("; export ANTHROPIC_AUTH_TOKEN; env -u ANTHROPIC_API_KEY", line)
         self.assertNotIn("\n", line)                 # pasteable — one line
         got = self._settings()                       # hooks are back
         from helm import hooks
@@ -801,7 +808,10 @@ class SeatMultiTest(unittest.TestCase):
                          line)
         # parent --model still rides; identity + scrub + ctx env intact
         self.assertIn("--model gpt-5.6-sol", line)
-        self.assertTrue(line.startswith("env -u ANTHROPIC_API_KEY "))
+        # launch_line itself is the env/claude command (no token, no export —
+        # the export prefix is added by the stdout print / launch.sh caller)
+        self.assertTrue(line.startswith("env -u ANTHROPIC_API_KEY "), line)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", line)   # no env NAME=value secret
         self.assertIn("HELM_CHAT_NAME=codex", line)
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=360000", line)
 

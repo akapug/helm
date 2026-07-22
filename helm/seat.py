@@ -338,20 +338,20 @@ def _proxy_pid_record(family, seat=None):
 
 
 def _running_pid(family, seat=None):
-    """The live proxy pid, ONLY when it is verifiably the process the pidfile
-    recorded — birth identity must match, so a reused pid is never mistaken
-    for the live proxy (and never signalled by `_down`). None when dead,
-    reused, or unverifiable."""
+    """The live proxy pid, ONLY when it is verifiably the SAME process the
+    pidfile recorded — a captured birth identity that still matches. FAIL
+    CLOSED: a record with no usable identity (legacy bare pid, or '?' from a
+    failed capture) is UNVERIFIABLE and returns None, so `_down` treats it as
+    stale and never signals the number — the reused-pid SIGTERM finding. A
+    live pid whose captured identity no longer matches is a REUSED pid and is
+    likewise refused. There is no alive-check-only fallback: trusting an
+    unauthenticated number is exactly the hazard this guard exists to close."""
     rec = _proxy_pid_record(family, seat)
     if not rec or not _pid_alive(rec["pid"]):
         return None
     ident = rec["identity"]
-    if ident in (None, "?"):
-        # identity never captured (legacy bare pid, or /proc unavailable at
-        # spawn — non-Linux degradation): fall back to the alive check alone,
-        # the pre-guard behavior. Distinct from a CAPTURED-then-MISMATCHED
-        # identity (a reused pid), which we refuse below.
-        return rec["pid"]
+    if not ident or ident == "?":
+        return None            # unauthenticated: refuse, never signal
     return rec["pid"] if _pid_identity(rec["pid"]) == ident else None
 
 
@@ -392,6 +392,18 @@ def _token_file(family, seat=None):
     before `up`) resolves empty until the mint lands — a clean empty var, not
     the wrong account."""
     return os.path.join(_proxy_home(family, seat), "token")
+
+
+def _token_export(family, seat=None):
+    """The shell statement that puts the seat's bearer into the environ WITHOUT
+    it ever touching a process argv: read the 0600 token file into a var and
+    `export` it (both shell builtins — no external process, no argv). `env`'s
+    NAME=value form is deliberately NOT used: the external env binary would
+    carry the resolved secret in its own argv (/proc/pid/cmdline). The launch
+    line/script prepend this, then exec claude (which inherits the export).
+    2>/dev/null keeps an unminted seat's read a clean empty var."""
+    return ("ANTHROPIC_AUTH_TOKEN=$(cat %s 2>/dev/null); export ANTHROPIC_AUTH_TOKEN; "
+            % shlex.quote(_token_file(family, seat)))
 
 
 # ---------------------------------------------------------------------------
@@ -576,15 +588,6 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     model = model or fam["model"]
     seat = seat or family
     port = _instance_port(family, seat)
-    # NO-keys-in-argv: the bearer is NEVER interpolated. The line reads it from
-    # the seat's 0600 token file at exec time (command substitution), so the
-    # script text / printed line / process argv carry only the PATH. This also
-    # makes the launch line mint-order-immune: it always resolves the CURRENT
-    # token, so a launch.sh written before `_mint_instance_proxy` still picks
-    # up the instance token the mint later writes (the first-mint stale-token
-    # finding). 2>/dev/null + a missing-file guard keep an unminted seat's
-    # failure a clean empty var, not a shell error line.
-    token_ref = "$(cat %s 2>/dev/null)" % shlex.quote(_token_file(family, seat))
     cfgdir = shlex.quote(os.path.join(_instance_dir(family, seat), "claude"))
     homing = (" HELM_CHAT_ROOM=%s" % shlex.quote(room)) if room else ""
     if room and room_source:
@@ -599,11 +602,19 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
         ctxenv += " CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d" % fam["max_context"]
     # --multi: no pin (frontmatter routes per-subagent); default: today's line.
     pin = "" if multi else " CLAUDE_CODE_SUBAGENT_MODEL=%s" % model
+    # NO-keys-in-argv (codex-2 re-review): the bearer is NEVER a NAME=value arg
+    # to the EXTERNAL `env` binary — `env TOKEN=$(cat f)` would put the
+    # resolved secret in env's OWN argv (/proc/pid/cmdline). Instead the token
+    # is exported into the seat's environ by `_token_export` (a shell builtin,
+    # no argv), and the `env` call below only UNSETS inherited vars and sets
+    # the non-secret ones. claude inherits the token from the export, so it
+    # never transits any process argv, the script text, or the printed line —
+    # and it resolves AT EXEC, so the line stays mint-order-immune (the
+    # first-mint finding).
     return ("env -u ANTHROPIC_API_KEY %s -u HELM_CHAT_ROOM"
             " -u MELD_CHAT_ROOM -u HELM_CHAT_ROOM_SOURCE"
             " -u MELD_CHAT_ROOM_SOURCE"
             " ANTHROPIC_BASE_URL=http://127.0.0.1:%d"
-            " ANTHROPIC_AUTH_TOKEN=%s"
             "%s"
             " CLAUDE_CONFIG_DIR=%s"
             " HELM_CHAT_NAME=%s%s"
@@ -612,7 +623,7 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
             " DREGG_PROFILE=%s%s"
             " claude --dangerously-skip-permissions --model %s"
             % (child_stamp_unsets(),
-               port, token_ref,
+               port,
                pin, cfgdir, shlex.quote(seat), homing,
                shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(seat),
                shlex.quote(seat), ctxenv, model))
@@ -892,8 +903,14 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
                      "# child-stamp guard: inherited from a daemon born inside "
                      "a Claude session,\n# these mark the seat a subprocess "
                      "child (persistence silently OFF) — strip.\n"
-                     "unset %s\nexec %s \"$@\"\n"
+                     "unset %s\n"
+                     "# bearer: exported from the 0600 token file (builtin, no argv) —\n"
+                     "# never an env NAME=value arg (the external env binary's argv\n"
+                     "# would carry the resolved secret).\n"
+                     "%s"
+                     "exec %s \"$@\"\n"
                      % (seat, seat, " ".join(CHILD_STAMP_VARS),
+                        _token_export(family, seat),
                         launch_line(family, room=room, seat=seat,
                                     room_source=room_source, multi=multi)))
 
@@ -1125,10 +1142,24 @@ def _up(family, quiet=False, seat=None):
     finally:
         log.close()
     # record pid + BIRTH identity so `_down`/`_running_pid` signal only THIS
-    # incarnation — a reused pid is never proxied-on or killed (Finding: bare
-    # reusable PID). Identity captured right after spawn, before any wait.
-    _write_private(os.path.join(cfgd, "proxy.pid"),
-                   "%d %s\n" % (p.pid, _pid_identity(p.pid) or "?"))
+    # incarnation — a reused pid is never proxied-on or killed (the bare
+    # reusable-PID finding). Capture right after spawn; /proc can lag a tick,
+    # so retry briefly. If identity is STILL unverifiable the proxy would be
+    # unmanageable (fail-closed `_down` would refuse to ever signal it) — kill
+    # the orphan and fail loudly rather than leave a proxy we cannot stop.
+    ident = None
+    for _ in range(10):
+        ident = _pid_identity(p.pid)
+        if ident or p.poll() is not None:
+            break
+        time.sleep(0.1)
+    if not ident:
+        p.kill()
+        print("helm seat: proxy pid %d birth identity unverifiable — killed "
+              "the orphan rather than leave an unstoppable proxy (no /proc?)"
+              % p.pid, file=sys.stderr)
+        return 1
+    _write_private(os.path.join(cfgd, "proxy.pid"), "%d %s\n" % (p.pid, ident))
     for _ in range(30):  # up to ~6s for the port to open
         if p.poll() is not None or _port_open(port):
             break
@@ -1167,12 +1198,24 @@ def _down(family, seat=None):
             os.remove(pidfile)  # stale
         print("helm seat: %s proxy not running" % seat)
         return 0
-    os.kill(pid, signal.SIGTERM)
+    # TOCTOU guard: re-verify the birth identity IMMEDIATELY before each
+    # signal. `_running_pid` verified at entry, but the proxy could die and its
+    # pid be recycled in the gap before a kill; a recycled pid has a different
+    # starttime, so the recheck refuses to signal it. (pidfd would close the
+    # window outright; /proc starttime narrows it to the check→kill instant,
+    # which is the portable floor here.)
+    expected = _proxy_pid_record(family, seat)["identity"]
+
+    def _still_ours():
+        return _pid_alive(pid) and _pid_identity(pid) == expected
+
+    if _still_ours():
+        os.kill(pid, signal.SIGTERM)
     for _ in range(15):
         if not _pid_alive(pid):
             break
         time.sleep(0.2)
-    if _pid_alive(pid):
+    if _still_ours():
         os.kill(pid, signal.SIGKILL)
     os.remove(pidfile)
     print("helm seat: %s proxy stopped (pid %d)" % (seat, pid))
@@ -2167,7 +2210,9 @@ def cmd_seat(args):
             print("helm seat: %s gets its own proxy — `helm seat up %s` "
                   "(127.0.0.1:%d) before launching"
                   % (seat, seat, _instance_port(family, seat)), file=sys.stderr)
-        print(launch_line(
+        # the pasteable line: export the bearer from its 0600 file (builtin, no
+        # argv), then the env/claude command — the token never transits argv.
+        print(_token_export(family, seat) + launch_line(
             family, model, room, seat, room_source=room_source, multi=multi))
         from . import hooks
         hooks.surface_uncovered(out=sys.stderr)  # a running joined-late pane
