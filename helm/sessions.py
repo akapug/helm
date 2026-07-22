@@ -550,11 +550,31 @@ def _age(mt):
 def cmd_sessions(args):
     """sessions [<project>] [--limit N] [--all] | sessions resume <id-prefix>"""
     if args and args[0] == "resume":
+        usage = ("sessions resume <session-id-prefix> [--go] [--title T] "
+                 "[--note TEXT] [--skip-permissions] [--force]")
         if len(args) < 2:
-            print("usage: helm sessions resume <session-id-prefix> [--go] [--title T] [--note TEXT]")
+            print("usage: helm " + usage)
             return 2
         pref = args[1]
         rest = args[2:]
+        if pref in ("-h", "--help"):
+            print("helm " + usage)
+            return 0
+        if pref.startswith("-"):
+            print("helm sessions: resume wants an <id-prefix>, got '%s' (%s)"
+                  % (pref, usage), file=sys.stderr)
+            return 2
+        # the tail is guarded BEFORE rows_for/spawn: an unknown flag exits 2
+        # pre-action (`resume <id> --go --bogus` used to spawn anyway with
+        # --help pretending success), and --title/--note must carry a
+        # non-flag value exactly once — a missing value used to crash AFTER
+        # the pane was already spawned.
+        from .cli import guard_tail
+        rc = guard_tail("helm sessions resume", rest,
+                        flags=("--go", "--skip-permissions", "--force"),
+                        valued=("--title", "--note"), usage=usage)
+        if rc is not None:
+            return rc
         go = "--go" in rest
         title = rest[rest.index("--title") + 1] if "--title" in rest else None
         hits = [r for r in rows_for(include_synthetic=True)

@@ -85,8 +85,9 @@ def cmd_skills(args):
         return skillsync.cmd_sync(args[1:])
     if args and args[0] != "dupes":
         import sys
-        print("helm skills: unknown verb '%s' (skills [dupes|sync])" % args[0],
-              file=sys.stderr)
+        from .cli import suggest
+        print("helm skills: unknown verb '%s'%s (skills [dupes|sync])"
+              % (args[0], suggest(args[0], ("dupes", "sync"))), file=sys.stderr)
         return 2
     # trailing junk after the matched subverb refuses BEFORE the census runs
     # (`skills dupes --bogus --help` used to scan and exit 0).

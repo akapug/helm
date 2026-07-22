@@ -1,6 +1,6 @@
 """Silent-dispatcher class closure — no dispatcher may be born silent.
 
-Two layers:
+Four layers:
 
 1. SweepTest DISCOVERS every subverb dispatcher from the SOURCE (AST — a
    module-level cmd/cmd_* function whose body dispatches on the first argv
@@ -11,11 +11,26 @@ Two layers:
    EXEMPT with their pinned alternative behavior; an exemption that stops
    matching a discovered dispatcher fails (no rot).
 
-2. Regression tests pin codex-2's FIX findings (helm-dogfood 2026-07-22):
+2. EXEMPT is BRANCH-AWARE, never wholesale: a positional dispatcher may
+   still own subverb branches (`sessions resume …`), and each discovered
+   branch literal must be declared WITH a guarded-tail probe — codex-2's
+   exact-SHA pass proved `sessions resume <id> --go --bogus --help`
+   spawned a pane and exited 0 behind the wholesale exemption.
+
+3. NoArgRootLeaves closes the class the dispatcher detector structurally
+   cannot see: a VERBS handler that never READS its args (cmd_sync) lets
+   the root pass any junk straight through — `helm sync --bogus --help`
+   ran the MUTATING sync and exited 0. The set of no-arg leaves is derived
+   from the source and must equal cli.NOARG_VERBS, whose tails the root
+   guards.
+
+4. Regression tests pin codex-2's FIX findings (helm-dogfood 2026-07-22):
    trailing junk after a KNOWN subverb must refuse BEFORE the side-effecting
    work runs — `seat down codex --bogus --help` stopped the seat and exited
    0 — and `--help` after junk refuses too (the existence probe stays
-   honest), while a clean `--help` tail still helps.
+   honest), while a clean `--help` tail still helps. Plus the centralized
+   nearest-match hint below root: a typo'd subverb/flag names what its
+   author probably meant.
 """
 import ast
 import contextlib
@@ -32,16 +47,30 @@ os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
 HELM_DIR = pathlib.Path(__file__).resolve().parent.parent / "helm"
 UNKNOWN = "zz-no-such-subverb-zz"
 
-# (module, function) -> (pinned rc for an unknown first token, why exempt).
-# Exemptions are for dispatchers whose first token is a documented free
-# positional, not a closed subverb set. Every key must still be DISCOVERED.
+# (module, function) -> {rc, why, branches}. Exemptions are for dispatchers
+# whose first token is a documented free positional, not a closed subverb
+# set. Every key must still be DISCOVERED, and the exemption is BRANCH-aware:
+# "branches" declares every string literal the dispatcher matches its first
+# token against, each with a probe proving that branch's tail is guarded
+# (junk + --help refuses with exit 2 BEFORE the named side-effecting call).
+# A branch discovered in the source but not declared here fails the sweep —
+# a dispatcher can be positional in one branch and must be guarded in the
+# others; the wholesale free-pass is what hid the resume hole.
 EXEMPT = {
-    ("sessions", "cmd_sessions"): (
-        0, "args[0] is the documented positional <project> filter; "
-           "'resume' is the one subverb"),
-    ("creds", "cmd_swap"): (
-        1, "args[0] is a positional <home-or-account-email>; an unknown "
-           "target refuses with rc 1 (not-found), never runs a default"),
+    ("sessions", "cmd_sessions"): {
+        "rc": 0,
+        "why": "args[0] is the documented positional <project> filter",
+        "branches": {
+            "resume": {"argv": ["resume", "abcdef", "--go", "--bogus", "--help"],
+                       "never": "spawn_resume"},
+        },
+    },
+    ("creds", "cmd_swap"): {
+        "rc": 1,
+        "why": "args[0] is a positional <home-or-account-email>; an unknown "
+               "target refuses with rc 1 (not-found), never runs a default",
+        "branches": {},
+    },
 }
 
 
@@ -155,6 +184,61 @@ def discover():
     return out
 
 
+def _fn_node(mod, fn):
+    tree = ast.parse((HELM_DIR / (mod + ".py")).read_text())
+    return next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == fn)
+
+
+def branch_literals(fn_node):
+    """String literals a dispatcher compares its FIRST token against — the
+    branch-aware view of an EXEMPT positional dispatcher. Deliberately
+    generation-1 only (args[0]/args.pop(0), or a name assigned DIRECTLY from
+    one): derived values (provider = match.get(...)) are data comparisons,
+    never argv branches."""
+    bound = set()
+    for n in ast.walk(fn_node):
+        if isinstance(n, ast.Assign) and _token(n.value):
+            bound.update(t.id for t in n.targets if isinstance(t, ast.Name))
+    lits = set()
+    for n in ast.walk(fn_node):
+        if not (isinstance(n, ast.Compare) and _tok_or_bound(n.left, bound)):
+            continue
+        for c in n.comparators:
+            if _is_str_const(c):
+                lits.add(c.value)
+            elif isinstance(c, (ast.Tuple, ast.List, ast.Set)) and _str_collection(c):
+                lits.update(e.value for e in c.elts)
+            elif isinstance(c, ast.Dict) and _str_collection(c):
+                lits.update(k.value for k in c.keys)
+    return lits
+
+
+def verb_map():
+    """cli.VERBS straight from the source: verb -> (module, function), both
+    the direct entries and the _lazy(module, fn) ones."""
+    tree = ast.parse((HELM_DIR / "cli.py").read_text())
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "VERBS" for t in node.targets):
+            for k, v in zip(node.value.keys, node.value.values):
+                if isinstance(v, ast.Name):
+                    out[k.value] = ("cli", v.id)
+                elif isinstance(v, ast.Call):
+                    out[k.value] = (v.args[0].value, v.args[1].value)
+    return out
+
+
+def reads_args(mod, fn):
+    """Does the handler ever LOAD its args parameter? A handler that never
+    does is a no-arg leaf: nothing below main() will look at the tail."""
+    node = _fn_node(mod, fn)
+    param = node.args.args[0].arg
+    return any(isinstance(n, ast.Name) and n.id == param
+               and isinstance(n.ctx, ast.Load) for n in ast.walk(node))
+
+
 def _call(mod, fn, argv):
     f = getattr(importlib.import_module("helm." + mod), fn)
     out, err = io.StringIO(), io.StringIO()
@@ -173,7 +257,7 @@ class SweepTest(unittest.TestCase):
     def test_every_discovered_dispatcher_refuses_unknown_subverb(self):
         found = discover()
         for mod, fn in found:
-            expected = EXEMPT.get((mod, fn), (2, None))[0]
+            expected = EXEMPT.get((mod, fn), {"rc": 2})["rc"]
             rc, out, err = _call(mod, fn, [UNKNOWN])
             self.assertEqual(
                 rc, expected,
@@ -188,6 +272,135 @@ class SweepTest(unittest.TestCase):
             self.assertIn(key, found,
                           "EXEMPT entry %r no longer matches a discovered "
                           "dispatcher — delete or re-justify it" % (key,))
+
+    def test_exempt_branches_declared_and_tail_guarded(self):
+        # branch-aware exemption: every subverb literal an EXEMPT dispatcher
+        # matches its first token against must be DECLARED with a probe, and
+        # that probe (known branch + junk + --help) must refuse with exit 2
+        # BEFORE the branch's side-effecting call. A new branch born inside
+        # a positional dispatcher fails here until it is declared + guarded.
+        for (mod, fn), spec in EXEMPT.items():
+            self.assertEqual(
+                branch_literals(_fn_node(mod, fn)), set(spec["branches"]),
+                "%s.%s branch set drifted from EXEMPT — declare each subverb "
+                "branch with a guarded-tail probe" % (mod, fn))
+            for name, probe in spec["branches"].items():
+                with mock.patch("helm.%s.%s" % (mod, probe["never"])) as p:
+                    rc, out, err = _call(mod, fn, probe["argv"])
+                self.assertEqual(rc, 2, (mod, fn, name, out, err))
+                self.assertTrue(err, "%s.%s %s refusal must ride stderr" % (mod, fn, name))
+                self.assertFalse(
+                    p.called, "%s.%s ran %s despite junk %r"
+                    % (mod, fn, probe["never"], probe["argv"]))
+
+
+class NoArgRootLeaves(unittest.TestCase):
+    """codex-2 HIGH: cli.main(['sync','--bogus','--help']) returned 0 AND ran
+    registry.sync — a MUTATING verb ran on junk while --help falsely
+    succeeded, and the dispatcher detector structurally cannot see it (the
+    leaf never dispatches). Class closure: derive the no-arg leaves from the
+    source, pin them to cli.NOARG_VERBS, and prove the ROOT guards their
+    tails."""
+
+    def _main(self, argv):
+        from helm import cli
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_noarg_leaves_equal_the_declared_set(self):
+        from helm import cli
+        noarg = {v for v, (m, f) in verb_map().items() if not reads_args(m, f)}
+        self.assertTrue(noarg)  # detector-health floor
+        self.assertEqual(
+            noarg, set(cli.NOARG_VERBS),
+            "no-arg VERBS leaves drifted from cli.NOARG_VERBS — a handler "
+            "that never reads args gets NO guard below main(), so the root "
+            "must guard its tail (or the handler must own its args)")
+
+    def test_root_guards_every_noarg_leaf_tail(self):
+        from helm import cli
+        for verb in cli.NOARG_VERBS:
+            for tail in (["--zz-bogus"], ["--zz-bogus", "--help"], ["zz-extra"]):
+                rc, out, err = self._main([verb] + tail)
+                self.assertEqual(rc, 2, (verb, tail, out, err))
+                self.assertIn(tail[0], err, (verb, tail))
+
+    def test_sync_junk_with_help_never_syncs(self):
+        # the exact codex-2 probe, pinned: refuse BEFORE the mutating sync.
+        with mock.patch("helm.registry.sync") as p:
+            rc, out, err = self._main(["sync", "--bogus", "--help"])
+        self.assertEqual(rc, 2, (out, err))
+        self.assertFalse(p.called, "registry.sync ran on junk")
+        self.assertIn("--bogus", err)
+
+    def test_clean_help_on_noarg_leaf_still_helps(self):
+        from helm import cli
+        for verb in cli.NOARG_VERBS:
+            rc, out, _ = self._main([verb, "--help"])
+            self.assertEqual(rc, 0, verb)
+            self.assertTrue(out.strip(), verb)
+
+
+class SessionsResumeTailGuard(unittest.TestCase):
+    """codex-2 HIGH, pinned exactly: the resume branch of the positional
+    cmd_sessions dispatcher guards its tail BEFORE rows_for/spawn."""
+
+    def _call(self, argv):
+        with mock.patch("helm.sessions.rows_for") as rows, \
+                mock.patch("helm.sessions.spawn_resume") as spawn:
+            rc, out, err = _call("sessions", "cmd_sessions", argv)
+        return rc, out, err, rows, spawn
+
+    def test_junk_with_help_never_spawns(self):
+        rc, out, err, rows, spawn = self._call(
+            ["resume", "abcdef", "--go", "--bogus", "--help"])
+        self.assertEqual(rc, 2, (out, err))
+        self.assertIn("--bogus", err)
+        self.assertFalse(rows.called, "rows_for ran despite junk")
+        self.assertFalse(spawn.called, "spawn_resume ran despite junk")
+
+    def test_missing_option_value_refuses_before_spawn(self):
+        # --title/--note used to be parsed AFTER the pane was spawned; a
+        # missing value crashed post-action. Now it refuses pre-action.
+        for argv in (["resume", "abcdef", "--go", "--title"],
+                     ["resume", "abcdef", "--go", "--note", "--title", "t"]):
+            rc, out, err, rows, spawn = self._call(argv)
+            self.assertEqual(rc, 2, (argv, out, err))
+            self.assertIn("wants a value", err, argv)
+            self.assertFalse(spawn.called, argv)
+
+    def test_flag_shaped_prefix_refuses(self):
+        rc, out, err, rows, spawn = self._call(["resume", "--go"])
+        self.assertEqual(rc, 2, (out, err))
+        self.assertFalse(rows.called)
+
+    def test_clean_help_tail_helps_without_resolving(self):
+        for argv in (["resume", "abcdef", "--help"], ["resume", "--help"]):
+            rc, out, err, rows, spawn = self._call(argv)
+            self.assertEqual(rc, 0, (argv, err))
+            self.assertIn("resume <session-id-prefix>", out + err)
+            self.assertFalse(rows.called, argv)
+            self.assertFalse(spawn.called, argv)
+
+
+class NearestMatchBelowRoot(unittest.TestCase):
+    """codex-2 MED, pinned exactly: the root's did-you-mean is centralized
+    (cli.suggest) and wired below root — guard_tail flags AND subdispatcher
+    verbs. One typo probe per dispatcher, end to end through cli.main."""
+
+    def test_typos_name_the_nearest_match(self):
+        from helm import cli
+        for argv, want in ((["skills", "syn"], "sync"),
+                           (["creds", "crosschek"], "crosscheck"),
+                           (["tidy", "--aply"], "--apply"),
+                           (["watchdog", "--quite"], "--quiet")):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = cli.main(argv)
+            self.assertEqual(rc, 2, (argv, err.getvalue()))
+            self.assertIn("did you mean '%s'?" % want, err.getvalue(), argv)
 
 
 # ---------------------------------------------------- codex-2 FIX findings

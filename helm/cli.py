@@ -40,6 +40,10 @@ def cmd_sync(args):
 
 def cmd_projects(args):
     """projects [--all] — the real project list, newest activity first."""
+    rc = guard_tail("helm projects", args, flags=("--all",),
+                    usage="projects [--all]")
+    if rc is not None:
+        return rc
     reg = registry.load()
     projects = list(reg["projects"].values())
     if not projects:
@@ -73,6 +77,9 @@ def cmd_show(args):
     if not args:
         print("usage: helm show <project>", file=sys.stderr)
         return 2
+    rc = guard_tail("helm show", args[1:], usage="show <project>")
+    if rc is not None:
+        return rc
     import json
     p = registry.get(args[0])
     if p is None:
@@ -80,6 +87,16 @@ def cmd_show(args):
         return 1
     print(json.dumps(p, indent=2, ensure_ascii=False))
     return 0
+
+
+def suggest(word, candidates):
+    """The one nearest-match hint — pure, shared by the root's unknown-verb
+    refusal, guard_tail's unknown-arg refusal, and every subdispatcher's
+    unknown-subverb refusal, so a typo anywhere in the tree says what its
+    author probably meant instead of only the generic usage line."""
+    import difflib
+    near = difflib.get_close_matches(word, list(candidates), n=1)
+    return (" — did you mean '%s'?" % near[0]) if near else ""
 
 
 def guard_tail(prog, args, flags=(), valued=(), usage=None):
@@ -111,8 +128,9 @@ def guard_tail(prog, args, flags=(), valued=(), usage=None):
             junk.append(a)
         i += 1
     if junk:
-        print("%s: unknown arg '%s'%s" % (
-            prog, junk[0], (" (%s)" % usage) if usage else ""), file=sys.stderr)
+        print("%s: unknown arg '%s'%s%s" % (
+            prog, junk[0], suggest(junk[0], tuple(flags) + tuple(valued)),
+            (" (%s)" % usage) if usage else ""), file=sys.stderr)
         return 2
     if want_help:
         print(usage or prog)
@@ -194,6 +212,14 @@ VERBS = {
     "worktree": _lazy("envtidy", "cmd_worktree"),
     "tidy": _lazy("envtidy", "cmd_tidy"),
 }
+
+# Verbs whose handlers read NO arguments at all: nothing below main() will
+# ever look at the tail, so the ROOT guards it — `helm sync --bogus --help`
+# must refuse (exit 2) BEFORE the (possibly mutating) leaf runs, not run
+# sync while --help pretends the flag existed. The sweep test DERIVES this
+# set from the source (AST: the handler never loads its args param) and
+# fails when a new no-arg leaf is born outside it, so the class stays closed.
+NOARG_VERBS = ("home", "sync", "doctor", "human")
 
 _VERB_HELP = {
     "brief": "brief [--hours N] [--json] — the operator's morning brief: sessions, knowledge delta (incl. pinned-starvation tail), seats, owner gates (read-only, never probes)",
@@ -278,16 +304,18 @@ def main(argv=None):
         # Honest even under --help: an unknown verb NEVER falls through to the
         # global usage with exit 0 — that false positive taught the fleet to
         # distrust `helm <verb> --help` as an existence probe.
-        import difflib
-        near = difflib.get_close_matches(verb, VERBS, n=1)
-        hint = (" — did you mean '%s'?" % near[0]) if near else ""
-        print("helm: unknown verb '%s'%s (helm --help)" % (verb, hint),
+        print("helm: unknown verb '%s'%s (helm --help)" % (verb, suggest(verb, VERBS)),
               file=sys.stderr)
         return 2
     rest = argv[1:]
     if rest and rest[0] in ("-h", "--help"):
         print("helm " + (_VERB_HELP.get(verb) or (fn.__doc__ or verb).strip().split("\n")[0]))
         return 0
+    if verb in NOARG_VERBS:
+        rc = guard_tail("helm " + verb, rest, usage=_VERB_HELP.get(verb)
+                        or (fn.__doc__ or verb).strip().split("\n")[0])
+        if rc is not None:
+            return rc
     return fn(rest)
 
 

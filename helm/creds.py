@@ -63,8 +63,9 @@ def cmd_creds(args):
         return localscan.cmd_crosscheck(args[1:])
     if args:
         import sys
-        print("helm creds: unknown verb '%s' (creds [crosscheck])" % args[0],
-              file=sys.stderr)
+        from .cli import suggest
+        print("helm creds: unknown verb '%s'%s (creds [crosscheck])"
+              % (args[0], suggest(args[0], ("crosscheck",))), file=sys.stderr)
         return 2
     try:
         rows = _rows()
