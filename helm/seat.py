@@ -107,7 +107,10 @@ FAMILIES = {
               # in-band). CLAUDE_CODE_MAX_CONTEXT_TOKENS (launch_line) teaches CC
               # the real window — shaved to 360k (seats request max_tokens=32k, CC
               # reserves 20k). Small-window codex families (spark 128k) want 128000.
-              "max_context": 360000},
+              "max_context": 360000,
+              # --multi probe models: two DISTINCT models one codex OAuth serves,
+              # the exact pair the proven mixed fan-out routed (run-1 2026-07-21).
+              "probe_models": ("gpt-5.6-sol", "gpt-5.6-terra")},
     # kimi keys come in two flavors that 401 on each other's endpoint: a
     # CODING-plan key ("sk-kimi-…") wants api.kimi.com/coding/v1 (dual-wire;
     # OpenAI wire live-verified 2026-07-20), a Moonshot PLATFORM key (plain
@@ -120,7 +123,10 @@ FAMILIES = {
     "kimi": {"port": 8318, "model": "kimi-k3", "mode": "proxy-key",
              "base_url": "https://api.moonshot.ai/v1",
              "key_base_urls": (("sk-kimi-", "https://api.kimi.com/coding/v1"),),
-             "key_env": "KIMI_API_KEY", "provider": "moonshot"},
+             "key_env": "KIMI_API_KEY", "provider": "moonshot",
+             # one alias in the proxy config -> one probe; the mixed fan-out
+             # leg needs two and SKIPs (loudly) for single-model families.
+             "probe_models": ("kimi-k3",)},
 }
 
 # CC's autocompact trigger = pct × (window − 20k). Against the CORRECT window it
@@ -136,10 +142,14 @@ _USAGE = """usage: helm seat <verb> [args]
                [--key-from <path>]    proxy-key families: .env-style key file
                [--room R]             home the seat's chat in team room R
   up <family> | down <family>         start/stop the seat's local proxy
-  launch <family> [--model M] [--room R]  print the exact launch line (never runs it)
+  launch <family> [--model M] [--room R] [--multi]  print the exact launch line (never runs it)
+                                      --multi: mixed-model fleet — DROP the
+                                      CLAUDE_CODE_SUBAGENT_MODEL pin (it blunt-pins
+                                      over per-agent frontmatter) + mint probe agents
   resume <seat>                       relaunch the seat's pane via the metaharness
                                       (freshest launch.sh + --resume/--continue)
-  smoke <family>                      the 4-leg acceptance gate (prompt/tool/subagent/whisper)
+  smoke <family> [--multi]            the 4-leg acceptance gate (prompt/tool/subagent/whisper);
+                                      --multi adds the mixed-model fan-out leg (conductor-log-verified)
   list | status                       seats, proxy liveness, cred expiry
   doctor                              binary + cred + seat health, read-only
 families: %s""" % ", ".join(sorted(FAMILIES))
@@ -390,7 +400,7 @@ def _instance_dir(family, seat):
         if seat and seat != family else seat_dir(family)
 
 
-def launch_line(family, model=None, room=None, seat=None):
+def launch_line(family, model=None, room=None, seat=None, multi=False):
     """The exact seat launch command. env -u ANTHROPIC_API_KEY is part of the
     line: an inherited key must never ride into a proxied seat either. The
     child-stamp trio (CHILD_STAMP_VARS) is unset right beside it: a spawning
@@ -416,7 +426,12 @@ def launch_line(family, model=None, room=None, seat=None):
     a per-tool permission prompt strands it silently (the owner had to flip
     kimi/codex into auto-mode by hand). The beacon permit narrows an
     interactive session; a launched seat skips wholesale — it never has a
-    human at its keyboard to answer a prompt."""
+    human at its keyboard to answer a prompt. `multi` (the proven mixed-model
+    law, premise multimodel-one-cc-proven-per-agent-frontmatter-no-fork):
+    DROP CLAUDE_CODE_SUBAGENT_MODEL entirely — that env var blunt-pins EVERY
+    subagent to one model, overriding the per-agent `model:` frontmatter that
+    IS the mixed-fleet mechanism; the probe agents minted beside this line
+    carry the per-model pins instead."""
     fam = FAMILIES[family]
     model = model or fam["model"]
     seat = seat or family
@@ -430,10 +445,12 @@ def launch_line(family, model=None, room=None, seat=None):
     ctxenv = " CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=%s" % AUTOCOMPACT_PCT_OVERRIDE
     if fam.get("max_context"):
         ctxenv += " CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d" % fam["max_context"]
+    # --multi: no pin (frontmatter routes per-subagent); default: today's line.
+    pin = "" if multi else " CLAUDE_CODE_SUBAGENT_MODEL=%s" % model
     return ("env -u ANTHROPIC_API_KEY %s"
             " ANTHROPIC_BASE_URL=http://127.0.0.1:%d"
             " ANTHROPIC_AUTH_TOKEN=%s"
-            " CLAUDE_CODE_SUBAGENT_MODEL=%s"
+            "%s"
             " CLAUDE_CONFIG_DIR=%s"
             " HELM_CHAT_NAME=%s%s"
             " HELM_CELL_BIN=%s"
@@ -442,7 +459,7 @@ def launch_line(family, model=None, room=None, seat=None):
             " claude --dangerously-skip-permissions --model %s"
             % (child_stamp_unsets(),
                fam["port"], _read_token(family) or "<seat-token-missing>",
-               model, cfgdir, shlex.quote(seat), homing,
+               pin, cfgdir, shlex.quote(seat), homing,
                shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(seat),
                shlex.quote(seat), ctxenv, model))
 
@@ -598,7 +615,43 @@ def _seed_seat_settings(cdir):
               "may stall at the bypass dialog" % (p, e), file=sys.stderr)
 
 
-def _write_launch_assets(family, d, room=None, seat=None, workdir=None):
+# The probe agent body: per-agent `model:` frontmatter is the WHOLE mixed-model
+# mechanism (premise multimodel-one-cc-proven-per-agent-frontmatter-no-fork) —
+# the string in `model:` goes to the wire per-request and the proxy conducts.
+_PROBE_AGENT_MD = """---
+name: %(name)s
+description: helm multi-model probe pinned to %(model)s via frontmatter (the proven per-agent mechanism). Spawn with subagent_type %(name)s when asked to run this probe.
+model: %(model)s
+---
+You are a helm multi-model probe subagent running as model %(model)s.
+Reply with exactly the marker text given in your task prompt, then name the
+model family you actually are — one line, nothing else.
+"""
+
+
+def probe_agents(family):
+    """[(agent_name, model)] for the family's probe models — deterministic
+    names (helm-probe-<model-slug>) so re-mints overwrite, never accrete."""
+    fam = FAMILIES[family]
+    models = fam.get("probe_models") or (fam["model"],)
+    return [("helm-probe-" + re.sub(r"[^a-z0-9]+", "-", m.lower()).strip("-"), m)
+            for m in models]
+
+
+def _mint_probe_agents(cdir, family):
+    """Mint the family's probe agents into <cdir>/agents/*.md (a
+    CLAUDE_CONFIG_DIR-scoped agent set). Returns probe_agents(family)."""
+    ad = os.path.join(cdir, "agents")
+    os.makedirs(ad, exist_ok=True)
+    probes = probe_agents(family)
+    for name, model in probes:
+        with open(os.path.join(ad, name + ".md"), "w") as f:
+            f.write(_PROBE_AGENT_MD % {"name": name, "model": model})
+    return probes
+
+
+def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
+                         multi=False):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
     identical for every mode, and refreshed by BOTH `add` and `launch` (a
     stale launch.sh minted before HELM_CHAT_NAME existed is why the live
@@ -626,6 +679,8 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None):
               "deliver + join + stop-guard + beacon permit)" % (seat, action),
               file=sys.stderr)
     _seed_seat_settings(cdir)   # skip the bypass-permissions dialog (settings.json)
+    if multi:
+        _mint_probe_agents(cdir, family)   # per-model frontmatter pins ride here
     _write_launch_sh(os.path.join(d, "launch.sh"),
                      "#!/bin/sh\n# helm seat %s — minted by `helm seat add`; "
                      "regenerate with `helm seat launch %s`\n"
@@ -634,7 +689,7 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None):
                      "child (persistence silently OFF) — strip.\n"
                      "unset %s\nexec %s \"$@\"\n"
                      % (seat, seat, " ".join(CHILD_STAMP_VARS),
-                        launch_line(family, room=room, seat=seat)))
+                        launch_line(family, room=room, seat=seat, multi=multi)))
 
 
 def _write_launch_sh(path, text):
@@ -882,29 +937,92 @@ def _down(family):
 # smoke — the 4-leg acceptance gate
 # ---------------------------------------------------------------------------
 
-def _seat_env(family, config_dir):
+def _seat_env(family, config_dir, multi=False):
     """The proxied-seat subprocess env: scrubbed base (so a stray inherited
     ANTHROPIC_API_KEY can never ride along), then the seat's own proxy, chat,
     and dregg-signing identity. Mirrors launch_line so smoke cannot certify a
-    materially different process shape — including the child-stamp strip."""
+    materially different process shape — including the child-stamp strip.
+    `multi` mirrors launch_line's --multi: NO CLAUDE_CODE_SUBAGENT_MODEL (it
+    would blunt-pin every subagent over the per-agent frontmatter — the proven
+    mixed-model mechanism); the scrubbed base also guarantees no inherited pin
+    leaks back in."""
     fam = FAMILIES[family]
     env = scrub_env(os.environ)
     for v in CHILD_STAMP_VARS:
         env.pop(v, None)
+    env.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
     env.update({
         "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % fam["port"],
         "ANTHROPIC_AUTH_TOKEN": _read_token(family) or "",
         "CLAUDE_CONFIG_DIR": config_dir,
-        "CLAUDE_CODE_SUBAGENT_MODEL": fam["model"],
         "HELM_CHAT_NAME": family,
         "HELM_CELL_BIN": DREGG_SIGNER_DEFAULT,
         "HELM_CELL_PROFILE": family,
         "DREGG_PROFILE": family,
     })
+    if not multi:
+        env["CLAUDE_CODE_SUBAGENT_MODEL"] = fam["model"]
     return env
 
 
-def _smoke(family):
+def _smoke_multi_leg(family, fam, smoke_dir, mark):
+    """The mixed-model fan-out leg (the proven run-1 pattern): TWO subagents
+    pinned to DIFFERENT models via per-agent frontmatter, one claude-code
+    process, no CLAUDE_CODE_SUBAGENT_MODEL. Verified against a CONDUCTOR LOG —
+    per-request model names on the wire, not the subagents' word: the smoke
+    claude rides through an ephemeral helm modelrouter fronting this seat's
+    proxy, and the leg passes only when the router's log shows BOTH probe
+    models leaving the process. (The stock proxy's gin log carries no model
+    names at debug:false; the router's conductor log is the helm-owned
+    equivalent of the debug log run-1 read.)"""
+    probes = _mint_probe_agents(smoke_dir, family)
+    if len(probes) < 2:
+        print("  %-8s SKIP — %s has one probe model; the mixed fan-out needs "
+              "two (FAMILIES probe_models)" % ("multi", family))
+        return True
+    from . import modelrouter
+    log_path = os.path.join(smoke_dir, "router.log")
+    if os.path.exists(log_path):
+        os.remove(log_path)      # stale wire evidence must never certify a run
+    srv = modelrouter.start_inprocess(default_family=family, log_path=log_path)
+    (a_name, a_model), (b_name, b_model) = probes[0], probes[1]
+    try:
+        env = _seat_env(family, smoke_dir, multi=True)
+        env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%d" % srv.server_address[1]
+        prompt = ("Use the Task tool to spawn exactly two subagents in "
+                  "parallel: one with subagent_type %s whose entire task is to "
+                  "reply with exactly helm-seat-multi-a-%s, and one with "
+                  "subagent_type %s whose entire task is to reply with exactly "
+                  "helm-seat-multi-b-%s. Report both replies verbatim."
+                  % (a_name, mark, b_name, mark))
+        try:
+            p = subprocess.run(["claude", "-p", prompt, "--model", fam["model"],
+                                "--allowedTools", "Task"],
+                               env=env, capture_output=True, text=True,
+                               timeout=600)
+            reply, note = (p.stdout or "").strip(), ""
+        except subprocess.TimeoutExpired:
+            p, reply, note = None, "", " (timeout 600s)"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    wired = modelrouter.logged_models(log_path)
+    markers = ("helm-seat-multi-a-%s" % mark in reply
+               and "helm-seat-multi-b-%s" % mark in reply)
+    routed = {a_model, b_model} <= wired
+    passed = p is not None and p.returncode == 0 and markers and routed
+    if not passed and not note:
+        note = " (rc %s%s%s)" % (
+            p.returncode if p else "-",
+            "" if markers else "; marker missing",
+            "" if routed else "; conductor log saw %s, wanted %s+%s"
+            % (sorted(wired) or "nothing", a_model, b_model))
+    print("  %-8s %s%s — %s" % ("multi", "PASS" if passed else "FAIL", note,
+                                (reply or "(no reply)").replace("\n", " ")[:200]))
+    return passed
+
+
+def _smoke(family, multi=False):
     fam = _require_seat(family)
     if fam is None:
         return 1
@@ -951,6 +1069,8 @@ def _smoke(family):
         ok = ok and passed
         print("  %-8s %s%s — %s" % (name, "PASS" if passed else "FAIL", note,
                                     (reply or "(no reply)").replace("\n", " ")[:200]))
+    if multi:
+        ok = _smoke_multi_leg(family, fam, smoke_dir, mark) and ok
     print("  %-8s SKIP — whisper: not yet wired" % "whisper")
     print("helm seat: %s smoke %s (model %s)" % (family, "PASS" if ok else "FAIL", model))
     return 0 if ok else 1
@@ -1180,6 +1300,9 @@ def cmd_seat(args):
         # --room homes the seat in a team channel (default main — un-homed):
         # add/launch bake HELM_CHAT_ROOM=<room> into the line + launch.sh
         room = rest[rest.index("--room") + 1] if "--room" in rest else None
+        # --multi (launch/smoke): the mixed-model fleet shape — no subagent
+        # pin, probe agents minted, smoke grows the fan-out leg.
+        multi = "--multi" in rest
         if verb == "add":
             return _add(family, rest[1:], room=room)
         if verb == "up":
@@ -1187,7 +1310,7 @@ def cmd_seat(args):
         if verb == "down":
             return _down(family)
         if verb == "smoke":
-            return _smoke(family)
+            return _smoke(family, multi=multi)
         fam = _require_seat(family)
         if fam is None:
             return 1
@@ -1225,8 +1348,9 @@ def cmd_seat(args):
         # hooks + beacon permit + a launch.sh carrying the CURRENT identity
         # shape — retrofitting a seat minted before either existed. stdout
         # stays exactly the pasteable line; notes ride stderr.
-        _write_launch_assets(family, _instance_dir(family, seat), room, seat)
-        print(launch_line(family, model, room, seat))
+        _write_launch_assets(family, _instance_dir(family, seat), room, seat,
+                             multi=multi)
+        print(launch_line(family, model, room, seat, multi=multi))
         from . import hooks
         hooks.surface_uncovered(out=sys.stderr)  # a running joined-late pane
         return 0                                 # still needs its relaunch

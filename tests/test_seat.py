@@ -730,5 +730,205 @@ class SeatBornWiredTest(unittest.TestCase):
         self.assertIn("wired for fleet delivery", err.getvalue())
 
 
+class SeatMultiTest(unittest.TestCase):
+    """--multi (0.2 mixed-model fleets, premise multimodel-one-cc-proven-
+    per-agent-frontmatter-no-fork): the launch line/env DROP the
+    CLAUDE_CODE_SUBAGENT_MODEL blunt pin (it overrides per-agent frontmatter),
+    probe agents with per-model `model:` frontmatter are minted, and the smoke
+    gate grows a conductor-log-verified fan-out leg. Hermetic: no proxy, no
+    claude, no network. Borrows SeatTest's fixtures without subclassing."""
+
+    setUp = SeatTest.setUp
+    tearDown = SeatTest.tearDown
+    _plant = SeatTest._plant
+    _add = SeatTest._add
+
+    def test_launch_line_multi_drops_subagent_pin_only(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        line = seat.launch_line("codex", multi=True)
+        self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", line)  # the proven law
+        base = seat.launch_line("codex")
+        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol", base)  # default intact
+        # everything else is byte-identical: removing the pin is the ONLY delta
+        self.assertEqual(base.replace(" CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol", ""),
+                         line)
+        # parent --model still rides; identity + scrub + ctx env intact
+        self.assertIn("--model gpt-5.6-sol", line)
+        self.assertTrue(line.startswith("env -u ANTHROPIC_API_KEY "))
+        self.assertIn("HELM_CHAT_NAME=codex", line)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=360000", line)
+
+    def test_probe_agents_names_and_frontmatter(self):
+        probes = seat.probe_agents("codex")
+        self.assertEqual(probes, [("helm-probe-gpt-5-6-sol", "gpt-5.6-sol"),
+                                  ("helm-probe-gpt-5-6-terra", "gpt-5.6-terra")])
+        self.assertEqual(seat.probe_agents("kimi"),
+                         [("helm-probe-kimi-k3", "kimi-k3")])
+        cdir = os.path.join(self.tmp, "cfg")
+        got = seat._mint_probe_agents(cdir, "codex")
+        self.assertEqual(got, probes)
+        for name, model in probes:
+            with open(os.path.join(cdir, "agents", name + ".md")) as f:
+                body = f.read()
+            self.assertTrue(body.startswith("---\n"))
+            self.assertIn("name: %s\n" % name, body)
+            self.assertIn("model: %s\n" % model, body)  # the wire-riding pin
+        # re-mint overwrites in place, never accretes
+        seat._mint_probe_agents(cdir, "codex")
+        self.assertEqual(len(os.listdir(os.path.join(cdir, "agents"))), 2)
+
+    def test_launch_verb_multi_mints_agents_and_launch_sh(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = seat.cmd_seat(["launch", "codex", "--multi"])
+        self.assertEqual(rc, 0)
+        line = out.getvalue().strip()
+        self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", line)
+        d = seat.seat_dir("codex")
+        agents = sorted(os.listdir(os.path.join(d, "claude", "agents")))
+        self.assertEqual(agents, ["helm-probe-gpt-5-6-sol.md",
+                                  "helm-probe-gpt-5-6-terra.md"])
+        with open(os.path.join(d, "launch.sh")) as f:
+            sh = f.read()
+        self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", sh)  # preset matches
+        # a plain launch afterwards restores the pinned single-model preset
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(seat.cmd_seat(["launch", "codex"]), 0)
+        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol", out.getvalue())
+        with open(os.path.join(d, "launch.sh")) as f:
+            self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol", f.read())
+
+    def test_seat_env_multi_no_pin_and_no_inherited_pin(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.dict(os.environ,
+                             {"CLAUDE_CODE_SUBAGENT_MODEL": "ambient-pin"}):
+            env = seat._seat_env("codex", os.path.join(self.tmp, "smoke"),
+                                 multi=True)
+            self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", env)
+            # default (pinned) shape: the seat's OWN pin, never the ambient one
+            env = seat._seat_env("codex", os.path.join(self.tmp, "smoke"))
+            self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "gpt-5.6-sol")
+
+    def test_smoke_multi_leg_skips_single_model_family(self):
+        """kimi has one probe model — the fan-out leg SKIPs loudly and passes,
+        never launching a router or a claude."""
+        smoke_dir = os.path.join(self.tmp, "smoke-kimi")
+        os.makedirs(smoke_dir)
+        booby = seat.subprocess.run
+        seat.subprocess.run = lambda *a, **k: self.fail("claude launched on SKIP")
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                passed = seat._smoke_multi_leg("kimi", seat.FAMILIES["kimi"],
+                                               smoke_dir, "12345")
+        finally:
+            seat.subprocess.run = booby
+        self.assertTrue(passed)
+        self.assertIn("SKIP", out.getvalue())
+        self.assertIn("probe_models", out.getvalue())
+
+    def test_smoke_multi_leg_verifies_against_conductor_log(self):
+        """The fan-out leg trusts the WIRE, not the reply: a fake claude whose
+        stdout carries both markers passes only when the router's conductor
+        log also saw both probe models (we replay the request shapes through
+        the leg's own router); a marker-perfect reply with a one-model log
+        FAILS (the blunt-pin regression shape)."""
+        import http.client
+        import subprocess
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        smoke_dir = os.path.join(self.tmp, "smoke-codex")
+        os.makedirs(smoke_dir)
+        calls = {}
+
+        def fake_run(cmd, env=None, **kw):
+            calls["cmd"], calls["env"] = cmd, env
+            # drive the leg's OWN router exactly as the proven fan-out would:
+            # one request per model the fake fleet puts on the wire
+            port = int(env["ANTHROPIC_BASE_URL"].rsplit(":", 1)[1])
+            for m in calls.get("wire_models", []):
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                try:
+                    conn.request("POST", "/v1/messages",
+                                 body=json.dumps({"model": m}).encode(),
+                                 headers={"Content-Type": "application/json"})
+                    conn.getresponse().read()
+                finally:
+                    conn.close()
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="helm-seat-multi-a-777 helm-seat-multi-b-777", stderr="")
+
+        # a tiny fake CLIProxyAPI so routed requests land somewhere real
+        fake_proxy_seen = []
+
+        class _P(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                fake_proxy_seen.append(self.rfile.read(n))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), _P)
+        proxy.daemon_threads = True
+        threading.Thread(target=proxy.serve_forever,
+                         kwargs={"poll_interval": 0.05}, daemon=True).start()
+        old_port = seat.FAMILIES["codex"]["port"]
+        seat.FAMILIES["codex"]["port"] = proxy.server_address[1]
+        try:
+            # leg 1: wire carries BOTH probe models -> PASS
+            calls["wire_models"] = ["gpt-5.6-sol", "gpt-5.6-terra"]
+            with mock.patch.object(seat.subprocess, "run", fake_run):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    passed = seat._smoke_multi_leg(
+                        "codex", seat.FAMILIES["codex"], smoke_dir, "777")
+            self.assertTrue(passed, out.getvalue())
+            self.assertIn("multi", out.getvalue())
+            self.assertIn("PASS", out.getvalue())
+            # the leg ran claude with NO pin and Task allowed, through its router
+            self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", calls["env"])
+            self.assertIn("Task", calls["cmd"])
+            self.assertIn("helm-probe-gpt-5-6-sol",
+                          calls["cmd"][calls["cmd"].index("-p") + 1])
+            # probe agents were minted into the smoke config dir
+            self.assertTrue(os.path.exists(os.path.join(
+                smoke_dir, "agents", "helm-probe-gpt-5-6-terra.md")))
+            # leg 2: reply perfect but the wire saw ONE model -> FAIL
+            calls["wire_models"] = ["gpt-5.6-sol"]
+            with mock.patch.object(seat.subprocess, "run", fake_run):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    passed = seat._smoke_multi_leg(
+                        "codex", seat.FAMILIES["codex"], smoke_dir, "777")
+            self.assertFalse(passed)
+            self.assertIn("conductor log saw", out.getvalue())
+        finally:
+            seat.FAMILIES["codex"]["port"] = old_port
+            proxy.shutdown()
+            proxy.server_close()
+
+    def test_usage_names_multi(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat([])
+        self.assertEqual(rc, 2)
+        self.assertIn("--multi", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

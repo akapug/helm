@@ -1600,3 +1600,32 @@ config dir; `helm hooks install` wires it there and `helm hooks status` reports
 seat coverage (see `helm hooks`). A seat already running an OLD session must be
 relaunched with a fresh `helm seat launch` to pick up the identity, signer, and
 delivery hooks — a live session's environment/settings are fixed at start.
+
+### `helm router [up|run|down|status|line|probes]` + `helm seat launch|smoke --multi`
+
+**Mixed models in ONE claude-code process** (proven 2026-07-21, raw conductor
+logs): a Task subagent's `.claude/agents/*.md` frontmatter `model:` string
+goes to the wire per-request, and the proxy routes each request by model
+name. The one law: **never set `CLAUDE_CODE_SUBAGENT_MODEL` for a mixed
+fleet** — it blunt-pins every subagent over the frontmatter. Two surfaces:
+
+- **`helm seat launch <family> --multi`** — the proxied-parent shape (e.g.
+  codex parent + mixed codex subagents): the launch line drops the
+  `CLAUDE_CODE_SUBAGENT_MODEL` pin and probe agents (per-model frontmatter)
+  are minted into the seat's config dir. `helm seat smoke <family> --multi`
+  adds the mixed fan-out leg: two subagents pinned to different models
+  through an ephemeral router, PASS only when the router's **conductor log**
+  shows both models on the wire (never the subagents' word).
+- **`helm router`** — the claude-PARENT shape. `ANTHROPIC_BASE_URL` is
+  process-global, so a Claude parent with non-claude subagents needs one
+  local endpoint speaking both worlds: the router forwards `claude-*`
+  requests **verbatim** to api.anthropic.com (claude-code's own OAuth
+  Authorization header, body, and headers untouched — no substitution, no
+  re-auth, and NEVER an Anthropic API key), and conducts non-claude models
+  to their seat's CLIProxyAPI with the seat token. `helm router line` prints
+  the parent launch line (`env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN
+  -u CLAUDE_CODE_SUBAGENT_MODEL ANTHROPIC_BASE_URL=http://127.0.0.1:8320
+  claude`); `helm router probes` mints the example per-model agents into a
+  project's `.claude/agents/`. Every request appends one paste-safe JSON
+  line (model/route/status — never header values) to
+  `~/.helm/_global/router/router.log`: the conductor log.

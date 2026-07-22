@@ -2,6 +2,17 @@
 
 ## Unreleased (0.2)
 
+- Multi-model in ONE claude-code process (the proven per-agent-frontmatter
+  mechanism): `helm router` — a stdlib-only transparent router at
+  ANTHROPIC_BASE_URL that forwards `claude-*` requests VERBATIM to
+  api.anthropic.com (claude-code's own OAuth, never an API key, no
+  substitution) and conducts non-claude models to their seat's CLIProxyAPI
+  with the seat token, logging every request's model/route to a paste-safe
+  conductor log. Plus `helm seat launch|smoke --multi`: the mixed-fleet
+  launch shape (drops the CLAUDE_CODE_SUBAGENT_MODEL blunt pin, mints
+  per-model probe agents) and a smoke fan-out leg that passes only when the
+  conductor log shows both probe models on the wire.
+
 - `helm codex` — codexhome roster + proxy cred pooling as a first-class
   verb (the manual night codified): `list` classifies ultra/team from the
   token plan claim with aliases and same-account dirs folded, `pool`
