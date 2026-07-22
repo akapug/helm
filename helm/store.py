@@ -23,8 +23,8 @@ Entry TYPES (filename prefix is the classifier, matching drain/doctor):
              the live/retired/delete_eligible lifecycle, one-line-JSON
              evidence_log/confidence_history, the certain-prior
              contradiction-logged-not-applied rule, the record law (retire keeps the file).
-  lexicon    lex-*.md — term/definition; matches when the TERM appears in the
-             turn text (word-boundary).
+  lexicon    lex-*.md — term/definition; matches when the TERM or a keyword
+             appears in the turn text (word-boundary).
   heuristic  heuristic-*.md — a MOVE you apply; confidence 1.0 by construction
              and load_class always jit (the only question is whether its
              trigger-pattern fires THIS turn).
@@ -272,8 +272,8 @@ _PRIOR_DEFAULTS = {
 }
 
 _LEX_DEFAULTS = {"term": "", "scope": "global", "definition": "", "kind": "",
-                 "source": "", "examples": [], "updated_ts": "", "hits": "0",
-                 "status": "live"}
+                 "keywords": "", "domain": "", "source": "", "examples": [],
+                 "updated_ts": "", "hits": "0", "status": "live"}
 
 _HEUR_DEFAULTS = {
     "id": "", "move": "", "statement": "", "trigger": "", "keywords": "",
@@ -312,9 +312,18 @@ def _parse_lexicon(path):
         return None
     e["term_scope"] = e.pop("scope")  # authored scope; entry scope is root-derived
     status = e.get("status") or STATUS_LIVE  # a candidate lexicon is non-live
+    kw = (e.get("keywords") or "").strip()
+    # legacy mis-file: the add verb once filed the keywords CSV into kind: (a
+    # real kind is a single taxonomy slug, never CSV) — those files must keep
+    # resolving, unrewritten. The comma gate keeps taxonomy words ("phrase",
+    # "bug-class") out of the probe vocabulary.
+    kind = (e.get("kind") or "").strip()
+    if not kw and "," in kind:
+        kw = kind
     e.update({"type": "lexicon", "id": e["term"], "statement": e["definition"],
               "confidence": 1.0, "class": "lexicon", "load_class": "jit",
-              "status": status, "keywords": "", "domain": "", "pinned": False})
+              "status": status, "keywords": kw,
+              "domain": (e.get("domain") or "").strip(), "pinned": False})
     return e
 
 
@@ -563,8 +572,8 @@ def _probe_hits(e, low):
 
 
 def resolve_prompt(text, project=None, cap=4, entries=None):
-    """JIT: live, non-dormant entries whose id/keywords (lexicon: term)
-    word-boundary-match the turn text, DF-WEIGHTED: each matched probe
+    """JIT: live, non-dormant entries whose id/keywords (lexicon: term +
+    keywords) word-boundary-match the turn text, DF-WEIGHTED: each matched probe
     contributes 1/df (df = how many candidate entries carry that probe, one
     in-memory pass per call), summed then confidence-weighted — one rare
     keyword outranks a pile of shared ones, so the cap-4 winners are earned,
@@ -731,6 +740,12 @@ def write_lexicon(e, root_dir=None, path=None):
         "  hits: " + str(e.get("hits") or "0"),
         "  definition: " + re.sub(r"\s+", " ", e.get("definition") or e.get("statement") or "").strip(),
     ]
+    kw = re.sub(r"\s+", " ", e.get("keywords") or "").strip()
+    if kw:
+        body.append("  keywords: " + kw)
+    dom = (e.get("domain") or "").strip()
+    if dom:
+        body.append("  domain: " + dom)
     # a candidate carries an explicit status line (excluded from inject until
     # confirmed); a live lexicon keeps its historical byte-shape (no status key)
     status = str(e.get("status") or STATUS_LIVE)
@@ -1240,7 +1255,7 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
   add <type> <id> | <statement> [| ...]       type: prior|premise|lexicon|heuristic|reference
       prior:     <id> | <statement> [| conf [| keywords [| domain]]]  (belief, default 0.6)
       premise:   <id> | <statement> [| keywords [| domain]]           (certain, conf 1.0)
-      lexicon:   <term> | <definition> [| kind [| ex1 || ex2]]
+      lexicon:   <term> | <definition> [| kind [| keywords [| domain]]]  (kind: ONE slug, e.g. phrase|coinage|bug-class)
       heuristic: <id> | <move> [| trigger-csv [| domain]]
       reference: <id> | <summary> [| url [| keywords [| domain]]]
       flags: [--source S] [--rationale <text...>] [--candidate]
@@ -1479,15 +1494,24 @@ def cmd_store(args):
             return 0
 
         if etype == "lexicon":
+            # the pipe contract is closed: a field the store will not keep is
+            # REFUSED, never silently filed under the wrong key (the live
+            # incident: a keywords CSV in field 3 died as kind:)
+            kind = parts[2] if len(parts) > 2 and parts[2] else "phrase"
+            if "," in kind or len(parts) > 5:
+                print("helm store add: lexicon is <term> | <definition> "
+                      "[| kind [| keywords,csv [| domain]]] — kind is ONE "
+                      "taxonomy slug (phrase|coinage|bug-class), field 4 "
+                      "carries the keywords CSV", file=sys.stderr)
+                return 2
             scope = ("project:" + project) if project else "global"
             status = STATUS_CANDIDATE if candidate else STATUS_LIVE
-            e = {"term": parts[0], "definition": parts[1],
-                 "kind": parts[2] if len(parts) > 2 and parts[2] else "phrase",
+            e = {"term": parts[0], "definition": parts[1], "kind": kind,
+                 "keywords": parts[3] if len(parts) > 3 else "",
+                 "domain": parts[4] if len(parts) > 4 else "",
                  "term_scope": scope, "status": status,
                  "source": source or ("inferred" if candidate else "define"),
                  "updated_ts": ts, "hits": "0"}
-            if len(parts) > 3 and parts[3]:
-                e["examples"] = [x.strip() for x in parts[3].split("||") if x.strip()]
             p = write_lexicon(e, root_dir=_default_dir("lexicon", project))
             pk.event("store.add", parts[0],
                      ("lexicon candidate — " if candidate else "lexicon — ") + parts[1])

@@ -367,6 +367,44 @@ class LexiconTest(StoreBase):
         self.assertEqual([x["id"] for x in got], ["youable"])
         self.assertEqual(store.resolve_prompt("unyouable is not the term"), [])
 
+    def test_keywords_resolve_symptom_phrasing(self):
+        # the live incident: symptom vocabulary must fire WITHOUT the term
+        store.write_lexicon({"term": "fleet-truth",
+                             "definition": "census-derived ground truth",
+                             "keywords": "fleet state, stale, still up, seats",
+                             "updated_ts": TS})
+        for text in ("fleet state seems stale", "is codex-2 still up",
+                     "which seats are actually alive",
+                     "what does fleet-truth mean"):
+            self.assertEqual([x["id"] for x in store.resolve_prompt(text)],
+                             ["fleet-truth"], text)
+        self.assertEqual(store.resolve_prompt("nothing relevant here"), [])
+
+    def test_legacy_kind_csv_reads_as_keywords(self):
+        # pre-fix files carry the keywords CSV under kind: (the add verb once
+        # filed it there) — they must keep resolving, unrewritten
+        d = self.global_dir("lexicon")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "lex-fleet-truth.md"), "w") as f:
+            f.write("---\nname: lex-fleet-truth\n"
+                    'description: "lexicon: fleet-truth = census ground truth"\n'
+                    "metadata:\n  node_type: memory\n  type: lexicon\n"
+                    "  term: fleet-truth\n  scope: global\n"
+                    "  kind: fleet state, stale, still up\n"
+                    "  definition: census ground truth\n---\n")
+        e = self.one(store.load_all(types=("lexicon",)), "fleet-truth")
+        self.assertEqual(e["keywords"], "fleet state, stale, still up")
+        self.assertEqual([x["id"] for x in
+                          store.resolve_prompt("fleet state seems stale")],
+                         ["fleet-truth"])
+
+    def test_taxonomy_kind_is_not_a_probe(self):
+        # a single-slug kind (the default "phrase" above all) never enters the
+        # probe vocabulary — only a legacy CSV does
+        store.write_lexicon({"term": "youable", "definition": "able to be you",
+                             "kind": "phrase", "updated_ts": TS})
+        self.assertEqual(store.resolve_prompt("turn a phrase for me"), [])
+
     def test_scoped_filename_never_clobbers_global(self):
         store.write_lexicon({"term": "youable", "definition": "global sense"})
         p = store.write_lexicon({"term": "youable", "definition": "project sense",
@@ -933,6 +971,51 @@ class AddGuardTest(StoreBase):
         self.assertEqual(err, "")
         self.assertEqual(self.one(store.load_all(types=("lexicon",)), "youable")
                          ["definition"], "able to be you, sharpened")
+
+
+class LexiconPipeContractTest(StoreBase):
+    """The lexicon pipe contract is CLOSED: field 3 is kind (ONE taxonomy
+    slug), field 4 the keywords CSV, field 5 domain. A CSV in kind or a sixth
+    field is refused loudly, never silently filed under the wrong key (the
+    live lex-fleet-truth incident: keywords died as kind:, domain as
+    examples:)."""
+
+    def add(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(["add", *args])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_keywords_and_domain_store_and_resolve(self):
+        rc, _, err = self.add(
+            "lexicon", "fleet-truth | census ground truth | coinage | "
+            "fleet state, stale, still up | helm-ops")
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        e = self.one(store.load_all(types=("lexicon",)), "fleet-truth")
+        self.assertEqual((e["kind"], e["keywords"], e["domain"]),
+                         ("coinage", "fleet state, stale, still up", "helm-ops"))
+        with open(e["path"]) as f:
+            raw = f.read()
+        self.assertIn("  keywords: fleet state, stale, still up", raw)
+        self.assertIn("  domain: helm-ops", raw)
+        for text in ("fleet state seems stale", "what does fleet-truth mean"):
+            self.assertEqual([x["id"] for x in store.resolve_prompt(text)],
+                             ["fleet-truth"], text)
+
+    def test_csv_in_kind_is_refused_not_swallowed(self):
+        rc, out, err = self.add(
+            "lexicon", "fleet-truth | census ground truth | fleet state, stale")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertIn("keywords,csv", err)
+        self.assertEqual(store.load_all(types=("lexicon",)), [])
+
+    def test_sixth_field_is_refused(self):
+        rc, _, err = self.add("lexicon", "t | d | phrase | kw | dom | extra")
+        self.assertEqual(rc, 2)
+        self.assertIn("keywords,csv", err)
+        self.assertEqual(store.load_all(types=("lexicon",)), [])
 
 
 class AdoptProjectMemdirsTest(StoreBase):
