@@ -757,7 +757,8 @@ def cmd_env(args):
     if sub not in ("census",):
         print("usage: helm env census [--json]", file=sys.stderr)
         return 2
-    r = census()
+    from . import seats
+    r = census(root=seats._flag(args, "--repo"))
     if "--json" in args:
         print(json.dumps(r, indent=2, ensure_ascii=False))
         return 0
@@ -848,7 +849,8 @@ def cmd_worktree(args):
     if not args or args[0] != "gc":
         print("usage: helm worktree gc [--apply]", file=sys.stderr)
         return 2
-    r = worktree_gc(apply="--apply" in args)
+    from . import seats
+    r = worktree_gc(root=seats._flag(args, "--repo"), apply="--apply" in args)
     _print_worktree(r)
     return 1 if "error" in r else 0
 
@@ -857,8 +859,10 @@ def cmd_tidy(args):
     """tidy [--apply] — the umbrella: census + hooks sync + mcp sync + worktree
     gc, all dry-run by default. One consolidated 'here is everything that would
     change' report; --apply runs them all backup-first."""
-    apply = "--apply" in (args or [])
-    r = tidy(apply=apply)
+    args = list(args or [])
+    from . import seats
+    apply = "--apply" in args
+    r = tidy(root=seats._flag(args, "--repo"), apply=apply)
     mode = "APPLY" if apply else "DRY-RUN — here is everything that would change"
     print("=" * 72)
     print("helm tidy [%s]" % mode)

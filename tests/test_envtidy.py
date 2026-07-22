@@ -341,6 +341,24 @@ class WorktreeGcTest(WorktreeBase):
         log = _sh(self.wt_dirty, "git", "log", "-1", "--name-only", "--format=")
         self.assertIn("uncommitted.txt", log.stdout)
 
+    def test_cmd_repo_flag_targets_named_repo(self):
+        # --repo PATH (the flag the no-repo error advertises) must actually
+        # steer the verb at that repo from an unrelated cwd — a real defect if
+        # the message promises a flag the dispatcher drops.
+        self._seed()
+        cwd = os.getcwd()
+        os.chdir(self.tmp)            # a dir that is NOT the git repo
+        try:
+            # without --repo, cwd is not a repo -> error return (1)
+            self.assertEqual(envtidy.cmd_worktree(["gc"]), 1)
+            # with --repo, the named repo is found and swept (dry-run) -> 0
+            self.assertEqual(
+                envtidy.cmd_worktree(["gc", "--repo", self.root]), 0)
+        finally:
+            os.chdir(cwd)
+        # the merged orphan is still present (dry-run touched nothing)
+        self.assertIn("worktree-merged", self._branches())
+
     def test_tidy_umbrella_runs_all_dry(self):
         self._seed()
         r = envtidy.tidy(root=self.root, apply=False)
