@@ -164,6 +164,35 @@ class TestWebChat(unittest.TestCase):
         status, d = self.req("/api/chat?since=x")
         self.assertEqual(status, 400)
 
+    def test_dm_endpoint_is_a_true_dm_never_a_room_post(self):
+        """The ledger 'message a seat' card's fixed route: POST /api/chat/dm
+        hits ONE recipient's private lane — the old path posted '@seat …'
+        into #main and called it a DM (owner-flagged)."""
+        from helm import seats
+        seats.join(session="s-web-dm", seat="codex", cwd="/tmp/p")
+        status, d = self.req("/api/chat/dm", {"to": "codex", "text": " go ",
+                                              "name": "david"})
+        self.assertEqual(status, 200)
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["msg"]["dm"], "codex")
+        self.assertEqual(d["msg"]["text"], "go")
+        # NO room fanout: no channel appears, #main empty, no owner marker
+        self.assertEqual(chat.list_rooms(), [])
+        self.assertEqual(chat.read("main")[1], 0)
+        self.assertFalse(os.path.exists(chat.marker_path("main")))
+        # the recipient's delivery lane surfaces it as a DM
+        line = seats.deliver_any(session="s-web-dm", seat="codex")
+        self.assertIn("go", line)
+        self.assertIn("dm", line)
+        # bad payloads answer 400; the bearer is demanded like every POST
+        status, d = self.req("/api/chat/dm", {"to": "codex", "text": "  "})
+        self.assertEqual(status, 400)
+        status, d = self.req("/api/chat/dm", {"to": "no such!", "text": "x"})
+        self.assertEqual(status, 400)
+        status, _d = self.req("/api/chat/dm", {"to": "codex", "text": "y"},
+                              token=False)
+        self.assertEqual(status, 403)
+
     def test_cli_read_clears_the_web_marker(self):
         # the full notify loop, endpoints-to-CLI: owner posts via web -> marker
         # -> an agent's `helm chat read` consumes past it -> cleared

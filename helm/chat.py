@@ -46,6 +46,14 @@ The notify loop: the owner's post (web panel or `helm --human`) drops
 owner-chat-unread reflex fires on that marker every turn until a
 `helm chat read` consumes past it — identical in BOTH transports.
 
+DMs (premise exact-token-addressee-match): `helm chat dm <seat> <text>` (and
+`post --dm <seat>`) is a TRUE 1:1 — the row rides the recipient's private
+lane <chat-dir>/dm/<seat-key>.jsonl (the `dm-` room-name prefix is that
+lane's reserved namespace; room_path routes it, list_rooms never shows it),
+stamped {dm: <recipient>} so only the EXACT-token recipient's beacon/boundary
+delivers it. No room ever sees it; it renders as a DM, not a room row; it
+signs like any post.
+
 The owner's orca pane sidecar is exactly: helm chat read --follow
 """
 import contextlib
@@ -66,6 +74,7 @@ SIZE_CAP = 2 * 1024 * 1024  # per-room rotation threshold — RAM etiquette
 POLL_S = 2.0                # --follow poll cadence (the web panel matches)
 CHAT_TAG = "chat:b2b:"      # algorithm-tagged digest, premise.py's pattern
 CHAT_TOPIC = "helm.chat"    # the signed turn's event topic on the room node
+DM_PREFIX = "dm-"           # reserved room-name namespace: the private lanes
 
 
 def chat_dir():
@@ -74,7 +83,22 @@ def chat_dir():
 
 
 def room_path(room="main"):
-    return os.path.join(chat_dir(), pk.slug(room) + ".jsonl")
+    """Room name -> its RAM file. The `dm-` prefix is the DM namespace: those
+    lanes live in the dm/ subdir, invisible to list_rooms (no room fanout, no
+    web channel row, no default log-flush) while every reader/cursor/rotation
+    mechanic composes unchanged."""
+    r = pk.slug(room)
+    if r.startswith(DM_PREFIX):
+        return os.path.join(chat_dir(), "dm", r[len(DM_PREFIX):] + ".jsonl")
+    return os.path.join(chat_dir(), r + ".jsonl")
+
+
+def dm_room(to):
+    """The recipient's private lane, as a (reserved-namespace) room name —
+    keyed by seats' exact-token seat key, so `team.a` and `team-a` hold
+    DIFFERENT lanes (the slug-collision class never crosses a DM)."""
+    from . import seats
+    return DM_PREFIX + seats._seat_key(to)
 
 
 def list_rooms():
@@ -383,6 +407,7 @@ def _append(row, room):
     predating it (or hand-written) simply have no id and never match one."""
     row.setdefault("id", os.urandom(6).hex())
     path = room_path(room)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)  # dm/ lane
     with _room_lock(room):
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -391,7 +416,8 @@ def _append(row, room):
     return row
 
 
-def post(text, room="main", who=None, profile=None, sign=None, origin=None):
+def post(text, room="main", who=None, profile=None, sign=None, origin=None,
+         dm=None):
     """Append one message; returns it. v2: shortcodes expand, and when the
     room node answers the digest rides a signed self-write turn FIRST — the
     row carries {turn, receipt, chain}. Node down -> plain v1 row (rendered
@@ -403,11 +429,18 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None):
     mention). ADVISORY by design — the room dir is same-uid 0700 tmpfs, so
     any local process could forge the field; what it defends against is the
     real threat here: an agent (or a prompt-injected one) impersonating the
-    owner through legit tooling. Principal crypto stays dregg's."""
+    owner through legit tooling. Principal crypto stays dregg's.
+
+    `dm` names the ONE recipient (exact token — seats.dm resolves it): the
+    row is stamped {dm} and lands in the recipient's private lane, OVERRIDING
+    `room` — a DM never touches a room file (no fanout, by construction)."""
     _ensure_dir()
     from . import emoji
     text = emoji.expand(text)
     row = {"ts": pk.now_ts(), "from": who or whoname(), "text": text}
+    if dm:
+        row["dm"] = dm
+        room = dm_room(dm)
     if origin:
         row["origin"] = origin
     _touch_poster_presence(row["from"])
@@ -590,6 +623,9 @@ def _fmt(m, hhmm=True):
             "un-reacted" if m.get("un") else "reacted",
             m["react"], m.get("tfrom") or "?",
             str(m.get("tts") or "")[11:16] or "--:--", tag)
+    if m.get("dm"):     # a DM row is a DM everywhere it renders — never a
+        return "%s %s -> @%s (dm): %s%s" % (stamp, m.get("from") or "?",
+                                            m["dm"], m.get("text") or "", tag)
     return "%s %s: %s%s" % (stamp, m.get("from") or "?", m.get("text") or "", tag)
 
 
@@ -692,7 +728,7 @@ def _fmt_body(m):
 # CLI
 # ---------------------------------------------------------------------------
 
-SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "seat",
+SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "seat", "dm",
               "claim", "release", "claims", "verdict", "reveal")
                                                # the delivery lane — seats.py
                                                # (verdict/reveal answer with
@@ -713,11 +749,13 @@ def _seat_flag(args):
 
 
 def cmd_chat(args):
-    """chat post <text...> [--seat S] | read [--since N] [--follow] | rooms |
-    react <n> <emoji> [--seat S] | log-flush | node up|down|status |
+    """chat post <text...> [--seat S] [--dm SEAT] | read [--since N]
+    [--follow] [--dm] | rooms | react <n> <emoji> [--seat S] | log-flush |
+    dm <seat> <text...> [--seat S] | node up|down|status |
     meld invite|join|recv|say|status |
     join|deliver|stop-guard [--hook-json] | wait [--any] [--follow] [--seat S]
     | seats [--all] | seat rename <sid|oldname> <newname>
+    | seat mute|unmute <room> [--seat S] | seat mutes [--seat S]
     | claim|release <resource> | claims  [--room R]"""
     args = list(args or [])
     # HELM_CHAT_ROOM homes a seat in a team channel (slice 3): every no---room
@@ -747,17 +785,39 @@ def cmd_chat(args):
         return seats.cmd(verb, args[1:], room)
     if verb == "post":
         seat = _seat_flag(args)
+        to = None
+        if "--dm" in args:      # post --dm SEAT = the dm verb, flag-shaped
+            i = args.index("--dm")
+            to = args[i + 1] if i + 1 < len(args) else None
+            del args[i:i + 2]
+            if not to:
+                print("helm chat: --dm wants a seat name", file=sys.stderr)
+                return 2
         text = " ".join(args[1:]).strip()
         if not text and not sys.stdin.isatty():
             text = sys.stdin.read().strip()
         if not text:
-            print("usage: helm chat post <text...> [--room R] [--seat S]",
-                  file=sys.stderr)
+            print("usage: helm chat post <text...> [--room R] [--seat S] "
+                  "[--dm SEAT]", file=sys.stderr)
             return 2
+        if to:
+            from . import seats
+            row, err = seats.dm(to, text, who=seat,
+                                session=home.session_id(), profile=seat)
+            if err:
+                print("helm chat: " + err, file=sys.stderr)
+                return 1
+            print("helm chat [dm] %s" % _fmt(row))
+            return 0
         print("helm chat [%s] %s"
               % (room, _fmt(post(text, room, who=seat, profile=seat))))
         return 0
     if verb == "read":
+        label = room
+        if "--dm" in args:      # the recipient's own private lane
+            args.remove("--dm")
+            room = dm_room(_seat_flag(args) or whoname())
+            label = "dm"
         since = 0
         if "--since" in args:
             try:
@@ -771,7 +831,9 @@ def cmd_chat(args):
         for m in msgs:
             print(_fmt(m))
         if not msgs:
-            print("helm chat [%s]: no messages — post one: helm chat post <text>" % room)
+            print("helm chat [%s]: no messages — post one: helm chat post "
+                  "<text>%s" % (label, " (or: helm chat dm <seat> <text>)"
+                                if label == "dm" else ""))
         consume(room, total)
         return 0
     if verb == "react":

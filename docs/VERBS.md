@@ -1046,7 +1046,7 @@ helm cell: node LIVE at http://127.0.0.1:8899 — chain head 43 ...
 
 ## chat — the human-included groupchat
 
-### `helm chat [post <text...> | read [--since N] [--follow] | rooms | react <n> <emoji> | log-flush | node up|down|status] [--room R]`
+### `helm chat [post <text...> [--dm SEAT] | read [--since N] [--follow] [--dm] | rooms | react <n> <emoji> | dm <seat> <text...> | log-flush | node up|down|status] [--room R]`
 One shared conversation log + notify + read/write loop, **owner in the room**.
 Rooms live in RAM (`/dev/shm/helm-chat/<room>.jsonl`, dir 0700, default room
 `main`; `HELM_CHAT_DIR` overrides) — ephemeral presence-chat, not the durable
@@ -1113,6 +1113,7 @@ $ helm chat log-flush            # the durable record, out-of-band
 your agent runs it:
 
 - "**tell the fleet:** …" / "**post in helm chat:** …" → `helm chat post "…"`
+- "**DM codex:** …" / "**tell ONLY codex:** …" → `helm chat dm codex "…"`
 - "**any chat for me?**" / "**read the room**" → `helm chat read`
 - "**watch the chat**" (in an orca pane) → `helm chat read --follow`
 - "**that chat point about X — keep it**" → `/premise` (chat is ephemeral;
@@ -1158,10 +1159,17 @@ frames; this lane is called *delivery*.)
   this delivers between tool calls. At most ONE row per boundary (oldest
   first, the rest collapse to `+N waiting`), 200-byte clip on a codepoint
   boundary, control-char scrub, labeled information-not-instruction. What
-  delivers: `@seat` / `@all` mentions and owner posts (`HELM_CHAT_OWNER_NAMES`);
-  agent chatter without a mention never does (noise law). **Multi-room**: the
-  boundary considers EVERY live channel — main first, then the
-  newest-activity rooms, bounded (16 rooms/pass, each read SCAN_CAP-capped) —
+  delivers — the **beacon scope** (premise
+  `beacon-scope-mentions-plus-home-room-owner-posts-not-all`): a `@seat`
+  mention or a DM from **any** room, always; **anything** posted in the
+  seat's HOME room (its roster `home_room`); `@all` and owner posts
+  (`HELM_CHAT_OWNER_NAMES`) in `{home, main}` only — never fleet-wide across
+  side rooms; foreign-room chatter never (noise law). `helm chat seat mute
+  <room>` tunes the noise classes off per seat (mentions + DMs still
+  surface). **Multi-room**: the
+  boundary considers EVERY live channel — the seat's DM lane first, then
+  main, then the newest-activity rooms, bounded (16 rooms/pass, each read
+  SCAN_CAP-capped, home + main pinned so foreign volume never evicts them) —
   so an @mention in a room the seat never joined delivers, labeled with its
   channel (`[helm chat #room → seat]`, `+N waiting — helm chat read --room R`).
   A tracked seat meeting a room born after its join backfills from the
@@ -1236,6 +1244,23 @@ frames; this lane is called *delivery*.)
   the next boundary. Refuses taken/reserved/unaddressable names; reminds you
   to re-arm a beacon armed on the old name. Web twin: the **rename** control
   on each seats-panel row (`POST /api/chat/seat`).
+- **`helm chat dm <seat> <text...> [--seat S]`** (also `post --dm SEAT`) —
+  a TRUE 1:1 (premise `exact-token-addressee-match`): the row lands in the
+  recipient's private lane (`dm/` in the room dir — never a room, never the
+  channel list), addressed by the EXACT seat token (a casefold roster snap
+  only — never a substring or slug fold: `team.a` ≠ `team-a`). The
+  recipient's beacon/boundary surfaces it first (`[helm chat dm → seat]`),
+  it gates their stop like any pending word, renders as a DM everywhere, and
+  signs like a post. Catch up with `helm chat read --dm`. A DM to a
+  not-yet-joined seat waits in its lane and delivers at join. Web twin: the
+  ledger tab's **message a seat** card — a named seat routes to
+  `POST /api/chat/dm`, only `@all` still posts to `#main`.
+- **`helm chat seat mute <room>` / `seat unmute <room>` / `seat mutes`
+  `[--seat S]`** — the seat's own beacon filter: a muted room stops
+  surfacing home-room chatter / `@all` / owner posts at that seat; a direct
+  `@seat` mention or a DM ALWAYS still surfaces (mute tunes noise, never
+  direct address). Roster-stored; boundary, beacon, stop-guard and the
+  roster report all read the same truth.
 - **`helm chat claim <resource> [--ttl N] [--lease ID]` /
   `release <resource> --lease ID` / `claims`** — the advisory TTL lease
   (meld claims, minus the cap-gate): refused while another holder's lease is

@@ -864,6 +864,24 @@ def _api_chat_post(payload):
     return {"ok": True, "msg": msg, "total": chat.read(room)[1]}, 200
 
 
+def _api_chat_dm(payload):
+    """The owner's TRUE 1:1 (the ledger 'message a seat' card routes single-
+    seat sends here): one private recipient's lane, never a room post — the
+    old path posted '@seat …' into #main and called it a DM (owner-flagged).
+    Exact-token addressee (seats.dm — premise exact-token-addressee-match);
+    signed like a post; the recipient's beacon surfaces it."""
+    from . import seats
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return {"error": "empty text"}, 400
+    row, err = seats.dm(str(payload.get("to") or ""), text,
+                        who=str(payload.get("name") or "david"),
+                        profile=_chat_profile(), origin="web")
+    if err:
+        return {"error": err}, 400
+    return {"ok": True, "msg": row}, 200
+
+
 def _api_chat_roster(qs):
     """The seats panel's read: roster presence + per-seat pending deliveries
     + live claims (seats.py — the meld-half's M3 parity surface). Read-only,
@@ -1242,6 +1260,7 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
     "/api/chat/react": _api_chat_react,
     "/api/chat/read": _api_chat_read_post,
     "/api/chat/seat": _api_chat_seat,
+    "/api/chat/dm": _api_chat_dm,
 }
 
 

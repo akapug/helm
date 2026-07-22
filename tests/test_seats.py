@@ -481,12 +481,21 @@ class MultiRoomTest(SeatsBase):
         rc, out = self.cmd_fd("deliver", ["--hook-json"], stdin=payload)
         self.assertEqual(out, "")              # nothing left — no re-nudge
 
-    def test_owner_rail_post_in_side_room_delivers_without_mention(self):
+    def test_owner_rail_post_is_not_fleet_wide(self):
+        """Beacon-scope premise (c): an owner post in a SIDE room drafts
+        nobody homed elsewhere — owner reach is {home, main} (+ mentions
+        anywhere). The old law delivered every owner post fleet-wide."""
         seats.join(session="s-o", seat="oz", cwd="/tmp/p")
-        chat.post("all hands", who="david", origin="web", room="announce")
+        chat.post("side-room note", who="david", origin="web", room="announce")
+        self.assertIsNone(seats.deliver_any(session="s-o", seat="oz"))
+        chat.post("all hands", who="david", origin="web")   # main still reaches
         line = seats.deliver_any(session="s-o", seat="oz")
         self.assertIn("david: all hands", line)
-        self.assertIn("#announce", line)
+        # …and a seat HOMED to the side room hears the owner there
+        seats.join(session="s-an", seat="anna", cwd="/tmp/p", room="announce")
+        chat.post("announce word", who="david", origin="web", room="announce")
+        self.assertIn("announce word",
+                      seats.deliver_any(session="s-an", seat="anna"))
 
     def test_primary_room_first_one_nudge_per_boundary_no_loss(self):
         """Main outranks the side rooms, one row per boundary, and nothing
@@ -610,10 +619,11 @@ class MultiRoomTest(SeatsBase):
 
 
 class RoomAllowlistTest(SeatsBase):
-    """Multi-team isolation (audit G1-G3): a HOMED seat's delivery lane is
-    allowlisted to {home room, main} — a foreign team's @mention / @all /
-    owner-post can never draft it, gate its stop, or backfill foreign
-    history at it. Un-homed seats keep every-room behavior."""
+    """Homing under the BEACON-SCOPE law (premise beacon-scope-mentions-
+    plus-home-room-owner-posts-not-all, superseding the G1-G3 allowlist —
+    the allowlist starved codex-2 of an @codex-2 mention in #helm-dogfood):
+    a foreign team's @all / owner-post still never drafts a homed seat, but
+    a direct @mention crosses EVERY room, always."""
 
     def test_home_room_recorded_at_join(self):
         os.environ["HELM_CHAT_ROOM"] = "team-a"
@@ -636,19 +646,21 @@ class RoomAllowlistTest(SeatsBase):
         seats.join(session="s-a2", seat="mv", cwd="/tmp/p")
         self.assertEqual(seats.roster()["mv"]["home_room"], "team-b")
 
-    def test_homed_seat_skips_foreign_mention_all_and_owner(self):
+    def test_homed_seat_skips_foreign_all_and_owner_but_hears_mentions(self):
         os.environ["HELM_CHAT_ROOM"] = "team-a"
         seats.join(session="s-ta", seat="ta", cwd="/tmp/p")
         del os.environ["HELM_CHAT_ROOM"]
-        # foreign room traffic of every deliverable class
-        chat.post("@ta foreign mention", who="bob", room="team-b")
+        # foreign broadcast + owner noise never drafts the homed seat…
         chat.post("@all standup", who="bob", room="team-b")
         chat.post("owner direction for team b", who="david", origin="web",
                   room="team-b")
+        chat.post("team b chatter", who="bob", room="team-b")
         self.assertIsNone(seats.deliver_any(session="s-ta", seat="ta"))
-        # …and the foreign room was never even scanned: no backfill cursor
-        self.assertIsNone(seats._cursor("team-b", "ta", "s-ta"))
-        self.assertIsNone(seats._cursor("team-b", "ta"))
+        # …but a DIRECT @mention crosses any room, always (THE codex-2 bug:
+        # a homed seat never saw '@codex-2 …' posted in #helm-dogfood)
+        chat.post("@ta foreign mention", who="bob", room="team-b")
+        self.assertIn("foreign mention",
+                      seats.deliver_any(session="s-ta", seat="ta"))
         # home room + main + owner-in-home DO land (primary room first:
         # main's mention outranks team-a's, one nudge per boundary)
         chat.post("@ta home word", who="bob", room="team-a")
@@ -668,36 +680,38 @@ class RoomAllowlistTest(SeatsBase):
         self.assertIn("foreign ping", line)
         self.assertIn("#team-b", line)
 
-    def test_stop_guard_ignores_foreign_room_for_homed_seat(self):
+    def test_stop_guard_scope_matches_the_lane_for_homed_seat(self):
         os.environ["HELM_CHAT_ROOM"] = "team-a"
         seats.join(session="s-g", seat="ga", cwd="/tmp/p")
         del os.environ["HELM_CHAT_ROOM"]
-        chat.post("@ga drafted by team b", who="bob", room="team-b")
+        chat.post("@all team b standup", who="bob", room="team-b")
+        chat.post("team b owner note", who="david", origin="web", room="team-b")
         blocks, _warns = seats.stop_guard(session="s-g", seat="ga")
-        self.assertEqual(blocks, [])          # foreign mention must NOT gate
+        self.assertEqual(blocks, [])          # foreign @all/owner must NOT gate
         chat.post("@ga home call", who="bob", room="team-a")
         blocks, _warns = seats.stop_guard(session="s-g", seat="ga")
         self.assertTrue(blocks)               # a home-room mention still gates
 
-    def test_scan_rooms_allowlist_shape(self):
+    def test_scan_rooms_covers_every_room_scope_lives_in_deliverable(self):
+        """The scan is scope-BLIND under the beacon-scope premise — an
+        @mention anywhere must surface, so homing filters per ROW, never
+        per room."""
         os.environ["HELM_CHAT_ROOM"] = "team-a"
         seats.join(session="s-s", seat="sc", cwd="/tmp/p")
         del os.environ["HELM_CHAT_ROOM"]
         chat.post("x", who="bob", room="team-b")
         chat.post("x", who="bob", room="team-c")
-        # the allowlist admits exactly {home, main}; main is only LISTED when
-        # it exists as a room (not yet posted-in here) — foreign rooms never
         rooms = seats._scan_rooms("team-a", seat="sc")
-        self.assertEqual(rooms, ["team-a"])
-        self.assertNotIn("team-b", rooms)
-        chat.post("x", who="bob")            # main now exists
-        rooms = seats._scan_rooms("team-a", seat="sc")
-        self.assertEqual(set(rooms), {"team-a", "main"})
-        # un-homed scans everything (cap aside), primary first
-        allrooms = seats._scan_rooms("team-a", seat="nobody")
-        self.assertEqual(allrooms[0], "team-a")
-        self.assertIn("team-b", allrooms)
-        self.assertIn("team-c", allrooms)
+        self.assertEqual(rooms[0], "team-a")   # primary first
+        self.assertIn("team-b", rooms)
+        self.assertIn("team-c", rooms)
+        # the scope filter is deliverable()'s: foreign chatter/broadcast no,
+        # home-room anything yes
+        sc = seats.seat_scope("sc")
+        self.assertEqual(sc["home"], "team-a")
+        row = {"ts": "t", "from": "bob", "text": "no mention"}
+        self.assertFalse(seats.deliverable(row, "sc", "team-b", sc))
+        self.assertTrue(seats.deliverable(row, "sc", "team-a", sc))
 
     def test_foreign_room_volume_cannot_starve_the_home_room(self):
         os.environ["HELM_CHAT_ROOM"] = "team-a"
@@ -705,12 +719,234 @@ class RoomAllowlistTest(SeatsBase):
         del os.environ["HELM_CHAT_ROOM"]
         chat.post("home", who="bob", room="team-a")
         chat.post("all hands", who="bob")
-        # Newer foreign rooms fill the global scan cap. Filtering only AFTER
-        # truncation would evict the older home room from its own seat's inbox.
+        # Newer foreign rooms fill the global scan cap. The scope-blind scan
+        # ADMITS them (mentions must cross rooms) but PINS home + main — the
+        # seat's own channel is never evicted by foreign volume.
         for i in range(seats.ROOM_SCAN_CAP + 5):
             chat.post("noise", who="bob", room="foreign-%02d" % i)
-        self.assertEqual(set(seats._scan_rooms("main", seat="cap")),
-                         {"main", "team-a"})
+        rooms = seats._scan_rooms("main", seat="cap")
+        self.assertIn("team-a", rooms)
+        self.assertIn("main", rooms)
+        self.assertLessEqual(len(rooms), seats.ROOM_SCAN_CAP + 3)  # bounded
+        # …and home-room traffic still DELIVERS through the flood
+        chat.post("word for the team", who="carol", room="team-a")
+        got = [seats.deliver_any(session="s-cap", seat="cap") for _ in range(3)]
+        self.assertIn("word for the team", "\n".join(g for g in got if g))
+
+
+class BeaconScopeTest(SeatsBase):
+    """Premise beacon-scope-mentions-plus-home-room-owner-posts-not-all:
+    (a) @mention any room ALWAYS; (b) ANYTHING in the home room; (c) owner
+    posts/@all never fleet-wide; (d) mute tunes (b)/(c), never (a)."""
+
+    def test_codex2_repro_foreign_room_mention_wakes_main_homed_beacon(self):
+        """THE live bug: codex-2 homed to #main never saw '@codex-2 …'
+        posted in #helm-dogfood — the homing allowlist starved the beacon."""
+        os.environ["HELM_CHAT_ROOM"] = "main"
+        seats.join(session="s-c2", seat="codex-2", cwd="/tmp/p")
+        del os.environ["HELM_CHAT_ROOM"]
+        self.assertEqual(seats.roster()["codex-2"]["home_room"], "main")
+        chat.post("@codex-2 please pick this up", who="david",
+                  room="helm-dogfood")
+        captured = []
+        seats.wait(seat="codex-2", session="s-c2", follow=True, timeout=0.15,
+                   poll=0.01, emit=captured.append)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("please pick this up", captured[0])
+        self.assertIn("#helm-dogfood", captured[0])
+
+    def test_home_room_surfaces_everything(self):
+        seats.join(session="s-h", seat="hm", cwd="/tmp/p", room="team-a")
+        chat.post("plain team chatter, no mention", who="bob", room="team-a")
+        line = seats.deliver_any(session="s-h", seat="hm")
+        self.assertIn("plain team chatter", line)
+        self.assertIn("#team-a", line)
+        # …and a seat homed to MAIN gets everything in main (codex-2's home)
+        os.environ["HELM_CHAT_ROOM"] = "main"
+        seats.join(session="s-h2", seat="hm2", cwd="/tmp/p")
+        del os.environ["HELM_CHAT_ROOM"]
+        chat.post("main chatter", who="bob")
+        self.assertIn("main chatter",
+                      seats.deliver_any(session="s-h2", seat="hm2"))
+
+    def test_non_home_non_mention_never_delivers(self):
+        seats.join(session="s-n", seat="nn", cwd="/tmp/p", room="team-a")
+        chat.post("other team chatter", who="bob", room="team-b")
+        chat.post("@all other team standup", who="bob", room="team-b")
+        chat.post("owner steering team b", who="david", origin="web",
+                  room="team-b")
+        chat.post("un-homed main chatter", who="bob")   # main ≠ home either
+        self.assertIsNone(seats.deliver_any(session="s-n", seat="nn"))
+
+    def test_mute_suppresses_noise_but_never_mentions_or_dms(self):
+        seats.join(session="s-m", seat="mu", cwd="/tmp/p", room="team-a")
+        rc, out, _err = self.cmd("seat", ["mute", "team-a", "--seat", "mu"])
+        self.assertEqual(rc, 0)
+        self.assertIn("muted", out)
+        seats.set_mute("mu", "main")
+        # home-room chatter + owner post in main: both muted away
+        chat.post("home chatter", who="bob", room="team-a")
+        chat.post("owner note", who="david", origin="web")
+        self.assertIsNone(seats.deliver_any(session="s-m", seat="mu"))
+        # a direct @mention in the MUTED room still surfaces (mute tunes
+        # noise, never direct address — premise (a) says ALWAYS)
+        chat.post("@mu direct word", who="bob", room="team-a")
+        self.assertIn("direct word", seats.deliver_any(session="s-m", seat="mu"))
+        # a DM still surfaces
+        seats.dm("mu", "psst", who="ada")
+        self.assertIn("psst", seats.deliver_any(session="s-m", seat="mu"))
+        # unmute restores the flow WITHOUT flooding the muted backlog
+        # (cursors advanced past it), and `mutes` reports the live set
+        self.assertEqual(seats.mutes("mu"), ["main", "team-a"])
+        rc, out, _err = self.cmd("seat", ["unmute", "team-a", "--seat", "mu"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seats.mutes("mu"), ["main"])
+        self.assertIsNone(seats.deliver_any(session="s-m", seat="mu"))
+        chat.post("after unmute", who="bob", room="team-a")
+        self.assertIn("after unmute",
+                      seats.deliver_any(session="s-m", seat="mu"))
+
+    def test_mute_gates_stop_guard_too(self):
+        seats.join(session="s-sg", seat="mg", cwd="/tmp/p", room="team-a")
+        seats.set_mute("mg", "team-a")
+        chat.post("noise while muted", who="bob", room="team-a")
+        blocks, _w = seats.stop_guard(session="s-sg", seat="mg")
+        self.assertEqual(blocks, [])          # muted noise never gates a stop
+        chat.post("@mg but answer this", who="bob", room="team-a")
+        blocks, _w = seats.stop_guard(session="s-sg", seat="mg")
+        self.assertTrue(blocks)               # the direct address still does
+
+
+class DMTest(SeatsBase):
+    """The 1:1 lane (premise exact-token-addressee-match): session/seat-keyed,
+    exactly one recipient, zero room fanout, renders as a DM, signs like a
+    post."""
+
+    def test_dm_reaches_exactly_one_seat_no_room_fanout(self):
+        seats.join(session="s-a", seat="ada", cwd="/tmp/p")
+        seats.join(session="s-b", seat="ben", cwd="/tmp/p")
+        seats.join(session="s-c", seat="cyd", cwd="/tmp/p")
+        row, err = seats.dm("ben", "secret handshake", who="ada")
+        self.assertIsNone(err)
+        self.assertEqual(row["dm"], "ben")
+        # NO room fanout: no channel appears, #main got nothing
+        self.assertEqual(chat.list_rooms(), [])
+        self.assertEqual(chat.read("main")[1], 0)
+        # exactly ONE recipient, delivered as a DM (not a room row)
+        line = seats.deliver_any(session="s-b", seat="ben")
+        self.assertIn("secret handshake", line)
+        self.assertIn("[helm chat dm → ben]", line)
+        self.assertIsNone(seats.deliver_any(session="s-b", seat="ben"))
+        self.assertIsNone(seats.deliver_any(session="s-a", seat="ada"))
+        self.assertIsNone(seats.deliver_any(session="s-c", seat="cyd"))
+
+    def test_dm_exact_token_never_substring_or_slug_fold(self):
+        """team.a and team-a slug-collide but are DIFFERENT addressees —
+        a DM to one must never reach the other."""
+        seats.join(session="s-p", seat="team.a", cwd="/tmp/p")
+        seats.join(session="s-q", seat="team-a", cwd="/tmp/p")
+        _row, err = seats.dm("team.a", "for the dot team only", who="ada")
+        self.assertIsNone(err)
+        self.assertIsNone(seats.deliver_any(session="s-q", seat="team-a"))
+        self.assertIn("for the dot team only",
+                      seats.deliver_any(session="s-p", seat="team.a"))
+
+    def test_dm_signed_like_a_post_and_renders_as_dm(self):
+        sent = {"sent": True, "turn_hash": "t" * 64, "receipt_hash": "r" * 64,
+                "chain_index": 9}
+        with mock.patch.object(chat, "_sign_send", return_value=(sent, None)) as ss:
+            row, err = seats.dm("zoe", "signed word", who="ada", sign=True)
+        self.assertIsNone(err)
+        self.assertEqual(row["chain"], 9)
+        ss.assert_called_once_with(chat.digest_payload("signed word"), mock.ANY)
+        rendered = chat._fmt(row)
+        self.assertNotIn("[unsigned]", rendered)
+        self.assertIn("-> @zoe (dm):", rendered)
+        # unsigned still lands, loudly tagged (fallback law)
+        row2, _err = seats.dm("zoe", "plain word", who="ada")
+        self.assertIn("[unsigned]", chat._fmt(row2))
+
+    def test_dm_beacon_wakes_the_recipient(self):
+        seats.join(session="s-r", seat="rio", cwd="/tmp/p")
+        seats.dm("rio", "wake up rio", who="ada")
+        captured = []
+        seats.wait(seat="rio", session="s-r", follow=True, timeout=0.15,
+                   poll=0.01, emit=captured.append)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("wake up rio", captured[0])
+        self.assertIn("dm", captured[0])
+
+    def test_dm_before_join_delivers_after_join(self):
+        seats.dm("late", "waiting for you", who="ada")
+        seats.join(session="s-l", seat="late", cwd="/tmp/p")
+        self.assertIn("waiting for you",
+                      seats.deliver_any(session="s-l", seat="late"))
+
+    def test_dm_to_untracked_seat_still_delivers(self):
+        """The lane always backfills from 0 — even a seat with no cursor
+        anywhere (reaped / never joined) gets the DM that created it."""
+        seats.dm("ghost", "boo", who="ada")
+        self.assertIn("boo", seats.deliver_any(session="s-gh", seat="ghost"))
+
+    def test_dm_case_snaps_to_the_live_roster_seat(self):
+        seats.join(session="s-k", seat="Kimi", cwd="/tmp/p")
+        row, _err = seats.dm("kimi", "case snap", who="ada")
+        self.assertEqual(row["dm"], "Kimi")
+        self.assertIn("case snap", seats.deliver_any(session="s-k", seat="Kimi"))
+
+    def test_dm_refuses_self_and_bad_tokens(self):
+        row, err = seats.dm("ada", "hi me", who="ada")
+        self.assertIsNone(row)
+        self.assertIn("yourself", err)
+        row, err = seats.dm("bad name!", "x", who="ada")
+        self.assertIsNone(row)
+        self.assertIn("exact seat token", err)
+
+    def test_dm_gates_the_stop_and_counts_pending(self):
+        seats.join(session="s-g", seat="gee", cwd="/tmp/p")
+        seats.dm("gee", "answer me first", who="ada")
+        blocks, _w = seats.stop_guard(session="s-g", seat="gee")
+        self.assertTrue(blocks)
+        self.assertIn("[dm]", blocks[0])
+        rep = seats.roster_report("main")
+        s = [x for x in rep["seats"] if x["seat"] == "gee"][0]
+        self.assertEqual(s["pending"], 1)
+
+    def test_dm_lane_survives_a_rename(self):
+        seats.join(session="s-rn", seat="oldname", cwd="/tmp/p")
+        seats.dm("oldname", "pre-rename word", who="ada")
+        ok, _msg = seats.rename_seat("oldname", "newname")
+        self.assertTrue(ok)
+        self.assertIn("pre-rename word",
+                      seats.deliver_any(session="s-rn", seat="newname"))
+        seats.dm("newname", "post-rename word", who="ada")
+        self.assertIn("post-rename word",
+                      seats.deliver_any(session="s-rn", seat="newname"))
+
+    def test_dm_cli_verbs(self):
+        seats.join(session="s-v", seat="vic", cwd="/tmp/p")
+        # helm chat dm <seat> <text...> [--seat S]
+        rc, out, _err = self.cmd("dm", ["vic", "hello", "there", "--seat", "ada"])
+        self.assertEqual(rc, 0)
+        self.assertIn("hello there", out)
+        self.assertIn("(dm)", out)
+        # helm chat post --dm SEAT (the flag-shaped route)
+        out2, err2 = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out2), contextlib.redirect_stderr(err2):
+            rc = chat.cmd_chat(["post", "hi", "again",
+                                "--dm", "vic", "--seat", "ada"])
+        self.assertEqual(rc, 0, err2.getvalue())
+        self.assertIn("(dm)", out2.getvalue())
+        # the recipient reads its lane: helm chat read --dm --seat vic
+        out3 = io.StringIO()
+        with contextlib.redirect_stdout(out3):
+            rc = chat.cmd_chat(["read", "--dm", "--seat", "vic"])
+        self.assertEqual(rc, 0)
+        self.assertIn("hello there", out3.getvalue())
+        self.assertIn("hi again", out3.getvalue())
+        self.assertIn("(dm)", out3.getvalue())
+        # nothing fanned out to any room
+        self.assertEqual(chat.list_rooms(), [])
 
 
 class AutoNameTest(SeatsBase):

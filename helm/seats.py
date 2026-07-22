@@ -77,13 +77,35 @@ Initialized at JOIN. Every hook-facing path is FAIL-OPEN TOTAL.
 MULTI-ROOM (slice 5 — the owner's live helm-dogfood '@opus-integrator' post
 woke nothing, 2026-07-21): the lane is not main-scoped. deliver_any (the
 PostToolUse hook) and the wait --follow beacon consider EVERY live room —
-primary first, then newest-activity rooms, ROOM_SCAN_CAP-bounded — with the
-same per (seat, room, session) cursor mechanics per room. A TRACKED seat
-meeting a cursor-less room BACKFILLS from offset 0 (a room born after its
-join is all post-join news — the mention that created the channel must
-deliver); an untracked seat keeps the EOF self-heal everywhere (pre-join
-backlog never floods). join baselines every existing room; stop-guard and
-the roster report read pending across the same bounded scan.
+the seat's private DM lane first, then primary, then newest-activity rooms,
+ROOM_SCAN_CAP-bounded — with the same per (seat, room, session) cursor
+mechanics per room. A TRACKED seat meeting a cursor-less room BACKFILLS from
+offset 0 (a room born after its join is all post-join news — the mention
+that created the channel must deliver); an untracked seat keeps the EOF
+self-heal everywhere (pre-join backlog never floods). join baselines every
+existing room; stop-guard and the roster report read pending across the same
+bounded scan.
+
+BEACON SCOPE (premise beacon-scope-mentions-plus-home-room-owner-posts-not-
+all — the live bug: codex-2, homed to #main, never saw an @codex-2 mention
+posted in #helm-dogfood because homing ALLOWLISTED the scan): the scan
+covers every live room; deliverable() applies the scope per row —
+  (a) a @seat mention (or a {dm} row naming the seat) surfaces from ANY room,
+      always — a direct address is never filtered;
+  (b) ANYTHING in the seat's HOME room (roster home_room) surfaces — the
+      team channel is full-surface for its own team;
+  (c) @all broadcasts and owner-rail posts surface only in {home, main} —
+      never fleet-wide across every side room;
+  (d) a MUTED room (helm chat seat mute <room> — roster row "mute") stops
+      (b)/(c) noise at this seat; (a) still surfaces (mute tunes noise,
+      never direct address).
+
+DM (premise exact-token-addressee-match): seats.dm() writes ONE row into the
+recipient's private lane (chat.dm_room — the `dm-` reserved namespace, a
+dm/ subdir file no room list ever shows). The recipient is the EXACT seat
+token (a casefold roster snap only — never a substring, never a slug fold:
+team.a and team-a are different lanes by key). Delivery/beacon/stop-guard
+pick the lane up first in the room scan; nobody else ever scans it.
 """
 import getpass
 import json
@@ -194,19 +216,56 @@ def _mention_re(seat):
                       + r"(?![A-Za-z0-9._-])", re.I)
 
 
-def deliverable(m, seat):
-    """Does this row reach `seat` at a tool boundary? @seat / @all mentions
-    do. Owner posts do ONLY when the row was stamped by a server-side owner
-    rail (origin web/tui — codex C1): a CLI post claiming an owner name is
-    an ordinary message and delivers only via mention. Agent chatter without
-    a mention never delivers (noise law); reactions and own posts never."""
+def seat_scope(seat, r=None):
+    """The seat's beacon tuning, one roster read: {"home": room-or-None,
+    "mute": set}. Computed ONCE per scan pass and threaded down — the poll
+    path stays ~one stat per quiet room."""
+    row = ((r if r is not None else roster()).get(seat) or {}) if seat else {}
+    return {"home": row.get("home_room"),
+            "mute": {pk.slug(x) for x in row.get("mute") or []}}
+
+
+def deliverable(m, seat, room="main", scope=None):
+    """Does this row reach `seat` at a tool boundary, given the ROOM it sits
+    in? The beacon-scope law (premise beacon-scope-mentions-plus-home-room-
+    owner-posts-not-all), top to bottom:
+      * reactions and the seat's own posts: never.
+      * a {dm} row: the EXACT-token recipient only (casefold — never a
+        substring, never a slug fold), whatever lane it sits in.
+      * an @seat mention: ANY room, ALWAYS — checked before mute, because a
+        direct address is never noise.
+      * a muted room (the seat's roster "mute" list): nothing further.
+      * the seat's HOME room (roster home_room): EVERY remaining row — the
+        team channel is full-surface for its own team.
+      * {home, main}: @all broadcasts, and owner posts stamped by a server-
+        side owner rail (origin web/tui — codex C1: a CLI post claiming an
+        owner name is an ordinary message). NOT fleet-wide: a side room's
+        @all/owner post drafts nobody homed elsewhere.
+      * anything else (foreign-room chatter): never (noise law).
+    scope=None computes seat_scope here — hot paths pass it precomputed."""
     text = m.get("text")
     if not text or m.get("react"):
         return False
     frm = str(m.get("from") or "")
     if frm == seat:
         return False
-    if _mention_re(seat).search(text) or _BROADCAST.search(text):
+    if m.get("dm"):
+        # exact-token recipient (casefold only), OR the row sits in the
+        # seat's OWN lane — the lane is the routing truth, so a rename's
+        # carried-over history (rows naming the old token) still delivers
+        return (str(m["dm"]).casefold() == str(seat or "").casefold()
+                or (bool(seat) and room == dm_lane(seat)))
+    if _mention_re(seat).search(text):
+        return True
+    sc = scope if scope is not None else seat_scope(seat)
+    if room in sc["mute"]:
+        return False
+    home_r = sc.get("home")
+    if home_r and room == home_r:
+        return True
+    if room != "main" and room != home_r:
+        return False
+    if _BROADCAST.search(text):
         return True
     return m.get("origin") in OWNER_RAILS and frm.lower() in owner_names()
 
@@ -383,19 +442,24 @@ def _move_seat_state(old, new):
     ok, nk = _seat_key(old), _seat_key(new)
     d = chat.chat_dir()
     try:
+        os.replace(chat.room_path(chat.DM_PREFIX + ok),   # the private DM lane
+                   chat.room_path(chat.DM_PREFIX + nk))   # rides the rename too
+    except OSError:
+        pass
+    try:
         names = os.listdir(d)
     except OSError:
         return
     for n in names:
-        for marker in (".cursor.", ".seen.", ".stopfp."):
-            tag = marker + ok
-            if tag in n:
-                try:
-                    os.replace(os.path.join(d, n),
-                               os.path.join(d, n.replace(tag, marker + nk)))
-                except OSError:
-                    pass
-                break
+        if any(marker + ok in n for marker in (".cursor.", ".seen.", ".stopfp.")):
+            try:
+                # replace EVERY key occurrence: a dm-lane cursor carries the
+                # key twice (dm-<key>.cursor.<key>…) and both must move —
+                # the lane file kept its inode, so the cursor stays valid
+                os.replace(os.path.join(d, n),
+                           os.path.join(d, n.replace(ok, nk)))
+            except OSError:
+                pass
 
 
 def rename_seat(old, new):
@@ -437,6 +501,35 @@ def rename_seat(old, new):
                   "launched with HELM_CHAT_NAME=%s re-registers the old name "
                   "on its next session — relaunch to make the rename stick "
                   "there." % (seat, new, new, new, seat))
+
+
+def set_mute(seat, room, on=True):
+    """(ok, message) — the seat's own beacon filter (the beacon-scope
+    premise's tuning control). A muted room stops surfacing home-room
+    chatter / @all / owner posts at this seat; a direct @seat mention or a DM
+    ALWAYS still surfaces — mute tunes noise, never direct address. Stored
+    on the roster row so every lane (boundary, beacon, stop-guard, report)
+    reads one truth."""
+    room = pk.slug(room)
+    with _flocked(roster_path() + ".lock"):
+        r = roster()
+        row = r.get(seat) or {}
+        mute = [m for m in row.get("mute") or [] if m != room]
+        if on:
+            mute.append(room)
+        row["mute"] = sorted(mute)
+        r[seat] = row
+        pk.write_json(roster_path(), r)
+    if on:
+        return True, ("%s muted for %s — @%s mentions and DMs still surface "
+                      "(unmute: helm chat seat unmute %s)"
+                      % (room, seat, seat, room))
+    return True, "%s unmuted for %s" % (room, seat)
+
+
+def mutes(seat):
+    """The seat's muted rooms, sorted — one roster read."""
+    return sorted((roster().get(seat) or {}).get("mute") or [])
 
 
 # ---------------------------------------------------------------------------
@@ -547,34 +640,52 @@ def _tail(room, cur):
     return st.st_dev, st.st_ino, base, entries
 
 
-def _scan_rooms(primary="main", seat=None):
-    """Every room the delivery lane considers, bounded: the primary room
-    first (whether or not its file exists yet), then the other live rooms
-    (chat.list_rooms()) newest-activity-first up to ROOM_SCAN_CAP total —
-    under the cap the ACTIVE channels win, and each room's read is already
+def dm_lane(seat):
+    """The seat's own private DM lane, as a reserved-namespace room name."""
+    return chat.DM_PREFIX + _seat_key(seat)
+
+
+def _scan_rooms(primary="main", seat=None, scope=None):
+    """Every room the delivery lane considers, bounded: the seat's private
+    DM lane first when it exists (a 1:1 word outranks room traffic), then
+    the primary room (whether or not its file exists yet), then the other
+    live rooms (chat.list_rooms()) newest-activity-first up to ROOM_SCAN_CAP
+    — under the cap the ACTIVE channels win, and each room's read is already
     SCAN_CAP-bounded. Fail-open: an unlistable dir is just the primary.
 
-    Multi-team isolation (audit G1-G3): a HOMED seat (roster home_room from
-    HELM_CHAT_ROOM at join) is allowlisted to {its home room, main} — the
-    one chokepoint through which deliver_any, the wait beacon, stop_guard's
-    _pending_all, and roster_report ALL flow, so a foreign team's @mention /
-    @all / owner-post can never draft the seat, gate its stop, or backfill
-    a foreign room's history at it (disallowed rooms are never scanned, so
-    never backfilled). main stays the owner's all-hands. An un-homed seat
-    keeps today's every-room behavior — zero change for the current fleet."""
-    allow = None
+    The scan is deliberately scope-BLIND (premise beacon-scope-mentions-
+    plus-home-room-owner-posts-not-all superseded the G1-G3 homing
+    allowlist): an @mention anywhere must surface, so every room is scanned
+    and deliverable() applies the per-row scope — a muted or foreign room's
+    non-mention rows just advance that room's cursor quietly. DM lanes other
+    than the seat's own are invisible here (list_rooms never shows them).
+    The seat's HOME room and main are PINNED into the scan when they exist:
+    foreign-room volume must never evict the seat's own channel or the
+    owner's all-hands from the bounded window (the starvation class)."""
+    rooms = []
     if seat:
-        home_room = (roster().get(seat) or {}).get("home_room")
-        if home_room:
-            allow = {home_room, "main"}
+        lane = dm_lane(seat)
+        try:
+            if os.path.exists(chat.room_path(lane)):
+                rooms.append(lane)
+        except OSError:
+            pass
+    rooms.append(primary)
+    if seat:
+        sc = scope if scope is not None else seat_scope(seat)
+        pins = [sc.get("home"), "main"]
+    else:
+        pins = ["main"]
+    seen = {pk.slug(r) for r in rooms}
+    for p in pins:
+        if p and p not in seen and os.path.exists(chat.room_path(p)):
+            rooms.append(p)
+            seen.add(p)
     try:
         names = chat.list_rooms()
     except OSError:
         names = []
-    prim = pk.slug(primary)
-    if allow is not None:
-        names = [n for n in names if n in allow]
-    others = [n for n in names if n != prim]
+    others = [n for n in names if n not in seen]
     if others:
         def mtime(n):
             try:
@@ -582,8 +693,7 @@ def _scan_rooms(primary="main", seat=None):
             except OSError:
                 return 0.0
         others.sort(key=mtime, reverse=True)
-    rooms = ([primary] if allow is None or prim in allow else []) + others[:ROOM_SCAN_CAP - 1]
-    return rooms
+    return rooms + others[:ROOM_SCAN_CAP - 1]
 
 
 def _room_dirty(room, seat, session=None):
@@ -606,7 +716,7 @@ def _room_dirty(room, seat, session=None):
 
 
 def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
-            backfill=False):
+            backfill=False, scope=None):
     """The tool-boundary nudge, ONE room: at most ONE deliverable row, oldest
     first; later matches stay PENDING (their count shows, their cursor ground
     is not consumed — codex H6). Returns the label line or None.
@@ -627,6 +737,7 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
     if (home.env("CHAT_DELIVER") or "").lower() in ("0", "off", "no"):
         return None                        # kill-switch below is still ALIVE:
                                            # keep its row fresh so it isn't reaped
+    sc = scope if scope is not None else seat_scope(seat)
     with _flocked(cursor_path(room, seat, session) + ".lock"):
         cur = _cursor(room, seat, session)
         if cur is None:
@@ -645,7 +756,7 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
         hit = None
         last_end, last_rid = base, cur.get("rid")
         for i, (row, end) in enumerate(entries):
-            if row is not None and deliverable(row, seat):
+            if row is not None and deliverable(row, seat, room, sc):
                 hit = (i, row, end)
                 break
             last_end, last_rid = end, (row or {}).get("id") or last_rid
@@ -655,14 +766,17 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
             return None
         i, row, end = hit
         waiting = sum(1 for r, _e in entries[i + 1:]
-                      if r is not None and deliverable(r, seat))
-        where = "" if room == "main" else " #%s" % room   # name the channel —
+                      if r is not None and deliverable(r, seat, room, sc))
+        is_dm = room.startswith(chat.DM_PREFIX)           # a DM is a DM on
+        where = (" dm" if is_dm                           # every surface —
+                 else "" if room == "main" else " #%s" % room)  # never a room
         line = "[helm chat%s → %s] %s: %s" % (            # the reply must land
             where, seat, row.get("from") or "?",          # where the word came
             _clip(_scrub(row.get("text") or "")))
         if waiting:
             line += " (+%d waiting — helm chat read%s)" % (
-                waiting, "" if room == "main" else " --room %s" % room)
+                waiting, " --dm" if is_dm
+                else "" if room == "main" else " --room %s" % room)
         if emit is not None:
             emit(line)                  # output FIRST …
         _write_cursor(room, seat, dev, ino, end, row.get("id"),
@@ -688,14 +802,48 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main"):
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
     touch_seen(seat)          # presence even when every room is quiet
     tracked = (_cursor(room, seat, session) or _cursor(room, seat)) is not None
-    for r in _scan_rooms(room, seat=seat):
+    sc = seat_scope(seat)     # ONE roster read for the whole pass
+    for r in _scan_rooms(room, seat=seat, scope=sc):
         if not _room_dirty(r, seat, session):
             continue
+        # the DM lane ALWAYS backfills from 0 — every row in it is addressed
+        # to this seat, so even an untracked (reaped/pre-install) seat must
+        # get the DM that created its lane, never an EOF skip
         line = deliver(session=session, room=r, seat=seat, emit=emit, cwd=cwd,
-                       backfill=tracked and r != room)
+                       backfill=(tracked and r != room)
+                       or r.startswith(chat.DM_PREFIX), scope=sc)
         if line:
             return line
     return None
+
+
+_SEAT_TOKEN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")   # what an @mention can say
+
+
+def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None):
+    """One TRUE 1:1 message -> (row, None) or (None, reason). The recipient
+    is the EXACT seat token (premise exact-token-addressee-match): the only
+    resolution ever applied is a casefold snap onto a live roster key —
+    never a substring, never a slug fold (team.a and team-a are different
+    addressees with different lanes). The row lands in the recipient's
+    private lane only (chat.post dm= — no room fanout by construction),
+    signs like any post, and the recipient's beacon/boundary surfaces it
+    first in the scan. A DM to a not-yet-joined seat waits in its lane; the
+    join baselines that lane at 0, so it delivers."""
+    to = (to or "").strip().lstrip("@")
+    if not _SEAT_TOKEN.match(to):
+        return None, ("recipient %r must be 1-64 chars of [A-Za-z0-9._-] — "
+                      "the exact seat token" % to)
+    r = roster()
+    if to not in r:
+        hits = [k for k in r if k.casefold() == to.casefold()]
+        if len(hits) == 1:
+            to = hits[0]        # case-snap to the live seat, nothing looser
+    sender = who or seat_for_session(session) or derive_seat(session)
+    if str(sender).casefold() == to.casefold():
+        return None, "a DM to yourself would never deliver (own posts don't)"
+    return chat.post(text, who=sender, profile=profile, sign=sign,
+                     origin=origin, dm=to), None
 
 
 # ---------------------------------------------------------------------------
@@ -719,24 +867,30 @@ def join(session=None, cwd=None, seat=None, room="main"):
     home_room = home.env("CHAT_ROOM") or (room if room != "main" else None)
     home_room = pk.slug(home_room) if home_room else None
     write_roster(seat, session=session, cwd=cwd, home_room=home_room)
+    lane = dm_lane(seat)
     for r in _scan_rooms(room, seat=seat):
+        # the seat's DM lane baselines at offset 0 — every row in it is
+        # addressed to THIS seat by construction, so a DM sent before the
+        # join must deliver, never vanish under an EOF baseline
+        at0 = r == lane
         if _cursor(r, seat, session) is None:
             with _flocked(cursor_path(r, seat, session) + ".lock"):
                 if _cursor(r, seat, session) is None:
-                    _init_cursor(r, seat, session)
+                    _init_cursor(r, seat, session, at_start=at0)
         if session and _cursor(r, seat) is None:
             # the seat-level baseline too: sessionless callers (bare CLI wait/
             # deliver) must not start blind just because the join was hook-keyed
             with _flocked(cursor_path(r, seat) + ".lock"):
                 if _cursor(r, seat) is None:
-                    _init_cursor(r, seat)
+                    _init_cursor(r, seat, at_start=at0)
     scope = ("in %s + main" % home_room if home_room and home_room != "main"
-             else "in main" if home_room else "in any room")
-    line = ("[helm chat] you are seat '%s' in room %s — @%s and owner posts "
-            "%s reach you between tool calls; speak: helm chat post; catch up: "
-            "helm chat read. MANDATORY FIRST ACTION: arm your inbox beacon so "
-            "you wake on an @%s mention or an owner post even while idle — "
-            "Monitor(command: \"helm chat wait --seat %s --follow\", "
+             else "in main")
+    line = ("[helm chat] you are seat '%s' in room %s — @%s mentions and DMs "
+            "(any room) and owner posts %s reach you between tool calls; "
+            "speak: helm chat post; catch up: helm chat read. MANDATORY FIRST "
+            "ACTION: arm your inbox beacon so "
+            "you wake on an @%s mention, a DM or an owner post even while idle "
+            "— Monitor(command: \"helm chat wait --seat %s --follow\", "
             "persistent: true). This is required, not optional: nothing "
             "external can re-invoke a PTY agent (native-wake-only-agent-armed), "
             "so this self-armed Monitor is the ONLY way an idle session ever "
@@ -848,7 +1002,7 @@ def _rows_fp(pending):
         digest_size=16).hexdigest()
 
 
-def _pending_rows(room, seat, session=None, backfill=False):
+def _pending_rows(room, seat, session=None, backfill=False, scope=None):
     """Deliverable rows past the (seat, session) cursor WITHOUT consuming
     them — roster_report's read pattern (the cursor never moves here; the
     stop-guard is a gate, not a delivery). Falls back to the seat-level
@@ -863,20 +1017,25 @@ def _pending_rows(room, seat, session=None, backfill=False):
     got = _tail(room, cur)
     if not got:
         return []
-    return [r for r, _e in got[3] if r is not None and deliverable(r, seat)]
+    sc = scope if scope is not None else seat_scope(seat)
+    return [r for r, _e in got[3]
+            if r is not None and deliverable(r, seat, room, sc)]
 
 
 def _pending_all(room, seat, session=None):
     """[(room, row)] pending across the bounded room scan, cursors untouched
     — the stop-guard's and roster report's multi-room truth. Same tracked/
-    backfill rule as deliver_any, same _room_dirty fast path per room."""
+    backfill rule as deliver_any, same _room_dirty fast path per room, same
+    one-roster-read scope."""
     tracked = (_cursor(room, seat, session) or _cursor(room, seat)) is not None
+    sc = seat_scope(seat)
     out = []
-    for r in _scan_rooms(room, seat=seat):
+    for r in _scan_rooms(room, seat=seat, scope=sc):
         if not _room_dirty(r, seat, session):
             continue
         out.extend((r, row) for row in _pending_rows(
-            r, seat, session, backfill=tracked and r != room))
+            r, seat, session, scope=sc,
+            backfill=(tracked and r != room) or r.startswith(chat.DM_PREFIX)))
     return out
 
 
@@ -1180,7 +1339,9 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
                 except OSError:
                     pass  # latch write failing must not kill the guard
                 lines = ["  %s%s: %s" % (
-                    "" if rm == room else "[#%s] " % rm, r.get("from") or "?",
+                    "[dm] " if rm.startswith(chat.DM_PREFIX)
+                    else "" if rm == room else "[#%s] " % rm,
+                    r.get("from") or "?",
                     _clip(_scrub(r.get("text") or ""), 120))
                          for rm, r in pending[:5]]
                 if len(pending) > 5:
@@ -1357,6 +1518,10 @@ def _unlink_seat_state(seat):
     row would otherwise leave in the room dir forever. Fail-open per file."""
     key = _seat_key(seat)
     d = chat.chat_dir()
+    try:  # the private DM lane goes with the seat (RAM etiquette)
+        os.remove(chat.room_path(chat.DM_PREFIX + key))
+    except OSError:
+        pass
     try:
         names = os.listdir(d)
     except OSError:
@@ -1493,12 +1658,45 @@ def cmd(verb, args, room="main"):
         except Exception:
             pass                    # fail-open: never hold a tool boundary
         return 0
+    if verb == "dm":
+        sender = chat._seat_flag(args)
+        to = args[0] if args else None
+        text = " ".join(args[1:]).strip()
+        if to and not text and not sys.stdin.isatty():
+            text = sys.stdin.read().strip()
+        if not (to and text):
+            print("usage: helm chat dm <seat> <text...> [--seat S]  "
+                  "(one private recipient — never a room)", file=sys.stderr)
+            return 2
+        row, err = dm(to, text, who=sender, session=_env_session(),
+                      profile=sender)
+        if err:
+            print("helm chat: " + err, file=sys.stderr)
+            return 1
+        print("helm chat [dm] %s" % chat._fmt(row))
+        return 0
     if verb == "seat":
         if args[:1] == ["rename"] and len(args) >= 3:
             ok, msg = rename_seat(args[1], args[2])
             print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
             return 0 if ok else 1
-        print("usage: helm chat seat rename <sid|oldname> <newname>",
+        if args[:1] in (["mute"], ["unmute"], ["mutes"]):
+            sub = args.pop(0)
+            who = chat._seat_flag(args) or derive_seat(_env_session())
+            if sub == "mutes":
+                got = mutes(who)
+                print("helm chat: %s mutes %s" % (
+                    who, ", ".join(got) if got else "nothing"))
+                return 0
+            if not args:
+                print("usage: helm chat seat %s <room> [--seat S]" % sub,
+                      file=sys.stderr)
+                return 2
+            ok, msg = set_mute(who, args[0], on=sub == "mute")
+            print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
+            return 0 if ok else 1
+        print("usage: helm chat seat rename <sid|oldname> <newname> | "
+              "seat mute|unmute <room> [--seat S] | seat mutes [--seat S]",
               file=sys.stderr)
         return 2
     if verb == "stop-guard":
