@@ -5,12 +5,15 @@ scratch repo minted in setUp — the real repo and its worktrees are never
 touched (every `helm work` call pins --repo at the scratch root)."""
 import contextlib
 import io
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -273,6 +276,289 @@ class ListTest(WorkBase):
         rc, out, _err = self.work("list")
         self.assertEqual(rc, 0)
         self.assertIn("no lane rooms", out)
+
+
+class UnguardedRoomTest(WorkBase):
+    """Only Claude Agent/Workflow isolation rooms are reported, with every
+    uncertain liveness input retaining an explicit UNKNOWN state."""
+
+    def foreign(self, name, dirty=None):
+        path = os.path.join(self.root, ".claude", "worktrees", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        r = _sh(self.root, "git", "worktree", "add", "-q", "-b",
+                "worktree-" + name, path, "main")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        if dirty:
+            with open(os.path.join(path, dirty), "w") as f:
+                f.write("a reviewer's uncommitted security fixes\n")
+        return path
+
+    @contextlib.contextmanager
+    def workflow_evidence(self, path, status="completed", live=True):
+        home = os.path.join(self.tmp, "claude-home")
+        sid = "11111111-2222-4333-8444-555555555555"
+        slug = self.root.replace(os.sep, "-").replace(".", "-")
+        d = os.path.join(home, "projects", slug, sid, "workflows")
+        os.makedirs(d, exist_ok=True)
+        run = os.path.basename(path).rsplit("-", 1)[0]
+        with open(os.path.join(d, run + ".json"), "w") as f:
+            json.dump({"runId": run, "status": status}, f)
+        sessions = {sid} if live else set()
+        with mock.patch.object(work, "_claude_homes", return_value=[home]), \
+                mock.patch.object(work, "_live_claude_sessions",
+                                  return_value=sessions):
+            yield
+
+    @contextlib.contextmanager
+    def direct_agent_evidence(self, path, terminal=False, live=True):
+        home = os.path.join(self.tmp, "direct-home")
+        sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        slug = self.root.replace(os.sep, "-").replace(".", "-")
+        d = os.path.join(home, "projects", slug, sid, "subagents")
+        os.makedirs(d, exist_ok=True)
+        room = os.path.basename(path)
+        with open(os.path.join(d, room + ".meta.json"), "w") as f:
+            json.dump({"worktreePath": path}, f)
+        msg = {"type": "assistant", "message": {
+            "stop_reason": "end_turn" if terminal else "tool_use",
+            "content": [{"type": "text", "text": "done"}] if terminal
+            else [{"type": "tool_use", "name": "Bash"}]}}
+        with open(os.path.join(d, room + ".jsonl"), "w") as f:
+            f.write(json.dumps(msg) + "\n")
+        sessions = {sid} if live else set()
+        with mock.patch.object(work, "_claude_homes", return_value=[home]), \
+                mock.patch.object(work, "_live_claude_sessions",
+                                  return_value=sessions):
+            yield
+
+    def test_agent_worktree_is_reported_with_stable_identity(self):
+        path = self.foreign("wf_dead00-1")
+        with self.workflow_evidence(path):
+            rows = work.unguarded_rows(self.root)
+            self.assertEqual([r["id"] for r in rows], ["wf_dead00-1"])
+            rc, out, err = self.work("list")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("UNGUARDED CLEAN", out)
+        self.assertIn("id=wf_dead00-1", out)
+        self.assertIn("never authorizes cleanup", out)
+
+    def test_main_lanes_and_arbitrary_worktrees_are_not_unguarded(self):
+        rc, _out, err = self.work("claim", "mine", "--seat", "s1")
+        self.assertEqual(rc, 0, err)
+        self.room("stray")
+        normal = os.path.join(self.tmp, "ordinary-review")
+        r = _sh(self.root, "git", "worktree", "add", "-q", "-b",
+                "ordinary-review", normal, "main")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(work.unguarded_rows(self.root), [])
+
+    def test_recent_write_is_advisory_not_ownership_claim(self):
+        path = self.foreign("wf_busy00-2", dirty="cred.py")
+        self.assertEqual(work._occupants(path), [])
+        with self.workflow_evidence(path):
+            row = work.unguarded_rows(self.root)[0]
+            rc, out, err = self.work("list")
+        self.assertTrue(row["dirty"])
+        self.assertLessEqual(row["wrote_ago"], work.RECENT_WRITE_SECONDS)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("RECENT-WRITE", out)
+        self.assertIn("advisory, not ownership proof", out)
+        self.assertNotIn("assume live", out)
+
+    def test_clean_but_live_workflow_is_live_with_parent_cwd_elsewhere(self):
+        path = self.foreign("wf_live000-3")
+        self.assertEqual(work._occupants(path), [])
+        with self.workflow_evidence(path, status="running", live=True):
+            row = work.unguarded_rows(self.root)[0]
+            rc, out, _err = self.work("list")
+        self.assertFalse(row["dirty"])
+        self.assertEqual(row["harness"], "live")
+        self.assertIn("LIVE-HARNESS", out)
+        self.assertIn("Workflow active", out)
+
+    def test_running_metadata_without_live_parent_is_unknown(self):
+        path = self.foreign("wf_crashed0-4")
+        with self.workflow_evidence(path, status="running", live=False):
+            rc, out, _err = self.work("list")
+        self.assertIn("UNGUARDED UNKNOWN", out)
+        self.assertIn("harness metadata incomplete", out)
+
+    def test_clean_direct_agent_is_live_until_its_final_text_end_turn(self):
+        path = self.foreign("agent-deadbeef1234")
+        with self.direct_agent_evidence(path, terminal=False, live=True):
+            self.assertEqual(work.unguarded_rows(self.root)[0]["harness"], "live")
+        with self.direct_agent_evidence(path, terminal=True, live=True):
+            self.assertEqual(work.unguarded_rows(self.root)[0]["harness"],
+                             "inactive")
+
+    def test_terminal_clean_room_is_clean_but_not_declared_unowned(self):
+        path = self.foreign("wf_idle000-5")
+        with self.workflow_evidence(path):
+            row = work.unguarded_rows(self.root)[0]
+            rc, out, _err = self.work("list")
+        self.assertIsNone(row["wrote_ago"])
+        self.assertEqual(row["harness"], "inactive")
+        self.assertIn("UNGUARDED CLEAN", out)
+        self.assertIn("not proof that no writer will resume", out)
+
+    def test_stale_dirty_write_remains_dirty_without_live_claim(self):
+        path = self.foreign("wf_stale00-6", dirty="half.py")
+        old = time.time() - 7200
+        os.utime(os.path.join(path, "half.py"), (old, old))
+        with self.workflow_evidence(path):
+            row = work.unguarded_rows(self.root)[0]
+            rc, out, _err = self.work("list")
+        self.assertGreaterEqual(row["wrote_ago"], 7000)
+        self.assertIn("UNGUARDED DIRTY", out)
+        self.assertNotIn("LIVE-HARNESS", out)
+
+    def test_missing_harness_metadata_fails_unknown(self):
+        self.foreign("wf_orphan00-7")
+        with mock.patch.object(work, "_claude_homes", return_value=[]), \
+                mock.patch.object(work, "_live_claude_sessions", return_value=set()):
+            rc, out, _err = self.work("list")
+        self.assertIn("UNGUARDED UNKNOWN", out)
+        self.assertIn("no matching harness metadata", out)
+
+    def test_symlink_escape_is_reported_unknown_without_git_status(self):
+        target = os.path.join(self.tmp, "outside")
+        os.makedirs(target)
+        path = os.path.join(self.root, ".claude", "worktrees", "wf_escape00-8")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.symlink(target, path)
+        records = [{"path": path, "branch": "refs/heads/worktree-wf_escape00-8",
+                    "locked": False, "reason": ""}]
+        with mock.patch.object(work, "_room_status") as status_call:
+            rows, errors = work.unguarded_inventory(self.root, registered=records)
+        self.assertEqual(errors, [])
+        self.assertEqual(rows[0]["harness"], "unknown")
+        self.assertIn("symlink", rows[0]["hard_unknown"])
+        status_call.assert_not_called()
+
+    def test_foreign_repo_replacement_is_not_inspected_as_same_repo(self):
+        path = os.path.join(self.root, ".claude", "worktrees", "wf_foreign0-9")
+        os.makedirs(path)
+        self.assertEqual(_sh(path, "git", "init", "-q").returncode, 0)
+        records = [{"path": path, "branch": "refs/heads/worktree-wf_foreign0-9",
+                    "locked": False, "reason": ""}]
+        with mock.patch.object(work, "_room_status") as status_call:
+            rows, _errors = work.unguarded_inventory(self.root, registered=records)
+        self.assertIn("not a regular worktree link", rows[0]["hard_unknown"])
+        status_call.assert_not_called()
+
+    def test_symlinked_container_escape_is_unknown(self):
+        outside = os.path.join(self.tmp, "escaped-claude")
+        os.makedirs(os.path.join(outside, "worktrees", "wf_parent00-1"))
+        os.symlink(outside, os.path.join(self.root, ".claude"))
+        path = os.path.join(self.root, ".claude", "worktrees", "wf_parent00-1")
+        records = [{"path": path, "branch": "refs/heads/worktree-wf_parent00-1",
+                    "locked": False, "reason": ""}]
+        with mock.patch.object(work, "_room_status") as status_call:
+            rows, _errors = work.unguarded_inventory(self.root, registered=records)
+        self.assertIn("container escapes", rows[0]["hard_unknown"])
+        status_call.assert_not_called()
+
+
+class PorcelainSafetyTest(WorkBase):
+    def test_worktree_registry_is_nul_and_byte_safe(self):
+        weird = os.fsencode(self.root) + b"/.claude/worktrees/agent-deadbeef\\\n\xff"
+        raw = (b"worktree " + weird + b"\0HEAD abc\0branch refs/heads/x\0"
+               b"locked because\0\0")
+        with mock.patch.object(work, "_git_bytes", return_value=(0, raw, b"")):
+            rows, error = work._worktree_records(self.root)
+        self.assertIsNone(error)
+        self.assertEqual(os.fsencode(rows[0]["path"]), weird)
+        self.assertEqual(rows[0]["branch"], "refs/heads/x")
+        self.assertEqual(rows[0]["reason"], "because")
+
+    def test_worktree_registry_failure_and_truncation_are_not_empty_success(self):
+        with mock.patch.object(work, "_git_bytes", return_value=(1, b"", b"boom")):
+            self.assertEqual(work._worktree_records(self.root), ([], "boom"))
+        with mock.patch.object(work, "_git_bytes",
+                               return_value=(0, b"worktree /tmp/no-nul", b"")):
+            rows, error = work._worktree_records(self.root)
+        self.assertEqual(rows, [])
+        self.assertIn("truncated", error)
+
+    def test_porcelain_v2_parser_consumes_two_path_records_exactly(self):
+        ordinary = b"1 .M N... 100644 100644 100644 a b line\\name\n\xff"
+        rename = b"2 R. N... 100644 100644 100644 a b R100 new name"
+        copy = b"2 C. N... 100644 100644 100644 a b C075 copy name"
+        unmerged = b"u UU N... 100644 100644 100644 100644 a b c conflict"
+        raw = (ordinary + b"\0" + rename + b"\0old name\0" + copy +
+               b"\0source name\0" + unmerged + b"\0? untracked dir/file\0")
+        got = work._status_entries(raw)
+        self.assertEqual([p for p, _sub in got], [
+            b"line\\name\n\xff", b"new name", b"copy name", b"conflict",
+            b"untracked dir/file"])
+
+    def test_human_porcelain_and_truncated_records_fail_closed(self):
+        with self.assertRaises(ValueError):
+            work._status_entries(b" M human path\0")
+        with self.assertRaises(ValueError):
+            work._status_entries(b"? no terminator")
+        with self.assertRaises(ValueError):
+            work._status_entries(
+                b"2 R. N... 100644 100644 100644 a b R100 new\0\0")
+
+    def test_weird_untracked_names_and_untracked_directory_are_timed(self):
+        path = self.room("weirdst")
+        rel = b"dir/space newline\nback\\slash-\xff"
+        os.makedirs(os.path.join(path, "dir"))
+        fd = os.open(os.path.join(os.fsencode(path), rel),
+                     os.O_WRONLY | os.O_CREAT, 0o600)
+        os.close(fd)
+        row = work._room_status(path)
+        self.assertTrue(row["dirty"])
+        self.assertIsNone(row["unknown"])
+        self.assertIsNotNone(row["wrote_ago"])
+
+    def test_deletion_and_dirty_submodule_are_timestamp_unknown(self):
+        path = self.room("deleted")
+        os.remove(os.path.join(path, "README"))
+        row = work._room_status(path)
+        self.assertTrue(row["dirty"])
+        self.assertIn("deleted", row["unknown"])
+        record = (b"1 .M S.M. 160000 160000 160000 a b sub\0")
+        fake_stat = os.stat(path)
+        with mock.patch.object(work, "_git_bytes", return_value=(0, record, b"")), \
+                mock.patch.object(work.os, "lstat", return_value=fake_stat):
+            row = work._room_status(path)
+        self.assertIn("submodule", row["unknown"])
+
+    def test_symlink_mtime_is_not_target_mtime_and_future_clock_is_advisory(self):
+        path = self.room("symlink")
+        target = os.path.join(self.tmp, "future-target")
+        with open(target, "w") as f:
+            f.write("outside")
+        future = time.time() + 3600
+        os.utime(target, (future, future))
+        link = os.path.join(path, "link")
+        os.symlink(target, link)
+        old = time.time() - 3600
+        os.utime(link, (old, old), follow_symlinks=False)
+        row = work._room_status(path, now=time.time())
+        self.assertGreater(row["wrote_ago"], 3000)
+        os.utime(link, (future, future), follow_symlinks=False)
+        row = work._room_status(path, now=time.time())
+        self.assertEqual(row["wrote_ago"], 0)
+        self.assertTrue(row["clock_skew"])
+
+    def test_ignored_files_are_excluded_and_status_failure_is_unknown(self):
+        path = self.room("ignored")
+        with open(os.path.join(path, ".gitignore"), "w") as f:
+            f.write("ignored/\n")
+        _sh(path, "git", "add", ".gitignore")
+        _sh(path, "git", "commit", "-q", "-m", "ignore")
+        os.makedirs(os.path.join(path, "ignored"))
+        with open(os.path.join(path, "ignored", "secret"), "w") as f:
+            f.write("ignored")
+        self.assertFalse(work._room_status(path)["dirty"])
+        with mock.patch.object(work, "_git_bytes",
+                               return_value=(-1, b"", b"timeout")):
+            row = work._room_status(path)
+        self.assertTrue(row["dirty"])
+        self.assertIn("status failed", row["unknown"])
 
 
 class GuardTest(WorkBase):
