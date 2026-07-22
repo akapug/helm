@@ -2165,45 +2165,48 @@ class RosterReportTest(SeatsBase):
         self.assertIn("fresh", out)
 
 
-class RosterReaperTest(SeatsBase):
-    """G-roster-reaper: the roster only ever grew — permanently-absent /tmp
-    throwaways piled up with orphan cursor/seen/latch files."""
+class ReportNeverMutatesTest(SeatsBase):
+    """codex-2 HIGH: roster_report auto-ran the legacy reap_roster, which
+    deleted ANY stale row on presence alone — an inactive-but-fully-persisted
+    seat lost its row to a 3s web poll, bypassing gc's transcript/process
+    evidence and the manual dry-run gate. The legacy path is DELETED, not
+    fenced: a report is a READ, cleanup has exactly one owner (gc_roster)."""
 
-    def test_stale_row_and_orphan_state_reaped_fresh_survives(self):
-        seats.join(seat="fresh", session="s-f", cwd="/tmp/p")
-        seats.join(seat="stale", session="s-s", cwd="/tmp/p")
-        with open(seats._stop_fp_path("main", "stale", "s-s"), "w") as f:
-            f.write("fp")                       # a stop latch orphan too
-        old = time.time() - 2 * seats.REAP_S
-        os.utime(seats.seen_path("stale"), (old, old))
-        reaped = seats.reap_roster()
-        self.assertEqual(reaped, ["stale"])
-        self.assertNotIn("stale", seats.roster())
-        self.assertIn("fresh", seats.roster())          # fresh row survives
+    def test_legacy_auto_reap_is_gone(self):
+        self.assertFalse(hasattr(seats, "reap_roster"))
+
+    def test_report_keeps_a_stale_seat_row_identical(self):
+        """codex-2's exact probe: persisted seat present before
+        roster_report(), row byte-identical after — no matter how stale its
+        presence is, the report consults NO deletion evidence at all."""
+        seats.join(seat="idle-persisted", session="s-idle", cwd="/tmp/p")
+        with open(seats._stop_fp_path("main", "idle-persisted", "s-idle"),
+                  "w") as f:
+            f.write("fp")                       # keyed state must survive too
+        old = time.time() - 10 * seats.REAP_S
+        os.utime(seats.seen_path("idle-persisted"), (old, old))
+        before = seats.roster()["idle-persisted"]
+        rep = seats.roster_report("main")
+        self.assertEqual(seats.roster()["idle-persisted"], before)
+        self.assertIn("idle-persisted", [s["seat"] for s in rep["seats"]])
         names = os.listdir(chat.chat_dir())
-        self.assertFalse([n for n in names
-                          if seats._seat_key("stale") in n])   # whole tail gone
         self.assertTrue([n for n in names
-                         if seats._seat_key("fresh") in n])    # fresh state kept
+                         if seats._seat_key("idle-persisted") in n])
 
-    def test_report_reaps_and_cli_hides_absent_behind_all(self):
+    def test_cli_hides_absent_rows_but_deletes_nothing(self):
         seats.join(seat="live", session="s-l", cwd="/tmp/p")
         seats.join(seat="gone", session="s-g", cwd="/tmp/p")
         old = time.time() - 2 * seats.REAP_S
         os.utime(seats.seen_path("gone"), (old, old))
-        rep = seats.roster_report("main")               # the report's GC leg
-        self.assertEqual([s["seat"] for s in rep["seats"]], ["live"])
-        # absent-but-not-yet-reap-age rows hide behind --all in the CLI
-        seats.write_roster("napping")
-        nap = time.time() - seats.QUIET_S - 60
-        os.utime(seats.seen_path("napping"), (nap, nap))
         rc, out, _ = self.cmd("seats")
         self.assertEqual(rc, 0)
         self.assertIn("live", out)
-        self.assertNotIn("napping", out)
+        self.assertNotIn("gone", out)           # hidden, never deleted
         self.assertIn("hidden", out)
+        self.assertIn("seat gc", out)           # the one cleanup owner, named
         rc, out, _ = self.cmd("seats", ["--all"])
-        self.assertIn("napping", out)
+        self.assertIn("gone", out)
+        self.assertIn("gone", seats.roster())   # the row itself survived
 
     def test_fresh_roster_poll_never_writes(self):
         """The web panel polls the report every 3s — an all-fresh roster must
@@ -2525,9 +2528,112 @@ class RosterGcTest(SeatsBase):
         self.assertIn("kept-live", seats.roster())
         self.assertFalse(os.path.exists(seen))             # state went with it
 
+    def test_gc_trusts_the_census_for_helm_seat_home_transcripts(self):
+        """codex-2 HIGH (finding 1): the old hand-rolled root list omitted
+        ~/.helm/_global/seats/**/claude/projects, so an inactive-but-fully-
+        persisted proxy seat probed as junk (codex-2's own transcript root
+        was missing). roots=None now delegates to session's persistence
+        census — the ONE truth owner — which walks the seat homes."""
+        from helm import home as _home, transcripts
+        self._row("proxy", session="sid-proxy-1")
+        proj = os.path.join(_home.global_dir(), "seats", "codex",
+                            "instances", "codex-2", "claude", "projects",
+                            "slug-x")
+        os.makedirs(proj)
+        open(os.path.join(proj, "sid-proxy-1.jsonl"), "w").close()
+        _roots, proc = self._empty_dirs()
+        with mock.patch.object(transcripts, "get_catalog",
+                               return_value={"rows": []}):
+            rows, pruned = seats.gc_roster(apply=True, roots=None,
+                                           proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("transcript exists", rows[0]["why"])
+        self.assertEqual(pruned, [])
+        self.assertIn("proxy", seats.roster())
+
+    def test_gc_incomplete_census_fails_closed(self):
+        """A census that could not finish proves nothing — the row stays."""
+        from helm import session
+        self._row("murky", session="sid-murky-1")
+        _roots, proc = self._empty_dirs()
+        bad = session._PersistenceCensus({}, complete=False)
+        with mock.patch.object(session, "_persisting_sids",
+                               return_value=bad):
+            rows, pruned = seats.gc_roster(apply=True, roots=None,
+                                           proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("census incomplete", rows[0]["why"])
+        self.assertEqual(pruned, [])
+        self.assertIn("murky", seats.roster())
+
+    def test_gc_apply_recheck_keeps_row_when_transcript_lands_late(self):
+        """codex-2 HIGH (finding 3): victims were computed before the lock
+        and the under-lock recheck was presence-only — a transcript flushing
+        between scan and apply still lost the row. The FULL evidence probe
+        now re-runs fresh under the roster lock."""
+        self._row("late", session="sid-late-9")
+        roots, proc = self._empty_dirs()
+        tdir = os.path.join(roots[0], "proj-slug")
+        os.makedirs(tdir)
+        real = seats._flocked
+
+        @contextlib.contextmanager
+        def landing(path):
+            open(os.path.join(tdir, "sid-late-9.jsonl"), "w").close()
+            with real(path):
+                yield
+        with mock.patch.object(seats, "_flocked", landing):
+            rows, pruned = seats.gc_roster(apply=True, roots=roots,
+                                           proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["prune"])  # scan-time
+        self.assertEqual(pruned, [])            # the locked recheck refused
+        self.assertIn("late", seats.roster())
+        self.assertTrue(os.path.exists(seats.seen_path("late")))
+
+    def test_gc_process_read_oserror_keeps_the_row(self):
+        """codex-2 HIGH (finding 3): a same-uid process whose cmdline/environ
+        cannot be read is probe TROUBLE, not absence — the row stays."""
+        self._row("murkyproc", session="sid-murkyproc-5")
+        roots, proc = self._empty_dirs()
+        os.makedirs(os.path.join(proc, "5150", "cmdline"))  # open -> EISDIR
+        rows, pruned = seats.gc_roster(apply=True, roots=roots, proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("fail closed", rows[0]["why"])
+        self.assertEqual(pruned, [])
+        self.assertIn("murkyproc", seats.roster())
+
+    def test_gc_exited_process_is_absence_not_trouble(self):
+        """A pid that vanished mid-scan (ENOENT) is proven not-live — it must
+        NOT fail-close the whole gc into a no-op."""
+        self._row("plainjunk", session="sid-plainjunk-2")
+        roots, proc = self._empty_dirs()
+        os.makedirs(os.path.join(proc, "777"))   # exited: no cmdline/environ
+        rows, pruned = seats.gc_roster(apply=True, roots=roots, proc_dir=proc)
+        self.assertEqual(pruned, ["plainjunk"])
+
+    def test_gc_keeps_sidless_row_with_live_helm_chat_name(self):
+        """codex-2 HIGH (finding 3): a row with NO remembered session had no
+        process evidence at all. A live environ carrying HELM_CHAT_NAME=<seat>
+        is a live seat, never junk."""
+        self._row("envseat")                     # no session remembered
+        roots, proc = self._empty_dirs()
+        pdir = os.path.join(proc, "6001")
+        os.makedirs(pdir)
+        with open(os.path.join(pdir, "environ"), "wb") as f:
+            f.write(b"PATH=/usr/bin\x00HELM_CHAT_NAME=envseat\x00LANG=C\x00")
+        rows, pruned = seats.gc_roster(apply=True, roots=roots, proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("HELM_CHAT_NAME=envseat", rows[0]["why"])
+        self.assertEqual(pruned, [])
+        self.assertIn("envseat", seats.roster())
+
     def test_gc_cli_dry_run_default(self):
+        from helm import session
         self._row("cli-junk", session="sid-cli-junk-3")
-        rc, out, err = self.cmd("seat", ["gc"])
+        empty = session._PersistenceCensus({}, complete=True)
+        with mock.patch.object(session, "_persisting_sids",
+                               return_value=empty):
+            rc, out, err = self.cmd("seat", ["gc"])
         self.assertEqual(rc, 0, err)
         self.assertIn("dry-run", out)
         self.assertIn("cli-junk", seats.roster())          # verb never applied

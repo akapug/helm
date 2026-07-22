@@ -2,6 +2,23 @@
 
 ## Unreleased (0.2)
 
+- Roster GC gets ONE evidence owner (codex-2's independent review, three
+  HIGHs closed). (1) Transcript truth is no longer a hand-rolled root list —
+  `seat gc` delegates to session's persistence census, which covers helm's
+  own seat homes (`~/.helm/_global/seats/**/claude/projects`); the old list
+  omitted them, so an inactive-but-fully-persisted proxy seat probed as
+  junk. The catalog now also scans `~/.claude-homes/*/projects` so the one
+  owner keeps the coverage the deleted list had. (2) The legacy auto-reap
+  that rode `roster_report` is DELETED, not fenced: it dropped any stale row
+  on presence alone, bypassing every transcript/process guard and the
+  dry-run gate — a report is a read; only `seat gc --apply` deletes.
+  (3) `--apply` re-runs the FULL keep-evidence probe fresh under the roster
+  lock before each deletion (a transcript flushing between scan and apply
+  wins); the process probe is same-uid scoped, counts a live
+  `HELM_CHAT_NAME=<seat>` environ for rows with no remembered session, and
+  any same-uid read failure keeps the row (only a pid proven exited
+  mid-scan — ENOENT/ESRCH — reads as absence, so gc never degenerates into
+  a fail-closed no-op).
 - Home-room scatter, as-prevented (owner mandate: "how they got scattered —
   needs to be as-prevented"). A live roster held THREE `home_room` truths for
   one team — `main` (the spawn mirror defaulted `room or "main"` and

@@ -648,8 +648,9 @@ def rename_seat(old, new):
         # case-INSENSITIVE taken-check: _seat_key casefolds, the reserved check
         # lowers, and _mention_re is re.I — a case-variant name (KIMI vs kimi)
         # is the SAME address + the SAME keyed state downstream, so two such
-        # rows alias mentions, share presence, and cross-fire the reaper onto
-        # the live seat's state (kimi cross-family review, live-probed 2026-07-21).
+        # rows alias mentions, share presence, and cross-fire gc's state
+        # unlink onto the live seat (kimi cross-family review, live-probed
+        # 2026-07-21).
         # Exclude `seat` itself so a pure self-case-change isn't falsely blocked.
         if any(k != seat and k.casefold() == new.casefold() for k in r):
             return False, ("seat name %r is taken (case-insensitive — the "
@@ -1123,7 +1124,7 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
     touch_seen(seat)                       # presence FIRST — a seat muted by the
     if (home.env("CHAT_DELIVER") or "").lower() in ("0", "off", "no"):
         return None                        # kill-switch below is still ALIVE:
-                                           # keep its row fresh so it isn't reaped
+                                           # its presence beat keeps gc off it
     sc = scope if scope is not None else seat_scope(seat)
     # Global order is roster -> cursor: rehome/join baseline cursors while the
     # roster lock is held. Register an unknown session BEFORE taking its cursor
@@ -1932,12 +1933,14 @@ def presence_of(ls):
     return "fresh" if age < FRESH_S else "quiet" if age < QUIET_S else "absent"
 
 
-REAP_S = 3600   # a roster row unseen this long is a throwaway — reap it
+REAP_S = 3600   # presence window: a beat this recent is live evidence on its
+                # own (gc's first keep tier; the CLI hides older rows behind
+                # --all). Presence ALONE never deletes anything anymore.
 
 
 def _unlink_seat_state(seat):
     """Remove every state file keyed on the seat (cursors + locks +
-    per-session variants, .seen, stop latches) — the orphan tail a reaped
+    per-session variants, .seen, stop latches) — the orphan tail a pruned
     row would otherwise leave in the room dir forever. Fail-open per file."""
     key = _seat_key(seat)
     d = chat.chat_dir()
@@ -1958,51 +1961,6 @@ def _unlink_seat_state(seat):
                 pass
 
 
-def reap_roster(max_age=REAP_S, now=None):
-    """G-roster-reaper -> [reaped seats]. The roster only ever GREW — /tmp
-    throwaway sessions piled up as permanently-absent rows with orphan
-    cursor/seen/latch files. Drop rows unseen for max_age+ and unlink their
-    state. Presence truth is the .seen mtime: deliver touches it at every
-    boundary and an armed beacon's wait loop delivers, so a live-but-idle
-    seat stays fresh; a reaped seat that returns self-heals at its next
-    boundary (cursor re-baselines — acceptable for something absent an
-    hour). Lock-free probe first: the web panel polls the report every 3s
-    and must not churn the roster — only an actually-stale row takes the
-    flock (claims_list's exact pattern). Fail-open total."""
-    now = time.time() if now is None else now
-    cut = now - max_age
-    try:
-        r = roster()
-        if not any((last_seen(s, row) or 0) < cut for s, row in r.items()):
-            return []
-        victims = []
-        with _flocked(roster_path() + ".lock"):
-            r = roster()
-            for s in list(r):
-                if (last_seen(s, r[s]) or 0) < cut:
-                    del r[s]
-                    victims.append(s)
-            if victims:
-                pk.write_json(roster_path(), r)
-        for s in victims:
-            _unlink_seat_state(s)
-        return victims
-    except Exception:
-        return []
-
-
-def _transcript_roots():
-    """Harness transcript stores on this host (claude + per-account homes,
-    codex + codex-homes) — ground truth for `this session existed here`."""
-    hm = os.path.expanduser("~")
-    return ([os.path.join(hm, ".claude", "projects")]
-            + sorted(glob.glob(os.path.join(hm, ".claude-homes", "*",
-                                            "projects")))
-            + [os.path.join(hm, ".codex", "sessions")]
-            + sorted(glob.glob(os.path.join(hm, ".codex-homes", "*",
-                                            "sessions"))))
-
-
 def _transcript_exists(sid, roots):
     """Any transcript file naming the session under any harness store:
     claude's <root>/<proj-slug>/<sid>.jsonl, codex's nested
@@ -2019,68 +1977,118 @@ def _transcript_exists(sid, roots):
     return False
 
 
-def _live_process_evidence(sids, proc_dir="/proc"):
-    """True when any live process's cmdline/environ names one of the session
-    ids — or when the process table cannot be listed at all (FAIL-CLOSED: no
-    scan means no prune). Per-process read errors are normal churn (exited
-    pids, foreign-uid environ) and skip only that process."""
-    needles = [str(s).encode("utf-8") for s in sids if s]
-    if not needles:
-        return False
+def _transcript_hit(sids, roots=None):
+    """First remembered session with a transcript on this host, else None.
+    Root discovery is NOT ours: session's persistence census
+    (session._persisting_sids) is the ONE truth owner — the catalog roots
+    (~/.claude + ~/.claude-homes, ~/.codex + ~/.codex-homes) PLUS every helm
+    seat home (~/.helm/_global/seats/**/claude/projects). The previous
+    hand-rolled root list here omitted helm's own seat stores, so an
+    inactive-but-fully-persisted proxy seat probed as junk (codex-2's live
+    reproduction: its own transcript root missing from the list). An
+    explicit roots list (tests / a foreign store) is globbed directly. An
+    INCOMPLETE census raises — probe trouble must keep the row, never pass
+    as proven-absent."""
+    if roots is not None:
+        return next((s for s in sids if _transcript_exists(s, roots)), None)
+    from . import session
+    census = session._persisting_sids()
+    hit = next((s for s in sids if s in census), None)
+    if hit is None and not getattr(census, "complete", True):
+        raise RuntimeError("persistence census incomplete")
+    return hit
+
+
+def _live_process_evidence(seat, sids, proc_dir="/proc"):
+    """Keep-reason when a live process of THIS uid references the seat — its
+    cmdline/environ naming a remembered session id, or its environ carrying
+    HELM_CHAT_NAME=<seat> (a joined pane whose row remembers no session is
+    still a live seat, not junk). FAIL-CLOSED: an unlistable table, or ANY
+    same-uid process whose cmdline/environ cannot be read, returns a
+    keep-reason — an unfinished scan never testifies to absence. Scope is
+    same-uid on purpose: a foreign-uid process cannot host this user's
+    harness, and its environ is unreadable by kernel design — counting that
+    as trouble would fail-close every gc on any real host into a no-op. A
+    process that EXITED mid-scan (ENOENT/ESRCH) is proven not-live and skips
+    — that is evidence of absence, not probe trouble."""
+    sid_needles = [str(s).encode("utf-8") for s in sids if s]
+    seat_needles = [("%s=%s" % (var, seat)).encode("utf-8") + b"\0"
+                    for var in ("HELM_CHAT_NAME", "MELD_CHAT_NAME")]
     try:
+        me = os.getuid()
         pids = [n for n in os.listdir(proc_dir) if n.isdigit()]
-    except OSError:
-        return True
+    except OSError as e:
+        return "process table unlistable (%s) — fail closed" % e
     for pid in pids:
+        pdir = os.path.join(proc_dir, pid)
+        try:
+            if os.stat(pdir).st_uid != me:
+                continue
+        except OSError:
+            continue                    # exited between listdir and stat
         blob = b""
         for leaf in ("cmdline", "environ"):
             try:
-                with open(os.path.join(proc_dir, pid, leaf), "rb") as f:
+                with open(os.path.join(pdir, leaf), "rb") as f:
                     blob += f.read(1 << 20)
-            except OSError:
-                continue
-        if any(n in blob for n in needles):
-            return True
-    return False
+            except (FileNotFoundError, ProcessLookupError):
+                continue                # exited mid-scan: proven not-live
+            except OSError as e:
+                return ("process %s %s unreadable (%s) — fail closed"
+                        % (pid, leaf, e.__class__.__name__))
+        if any(n in blob for n in sid_needles):
+            return "a live process references a remembered session"
+        if any(n in blob for n in seat_needles):
+            return "a live process carries HELM_CHAT_NAME=%s" % seat
+    return None
+
+
+def _gc_keep_reason(seat, row, roots, proc_dir, now):
+    """The ONE keep-evidence probe — the dry-run scan AND the locked apply
+    both run THIS, so no deletion path can ever act on less evidence than
+    the report showed. Returns the keep reason, or None (prunable junk).
+    Any raise is probe trouble: the caller keeps the row (fail closed)."""
+    sids = [x for x in [row.get("session")]
+            + list(row.get("sessions") or []) if x]
+    ls = last_seen(seat, row)
+    if ls and now - ls < REAP_S:
+        return "presence beat %dm ago" % max(0, int((now - ls) / 60))
+    hit = _transcript_hit(sids, roots)
+    if hit:
+        return "transcript exists for session %.12s" % hit
+    return _live_process_evidence(seat, sids, proc_dir)
 
 
 def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
-    """The MANUAL roster GC (`helm chat seat gc`) — a verb someone RUNS,
-    never automatic. reap_roster handles ordinary staleness; this handles
-    JUNK rows (the /tmp throwaway class) that keep re-appearing: rows whose
-    remembered sessions left NO transcript on this host and are referenced
-    by NO live process. REFUSAL IS THE DEFAULT — a row is kept on ANY live
-    evidence:
+    """The roster's ONE cleanup owner (`helm chat seat gc`) — a verb someone
+    RUNS, never automatic, and the only code allowed to delete a roster row.
+    (The legacy auto-reap that rode roster_report deleted any stale row on
+    presence ALONE — an inactive-but-fully-persisted seat lost its row to a
+    3-second web poll, bypassing every transcript/process guard and the
+    dry-run gate. Retired, not fenced: a report is a read.) Targets JUNK
+    rows (the /tmp throwaway class). REFUSAL IS THE DEFAULT — a row is kept
+    on ANY live evidence (_gc_keep_reason, the one probe):
       * a presence beat within REAP_S (.seen mtime / roster last_seen),
-      * a transcript for ANY remembered session, in ANY harness store,
-      * a live process naming ANY remembered session id,
+      * a transcript for ANY remembered session, anywhere the session
+        census covers (incl. helm's own seat homes),
+      * a live same-uid process naming ANY remembered session id or
+        carrying the seat's HELM_CHAT_NAME,
       * probe trouble of any kind (fail-closed).
     Returns (rows, pruned): rows = [{seat, verdict: keep|prune, why}] for the
-    whole roster; dry-run (apply=False) prunes NOTHING. apply=True deletes
-    only the prune rows (freshness re-checked under the roster lock) plus
-    their derived seat state (_unlink_seat_state — cursors, .seen, latches,
-    the RAM DM lane)."""
+    whole roster; dry-run (apply=False) prunes NOTHING. apply=True deletes a
+    scan-flagged row only after the FULL evidence probe re-runs fresh under
+    the roster lock (TOCTOU: a transcript flushing or a presence beat
+    landing between scan and apply must win), then unlinks its derived seat
+    state (_unlink_seat_state — cursors, .seen, latches, the RAM DM lane)."""
     now = time.time() if now is None else now
-    roots = _transcript_roots() if roots is None else roots
     rows = []
     for s, row in sorted(roster().items()):
         sids = [x for x in [row.get("session")]
                 + list(row.get("sessions") or []) if x]
-        ls = last_seen(s, row)
-        why = None
-        if ls and now - ls < REAP_S:
-            why = "presence beat %dm ago" % max(0, int((now - ls) / 60))
-        if why is None:
-            try:
-                hit = next((sid for sid in sids
-                            if _transcript_exists(sid, roots)), None)
-            except Exception as e:            # fail-closed, loudly
-                why = "transcript probe failed (%s)" % e
-                hit = None
-            if hit:
-                why = "transcript exists for session %.12s" % hit
-        if why is None and _live_process_evidence(sids, proc_dir):
-            why = "a live process references a remembered session"
+        try:
+            why = _gc_keep_reason(s, row, roots, proc_dir, now)
+        except Exception as e:                # fail-closed, loudly
+            why = "keep-evidence probe failed (%s)" % e
         rows.append({
             "seat": s, "verdict": "keep" if why else "prune",
             "why": why or (
@@ -2095,10 +2103,17 @@ def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
             with _flocked(roster_path() + ".lock"):
                 r = roster()
                 for s in list(r):
-                    ls = last_seen(s, r[s])
-                    if s in victims and not (ls and time.time() - ls < REAP_S):
-                        del r[s]              # re-checked fresh? refuse.
-                        pruned.append(s)
+                    if s not in victims:
+                        continue
+                    try:      # the SAME full probe, fresh, under the lock
+                        keep = _gc_keep_reason(s, r[s], roots, proc_dir,
+                                               time.time())
+                    except Exception:         # fail closed under the lock too
+                        keep = "probe trouble"
+                    if keep:
+                        continue              # evidence landed since the scan
+                    del r[s]
+                    pruned.append(s)
                 if pruned:
                     pk.write_json(roster_path(), r)
             for s in pruned:
@@ -2108,10 +2123,12 @@ def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
 
 def roster_report(room="main"):
     """{"seats": [...], "claims": [...]} — fail-open by caller. Pending is
-    computed from each seat's cursor WITHOUT moving it. One GC leg rides the
-    read (claims_list's precedent): rows absent past REAP_S are reaped here,
-    so every live surface (CLI table, web panel) keeps the roster clean."""
-    reap_roster()
+    computed from each seat's cursor WITHOUT moving it. A report is a READ:
+    it deletes NOTHING. (The legacy auto-reap that rode this verb was a
+    second cleanup owner, dropping stale rows on presence alone — a
+    persisted seat vanished on a poll while gc's evidence probe would have
+    kept it. Cleanup has ONE owner now: gc_roster, a verb someone runs.
+    Absent rows merely hide behind --all in the surfaces.)"""
     seats = []
     for seat, row in sorted(roster().items()):
         # pending is the MULTI-ROOM truth (the owner's panel must show a
@@ -2324,9 +2341,9 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
         rep = roster_report(room)
         rows = rep["seats"]
         hidden = 0
-        if "--all" not in args:      # absent rows hide by default (rows past
+        if "--all" not in args:      # absent rows hide by default (junk rows
             shown = [s for s in rows if s["presence"] != "absent"]
-            hidden = len(rows) - len(shown)          # REAP_S are already gone)
+            hidden = len(rows) - len(shown)          # leave via seat gc only)
             rows = shown
         if not rows and not hidden:
             print("helm chat: no seats yet — sessions join on their next start "
@@ -2347,8 +2364,9 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                 w, s["seat"], s["presence"], s["pending"],
                 (s.get("project") or ""), scope, source, task))
         if hidden:
-            print("  (%d absent seat%s hidden — --all shows them; unseen "
-                  ">%dm reaps them)" % (hidden, "s"[:hidden != 1], REAP_S // 60))
+            print("  (%d absent seat%s hidden — --all shows them; `helm chat "
+                  "seat gc` prunes evidence-free rows)"
+                  % (hidden, "s"[:hidden != 1]))
         for c in rep["claims"]:
             print("  claim: %s -> %s (%ds left, fence %s)" % (
                 c["resource"], c["holder"], c["remaining"], c["fence"]))

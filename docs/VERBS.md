@@ -1599,9 +1599,10 @@ frames; this lane is called *delivery*.)
 - **`helm chat seats [--all]`** — the roster table: presence (fresh <2m /
   quiet <15m / absent, off the last tool boundary), pending deliveries, each
   seat's active home + provenance (`#helm (derived)`, `#team (operator)`, or
-  `all`), and live claims. Absent rows hide by default (`--all` shows them), and rows unseen
-  **>1h are REAPED** together with their orphan cursor/seen/latch files (the
-  reaper rides every report read — the roster no longer only grows). The
+  `all`), and live claims. Absent rows hide by default (`--all` shows them).
+  The report is a pure READ — it deletes nothing (the legacy auto-reap that
+  rode it dropped stale-but-persisted seats on presence alone; retired).
+  Junk rows leave only via `helm chat seat gc`, the one cleanup owner. The
   web twin is the **seats** panel in the ledger tab (`GET /api/chat/roster`).
 - **`helm chat seat rename <sid|oldname> <newname>`** — bind a live agent to
   a memorable @name (`old` = seat name or an 8+-char session-id prefix). The
@@ -1634,14 +1635,20 @@ frames; this lane is called *delivery*.)
   all-room scope. Newly admitted rooms baseline at current EOF, so destination
   history and traffic accumulated while the seat was away never replay. The
   operator choice survives later project-derived SessionStart joins.
-- **`helm chat seat gc [--apply]`** — the MANUAL roster junk pruner (a verb
-  someone runs, never automatic; dry-run default). Prunes only rows with NO
-  live evidence: no presence beat within the reap window, no transcript for
-  ANY remembered session in any harness store, and no live process naming
-  one — the `/tmp` throwaway class. Refusal is the default and every probe
-  fails CLOSED (an unreadable process table prunes nothing). `--apply`
-  removes the row plus its derived seat state (cursors, `.seen`, stop
-  latches, the RAM DM lane).
+- **`helm chat seat gc [--apply]`** — the roster's ONE cleanup owner (a verb
+  someone runs, never automatic; dry-run default; no other code deletes a
+  roster row). Prunes only rows with NO live evidence: no presence beat
+  within the reap window, no transcript for ANY remembered session anywhere
+  the session persistence census covers (`~/.claude`, `~/.claude-homes`,
+  `~/.codex`, `~/.codex-homes`, **and helm's own seat homes** under
+  `~/.helm/_global/seats/`), and no live same-uid process naming a
+  remembered session or carrying the seat's `HELM_CHAT_NAME` — the `/tmp`
+  throwaway class. Refusal is the default and every probe fails CLOSED (an
+  unlistable process table, an unreadable same-uid process, or an incomplete
+  census prunes nothing). `--apply` re-runs the FULL evidence probe fresh
+  under the roster lock before each deletion (evidence landing between scan
+  and apply wins), then removes the row plus its derived seat state
+  (cursors, `.seen`, stop latches, the RAM DM lane).
 - **`helm chat claim <resource> [--ttl N] [--lease ID]` /
   `release <resource> --lease ID` / `claims`** — the advisory TTL lease
   (meld claims, minus the cap-gate): refused while another holder's lease is
