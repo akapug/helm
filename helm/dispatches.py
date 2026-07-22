@@ -27,6 +27,12 @@ from . import eventledger, home, pk
 LEDGER = "dispatches.jsonl"
 DEFAULT_DEADLINE_S = 2700
 MAX_DEADLINE_S = 31 * 24 * 60 * 60
+# The reduced core landed 2026-07-22 ~19:22Z; the newest legacy row on the
+# live ledger is 09:13Z. Compat branches replay ONLY rows stamped before this
+# boundary, so an event appended after landing can never drive the removed
+# machinery — replay distinguishes an old retarget from a fresh one by when
+# it claims to have been written (fail-closed: a missing ts is never compat).
+LEGACY_COMPAT_BOUNDARY = "2026-07-22T12:00:00Z"
 _ID = re.compile(r"[0-9a-f]{8,64}\Z")
 _TIP = re.compile(r"[0-9a-f]{40,64}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
@@ -108,11 +114,19 @@ def _resolve_tip(repo, ref):
     return tip if _TIP.fullmatch(tip) else None
 
 
+def _int_seq(value, fallback):
+    """Adopt a row's seq only when it is a real integer — a type-corrupt seq
+    must never enter replay state, where int(state.seq)+1 would crash."""
+    return value if isinstance(value, int) else fallback
+
+
 def _valid_identity(row):
     if not _ID.fullmatch(str(row.get("id") or "")):
         return False
     if not _TOKEN.fullmatch(str(row.get("recipient") or "")):
         return False
+    if row.get("seq") is not None and not isinstance(row.get("seq"), int):
+        return False              # type-corrupt seq would crash replay
     lane, err = _clean(row.get("lane"), "lane", 160)
     if err or lane != row.get("lane"):
         return False
@@ -179,25 +193,30 @@ def _apply(state, row):
         return state
     event = row.get("event")
     legacy = state.get("v") != 3
+    # Compat replays ONLY rows stamped before the reduced core landed: an
+    # event appended today can never drive the removed machinery, however
+    # well-shaped. Missing ts is never compat (fail-closed, "~" sorts high).
+    compat = legacy and str(row.get("ts") or "~") < LEGACY_COMPAT_BOUNDARY
     # Historical full-snapshot compatibility.
-    if event is None and legacy:
-        if row.get("status") == "verdict" and row.get("verdict_ref"):
+    if event is None:
+        if compat and row.get("status") == "verdict" and row.get("verdict_ref"):
             out = dict(state)
             out.update(status="verdict", verdict_ref=row.get("verdict_ref"),
                        reviewed_tip=row.get("reviewed_tip") or state.get("tip"))
             return out
         return state
-    if event == "retarget" and legacy \
+    if event == "retarget" and compat \
             and _TIP.fullmatch(str(row.get("tip") or "")):
         # Compatibility only for already-written rows; there is no shipping verb.
         out = dict(state)
         out.update(tip=str(row["tip"]).lower(), ref=row.get("ref"),
-                   migration=None, seq=row.get("seq", state.get("seq", 0)))
+                   migration=None,
+                   seq=_int_seq(row.get("seq"), state.get("seq", 0)))
         return out
     expected = int(state.get("seq") or 0) + 1
     strict = row.get("v") == 3 and row.get("seq") == expected
     if event == "delivered" and state["status"] == "open" \
-            and (strict or legacy):
+            and (strict or compat):
         ref, err = _clean(row.get("delivery_ref"), "delivery ref", 256)
         if err:
             return state
@@ -205,7 +224,7 @@ def _apply(state, row):
         out.update(delivery="observed", delivery_ref=ref, seq=expected)
         return out
     if event == "verdict" and state["status"] == "open" \
-            and (strict or legacy):
+            and (strict or compat):
         reviewed = str(row.get("reviewed_tip") or "").lower()
         evidence, err = _clean(row.get("verdict_ref"), "verdict evidence", 256)
         if state.get("tip") and reviewed == state["tip"] and not err:
@@ -214,19 +233,19 @@ def _apply(state, row):
                        verdict_ref=evidence, seq=expected)
             return out
         return state
-    # Historical snapshot verdicts/retarget-derived verdicts (legacy only).
-    if legacy and row.get("status") == "verdict" and row.get("verdict_ref"):
+    # Historical snapshot verdicts/retarget-derived verdicts (compat only).
+    if compat and row.get("status") == "verdict" and row.get("verdict_ref"):
         reviewed = str(row.get("reviewed_tip") or state.get("tip") or "").lower()
         if not state.get("tip") or reviewed == state.get("tip"):
             out = dict(state)
             out.update(status="verdict", reviewed_tip=reviewed or None,
                        verdict_ref=row.get("verdict_ref"),
-                       seq=row.get("seq", state.get("seq", 0)))
+                       seq=_int_seq(row.get("seq"), state.get("seq", 0)))
             return out
-    if legacy and row.get("delivery_ref") and state["status"] == "open":
+    if compat and row.get("delivery_ref") and state["status"] == "open":
         out = dict(state)
         out.update(delivery="observed", delivery_ref=row.get("delivery_ref"),
-                   seq=row.get("seq", state.get("seq", 0)))
+                   seq=_int_seq(row.get("seq"), state.get("seq", 0)))
         return out
     return state
 
@@ -237,13 +256,19 @@ def snapshot():
         return {}, unavailable
     out = {}
     for row in events:
-        rid = str(row.get("id") or "")
-        if rid not in out:
-            state = _new_state(row)
-            if state:
-                out[rid] = state
-        else:
-            out[rid] = _apply(out[rid], row)
+        # One malformed row must never blind the whole ledger: a crash here
+        # would turn every obligation into "no usable obligations" — worse
+        # than skipping the bad row and keeping every good state intact.
+        try:
+            rid = str(row.get("id") or "")
+            if rid not in out:
+                state = _new_state(row)
+                if state:
+                    out[rid] = state
+            else:
+                out[rid] = _apply(out[rid], row)
+        except Exception:
+            continue
     return out, None
 
 

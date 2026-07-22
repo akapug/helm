@@ -288,20 +288,28 @@ class AtomicSendTest(DispatchBase):
         self.assertNotEqual(one["delivery_ref"], two["delivery_ref"])
 
 
+OLD_TS = "2026-07-01T00:00:00Z"     # before LEGACY_COMPAT_BOUNDARY
+
+
 class HistoricalCompatTest(DispatchBase):
     """The shipping surface is dispatch/delivered/verdict only. Rows the old
     schemas already wrote keep replaying truthfully — never rebound, never
-    silently dropped — and the removed verbs stay removed."""
+    silently dropped — and the removed verbs stay removed. Compat honors only
+    rows stamped BEFORE the boundary: appending removed-class events today
+    drives nothing, however well-shaped."""
+
+    def _legacy_open(self, rid, ref, ts=OLD_TS, lane=None):
+        row = {"id": rid, "ts": ts, "recipient": "codex-3",
+               "lane": lane or ("legacy-" + rid), "ref": ref, "note": None,
+               "deadline_s": 60, "source": "old", "status": "open",
+               "ack_ref": None, "verdict_ref": None, "last_updated": ts}
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), row))
+        return row
 
     def test_already_written_retarget_rows_still_replay_for_legacy_opens(self):
-        ts = dispatches.pk.now_ts()
-        legacy = {"id": "ce1e7dd0", "ts": ts, "recipient": "codex-3",
-                  "lane": "legacy", "ref": self.a[:7], "note": None,
-                  "deadline_s": 60, "source": "old", "status": "open",
-                  "ack_ref": None, "verdict_ref": None, "last_updated": ts}
-        self.assertTrue(eventledger.append(dispatches.ledger_path(), legacy))
+        self._legacy_open("ce1e7dd0", self.a[:7], lane="legacy")
         move = {"id": "ce1e7dd0", "event": "retarget", "tip": self.b,
-                "ref": self.b, "ts": dispatches.pk.now_ts()}
+                "ref": self.b, "ts": OLD_TS}
         self.assertTrue(eventledger.append(dispatches.ledger_path(), move))
         got = dispatches.rows()["ce1e7dd0"]
         self.assertEqual(got["tip"], self.b)
@@ -312,6 +320,75 @@ class HistoricalCompatTest(DispatchBase):
         closed, why = dispatches.mark_verdict("ce1e7dd0", self.b, "reviewed-b")
         self.assertIsNone(why)
         self.assertEqual(closed["reviewed_tip"], self.b)
+
+    def test_fresh_retarget_after_boundary_never_rebinds(self):
+        # codex round-1 HIGH: a retarget appended TODAY must be inert — the
+        # row stays needs-redispatch and can never become verdict-closable.
+        self._legacy_open("ce1e7dd0", self.a[:7], lane="legacy")
+        move = {"id": "ce1e7dd0", "event": "retarget", "tip": self.b,
+                "ref": self.b, "ts": dispatches.pk.now_ts()}
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), move))
+        got = dispatches.rows()["ce1e7dd0"]
+        self.assertIsNone(got["tip"])
+        self.assertEqual(got["migration"], "needs-redispatch")
+        blocked, why = dispatches.mark_verdict("ce1e7dd0", self.b, "evidence")
+        self.assertIsNone(blocked)
+        self.assertIn("redispatch", why)
+        # a retarget with NO ts at all is never compat either (fail-closed)
+        bare = {"id": "ce1e7dd0", "event": "retarget", "tip": self.c,
+                "ref": self.c}
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), bare))
+        self.assertIsNone(dispatches.rows()["ce1e7dd0"]["tip"])
+
+    def test_fresh_snapshot_close_after_boundary_never_closes(self):
+        # The close-compat door obeys the same boundary: a well-shaped v1
+        # snapshot-verdict row appended today cannot close a legacy open.
+        base = self._legacy_open("1a2b3c4d", self.a[:7])
+        fake = dict(base, status="verdict", verdict_ref="forged",
+                    ts=dispatches.pk.now_ts(),
+                    last_updated=dispatches.pk.now_ts())
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), fake))
+        got = dispatches.rows()["1a2b3c4d"]
+        self.assertEqual(got["status"], "open")
+        self.assertIn("1a2b3c4d", [r["id"] for r in dispatches.open_rows()])
+
+    def test_live_ledger_shape_open_retarget_verdict_replays_closed(self):
+        # The exact shape of the three closed obligations on the real ledger:
+        # short-ref open -> retarget to an exact tip -> verdict at that tip,
+        # all pre-boundary. History must keep replaying CLOSED.
+        self._legacy_open("4f65d90d", self.a[:7])
+        for event in (
+                {"id": "4f65d90d", "event": "retarget", "tip": self.b,
+                 "ref": self.b, "ts": OLD_TS},
+                {"id": "4f65d90d", "event": "verdict", "status": "verdict",
+                 "reviewed_tip": self.b, "verdict_ref": "review-post",
+                 "ts": OLD_TS}):
+            self.assertTrue(eventledger.append(dispatches.ledger_path(), event))
+        got = dispatches.rows()["4f65d90d"]
+        self.assertEqual(got["status"], "verdict")
+        self.assertEqual(got["reviewed_tip"], self.b)
+        self.assertNotIn("4f65d90d", [r["id"] for r in dispatches.open_rows()])
+
+    def test_garbage_seq_rows_never_crash_replay_or_blind_good_rows(self):
+        # codex round-1 HIGH: a valid legacy row with seq='not-an-int' made
+        # snapshot() raise, turning EVERY obligation into "no usable
+        # obligations". The bad row is ignored; the good rows survive.
+        good = self.add()
+        bad = dict(self._legacy_open("deadc0de", self.a[:7]))
+        bad = dict(bad, id="c0ffee00", seq="not-an-int")
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), bad))
+        garbage_followup = {"id": good["id"], "v": 3, "event": "delivered",
+                            "seq": "also-not-an-int", "ts": OLD_TS,
+                            "delivery_ref": "x"}
+        self.assertTrue(eventledger.append(dispatches.ledger_path(),
+                                           garbage_followup))
+        current, unavailable = dispatches.snapshot()
+        self.assertIsNone(unavailable)
+        self.assertIn(good["id"], current)
+        self.assertIn("deadc0de", current)
+        self.assertNotIn("c0ffee00", current)          # bad row ignored
+        self.assertEqual(current[good["id"]]["delivery"],
+                         "needs-confirmation")         # garbage never applied
 
     def test_ambiguous_and_foreign_refs_are_refused_at_dispatch_time(self):
         self.git("branch", "dup", self.b)
@@ -377,17 +454,12 @@ class HistoricalCompatTest(DispatchBase):
         self.assertIn(row["id"], [r["id"] for r in dispatches.open_rows()])
 
     def test_validated_v1_no_seq_transitions_preserve_old_closures(self):
-        ts = dispatches.pk.now_ts()
-        base = {"id": "1a2b3c4d", "ts": ts, "recipient": "codex-3",
-                "lane": "legacy-close", "ref": self.a[:7], "note": None,
-                "deadline_s": 60, "source": "old", "status": "open",
-                "ack_ref": None, "verdict_ref": None, "last_updated": ts}
-        self.assertTrue(eventledger.append(dispatches.ledger_path(), base))
+        base = self._legacy_open("1a2b3c4d", self.a[:7], lane="legacy-close")
         acked = dict(base, status="acked", ack_ref="post-1",
-                     last_updated=dispatches.pk.now_ts())
+                     last_updated=OLD_TS)
         self.assertTrue(eventledger.append(dispatches.ledger_path(), acked))
         closed = dict(acked, status="verdict", verdict_ref="safe",
-                      last_updated=dispatches.pk.now_ts())
+                      last_updated=OLD_TS)
         self.assertTrue(eventledger.append(dispatches.ledger_path(), closed))
         got = dispatches.rows()[base["id"]]
         self.assertEqual(got["status"], "verdict")
