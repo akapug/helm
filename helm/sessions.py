@@ -557,7 +557,17 @@ def cmd_sessions(args):
             return 2
         pref = args[1]
         rest = args[2:]
+        flags = ("--go", "--skip-permissions", "--force")
+        valued = ("--title", "--note")
+        from .cli import guard_tail
         if pref in ("-h", "--help"):
+            # help-FIRST still guards the tail: `resume --help --bogus` used
+            # to print usage and exit 0, a soft false existence probe for
+            # --bogus. Junk beats help, same as everywhere else.
+            rc = guard_tail("helm sessions resume", rest, flags=flags,
+                            valued=valued, usage=usage)
+            if rc is not None:
+                return rc
             print("helm " + usage)
             return 0
         if pref.startswith("-"):
@@ -569,10 +579,8 @@ def cmd_sessions(args):
         # --help pretending success), and --title/--note must carry a
         # non-flag value exactly once — a missing value used to crash AFTER
         # the pane was already spawned.
-        from .cli import guard_tail
         rc = guard_tail("helm sessions resume", rest,
-                        flags=("--go", "--skip-permissions", "--force"),
-                        valued=("--title", "--note"), usage=usage)
+                        flags=flags, valued=valued, usage=usage)
         if rc is not None:
             return rc
         go = "--go" in rest
@@ -666,6 +674,13 @@ def cmd_sessions(args):
             limit = int(rest[i + 1])
         except (IndexError, ValueError):
             print("helm sessions: --limit wants an integer", file=sys.stderr)
+            return 2
+        if limit < 1:
+            # a negative/zero limit used to silently truncate the listing to
+            # one row (rows_for's `len(out) >= limit` fires immediately) —
+            # nonsense values refuse like non-integers do.
+            print("helm sessions: --limit wants a positive integer",
+                  file=sys.stderr)
             return 2
         del rest[i:i + 2]
     include_synthetic = "--all" in rest

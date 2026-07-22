@@ -541,5 +541,155 @@ class CleanHelpStillHelps(unittest.TestCase):
         self._help("modelrouter", "cmd_router", ["down", "--help"], "_down")
 
 
+# --------------------------------------- fable review findings (2026-07-22)
+
+class MembershipReadersRefuseJunk(unittest.TestCase):
+    """The adversarial review's HIGH: handlers that read flags only via
+    membership tests (`'--apply' in args`) are invisible to BOTH AST
+    detectors and include MUTATING verbs — `helm promote --bogus --apply`
+    WROTE 43 intake files with rc 0, and `--help` after junk exited 0."""
+
+    def _refuse(self, mod, fn, argv, patched):
+        with mock.patch("helm.%s.%s" % (mod, patched)) as p:
+            rc, _, err = _call(mod, fn, argv)
+        self.assertEqual(rc, 2, (argv, err))
+        self.assertFalse(p.called,
+                         "%s.%s ran despite junk %r" % (mod, patched, argv))
+        return err
+
+    def test_promote_junk_never_writes(self):
+        for argv in (["--bogus", "--apply"], ["--bogus", "--help"]):
+            err = self._refuse("drain", "cmd_promote", argv, "promote")
+            self.assertIn("--bogus", err)
+
+    def test_drain_junk_never_routes(self):
+        for argv in (["--bogus", "--apply"], ["--bogus", "--help"]):
+            self._refuse("drain", "cmd_drain", argv, "classify")
+
+    def test_sweep_junk_never_sweeps(self):
+        for argv in (["--frobnicate", "--help"], ["--bogus", "--apply"]):
+            self._refuse("sweep", "cmd_sweep", argv, "propose")
+
+    def test_coach_junk_never_plans(self):
+        for argv in (["lesson", "--bogus", "--apply"],
+                     ["lesson", "--bogus", "--help"]):
+            err = self._refuse("coach", "cmd_coach", argv, "plan")
+            self.assertIn("--bogus", err)
+
+    def test_coach_single_dash_stays_lesson_text(self):
+        r = {"layer": "prior", "id": "x", "statement": "s",
+             "confidence": 0.5, "why": "w", "landing": "l",
+             "near": [], "subsumes": []}
+        with mock.patch("helm.coach.plan", return_value=r) as p:
+            rc, _, _ = _call("coach", "cmd_coach", ["use", "-j", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertIn("use -j", p.call_args[0][0])
+
+    def test_clean_help_still_helps(self):
+        for mod, fn, patched in (("drain", "cmd_promote", "promote"),
+                                 ("drain", "cmd_drain", "classify"),
+                                 ("sweep", "cmd_sweep", "propose"),
+                                 ("coach", "cmd_coach", "plan")):
+            with mock.patch("helm.%s.%s" % (mod, patched)) as p:
+                rc, out, _ = _call(mod, fn, ["--help"])
+            self.assertEqual(rc, 0, (mod, fn))
+            self.assertTrue(out.strip(), (mod, fn))
+            self.assertFalse(p.called)
+
+
+# The mutation switch is the tell: any module-level cmd_* handler whose
+# source mentions '--apply' but never calls guard_tail is a membership
+# reader that CAN run mutating work on a junk tail. Each must either grow
+# the guard or be declared here with its alternative guard probed — a new
+# handler born into the class fails the sweep before it ships.
+APPLY_READER_EXEMPT = {
+    ("coach", "cmd_coach"):
+        "free-text lesson tail — guard_tail would junk the lesson words; "
+        "custom '--' junk guard, probed in MembershipReadersRefuseJunk",
+    ("gc", "cmd_gc"):
+        "closed-set refusal of its own (every non --dry/--apply token "
+        "refuses); probed below",
+}
+
+
+class ApplyReadersAreGuarded(unittest.TestCase):
+    """Class closure for the membership-reader hole the two structural
+    detectors above cannot see (not dispatchers, not no-arg leaves)."""
+
+    def _readers(self):
+        found = set()
+        for path in sorted(HELM_DIR.glob("*.py")):
+            tree = ast.parse(path.read_text())
+            for node in tree.body:
+                if not (isinstance(node, ast.FunctionDef)
+                        and node.name.startswith("cmd")):
+                    continue
+                consts = {n.value for n in ast.walk(node)
+                          if isinstance(n, ast.Constant)
+                          and isinstance(n.value, str)}
+                if "--apply" in consts \
+                        and "guard_tail" not in ast.unparse(node):
+                    found.add((path.stem, node.name))
+        return found
+
+    def test_every_apply_reader_is_guarded_or_declared(self):
+        self.assertEqual(self._readers(), set(APPLY_READER_EXEMPT))
+
+    def test_gc_junk_refuses_before_scan(self):
+        with mock.patch("helm.gc.scan") as p:
+            rc, _, err = _call("gc", "cmd_gc", ["--bogus", "--apply"])
+        self.assertEqual(rc, 2, err)
+        self.assertFalse(p.called)
+
+
+class HelpFirstTailStillGuarded(unittest.TestCase):
+    """`sessions resume --help --bogus` used to print usage and exit 0 — a
+    soft false existence probe for --bogus. Junk beats help even when help
+    comes first. (The ROOT's `helm <verb> --help --bogus` deliberately keeps
+    the short-circuit: the root cannot know a verb's flag surface, so
+    refusing there would lie about real flags; no work runs on that path.)"""
+
+    def test_resume_help_then_junk_refuses(self):
+        with mock.patch("helm.sessions.spawn_resume") as p:
+            rc, _, err = _call("sessions", "cmd_sessions",
+                               ["resume", "--help", "--bogus"])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("--bogus", err)
+        self.assertFalse(p.called)
+
+    def test_resume_help_first_clean_still_helps(self):
+        rc, out, _ = _call("sessions", "cmd_sessions", ["resume", "--help"])
+        self.assertEqual(rc, 0)
+        self.assertIn("resume", out)
+
+
+class SessionsLimitBounds(unittest.TestCase):
+    """--limit -5 was accepted and silently truncated the listing (rows_for's
+    `len(out) >= limit` break fires immediately) — a nonsense value refuses
+    rc 2 exactly like a non-integer one."""
+
+    def test_negative_and_zero_limit_refuse(self):
+        for bad in ("-5", "0"):
+            with mock.patch("helm.sessions.rows_for") as p:
+                rc, _, err = _call("sessions", "cmd_sessions",
+                                   ["--limit", bad])
+            self.assertEqual(rc, 2, (bad, err))
+            self.assertFalse(p.called)
+
+
+class CodexLaunchJunkBeforeGate(unittest.TestCase):
+    """Junk on `codex launch` refuses rc 2 BEFORE launch_gate — a failing
+    pool gate (rc 1) used to mask the unknown flag entirely, printing gate
+    diagnostics as if the flag existed."""
+
+    def test_launch_junk_refuses_before_gate(self):
+        with mock.patch("helm.codexhomes.launch_gate") as g:
+            rc, _, err = _call("codexhomes", "cmd_codex",
+                               ["launch", "--bogus"])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("--bogus", err)
+        self.assertFalse(g.called)
+
+
 if __name__ == "__main__":
     unittest.main()

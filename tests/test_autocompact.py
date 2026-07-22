@@ -1,12 +1,16 @@
 """Hermetic tests for helm.autocompact — the proxy-seat /compact watchdog.
 HELM_HOME points at a tmp dir; planted transcripts/proxy.logs drive the read;
 a fake adapter records injections. No chat posts (post=False), no real panes."""
+import contextlib
+import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from helm import autocompact, seat
 
@@ -227,6 +231,59 @@ class AutocompactTest(unittest.TestCase):
         seats = autocompact.proxy_seats()
         self.assertIn("codex", seats)
         self.assertIn("codex-2", seats)
+
+
+class CmdAutocompactCliSeam(unittest.TestCase):
+    """The CLI guard accepts the verb's WHOLE documented+consumed surface.
+    The fable composition review (2026-07-22) caught the guard refusing
+    --once — which killed every installed systemd watchdog: the minted unit
+    runs `helm seat autocompact --once` on each tick and exited 2 before
+    check() ever ran. These pins tie the guard to its two masters: the unit
+    template it mints and the usage synopsis it prints."""
+
+    def _run(self, argv):
+        with mock.patch.object(autocompact, "check",
+                               return_value={"rows": [], "fired": []}) as c, \
+                mock.patch.object(autocompact, "_install_timer",
+                                  return_value=0) as t:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(buf):
+                rc = autocompact.cmd_autocompact(argv)
+        return rc, buf.getvalue(), c, t
+
+    def test_systemd_unit_argv_is_accepted(self):
+        # derive the argv from the unit template itself, so a template
+        # change keeps this pin honest.
+        execline = [l for l in autocompact._UNIT_SERVICE.splitlines()
+                    if l.startswith("ExecStart=")][0]
+        toks = execline.split()
+        self.assertIn("autocompact", toks)
+        tail = toks[toks.index("autocompact") + 1:]
+        self.assertEqual(tail, ["--once"])  # today's exact unit argv
+        rc, out, c, _ = self._run(tail)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(c.called, "the watchdog pass never ran")
+
+    def test_every_documented_flag_is_accepted(self):
+        # every flag in the usage SYNOPSIS lines must pass the guard —
+        # 'accepted for interface stability' has to be true, not prose.
+        syn = [l for l in autocompact._USAGE.splitlines()
+               if "helm seat autocompact" in l or l.strip().startswith("[--")]
+        flags = sorted(set(re.findall(r"--[a-z-]+", "\n".join(syn))))
+        self.assertIn("--once", flags)
+        val = {"--seat": "codex", "--threshold": "95", "--interval": "60"}
+        for flag in flags:
+            if flag in ("--install-timer", "--apply", "--interval"):
+                argv = ["--install-timer"]
+                if flag != "--install-timer":
+                    argv += [flag] + ([val[flag]] if flag in val else [])
+            else:
+                argv = [flag] + ([val[flag]] if flag in val else [])
+                argv += ["--dry-run"]
+            rc, out, _, _ = self._run(argv)
+            self.assertEqual(rc, 0, (flag, argv, out))
+            self.assertNotIn("unknown arg", out, (flag, argv))
 
 
 if __name__ == "__main__":

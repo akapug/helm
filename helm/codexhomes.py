@@ -547,6 +547,16 @@ def cmd_codex(args):
     if verb == "launch":
         force = "--force" in rest
         rest = [a for a in rest if a != "--force"]
+        # junk refuses BEFORE launch_gate: a failing pool gate (rc 1) used to
+        # mask the unknown flag entirely, printing gate diagnostics as if it
+        # existed. Mirrors seat's launch tail (the downstream authority);
+        # drift refuses loudly here rather than silently passing junk on.
+        rc = guard_tail("helm codex launch", rest, flags=("--multi",),
+                        valued=("--room", "--model", "-i", "--instance"),
+                        usage="codex launch [-i N] [--force] [--room R] "
+                              "[--model M] [--multi]")
+        if rc is not None:
+            return rc
         inst = 1
         for flag in ("-i", "--instance"):
             if flag in rest:

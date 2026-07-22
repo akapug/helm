@@ -502,9 +502,12 @@ def cmd_autocompact(args):
     # autocompact frobnicate --help` is an existence probe, and a typo'd arg
     # must not fire the /compact injector as if the arg existed.
     from .cli import guard_tail
+    # --once is load-bearing compatibility: the minted systemd unit
+    # (_UNIT_SERVICE) runs `helm seat autocompact --once` every interval —
+    # a guard that refuses it kills the fleet's installed watchdog timers.
     rc = guard_tail("helm seat autocompact", args,
-                    flags=("--install-timer", "--apply", "--dry-run",
-                           "--quiet", "--json"),
+                    flags=("--once", "--install-timer", "--apply",
+                           "--dry-run", "--quiet", "--json"),
                     valued=("--threshold", "--seat", "--interval"),
                     usage=_USAGE)
     if rc is not None:

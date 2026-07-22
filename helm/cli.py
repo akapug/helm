@@ -309,6 +309,10 @@ def main(argv=None):
         return 2
     rest = argv[1:]
     if rest and rest[0] in ("-h", "--help"):
+        # help-FIRST short-circuits with the tail unread — deliberately: the
+        # root does not know a verb's flag surface, so refusing `--help
+        # --json` here would lie about real flags. No work ever runs on this
+        # path; junk-beats-help binds where a handler parses its own tail.
         print("helm " + (_VERB_HELP.get(verb) or (fn.__doc__ or verb).strip().split("\n")[0]))
         return 0
     if verb in NOARG_VERBS:
