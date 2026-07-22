@@ -79,13 +79,16 @@ class SpawnBase(unittest.TestCase):
                 os.environ[k] = v
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _mint(self, seat_name="codex", family="codex", room=None):
+    def _mint(self, seat_name="codex", family="codex", room=None,
+              multi=False):
         d = seat._instance_dir(family, seat_name)
         os.makedirs(d, exist_ok=True)
         launch = os.path.join(d, "launch.sh")
         homing = " HELM_CHAT_ROOM=%s" % room if room else ""
+        pin = "" if multi else " CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol"
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec env FAKE=1%s claude \"$@\"\n" % homing)
+            f.write("#!/bin/sh\nexec env FAKE=1%s%s claude \"$@\"\n"
+                    % (homing, pin))
         os.chmod(launch, 0o700)
         return d, launch
 
@@ -95,6 +98,7 @@ class SpawnBase(unittest.TestCase):
         with mock.patch.object(seat, "_write_launch_assets") as wla, \
                 mock.patch.object(harness, "detect", return_value=adapter), \
                 mock.patch.object(seat.subprocess, "Popen", popen), \
+                mock.patch.object(seat, "_pid_identity", return_value="test-start"), \
                 contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err):
             rc = seat.cmd_seat(["spawn"] + list(args))
@@ -140,10 +144,11 @@ class HeadlessSpawnTest(SpawnBase):
         the replacement spawns."""
         d, launch = self._mint()
         with open(os.path.join(d, "spawn.json"), "w") as f:
-            json.dump({"harness": "headless", "pid": 987654}, f)
+            json.dump({"harness": "headless", "pid": 987654,
+                       "pid_identity": "old-start"}, f)
         kills = []
-        with mock.patch.object(seat, "_pid_alive",
-                               side_effect=[True, False, False]), \
+        with mock.patch.object(seat, "_recorded_pid_alive",
+                               side_effect=[True, False, False, False]), \
                 mock.patch.object(seat.os, "kill",
                                   side_effect=lambda p, s: kills.append((p, s))):
             rc, out, err, _, popen = self._spawn(["codex"], None)
@@ -151,6 +156,34 @@ class HeadlessSpawnTest(SpawnBase):
         self.assertEqual(kills, [(987654, seat.signal.SIGTERM)])
         self.assertIn("reaped stale headless codex (pid 987654)", out)
         self.assertTrue(popen.called)              # then the fresh spawn
+
+    def test_headless_pid_reuse_never_kills_unrelated_process(self):
+        d, _ = self._mint()
+        with open(os.path.join(d, "spawn.json"), "w") as f:
+            json.dump({"harness": "headless", "pid": 987654,
+                       "pid_identity": "original-start"}, f)
+        kills = []
+        with mock.patch.object(seat, "_pid_alive", return_value=True), \
+                mock.patch.object(seat, "_pid_identity",
+                                  return_value="reused-start"), \
+                mock.patch.object(seat.os, "kill",
+                                  side_effect=lambda p, s: kills.append((p, s))):
+            rc, _, err, _, popen = self._spawn(["codex"], None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(kills, [])
+        self.assertTrue(popen.called)
+
+    def test_unverifiable_live_headless_pid_aborts_replacement(self):
+        d, _ = self._mint()
+        with open(os.path.join(d, "spawn.json"), "w") as f:
+            json.dump({"harness": "headless", "pid": 987654}, f)
+        with mock.patch.object(seat, "_recorded_pid_alive", return_value=None):
+            rc, _, err, wla, popen = self._spawn(["codex"], None)
+        self.assertEqual(rc, 1)
+        self.assertIn("identity is unverifiable", err)
+        self.assertIn("replacement aborted", err)
+        wla.assert_not_called()
+        popen.assert_not_called()
 
     def test_headless_never_leaks_the_seat_token(self):
         d, launch = self._mint()
@@ -161,6 +194,17 @@ class HeadlessSpawnTest(SpawnBase):
         for arg in popen.call_args[0][0]:
             self.assertNotIn("super-secret-token", arg)
             self.assertNotIn("ANTHROPIC", arg)
+
+    def test_headless_register_failure_stops_untracked_process(self):
+        self._mint()
+        kills = []
+        with mock.patch.object(seat, "_register_spawn", return_value=False), \
+                mock.patch.object(seat.os, "kill",
+                                  side_effect=lambda p, s: kills.append((p, s))):
+            rc, _, _, _, _ = self._spawn(["codex"], None)
+        self.assertEqual(rc, 1)
+        self.assertEqual([x for x in kills if x[1]],
+                         [(4242, seat.signal.SIGTERM)])
 
 
 class AdapterSpawnTest(SpawnBase):
@@ -198,6 +242,30 @@ class AdapterSpawnTest(SpawnBase):
         self.assertEqual(fake.order[0], "stop")    # reap strictly first
         self.assertIn("reaped stale codex pane p9", out)
 
+    def test_adapter_reap_failure_aborts_replacement(self):
+        self._mint()
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "codex"}])
+        fake.stop = mock.Mock(side_effect=harness.HarnessError("close failed"))
+        rc, _, err, wla, popen = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("pane p9 NOT reaped", err)
+        self.assertIn("replacement aborted", err)
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        popen.assert_not_called()
+
+    def test_recorded_other_harness_must_be_reapable(self):
+        d, _ = self._mint()
+        with open(os.path.join(d, "spawn.json"), "w") as f:
+            json.dump({"harness": "orca", "handle": "old-pane"}, f)
+        fake = FakeAdapter()
+        with mock.patch.object(seat.shutil, "which", return_value=None):
+            rc, _, err, wla, _ = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("orca CLI is unavailable", err)
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+
     def test_adapter_command_never_carries_the_seat_token(self):
         d, _ = self._mint()
         with open(os.path.join(seat.seat_dir("codex"), "token"), "w") as f:
@@ -221,6 +289,56 @@ class AdapterSpawnTest(SpawnBase):
         self.assertIn("--room team-q", text)
         rec = json.load(open(os.path.join(d, "spawn.json")))
         self.assertEqual(rec["room"], "team-q")
+
+    def test_spawn_remint_preserves_multi_shape(self):
+        """The re-mint must recover --multi from the old launch: pin absence
+        stays pinless, while a normal seat stays pinned."""
+        self._mint(multi=True)
+        rc, _, err, wla, _ = self._spawn(["codex"], FakeAdapter())
+        self.assertEqual(rc, 0, err)
+        self.assertIs(wla.call_args.kwargs["multi"], True)
+        self._mint(multi=False)
+        rc, _, err, wla, _ = self._spawn(["codex"], FakeAdapter())
+        self.assertEqual(rc, 0, err)
+        self.assertIs(wla.call_args.kwargs["multi"], False)
+
+    def test_spawn_remints_legacy_launch_before_adapter_launch(self):
+        """A pre-child-stamp launch.sh must be replaced from current code
+        before the adapter starts it, or the child is born MEMORY-ONLY."""
+        _, launch = self._mint()
+        seen = {}
+
+        class ReadingAdapter(FakeAdapter):
+            def spawn(self, command, title=None, cwd=None):
+                with open(launch) as f:
+                    seen["launch"] = f.read()
+                return super().spawn(command, title=title, cwd=cwd)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(harness, "detect", return_value=ReadingAdapter()), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["spawn", "codex"])
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("unset CLAUDE_CODE_CHILD_SESSION", seen["launch"])
+        self.assertIn("exec env -u ANTHROPIC_API_KEY", seen["launch"])
+
+    def test_onboarding_failure_closes_incomplete_pane(self):
+        self._mint()
+        fake = FakeAdapter()
+        fake.send = mock.Mock(side_effect=harness.HarnessError("send failed"))
+        rc, _, err, _, _ = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.stopped, ["pane-1"])
+        self.assertIn("incomplete pane pane-1 closed", err)
+
+    def test_adapter_register_failure_closes_untracked_pane(self):
+        self._mint()
+        fake = FakeAdapter()
+        with mock.patch.object(seat, "_register_spawn", return_value=False):
+            rc, _, _, _, _ = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.stopped, ["pane-1"])
 
     def test_orca_path_end_to_end_exact_cli_calls(self):
         """The real OrcaAdapter under spawn: terminal list (reap scan) +
@@ -309,7 +427,7 @@ class WhereTest(SpawnBase):
     def test_where_resolves_headless_record_with_liveness(self):
         d, _ = self._mint()
         self._spawn(["codex", "--room", "team-z"], None)
-        with mock.patch.object(seat, "_pid_alive", return_value=True):
+        with mock.patch.object(seat, "_recorded_pid_alive", return_value=True):
             rc, out, err = self._where(["codex"])
         self.assertEqual(rc, 0, err)
         self.assertIn("codex: headless pid 4242 — LIVE", out)
@@ -319,7 +437,7 @@ class WhereTest(SpawnBase):
     def test_where_json_is_machine_readable(self):
         self._mint()
         self._spawn(["codex"], None)
-        with mock.patch.object(seat, "_pid_alive", return_value=False):
+        with mock.patch.object(seat, "_recorded_pid_alive", return_value=False):
             rc, out, err = self._where(["codex", "--json"])
         self.assertEqual(rc, 0, err)
         got = json.loads(out)
@@ -349,6 +467,11 @@ class WhereTest(SpawnBase):
         self.assertEqual(rc, 2)
         self.assertIn("unknown seat", err)
 
+    def test_where_rejects_unknown_option(self):
+        rc, _, err = self._where(["codex", "--surprise"])
+        self.assertEqual(rc, 2)
+        self.assertIn("usage: helm seat where", err)
+
 
 class GuardsAndHelpTest(SpawnBase):
     def test_spawn_unminted_seat_refuses(self):
@@ -362,6 +485,23 @@ class GuardsAndHelpTest(SpawnBase):
         rc, out, err, _, _ = self._spawn(["mystery"], FakeAdapter())
         self.assertEqual(rc, 2)
         self.assertIn("unknown seat", err)
+
+    def test_spawn_rejects_missing_option_value_without_traceback(self):
+        self._mint()
+        rc, _, err, wla, popen = self._spawn(["codex", "--room"],
+                                             FakeAdapter())
+        self.assertEqual(rc, 2)
+        self.assertIn("--room wants a value", err)
+        wla.assert_not_called()
+        popen.assert_not_called()
+
+    def test_spawn_rejects_unknown_option(self):
+        self._mint()
+        rc, _, err, wla, _ = self._spawn(["codex", "--surprise"],
+                                         FakeAdapter())
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown option --surprise", err)
+        wla.assert_not_called()
 
     def test_spawn_instance_seat_uses_instance_dir(self):
         d, launch = self._mint(seat_name="codex-2")
