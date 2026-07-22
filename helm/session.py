@@ -288,6 +288,22 @@ def _is_nonpersistent(argv):
     return _argv_flag(argv, (NONPERSISTENT_FLAG,))
 
 
+def _own_session_identity(r):
+    """A session identity that belongs to THIS process — any canonical rung:
+    a procStart-bound pid record (`declared`), an unambiguous ``--resume``
+    (`resume`), or ``helm who``'s fresh exact attribution (identity ``who``).
+
+    `who` is canonical here, not a hint: _proc_claude_rows suppresses who
+    attribution for child processes (both the CLAUDE_CODE_CHILD_SESSION stamp
+    and who's own agent-ancestor marking), and who's session dedupe demotes
+    every younger same-session process to a candidate — so a row that SURVIVES
+    with identity=='who' carries the process's own exact attribution, never
+    its parent's. Treating who rows as inherited hints hid a proven holder
+    from live-holder/DOUBLE-OPEN arithmetic (codex-2 round-3 HIGH)."""
+    return bool(r.get("declared") or r.get("resume")
+                or r.get("identity") == "who")
+
+
 def _sessionless_oneshot(r):
     """True only when the row PROVES sessionless intent: explicit
     `--no-session-persistence` with no explicit session identity of its own.
@@ -305,27 +321,32 @@ def _sessionless_oneshot(r):
     unresolved row (see _cmd_ls). Whether such a row enters HOLDER arithmetic
     is the separate axis _inherited_hint_worker decides.
 
-    The line that must never move: a row with an EXPLICIT session identity —
-    a procStart-bound pid record or an unambiguous ``--resume`` in argv — is a
-    proven holder and stays in every count no matter how it interacts or how
-    soon it exits (`--no-session-persistence --resume X` still READS X while
-    it lives).
+    The line that must never move: a row with a CANONICAL session identity of
+    its own — pid record, unambiguous ``--resume``, or exact who attribution
+    (_own_session_identity) — is a proven holder and stays in every count no
+    matter how it interacts or how soon it exits (`--no-session-persistence
+    --resume X` still READS X while it lives).
 
     This narrows WHAT IS COUNTED, never what is allowed: a helm SEAT that
     shows up headless is still a law violation, and it stays visible in
     `session ls` tagged as such rather than being hidden."""
-    return bool(r.get("nonpersistent")
-                and not (r.get("declared") or r.get("resume")))
+    return bool(r.get("nonpersistent") and not _own_session_identity(r))
 
 
 def _inherited_hint_worker(r):
-    """True for a print-mode/nonpersistent row with no explicit session
-    identity of its OWN: whatever SID it carries is inherited/attributed from
-    the pane that spawned it, so it is never a SECOND holder of that session.
-    Such rows leave HOLDER arithmetic — live_sids/DOUBLE-OPEN and the
-    memory-only pane census — or an ordinary background print worker carrying
-    its parent's SID would manufacture a false DOUBLE-OPEN against the very
-    pane it serves.
+    """True for a print-mode/nonpersistent row with NO canonical session
+    identity of its own (identity 'unknown' — no pid record, no unambiguous
+    ``--resume``, no exact who attribution): any SID such a row still carries
+    is at best inherited/echoed from the pane that spawned it, so it is never
+    a SECOND holder of that session. Such rows leave HOLDER arithmetic —
+    live_sids/DOUBLE-OPEN and the memory-only pane census — or an ordinary
+    background print worker echoing its parent's SID would manufacture a
+    false DOUBLE-OPEN against the very pane it serves.
+
+    Exclusion is based on the ABSENCE of every canonical rung, never on the
+    interaction mode alone: identity=='who' is the process's own exact
+    attribution (who suppresses child processes and dedupes shared sessions —
+    see _own_session_identity), so a who-attributed print row stays a holder.
 
     Deliberately distinct from _sessionless_oneshot: leaving holder
     arithmetic never certifies a row green. Without explicit nonpersistence a
@@ -333,7 +354,7 @@ def _inherited_hint_worker(r):
     print mode normally persists, so 'not a second holder' is a claim about
     double-open arithmetic, never proof of sessionlessness."""
     return bool((r.get("headless") or r.get("nonpersistent"))
-                and not (r.get("declared") or r.get("resume")))
+                and not _own_session_identity(r))
 
 
 def _resume_sid(argv):
@@ -341,23 +362,27 @@ def _resume_sid(argv):
     honors the standard ``--`` terminator under the same law as _argv_flag:
     past it every token is positional prose, so `claude -p -- --resume <uuid>`
     carries prompt text, never a session identity — and post-terminator prose
-    can never conflict away a real pre-terminator resume. Bare/trailing
-    ``--resume``, a flag consumed as its value, prefixes, and conflicting
-    repeats are UNKNOWN — a false holder is worse than falling through to
-    another rung."""
+    can never conflict away a real pre-terminator resume. Within the option
+    region the parse is FAIL-CLOSED over every ``--resume`` occurrence: a
+    bare/trailing ``--resume``, a flag consumed as its value, a prefix or
+    otherwise invalid value, and conflicting repeats each poison the WHOLE
+    parse — a valid occurrence beside an invalid one is contradictory
+    evidence, not a majority vote. A false holder is worse than falling
+    through to another rung."""
     found = []
     for i, arg in enumerate(argv):
         if arg == "--":
             break
-        value = None
-        if arg == "--resume" and i + 1 < len(argv):
-            value = argv[i + 1]
+        if arg == "--resume":
+            value = argv[i + 1] if i + 1 < len(argv) else None
         elif arg.startswith("--resume="):
             value = arg.split("=", 1)[1]
-        if isinstance(value, str) and _SID_RE.fullmatch(value):
-            found.append(value)
-    unique = sorted(set(found))
-    return unique[0] if len(unique) == 1 else None
+        else:
+            continue
+        if not (isinstance(value, str) and _SID_RE.fullmatch(value)):
+            return None
+        found.append(value)
+    return found[0] if len(set(found)) == 1 else None
 
 
 def _safe_owned_dir(value, uid):
@@ -564,12 +589,12 @@ def live_sids(rows=None):
     """{sid: [pid,...]} of proven live copies. The procStart-bound pid record
     wins, then canonical resume/who evidence. An inherited stamp SID is only the
     spawning ancestor and never enters this map, and neither does a print-mode
-    worker whose only session hint is inherited/attributed — a background
-    worker carrying its parent's SID must not manufacture a false DOUBLE-OPEN.
-    But headless is only an interaction mode: a print-mode row with an explicit
-    ``--resume``/pid-record identity is a proven live holder and MUST enter, or
-    a real overlapping holder hides from the certifier while the launch guard
-    still sees it (see _inherited_hint_worker)."""
+    worker with NO canonical identity of its own — a background worker echoing
+    its parent's SID must not manufacture a false DOUBLE-OPEN. But headless is
+    only an interaction mode: a print-mode row with a canonical pid-record /
+    ``--resume`` / exact-who identity is a proven live holder and MUST enter,
+    or a real overlapping holder hides from the certifier while the launch
+    guard still sees it (see _inherited_hint_worker)."""
     out = {}
     for r in (rows if rows is not None else _proc_claude_rows()):
         sid = r.get("session") or r.get("resume")
@@ -612,13 +637,14 @@ def memory_only_panes(rows=None, persisting=None):
     PASS nor memory-only — a check that passes on absent input reports the
     opposite of the truth.
 
-    Print-mode workers with no session identity of their OWN are excluded
-    because they are not panes: an explicitly nonpersistent one-shot has no
-    transcript by design, and an inherited/attributed-SID worker's transcript
+    Print-mode workers with no canonical session identity of their OWN are
+    excluded because they are not panes: an explicitly nonpersistent one-shot
+    has no transcript by design, and an inherited-hint worker's transcript
     risk belongs to the pane that actually holds that session. But a
-    print-mode row with an EXPLICIT session identity stays — headless is an
-    interaction mode, and print mode persists unless nonpersistence was
-    requested outright (see _inherited_hint_worker)."""
+    print-mode row with a CANONICAL identity — pid record, ``--resume``, or
+    exact who attribution — stays: headless is an interaction mode, and print
+    mode persists unless nonpersistence was requested outright (see
+    _inherited_hint_worker)."""
     rows = rows if rows is not None else _proc_claude_rows()
     persisting = persisting if persisting is not None else _persisting_sids()
     return [r for r in rows if r.get("session") and not _inherited_hint_worker(r)
@@ -755,16 +781,16 @@ def _cmd_ls(args, certify=False):
     disk = {r["pid"]: _sid_on_disk(r.get("session"), persisting)
             for r in rows if r.get("session")}
     # Two exclusion axes, deliberately different in reach. HOLDER arithmetic
-    # (memory-only, double-open) excludes every print-mode row with no session
-    # identity of its OWN (_inherited_hint_worker) — a worker carrying its
-    # parent's SID is not a second holder. But CERTIFICATION green is earned
-    # only by proof: an explicitly nonpersistent one-shot
-    # (_sessionless_oneshot) is sessionless by request; a plain `-p` row with
-    # no resolvable SID is an UNRESOLVED session — print mode persists by
-    # default — and fails closed as UNKNOWN. A print-mode row with an explicit
-    # --resume/pid-record identity is a proven holder that stays in every
-    # count. Excluded rows stay rendered below; exclusion narrows what is
-    # COUNTED, never what the operator can SEE.
+    # (memory-only, double-open) excludes every print-mode row with no
+    # CANONICAL session identity of its own (_inherited_hint_worker) — a
+    # worker echoing its parent's SID is not a second holder. But
+    # CERTIFICATION green is earned only by proof: an explicitly nonpersistent
+    # one-shot (_sessionless_oneshot) is sessionless by request; a plain `-p`
+    # row with no resolvable SID is an UNRESOLVED session — print mode
+    # persists by default — and fails closed as UNKNOWN. A print-mode row
+    # with a canonical pid-record/--resume/exact-who identity is a proven
+    # holder that stays in every count. Excluded rows stay rendered below;
+    # exclusion narrows what is COUNTED, never what the operator can SEE.
     mo = memory_only_panes(rows, persisting)
     unknown = [r for r in rows if not _sessionless_oneshot(r)
                and (not r.get("session") or disk.get(r["pid"]) is None)]

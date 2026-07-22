@@ -1079,7 +1079,7 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertTrue(session._is_headless(argv))
         self.assertTrue(session._is_nonpersistent(argv))
         self.assertTrue(session._sessionless_oneshot(
-            {"headless": True, "nonpersistent": True,
+            {"headless": True, "nonpersistent": True, "identity": "unknown",
              "declared": None, "resume": None}))
 
     def test_headless_and_nonpersistent_are_separate_axes(self):
@@ -1131,6 +1131,26 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertIsNone(session._resume_sid(
             ["claude", "--resume", "--", self.SID_A]))
 
+    def test_an_invalid_resume_occurrence_poisons_a_valid_one(self):
+        # codex-2 round-3 MED: the fleet lane's fail-closed law, kept intact
+        # while adding the terminator — a valid occurrence beside an invalid
+        # one is contradictory evidence, not a majority vote
+        for argv in (["claude", "--resume", self.SID_A, "--resume"],
+                     ["claude", "--resume=" + self.SID_A, "--resume=bad"],
+                     ["claude", "--resume", "--print",
+                      "--resume", self.SID_A]):
+            self.assertIsNone(session._resume_sid(argv), argv)
+        # a repeat of the SAME valid value is not a conflict
+        self.assertEqual(
+            session._resume_sid(["claude", "--resume", self.SID_A,
+                                 "--resume=" + self.SID_A]),
+            self.SID_A)
+        # and post-terminator tokens can neither poison nor conflict
+        self.assertEqual(
+            session._resume_sid(["claude", "--resume", self.SID_A, "--",
+                                 "--resume", "--resume=bad"]),
+            self.SID_A)
+
     def test_option_terminator_ends_the_flag_scan(self):
         # past the standard `--` terminator every token is positional: a boot
         # prompt exactly equal to -p/--print is prose there, never a flag
@@ -1145,10 +1165,14 @@ class HeadlessCensusTest(unittest.TestCase):
             ["claude", "--no-session-persistence", "--", "prompt"]))
 
     def test_sessionless_rows_leave_the_memory_only_census(self):
-        # pid 1's only session hint is inherited/attributed — an ordinary
-        # background print worker, not a pane with work at risk
-        rows = [{"pid": 1, "session": "sid-a", "headless": True},
-                {"pid": 2, "session": "sid-b", "headless": False}]
+        # pid 1's session hint carries NO canonical identity rung (identity
+        # unknown) — an ordinary background print worker echoing a SID, not a
+        # pane with work at risk. Exclusion keys the ABSENT identity, never
+        # the interaction mode alone.
+        rows = [{"pid": 1, "session": "sid-a", "headless": True,
+                 "identity": "unknown"},
+                {"pid": 2, "session": "sid-b", "headless": False,
+                 "identity": "who"}]
         got = session.memory_only_panes(rows=rows, persisting={})
         self.assertEqual([r["pid"] for r in got], [2])
 
@@ -1156,7 +1180,7 @@ class HeadlessCensusTest(unittest.TestCase):
         # a proven SID never leaves the count merely because the process will
         # exit after one response
         rows = [{"pid": 1, "session": "sid-a", "declared": "sid-a",
-                 "headless": True}]
+                 "identity": "declared", "headless": True}]
         got = session.memory_only_panes(rows=rows, persisting={})
         self.assertEqual([r["pid"] for r in got], [1])
 
@@ -1167,6 +1191,14 @@ class HeadlessCensusTest(unittest.TestCase):
                 "ancestor_sid8": "", "force": False, "headless": headless,
                 "nonpersistent": False}
         base.update(kw)
+        # identity mirrors the census derivation (codex-2 round-3: synthetic
+        # rows must not manufacture shapes _proc_claude_rows never emits — a
+        # real row with a session but no declared/resume is who-attributed);
+        # tests probing the defensive unknown-hint shape override explicitly
+        base.setdefault("identity",
+                        "declared" if base["declared"] else
+                        "resume" if base["resume"] else
+                        "who" if base["session"] else "unknown")
         return base
 
     def ls(self, rows, persisting, certify=False):
@@ -1208,9 +1240,13 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertNotIn("headless one-shot", out)
 
     def test_a_headless_row_never_manufactures_a_double_open(self):
-        # a worker CARRYING its parent's proven SID (inherited/attributed
-        # hint only — no --resume, no pid record) is not a second holder
-        rows = [self.row(1, "sid-x", False), self.row(2, "sid-x", True)]
+        # a worker ECHOING its parent's proven SID with NO canonical identity
+        # rung of its own (identity unknown — no --resume, no pid record, no
+        # exact who attribution) is not a second holder. Defensive shape:
+        # the real census only ever sets `session` from a canonical rung, so
+        # this pins the fail-direction should an unproven hint ever leak in.
+        rows = [self.row(1, "sid-x", False),
+                self.row(2, "sid-x", True, identity="unknown")]
         self.assertEqual(session.live_sids(rows), {"sid-x": [1]})
         rc, out, err = self.ls(rows, {"sid-x": __file__}, certify=True)
         self.assertEqual(rc, 0, err)
@@ -1223,7 +1259,7 @@ class HeadlessCensusTest(unittest.TestCase):
         # missing transcript is its holder's risk, so it is neither counted
         # nor labeled MEMORY-ONLY — but this exclusion never becomes a
         # sessionless claim (no "one-shot" label without nonpersistence)
-        rows = [self.row(2, "sid-x", True)]
+        rows = [self.row(2, "sid-x", True, identity="unknown")]
         self.assertEqual(session.memory_only_panes(rows=rows, persisting={}),
                          [])
         rc, out, err = self.ls(rows, {}, certify=True)
@@ -1231,6 +1267,48 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertIn("inherited-session print worker", out)
         self.assertNotIn("MEMORY-ONLY", out)
         self.assertNotIn("headless one-shot", out)
+
+    def test_who_attribution_is_the_processes_own_identity_not_a_hint(self):
+        # codex-2 round-3 HIGH, exact probe row: _proc_claude_rows suppresses
+        # who for child processes and who dedupes shared sessions, so a
+        # surviving identity=='who' row is the process's OWN exact canonical
+        # attribution — a proven holder that must stay in live-holder
+        # arithmetic. Before the fix this exact row produced live_sids={}.
+        r = self.row(2, "sid-x", True)
+        self.assertEqual(r["identity"], "who")  # helper mirrors the census
+        self.assertEqual(session.live_sids([r]), {"sid-x": [2]})
+        self.assertEqual(session.open_pids("sid-x", [r]), [2])
+
+    def test_a_who_attributed_print_row_is_a_real_double_open(self):
+        # overlapping an interactive holder of the same session, the
+        # who-attributed print row IS the second holder — hiding it violated
+        # law 1 and let the certifier pass rc=0 on a live overlap
+        rows = [self.row(1, "sid-x", False),
+                self.row(2, "sid-x", True)]
+        self.assertEqual(session.live_sids(rows), {"sid-x": [1, 2]})
+        rc, out, err = self.ls(rows, {"sid-x": __file__}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("DOUBLE-OPEN", out)
+
+    def test_nonpersistence_never_flips_a_who_attributed_holder_sessionless(self):
+        # codex-2's second probe arm: adding nonpersistent to the who row made
+        # _sessionless_oneshot true — certifying green a process whose exact
+        # attribution proves it operates on session X while it lives
+        r = self.row(2, "sid-x", True, nonpersistent=True)
+        self.assertEqual(r["identity"], "who")
+        self.assertFalse(session._sessionless_oneshot(r))
+        self.assertFalse(session._inherited_hint_worker(r))
+        self.assertEqual(session.live_sids([r]), {"sid-x": [2]})
+
+    def test_a_transcriptless_who_attributed_print_row_is_memory_only(self):
+        # its transcript risk is its OWN — a who-attributed print row with no
+        # transcript on disk counts as memory-only, never as an inherited
+        # worker whose alarm belongs elsewhere
+        rows = [self.row(2, "sid-x", True)]
+        self.assertEqual(
+            [r["pid"] for r in session.memory_only_panes(rows=rows,
+                                                         persisting={})],
+            [2])
 
     def test_a_print_mode_resume_is_a_real_holder_and_double_open(self):
         # BOTH reviewers' HIGH: `claude -p --resume X` operates on a proven
