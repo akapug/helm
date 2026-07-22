@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -273,6 +274,76 @@ class ListTest(WorkBase):
         rc, out, _err = self.work("list")
         self.assertEqual(rc, 0)
         self.assertIn("no lane rooms", out)
+
+
+class UnguardedRoomTest(WorkBase):
+    """Worktrees outside `<root>-wt/` — above all the agent-spawned rooms under
+    .claude/worktrees/wf_* — are real writable checkouts that no lease covers.
+    `list` showed only lane rooms, so occupancy lived solely in chat prose and
+    three agents came to share one review room."""
+
+    def foreign(self, name, dirty=None):
+        path = os.path.join(self.root, ".claude", "worktrees", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        r = _sh(self.root, "git", "worktree", "add", "-q", "-b",
+                "worktree-" + name, path, "main")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        if dirty:
+            with open(os.path.join(path, dirty), "w") as f:
+                f.write("a reviewer's uncommitted security fixes\n")
+        return path
+
+    def test_foreign_worktree_is_reported_as_unguarded(self):
+        self.foreign("wf_dead00-1")
+        rows = work.unguarded_rows(self.root)
+        self.assertEqual([os.path.basename(r["path"]) for r in rows],
+                         ["wf_dead00-1"])
+        rc, out, err = self.work("list")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("UNGUARDED", out)
+        self.assertIn("wf_dead00-1", out)
+
+    def test_lane_rooms_and_the_checkout_itself_are_not_unguarded(self):
+        rc, _out, err = self.work("claim", "mine", "--seat", "s1")
+        self.assertEqual(rc, 0, err)
+        self.room("stray")
+        # Leased room, lease-less lane room, and the shared checkout all sit
+        # INSIDE the claims system — only foreign paths may be flagged.
+        self.assertEqual(work.unguarded_rows(self.root), [])
+
+    def test_recent_write_reads_as_live_without_any_cwd_occupant(self):
+        # The subagent-writer shape: bytes land in the room, nothing is ever
+        # cwd'd there. The cwd census alone reports it empty.
+        path = self.foreign("wf_busy00-2", dirty="cred.py")
+        self.assertEqual(work._occupants(path), [])
+        row = next(r for r in work.unguarded_rows(self.root)
+                   if r["path"] == path)
+        self.assertTrue(row["dirty"])
+        self.assertIsNotNone(row["wrote_ago"])
+        self.assertLess(row["wrote_ago"], 900)
+        rc, out, err = self.work("list")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("assume live", out)
+
+    def test_clean_room_reports_no_work_in_flight(self):
+        path = self.foreign("wf_idle00-3")
+        self.assertIsNone(work._wrote_ago(path))
+        row = next(r for r in work.unguarded_rows(self.root)
+                   if r["path"] == path)
+        self.assertIsNone(row["wrote_ago"])
+        rc, out, _err = self.work("list")
+        self.assertIn("no live occupant", out)
+
+    def test_stale_write_is_in_flight_but_not_claimed_live(self):
+        path = self.foreign("wf_stale0-4", dirty="half.py")
+        old = time.time() - 7200
+        os.utime(os.path.join(path, "half.py"), (old, old))
+        row = next(r for r in work.unguarded_rows(self.root)
+                   if r["path"] == path)
+        self.assertGreaterEqual(row["wrote_ago"], 7000)
+        rc, out, _err = self.work("list")
+        self.assertIn("work in flight", out)
+        self.assertNotIn("assume live", out)
 
 
 class GuardTest(WorkBase):

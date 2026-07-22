@@ -34,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 from . import automap, pk, seats
 
@@ -186,6 +187,63 @@ def lane_rows(root):
             w["lane"] = w["path"][len(box):].strip(os.sep)
             rows.append(w)
     return rows
+
+
+def unguarded_rows(root):
+    """Registered worktrees that are NOT lane rooms — the shared checkout's
+    own siblings, and above all the agent-spawned rooms under
+    `.claude/worktrees/wf_*` that the Agent/Workflow `isolation: worktree`
+    option mints directly through git.
+
+    These are real, writable checkouts of this repo that no lease covers and
+    no `helm work list` row mentioned, so occupancy existed only as chat prose
+    — which is how three agents came to share one review room on 2026-07-22
+    and a concurrent rebase destroyed a reviewer's uncommitted work. The
+    claims guard was never missing (`claim` refuses a second holder outright);
+    these rooms simply bypass it. Reporting them with their LIVE occupants
+    turns 'nobody told me it was taken' into a question anyone can answer
+    before they touch it."""
+    box = root.rstrip(os.sep) + "-wt" + os.sep
+    me = os.path.realpath(root).rstrip(os.sep)
+    rows = []
+    for w in worktrees(root):
+        if w["path"].startswith(box):
+            continue
+        if os.path.realpath(w["path"]).rstrip(os.sep) == me:
+            continue
+        rows.append({"path": w["path"],
+                     "branch": (w["branch"] or "")[len("refs/heads/"):],
+                     "locked": w["locked"],
+                     "occupants": _occupants(w["path"]),
+                     "wrote_ago": _wrote_ago(w["path"]),
+                     "dirty": _dirty(w["path"])})
+    return rows
+
+
+def _wrote_ago(path):
+    """Seconds since the newest write among this room's UNCOMMITTED files, or
+    None when nothing is in flight.
+
+    The cwd census (`_occupants`) is necessary but NOT sufficient: a subagent
+    reviewer edits a room through `git -C`/absolute paths without ever cwd-ing
+    into it, so the room reads 'no live occupant' while a file in it was
+    written seconds ago. That exact gap is what a waking seat saw before it
+    rebased a live reviewer's tree out from under it. Scoped to changed files
+    (`diff --name-only` + untracked), so a clean room costs one git call and a
+    busy one stats only what is actually in flight."""
+    rc, out, _err = _git(path, "status", "--porcelain")
+    if rc != 0 or not out:
+        return None
+    newest = None
+    for ln in out.splitlines():
+        rel = ln[3:].strip().strip('"')
+        rel = rel.split(" -> ")[-1]  # renames report old -> new
+        try:
+            m = os.stat(os.path.join(path, rel)).st_mtime
+        except OSError:
+            continue
+        newest = m if newest is None else max(newest, m)
+    return None if newest is None else max(0, int(time.time() - newest))
 
 
 def _dirty(path):
@@ -555,17 +613,45 @@ def cmd_work(args):
         return 0
     if verb == "list":
         rows = list_rows(root)
-        if not rows:
+        loose = unguarded_rows(root)
+        if not rows and not loose:
             print("helm work: no lane rooms — `helm work claim <lane>` opens "
                   "one at %s-wt/<lane>" % root)
             return 0
-        w = max(len(r["lane"]) for r in rows)
-        for r in rows:
-            hold = "%s %ds" % (r["holder"], r["remaining"]) if r["holder"] else "-"
-            print("  %-*s  %-24s  %-5s  +%s/-%s%s  %s" % (
-                w, r["lane"], hold, "dirty" if r["dirty"] else "clean",
-                r["ahead"], r["behind"], "  locked" if r["locked"] else "",
-                r["path"]))
+        if rows:
+            w = max(len(r["lane"]) for r in rows)
+            for r in rows:
+                hold = ("%s %ds" % (r["holder"], r["remaining"])
+                        if r["holder"] else "-")
+                print("  %-*s  %-24s  %-5s  +%s/-%s%s  %s" % (
+                    w, r["lane"], hold, "dirty" if r["dirty"] else "clean",
+                    r["ahead"], r["behind"], "  locked" if r["locked"] else "",
+                    r["path"]))
+        if loose:
+            # Occupancy that no lease covers. Printed as a WARNING, never as a
+            # lane row: these rooms are outside the claims system, so `claim`
+            # cannot refuse a second writer in them and `gc` will not rescue
+            # them. Anyone about to rebase one can now see who is standing in
+            # it first.
+            print("⚠ %d UNGUARDED room%s — outside the claims lane, so NO "
+                  "lease can refuse a second writer here. Verify occupancy "
+                  "before touching one; prefer `helm work claim <lane>`:"
+                  % (len(loose), "s"[:len(loose) != 1]))
+            for r in loose:
+                if r["occupants"]:
+                    who = "OCCUPIED by pid " + ",".join(r["occupants"])
+                elif r["wrote_ago"] is not None and r["wrote_ago"] < 900:
+                    # No cwd, but bytes landed just now — a subagent writer.
+                    who = "WRITTEN %ds AGO — assume live" % r["wrote_ago"]
+                elif r["wrote_ago"] is not None:
+                    who = "work in flight, last write %dm ago" % (
+                        r["wrote_ago"] // 60)
+                else:
+                    who = "no live occupant"
+                print("    %-6s %-11s %-34s %s  %s" % (
+                    "dirty" if r["dirty"] else "clean",
+                    "locked" if r["locked"] else "unlocked",
+                    who, r["branch"] or "(detached)", r["path"]))
         return 0
     if verb == "install-guard":
         rc, lines = install_guard(root, apply="--apply" in rest)
