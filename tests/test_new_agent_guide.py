@@ -33,6 +33,33 @@ SOURCE_PROBE_RUNNERS = {"grep", "egrep", "fgrep", "rg", "cat", "sed", "awk",
                         "head", "tail", "ls", "find", "test", "python",
                         "python3"}
 
+# Named SUBcommands the guide leans on. Depth-1 verb probing (toks[1]) cannot
+# see a dropped/renamed subverb while the parent keeps rc0 — these pairs get
+# the differential parent+subverb probe below. Every pair must also appear
+# verbatim in the guide, so this list cannot drift away from the text.
+GUIDE_SUBVERBS = (("chat", "dm"), ("chat", "reply"), ("session", "ls"),
+                  ("work", "release"), ("seat", "launch"))
+
+LANE_MARKER = re.compile(r"\(lane/([A-Za-z0-9._~-]+)\)")
+
+
+def parse_guide_helm_spans(text):
+    """(present_verbs, marked_pairs): every `helm <verb> ...` span splits into
+    present-tense verbs (must --help-resolve rc0 from a neutral cwd) and
+    future-tense (verb, lane) pairs — a span immediately followed by the
+    structural marker `(lane/<lane>)` naming where the verb lands."""
+    present, marked = set(), []
+    for m in re.finditer(r"`(helm [^`\n]+)`", text):
+        toks = m.group(1).split()
+        if len(toks) < 2 or toks[1].startswith("<"):
+            continue  # `helm <verb> --help` is the probe idiom itself
+        lane = LANE_MARKER.match(text[m.end():].lstrip())
+        if lane:
+            marked.append((toks[1], lane.group(1)))
+            continue  # marked unlanded — present tense would be a lie
+        present.add(toks[1])
+    return present, marked
+
 
 class NewAgentGuideTest(unittest.TestCase):
     def setUp(self):
@@ -98,14 +125,7 @@ class NewAgentGuideTest(unittest.TestCase):
         # span immediately followed by "(lane/<lane>)" — `helm fleet`
         # (lane/fleet-truth-verb) — which names where the verb lands.
         text = open(GUIDE, encoding="utf-8").read()
-        verbs = set()
-        for m in re.finditer(r"`(helm [^`\n]+)`", text):
-            toks = m.group(1).split()
-            if len(toks) < 2 or toks[1].startswith("<"):
-                continue  # `helm <verb> --help` is the probe idiom itself
-            if text[m.end():].lstrip()[:6] == "(lane/":
-                continue  # marked unlanded — present tense would be a lie
-            verbs.add(toks[1])
+        verbs, _marked = parse_guide_helm_spans(text)
         self.assertTrue(verbs, "guide carries no helm commands to verify")
         neutral = tempfile.mkdtemp(prefix="helm-guide-neutral-")
         try:
@@ -120,6 +140,124 @@ class NewAgentGuideTest(unittest.TestCase):
                     % (verb, p.returncode, p.stderr.strip()))
         finally:
             shutil.rmtree(neutral, ignore_errors=True)
+
+    def test_lane_markers_expire_and_name_real_lanes(self):
+        # the (lane/<lane>) marker is a dated promise, not a permanent skip:
+        # (a) the named lane must actually exist as a branch — a bogus marker
+        #     is a fabricated excuse and fails here;
+        # (b) once the verb --help-resolves rc0 from a neutral cwd the lane
+        #     LANDED — the marker is now a stale lie ("supersedes it once
+        #     landed" about a verb that IS landed) and fails here: drop the
+        #     marker and rewrite the claim in the present tense.
+        text = open(GUIDE, encoding="utf-8").read()
+        _verbs, marked = parse_guide_helm_spans(text)
+        neutral = tempfile.mkdtemp(prefix="helm-guide-neutral-")
+        try:
+            for verb, lane in marked:
+                b = subprocess.run(
+                    ["git", "-C", REPO, "branch", "--list", "--all",
+                     "lane/%s" % lane, "*/lane/%s" % lane],
+                    capture_output=True, text=True, timeout=60)
+                self.assertTrue(
+                    b.stdout.strip(),
+                    "guide marks `helm %s` (lane/%s) but no such lane branch "
+                    "exists — a marker must name a real lane" % (verb, lane))
+                p = subprocess.run(
+                    [sys.executable, HELM, verb, "--help"], cwd=neutral,
+                    capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(
+                    p.returncode, 0,
+                    "`helm %s` resolves from a neutral cwd — the verb LANDED; "
+                    "drop the (lane/%s) marker and state it in the present "
+                    "tense" % (verb, lane))
+        finally:
+            shutil.rmtree(neutral, ignore_errors=True)
+
+    def _probe_sub(self, parent, sub, cwd):
+        """(rc, out, err) of `helm <parent> <sub> --help`, the probed token
+        normalized to @ so an unknown-subverb echo compares structurally."""
+        p = subprocess.run(
+            [sys.executable, HELM, parent, sub, "--help"], cwd=cwd,
+            capture_output=True, text=True, timeout=60)
+        return (p.returncode, p.stdout.replace(sub, "@"),
+                p.stderr.replace(sub, "@"))
+
+    def test_guide_subverbs_resolve_differentially(self):
+        # depth-2: rc alone cannot prove a SUBverb exists (most known subverbs
+        # exit rc 2 on --help, same code as an unknown one). The differential
+        # probe can: a real subverb's response must DIFFER from a bogus
+        # sibling's — if `chat dm` were dropped it would take the exact
+        # unknown-subcommand path the bogus probe takes, and the normalized
+        # outputs collapse to equal. `helm work` refuses everything outside a
+        # git repo, so the probes run from a scratch git repo — still neutral,
+        # not the checkout.
+        text = open(GUIDE, encoding="utf-8").read()
+        scratch = tempfile.mkdtemp(prefix="helm-guide-subverb-")
+        try:
+            subprocess.run(["git", "init", "-q", scratch],
+                           capture_output=True, text=True, timeout=60,
+                           check=True)
+            for parent, sub in GUIDE_SUBVERBS:
+                self.assertIn(
+                    "helm %s %s" % (parent, sub), text,
+                    "GUIDE_SUBVERBS pins `helm %s %s` but the guide no longer "
+                    "names it — drop the pair or restore the claim"
+                    % (parent, sub))
+                real = self._probe_sub(parent, sub, scratch)
+                bogus = self._probe_sub(parent, "zzqx-no-such-subverb",
+                                        scratch)
+                self.assertNotEqual(
+                    real, bogus,
+                    "`helm %s %s` answers exactly like a bogus subverb — "
+                    "dropped or renamed while the parent still resolves"
+                    % (parent, sub))
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_canary_bare_post_from_a_project_cwd_resolves_to_main(self):
+        # ============================ MERGE-TIME CANARY =====================
+        # This test pins TODAY'S behavior: a bare `helm chat post` (no --room)
+        # from a project cwd resolves to `main`, NOT the cwd-derived home room
+        # — exactly what guide section 2 states. lane/homing-as-prevented
+        # rewires every no---room verb through seats.resolve_homing (env seam
+        # > cwd derivation), which INVERTS this default.
+        #
+        # WHEN THIS TEST FAILS AFTER lane/homing-as-prevented MERGES, THAT IS
+        # THE CANARY FIRING, NOT A REGRESSION: flip BOTH together —
+        #   1. guide section 2: the bare default now resolves to the derived
+        #      home room (drop the "today ... resolves to `main`" sentence and
+        #      its lane marker);
+        #   2. this test: assert the post lands in the DERIVED room and not in
+        #      `main`.
+        # Do not delete the test and do not touch the sentence without the
+        # pin, or the guide silently inverts (staleness-adversary MED 2).
+        # ====================================================================
+        proj = os.path.join(self.tmp, "canary-proj")
+        os.makedirs(proj)
+        subprocess.run(["git", "init", "-q", proj], capture_output=True,
+                       text=True, timeout=60, check=True)
+        token = "guide-canary-row"
+        p = subprocess.run([sys.executable, HELM, "chat", "post", token],
+                           cwd=proj, capture_output=True, text=True,
+                           timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        in_main = subprocess.run(
+            [sys.executable, HELM, "chat", "read", "--room", "main",
+             "--since", "0"], cwd=proj, capture_output=True, text=True,
+            timeout=60)
+        self.assertIn(
+            token, in_main.stdout,
+            "bare post from a project cwd no longer lands in `main` — if "
+            "lane/homing-as-prevented just merged this is the CANARY: flip "
+            "guide section 2 and this pin together (see comment above)")
+        in_derived = subprocess.run(
+            [sys.executable, HELM, "chat", "read", "--room", "canary-proj",
+             "--since", "0"], cwd=proj, capture_output=True, text=True,
+            timeout=60)
+        self.assertNotIn(
+            token, in_derived.stdout,
+            "bare post reached the derived home room — homing landed; flip "
+            "guide section 2 and this pin together (see comment above)")
 
 
 if __name__ == "__main__":

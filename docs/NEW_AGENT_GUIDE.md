@@ -102,11 +102,18 @@ so an account swap in one pane is an account swap in all of them.
 - Subagents are encouraged for orthogonal priorities — fan out.
 - **Codex-family seats**: before fanning out, probe per-instance proxies at
   runtime, from any cwd — `helm seat launch codex -i 2` prints the exact
-  launch line (never runs it). Landed (lane/per-instance-codex-proxies): the
+  launch line without running it, and idempotently wires the seat's instance
+  state as it does (a safe-to-repeat probe, not a side-effect-free one).
+  Landed (lane/per-instance-codex-proxies): the
   N≥2 line carries the instance's OWN proxy port
   (`ANTHROPIC_BASE_URL=…:<base+N>`, e.g. 8319 for codex-2). Not landed: the
   line still carries the shared family port (8317) — do not multiply codex
   subagents; shared-port multiplication was the silent-hang vector.
+- **Launch lines are secret-bearing**: never paste one that carries a token
+  into a room, doc, or anything else durable — transcripts are the corpus
+  (§5). Once lane/per-instance-codex-proxies lands, the printed line reads
+  the bearer from its 0600 token file at exec time (no inline token); until
+  then it embeds the live token. Either way: run it, don't quote it.
 - In-process subagents **die with their host pane**. Enumerate children
   before killing any pane — a kill takes the whole household.
 
