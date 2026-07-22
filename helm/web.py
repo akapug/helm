@@ -878,8 +878,9 @@ def _api_chat_post(payload):
 
     Optional `reply_to` = the parent row's id (the panel's reply button holds
     it): the row threads under that parent and, when signed, its digest BINDS
-    it. It changes nothing about delivery — a reply wakes exactly what its
-    text would have woken (seats.deliverable never reads reply_to)."""
+    it. Delivery: the reply also WAKES the parent's author (mention-tier,
+    casefold, via the stamped rfrom — inverted 2026-07-22, replying replaces
+    typing the @mention); otherwise it wakes what its text alone would."""
     from . import chat
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip():

@@ -2334,5 +2334,100 @@ class ChatDispatchTest(SeatsBase):
         self.assertEqual(seats.claims_list()[0]["holder"], "alice")
 
 
+class ReplyWakesParentTest(unittest.TestCase):
+    """The owner's WHY was the spec: replies exist so he can stop typing
+    @names. A reply is therefore a direct address of the parent's author —
+    mention-tier, any room — and only of the parent's author.
+
+    Sits ABOVE the __main__ guard: a class appended after unittest.main()
+    is invisible to the direct runner (the guard exits the process), so its
+    tests silently never run — the regression this file itself pins below."""
+
+    def _row(self, **kw):
+        r = {"text": "a reply", "from": "david"}
+        r.update(kw)
+        return r
+
+    def test_a_reply_wakes_the_parent_author_without_a_mention(self):
+        self.assertTrue(seats.deliverable(
+            self._row(rfrom="opus-integrator"), "opus-integrator", room="main"))
+
+    def test_a_reply_wakes_nobody_else(self):
+        self.assertFalse(seats.deliverable(
+            self._row(rfrom="opus-integrator"), "codex-3", room="side-room"))
+
+    def test_a_reply_to_your_own_row_does_not_self_wake(self):
+        self.assertFalse(seats.deliverable(
+            self._row(**{"from": "opus-integrator", "rfrom": "opus-integrator"}),
+            "opus-integrator", room="main"))
+
+    def test_mention_tier_means_before_mute(self):
+        with mock.patch.object(seats, "seat_scope",
+                               return_value={"mute": ["main"], "home": None}):
+            self.assertTrue(seats.deliverable(
+                self._row(rfrom="opus-integrator"), "opus-integrator", room="main"))
+
+    def test_case_variant_rfrom_still_wakes_the_seat(self):
+        # Seat identity is casefold-exact everywhere (roster, mentions, dm) —
+        # a case-only rename must not silently lose direct reply delivery:
+        # rfrom='kimi' stamped pre-rename must still wake live seat 'Kimi'.
+        self.assertTrue(seats.deliverable(
+            self._row(rfrom="kimi"), "Kimi", room="side-room"))
+        self.assertTrue(seats.deliverable(
+            self._row(rfrom="Kimi"), "kimi", room="side-room"))
+
+    def test_case_variant_self_reply_still_does_not_self_wake(self):
+        self.assertFalse(seats.deliverable(
+            self._row(**{"from": "Kimi", "rfrom": "kimi"}), "Kimi",
+            room="main"))
+
+    def test_cross_case_self_reply_does_not_self_wake(self):
+        # BOTH reviewers' MED (codex + codex-2 xrev of c2f4856): the test
+        # above uses from='Kimi' — exact-case — so it never exercised the
+        # real rename path. After a case-only rename kimi -> Kimi, the
+        # seat's own pre-rename reply carries from='kimi': the own-post
+        # suppression must casefold like rfrom does, or the seat wakes on
+        # its own reply — the exact transition this fix targets.
+        self.assertFalse(seats.deliverable(
+            self._row(**{"from": "kimi", "rfrom": "kimi", "text": "self reply"}),
+            "Kimi", room="main"))
+        self.assertFalse(seats.deliverable(
+            self._row(**{"from": "Kimi", "rfrom": "Kimi", "text": "self reply"}),
+            "kimi", room="main"))
+
+    def test_cross_case_own_post_with_self_mention_does_not_self_wake(self):
+        # Same normalization beyond replies: a pre-rename own post that
+        # happens to @mention the seat's new casing is still its OWN post.
+        self.assertFalse(seats.deliverable(
+            self._row(**{"from": "kimi", "text": "@Kimi noted"}),
+            "Kimi", room="main"))
+
+    def test_empty_rfrom_never_matches_an_empty_seat(self):
+        self.assertFalse(seats.deliverable(
+            self._row(room="side-room"), "", room="side-room"))
+
+    def test_the_pointer_is_read_the_old_invisibility_law_is_dead(self):
+        # The superseded law said deliverable() never reads the pointer. The
+        # inversion must be REAL, not vacuous: the same non-mention text flips
+        # on rfrom alone.
+        row = self._row(rfrom="opus-integrator")
+        self.assertTrue(seats.deliverable(row, "opus-integrator",
+                                          room="side-room"))
+        row.pop("rfrom")
+        self.assertFalse(seats.deliverable(row, "opus-integrator",
+                                           room="side-room"))
+
+    def test_this_class_is_discovered_by_the_default_loader(self):
+        # Pin for the after-main() regression: the loader that both the direct
+        # runner and pytest walk must SEE this class's tests.
+        names = [str(t) for t in unittest.defaultTestLoader
+                 .loadTestsFromTestCase(ReplyWakesParentTest)]
+        self.assertGreaterEqual(len(names), 8)
+        mod_tests = unittest.defaultTestLoader.loadTestsFromModule(
+            sys.modules[__name__])
+        flat = str(list(mod_tests))
+        self.assertIn("ReplyWakesParentTest", flat)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1449,9 +1449,12 @@ quote words the author never wrote under the reply.) A parent that never had
 an id resolves only through an exact `(rts, rfrom, rtext)` match; ambiguity or
 rotation renders an orphan rather than guessing.
 
-**Threading never changes who a message wakes.** `seats.deliverable()` reads
-text, `{dm}` and the room — never `reply_to` — so replying to a seat does
-**not** wake it unless the text @mentions it. (Tested as a law, not an
+**A reply wakes its parent's author.** `seats.deliverable()` reads `rfrom` —
+the parent author stamped at post time — and treats a reply to a seat's row
+as a direct address of that seat: mention-tier, any room, before mute (the
+owner's WHY: replying *instead of* typing the @mention). Only the parent's
+author wakes; for every other seat the pointer changes nothing, so a reply
+stays quieter than the mention it replaces. (Tested as a law, not an
 observation: `tests/test_chat_reply.py::ReplyWakeTest`.)
 
 The notify loop: when the owner posts (web panel or `helm --human`), helm

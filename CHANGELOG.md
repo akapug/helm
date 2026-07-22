@@ -37,10 +37,13 @@
   scope: self-consistency, not remote re-verification — the node still cannot
   disclose a turn's payload). Rendering is one level, builders.dev style — a
   compact parent quote, a `↩N` count, graceful orphans — in `helm chat read`,
-  the journal, and the web panel. Threading does NOT touch beacon-wake:
-  `seats.deliverable()` never reads the pointer, so a reply wakes exactly what
-  its text alone would have woken (asserted as a law over the full scope
-  matrix). The web chat surface also gains: per-channel unread/mention badges
+  the journal, and the web panel. Threading now REACHES beacon-wake — the
+  original "threading is invisible to the beacon" law was inverted 2026-07-22
+  (the owner's WHY: "I'm tired of typing agent names to mention"): a reply is
+  a direct address of the parent's author, mention-tier, any room, casefold —
+  and of NOBODY else; every other row wakes exactly what its text alone would
+  have woken (asserted over the full scope matrix). The web chat surface also
+  gains: per-channel unread/mention badges
   with last-activity age and dimmed quiet rooms, readable seat rows (age +
   legend, distinguishing-tail truncation), collapse for long agent posts,
   @mention completion from the live roster, an unread divider and

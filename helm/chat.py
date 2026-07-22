@@ -61,9 +61,13 @@ carries {rtext}: ts|from is not unique when one author posts twice inside a
 second, so exact text disambiguates without inventing an identity. One level
 only, builders.dev style: a reply renders with a compact quote of its parent,
 a parent renders its reply count, and an orphan parent (rotated out) renders
-as such — never a crash. Threading is INVISIBLE
-to the beacon: seats.deliverable never reads reply_to, so a reply wakes
-exactly what its text alone would have woken (a reply is not a mention).
+as such — never a crash. A REPLY WAKES ITS PARENT'S AUTHOR
+(seats.deliverable reads rfrom): replying is a direct address, the same tier
+as an @mention — the owner's stated reason for replies was "I'm tired of
+typing agent names to mention", so a reply that woke nobody delivered the
+mechanism while dropping its purpose (2026-07-22; inverted the original
+threading-is-invisible law). Only the parent's author wakes — a reply stays
+quieter than the mention it replaces.
 
 Signed replies bind the parent: the payload is a DISTINCT algorithm tag
 ("chat:reply:b2b:") over \\x1e-joined, injectively escaped parent fields +
@@ -618,9 +622,11 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
     `reply_to` is a parent REFERENCE (row id, id prefix, or ordinal) resolved
     against the room the row lands in: the row gains {reply_to, rts, rfrom}
     (plus rtext for a pre-id parent) and, when signed, a parent-bound digest.
-    It changes NOTHING about who the
-    message wakes — seats.deliverable never reads it, so a reply reaches
-    exactly what its text alone would have reached."""
+    A reply WAKES the parent row's author (seats.deliverable reads rfrom,
+    casefold, mention-tier — before mute, any room): replying is a direct
+    address, the owner's stated substitute for typing @names. Only the
+    parent's author wakes; every other seat sees exactly what the text
+    alone would have reached."""
     _ensure_dir()
     from . import emoji
     text = emoji.expand(text)

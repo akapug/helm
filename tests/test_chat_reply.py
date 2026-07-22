@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """helm chat replies — the parent pointer, the parent-bound signed digest, the
-one-level render, and the law that threading changes NOTHING about who a
-message wakes. Hermetic: tmp HELM_HOME + HELM_CHAT_DIR, transport disabled
+one-level render, and the law that a reply WAKES its parent's author (rfrom,
+casefold, mention-tier) and nobody else. Hermetic: tmp HELM_HOME +
+HELM_CHAT_DIR, transport disabled
 (the signing seam is mocked, like test_chat_v2)."""
 import contextlib
 import io
@@ -508,25 +509,34 @@ class ReplyCliTest(ReplyBase):
 
 
 # ---------------------------------------------------------------------------
-# 5. THE LAW: threading does not touch beacon-wake semantics
+# 5. THE LAW (inverted 2026-07-22): a reply is a direct address of the
+#    parent's author — mention-tier — and of nobody else
 # ---------------------------------------------------------------------------
 
 class ReplyWakeTest(ReplyBase):
-    """A reply wakes EXACTLY what its text alone would have woken. Asserted
-    against seats.deliverable() — the beacon's own decision function — not a
-    proxy for it."""
+    """A reply wakes the parent's author (the owner's WHY: replying replaces
+    typing the @mention) and otherwise EXACTLY what its text alone would have
+    woken. Asserted against seats.deliverable() — the beacon's own decision
+    function — not a proxy for it."""
 
     def deliv(self, row, seat, room="main"):
         return seats.deliverable(row, seat, room)
 
-    def test_replying_to_a_seat_does_not_wake_it(self):
+    def test_replying_to_a_seat_wakes_its_author(self):
+        # INVERTED 2026-07-22. This test previously pinned the opposite —
+        # "threading is invisible to the beacon" — which delivered the reply
+        # MECHANISM while dropping its PURPOSE: the owner's stated reason for
+        # replies was "I'm tired of typing agent names to mention". A reply is
+        # a direct address of the parent's author, mention-tier.
         seats.write_roster("codex", session="s-codex")
         p = chat.post("codex's own words", who="codex")
         r = chat.post("thanks, noted", who="alice", reply_to=p["id"])
-        self.assertFalse(self.deliv(r, "codex"))
-        # ...and the identical text without the thread is equally silent
+        self.assertTrue(self.deliv(r, "codex"))
+        # the identical text WITHOUT the thread stays silent — the wake is the
+        # thread's, and only the parent's author gets it
         plain = chat.post("thanks, noted", who="alice")
-        self.assertEqual(self.deliv(r, "codex"), self.deliv(plain, "codex"))
+        self.assertFalse(self.deliv(plain, "codex"))
+        self.assertFalse(self.deliv(r, "kimi"))
 
     def test_a_reply_that_mentions_still_wakes(self):
         seats.write_roster("codex", session="s-codex")
@@ -534,47 +544,91 @@ class ReplyWakeTest(ReplyBase):
         r = chat.post("@codex what about this", who="alice", reply_to=p["id"])
         self.assertTrue(self.deliv(r, "codex"))
 
-    def test_wake_is_identical_with_and_without_the_pointer_everywhere(self):
+    def test_the_pointer_changes_wake_only_for_the_parent_author(self):
         """The whole matrix: for every scope the beacon knows, the reply row
-        and the same text unparented decide the SAME way."""
+        and the same text unparented decide the SAME way for everyone EXCEPT
+        the parent's author, who is always woken (mention-tier). The parent
+        here is codex's own row, so the threaded/plain delta is exactly the
+        codex wake — a bystander seat sees no delta anywhere."""
         seats.write_roster("codex", session="s-codex", home_room="team-z")
-        p = chat.post("parent", room="team-z", who="alice")
+        seats.write_roster("kimi", session="s-kimi", home_room="team-k")
         cases = [("plain chatter", "main"), ("plain chatter", "team-z"),
                  ("@all hands", "main"), ("@all hands", "side"),
                  ("@codex ping", "side"), ("nothing for you", "side")]
         for text, room in cases:
+            p = chat.post("parent", room=room, who="codex")
             r = dict(chat.post(text, room=room, who="alice",
                                reply_to=p["id"]))
             plain = dict(r)
             for k in ("reply_to", "rts", "rfrom"):
                 plain.pop(k, None)
-            self.assertEqual(self.deliv(r, "codex", room),
-                             self.deliv(plain, "codex", room),
-                             "%r in #%s decided differently once threaded"
-                             % (text, room))
+            self.assertTrue(self.deliv(r, "codex", room),
+                            "reply to codex's row in #%s must wake codex"
+                            % room)
+            self.assertEqual(self.deliv(r, "kimi", room),
+                             self.deliv(plain, "kimi", room),
+                             "%r in #%s decided differently for a bystander "
+                             "once threaded" % (text, room))
 
-    def test_deliverable_never_reads_the_pointer(self):
-        """Structural proof, not just behavioural: the row's thread fields are
-        invisible to the wake decision by construction."""
+    def test_deliverable_reads_only_rfrom_of_the_thread_fields(self):
+        """Structural proof, not just behavioural: rfrom is the ONE thread
+        field the wake decision reads — non-mention text flips on it alone,
+        and reply_to/rts stay invisible. (Previously asserted the superseded
+        never-reads-the-pointer law, vacuously: an @codex mention kept the
+        old assertions true whatever rfrom said.)"""
         seats.write_roster("codex", session="s-codex")
-        row = {"ts": "T", "from": "alice", "text": "@codex hi",
+        row = {"ts": "T", "from": "alice", "text": "no mention here",
                "reply_to": "x", "rts": "T0", "rfrom": "codex"}
         self.assertTrue(seats.deliverable(row, "codex", "main"))
         row["reply_to"] = "totally-different"
-        row["rfrom"] = "someone-else"
+        row["rts"] = "T9"
         self.assertTrue(seats.deliverable(row, "codex", "main"))
+        row["rfrom"] = "someone-else"
+        self.assertFalse(seats.deliverable(row, "codex", "main"))
 
-    def test_deliver_any_end_to_end_stays_text_driven(self):
-        """Integration proof at the actual boundary hook: replying to a seat's
-        own row is silent, then the same threaded path wakes once its text
-        contains the exact mention."""
+    def test_deliver_any_end_to_end_reply_wakes_parent(self):
+        """Integration proof at the actual boundary hook: a bare reply to the
+        seat's own row DELIVERS (inverted 2026-07-22 — replying replaces
+        typing the mention), and a reply to someone else's row does not."""
         seats.join(session="s-codex", seat="codex", cwd="/tmp/reply-wake")
+        other = chat.post("alice parent", who="alice")
+        chat.post("threaded, but not to codex", who="bob", reply_to=other["id"])
+        self.assertIsNone(seats.deliver_any(session="s-codex", seat="codex"))
         p = chat.post("codex parent", who="codex")
         chat.post("quiet threaded answer", who="alice", reply_to=p["id"])
-        self.assertIsNone(seats.deliver_any(session="s-codex", seat="codex"))
-        chat.post("@codex threaded ping", who="alice", reply_to=p["id"])
         line = seats.deliver_any(session="s-codex", seat="codex")
-        self.assertIn("@codex threaded ping", line)
+        self.assertIn("quiet threaded answer", line)
+
+
+class ReplyDocsContractTest(unittest.TestCase):
+    """The superseded law must be DEAD in every contract surface, not just the
+    code (codex round-2 xrev of 2efe3f8: docs/VERBS.md + docs/WEB.md still
+    taught 'threading never changes who a message wakes' after the inversion
+    shipped). A doc that contradicts the beacon is an executable-looking trap
+    for the next regression, so the docs are pinned like code."""
+
+    DOCS = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "docs")
+
+    def doc(self, name):
+        with open(os.path.join(self.DOCS, name)) as f:
+            return f.read()
+
+    def test_the_retired_law_phrase_is_gone_from_the_doc_contracts(self):
+        for name in ("VERBS.md", "WEB.md"):
+            text = self.doc(name).casefold()
+            self.assertNotIn("never changes who", text, name)
+            self.assertNotIn("never change who", text, name)
+            self.assertNotIn("threading is invisible", text, name)
+
+    def test_verbs_states_the_live_law_and_points_at_its_test(self):
+        text = self.doc("VERBS.md")
+        self.assertIn("A reply wakes its parent's author.", text)
+        self.assertIn("`rfrom`", text)
+        self.assertIn("tests/test_chat_reply.py::ReplyWakeTest", text)
+
+    def test_web_api_doc_states_the_live_wake_behavior(self):
+        self.assertIn("wakes the parent row's author", self.doc("WEB.md"))
 
 
 if __name__ == "__main__":

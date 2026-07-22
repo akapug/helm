@@ -226,20 +226,26 @@ class TestWebChat(unittest.TestCase):
         self.assertEqual(d["msg"]["reply_to"], "beef99")
         self.assertNotIn("rts", d["msg"])
 
-    def test_a_reply_never_changes_who_the_row_wakes(self):
-        """The beacon law, asserted at the ENDPOINT: the row the web writes
-        decides identically with and without its parent pointer."""
+    def test_a_web_reply_wakes_the_parent_rows_author(self):
+        """The beacon law, asserted at the ENDPOINT (inverted 2026-07-22 —
+        replying replaces typing the @mention): the reply row the web writes
+        carries the parent's identity and wakes EXACTLY the parent's author —
+        the text alone would have woken nobody, and a bystander seat decides
+        identically with and without the pointer."""
         from helm import seats
         seats.write_roster("codex", session="s-codex")
-        self.req("/api/chat", {"text": "seed"})
+        seats.write_roster("kimi", session="s-kimi")
+        self.req("/api/chat", {"text": "seed", "name": "codex"})
         p = self.req("/api/chat?since=0")[1]["lines"][0]
         self.req("/api/chat", {"text": "no mention here", "reply_to": p["id"]})
         row = self.req("/api/chat?since=0")[1]["lines"][1]
         plain = {k: v for k, v in row.items()
                  if k not in ("reply_to", "rts", "rfrom")}
-        self.assertFalse(seats.deliverable(row, "codex", "main"))
-        self.assertEqual(seats.deliverable(row, "codex", "main"),
-                         seats.deliverable(plain, "codex", "main"))
+        self.assertTrue(seats.deliverable(row, "codex", "main"))
+        self.assertFalse(seats.deliverable(plain, "codex", "main"))
+        self.assertFalse(seats.deliverable(row, "kimi", "main"))
+        self.assertEqual(seats.deliverable(row, "kimi", "main"),
+                         seats.deliverable(plain, "kimi", "main"))
 
     def test_poll_carries_the_live_roster_for_mention_completion(self):
         from helm import seats

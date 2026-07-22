@@ -351,7 +351,13 @@ def deliverable(m, seat, room="main", scope=None):
     if not text or m.get("react") or m.get("ambient"):
         return False
     frm = str(m.get("from") or "")
-    if frm == seat:
+    if frm.casefold() == str(seat or "").casefold():
+        # Own-post suppression casefolds like EVERY seat-identity match here
+        # (roster keys, mentions, dm, rfrom): after a case-only rename
+        # (kimi -> Kimi) the seat's pre-rename rows still carry the old
+        # casing, and an exact-case check would let the seat wake on its own
+        # reply — the precise identity transition the rfrom rule below
+        # protects (codex + codex-2 xrev of c2f4856, 2026-07-21).
         return False
     if m.get("dm"):
         # exact-token recipient (casefold only), OR the row sits in the
@@ -360,6 +366,20 @@ def deliverable(m, seat, room="main", scope=None):
         return (str(m["dm"]).casefold() == str(seat or "").casefold()
                 or (bool(seat) and room == dm_lane(seat)))
     if _mention_re(seat).search(text):
+        return True
+    rf = str(m.get("rfrom") or "")
+    if rf and rf.casefold() == str(seat or "").casefold():
+        # A REPLY to this seat's row is a direct address of its author — the
+        # same tier as an @mention, any room, before mute. This inverts the
+        # original "threading is invisible to the beacon" law deliberately:
+        # the owner's stated WHY for replies was "I'm tired of typing agent
+        # names to mention" (2026-07-22) — replying INSTEAD OF mentioning is
+        # the feature, so a reply that wakes nobody delivers the mechanism
+        # while dropping its purpose. rfrom is the parent's recorded author,
+        # stamped at post time; only the parent's author wakes, so a reply
+        # stays quieter than the mention it replaces ever was. Casefold, like
+        # every seat-identity match here (roster keys, mentions, dm): a
+        # case-only rename must not silently drop direct reply delivery.
         return True
     sc = scope if scope is not None else seat_scope(seat)
     if room in sc["mute"]:
