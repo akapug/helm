@@ -143,3 +143,63 @@ against a different home (`helm session port --cred <home> <sid>`).
 
 *Record the answers inline here at the switch — this file is the durable home
 for what we learn.*
+
+## VENDOR ANSWERS (orca team, Brennan — 2026-07-21, in response to the owner)
+
+Several matrix rows are answered upstream; recorded verbatim-in-substance so we
+only spend the live test on what is genuinely still open.
+
+**The build we are ON (pre-rc.2):** all managed Codex accounts share ONE runtime
+home, and switching **hot-swaps the credentials in place**, so every running
+codex follows the currently selected account — one account at a time. The team
+confirms this is a real limitation and that "a custom multi-home setup was a
+reasonable workaround" (that workaround is helm's credhomes). Note this is the
+SAME root cause we measured independently via `/login`:
+**credential-overwrite-in-place**, on a different surface.
+
+**Starting 1.4.149-rc.2** each managed account gets its **own self-contained
+home** — credentials, config, and session history fully isolated per account:
+
+* Sessions launched under different accounts **run concurrently**, each against
+  its own cred home. Launch under A, switch the picker to B, launch more → A's
+  sessions keep running as A.
+* **Automatic resume pins each session to the account that created it**, even if
+  the global selection changed since. No more sessions silently hopping accounts.
+* Usage/history are tracked per-account.
+* The picker chooses which account NEW terminals get: the flow is
+  **switch → launch**, not a per-terminal dropdown.
+
+### What that resolves
+
+* **E3, E5, E6 → answered.** Per-account dirs are the model; a switch applies to
+  NEW terminals while running sessions keep their account (which matches the
+  immutable-env physics above); each account's creds stay in its own home rather
+  than being overwritten.
+* **Case B's shared-fate problem is fixed for orca-managed panes**: switching the
+  picker no longer reaccounts running sessions.
+* **helm's per-ACCOUNT credhoming becomes redundant with orca rc.2+** — orca now
+  provides the guarantee helm's credhomes were built for (isolated per-account
+  creds + sessions pinned to their creating account).
+
+### What is STILL open — the only thing the live test must decide
+
+**orca isolates per-ACCOUNT; helm isolates per-SEAT.** Two helm seats on the SAME
+account (e.g. `codex` and `codex-2`, both on the ultra) would share that
+account's single orca home. So:
+
+* **E7 (the deciding test):** launch two seats under ONE account against one
+  shared home. Do their sessions coexist cleanly — separate session records, no
+  cross-resume, no violation of the single-open law — or do they collide?
+  * If they COEXIST → helm can drop per-seat pinning and defer credhoming to
+    orca entirely (one cred pool, `helm session port --cred` targeting
+    `~/.config/orca/claude-accounts/<uuid>/auth`).
+  * If they COLLIDE → helm keeps per-seat pinning as sub-account isolation, and
+    orca owns the per-account layer beneath it.
+* **E8:** does a `/login` INSIDE an orca-managed pane still overwrite that
+  account's home in place (leaving a home named for A holding B)? If yes, the
+  `credhome-name-account-drift` class survives rc.2 and `helm cred`
+  (backup + identity-from-content + heal) remains necessary regardless.
+
+*Owner feedback loop: the orca team explicitly asked for feedback from exactly
+this multi-account power-user case. E7/E8 results — plus the measured `/login`
+drift — are the feedback worth sending back.*
