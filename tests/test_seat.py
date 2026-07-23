@@ -1479,5 +1479,257 @@ class SeatMultiTest(unittest.TestCase):
         self.assertIn("--multi", err.getvalue())
 
 
+class SeatEnsureTest(unittest.TestCase):
+    """doctor --ensure (the proxy watchdog, codex-2 silent-starvation class):
+    supervise every minted family+instance proxy — healthy rows pass through,
+    dead/wedged rows respawn via the LANDED _up (never a second spawn path),
+    and any row the watchdog cannot PROVE healthy surfaces UNKNOWN (rc 2),
+    never a silent down/up. Hermetic: primitives mocked, no real proxy.
+    Borrows SeatTest's fixtures without subclassing."""
+
+    setUp = SeatTest.setUp
+    tearDown = SeatTest.tearDown
+    _plant = SeatTest._plant
+    _add = SeatTest._add
+
+    def _row(self, family="codex", seat_name="codex"):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            verdict = seat._ensure_row(family, seat_name)
+        return verdict
+
+    # -- the acceptance path: a DOWN proxy is respawned ---------------------
+    def test_ensure_respawns_dead_proxy(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        # no pidfile -> down; a successful _up flips the row to live+open so the
+        # post-respawn probe proves healthy (the seq-flip pattern: the initial
+        # probe must read DOWN, only the re-probe after _up reads live).
+        seq = {"live": False, "open": False}
+        up_calls = []
+
+        def fake_up(f, quiet=False, seat=None):
+            up_calls.append((f, seat))
+            seq.update(live=True, open=True)
+            return 0
+
+        with mock.patch.object(seat, "_proxy_pid_record", return_value=None), \
+                mock.patch.object(seat, "_running_pid",
+                                  lambda f, s=None: 4321 if seq["live"] else None), \
+                mock.patch.object(seat, "_port_open",
+                                  lambda p, timeout=0.5: seq["open"]), \
+                mock.patch.object(seat, "_up", fake_up), \
+                mock.patch.object(seat, "_down") as down:
+            label, state, detail = self._row()
+        self.assertEqual(label, "codex")
+        self.assertEqual(state, "respawned")
+        self.assertEqual(up_calls, [("codex", "codex")])
+        down.assert_not_called()          # nothing live to signal away
+
+    def test_ensure_healthy_row_untouched(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 4321, "identity": "x"}), \
+                mock.patch.object(seat, "_running_pid", return_value=4321), \
+                mock.patch.object(seat, "_port_open", return_value=True), \
+                mock.patch.object(seat, "_up") as up, \
+                mock.patch.object(seat, "_down") as down:
+            label, state, detail = self._row()
+        self.assertEqual(state, "healthy")
+        up.assert_not_called()
+        down.assert_not_called()
+
+    def test_ensure_wedged_proxy_signaled_then_respawned(self):
+        # live verified pid but the port does not answer -> _down clears it,
+        # then _up brings a fresh one up.
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        seq = {"live": True, "open": False}
+        down_calls, up_calls = [], []
+
+        def fake_up(f, quiet=False, seat=None):
+            up_calls.append((f, seat))
+            seq.update(live=True, open=True)   # fresh proxy up + answering
+            return 0
+
+        def fake_down(f, seat=None):
+            down_calls.append((f, seat))
+            seq.update(live=False, open=False)
+            return 0
+
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 4321, "identity": "x"}), \
+                mock.patch.object(seat, "_running_pid",
+                                  lambda f, s=None: 4321 if seq["live"] else None), \
+                mock.patch.object(seat, "_port_open",
+                                  lambda p, timeout=0.5: seq["open"]), \
+                mock.patch.object(seat, "_proxy_age_s",
+                                  return_value=120.0), \
+                mock.patch.object(seat, "_up", fake_up), \
+                mock.patch.object(seat, "_down", fake_down):
+            label, state, detail = self._row()
+        self.assertEqual(state, "respawned")
+        self.assertEqual(down_calls, [("codex", "codex")])
+        self.assertEqual(len(up_calls), 1)
+
+    def test_ensure_starting_proxy_within_grace_is_never_killed(self):
+        # THE fable adversarial MED: a HEALTHY just-launched proxy still binding
+        # its port reads 'live pid + port not answering' -> the OLD code SIGTERMed
+        # it. Within the startup-grace window it must be left alone (unknown /
+        # STARTING), _down NEVER called — cron firing in the boot window must not
+        # churn kill->respawn->kill.
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 4321, "identity": "x"}), \
+                mock.patch.object(seat, "_running_pid", return_value=4321), \
+                mock.patch.object(seat, "_port_open", return_value=False), \
+                mock.patch.object(seat, "_proxy_age_s", return_value=3.0), \
+                mock.patch.object(seat, "_up") as up, \
+                mock.patch.object(seat, "_down") as down:
+            label, state, detail = self._row()
+        self.assertEqual(state, "unknown")
+        self.assertIn("STARTING", detail)
+        down.assert_not_called()          # the whole point: never SIGTERM a boot
+        up.assert_not_called()            # nor double-spawn over it
+
+    def test_ensure_grace_boundary_old_proxy_still_wedged(self):
+        # past grace AND still not answering -> genuinely wedged -> signal+respawn
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        seq = {"live": True}
+        down_calls = []
+
+        def fake_down(f, seat=None):
+            down_calls.append((f, seat))
+            seq["live"] = False
+            return 0
+
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 4321, "identity": "x"}), \
+                mock.patch.object(seat, "_running_pid",
+                                  lambda f, s=None: 4321 if seq["live"] else None), \
+                mock.patch.object(seat, "_port_open", return_value=False), \
+                mock.patch.object(seat, "_proxy_age_s",
+                                  return_value=seat._ENSURE_STARTUP_GRACE_S + 1), \
+                mock.patch.object(seat, "_up", return_value=1), \
+                mock.patch.object(seat, "_down", fake_down):
+            label, state, detail = self._row()
+        self.assertEqual(down_calls, [("codex", "codex")])
+        self.assertEqual(state, "unknown")   # _up refused -> unresolved -> UNKNOWN
+
+    def test_ensure_unverifiable_live_pid_is_unknown_never_touched(self):
+        # a record whose pid is ALIVE but fails identity verification (a reused
+        # pid now owned by a stranger, or a legacy bare-pid proxy): the watchdog
+        # refuses to signal it AND refuses to respawn over a live foreign
+        # listener — UNKNOWN for a human. (The ds4pro-SIGKILL fix: only an
+        # ALIVE-but-unverifiable pid refuses; a DEAD one respawns.)
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 4321, "identity": None}), \
+                mock.patch.object(seat, "_running_pid", return_value=None), \
+                mock.patch.object(seat, "_pid_alive", return_value=True), \
+                mock.patch.object(seat, "_up") as up, \
+                mock.patch.object(seat, "_down") as down:
+            label, state, detail = self._row()
+        self.assertEqual(state, "unknown")
+        self.assertIn("unverifiable", detail)
+        up.assert_not_called()
+        down.assert_not_called()
+
+    def test_ensure_stale_dead_pidfile_respawns(self):
+        # the codex-2 silent-starvation case: a well-formed identity record
+        # whose pid has since DIED. _running_pid fails closed to None (corpse),
+        # but the record still parses — the watchdog must NOT read it as
+        # 'unverifiable, refuse'; the pid is dead, so this is a plain DOWN ->
+        # respawn via _up.
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        seq = {"live": False}
+        up_calls = []
+
+        def fake_up(f, quiet=False, seat=None):
+            up_calls.append((f, seat))
+            seq["live"] = True
+            return 0
+
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 9999, "identity": "proc:x"}), \
+                mock.patch.object(seat, "_running_pid",
+                                  lambda f, s=None: 5555 if seq["live"] else None), \
+                mock.patch.object(seat, "_pid_alive", return_value=False), \
+                mock.patch.object(seat, "_port_open",
+                                  lambda p, timeout=0.5: seq["live"]), \
+                mock.patch.object(seat, "_up", fake_up), \
+                mock.patch.object(seat, "_down") as down:
+            label, state, detail = self._row()
+        self.assertEqual(state, "respawned")
+        self.assertEqual(up_calls, [("codex", "codex")])
+        down.assert_not_called()          # corpse already gone; nothing to signal
+
+    def test_ensure_respawn_failure_is_unknown(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_proxy_pid_record", return_value=None), \
+                mock.patch.object(seat, "_running_pid", return_value=None), \
+                mock.patch.object(seat, "_port_open", return_value=False), \
+                mock.patch.object(seat, "_up", return_value=1):
+            label, state, detail = self._row()
+        self.assertEqual(state, "unknown")
+        self.assertIn("respawn failed", detail)
+
+    def test_ensure_concurrent_up_loser_reads_healthy_not_unknown(self):
+        # fable LOW: a seat launching in the same instant wins the flock; our
+        # _up returns rc 1 ('already running'). That is NOT a respawn failure —
+        # the row is now HEALTHY under the winner. Re-probe must recover it.
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        seq = {"live": False}   # winner flips this when it steals the start
+
+        def losing_up(f, quiet=False, seat=None):
+            seq["live"] = True   # the concurrent winner's proxy is now up
+            return 1             # ... so OUR _up loses the race
+
+        with mock.patch.object(seat, "_proxy_pid_record", return_value=None), \
+                mock.patch.object(seat, "_running_pid",
+                                  lambda f, s=None: 7777 if seq["live"] else None), \
+                mock.patch.object(seat, "_port_open",
+                                  lambda p, timeout=0.5: seq["live"]), \
+                mock.patch.object(seat, "_up", losing_up), \
+                mock.patch.object(seat, "_down"):
+            label, state, detail = self._row()
+        self.assertEqual(state, "healthy")
+        self.assertIn("concurrent starter won", detail)
+
+    def test_ensure_rc2_on_any_unknown_row(self):
+        # one healthy family + one wedged respawn that fails -> rc 2 overall
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_proxy_pid_record", return_value=None), \
+                mock.patch.object(seat, "_running_pid", return_value=None), \
+                mock.patch.object(seat, "_port_open", return_value=False), \
+                mock.patch.object(seat, "_up", return_value=1):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = seat._ensure([])
+        self.assertEqual(rc, 2)
+
+    def test_doctor_ensure_dispatches_and_guards_tail(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_ensure", return_value=0) as ens:
+            rc = seat.cmd_seat(["doctor", "--ensure"])
+        self.assertEqual(rc, 0)
+        ens.assert_called_once()
+        # junk after --ensure still refuses BEFORE any work
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["doctor", "--ensure", "--bogus"])
+        self.assertEqual(rc, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
