@@ -21,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -1050,6 +1051,61 @@ def _api_todos(qs):
                 "unavailable": True}, 200
 
 
+# The roster DOING column shows a lane-less (source=home) agent's repo LAST
+# COMMIT instead of just its home room. git log is a subprocess, so it is kept
+# OFF the 2s presence poll (roster_report/presence_report stay subprocess-free):
+# it lives here, on the roster tab's OWN 60s timer, behind a module-level 60s
+# TTL cache. Fail-open per cwd (a bad cwd caches None, never 500s the panel).
+_ROSTER_GIT_CACHE = {}   # cwd -> (fetched_at, {"ts", "subject"} | None)
+_ROSTER_GIT_TTL = 60
+
+
+def _roster_git_one(cwd, now):
+    hit = _ROSTER_GIT_CACHE.get(cwd)
+    if hit and now - hit[0] < _ROSTER_GIT_TTL:
+        return hit[1]
+    info = None
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "log", "-1", "--format=%ct%x09%s"],
+            capture_output=True, text=True, timeout=2)
+        line = (r.stdout or "").strip()
+        if r.returncode == 0 and line:
+            ts_s, _, subj = line.partition("\t")
+            info = {"ts": int(ts_s), "subject": subj}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        info = None   # fail-open: cache the miss so a bad cwd is not re-run hot
+    _ROSTER_GIT_CACHE[cwd] = (now, info)
+    return info
+
+
+def _api_roster_git(qs):
+    """Last commit (epoch ts + subject) per distinct non-/tmp cwd of the
+    NON-ABSENT, lane-less (source=home) seats — the only rows whose DOING cell
+    the roster tab decorates with 'last commit N ago'. Read-only, fail-open;
+    the 60s cache + the tab's 60s poll keep git off the 2s presence hot path."""
+    now = time.time()
+    try:
+        from . import seats
+        rows = seats.roster_report(_q1(qs, "room", "main")).get("seats", [])
+    except Exception:
+        rows = []
+    seen, out = set(), {}
+    for s in rows:
+        if not isinstance(s, dict):
+            continue
+        if s.get("presence") == "absent" or s.get("source") != "home":
+            continue
+        cwd = s.get("cwd")
+        if not cwd or cwd.startswith("/tmp") or cwd in seen:
+            continue
+        seen.add(cwd)
+        info = _roster_git_one(cwd, now)
+        if info:
+            out[cwd] = info
+    return {"commits": out}, 200
+
+
 def _api_chat_seat(payload):
     """The seats panel's one mutation: bind a live agent to a memorable @name
     (seats.rename_seat — roster row + delivery state move together). Bearer-
@@ -1556,6 +1612,7 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/chat": _api_chat,
     "/api/chat/roster": _api_chat_roster,
     "/api/todos": _api_todos,
+    "/api/roster/git": _api_roster_git,
     "/api/ledger": _api_ledger,
     "/api/ledger/turn": _api_ledger_turn,
     "/api/ledger/native": _api_ledger_native,

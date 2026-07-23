@@ -3502,6 +3502,7 @@ let ROSTER_TIMER = null, ROSTER_POLLING = false;
 let ROSTER_SORT = {key: "presence", dir: 1};
 let ROSTER_SHOW = {absent: false, sas: false};
 let ROSTER_TODOS = {};                                   // seat -> /api/todos digest
+let ROSTER_GIT = {}, ROSTER_GIT_TIMER = null;            // cwd -> {ts, subject} (60s git side-channel)
 const rrank = p => p === "fresh" ? 0 : p === "quiet" ? 1 : 2;
 const rdotGlyph = p => p === "fresh" ? '<span class="rdot fresh">\u25cf</span>'
   : p === "quiet" ? '<span class="rdot quiet">\u25d0</span>'
@@ -3524,6 +3525,10 @@ function rosterDoing(s) {
     return {cls: "status" + (stale ? " stale" : ""), text: (s.line || "") + age + by};
   }
   if (s.source === "claim" && s.line) return {cls: "claim", text: "\u25b8 " + s.line};
+  // lane-less: show the repo's LAST COMMIT (merged from the 60s git side-channel)
+  // if we have it, else the home room. The commit subject rides the cell title.
+  const g = s.cwd && ROSTER_GIT[s.cwd];
+  if (g && g.ts) return {cls: "home", text: "last commit " + chatAgo(Date.now() / 1e3 - g.ts) + " ago", title: g.subject};
   return {cls: "home", text: "in " + (s.home_room ? "#" + s.home_room : "all rooms")};
 }
 // TASK = the todo digest (2/7 . active) from /api/todos when present, else the
@@ -3582,7 +3587,7 @@ function renderRoster(rep) {
         '<td>' + rdotGlyph(s.presence) + '</td>' +
         '<td><span class="rseat" data-seat="' + esc(s.seat) + '" data-sess="' + esc(s.session || '') + '" title="facts + transcript">' + esc(chatShort(s.seat)) + '</span></td>' +
         '<td class="num">' + (s.last_seen ? esc(lago(s.last_seen)) : "\u2014") + '</td>' +
-        '<td class="rdoing ' + d.cls + '" title="' + esc(d.text) + '">' + esc(d.text) + '</td>' +
+        '<td class="rdoing ' + d.cls + '" title="' + esc(d.title || d.text) + '">' + esc(d.text) + '</td>' +
         '<td>' + (task ? esc(task) : '<span style="opacity:.4">\u2014</span>') + '</td>' +
         '<td class="num">' + (s.pending ? '<span class="rpend">' + s.pending + '</span>' : '') + '</td>' +
         '<td>' + (s.preview ? '<span class="rmsg" title="' + esc(s.preview) + '">\u201c' + esc(s.preview) + '\u201d</span>' : '') + '</td>' +
@@ -3628,9 +3633,21 @@ async function pollRoster() {
     catch (e) { /* roster fails quiet -- the tab stays usable */ }
   } finally { ROSTER_POLLING = false; }
 }
+// The last-commit side-channel rides its OWN 60s timer (git is a subprocess,
+// kept off the 2s presence poll) + a server-side 60s cache. Each fetch re-
+// renders so lane-less rows pick up "last commit N ago" in their DOING cell.
+async function pollRosterGit() {
+  if (!$("#view-roster").classList.contains("on") || document.hidden) return;
+  try {
+    const d = await j("/api/roster/git");
+    ROSTER_GIT = (d && d.commits) || {};
+    if (LAST_ROSTER) renderRoster(LAST_ROSTER);
+  } catch (e) { /* git side-channel fails quiet -- DOING falls back to the home room */ }
+}
 function initRoster() {
   if (!ROSTER_TIMER) {
     ROSTER_TIMER = setInterval(pollRoster, 2000);
+    ROSTER_GIT_TIMER = setInterval(pollRosterGit, 60000);
     // the message-a-seat composer moved here from the ledger -- wire it once
     $("#seatform").addEventListener("submit", sendSeatMsg);
     const key = $("#seatkey");
@@ -3644,6 +3661,7 @@ function initRoster() {
     chip("#togSAs", () => ROSTER_SHOW.sas = !ROSTER_SHOW.sas);
   }
   pollRoster();
+  pollRosterGit();
 }
 
 
