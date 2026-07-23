@@ -30,7 +30,8 @@ class SeatTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-seat-")
         self._env = {k: os.environ.get(k) for k in
                      ("HELM_HOME", "MELD_HOME", "HELM_PROXY_BIN",
-                      "MELD_PROXY_BIN", "KIMI_API_KEY", "HELM_PROC",
+                      "MELD_PROXY_BIN", "KIMI_API_KEY", "NOUS_AGENT_KEY",
+                      "HELM_PROC",
                       "HELM_CHAT_DIR", "HELM_CHAT_ROOM",
                       "HELM_CHAT_ROOM_SOURCE", "MELD_CHAT_ROOM",
                       "MELD_CHAT_ROOM_SOURCE", "HELM_CODEX_HOMES_DIR",
@@ -42,6 +43,10 @@ class SeatTest(unittest.TestCase):
         os.environ.pop("HELM_PROXY_BIN", None)
         os.environ.pop("MELD_PROXY_BIN", None)
         os.environ.pop("KIMI_API_KEY", None)  # hermetic: never the real key
+        os.environ.pop("NOUS_AGENT_KEY", None)
+        # hermetic: the real ~/.hermes/auth.json must never feed a test mint
+        self._hermes_auth = seat.HERMES_AUTH
+        seat.HERMES_AUTH = os.path.join(self.tmp, "hermes-auth.json")
         for key in ("HELM_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
                     "MELD_CHAT_ROOM", "MELD_CHAT_ROOM_SOURCE"):
             os.environ.pop(key, None)
@@ -54,6 +59,7 @@ class SeatTest(unittest.TestCase):
 
     def tearDown(self):
         seat.CODEX_HOMES = self._codex_homes
+        seat.HERMES_AUTH = self._hermes_auth
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -401,6 +407,133 @@ class SeatTest(unittest.TestCase):
         self.assertTrue(line.endswith(
             "claude --dangerously-skip-permissions --model kimi-k3"))
         self.assertNotIn("fake-kimi-key-for-tests", line)  # key never rides
+
+    # -- ds4pro (hermes-keyed proxy-key family, nous portal) ----------------
+    def _plant_hermes(self, key="fake-nous-agent-key-for-tests",
+                      expires_at="2099-01-01T00:00:00.000Z", provider="nous"):
+        """A fake ~/.hermes/auth.json at the patched seat.HERMES_AUTH."""
+        with open(seat.HERMES_AUTH, "w") as f:
+            json.dump({"providers": {provider: {
+                "agent_key": key,
+                "agent_key_expires_at": expires_at,
+                "inference_base_url": "https://inference-api.nousresearch.com/v1",
+                "portal_base_url": "https://portal.nousresearch.com",
+            }}}, f)
+
+    def test_family_ports_unique_with_interleave_headroom(self):
+        """The port invariant, extended for ds4pro: every family owns a
+        distinct port, ds4pro sits at 8360 — clear of the codex 8317+N
+        instance range and kimi's 8318 (no OTHER family within 8350-8370)."""
+        ports = {f: fam["port"] for f, fam in seat.FAMILIES.items()}
+        self.assertEqual(len(set(ports.values())), len(ports), ports)
+        self.assertEqual(ports["ds4pro"], 8360)
+        for f, p in ports.items():
+            if f != "ds4pro":
+                self.assertFalse(8350 <= p <= 8370,
+                                 "%s port %d crowds ds4pro's headroom" % (f, p))
+
+    def test_ds4pro_family_shape(self):
+        fam = seat.FAMILIES["ds4pro"]
+        self.assertEqual(fam["mode"], "proxy-key")
+        self.assertEqual(fam["model"], "ds4-pro")           # claude-side alias
+        self.assertEqual(fam["upstream_model"], "deepseek/deepseek-v4-pro")
+        self.assertEqual(fam["base_url"],
+                         "https://inference-api.nousresearch.com/v1")
+        self.assertEqual(fam["provider"], "nous")
+        self.assertEqual(fam["key_env"], "NOUS_AGENT_KEY")
+        self.assertEqual(fam["hermes_provider"], "nous")
+        self.assertEqual(fam["probe_models"], ("ds4-pro",))
+        self.assertIn("max_context", fam)
+
+    def test_config_yaml_key_upstream_alias_mapping(self):
+        cfg = seat._config_yaml_key(8360, "tok", "nous", "https://x.test/v1",
+                                    "ds4-pro", "fake-key",
+                                    "deepseek/deepseek-v4-pro")
+        self.assertIn('- name: "deepseek/deepseek-v4-pro"\n'
+                      '        alias: "ds4-pro"', cfg)
+
+    def test_add_ds4pro_mints_from_hermes(self):
+        self._plant_hermes()
+        rc, out, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        # the key is secret: never printed, baked 0600
+        self.assertNotIn("fake-nous-agent-key-for-tests", out + err)
+        self.assertNotIn("WARNING", err)      # fresh recorded expiry: silent
+        d = seat.seat_dir("ds4pro")
+        for p, want in ((os.path.join(d, "token"), 0o600),
+                        (os.path.join(d, "config.yaml"), 0o600),
+                        (os.path.join(d, "launch.sh"), 0o700)):
+            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), want, p)
+        with open(os.path.join(d, "config.yaml")) as f:
+            cfg = f.read()
+        self.assertIn('api-key: "fake-nous-agent-key-for-tests"', cfg)
+        self.assertIn('base-url: "https://inference-api.nousresearch.com/v1"',
+                      cfg)
+        self.assertIn('name: "deepseek/deepseek-v4-pro"', cfg)
+        self.assertIn('alias: "ds4-pro"', cfg)
+        self.assertIn("port: 8360", cfg)
+        self.assertNotIn("auth-dir", cfg)     # no OAuth dir for proxy-key
+
+    def test_add_ds4pro_stale_recorded_expiry_warns_but_mints(self):
+        """seed-feature-cache's law: a stale key at mint WARNs loud but the
+        mint still lands (the seat is ready the moment the cred is) — the
+        WARN pre-explains the 401→quarantine→503 failure shape (live-verified
+        2026-07-22) and names the one-time human unblock."""
+        self._plant_hermes(expires_at="2026-05-18T23:30:44.861Z")
+        rc, out, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("WARNING", err)
+        self.assertIn("2026-05-18T23:30:44.861Z", err)
+        self.assertIn("hermes", err)          # names the re-auth path
+        self.assertNotIn("fake-nous-agent-key-for-tests", out + err)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
+            self.assertIn('api-key: "fake-nous-agent-key-for-tests"', f.read())
+
+    def test_add_ds4pro_unparseable_expiry_no_false_warn(self):
+        self._plant_hermes(expires_at="not-a-date")
+        rc, _, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("WARNING", err)      # no signal ≠ stale
+
+    def test_add_ds4pro_env_var_beats_hermes(self):
+        self._plant_hermes(key="fake-hermes-loses")
+        os.environ["NOUS_AGENT_KEY"] = "fake-env-wins"
+        rc, _, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
+            self.assertIn('api-key: "fake-env-wins"', f.read())
+
+    def test_add_ds4pro_missing_everything_names_all_sources(self):
+        rc, out, err = self._add(("add", "ds4pro"))   # no env/file/hermes
+        self.assertEqual(rc, 1)
+        self.assertIn("NOUS_AGENT_KEY", err)
+        self.assertIn("--key-from", err)
+        self.assertIn(seat.HERMES_AUTH, err)  # names the hermes dependency
+        self.assertFalse(os.path.exists(os.path.join(seat.seat_dir("ds4pro"),
+                                                     "config.yaml")))
+
+    def test_add_ds4pro_hermes_missing_agent_key(self):
+        with open(seat.HERMES_AUTH, "w") as f:
+            json.dump({"providers": {"nous": {"access_token": "x"}}}, f)
+        rc, _, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 1)
+        self.assertIn("agent_key", err)
+
+    def test_ds4pro_launch_line_shape(self):
+        self._plant_hermes()
+        self.assertEqual(self._add(("add", "ds4pro"))[0], 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = seat.cmd_seat(["launch", "ds4pro"])
+        self.assertEqual(rc, 0)
+        line = out.getvalue().strip()
+        self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8360", line)
+        self.assertIn("HELM_CHAT_NAME=ds4pro", line)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000", line)
+        self.assertTrue(line.endswith(
+            "claude --dangerously-skip-permissions --model ds4-pro"))
+        self.assertNotIn("deepseek/", line)   # alias on the wire, not the id
+        self.assertNotIn("fake-nous-agent-key-for-tests", line)
 
     # -- launch line shape --------------------------------------------------
     def test_launch_line_shape(self):

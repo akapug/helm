@@ -90,6 +90,9 @@ CHILD_STAMP_VARS = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
                     "CLAUDE_CODE_BRIDGE_SESSION_ID")
 
 CODEX_HOMES = os.path.join(os.path.expanduser("~"), ".codex-homes")
+# The hermes CLI's OAuth artifact — the mint SOURCE for hermes-keyed families
+# (ds4pro). Read-only, never modified; tests point this at a fixture.
+HERMES_AUTH = os.path.join(os.path.expanduser("~"), ".hermes", "auth.json")
 PROXY_BIN_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin", "cli-proxy-api")
 DREGG_SIGNER_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin",
                                     "dregg-client-sign")
@@ -127,6 +130,39 @@ FAMILIES = {
              # one alias in the proxy config -> one probe; the mixed fan-out
              # leg needs two and SKIPs (loudly) for single-model families.
              "probe_models": ("kimi-k3",)},
+    # ds4pro = DeepSeek v4 Pro served through the THENOUS PORTAL (nous)
+    # inference endpoint. OUTBOUND KEY SOURCE (the hermes-auth dependency):
+    # when $NOUS_AGENT_KEY / --key-from are absent the mint reads
+    # providers.<hermes_provider>.agent_key from HERMES_AUTH (~/.hermes/
+    # auth.json, the hermes CLI's OAuth artifact) — so the seat depends on a
+    # prior hermes login. EXPIRY (live-probed 2026-07-22, all against the
+    # real endpoint): agent_key_expires_at is REAL for inference — an
+    # expired key still answers GET /models 200 (a models probe CANNOT
+    # certify the key) but POST /chat/completions 401s "invalid, blocked or
+    # out of funds", CLIProxyAPI then QUARANTINES the auth and every later
+    # call 503s auth_unavailable (kimi's documented quarantine class). The
+    # refresh chain is not self-serve: the portal token endpoint is
+    # <portal_base_url>/api/oauth/token, but a stale refresh_token gets
+    # invalid_grant, and re-minting an agent_key needs the hermes CLI's own
+    # login (scope inference:mint_agent_key) — a human, one time. So a stale
+    # key at mint WARNs loud and still mints (seed-feature-cache's law: the
+    # seat is ready the moment the cred is). Model ids probed live off
+    # <base_url>/models 2026-07-22: pro = deepseek/deepseek-v4-pro, flash =
+    # deepseek/deepseek-v4-flash (both report a 1,048,576-token context).
+    # "ds4-pro" is the claude-side alias; the proxy's openai-compatibility
+    # block maps it to the upstream id (upstream_model — slashes never reach
+    # claude's --model). Port 8360: clear of codex 8317+N instance headroom
+    # and kimi 8318 (interleave discipline: families claim ports tens apart
+    # so instance ranges never collide). max_context mirrors codex's shave:
+    # 1M window less headroom for the 32k max_tokens request + CC's 20k
+    # reserve.
+    "ds4pro": {"port": 8360, "model": "ds4-pro", "mode": "proxy-key",
+               "base_url": "https://inference-api.nousresearch.com/v1",
+               "upstream_model": "deepseek/deepseek-v4-pro",
+               "key_env": "NOUS_AGENT_KEY", "provider": "nous",
+               "hermes_provider": "nous",
+               "max_context": 1000000,
+               "probe_models": ("ds4-pro",)},
 }
 
 # CC's autocompact trigger = pct × (window − 20k). Against the CORRECT window it
@@ -398,11 +434,15 @@ def _config_yaml(port, auth_dir, token):
             "  disable-control-panel: true\n") % (port, auth_dir, token)
 
 
-def _config_yaml_key(port, token, provider, base_url, model, api_key):
+def _config_yaml_key(port, token, provider, base_url, model, api_key,
+                     upstream=None):
     """The proxy-key config: same inbound head (the per-seat token claude
     presents), no auth-dir (no OAuth cred), plus the openai-compatibility
     provider block carrying the outbound API key (0600 via _write_private —
-    the same trust level as the seat token beside it)."""
+    the same trust level as the seat token beside it). `upstream` is the
+    provider-side model id when it differs from the claude-side alias
+    (ds4pro: alias ds4-pro -> deepseek/deepseek-v4-pro); default: same id
+    both sides (kimi)."""
     return ('host: "127.0.0.1"\n'
             "port: %d\n"
             "api-keys:\n"
@@ -421,7 +461,8 @@ def _config_yaml_key(port, token, provider, base_url, model, api_key):
             "    models:\n"
             '      - name: "%s"\n'
             '        alias: "%s"\n'
-            % (port, token, provider, base_url, api_key, model, model))
+            % (port, token, provider, base_url, api_key,
+               upstream or model, model))
 
 
 def _key_base_url(fam, api_key):
@@ -797,6 +838,35 @@ def _env_file_value(path, key):
     return None
 
 
+def _iso_epoch(s):
+    """Epoch seconds of an ISO-8601 timestamp ('Z' tolerated); None when the
+    value is absent/unparseable — an unreadable expiry must never look fresh
+    OR stale, it just carries no signal."""
+    import datetime
+    try:
+        return datetime.datetime.fromisoformat(
+            str(s).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _hermes_agent_key(provider):
+    """(agent_key, agent_key_expires_at, err) for a portal provider from the
+    hermes CLI's auth artifact (HERMES_AUTH). READ-ONLY on the source, and the
+    key value is secret — callers must never print or log it."""
+    try:
+        with open(HERMES_AUTH) as f:
+            a = json.load(f)
+    except (OSError, ValueError) as exc:
+        return None, None, "unreadable %s (%s)" % (HERMES_AUTH, exc)
+    p = (a.get("providers") or {}).get(provider) or {}
+    key = p.get("agent_key")
+    if not key:
+        return None, None, ("no providers.%s.agent_key in %s"
+                            % (provider, HERMES_AUTH))
+    return key, p.get("agent_key_expires_at"), None
+
+
 def _resolve_homing(explicit_room=None):
     """(room, source) for seat add/launch — seats.resolve_homing is THE one
     precedence (CLI wins, then the inherited launch seam, then the current
@@ -813,8 +883,16 @@ def _resolve_homing(explicit_room=None):
 def _add_proxy_key(family, fam, args, room=None, room_source=None):
     """mode "proxy-key": an API-key provider behind the same local proxy via
     its openai-compatibility block. No OAuth, no auth-dir. Key source order:
-    $<key_env>, then --key-from <.env-style file>. The key is baked into the
-    seat's 0600 config.yaml once, at add time — never printed, never logged."""
+    $<key_env>, then --key-from <.env-style file>, then — for hermes-keyed
+    families (hermes_provider set, e.g. ds4pro) — the agent_key in the hermes
+    CLI's auth artifact (HERMES_AUTH, read-only). The key is baked into the
+    seat's 0600 config.yaml once, at add time — never printed, never logged.
+    A hermes key whose RECORDED expiry has passed WARNs loud but still mints
+    (seed-feature-cache's law — the seat is ready the moment the cred is):
+    live-verified 2026-07-22 the expiry is REAL for inference (first proxied
+    call 401s upstream, CLIProxyAPI quarantines the auth, later calls 503
+    auth_unavailable), so the WARN pre-explains exactly that failure and
+    names the one-time human unblock (hermes CLI re-login)."""
     key_env = fam["key_env"]
     api_key = os.environ.get(key_env)
     if not api_key and "--key-from" in args:
@@ -824,10 +902,35 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
             print("helm seat: no %s= line found in %s" % (key_env, path),
                   file=sys.stderr)
             return 1
+    hermes_err = None
+    if not api_key and fam.get("hermes_provider"):
+        api_key, exp_iso, hermes_err = _hermes_agent_key(fam["hermes_provider"])
+        if api_key:
+            exp = _iso_epoch(exp_iso)
+            if exp is not None and exp <= time.time():
+                print("helm seat: WARNING — %s agent_key in %s is recorded "
+                      "EXPIRED (agent_key_expires_at %s), and that expiry is "
+                      "REAL for inference: the seat's first call will 401 "
+                      "upstream, the proxy quarantines the auth, and every "
+                      "later call 503s auth_unavailable. Mint proceeds so the "
+                      "seat is ready the moment the cred is. Unblock (human, "
+                      "one-time): re-login the hermes CLI so %s refreshes "
+                      "providers.%s.agent_key, then `helm seat add %s` and "
+                      "`helm seat down %s` + `up %s` to clear the quarantine."
+                      % (fam["hermes_provider"], HERMES_AUTH, exp_iso,
+                         HERMES_AUTH, fam["hermes_provider"], family, family,
+                         family), file=sys.stderr)
     if not api_key:
+        hermes_hint = ""
+        if fam.get("hermes_provider"):
+            hermes_hint = (", or log the hermes CLI into portal provider "
+                           "'%s' so %s carries providers.%s.agent_key (%s)"
+                           % (fam["hermes_provider"], HERMES_AUTH,
+                              fam["hermes_provider"], hermes_err))
         print("helm seat: no outbound key — export %s=<key> or pass "
-              "--key-from <env-file> carrying a %s= line, then re-run "
-              "`helm seat add %s`" % (key_env, key_env, family), file=sys.stderr)
+              "--key-from <env-file> carrying a %s= line%s, then re-run "
+              "`helm seat add %s`" % (key_env, key_env, hermes_hint, family),
+              file=sys.stderr)
         return 1
     d = seat_dir(family)
     os.makedirs(d, mode=0o700, exist_ok=True)
@@ -836,7 +939,8 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
     base_url = _key_base_url(fam, api_key)
     _write_private(os.path.join(d, "config.yaml"),
                    _config_yaml_key(fam["port"], token, fam["provider"],
-                                    base_url, fam["model"], api_key))
+                                    base_url, fam["model"], api_key,
+                                    fam.get("upstream_model")))
     _write_launch_assets(family, d, room, room_source=room_source)
     print("helm seat: %s seat minted at %s" % (family, d))
     print("  outbound %s key baked into config.yaml (0600 — value never "
