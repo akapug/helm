@@ -1191,6 +1191,24 @@ def cmd_inject(args):
     nothing, rc 0 (fail-open). --explain prints what WOULD fire and why, sans
     ledger row. --lane-report renders the lane-split cohort table (read-only).
     --compare-report renders the local-vs-comparison divergence verdict (read-only)."""
+    # flags-only membership reader with an inline-text positional (quick
+    # tests): guard_tail would junk the inline text, so a custom guard refuses
+    # any UNKNOWN --flag (rc 2) while passing inline non-dash text + the
+    # hook-json path — `inject --bogus` used to inject the real context and
+    # exit 0 with the bogus flag pretending it existed.
+    _known = ("--project", "--json", "--explain", "--hook-json",
+              "--lane-report", "--compare-report")
+    bad = [a for a in args if a.startswith("-")
+           and a not in _known and a not in ("-h", "--help")]
+    if bad:
+        from .cli import suggest
+        print("helm inject: unknown arg '%s'%s" % (bad[0], suggest(bad[0], _known)),
+              file=sys.stderr)
+        return 2
+    if "-h" in args or "--help" in args:
+        print("inject [--project P] [--json] [--explain] [--hook-json] "
+              "[--lane-report] [--compare-report]")
+        return 0
     project = None
     if "--project" in args:
         project = args[args.index("--project") + 1]

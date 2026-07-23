@@ -431,6 +431,13 @@ def cmd_projections(args):
     projection naming its source + rebuild. Laws 2+3's read surface;
     `helm doctor` enforces it (source present, rebuild declared, staleness,
     squatters)."""
+    # flags-only membership reader — guard the tail before the survey:
+    # `projections --bogus` silently printed the table and exited 0.
+    from .cli import guard_tail
+    rc = guard_tail("helm projections", args, flags=("--json",),
+                    usage="projections [--json]")
+    if rc is not None:
+        return rc
     rows, squat = projection_survey()
     if "--json" in args:
         import json

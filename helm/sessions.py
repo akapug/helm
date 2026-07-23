@@ -685,6 +685,12 @@ def cmd_sessions(args):
         del rest[i:i + 2]
     include_synthetic = "--all" in rest
     rest = [a for a in rest if a != "--all"]
+    # -h/--help on an OTHERWISE-CLEAN tail is a help request, not junk:
+    # `sessions --all --help` used to refuse rc 2 lying that --help is an
+    # unknown arg. Junk still beats help (an unknown flag alongside --help
+    # refuses — the existence probe stays honest).
+    want_help = any(a in ("-h", "--help") for a in rest)
+    rest = [a for a in rest if a not in ("-h", "--help")]
     junk = [a for a in rest if a.startswith("-")]
     if junk:
         print("helm sessions: unknown arg '%s' (sessions [<project>] "
@@ -695,6 +701,10 @@ def cmd_sessions(args):
         print("helm sessions: one <project> filter at most (got: %s)"
               % ", ".join(rest), file=sys.stderr)
         return 2
+    if want_help:
+        print("sessions [<project>] [--limit N] [--all] | "
+              "sessions resume <id-prefix>")
+        return 0
     project = rest[0] if rest else None
     rows = rows_for(project=project, include_synthetic=include_synthetic, limit=limit)
     if not rows:

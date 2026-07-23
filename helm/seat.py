@@ -2503,7 +2503,8 @@ def cmd_seat(args):
         family = rest[0]
         # per-verb tail contract — refuse trailing junk BEFORE anything runs:
         # `seat down codex --bogus --help` used to STOP the seat and exit 0.
-        tails = {"add": ((), ("--room", "--auth-from", "--key-from")),
+        tails = {"add": ((), ("--room", "--auth-from", "--key-from",
+                              "--provider")),
                  "up": ((), ()),
                  "down": ((), ()),
                  "smoke": (("--multi",), ()),

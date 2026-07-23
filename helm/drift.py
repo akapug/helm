@@ -131,6 +131,15 @@ def report(project=None, snapshot=True):
 
 def cmd_drift(args):
     """drift [--project P] [--peek] — surface belief drift; silent when none."""
+    # flags-only membership reader: `--peek` was read via `"--peek" not in
+    # args`, so `drift --peekk` (typo) exited 0 AND ran the snapshot-WRITING
+    # path — the very state --peek exists to avoid. Guard the tail first.
+    from .cli import guard_tail
+    rc = guard_tail("helm drift", args, flags=("--peek",),
+                    valued=("--project",),
+                    usage="drift [--project P] [--peek]")
+    if rc is not None:
+        return rc
     project = None
     if "--project" in args:
         project = args[args.index("--project") + 1]

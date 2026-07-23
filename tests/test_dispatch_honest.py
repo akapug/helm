@@ -609,6 +609,14 @@ APPLY_READER_EXEMPT = {
     ("gc", "cmd_gc"):
         "closed-set refusal of its own (every non --dry/--apply token "
         "refuses); probed below",
+    ("rearm", "cmd_rearm"):
+        "closed-set refusal of its own — every token outside {--apply,--json} "
+        "refuses rc 2 (probed below); the usage-line message is separately "
+        "pinned by test_rearm.test_bad_flag_rejected",
+    ("seats", "cmd"):
+        "the `helm chat <verb>` dispatcher, cmd(verb, args); '--apply' lives "
+        "only in the `seat gc` branch, which refuses any non-(--apply) token "
+        "rc 2 before gc_roster (probed below)",
 }
 
 
@@ -640,6 +648,159 @@ class ApplyReadersAreGuarded(unittest.TestCase):
             rc, _, err = _call("gc", "cmd_gc", ["--bogus", "--apply"])
         self.assertEqual(rc, 2, err)
         self.assertFalse(p.called)
+
+    def test_rearm_junk_refuses_before_apply(self):
+        # main grew rearm since the merge-base — its closed-set check refuses
+        # every token outside {--apply,--json} BEFORE apply() signals anyone.
+        for argv in (["--bogus", "--apply"], ["--bogus"]):
+            with mock.patch("helm.rearm.apply") as p:
+                rc, _, err = _call("rearm", "cmd_rearm", argv)
+            self.assertEqual(rc, 2, (argv, err))
+            self.assertIn("usage: helm rearm", err)
+            self.assertFalse(p.called, argv)
+
+    def test_seats_seat_gc_junk_refuses_before_prune(self):
+        # seats.cmd(verb, args) is the `helm chat` dispatcher; '--apply' lives
+        # only in the seat-gc branch, which refuses non-(--apply) tokens before
+        # gc_roster. Called directly (its signature is not the _call shape).
+        from helm import seats
+        for argv in (["gc", "--bogus"], ["gc", "--bogus", "--apply"]):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch("helm.seats.gc_roster") as p, \
+                    contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                rc = seats.cmd("seat", argv)
+            self.assertEqual(rc, 2, (argv, err.getvalue()))
+            self.assertFalse(p.called, argv)
+
+
+# The membership-reader hole GENERALIZED past the mutation switch: the class
+# now covers MEMBERSHIP-READERS. A root-dispatched (VERBS) handler that reads
+# its flags ONLY via membership (`'--x' in args` / `args.index('--x')`) is
+# invisible to BOTH structural detectors above — it is not a subverb
+# dispatcher (SweepTest sees args[0] vs literals) and it DOES read args so it
+# is not a no-arg leaf (NoArgRootLeaves). Nothing between the root and it
+# guards the tail, so an unknown flag rides straight through: `drift --peekk`
+# ran the snapshot-WRITING path and exited 0; `brief/projections/who/attribute
+# /evolve --bogus` all ran their work with the bogus flag pretending to exist.
+# This detector closes that class BY CONSTRUCTION — the next flags-only reader
+# born without guard_tail (or a declared alternative refusal) fails HERE
+# before it ships. Scope is deliberately tight: VERBS handlers only (the root
+# dispatches straight to them); '--apply' readers belong to
+# ApplyReadersAreGuarded above; subverb dispatchers to SweepTest; positional
+# subhandlers reached THROUGH a dispatcher are that dispatcher's branch job.
+FLAG_READER_EXEMPT = {
+    ("premise", "cmd_premise"):
+        "free-text `<id> | <statement>` capture — guard_tail would junk the "
+        "statement words; a tail lacking the required '|' 2-part structure "
+        "refuses rc 2 (probed below)",
+    ("inject", "cmd_inject"):
+        "accepts inline non-dash prompt text for quick tests (guard_tail "
+        "would reject it); a custom guard refuses any unknown --flag rc 2 "
+        "while passing inline text + the hook-json path (probed below)",
+}
+
+
+def _flag_membership(node):
+    """Flag literals the fn reads via `'-x' in args` or `args.index('-x')` —
+    a flag consumed by membership rather than positional dispatch."""
+    flags = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Compare) and len(n.ops) == 1 \
+                and isinstance(n.ops[0], ast.In) \
+                and _is_str_const(n.left) and n.left.value.startswith("-") \
+                and any(isinstance(c, ast.Name) and c.id == "args"
+                        for c in n.comparators):
+            flags.add(n.left.value)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                and n.func.attr == "index" \
+                and isinstance(n.func.value, ast.Name) \
+                and n.func.value.id == "args" and n.args \
+                and _is_str_const(n.args[0]) \
+                and n.args[0].value.startswith("-"):
+            flags.add(n.args[0].value)
+    return flags
+
+
+class MembershipFlagReadersGuarded(unittest.TestCase):
+    """Third structural closure, companion to SweepTest + NoArgRootLeaves +
+    ApplyReadersAreGuarded: every VERBS handler that reads its flags only via
+    membership (and is neither a subverb dispatcher nor a no-arg leaf) must
+    call guard_tail or be declared in FLAG_READER_EXEMPT with a probed
+    alternative refusal. A new flags-only reader born unguarded fails here."""
+
+    def _readers(self):
+        vm = verb_map()
+        dispatchers = set(discover())
+        found = set()
+        for verb, (mod, fn) in vm.items():
+            if (mod, fn) in dispatchers:
+                continue                      # SweepTest owns dispatchers
+            node = _fn_node(mod, fn)
+            if not (node.name == "cmd" or node.name.startswith("cmd")):
+                continue
+            if not node.args.args or node.args.args[0].arg != "args":
+                continue                      # single-`args` handlers only
+            if not _flag_membership(node):
+                continue                      # not a flag-membership reader
+            if not reads_args(mod, fn):
+                continue                      # no-arg leaf: NoArgRootLeaves' job
+            src = ast.unparse(node)
+            if "guard_tail" in src or "--apply" in src:
+                continue                      # guarded, or ApplyReaders' job
+            found.add((mod, fn))
+        return found
+
+    def test_every_flag_reader_is_guarded_or_declared(self):
+        self.assertEqual(self._readers(), set(FLAG_READER_EXEMPT))
+
+    def test_premise_junk_refuses(self):
+        for argv in (["--bogus"], ["--bogus", "--help"]):
+            rc, _, err = _call("premise", "cmd_premise", argv)
+            self.assertEqual(rc, 2, (argv, err))
+
+    def test_inject_unknown_flag_refuses(self):
+        for argv in (["--bogus"], ["--bogus", "--help"]):
+            with mock.patch("helm.inject.gather") as g:
+                rc, _, err = _call("inject", "cmd_inject", argv)
+            self.assertEqual(rc, 2, (argv, err))
+            self.assertIn("--bogus", err)
+            self.assertFalse(g.called, argv)
+
+    def test_inject_inline_text_still_works(self):
+        with mock.patch("helm.inject.gather", return_value={}) as g, \
+                mock.patch("helm.inject.render", return_value=""):
+            rc, _, _ = _call("inject", "cmd_inject", ["hello world"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(g.called)
+
+    def test_guarded_readers_refuse_unknown_flag(self):
+        # end-to-end proof the five named + evolve now refuse their junk tail.
+        for mod, fn, work, argv in (
+                ("drift", "cmd_drift", "report", ["--peekk"]),
+                ("brief", "cmd_brief", "compose", ["--bogus"]),
+                ("registry", "cmd_projections", "projection_survey", ["--bogus"]),
+                ("who", "cmd_who", "scan", ["--bogus"]),
+                ("attribute", "cmd_attribute", "gather", ["--bogus"]),
+                ("evolve", "cmd_evolve", "cycle", ["--bogus"])):
+            with mock.patch("helm.%s.%s" % (mod, work)) as p:
+                rc, _, err = _call(mod, fn, argv)
+            self.assertEqual(rc, 2, (mod, argv, err))
+            self.assertIn(argv[0], err, (mod, argv))
+            self.assertFalse(p.called, (mod, argv))
+
+    def test_guarded_readers_clean_help_helps(self):
+        for mod, fn, work in (("drift", "cmd_drift", "report"),
+                              ("brief", "cmd_brief", "compose"),
+                              ("registry", "cmd_projections", "projection_survey"),
+                              ("who", "cmd_who", "scan"),
+                              ("attribute", "cmd_attribute", "gather"),
+                              ("evolve", "cmd_evolve", "cycle")):
+            with mock.patch("helm.%s.%s" % (mod, work)) as p:
+                rc, out, _ = _call(mod, fn, ["--help"])
+            self.assertEqual(rc, 0, mod)
+            self.assertTrue(out.strip(), mod)
+            self.assertFalse(p.called, mod)
 
 
 class HelpFirstTailStillGuarded(unittest.TestCase):
@@ -689,6 +850,31 @@ class CodexLaunchJunkBeforeGate(unittest.TestCase):
         self.assertEqual(rc, 2, err)
         self.assertIn("--bogus", err)
         self.assertFalse(g.called)
+
+
+class SessionsBareHelpTail(unittest.TestCase):
+    """`sessions --all --help` used to refuse rc 2 lying that --help is an
+    unknown arg (the bare-list junk sweep caught -h/--help when it was not
+    argv[0]). -h/--help on an otherwise-clean tail prints usage, rc 0; real
+    junk alongside --help still refuses (the existence probe stays honest)."""
+
+    def _call(self, argv):
+        with mock.patch("helm.sessions.rows_for") as rows:
+            rc, out, err = _call("sessions", "cmd_sessions", argv)
+        return rc, out, err, rows
+
+    def test_help_after_flag_helps(self):
+        for argv in (["--all", "--help"], ["--limit", "5", "--help"], ["-h"]):
+            rc, out, err, rows = self._call(argv)
+            self.assertEqual(rc, 0, (argv, err))
+            self.assertIn("sessions", out + err)
+            self.assertFalse(rows.called, argv)
+
+    def test_junk_beside_help_still_refuses(self):
+        rc, out, err, rows = self._call(["--all", "--bogus", "--help"])
+        self.assertEqual(rc, 2, (out, err))
+        self.assertIn("--bogus", err)
+        self.assertFalse(rows.called)
 
 
 if __name__ == "__main__":
