@@ -960,12 +960,25 @@ def _node_token():
 
 def _env_extra(token):
     """Aim the signer at the ROOM node (not the attest node): dregg-native
-    DREGG_* plus the legacy meld-style names — the seam drives either bin."""
+    DREGG_* plus the legacy meld-style names — the seam drives either bin.
+
+    A chat send is ALWAYS a single EmitEvent (topic helm.chat) — the
+    coordination class dregg's Stage B waives the admission charge for. When
+    `cell.coord_fee()` is 0 (the default = the room node opted into the exempt
+    class), forward `DREGG_COORDINATION_EXEMPT=1` so the signer estimates the
+    turn's declared fee at 0 and it rides free: no cell drain, no faucet grant,
+    no [unsigned] throttle. Setting HELM_NODE_COORD_FEE to a nonzero fee (a
+    node that has NOT opted in) disables the signal so the signer funds the
+    full computron cost as before — ONE knob for both the anchor and chat
+    paths."""
+    from . import cell
     u = node_url() or ""
     env = {"MELD_NODE_URL": u, "DREGG_NODE_URL": u}
     if token:
         env["MELD_NODE_TOKEN"] = token
         env["DREGG_API_TOKEN"] = token
+    if cell.coord_fee() == 0:
+        env["DREGG_COORDINATION_EXEMPT"] = "1"
     return env
 
 
