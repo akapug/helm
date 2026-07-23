@@ -2592,6 +2592,30 @@ class RosterGcTest(SeatsBase):
         self.assertFalse(
             os.path.exists(os.path.join(d, "main.cursor.%s" % key)))
 
+    def test_move_keeps_a_room_slug_that_embeds_the_key(self):
+        """PRE-EXISTING boundary-blind rename substitution (fable adversarial
+        probe C10): a room whose slug merely EMBEDS the seat's full key
+        ('<key>-updates') had its ROOM segment rewritten by the raw
+        str.replace on rename — the cursor silently detached from its room
+        (delivery ground lost to an EOF re-baseline, orphan file left).
+        _bounded_sub swaps the key only where it fills a whole '.'-field —
+        bare, or dm-prefixed for the dm-lane room segment, which carries the
+        key TWICE and must still fully move."""
+        chat._ensure_dir()
+        d = chat.chat_dir()
+        ok, nk = seats._seat_key("foo"), seats._seat_key("zed")
+        embed = "%s-updates.cursor.%s" % (ok, ok)   # the reviewer's probe
+        dmlane = "dm-%s.cursor.%s" % (ok, ok)       # key twice: both move
+        for n in (embed, dmlane):
+            open(os.path.join(d, n), "w").close()
+        seats._move_seat_state("foo", "zed")
+        self.assertTrue(os.path.exists(os.path.join(       # room segment kept,
+            d, "%s-updates.cursor.%s" % (ok, nk))))        # seat field moved
+        self.assertFalse(os.path.exists(os.path.join(
+            d, "%s-updates.cursor.%s" % (nk, nk))))
+        self.assertTrue(os.path.exists(os.path.join(
+            d, "dm-%s.cursor.%s" % (nk, nk))))
+
     def test_gc_refuses_fresh_presence(self):
         self._row("alive", session="sid-alive-1", stale=False)
         roots, proc = self._empty_dirs()

@@ -107,12 +107,14 @@ def cmd_launch(args):
             return 1
         home_path = targets[0][1]
         home_note(home_path, opts["home"])
-    seat = opts["seat"] or os.environ.get("HELM_CHAT_NAME") or stable_seat()
     # seats.resolve_homing is THE one precedence (CLI --room > env seam >
     # project derivation) — launch never re-derives its own copy. safe_cwd:
     # a deleted process cwd must not crash the launch seam (eager-getcwd
-    # class), it just launches un-homed.
+    # class), it just launches un-homed — hoisted above the seat default
+    # because stable_seat() derives from cwd too.
     cwd = seats.safe_cwd()
+    seat = (opts["seat"] or os.environ.get("HELM_CHAT_NAME")
+            or stable_seat(cwd or "here"))
     room, source = seats.resolve_homing(opts["room"], cwd)
     room_source = "derived" if source == "derived" else None
     room_explicit = source == "explicit"

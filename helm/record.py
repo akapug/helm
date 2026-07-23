@@ -194,8 +194,10 @@ def _record(event):
     # everything else reads the cached last-dirty. A probe that FAILED (None:
     # timeout, git error) keeps the cache — unknown never masquerades as clean.
     if tool in DIRTYING:
+        from . import seats
         wd = str(tin.get("workdir") or tin.get("cwd") or event.get("cwd") or "") \
-            or os.getcwd()
+            or seats.safe_cwd() or ""  # deleted cwd: _git_dirty("") fails to
+        # None -> cached last-dirty, instead of an eager-getcwd hook crash
         dirty = _git_dirty(wd)
         if dirty is None:
             dirty = bool(c.get("last-dirty"))

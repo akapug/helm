@@ -1282,8 +1282,10 @@ def _resume(seat_name, rest):
         # assets (identity vars, delivery hooks, context env), room preserved.
         _write_launch_assets(
             family, d, room, seat_name, room_source=room_source, multi=multi)
-        handle = ad.spawn(command, title=seat_name,
-                          cwd=sess_cwd or os.getcwd())
+        from . import seats
+        handle = ad.spawn(command, title=seat_name,   # safe_cwd: a deleted
+                          cwd=sess_cwd or seats.safe_cwd())  # cwd must not
+        # crash the resume (eager-getcwd class); spawn treats None as inherit.
     except harness.HarnessError as e:
         print("helm seat: %s resume via %s failed: %s"
               % (seat_name, ad.name, e), file=sys.stderr)
@@ -1522,8 +1524,11 @@ def _spawn_plan(seat_name, d, launch_sh, room, cwd, onboard, ad):
 
 def _spawn_args(rest):
     """Parse spawn's small option surface without letting a missing value raise
-    IndexError or an unknown flag silently change the launch."""
-    room, cwd, dry_run = None, os.getcwd(), False
+    IndexError or an unknown flag silently change the launch. The default cwd
+    is safe_cwd, not a bare os.getcwd() — a deleted cwd must not crash spawn
+    (eager-getcwd class); downstream tolerates None (harness inherits)."""
+    from . import seats
+    room, cwd, dry_run = None, seats.safe_cwd(), False
     i = 0
     while i < len(rest):
         arg = rest[i]

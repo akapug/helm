@@ -642,6 +642,19 @@ def _key_bounded(name, key):
     return False
 
 
+def _bounded_sub(name, ok, nk):
+    """_key_bounded's boundary law applied to the RENAME substitution: swap
+    the key only where it fills a whole '.'-field (bare, or dm-prefixed for
+    the dm-lane room segment) — keys/rooms never contain '.' (slug + hash
+    alphabets), so '.' is a hard field boundary. The raw str.replace it
+    replaces rewrote a ROOM slug that merely EMBEDS the key
+    ('<key>-updates.cursor.<key>' -> room segment corrupted), silently
+    detaching the cursor from its room (fable adversarial probe C10)."""
+    dm_ok, dm_nk = chat.DM_PREFIX + ok, chat.DM_PREFIX + nk
+    return ".".join(nk if s == ok else (dm_nk if s == dm_ok else s)
+                    for s in name.split("."))
+
+
 def _move_seat_state(old, new):
     """Carry every state file from the old seat key to the new one — cursors
     (+ per-session variants + locks), .seen, stop latches, every room. The
@@ -663,9 +676,11 @@ def _move_seat_state(old, new):
             try:
                 # replace EVERY key occurrence: a dm-lane cursor carries the
                 # key twice (dm-<key>.cursor.<key>…) and both must move —
-                # the lane file kept its inode, so the cursor stays valid
+                # the lane file kept its inode, so the cursor stays valid.
+                # Segment-bounded (_bounded_sub), never raw str.replace: a
+                # room slug embedding the key must keep its room segment.
                 os.replace(os.path.join(d, n),
-                           os.path.join(d, n.replace(ok, nk)))
+                           os.path.join(d, _bounded_sub(n, ok, nk)))
             except OSError:
                 pass
 
