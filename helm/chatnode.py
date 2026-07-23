@@ -143,20 +143,36 @@ def bootstrap_cell_hex():
     return hashlib.blake2b(b"helm-chat-node-bootstrap", digest_size=32).hexdigest()
 
 
+def faucet(url, recipient, amount):
+    """One faucet grant, validated instead of fire-and-forgotten. Returns the
+    accepted response or a precise reason. The node's contract is
+    {success:true}; reachable JSON with success:false is a refusal, not health."""
+    r = cell.post_json(url + "/api/faucet",
+                       {"recipient": recipient, "amount": amount})
+    if not isinstance(r, dict):
+        return None, "faucet unreachable or returned a non-object response at %s" % url
+    if not r.get("success"):
+        return None, "faucet refused: %s" % (r.get("error") or "success was false")
+    return r, None
+
+
 def ensure_healthy(url):
     """The node's client-facing health gate demands one committed block; a
-    faucet turn to the throwaway bootstrap cell provides it. True iff healthy."""
+    faucet turn to the throwaway bootstrap cell provides it. Returns
+    (True, None) or (False, precise reason) — the faucet response is never
+    discarded."""
     st = cell.get_json(url + "/status", timeout=3)
     if isinstance(st, dict) and st.get("healthy"):
-        return True
-    cell.post_json(url + "/api/faucet",
-                   {"recipient": bootstrap_cell_hex(), "amount": 1})
+        return True, None
+    _r, err = faucet(url, bootstrap_cell_hex(), 1)
+    if err:
+        return False, err
     for _ in range(20):
         st = cell.get_json(url + "/status", timeout=3)
         if isinstance(st, dict) and st.get("healthy"):
-            return True
+            return True, None
         time.sleep(0.25)
-    return False
+    return False, "faucet accepted but the node never became healthy at %s" % url
 
 
 def provision(url, passphrase=None):
@@ -169,8 +185,9 @@ def provision(url, passphrase=None):
     token, err = unlock(url, passphrase)
     if err:
         return None, err
-    if not ensure_healthy(url):
-        return None, "node reachable but never produced a block (bootstrap faucet failed)"
+    healthy, err = ensure_healthy(url)
+    if not healthy:
+        return None, "node reachable but never produced a block: %s" % err
     st.update({"url": url, "passphrase": passphrase, "token": token})
     write_state(st)
     return st, None
@@ -239,6 +256,10 @@ def _status(args):
     rc, out = _systemctl("is-active", UNIT)
     print("helm chat node: unit %s (%s)" % (UNIT, out or "unknown"))
     url = chat.node_url() or default_url()
+    transport = chat.transport_status()
+    if transport.get("mode") == "degraded":
+        print("helm chat node: " + chat.transport_failure_summary(transport),
+              file=sys.stderr)
     head = cell.get_json(url + "/api/receipts", timeout=3)
     if head is None:
         print("helm chat node: API UNREACHABLE at %s — chat posts fall back "
@@ -251,7 +272,7 @@ def _status(args):
         info = cell.get_json(url + "/api/cell/" + cells[profile], timeout=3) or {}
         print("  cell %s (%s): balance %s" % (
             cells[profile][:12], profile, info.get("balance", "?")))
-    return 0
+    return 1 if transport.get("mode") == "degraded" else 0
 
 
 def cmd_node(args):

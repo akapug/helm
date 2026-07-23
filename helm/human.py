@@ -86,8 +86,12 @@ def chat_pane(m, width, height):
 def status_line(m, width):
     st = m["status"]
     head = ("#%s" % st["head"]) if st.get("head") is not None else "-"
-    parts = ["helm", m["room"],
-             "%s %s" % (st.get("mode", "?").upper(), head), m["quota"],
+    transport = "%s %s" % (st.get("mode", "?").upper(), head)
+    if st.get("mode") == "degraded":
+        transport += " · %s: %s · last %ss ago" % (
+            st.get("profile") or "?", st.get("reason") or "unknown",
+            st.get("last_age_s") or 0)
+    parts = ["helm", m["room"], transport, m["quota"],
              m["notice"] or "q quits"]
     return emoji.clip(" · ".join(p for p in parts if p), width)
 

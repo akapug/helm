@@ -18,7 +18,9 @@ from helm import chat, human  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
-            "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG")
+            "MELD_CHAT_NODE_URL", "HELM_CHAT_ROOM", "MELD_CHAT_ROOM",
+            "HELM_CHAT_ROOM_SOURCE", "MELD_CHAT_ROOM_SOURCE",
+            "HELM_CHAT_LOG", "MELD_CHAT_LOG")
 
 
 class HumanBase(unittest.TestCase):
@@ -84,6 +86,12 @@ class RenderTest(HumanBase):
         self.assertIn("63% left", s)
         m["status"] = {"mode": "unsigned", "url": None, "head": None}
         self.assertIn("UNSIGNED -", human.status_line(m, 80))
+        m["status"] = {"mode": "degraded", "head": 12, "profile": "seat-a",
+                       "reason": "send failed", "last_age_s": 7}
+        loud = human.status_line(m, 120)
+        self.assertIn("DEGRADED #12", loud)
+        self.assertIn("seat-a: send failed", loud)
+        self.assertIn("last 7s ago", loud)
 
     def test_input_line_keeps_the_cursor_end_visible(self):
         m = human.model_new()

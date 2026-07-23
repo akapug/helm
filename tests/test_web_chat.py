@@ -15,6 +15,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,7 +23,8 @@ from helm import chat, web  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
-            "HELM_CELL_BIN", "MELD_CELL_BIN")
+            "HELM_CHAT_ROOM", "MELD_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
+            "MELD_CHAT_ROOM_SOURCE", "HELM_CELL_BIN", "MELD_CELL_BIN")
 
 
 class TestWebChat(unittest.TestCase):
@@ -46,6 +48,7 @@ class TestWebChat(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        failure_dir = chat.sign_failures_dir()
         cls.srv.shutdown()
         cls.srv.server_close()
         cls.thread.join(timeout=5)
@@ -55,10 +58,12 @@ class TestWebChat(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        shutil.rmtree(failure_dir, ignore_errors=True)
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
-        # each test starts with an empty room dir (rooms are per-test state)
+        # each test starts with an empty room + RAM incident dir
+        shutil.rmtree(chat.sign_failures_dir(), ignore_errors=True)
         shutil.rmtree(os.environ["HELM_CHAT_DIR"], ignore_errors=True)
 
     def req(self, path, payload=None, token=True):
@@ -86,6 +91,35 @@ class TestWebChat(unittest.TestCase):
         self.assertEqual(d["transport"],
                          {"mode": "unsigned", "url": None, "head": None,
                           "signer": False})
+
+    def test_web_poll_and_served_ui_show_precise_degraded_transport(self):
+        failure = chat._diag("send_failed", "second send failed")
+        with mock.patch.object(chat, "_sign_send", return_value=(None, failure)):
+            row = chat.post("still delivered", who="agent", profile="seat-a",
+                            sign=True)
+        self.assertEqual(row["transport"]["state"], "DEGRADED")
+        status, d = self.req("/api/chat")
+        self.assertEqual(status, 200)
+        t = d["transport"]
+        self.assertEqual((t["mode"], t["state"], t["profile"], t["reason"]),
+                         ("degraded", "DEGRADED", "seat-a",
+                          "second send failed"))
+        for key in ("first_failure", "last_failure", "age_s", "remediation"):
+            self.assertIn(key, t)
+        with urllib.request.urlopen("http://127.0.0.1:%d/" % self.port,
+                                    timeout=10) as resp:
+            html = resp.read().decode("utf-8")
+        self.assertIn('t.mode === "degraded"', html)
+        self.assertIn('"DEGRADED · " + (t.profile', html)
+        self.assertIn("t.first_failure", html)
+        self.assertIn("t.last_failure", html)
+        self.assertIn("t.remediation", html)
+        self.assertIn('signing <span class="lbadge tent">DEGRADED</span>', html)
+        self.assertIn("tp.first_failure", html)
+        self.assertIn("tp.last_failure", html)
+        self.assertIn('tr.state === "DEGRADED"', html)
+        self.assertIn('class="cdiag"', html)
+        self.assertIn('⚠ DEGRADED', html)
 
     def test_rooms_sidebar_lists_channels_with_cross_room_signal(self):
         """slice-1: /api/chat carries `rooms` (the channel sidebar) with a

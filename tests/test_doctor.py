@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from helm import doctor, home, pk, whoami
+from helm import chat, doctor, home, pk, whoami
 
 
 def levels(results, level):
@@ -183,6 +183,40 @@ class TestChecks(DoctorBase):
     def test_env_overrides_reported(self):
         msgs = levels(doctor.check_env(), doctor.OK)
         self.assertTrue(any("HELM_HOME=" + self.helm_home in m for m in msgs))
+
+    def test_chat_sign_failure_is_a_loud_operator_warning(self):
+        st = {"mode": "degraded", "profile": "seat-a",
+              "reason": "send failed", "first_failure": "first",
+              "last_failure": "last", "last_age_s": 9,
+              "failure_count": 2,
+              "remediation": "repair balance, then retry"}
+        from helm import cell
+        with mock.patch.object(chat, "node_url", return_value="http://node"), \
+             mock.patch.object(chat, "node_head", return_value={"chain_index": 7}), \
+             mock.patch.object(chat, "transport_status", return_value=st), \
+             mock.patch.object(chat, "cells_path",
+                               return_value=os.path.join(self.tmp.name, "none")), \
+             mock.patch.object(cell, "bin_ready", return_value=True):
+            results = doctor.check_chat_node()
+        warning = "\n".join(levels(results, doctor.WARN))
+        self.assertIn("DEGRADED profile 'seat-a': send failed", warning)
+        self.assertIn("first first, last last (9s ago)", warning)
+        self.assertIn("remediation: repair balance, then retry", warning)
+        # The persistent incident must not disappear behind a CURRENT node-down
+        # early return; doctor reports both facts until signed recovery clears it.
+        with mock.patch.object(chat, "node_url", return_value="http://node"), \
+             mock.patch.object(chat, "node_head", return_value=None), \
+             mock.patch.object(chat, "transport_status", return_value=st):
+            down = "\n".join(levels(doctor.check_chat_node(), doctor.WARN))
+        self.assertIn("DEGRADED profile 'seat-a'", down)
+        self.assertIn("UNREACHABLE", down)
+        with mock.patch.object(chat, "node_url", return_value=None), \
+             mock.patch.object(chat, "transport_status", return_value=st):
+            disabled = doctor.check_chat_node()
+        self.assertTrue(any(lvl == doctor.WARN and "DEGRADED" in msg
+                            for lvl, msg in disabled))
+        self.assertTrue(any(lvl == doctor.OK and "disabled" in msg
+                            for lvl, msg in disabled))
 
 
 class TestProjectionRegistry(DoctorBase):

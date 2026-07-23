@@ -88,6 +88,7 @@ class LiveNodeTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        failure_dir = chat.sign_failures_dir()
         cls._teardown_node()
         os.chdir(cls.cwd_prior)
         for k, v in cls.env_prior.items():
@@ -95,11 +96,13 @@ class LiveNodeTest(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        shutil.rmtree(failure_dir, ignore_errors=True)
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     _seq = 0
 
     def setUp(self):
+        shutil.rmtree(chat.sign_failures_dir(), ignore_errors=True)
         shutil.rmtree(os.environ["HELM_CHAT_DIR"], ignore_errors=True)
         # a FRESH cell per test: the faucet is 1/min/cell and a signed send
         # costs ~1442 computrons — one shared cell would run dry mid-suite
@@ -138,10 +141,12 @@ class LiveNodeTest(unittest.TestCase):
         finally:
             os.environ["HELM_CHAT_NODE_URL"] = self.url
         self.assertNotIn("chain", m)                    # dropped the signature
-        self.assertIn("[unsigned]", chat._fmt(m))       # visibly
+        self.assertIn("[DEGRADED", chat._fmt(m))        # loud + precise
+        self.assertEqual(m["transport"]["code"], "node_unreachable")
         self.assertEqual(chat.read()[1], 1)             # never the message
         m2 = chat.post("back up", who="a1")             # node back -> signed again
         self.assertIsInstance(m2.get("chain"), int)
+        self.assertEqual(chat.transport_status()["mode"], "signed")
 
     def test_04_stale_token_recovery_lap(self):
         chat.post("prime", who="a1")                    # cache cells + token

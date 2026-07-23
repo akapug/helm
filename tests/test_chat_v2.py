@@ -17,11 +17,13 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import cell as cellmod  # noqa: E402
-from helm import chat, chatnode, home  # noqa: E402
+from helm import chat, chatnode, home, pk  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
-            "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG",
+            "MELD_CHAT_NODE_URL", "HELM_CHAT_ROOM", "MELD_CHAT_ROOM",
+            "HELM_CHAT_ROOM_SOURCE", "MELD_CHAT_ROOM_SOURCE",
+            "HELM_CHAT_LOG", "MELD_CHAT_LOG",
             "HELM_CHAT_NODE_BIN", "MELD_CHAT_NODE_BIN",
             "HELM_CELL_BIN", "MELD_CELL_BIN")
 
@@ -44,12 +46,14 @@ class V2Base(unittest.TestCase):
         os.chdir(self.tmp)
 
     def tearDown(self):
+        failure_dir = chat.sign_failures_dir()
         os.chdir(self.cwd_prior)
         for k, v in self.env_prior.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        shutil.rmtree(failure_dir, ignore_errors=True)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
@@ -59,6 +63,7 @@ class TransportTest(V2Base):
         self.assertEqual(chat.transport_status(),
                          {"mode": "unsigned", "url": None, "head": None,
                           "signer": False})
+        self.assertFalse(os.path.exists(os.environ["HELM_CHAT_DIR"]))
 
     def test_node_url_env_wins_and_strips(self):
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:9999/"
@@ -96,10 +101,16 @@ class TransportTest(V2Base):
         self.assertIn("[unsigned]", chat._fmt(m))
 
     def test_sign_failure_falls_back_to_unsigned(self):
-        with mock.patch.object(chat, "_sign_send", return_value=(None, "down")):
-            m = chat.post("tried", who="a1", sign=True)
+        with mock.patch.object(
+                chat, "_sign_send",
+                return_value=(None, chat._diag("send_failed", "down"))):
+            m = chat.post("tried", who="a1", profile="p1", sign=True)
         self.assertNotIn("chain", m)
         self.assertEqual(chat.read()[1], 1)  # the message never dies
+        self.assertEqual(m["transport"]["state"], "DEGRADED")
+        self.assertEqual(m["transport"]["profile"], "p1")
+        self.assertEqual(m["transport"]["reason"], "down")
+        self.assertIn("[DEGRADED p1/send_failed: down]", chat._fmt(m))
 
     def test_sign_leg_raising_falls_back_to_unsigned(self):
         # fallback law, hardened: a RAISING signing leg (a raced .cells.json
@@ -107,9 +118,11 @@ class TransportTest(V2Base):
         # must never die on the signature (a raise once killed a web POST)
         with mock.patch.object(chat, "_sign_send",
                                side_effect=RuntimeError("raced tmp write")):
-            m = chat.post("survives", who="a1", sign=True)
+            m = chat.post("survives", who="a1", profile="p1", sign=True)
         self.assertNotIn("chain", m)
         self.assertEqual(chat.read()[1], 1)
+        self.assertEqual(m["transport"]["code"], "signing_exception")
+        self.assertIn("raced tmp write", m["transport"]["reason"])
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:9"
         with mock.patch.object(chat, "node_head",
                                side_effect=OSError("probe blew up")):
@@ -131,8 +144,9 @@ class TransportTest(V2Base):
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
         with mock.patch.object(cellmod, "bin_ready", return_value=True), \
              mock.patch.object(cellmod, "run_bin", side_effect=fake_run), \
-             mock.patch.object(chat, "_revive", return_value="tok2") as rv, \
-             mock.patch.object(chat, "_faucet") as fc:
+             mock.patch.object(chat, "_revive", return_value=("tok2", None)) as rv, \
+             mock.patch.object(chat, "_faucet",
+                               return_value=({"success": True}, None)) as fc:
             info, err = chat._sign_send("payload", "p1")
         self.assertIsNone(err)
         self.assertEqual(info["chain_index"], 7)
@@ -142,6 +156,120 @@ class TransportTest(V2Base):
         # the join result was cached RAM-side (the room dir), not on disk
         with open(chat.cells_path()) as f:
             self.assertEqual(json.load(f)["p1"], "c" * 64)
+
+    def test_two_send_failures_and_faucet_false_are_returned_precisely(self):
+        """The proven failure: both sends + a success:false faucet used to be
+        discarded. The final diagnostic names every leg and redacts secrets."""
+        secret = "x" * 320  # long enough that tail-slicing first loses `token=`
+        outs = [(1, "", "insufficient computrons token=" + secret),
+                (1, "", "still insufficient")]
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(chat, "_room_cell",
+                               return_value=("c" * 64, None, True)), \
+             mock.patch.object(chat, "_balance", return_value=0), \
+             mock.patch.object(cellmod, "run_bin", side_effect=outs) as rb, \
+             mock.patch.object(chat, "_revive",
+                               return_value=(None, "unlock refused")), \
+             mock.patch.object(chat, "_faucet",
+                               return_value=(None, "faucet refused: rate limited")) as fc:
+            info, failure = chat._sign_send("payload", "p1")
+        self.assertIsNone(info)
+        self.assertEqual(failure["code"], "send_failed")
+        self.assertIn("attempt 1 rc 1", failure["reason"])
+        self.assertIn("attempt 2 rc 1", failure["reason"])
+        self.assertIn("faucet refused: rate limited", failure["reason"])
+        self.assertIn("unlock refused", failure["reason"])
+        self.assertNotIn(secret[:40], failure["reason"])
+        self.assertIn("token=[redacted]", failure["reason"])
+        self.assertEqual(rb.call_count, 2)
+        self.assertEqual(fc.call_count, 2)  # proactive + recovery grants
+
+    def test_failure_persists_in_ram_status_and_signed_success_clears_it(self):
+        """Two unsigned fallbacks land, first/last/count/age persist, every
+        surface reads DEGRADED, then the profile's signed turn is the clear
+        witness. The incident owner lives only under HELM_CHAT_DIR (tmpfs in
+        production), never the disk journal/state tree."""
+        failure1 = {"code": "send_failed",
+                    "reason": "first failure bearer abc123"}
+        failure2 = {"code": "send_failed", "reason": "second failure"}
+        with mock.patch.object(chat.time, "time", return_value=100), \
+             mock.patch.object(pk, "now_ts", return_value="2026-07-22T10:00:00Z"), \
+             mock.patch.object(chat, "_sign_send", return_value=(None, failure1)):
+            one = chat.post("one", who="a1", profile="p1", sign=True)
+        with mock.patch.object(chat.time, "time", return_value=160), \
+             mock.patch.object(pk, "now_ts", return_value="2026-07-22T10:01:00Z"), \
+             mock.patch.object(chat, "_sign_send", return_value=(None, failure2)):
+            two = chat.post("two", who="a1", profile="p1", sign=True)
+        self.assertEqual(chat.read()[1], 2)       # unsigned RAM delivery survives
+        self.assertNotIn("chain", one)
+        self.assertNotIn("chain", two)
+        self.assertEqual(two["transport"]["failure_count"], 2)
+        self.assertEqual(two["transport"]["first_failure"],
+                         "2026-07-22T10:00:00Z")
+        self.assertEqual(two["transport"]["last_failure"],
+                         "2026-07-22T10:01:00Z")
+        self.assertNotIn("abc123", json.dumps(one))
+        self.assertTrue(chat.sign_failures_path().startswith(
+            chat.SIGN_FAILURES_ROOT + os.sep))
+        self.assertFalse(chat.sign_failures_path().startswith(
+            os.environ["HELM_CHAT_DIR"] + os.sep))  # override cannot move state to disk
+        self.assertFalse(os.path.exists(chat.journal_dir()))  # log-after stays separate
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with mock.patch.object(chat.time, "time", return_value=220), \
+             mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(chat, "node_head",
+                               return_value={"chain_index": 42}):
+            st = chat.transport_status()
+        self.assertEqual(st["state"], "DEGRADED")
+        self.assertEqual((st["profile"], st["reason"], st["failure_count"]),
+                         ("p1", "second failure", 2))
+        self.assertEqual((st["age_s"], st["last_age_s"]), (120, 60))
+        self.assertIn("remediation", st)
+        with mock.patch.object(chat, "_sign_send", return_value=(SENT, None)):
+            three = chat.post("recovered", who="a1", profile="p1", sign=True)
+        self.assertEqual(three["chain"], 7)
+        self.assertEqual(chat.sign_failures(), [])
+        self.assertTrue(os.path.exists(chat.sign_failures_path()))  # success watermark
+        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(chat, "node_head",
+                               return_value={"chain_index": 43}):
+            self.assertEqual(chat.transport_status()["mode"], "signed")
+
+    def test_failure_state_is_per_profile(self):
+        chat._record_sign_failure("p1", chat._diag("send_failed", "one"))
+        chat._record_sign_failure("p2", chat._diag("join_failed", "two"))
+        self.assertEqual({f["profile"] for f in chat.sign_failures()}, {"p1", "p2"})
+        chat._clear_sign_failure("p1")
+        self.assertEqual([f["profile"] for f in chat.sign_failures()], ["p2"])
+
+    def test_older_signed_completion_cannot_clear_a_newer_failure(self):
+        with mock.patch.object(chat.time, "time", return_value=200):
+            chat._record_sign_failure("p1", chat._diag("send_failed", "later"))
+        self.assertFalse(chat._clear_sign_failure("p1", succeeded_at=100))
+        self.assertEqual(chat.sign_failures()[0]["reason"], "later")
+        self.assertTrue(chat._clear_sign_failure("p1", succeeded_at=300))
+        self.assertEqual(chat.sign_failures(), [])
+
+    def test_delayed_older_failure_cannot_redegrade_after_success(self):
+        with mock.patch.object(chat.time, "time", return_value=200):
+            delayed = chat._diag("send_failed", "stale delayed failure")
+        self.assertFalse(chat._clear_sign_failure("p1", succeeded_at=300))
+        with mock.patch.object(chat.time, "time", return_value=400):
+            row_diag = chat._record_sign_failure("p1", delayed)
+        self.assertEqual(row_diag["reason"], "stale delayed failure")
+        self.assertEqual(chat.sign_failures(), [])
+
+    def test_delayed_older_failure_cannot_overwrite_newer_failure(self):
+        with mock.patch.object(chat.time, "time", return_value=200):
+            delayed = chat._diag("send_failed", "older")
+        with mock.patch.object(chat.time, "time", return_value=300):
+            chat._record_sign_failure("p1", chat._diag("join_failed", "newer"))
+        with mock.patch.object(chat.time, "time", return_value=400):
+            chat._record_sign_failure("p1", delayed)
+        state = chat.sign_failures()[0]
+        self.assertEqual((state["code"], state["reason"]),
+                         ("join_failed", "newer"))
 
     def test_no_signer_short_circuits_the_signing_leg(self):
         """Day-review #1: with HELM_CELL_BIN unset a signed turn is
@@ -154,7 +282,8 @@ class TransportTest(V2Base):
              mock.patch.object(chat, "_revive") as rv:
             info, err = chat._sign_send("payload", "p1")
         self.assertIsNone(info)
-        self.assertIn("no signer", err)
+        self.assertEqual(err["code"], "signer_unavailable")
+        self.assertIn("no signer", err["reason"])
         rb.assert_not_called()
         rv.assert_not_called()
         with mock.patch.object(chat, "node_head") as nh, \
@@ -276,11 +405,14 @@ class DreggSignerBinTest(V2Base):
         self.SEND = {"ok": True}
         self.fake_signer()
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
-        with mock.patch.object(chat, "_revive", return_value=None), \
-             mock.patch.object(chat, "_faucet"):
+        with mock.patch.object(chat, "_revive",
+                               return_value=(None, "revive unavailable")), \
+             mock.patch.object(chat, "_faucet",
+                               return_value=(None, "faucet refused")):
             m = chat.post("hello", who="a1", sign=True)
         self.assertNotIn("chain", m)
-        self.assertIn("[unsigned]", chat._fmt(m))
+        self.assertIn("[DEGRADED", chat._fmt(m))
+        self.assertEqual(m["transport"]["code"], "send_failed")
         self.assertEqual(chat.read()[1], 1)   # the message never dies
 
 
@@ -523,6 +655,16 @@ class NodeSupervisorTest(V2Base):
         int(h, 16)
         self.assertEqual(h, chatnode.bootstrap_cell_hex())
 
+    def test_faucet_false_is_a_returned_refusal(self):
+        with mock.patch.object(cellmod, "post_json",
+                               return_value={"success": False,
+                                             "error": "rate limited"}) as post:
+            response, err = chatnode.faucet("http://node", "c" * 64, 10000)
+        self.assertIsNone(response)
+        self.assertEqual(err, "faucet refused: rate limited")
+        post.assert_called_once_with(
+            "http://node/api/faucet", {"recipient": "c" * 64, "amount": 10000})
+
     def test_cmd_node_usage_and_missing_binary(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -531,6 +673,21 @@ class NodeSupervisorTest(V2Base):
              contextlib.redirect_stderr(err):
             self.assertEqual(chatnode.cmd_node(["up"]), 1)
         self.assertIn("not found", err.getvalue())
+
+    def test_node_status_keeps_degraded_incident_loud_while_api_is_down(self):
+        st = {"mode": "degraded", "profile": "p1", "reason": "send failed",
+              "first_failure": "first", "last_failure": "last",
+              "last_age_s": 4, "failure_count": 2,
+              "remediation": "repair and retry"}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(chatnode, "_systemctl", return_value=(0, "active")), \
+             mock.patch.object(chat, "node_url", return_value="http://node"), \
+             mock.patch.object(chat, "transport_status", return_value=st), \
+             mock.patch.object(cellmod, "get_json", return_value=None), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(chatnode.cmd_node(["status"]), 1)
+        self.assertIn("DEGRADED profile 'p1'", err.getvalue())
+        self.assertIn("API UNREACHABLE", out.getvalue())
 
     def test_cmd_chat_dispatches_node(self):
         with mock.patch.object(chatnode, "cmd_node", return_value=0) as cn:
