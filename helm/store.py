@@ -565,11 +565,23 @@ def _find(eid, project=None, types=None):
 def _probes(e):
     """The entry's probe set — id + csv keywords, lowercased, deduped — as
     {(probe, is_generic)}. The ONE probe vocabulary, shared by matching
-    (_probe_hits) and DF weighting (_df_map)."""
+    (_probe_hits) and DF weighting (_df_map).
+
+    EXCEPTION — capabilities probe on CURATED KEYWORDS ONLY, never the bare id.
+    A store id is a long kebab-case slug that word-boundary-matches ~never, but
+    a capability id is a short verb-slug ('pending','meld','store','dispatch')
+    that IS a common dev word — as a specific probe it broad-fires the whole
+    lever on any turn containing it ('the PR is pending', 'consensus root'),
+    the exact relevance regression the index exists to avoid. The curated
+    keywords carry every intended trigger (the verb word, when wanted, is
+    listed there), so dropping the id probe loses nothing and protects every
+    present and future cap by construction (cross-family gate, 2026-07-23)."""
     generic = _HEURISTIC_GENERIC if e["type"] == "heuristic" else GENERIC_KEYWORDS
-    return {(str(e["id"]).lower(), False)} | {
-        (k.strip().lower(), k.strip().lower() in generic)
-        for k in (e.get("keywords") or "").split(",") if k.strip()}
+    kws = {(k.strip().lower(), k.strip().lower() in generic)
+           for k in (e.get("keywords") or "").split(",") if k.strip()}
+    if e.get("type") == "capability":
+        return kws
+    return {(str(e["id"]).lower(), False)} | kws
 
 
 def _jit_candidates(entries):

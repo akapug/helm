@@ -107,6 +107,27 @@ class SurfacingTest(CapBase):
                      "refactor this function to be cleaner"):
             self.assertNotIn("meld", self.jit_ids(text), text)
 
+    def test_dregg_protocol_vocab_does_not_false_fire_a2a_levers(self):
+        # Cross-family gate catch (2026-07-23): this fleet debugs dregg CONSTANTLY
+        # ("consensus root", "converge with the finalized root"), so bare
+        # "consensus"/"converge" in the meld+deliver keywords was a relevance
+        # regression in the index whose whole job is relevance. Scoped to a2a.
+        for text in ("debug the Lean consensus root disagreement",
+                     "make the faucet turn converge with the finalized root",
+                     "the full-consensus node smoke fails on the faucet turn"):
+            ids = self.jit_ids(text)
+            self.assertNotIn("meld", ids, text)
+            self.assertNotIn("chat-deliver", ids, text)
+
+    def test_a_common_word_cap_id_does_not_broad_fire(self):
+        # The SYSTEMIC fix (_probes): a capability id is a short verb-slug, and
+        # 'pending' is everywhere in dev work — the id must NOT be a match probe
+        # or the lever broad-fires on any "pending" turn. It fires on its curated
+        # SEEN/ACTED keywords only. Protects every present + future cap.
+        for text in ("is the deploy pending", "the PR is pending review",
+                     "pending migrations to run"):
+            self.assertNotIn("pending", self.jit_ids(text), text)
+
     def test_per_toolcall_whisper_meld_reaches_chat_deliver(self):
         # the ORIGINAL failure: reasoning about the per-toolcall whisper meld
         # and NOT reaching for helm chat deliver. It must now surface.
