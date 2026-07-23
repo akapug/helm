@@ -1203,9 +1203,10 @@ class HeadlessCensusTest(unittest.TestCase):
                                  "--resume", self.SID_B]),
             self.SID_A)
 
-    def test_a_resume_consumed_by_the_terminator_stays_unknown(self):
-        # `--resume` whose would-be value is the terminator is a bare resume;
-        # the post-terminator UUID is prose, not its value
+    def test_a_resume_meeting_the_terminator_stays_unknown(self):
+        # `--resume` refuses the terminator as its value (optional-value law)
+        # and stays a BARE resume; the post-terminator UUID is prose, not its
+        # value
         self.assertIsNone(session._resume_sid(
             ["claude", "--resume", "--", self.SID_A]))
 
@@ -1266,14 +1267,74 @@ class HeadlessCensusTest(unittest.TestCase):
                                  "--resume", self.SID_A]),
             self.SID_A)
 
-    def test_unmapped_short_clusters_stay_opaque(self):
-        # `-d [filter]` swallows its cluster remainder, so `-dr` is a debug
-        # filter "r" — it must neither mint a resume nor poison a real one
+    def test_value_taking_short_clusters_stay_opaque(self):
+        # `-d [filter]` absorbs its cluster remainder as its attached value,
+        # so `-dr` is a debug filter "r" — it must neither mint a resume nor
+        # poison a real one, and `-dp` is a filter "p", never print mode
         self.assertIsNone(session._resume_sid(["claude", "-dr"]))
         self.assertEqual(
             session._resume_sid(["claude", "-dr", "--resume", self.SID_A]),
             self.SID_A)
         self.assertFalse(session._is_headless(["claude", "-dp"]))
+
+    def test_optional_value_options_skip_a_flag_shaped_neighbor(self):
+        # r7's regression, live-probed on 2.1.218: commander is greedy ONLY
+        # for REQUIRED-value options. `claude -d --resume <uuid> -p
+        # --no-session-persistence hi` REALLY resumes the uuid (`claude -d
+        # --resume BAD -p hi` errors 'not a UUID'), yet the one-consumption
+        # presumption read the resume as -d's debug filter — returning
+        # resume=None, certifying sessionless green, and dropping the holder
+        # from DOUBLE-OPEN arithmetic. Base 690b669 found this holder.
+        argv = ["claude", "-d", "--resume", self.SID_A, "-p",
+                "--no-session-persistence", "hi"]
+        self.assertEqual(session._resume_sid(argv), self.SID_A)
+        self.assertTrue(session._is_headless(argv))
+        self.assertTrue(session._is_nonpersistent(argv))
+        self.assertFalse(session._sessionless_oneshot(
+            {"headless": True, "nonpersistent": True, "identity": "resume",
+             "declared": None, "resume": self.SID_A}))
+        # the greedy control: `--model --resume <uuid>` still mints nothing —
+        # required-value options keep consuming their flag-shaped neighbor
+        self.assertIsNone(session._resume_sid(
+            ["claude", "--model", "--resume", self.SID_A]))
+        # every MEASURED optional-value long flag skips a flag-shaped
+        # neighbor (`claude <flag> --version` prints the version, 2.1.218)
+        for flag in ("--debug", "--from-pr", "--prompt-suggestions",
+                     "--remote-control", "--worktree"):
+            self.assertEqual(
+                session._resume_sid(["claude", flag, "--resume",
+                                     self.SID_A]),
+                self.SID_A, flag)
+            self.assertTrue(
+                session._is_headless(["claude", flag, "-p", "hi"]), flag)
+        # ... but consumes a NON-dash neighbor as its value (measured:
+        # `claude -p -d hi` errors 'Input must be provided' — `hi` became
+        # the filter), so that value is opaque prose, never a flag
+        self.assertTrue(session._is_headless(["claude", "-d", "api", "-p"]))
+        self.assertEqual(
+            session._resume_sid(["claude", "-w", "feature", "--resume",
+                                 self.SID_A]),
+            self.SID_A)
+        # bare short aliases carry the same optional-value law
+        self.assertTrue(session._is_headless(["claude", "-d", "-p", "hi"]))
+        self.assertTrue(session._is_headless(["claude", "-w", "-p", "hi"]))
+
+    def test_optional_value_options_leave_the_terminator_alone(self):
+        # measured: `claude -d -- --version` runs `--version` as prompt
+        # prose (the required-greedy `--model --` swallows the terminator
+        # whole) — so past it every token is positional, and a resume whose
+        # would-be value is the terminator stays bare, poisoning the parse
+        self.assertFalse(session._is_headless(["claude", "-d", "--", "-p"]))
+        self.assertIsNone(session._resume_sid(
+            ["claude", "-d", "--", "--resume", self.SID_A]))
+
+    def test_a_flag_refused_by_optional_resume_leaves_it_bare(self):
+        # `--resume` is itself optional-value: commander refuses a
+        # flag-shaped neighbor as its value, so `--resume -p` is a BARE
+        # resume (poison) AND the neighbor is a real flag again
+        argv = ["claude", "--resume", "-p", "hi"]
+        self.assertIsNone(session._resume_sid(argv))
+        self.assertTrue(session._is_headless(argv))
 
     def test_short_aliases_are_prose_past_the_terminator(self):
         # the option-region law is alias-blind: post-terminator `-r`/`-pr`

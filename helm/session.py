@@ -265,18 +265,19 @@ NONPERSISTENT_FLAG = "--no-session-persistence"
 # rejected: "Provided value \"=<sid>\" is not a UUID"), and commander splits
 # boolean shorts off a cluster before a value-taking one, so `-pr <sid>`
 # resumes in print mode. Booleans commander splits off; value-takers consume
-# the cluster remainder. Shorts absent from both maps (`-d [filter]`,
-# `-w [name]`, `-n <name>`) swallow the remainder themselves, so their
-# clusters stay OPAQUE — `-dr` is a debug filter, never a resume.
+# the cluster remainder — `-dr` is a debug filter, never a resume. A short
+# absent from both maps (`-n <name>`) swallows the remainder itself, so its
+# cluster stays OPAQUE verbatim.
 _SHORT_BOOL = {"c": "--continue", "p": "--print"}
-_SHORT_VALUED = {"r": "--resume"}
+_SHORT_OPTIONAL = {"d": "--debug", "r": "--resume", "w": "--worktree"}
 
 # Long flags MEASURED as boolean — never consuming the next token — against
 # the real CLI (2.1.218, probe 2026-07-22: `claude <flag> --version` prints
 # the version iff the flag cannot swallow `--version`; a value-taker eats it
-# and the short-circuit never fires). Every other option is presumed capable
-# of consuming its neighbor, because commander hands a required
-# option-argument the next token RAW even when it is flag-shaped.
+# and the short-circuit never fires). Every option outside this set and
+# _MEASURED_OPTIONAL_FLAGS is presumed capable of consuming its neighbor,
+# because commander hands a required option-argument the next token RAW even
+# when it is flag-shaped.
 # `--bg`/`--background` probed INCONCLUSIVE (they dispatch before the version
 # action fires) and stay presumed value-taking — the fail-closed side.
 _MEASURED_BOOL_FLAGS = frozenset((
@@ -288,6 +289,21 @@ _MEASURED_BOOL_FLAGS = frozenset((
     "--include-hook-events", "--include-partial-messages", "--no-chrome",
     "--replay-user-messages", "--safe-mode", "--strict-mcp-config",
     "--verbose"))
+
+# Long flags MEASURED as OPTIONAL-value — help declares `[value]`, and each
+# passes the same discriminator as the boolean set (2.1.218, probe
+# 2026-07-22: `claude <flag> --version` prints the version, so the flag
+# cannot swallow a flag-shaped neighbor; `claude --model --version` still
+# swallows). Commander consumes an optional option-argument only when the
+# next token is NOT flag-shaped (live: `claude -d --resume BAD -p hi` errors
+# 'not a UUID' — the resume was parsed, not eaten as a debug filter) and
+# leaves even the ``--`` terminator alone (`claude -d -- --version` runs
+# `--version` as prompt prose; `--model --` swallows the terminator). A
+# NON-dash neighbor it does consume: `claude -p -d hi` errors 'Input must be
+# provided' — `hi` became the debug filter, not the prompt.
+_MEASURED_OPTIONAL_FLAGS = frozenset((
+    "--debug", "--from-pr", "--prompt-suggestions", "--remote-control",
+    "--resume", "--worktree"))
 
 
 def _expand_options(argv):
@@ -304,47 +320,64 @@ def _expand_options(argv):
     swallowed whole (`--model -cp --no-session-persistence`), and poisoned a
     real holder on prompt prose that merely looked like a cluster.
 
+    One law, THREE measured token classes: a measured boolean never takes a
+    value; a measured OPTIONAL-value option consumes its neighbor only when
+    the neighbor is not flag-shaped (a lone ``-`` is a value; ``-x``/``--x``
+    are options; the ``--`` terminator stays a terminator — all measured, see
+    _MEASURED_OPTIONAL_FLAGS); everything else is presumed REQUIRED-greedy,
+    the fail-closed side. Collapsing the optional class into the greedy one
+    was r7's regression: `claude -d --resume <uuid> -p` REALLY resumes, yet
+    the presumption read the resume as a debug filter — certifying green and
+    dropping a proven holder from DOUBLE-OPEN.
+
     Unconsumed short clusters are rewritten to canonical long form exactly as
     commander parses them: leading boolean shorts split off one by one, then
     a value-taking short absorbs the remainder as its attached value (`-pr X`
     -> `--print --resume X`; `-rX` -> `--resume=X`; `-r=X` -> the literal
-    value `=X`, invalid, poisoning downstream). A cluster led by an unmapped
-    short stays verbatim — its remainder belongs to THAT flag — and a BARE
-    unmapped short (`-d`) is presumed to consume its neighbor like any other
+    value `=X`, invalid, poisoning downstream; `-dr` -> `--debug=r`, a debug
+    filter, never a resume) — a BARE mapped short (`-d`, `-r`, `-w`) takes
+    its long form's optional-value law. A cluster led by an unmapped short
+    stays verbatim — its remainder belongs to THAT flag — and a BARE unmapped
+    short (`-n`) is presumed to consume its neighbor like any other
     unmeasured option. Past the standard ``--`` terminator every token is
     positional prose and passes through untouched."""
     out = []
-    pending = False
+    pending = None
 
-    def emit(token, takes_value):
+    def emit(token, takes):
         nonlocal pending
         out.append((token, False))
-        pending = takes_value
+        pending = takes
 
     for i, arg in enumerate(argv):
-        if pending:
+        if pending == "required" or (pending == "optional"
+                                     and not (len(arg) > 1 and arg[0] == "-")):
             out.append((arg, True))
-            pending = False
+            pending = None
             continue
+        pending = None
         if arg == "--":
             out.extend((a, False) for a in argv[i:])
             break
         if len(arg) > 1 and arg[0] == "-" and arg[1] != "-":
             rest = arg[1:]
             while rest and rest[0] in _SHORT_BOOL:
-                emit(_SHORT_BOOL[rest[0]], False)
+                emit(_SHORT_BOOL[rest[0]], None)
                 rest = rest[1:]
-            if rest and rest[0] in _SHORT_VALUED:
-                long = _SHORT_VALUED[rest[0]]
+            if rest and rest[0] in _SHORT_OPTIONAL:
+                long = _SHORT_OPTIONAL[rest[0]]
                 if len(rest) == 1:
-                    emit(long, True)
+                    emit(long, "optional")
                 else:
-                    emit(long + "=" + rest[1:], False)
+                    emit(long + "=" + rest[1:], None)
             elif rest:
-                emit("-" + rest, len(rest) == 1)
+                emit("-" + rest, "required" if len(rest) == 1 else None)
             continue
-        emit(arg, len(arg) > 2 and arg[:2] == "--" and "=" not in arg
-             and arg not in _MEASURED_BOOL_FLAGS)
+        if arg in _MEASURED_OPTIONAL_FLAGS:
+            emit(arg, "optional")
+            continue
+        emit(arg, "required" if len(arg) > 2 and arg[:2] == "--"
+             and "=" not in arg and arg not in _MEASURED_BOOL_FLAGS else None)
     return out
 
 
@@ -509,14 +542,20 @@ def _resume_sid(argv):
     holder (`--model -cr <uuid>` names a model, and `--model --resume <uuid>`
     swallows the long flag whole — measured, the CLI parses no resume) nor
     poisons a real one (`--append-system-prompt '-pr be brief' --resume
-    <sid>` keeps the proven holder). Within the option region the parse is
-    FAIL-CLOSED over every UNCONSUMED resume occurrence, short or long: a
-    bare/trailing ``--resume``/``-r``, a flag consumed as its value, a prefix
-    or otherwise invalid value (`-r=X` carries the literal value `=X`; `-rp`
-    resumes by TITLE "p", unresolvable from argv), and conflicting repeats
-    each poison the WHOLE parse — a valid occurrence beside an invalid one is
-    contradictory evidence, not a majority vote. A false holder is worse than
-    falling through to another rung."""
+    <sid>` keeps the proven holder). Only a MEASURED greedy predecessor
+    consumes that way: `-d [filter]` is optional-value, so `claude -d
+    --resume <uuid> -p` REALLY resumes (measured — `-d --resume BAD -p hi`
+    errors 'not a UUID') and the holder stays attributed. `--resume` itself
+    is optional-value, so only a CONSUMED neighbor is its value — a
+    flag-shaped neighbor commander refuses (`--resume --print`) leaves the
+    resume BARE. Within the option region the parse is FAIL-CLOSED over
+    every UNCONSUMED resume occurrence, short or long: a bare/trailing
+    ``--resume``/``-r``, a prefix or otherwise invalid value (`-r=X` carries
+    the literal value `=X`; `-rp` resumes by TITLE "p", unresolvable from
+    argv), and conflicting repeats each poison the WHOLE parse — a valid
+    occurrence beside an invalid one is contradictory evidence, not a
+    majority vote. A false holder is worse than falling through to another
+    rung."""
     found = []
     tokens = _expand_options(argv)
     for i, (token, consumed) in enumerate(tokens):
@@ -525,7 +564,8 @@ def _resume_sid(argv):
         if token == "--":
             break
         if token == "--resume":
-            value = tokens[i + 1][0] if i + 1 < len(tokens) else None
+            after = tokens[i + 1] if i + 1 < len(tokens) else None
+            value = after[0] if after and after[1] else None
         elif token.startswith("--resume="):
             value = token.split("=", 1)[1]
         else:
