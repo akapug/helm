@@ -471,6 +471,7 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .chatmsg .cts{font-size:var(--f0);color:var(--sub);margin-left:7px;font-variant-numeric:tabular-nums}
 .chatmsg .ctxt{white-space:pre-wrap;word-break:break-word}
 .chatmsg .ctick{font-size:var(--f0);color:var(--sub);margin-left:6px;cursor:default}
+.chatmsg .cdiag{font-size:var(--f0);color:var(--bad);margin:2px 0 0;border-left:2px solid var(--bad);padding-left:6px}
 .chatmsg .creacts{font-size:var(--f1);margin:2px 0 0 2px;color:var(--sub)}
 .chatmsg .creacts span{margin-right:8px}
 .chatmsg .rbar{display:none;font-size:var(--f1);margin-left:8px}
@@ -2623,9 +2624,16 @@ function chatJumpReplies(div) {
 function chatRow(m) {
   const who = String(m.from || "?");
   const owner = who === (($("#chatname").value || "david").trim() || "david");
-  // the subtle receipt tick: this row rode a signed turn (chain index on hover)
+  // Receipt truth on the row itself: signed tick, or a LOUD attempted-signing
+  // fallback. Configured-off v1 rows stay quietly unsigned; the transport strip
+  // explains that room-wide fact.
+  const tr = m.transport || {}, degraded = tr.state === "DEGRADED";
   const tick = (m.chain != null)
-    ? '<span class="ctick" title="signed — chain #' + esc(String(m.chain)) + '">✓</span>' : "";
+    ? '<span class="ctick" title="signed — chain #' + esc(String(m.chain)) + '">✓</span>'
+    : degraded ? '<span class="ctick" style="color:var(--bad)" title="unsigned RAM fallback">⚠ DEGRADED</span>' : "";
+  const diag = degraded
+    ? '<div class="cdiag">' + esc(tr.profile || "?") + '/' + esc(tr.code || "signing") +
+      ': ' + esc(tr.reason || "unknown failure") + '</div>' : "";
   const rbar = '<span class="rbar">' + CHAT_RSET.map(e =>
     '<button class="rbtn" data-e="' + e + '">' + e + "</button>").join("") +
     '<button class="rbtn rbreply" title="reply to this message">↩</button></span>';
@@ -2639,7 +2647,7 @@ function chatRow(m) {
     '">' + chatQuote(m) + '<span class="cwho">' + esc(who) +
     '</span><span class="cts">' + esc(String(m.ts || "").slice(11, 16)) + '</span>' + tick +
     '<span class="creplies"></span>' + rbar +
-    '<div class="ctxt' + (long ? " clamp" : "") + '">' + esc(txt) + "</div>" +
+    '<div class="ctxt' + (long ? " clamp" : "") + '">' + esc(txt) + "</div>" + diag +
     (long ? '<button class="cmore">show more ▾</button>' : "") +
     '<div class="creacts"></div></div>';
 }
@@ -2661,10 +2669,19 @@ function chatApplyReact(m) {
 
 function chatTransport(t) {
   if (!t) return;
-  $("#chattransport").textContent =
-    t.mode === "signed" ? "signed ⛓" + (t.head == null ? "" : "#" + t.head)
-                        : (t.mode || "unsigned"); // honest label, e.g. "unsigned (no signer)"
-  $("#chattransport").title = "chat transport: " + (t.url || "v1 RAM room only");
+  const el = $("#chattransport");
+  if (t.mode === "degraded") {
+    el.textContent = "DEGRADED · " + (t.profile || "?") + " · " +
+      (t.reason || "signing failed") + " · first " + (t.first_failure || "?") +
+      " · last " + (t.last_failure || "?") + " (" + (t.last_age_s || 0) + "s ago)";
+    el.title = "RAM chat still delivers unsigned rows. Remediation: " +
+      (t.remediation || "repair signing, then retry a signed turn");
+    return;
+  }
+  el.textContent = t.mode === "signed"
+    ? "signed ⛓" + (t.head == null ? "" : "#" + t.head)
+    : (t.label || t.mode || "unsigned"); // honest owner wording
+  el.title = "chat transport: " + (t.url || "v1 RAM room only");
 }
 
 let CHAT_POLLING = false; // one poll at a time — two since=0 polls in flight double-render the log
@@ -3281,14 +3298,24 @@ function nativeRows(d) {
 function ledgerStrip(d) {
   const el = $("#ledgerstrip");
   if (d.offline) {
-    el.innerHTML = '<span class="offline">substrate offline — node unreachable at <code>' + esc(d.node) + '</code>; retrying quietly…</span>';
+    const tp = d.transport, degraded = tp && tp.mode === "degraded";
+    el.innerHTML = '<span class="offline">substrate offline — node unreachable at <code>' +
+      esc(d.node) + '</code>; retrying quietly…</span>' + (degraded
+        ? '<span title="' + esc(tp.remediation || "repair signing and retry") +
+          '">chat signing <span class="lbadge tent">DEGRADED</span> · <b>' +
+          esc(tp.profile || "?") + '</b> · ' + esc(tp.reason || "signing failed") +
+          ' · first ' + esc(tp.first_failure || "?") + ' · last ' +
+          esc(tp.last_failure || "?") + ' (' + esc(String(tp.last_age_s || 0)) +
+          's ago)</span>' : '');
     return;
   }
   const s = d.status || {}, fin = s.latest_height ?? 0, tp = d.transport;
   const sig = !tp ? ''
     : tp.mode === "signed"
       ? '<span title="chat transport truth (helm chat status): posts + attestations sign as cave turns">signing <span class="lbadge final">live · dregg-primary</span></span>'
-      : '<span title="chat transport truth (helm chat status)">signing <span class="lbadge tent">' + esc(tp.mode) + '</span></span>';
+      : tp.mode === "degraded"
+        ? '<span title="RAM chat still delivers unsigned rows. Remediation: ' + esc(tp.remediation || "repair signing and retry") + '">signing <span class="lbadge tent">DEGRADED</span> · <b>' + esc(tp.profile || "?") + '</b> · ' + esc(tp.reason || "signing failed") + ' · first ' + esc(tp.first_failure || "?") + ' · last ' + esc(tp.last_failure || "?") + ' (' + esc(String(tp.last_age_s || 0)) + 's ago)</span>'
+        : '<span title="chat transport truth (helm chat status)">signing <span class="lbadge tent">' + esc(tp.label || tp.mode) + '</span></span>';
   el.innerHTML =
     '<span><b>' + (s.healthy === true ? "healthy" : "degraded") + '</b></span>' + sig +
     '<span title="turns accepted at ingress">ingress <b>' + esc(String(s.dag_height ?? "?")) + '</b></span>' +

@@ -989,7 +989,8 @@ def _api_chat_post(payload):
                     profile=_chat_profile(), origin="web",
                     reply_to=str(payload.get("reply_to") or "") or None)
     chat.mark_owner_unread(room)
-    return {"ok": True, "msg": msg, "total": chat.read(room)[1]}, 200
+    return {"ok": True, "msg": chat.public_rows([msg])[0],
+            "total": chat.read(room)[1]}, 200
 
 
 def _api_chat_dm(payload):
@@ -998,7 +999,7 @@ def _api_chat_dm(payload):
     old path posted '@seat …' into #main and called it a DM (owner-flagged).
     Exact-token addressee (seats.dm — premise exact-token-addressee-match);
     signed like a post; the recipient's beacon surfaces it."""
-    from . import seats
+    from . import chat, seats
     text = str(payload.get("text") or "").strip()
     if not text:
         return {"error": "empty text"}, 400
@@ -1007,7 +1008,7 @@ def _api_chat_dm(payload):
                         profile=_chat_profile(), origin="web")
     if err:
         return {"error": err}, 400
-    return {"ok": True, "msg": row}, 200
+    return {"ok": True, "msg": chat.public_rows([row])[0]}, 200
 
 
 def _api_chat_roster(qs):
@@ -1059,7 +1060,8 @@ def _api_chat_react(payload):
                           profile=_chat_profile())
     if err:
         return {"error": err}, 400
-    return {"ok": True, "msg": row, "total": chat.read(room)[1]}, 200
+    return {"ok": True, "msg": chat.public_rows([row])[0],
+            "total": chat.read(room)[1]}, 200
 
 
 # ── ledger: read-only projection of the attestation node's public reads ──
@@ -1140,8 +1142,9 @@ def _api_ledger(qs):
     url = cell.node_url()
     status = cell.get_json(url + "/status", timeout=3)
     receipts = cell.get_json(url + "/api/receipts", timeout=3)
+    transport = _chat_transport()
     if status is None and receipts is None:
-        return {"offline": True, "node": url}, 200
+        return {"offline": True, "node": url, "transport": transport}, 200
     turns = sorted((r for r in (receipts or []) if isinstance(r, dict)),
                    key=lambda r: r.get("chain_index", 0),
                    reverse=True)[:LEDGER_TURNS]
@@ -1167,7 +1170,7 @@ def _api_ledger(qs):
                              -(c.get("last_turn_ts") or 0), c.get("id") or ""))
     return {"node": url,
             "status": {k: (status or {}).get(k) for k in LEDGER_STATUS_KEYS},
-            "transport": _chat_transport(),
+            "transport": transport,
             "turns": turns, "cells": rows}, 200
 
 
