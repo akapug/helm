@@ -68,6 +68,10 @@ class TestWebChat(unittest.TestCase):
         chat.acknowledge_sign_failures()
         shutil.rmtree(chat.sign_failures_dir(), ignore_errors=True)
         shutil.rmtree(os.environ["HELM_CHAT_DIR"], ignore_errors=True)
+        # the class reuses ONE tmp root; a dir-wipe rewinds the room (a thing
+        # append-only signed history never does in prod), so drop the immutable-
+        # slice body cache between tests or a stale slice could survive the wipe
+        web._CHAT_OLDER_CACHE.clear()
 
     def req(self, path, payload=None, token=True):
         """(status, obj) — 4xx/5xx returned, not raised. payload -> POST;
@@ -410,6 +414,102 @@ class TestWebChat(unittest.TestCase):
         rooms = {r["room"]: r for r in self.req("/api/chat")[1]["rooms"]}
         self.assertEqual(rooms["main"]["owner_unread"], 0)
         self.assertEqual(rooms["team-x"]["owner_unread"], 1)
+
+
+    # ── lazy-load window (bounded initial open + older-history pages) ──
+
+    def test_initial_open_windows_to_the_last_win_rows_and_stamps_base(self):
+        """The since=0 open returns only the last `win` rows and stamps `base`
+        (the absolute index of lines[0]) so the client can page older history
+        from there. This is the fix for the linear full-history dump."""
+        for i in range(60):
+            chat.post("row %d" % i, room="win", who="agent-a")
+        status, d = self.req("/api/chat?room=win&since=0&win=50")
+        self.assertEqual(status, 200)
+        self.assertEqual(d["total"], 60)
+        self.assertEqual(len(d["lines"]), 50)
+        self.assertEqual(d["base"], 10)                       # 60 - 50
+        self.assertEqual(d["lines"][0]["text"], "row 10")     # the window tail
+        self.assertEqual(d["lines"][-1]["text"], "row 59")
+
+    def test_win_default_is_fifty_when_param_omitted(self):
+        for i in range(70):
+            chat.post("r%d" % i, room="win", who="agent-a")
+        d = self.req("/api/chat?room=win&since=0")[1]
+        self.assertEqual(len(d["lines"]), 50)                 # server default WIN
+        self.assertEqual(d["base"], 20)
+
+    def test_win_all_and_win_zero_are_the_full_history_escape_hatch(self):
+        for i in range(60):
+            chat.post("r%d" % i, room="win", who="agent-a")
+        for esc in ("all", "0"):
+            d = self.req("/api/chat?room=win&since=0&win=%s" % esc)[1]
+            self.assertEqual(len(d["lines"]), 60)
+            self.assertEqual(d["base"], 0)
+            self.assertEqual(d["total"], 60)
+
+    def test_incremental_poll_is_unwindowed_and_carries_no_base(self):
+        """The live cursor path (since>0) stays byte-identical: rows[since:],
+        no window, and — critically — NO `base` field, so the 22ms/54KB
+        contract is untouched."""
+        for i in range(60):
+            chat.post("r%d" % i, room="win", who="agent-a")
+        # a wide incremental read returns EVERY row past the cursor, unwindowed
+        d = self.req("/api/chat?room=win&since=1")[1]
+        self.assertEqual(len(d["lines"]), 59)                 # rows[1:], not a window
+        self.assertNotIn("base", d)
+        self.assertEqual(d["lines"][0]["text"], "r1")
+        # at the end the incremental poll is empty, still no base
+        d2 = self.req("/api/chat?room=win&since=60")[1]
+        self.assertEqual(d2["lines"], [])
+        self.assertNotIn("base", d2)
+
+    def test_older_page_returns_the_prior_window_body_only(self):
+        """?before=<idx> is the analog of builders getRecent(before): the
+        immutable slice rows[before-win:before], its `base`, and the live
+        total — BODY ONLY (no transport/rooms/roster/signal/presence)."""
+        for i in range(60):
+            chat.post("row %d" % i, room="win", who="agent-a")
+        d = self.req("/api/chat?room=win&before=10&win=50")[1]
+        self.assertEqual(len(d["lines"]), 10)                 # rows[0:10]
+        self.assertEqual(d["base"], 0)
+        self.assertEqual(d["total"], 60)                      # total stays LIVE
+        self.assertEqual(d["lines"][0]["text"], "row 0")
+        self.assertEqual(d["lines"][-1]["text"], "row 9")
+        # DREGGTEGRITY: the signing/transport truth is NEVER in the cached body
+        for k in ("transport", "rooms", "roster", "presence",
+                  "owner_unread", "owner_read", "owner_mentions"):
+            self.assertNotIn(k, d)
+        # a mid-history page: rows[20:40] from before=40
+        d2 = self.req("/api/chat?room=win&before=40&win=20")[1]
+        self.assertEqual(d2["base"], 20)
+        self.assertEqual([m["text"] for m in d2["lines"]],
+                         ["row %d" % i for i in range(20, 40)])
+        # bad before -> 400
+        self.assertEqual(self.req("/api/chat?room=win&before=x")[0], 400)
+
+    def test_owner_signal_counts_full_rows_even_when_the_body_is_windowed(self):
+        """The badge is computed from the FULL rows, never the window — 40
+        unread land, the window shows 10, owner_unread is still 40."""
+        for i in range(40):
+            chat.post("@david row %d" % i, room="main", who="agent-a")
+        d = self.req("/api/chat?room=main&since=0&win=10")[1]
+        self.assertEqual(len(d["lines"]), 10)                 # windowed body
+        self.assertEqual(d["owner_unread"], 40)               # full-rows signal
+        self.assertEqual(d["owner_mentions"], 40)
+
+    def test_older_page_slice_is_immutable_under_appends(self):
+        """The older-page body is signed, immutable history — appending new
+        rows never changes an already-fetched slice (cache-safe), while total
+        tracks live."""
+        for i in range(50):
+            chat.post("row %d" % i, room="win", who="agent-a")
+        first = self.req("/api/chat?room=win&before=20&win=10")[1]
+        chat.post("newest", room="win", who="agent-a")        # total -> 51
+        again = self.req("/api/chat?room=win&before=20&win=10")[1]
+        self.assertEqual([m["text"] for m in first["lines"]],
+                         [m["text"] for m in again["lines"]])  # slice unchanged
+        self.assertEqual(again["base"], 10)
 
 
 if __name__ == "__main__":

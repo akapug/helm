@@ -2586,6 +2586,16 @@ let CHAT_ROOMS_LAST = []; // last poll's rooms — instant sidebar repaint on sw
 let CHAT_BY_ID = {}, CHAT_BY_KEY = {}, CHAT_REPLYN = {}, CHAT_KIDS = {}, CHAT_REPLY_TO = null;
 let CHAT_ROSTER = [], CHAT_PRESENCE = {};   // @mention completion + seat ages
 let CHAT_DIVIDED = false, CHAT_AWAY = 0;    // the unread divider + jump button
+// ── lazy-load window (aligned 1:1 with builders.dev: recent-50 initial paint +
+// scroll-up older pages). CHAT_WIN is the one tunable knob; the server default
+// matches it. CHAT_OLDEST_BASE is the ABSOLUTE index of the topmost rendered
+// row — the cursor the older-page fetch scrolls back from (>0 means more above).
+const CHAT_WIN = 50;
+let CHAT_OLDEST_BASE = 0, CHAT_LOADING_OLDER = false; // single-flight, mirrors CHAT_POLLING
+// per-room render cache: instant channel-switch (repaint the cached DOM + state,
+// THEN the poll fetches only the delta from the cached cursor). Pure speedup —
+// an absent entry falls back to the fresh reset paint, so it can never wedge.
+const CHAT_CACHE = {};
 const CHAT_CLAMP_CHARS = 1200, CHAT_CLAMP_LINES = 14; // a ledger post must not bury the pane
 const CHAT_DIV_HTML = '<div id="chatdivider">new since you last looked</div>';
 
@@ -2740,8 +2750,13 @@ async function pollChat() {
   try {
     let d;
     const want = CHAT_ROOM; // the room this request is FOR — a mid-flight switch drops the render
-    const base = CHAT_SINCE; // absolute index of d.lines[0] — the divider needs it
-    try { d = await j("/api/chat?room=" + encodeURIComponent(want) + "&since=" + base); } catch (e) { return; } // fail-open: keep the page, keep quiet
+    const sentSince = CHAT_SINCE; // the cursor we asked from — 0 => initial/reset (windowed) paint
+    // the initial/reset open asks for only the last CHAT_WIN rows (builders.dev
+    // getRecent parity); the incremental poll (since>0) stays exactly since=<n>,
+    // the untouched 22ms/54KB good path.
+    const url = "/api/chat?room=" + encodeURIComponent(want) + "&since=" + sentSince
+              + (sentSince === 0 ? "&win=" + CHAT_WIN : "");
+    try { d = await j(url); } catch (e) { return; } // fail-open: keep the page, keep quiet
     if (d.unavailable || !Array.isArray(d.lines)) { chatSignal(d); return; }
     if (Array.isArray(d.roster)) CHAT_ROSTER = d.roster; // @mention completion source
     chatRooms(d.rooms); // sidebar rides every poll (room-agnostic — render before the staleness bail)
@@ -2750,6 +2765,16 @@ async function pollChat() {
     chatTransport(d.transport);
     const log = $("#chatlog");
     if (d.total < CHAT_SINCE) CHAT_SINCE = 0; // the room rotated — server resent everything
+    // absolute index of d.lines[0]: the windowed initial open stamps `base`
+    // (last-WIN slice starts mid-history); the incremental poll omits it and
+    // d.lines[0] sits exactly at the cursor we sent.
+    const absBase = (typeof d.base === "number") ? d.base : CHAT_SINCE;
+    // `base` rides ONLY the windowed initial/reset response (never the
+    // incremental poll), so its presence is the exact signal "the log was
+    // repainted from absBase" — the topmost rendered row, i.e. the older-page
+    // cursor. An incremental append leaves the topmost row (and CHAT_OLDEST_BASE)
+    // untouched.
+    if (typeof d.base === "number") CHAT_OLDEST_BASE = d.base;
     if (d.lines.length) {
       if (CHAT_SINCE === 0) chatResetLog(); // clear the empty-state (or the stale pre-rotation log)
       const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
@@ -2757,13 +2782,13 @@ async function pollChat() {
       if (msgs.length) {
         // the "new since you last looked" divider: placed ONCE, at the owner's
         // server-side read cursor, and only when he wasn't watching it land —
-        // an initial paint (base 0) or rows that arrived on a hidden tab
+        // an initial paint (the since=0 open) or rows that arrived on a hidden tab
         const away = !$("#view-chat").classList.contains("on") || document.hidden;
         const cut = d.owner_read | 0;
-        let html = "", abs = base;
+        let html = "", abs = absBase;
         for (const m of d.lines) {
           if (m.react) { abs++; continue; }
-          if (!CHAT_DIVIDED && cut > 0 && abs >= cut && (base === 0 || away)) {
+          if (!CHAT_DIVIDED && cut > 0 && abs >= cut && (sentSince === 0 || away)) {
             html += CHAT_DIV_HTML; CHAT_DIVIDED = true;
           }
           html += chatRow(m); abs++;
@@ -2786,7 +2811,39 @@ async function pollChat() {
 function chatResetLog() {
   $("#chatlog").innerHTML = "";
   CHAT_REACTS = {}; CHAT_BY_ID = {}; CHAT_BY_KEY = {}; CHAT_REPLYN = {}; CHAT_KIDS = {};
-  CHAT_DIVIDED = false; CHAT_AWAY = 0;
+  CHAT_DIVIDED = false; CHAT_AWAY = 0; CHAT_OLDEST_BASE = 0; // no older page until the next paint stamps base
+}
+
+/* lazy-load older history (builders.dev back-scroll parity — the analog of
+   getRecent(before, N)): the owner scrolled near the top, there is history
+   ABOVE the topmost rendered row (CHAT_OLDEST_BASE>0), so pull the prior page
+   and PREPEND it with the viewport pinned (scroll-anchor) — no re-render of the
+   rows already on screen (the append-only invariant the poll relies on holds in
+   both directions). The prepended rows are fed chatRow (which indexes them) +
+   chatBumpReply so a reply/jump/quote resolves across the newly-loaded window.
+   Single-flight (mirrors CHAT_POLLING) so a fast scroll can't double-fetch a
+   page. This response is BODY-ONLY — no transport/signal here; the signing
+   truth is recomputed live on the poll path, never from this cached slice. */
+async function chatLoadOlder() {
+  if (CHAT_LOADING_OLDER || !(CHAT_OLDEST_BASE > 0)) return;
+  CHAT_LOADING_OLDER = true;
+  try {
+    const want = CHAT_ROOM, before = CHAT_OLDEST_BASE;
+    let d;
+    try {
+      d = await j("/api/chat?room=" + encodeURIComponent(want) + "&before=" + before + "&win=" + CHAT_WIN);
+    } catch (e) { return; } // fail-open: leave the log as-is, retry on the next scroll
+    if (CHAT_ROOM !== want || !d || !Array.isArray(d.lines)) return; // switched mid-flight
+    if (!d.lines.length) { CHAT_OLDEST_BASE = (typeof d.base === "number") ? d.base : 0; return; }
+    const log = $("#chatlog"), oldH = log.scrollHeight;
+    let html = "";
+    for (const m of d.lines) { if (!m.react) html += chatRow(m); } // chatRow indexes each row
+    log.insertAdjacentHTML("afterbegin", html);
+    d.lines.forEach(chatBumpReply);                 // reply/jump resolve across the loaded window
+    d.lines.filter(m => m.react).forEach(chatApplyReact);
+    CHAT_OLDEST_BASE = (typeof d.base === "number") ? d.base : 0; // walk the cursor further up
+    log.scrollTop += (log.scrollHeight - oldH);      // scroll-anchor: the viewport does not jump
+  } finally { CHAT_LOADING_OLDER = false; }
 }
 
 /* jump-to-latest: scrolled off the bottom is the ONLY state where an arriving
@@ -2874,13 +2931,48 @@ function chatPresence(list) {
   bar.title = rows.length + ' online — click for the full roster';
 }
 
+/* snapshot / restore a room's whole render state — the log DOM plus every
+   per-room index (ids, keys, reply counts, kids, reactions, divider, away
+   count, the window cursors + scroll). Switching AWAY caches it; switching
+   BACK repaints it instantly and lets the very next poll fetch only the delta
+   from the cached cursor (since=cached total). Pure speedup, so it holds only
+   the immutable BODY — the transport/signing truth is never cached here; it is
+   recomputed live on the first poll after the switch. */
+function chatSnapshot() {
+  if (!CHAT_ROOM) return;
+  CHAT_CACHE[CHAT_ROOM] = {
+    html: $("#chatlog").innerHTML, scrollTop: $("#chatlog").scrollTop,
+    since: CHAT_SINCE, oldest: CHAT_OLDEST_BASE, divided: CHAT_DIVIDED, away: CHAT_AWAY,
+    byId: CHAT_BY_ID, byKey: CHAT_BY_KEY, replyn: CHAT_REPLYN, kids: CHAT_KIDS, reacts: CHAT_REACTS,
+  };
+}
+
+function chatRestore(room) {
+  const c = CHAT_CACHE[room];
+  if (!c) return false;
+  const log = $("#chatlog");
+  log.innerHTML = c.html;
+  CHAT_SINCE = c.since; CHAT_OLDEST_BASE = c.oldest; CHAT_DIVIDED = c.divided; CHAT_AWAY = c.away;
+  CHAT_BY_ID = c.byId; CHAT_BY_KEY = c.byKey; CHAT_REPLYN = c.replyn; CHAT_KIDS = c.kids; CHAT_REACTS = c.reacts;
+  log.scrollTop = c.scrollTop;   // restore the viewport where the owner left it
+  return true;
+}
+
 function chatSwitch(room) {
   room = chatSlug(room);
   if (!room || room === CHAT_ROOM) return;
+  chatSnapshot();                 // cache the room we are leaving for an instant return
   CHAT_ROOM = room;
   localStorage.setItem("helm.chatroom", room); // survive reload, like helm.chatname
-  CHAT_SINCE = 0; chatResetLog(); // the rotation-reset path repaints the log from 0
   chatClearReply();               // a reply target never survives its room
+  if (chatRestore(room)) {
+    // instant repaint from cache; the poll below fetches only the delta from
+    // the cached cursor (since>0 => the untouched incremental path)
+    chatRooms(CHAT_ROOMS_LAST);   // active row flips NOW; the poll refreshes counts
+    pollChat();
+    return;
+  }
+  CHAT_SINCE = 0; chatResetLog(); // fresh room: the reset path repaints from the windowed open
   $("#chatlog").innerHTML = '<div class="empty">#' + esc(room) +
     " — no messages yet. the first post creates the channel.</div>";
   chatRooms(CHAT_ROOMS_LAST); // active row flips NOW; the poll refreshes counts
@@ -3063,7 +3155,12 @@ function initChat() {
       const log = $("#chatlog");
       log.scrollTop = log.scrollHeight; CHAT_AWAY = 0; chatJumpSync();
     };
-    $("#chatlog").addEventListener("scroll", chatJumpSync);
+    $("#chatlog").addEventListener("scroll", () => {
+      chatJumpSync();
+      // near the top with history above -> pull the prior page (builders'
+      // SCROLL_THRESHOLD parity; single-flight guarded inside chatLoadOlder)
+      if ($("#chatlog").scrollTop < 80) chatLoadOlder();
+    });
     $("#chatlog").addEventListener("click", ev => {   // react / reply / expand / jump (delegated)
       const q = ev.target.closest(".cquote[data-jump]");
       if (q) { chatJumpTo(q.dataset.jump); return; }

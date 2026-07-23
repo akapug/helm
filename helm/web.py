@@ -969,6 +969,83 @@ def _rooms_summary_cached(roster=None):
         return summary
 
 
+# ── chat window (lazy-load) ──────────────────────────────────────────────
+# The initial/reset open returns only the last CHAT_WIN_DEFAULT rows (aligned
+# 1:1 with builders.dev getRecent(...,50)); deeper history comes from the
+# older-page fetch (?before=<idx>) as the owner scrolls up. The live
+# incremental poll (since=<total>) is UNTOUCHED — it stays rows[since:] byte
+# for byte, the measured 22ms/54KB good path.
+CHAT_WIN_DEFAULT = 50
+
+
+def _chat_win(qs):
+    """Window size from ?win=. Default CHAT_WIN_DEFAULT. `win=0`/`win=all`
+    is the escape hatch for a consumer that genuinely needs the whole room
+    (None => no window). A garbled value falls back to the default rather
+    than erroring — the window is a rendering hint, never a contract."""
+    raw = (_q1(qs, "win", None) or "").strip().lower()
+    if raw in ("all", "0"):
+        return None
+    if not raw:
+        return CHAT_WIN_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        return CHAT_WIN_DEFAULT
+    return n if n > 0 else None
+
+
+# The older-page body cache. The slice rows[start:before] is IMMUTABLE signed
+# history (rows only ever append, and a signed row never mutates once written),
+# so caching the BODY keyed (room, before, win) can never corrupt integrity —
+# DREGGTEGRITY-legal precisely because this response carries NO transport/signal
+# truth (that is recomputed live on the poll path only, never here). Single-
+# flight TTL, keyed by the chat root like _ROOMS_SUM so isolated test worlds
+# can never read each other's slice.
+_CHAT_OLDER_CACHE = {}          # (chat-root, room, before, win) -> (at, body)
+_CHAT_OLDER_TTL = 30.0
+_CHAT_OLDER_LOCK = threading.Lock()
+
+
+def _api_chat_older(qs):
+    """Older-history page (the analog of builders' getRecent(before, n)): the
+    immutable body of rows[max(0,before-win):before] for a room, plus the
+    absolute `base` of the first row returned and the live `total`. BODY ONLY —
+    no transport, no rooms, no roster, no signal, no presence. Signed history is
+    immutable, so this slice is cache-safe; the signing STATUS is never in this
+    response and is always recomputed live on the poll path."""
+    from . import chat
+    room = _q1(qs, "room", "main")
+    try:
+        before = int(_q1(qs, "before", "0"))
+    except ValueError:
+        return {"error": "before wants an integer"}, 400
+    win = _chat_win(qs)
+    if win is None:
+        win = CHAT_WIN_DEFAULT
+    try:
+        root = str(chat.chat_dir())
+    except Exception:
+        root = "?"
+    key = (root, room, before, win)
+    now = time.time()
+    hit = _CHAT_OLDER_CACHE.get(key)
+    if hit and now - hit[0] < _CHAT_OLDER_TTL:
+        return dict(hit[1]), 200
+    with _CHAT_OLDER_LOCK:
+        hit = _CHAT_OLDER_CACHE.get(key)   # re-check under the single-flight lock
+        if hit and now - hit[0] < _CHAT_OLDER_TTL:
+            return dict(hit[1]), 200
+        rows, total = chat.read(room)
+        end = before if 0 <= before <= total else total
+        start = max(0, end - win)
+        body = {"room": room,
+                "lines": chat.public_rows(rows[start:end]),
+                "base": start, "total": total}
+        _CHAT_OLDER_CACHE[key] = (now, body)
+        return dict(body), 200
+
+
 def _api_chat(qs):
     """Poll read: rows after ?since= (count already seen) + the new total +
     the transport truth (signed/unsigned + chain head — the panel's tick and
@@ -978,7 +1055,18 @@ def _api_chat(qs):
     source, so a mention the owner types is an EXACT token seats.deliverable
     will actually match). The panel polls this every ~2s; since past the end
     resets. Rows include reaction rows AND reply rows ({reply_to, rts, rfrom});
-    the client aggregates both."""
+    the client aggregates both.
+
+    Two read shapes share this route:
+      • ?before=<idx>  -> the older-history page (body only; see _api_chat_older).
+      • else           -> the live poll. The INCREMENTAL path (0<since<=total)
+        is byte-identical to always — rows[since:], no window, no base — the
+        measured 22ms/54KB good path stays exactly what it was. Only the
+        INITIAL/RESET open (since==0, or a since past the end) is WINDOWED to
+        the last `win` rows and stamped with `base` (the absolute index of
+        lines[0]) so the client can lazy-load older pages from there."""
+    if _q1(qs, "before", None) is not None:
+        return _api_chat_older(qs)
     try:
         since = int(_q1(qs, "since", "0"))
     except ValueError:
@@ -997,6 +1085,14 @@ def _api_chat(qs):
             presence = _s.presence_report()
         except Exception:
             presence = []
+        win = _chat_win(qs)
+        incremental = 0 < since <= total   # the live cursor path — never windowed
+        if incremental:
+            start = since                   # BYTE-IDENTICAL to always: rows[since:]
+        elif win is None:
+            start = 0                       # win=0/all escape hatch: full history
+        else:
+            start = max(0, total - win)     # initial/reset: the last `win` rows
         # `roster` feeds the composer's @mention list — the seat KEYS ride
         # the JSON wire raw (ensure_ascii=False), so launder each label so a
         # hostile HELM_CHAT_NAME (ESC/bidi) cannot reach a non-browser consumer
@@ -1007,13 +1103,21 @@ def _api_chat(qs):
         # launder the EMITTED copy so no such name reaches a non-browser reader
         # of the /api/chat JSON (chat.public_rows; the stored rows stay raw for
         # reaction/reply matching, mirroring the roster's _pub_row owner).
+        # DREGGTEGRITY: transport is chat.transport_status() computed LIVE on
+        # EVERY poll — the signed/unsigned + chain-head truth is cheap and is
+        # NEVER served from a cache. Only the immutable row BODY may be windowed
+        # (above) or cached (the older-page); the signing STATUS always recomputes.
         out = {"room": room,
-               "lines": chat.public_rows(
-                   rows[since if 0 <= since <= total else 0:]),
+               "lines": chat.public_rows(rows[start:]),
                "total": total, "transport": chat.transport_status(),
                "rooms": _rooms_summary_cached(roster),
                "roster": sorted(_s._seat_label(s) for s in roster),
                "presence": presence}
+        if not incremental:
+            # only the initial/reset open carries `base` (absolute index of
+            # lines[0]) so the client can lazy-load older pages from there; the
+            # incremental poll stays exactly rows[since:] with no extra field.
+            out["base"] = start
         out.update(_owner_signal(room, rows))
         return out, 200
     except Exception:
