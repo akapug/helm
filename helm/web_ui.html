@@ -3051,7 +3051,12 @@ function rosterSeats(rep) {
     '<button class="seatrn" data-seat="' + esc(s.seat) + '" title="rename this seat — @newname delivers to the same agent">rename</button>' +
     '<span class="lage">' + (s.last_seen ? lago(s.last_seen) : "—") + '</span></div>' +
     '<div class="lmeta">' + [s.project ? esc(s.project) : '', seatHome(s),
-      s.line && s.source !== 'home' ? '<span title="status — ' + esc(s.source === 'status' ? 'the seat set it (helm chat status)' : 'its live claim') + '">▸ ' + esc(s.line) + '</span>' : '',
+      // VERBS law: all three surfaces glance identically — an explicit line
+      // carries its AGE (server-stamped status_age) + '(by X)' provenance
+      // here too, not just on the bar and the CLI row.
+      s.line && s.source !== 'home' ? '<span title="status — ' + esc(s.source === 'status' ? 'the seat set it (helm chat status)' : 'its live claim') + '">▸ ' + esc(s.line) +
+        (s.source === 'status' && s.status_age != null ? ' (' + esc(chatAgo(s.status_age)) + ')' : '') +
+        (s.source === 'status' && s.status_by ? ' (by ' + esc(s.status_by) + ')' : '') + '</span>' : '',
       s.todo && s.todo.active ? '<span title="current task — the todo mirror">\u25b6 ' + esc(s.todo.active) + '</span>' : '',
       s.preview ? '<span title="newest pending delivery">\u201c' + esc(s.preview) + '\u201d</span>' : '']
       .filter(Boolean).join(' \u00b7 ') + '</div></div>').join("");

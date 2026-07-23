@@ -1627,9 +1627,15 @@ frames; this lane is called *delivery*.)
   coordinator annotating a wedged seat is the point — but record the writer
   (`status_by`, post-attribution parity), rendered as `(by X)`; the beat
   lands on the writer, never the annotated target. Reader-side, whatever
-  tier wins is scrubbed + clipped in `status_line` itself (a planted claim
-  resource or junk roster field cannot reshape a terminal), and a corrupt
-  row fails open to `?` instead of blanking the bar.
+  tier wins is scrubbed + clipped in `status_line` itself, `claims_list`
+  launders resource/holder for EVERY claim surface (the seats footer,
+  `helm chat claims`, the web ledger), and the roster report launders the
+  display columns (home room, project, todo cell) — a planted claim
+  resource or junk roster field cannot reshape a terminal anywhere the
+  fleet is glanced. A corrupt row fails open to `?` instead of blanking
+  the bar, and a junk `status_ts` — missing, non-numeric, OR dated into
+  the future past a small skew allowance — counts as stale: an unknown
+  (or unfalsifiably "fresh") age must never outrank a live lease.
 - **`helm chat seat rename <sid|oldname> <newname>`** — bind a live agent to
   a memorable @name (`old` = seat name or an 8+-char session-id prefix). The
   roster row AND every keyed state file move together, so tracked delivery

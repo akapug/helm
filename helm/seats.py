@@ -1988,7 +1988,15 @@ def claims_list():
     (tmp + os.replace) so a lockless read never sees a torn file. Only
     when a row actually expired does the GC leg take the flock, re-read,
     and persist the sweep — a watched roster (web polls every 3s) must
-    never churn .claims.json or contend with real claim/release traffic."""
+    never churn .claims.json or contend with real claim/release traffic.
+
+    Reader-side law (same as status_line): resource + holder leave here
+    scrubbed (Cc/Cf incl. bidi, Zl/Zp) + clipped — this is the ONE publish
+    boundary every claim surface reads (the seats footer, `helm chat
+    claims`, the web ledger), so a hostile claim("evil\\x1b[2J…") cannot
+    clear/retitle the operator's terminal through any of them. The stored
+    file keeps the raw key: release/extend match on the dict itself, never
+    on this table."""
     raw = pk.read_json(claims_path(), {}) or {}
     c = _sweep(raw)
     if len(c) != len(raw):  # sweep only ever drops rows
@@ -1998,7 +2006,10 @@ def claims_list():
             if len(c) != len(raw):
                 pk.write_json(claims_path(), c)
     now = _now_mono()
-    return [{"resource": r, "holder": v.get("holder"), "fence": v.get("fence"),
+    return [{"resource": _clip(_scrub(str(r)).strip(), STATUS_BYTES),
+             "holder": _clip(_scrub(str(v.get("holder") or "")).strip(), 40)
+             or None,
+             "fence": v.get("fence"),
              "remaining": int(v.get("exp_mono", now) - now)}
             for r, v in sorted(c.items()) if r != "_fence"]
 
@@ -2084,13 +2095,22 @@ STATUS_FRESH_S = 4 * 3600   # how long an explicit status outranks LIVE truth:
 # its age on every surface). A missing/junk status_ts counts as stale:
 # unknown age must never outrank a live lease.
 
+STATUS_SKEW_S = 300   # clock-skew allowance on status_ts: a ts slightly in
+# the future (NTP drift between writers) still reads age 0; FURTHER in the
+# future is a plant — clamping it to 0 forever would invert the decay law
+# (perpetually 'fresh', outranking every live lease), so it counts as junk,
+# same bucket as a missing ts.
+
 
 def _status_age(row):
     """Seconds since the explicit status was set, or None (no status, or a
-    planted row without a sane status_ts)."""
+    planted row without a sane status_ts — missing, non-numeric, or dated
+    beyond STATUS_SKEW_S into the future)."""
     ts = row.get("status_ts")
     if row.get("status") and isinstance(ts, (int, float)):
-        return max(0, int(time.time() - ts))
+        d = time.time() - ts
+        if d >= -STATUS_SKEW_S:
+            return max(0, int(d))
     return None
 
 
@@ -2381,6 +2401,15 @@ def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
     return rows, pruned
 
 
+def _pub(v, cap=80):
+    """Reader-side publish filter for roster-borne DISPLAY fields (home_room,
+    project, cwd…): scrub + clip, falsy passes through. The roster row keeps
+    what was written; only the report copy is laundered — a planted
+    home_room must not reshape the operator's terminal via the `home #…`
+    column (the same law status_line already applies to its winning tier)."""
+    return _clip(_scrub(str(v)).strip(), cap) if v else v
+
+
 def roster_report(room="main"):
     """{"seats": [...], "claims": [...]} — fail-open by caller. Pending is
     computed from each seat's cursor WITHOUT moving it. A report is a READ:
@@ -2417,9 +2446,11 @@ def roster_report(room="main"):
             line, source = status_line(row, by_holder.get(seat))
             p = presence_of(ls)
             seats.append({"seat": seat, "session": row.get("session"),
-                          "project": row.get("project"), "cwd": row.get("cwd"),
-                          "home_room": row.get("home_room"),
-                          "home_room_source": row.get("home_room_source"),
+                          "project": _pub(row.get("project")),
+                          "cwd": _pub(row.get("cwd"), 160),
+                          "home_room": _pub(row.get("home_room"), 40),
+                          "home_room_source": _pub(row.get("home_room_source"),
+                                                   40),
                           "last_seen": ls, "presence": p,
                           "dot": presence_dot(p), "status": row.get("status"),
                           "status_age": _status_age(row),

@@ -42,6 +42,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 
 from . import home, pk
 
@@ -152,6 +153,17 @@ def _apply_task(items, tool, tin, resp):
 
 # ── digest ──────────────────────────────────────────────────────────────────
 
+def _scrub(s):
+    """seats._scrub's reader-side label defense, local copy (importing seats
+    here would cycle): strip C0/C1 controls, format chars (incl. bidi
+    overrides), line/paragraph separators — a todo whose text carries
+    \\x1b[2J must not reshape the terminal `helm chat seats` prints its
+    task cell into. Capture's whitespace-collapse does NOT strip these
+    (str.split() only splits on whitespace), so the read seam must."""
+    return "".join(ch for ch in s if ch == "\t"
+                   or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
+
+
 def digest(items):
     """The pull surface's one-line summary of a list:
     {"active","done","total","fp"}. `fp` is the MATERIAL fingerprint — the
@@ -161,10 +173,12 @@ def digest(items):
 
     Rows that are not well-formed dicts are DROPPED, not trusted: this reads
     a file a hand-edit or a truncated write can reach, and every consumer of
-    the digest (CLI, roster, web) has to survive it."""
+    the digest (CLI, roster, web) has to survive it. `active` leaves here
+    SCRUBBED for the same reason — every surface (CLI task cell, fleet
+    table, web panel) renders it as a one-line label."""
     items = [i for i in (items or []) if isinstance(i, dict)] \
         if isinstance(items, list) else []
-    active = next((str(i.get("text") or "") for i in items
+    active = next((_scrub(str(i.get("text") or "")) for i in items
                    if i.get("status") == ACTIVE), None)
     done = sum(1 for i in items if i.get("status") == DONE)
     return {"active": active, "done": done, "total": len(items),

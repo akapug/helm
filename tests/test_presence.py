@@ -215,7 +215,55 @@ class ClaimTierScrubTest(PresenceBase):
         self.assertIn("resource", line)
         rc, out = self._seats_out()         # the CLI glance stays inert too
         self.assertEqual(rc, 0)
-        self.assertNotIn("\x1b", out.split("claim:")[0])  # per-seat rows
+        # the WHOLE output — per-seat rows AND the claims footer. (An earlier
+        # pin carved the footer out with out.split("claim:")[0]; the footer
+        # printed the raw resource and cleared the operator's terminal.)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("‮", out)
+        self.assertIn("claim:", out)        # the footer still shows, scrubbed
+        self.assertIn("resource", out)
+
+    def test_planted_home_room_and_todo_are_scrubbed(self):
+        """The other roster-borne columns of the same rows: a planted
+        home_room must not reshape the `home #…` column, and a todo whose
+        active text carries ESC (capture's whitespace-collapse keeps \\x1b)
+        must not reshape the task cell."""
+        from helm import pk, todos
+        sid = "s" * 32
+        seats.write_roster("victim", session=sid, cwd=self.tmp)
+        with seats._flocked(seats.roster_path() + ".lock"):
+            r = seats.roster()
+            r["victim"]["home_room"] = "room\x1b[2J‮pwn"
+            r["victim"]["home_room_source"] = "exp\x1b]0;t\x07licit"
+            pk.write_json(seats.roster_path(), r)
+        os.makedirs(os.path.dirname(todos.state_path(sid)), exist_ok=True)
+        pk.write_json(todos.state_path(sid), {
+            "v": 1, "ts": time.time(),
+            "items": [{"id": "1", "text": "evil\x1b[31m‮task",
+                       "status": "in_progress"}]})
+        rc, out = self._seats_out(["--all"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("‮", out)
+        self.assertIn("#room", out)          # the column survives, laundered
+        self.assertIn("task", out)
+        rep = {s["seat"]: s for s in seats.roster_report()["seats"]}
+        self.assertNotIn("\x1b", rep["victim"]["home_room"])   # web copy too
+        self.assertNotIn("\x1b", rep["victim"]["home_room_source"])
+        self.assertNotIn("\x1b", rep["victim"]["todo"]["active"])
+
+    def test_claims_verb_is_scrubbed(self):
+        """`helm chat claims` reads the same public table — the standalone
+        listing must be as inert as the seats footer."""
+        seats.write_roster("victim", session="c" * 32, cwd=self.tmp)
+        seats.claim("bad\x1b[2J‮res", "victim", ttl=600)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(seats.cmd("claims", []), 0)
+        got = out.getvalue()
+        self.assertNotIn("\x1b", got)
+        self.assertNotIn("‮", got)
+        self.assertIn("res -> victim", got)
 
     def test_giant_claim_resource_is_clipped(self):
         seats.write_roster("victim", session="i" * 32, cwd=self.tmp)
@@ -279,6 +327,39 @@ class StatusDecayTest(PresenceBase):
         row = {x["seat"]: x for x in seats.presence_report()}["planted"]
         self.assertEqual(row["source"], "claim")
         self.assertIsNone(row["status_age"])
+
+    def test_future_status_ts_counts_as_junk(self):
+        """The inversion of the missing-ts law: a status_ts planted in the
+        FUTURE must not read age-0-forever (perpetually fresh, masking every
+        live lease until the heat death of the fleet). Beyond the skew
+        allowance it is junk — the live claim wins."""
+        from helm import pk
+        seats.write_roster("fut", session="f" * 32, cwd=self.tmp)
+        seats.set_status("fut", "frozen in amber")
+        with seats._flocked(seats.roster_path() + ".lock"):
+            r = seats.roster()
+            r["fut"]["status_ts"] = time.time() + 10 * 365 * 86400
+            pk.write_json(seats.roster_path(), r)
+        seats.claim("worktree:helm:real-work", "fut", ttl=600)
+        row = {x["seat"]: x for x in seats.presence_report()}["fut"]
+        self.assertEqual(row["source"], "claim")      # the lease surfaces
+        self.assertIn("working lane/real-work", row["line"])
+        self.assertIsNone(row["status_age"])          # junk ts = unknown age
+
+    def test_small_clock_skew_still_reads_fresh(self):
+        """NTP drift between writers is not an attack: a ts a few seconds
+        ahead reads age 0 and the explicit status still wins."""
+        from helm import pk
+        seats.write_roster("skew", session="e" * 32, cwd=self.tmp)
+        seats.set_status("skew", "on triage")
+        with seats._flocked(seats.roster_path() + ".lock"):
+            r = seats.roster()
+            r["skew"]["status_ts"] = time.time() + 60   # < STATUS_SKEW_S
+            pk.write_json(seats.roster_path(), r)
+        seats.claim("worktree:helm:x", "skew", ttl=600)
+        row = {x["seat"]: x for x in seats.presence_report()}["skew"]
+        self.assertEqual((row["line"], row["source"]), ("on triage", "status"))
+        self.assertEqual(row["status_age"], 0)
 
 
 class JunkRowTest(PresenceBase):
@@ -438,6 +519,18 @@ class WebPresenceTest(PresenceBase):
         html = body.decode("utf-8")
         self.assertIn('id="chatpresence"', html)
         self.assertIn("function chatPresence", html)
+
+    def test_ledger_seats_panel_annotates_age_and_provenance(self):
+        """VERBS: the web bar, `helm chat seats`, and the LEDGER seats panel
+        glance identically — rosterSeats must render status_age + '(by X)'
+        (roster_report ships both), not just the bare line."""
+        st, body = self.get("/")
+        self.assertEqual(st, 200)
+        html = body.decode("utf-8")
+        panel = html.split("function rosterSeats")[1].split(
+            "function fleetTodos")[0]
+        self.assertIn("status_age", panel)
+        self.assertIn("status_by", panel)
 
 
 if __name__ == "__main__":
