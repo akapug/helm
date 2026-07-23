@@ -836,6 +836,24 @@ def _code_visible(line, st):
     return "".join(out)
 
 
+def _strip_comment(code):
+    """Drop the trailing comment QUOTE-AWARE — a naive split("#") truncates at
+    a '#' INSIDE a string literal, hiding any accessor after it (a planted
+    `print("#issue %s" % row.get("from"))` evaded the r10 tripwire that way).
+    Worst-case mis-tracking keeps comment text and over-counts — which fails
+    the count-pin LOUDLY, never silently hides a read site."""
+    q = None
+    for i, ch in enumerate(code):
+        if q:
+            if ch == q and (i == 0 or code[i - 1] != "\\"):
+                q = None
+        elif ch in "'\"":
+            q = ch
+        elif ch == "#":
+            return code[:i]
+    return code
+
+
 def _from_field_read_sites():
     """[(module, lineno, text)] for every helm/*.py line that reads a chat/meld
     row's IDENTITY field — a from/tfrom/rfrom/dm/peer dict accessor, or the
@@ -849,7 +867,7 @@ def _from_field_read_sites():
         st = {"in": False, "q": None}
         with open(os.path.join(PKG, fn), encoding="utf-8") as fh:
             for i, line in enumerate(fh, 1):
-                code = _code_visible(line, st).split("#", 1)[0]
+                code = _strip_comment(_code_visible(line, st))
                 hit = bool(_FROM_FIELD_READ.search(code))
                 if not hit and _CONVENER_LOCAL.search(_STR_LITERAL.sub("", code)):
                     hit = True                  # bare convener local, no literal
