@@ -122,6 +122,7 @@ from . import chat, home, pk
 
 MAX_BYTES = 200          # the delivery clip — meld's whisper frame budget
 PREVIEW_CHARS = 80       # roster panel preview
+SEAT_BYTES = 80          # the seat label clip — a name is a glance, not a payload
 FRESH_S, QUIET_S = 120, 900
 DEFAULT_TTL = 900        # claims lease default
 SCAN_CAP = 512 * 1024    # deliver never reads more than this per room
@@ -2410,6 +2411,46 @@ def _pub(v, cap=80):
     return _clip(_scrub(str(v)).strip(), cap) if v else v
 
 
+def _seat_label(s):
+    """Launder a seat KEY for terminal display (the `seat gc` listing and
+    `status` bare-show read the roster dict directly, not roster_report).
+    A legit seat — [A-Za-z0-9._-], a slug, or auto_name — is unchanged; a
+    hostile HELM_CHAT_NAME (the seat key is unvalidated at the join seam)
+    loses its ESC/bidi so the most prominent, first-printed column cannot
+    reshape the operator's terminal. The report path routes through
+    _pub_row; this is the same law for the two direct-read surfaces."""
+    return _clip(_scrub(str(s)).strip(), SEAT_BYTES)
+
+
+# per-field byte caps for a roster row's DISPLAY strings; unlisted string
+# fields ride the default. seat + session are here too so NO roster-borne
+# string — the seat KEY included — reaches an operator terminal unlaundered.
+_ROW_CAPS = {"seat": SEAT_BYTES, "session": MAX_BYTES, "project": 80,
+             "cwd": 160, "home_room": 40, "home_room_source": 40,
+             "status": STATUS_BYTES, "status_by": 40, "line": STATUS_BYTES,
+             "source": 40, "preview": PREVIEW_CHARS}
+
+
+def _pub_row(d):
+    """The ONE publish boundary for a roster row: scrub+clip EVERY string
+    field (Cc/Cf incl. bidi, Zl/Zp) at its per-field cap, so no roster-borne
+    string — seat KEY, project, cwd, status, status_by, line, source,
+    preview, and any FUTURE string field — can reshape an operator terminal
+    or reorder the fleet table. Non-string values (last_seen, pending, dot,
+    status_age) and falsy strings pass through; the nested todo cell's active
+    text is laundered too. The stored roster keeps its raw keys (rename/claim
+    match the dict itself); only this report copy is laundered — one owner,
+    not a scrub scattered across every print site."""
+    for k, v in list(d.items()):
+        if isinstance(v, str) and v:
+            d[k] = _clip(_scrub(v).strip(), _ROW_CAPS.get(k, 80))
+    todo = d.get("todo")
+    if isinstance(todo, dict) and isinstance(todo.get("active"), str) \
+            and todo["active"]:
+        todo["active"] = _clip(_scrub(todo["active"]).strip(), STATUS_BYTES)
+    return d
+
+
 def roster_report(room="main"):
     """{"seats": [...], "claims": [...]} — fail-open by caller. Pending is
     computed from each seat's cursor WITHOUT moving it. A report is a READ:
@@ -2445,28 +2486,28 @@ def roster_report(room="main"):
                 todo = None              # fail-open: a roster read never 500s
             line, source = status_line(row, by_holder.get(seat))
             p = presence_of(ls)
-            seats.append({"seat": seat, "session": row.get("session"),
-                          "project": _pub(row.get("project")),
-                          "cwd": _pub(row.get("cwd"), 160),
-                          "home_room": _pub(row.get("home_room"), 40),
-                          "home_room_source": _pub(row.get("home_room_source"),
-                                                   40),
+            seats.append(_pub_row({
+                          "seat": seat, "session": row.get("session"),
+                          "project": row.get("project"),
+                          "cwd": row.get("cwd"),
+                          "home_room": row.get("home_room"),
+                          "home_room_source": row.get("home_room_source"),
                           "last_seen": ls, "presence": p,
                           "dot": presence_dot(p), "status": row.get("status"),
                           "status_age": _status_age(row),
                           "status_by": _status_by(row),
                           "line": line, "source": source,
                           "pending": pending, "preview": preview,
-                          "todo": todo})
+                          "todo": todo}))
         except Exception:   # per-row fail-open (the same law as the bar): a
-            seats.append({  # junk row reads '?', it never kills the report
+            seats.append(_pub_row({  # junk row reads '?', never kills the report
                 "seat": seat, "session": None, "project": None, "cwd": None,
                 "home_room": None, "home_room_source": None,
                 "last_seen": None, "presence": "absent",
                 "dot": presence_dot("absent"), "status": None,
                 "status_age": None, "status_by": None,
                 "line": "?", "source": "home",
-                "pending": 0, "preview": None, "todo": None})
+                "pending": 0, "preview": None, "todo": None}))
     return {"room": room, "seats": seats, "claims": cl}
 
 
@@ -2586,7 +2627,9 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             if sub == "mutes":
                 got = mutes(who)
                 print("helm chat: %s mutes %s" % (
-                    who, ", ".join(got) if got else "nothing"))
+                    _seat_label(who),
+                    ", ".join(_seat_label(g) for g in got)
+                    if got else "nothing"))
                 return 0
             if not args:
                 print("usage: helm chat seat %s <room> [--seat S]" % sub,
@@ -2611,10 +2654,14 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             if not rows:
                 print("helm chat: roster empty — nothing to gc")
                 return 0
-            w = max(len(r["seat"]) for r in rows)
+            # launder BOTH columns: the seat KEY (a hostile HELM_CHAT_NAME) and
+            # the why (it interpolates that same key — "carries HELM_CHAT_NAME=%s")
+            labels = {id(r): _seat_label(r["seat"]) for r in rows}
+            w = max(len(labels[id(r)]) for r in rows)
             for r in rows:
                 print("  %-5s %-*s  %s"
-                      % (r["verdict"].upper(), w, r["seat"], r["why"]))
+                      % (r["verdict"].upper(), w, labels[id(r)],
+                         _clip(_scrub(str(r["why"])).strip(), STATUS_BYTES)))
             n = sum(r["verdict"] == "prune" for r in rows)
             if "--apply" in rest:
                 print("helm chat: pruned %d roster row%s (+ derived seat "
@@ -2745,8 +2792,8 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                 if sb:
                     extra += " (by %s)" % sb
             print("helm chat: %s %s ▸ %s (%s)%s" % (
-                presence_dot(presence_of(last_seen(who, row))), who,
-                line or "—", source, extra))
+                presence_dot(presence_of(last_seen(who, row))),
+                _seat_label(who), line or "—", source, extra))
             return 0
         # the WRITER is always the ambient identity — a cross-seat write
         # (--seat != self) is allowed but recorded (status_by, post parity)

@@ -274,6 +274,131 @@ class ClaimTierScrubTest(PresenceBase):
                              seats.STATUS_BYTES + len("…".encode("utf-8")))
 
 
+# the two payload markers every roster surface must strip: a screen-clear
+# CSI (Cc) and a right-to-left override (Cf, reorders the whole line).
+ESC, BIDI = "\x1b", "‮"
+
+
+def _walk_strings(v):
+    """Every string reachable in a report value — dict values, list items,
+    nested. The completeness guard walks the OUTPUT schema, so a NEW string
+    field added to a roster row (without laundering) is caught with no test
+    edit: it simply shows up here carrying the planted payload."""
+    if isinstance(v, str):
+        yield v
+    elif isinstance(v, dict):
+        for x in v.values():
+            yield from _walk_strings(x)
+    elif isinstance(v, (list, tuple)):
+        for x in v:
+            yield from _walk_strings(x)
+
+
+class RosterLaunderCompletenessTest(PresenceBase):
+    """r4 pin — CLOSE THE CLASS, don't patch a 5th site. The seat KEY was the
+    one roster-borne string that still reached the operator terminal raw
+    (status tier → footer → todos → seat key was the 4th iteration of the
+    SAME display-laundering bug). This enumerates EVERY roster-borne string
+    field, plants an ESC+bidi payload in each, and asserts it is absent from
+    the FULL output of every roster-printing verb AND from every string in
+    the roster_report JSON — source-driven over the output schema so a 5th
+    surface (or a new field) cannot be born unlaundered."""
+
+    # a hostile seat KEY (the unvalidated HELM_CHAT_NAME join seam) — the
+    # most prominent, first-printed column on every glance surface.
+    SEAT = "lane" + ESC + "[2J" + BIDI + "pwn"
+
+    def _plant(self):
+        """One victim carrying the payload in every roster-borne field: the
+        seat KEY, the display columns (project/cwd/home_room/source), the
+        explicit status + its cross-seat writer, a live claim (resource +
+        holder), and the todo cell. A legit session keeps the cursor plumbing
+        alive so no field falls to the fail-open '?' row."""
+        from helm import pk, todos
+        sid = "z" * 32
+        seats.write_roster(self.SEAT, session=sid, cwd=self.tmp)
+        with seats._flocked(seats.roster_path() + ".lock"):
+            r = seats.roster()
+            row = r[self.SEAT]
+            row["project"] = "proj" + ESC + "[31m" + BIDI + "X"
+            row["cwd"] = "/tmp/" + ESC + "]0;t\x07" + BIDI + "cwd"
+            row["home_room"] = "room" + ESC + "[2J" + BIDI + "pwn"
+            row["home_room_source"] = "exp" + ESC + "]0;t\x07" + BIDI + "licit"
+            row["status"] = "busy" + ESC + "[2J" + BIDI + "wiping"
+            row["status_ts"] = time.time()        # FRESH: the status tier wins
+            row["status_by"] = "boss" + ESC + "[31m" + BIDI + "man"
+            pk.write_json(seats.roster_path(), r)
+        seats.claim("res" + ESC + "[2J" + BIDI + "ource",
+                    self.SEAT, ttl=600)
+        os.makedirs(os.path.dirname(todos.state_path(sid)), exist_ok=True)
+        pk.write_json(todos.state_path(sid), {
+            "v": 1, "ts": time.time(),
+            "items": [{"id": "1", "text": "evil" + ESC + "[31m" + BIDI + "task",
+                       "status": "in_progress"}]})
+        return sid
+
+    def _verb(self, verb, args=()):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seats.cmd(verb, list(args))
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_no_roster_string_reaches_any_verb_raw(self):
+        self._plant()
+        # every roster-printing verb — the seat KEY rides the FIRST column of
+        # each, and the claim footer / todo cell / status line ride the rest.
+        surfaces = [("seats", []), ("seats", ["--all"]), ("claims", []),
+                    ("seat", ["gc"]), ("status", ["--seat", self.SEAT])]
+        for verb, args in surfaces:
+            rc, out = self._verb(verb, args)
+            self.assertNotIn(ESC, out, "%s %s leaked ESC" % (verb, args))
+            self.assertNotIn(BIDI, out, "%s %s leaked bidi" % (verb, args))
+        # the seat KEY specifically must have PRINTED (laundered), not vanished
+        _, seats_out = self._verb("seats", ["--all"])
+        self.assertIn("lane", seats_out)          # the label survives, inert
+        self.assertIn("pwn", seats_out)
+
+    def test_report_json_launders_every_string_field(self):
+        """The source-driven completeness guard: walk EVERY string in the
+        roster_report seat rows (+ claims) and assert none carries the
+        payload. Enumerates the output schema — a new roster-borne string
+        field added without routing through _pub_row fails here automatically,
+        as does the JSON a CLI consumer prints raw."""
+        self._plant()
+        rep = seats.roster_report()
+        strings = list(_walk_strings(rep["seats"])) + \
+            list(_walk_strings(rep["claims"]))
+        self.assertTrue(strings)                  # we actually walked content
+        # every roster-borne field enumerated as present in the report
+        present = set(rep["seats"][0].keys())
+        for field in ("seat", "project", "cwd", "home_room",
+                      "home_room_source", "status", "status_by", "line",
+                      "source", "todo"):
+            self.assertIn(field, present, "report dropped field %r" % field)
+        for s in strings:
+            self.assertNotIn(ESC, s, "report leaked ESC in %r" % s)
+            self.assertNotIn(BIDI, s, "report leaked bidi in %r" % s)
+
+    def test_pub_row_is_field_agnostic(self):
+        """The choke point itself: _pub_row scrubs EVERY string value, even a
+        field name it has never seen — the mechanism is enumeration over the
+        row, not a fixed per-field list. This is what stops the 5th surface:
+        a future `seats.append({... "newthing": row.get("newthing")})` is
+        laundered the moment it joins the dict."""
+        row = seats._pub_row({
+            "seat": self.SEAT, "session": "sid" + ESC + BIDI,
+            "future_field": "surprise" + ESC + "[2J" + BIDI + "!",
+            "nested_todo": {"active": "x" + ESC + BIDI + "y"},
+            "count": 7, "flag": True, "empty": None})
+        self.assertNotIn(ESC, row["future_field"])
+        self.assertNotIn(BIDI, row["future_field"])
+        self.assertNotIn(ESC, row["seat"])
+        self.assertNotIn(ESC, row["session"])
+        self.assertEqual(row["count"], 7)         # non-strings pass through
+        self.assertIs(row["flag"], True)
+        self.assertIsNone(row["empty"])
+
+
 class StatusDecayTest(PresenceBase):
     """Reviewer pin (P9): a 3-day-old explicit status must not mask a LIVE
     worktree lease — fresh claim beats stale status, fresh status still
