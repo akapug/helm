@@ -512,8 +512,16 @@ class ChatHostileNameSweepTest(unittest.TestCase):
 # outside the validating join seam — a pre-fix row, a foreign node's row). The
 # TEXT legitimately carries unicode and is left as-is (the class rule); only
 # the identity field is laundered through chat._dsan. THIS SWEEP now covers the
-# chat-ROW from-field sinks, not just roster()/env readers — a 12th surface in
-# any of these three verbs trips here.
+# chat-ROW from-field sinks, not just roster()/env readers.
+#
+# r10 broadened the sweep to the FULL meld identity surface + verify: the
+# convener/peer from-field also PROMOTES into posted message TEXT (join's READY,
+# invite's @peer, say's DONE/ABORT mention) which chat._fmt renders raw
+# fleet-wide — the identity-into-text bypass — plus meld.status' peer column and
+# chat.verify's MISMATCH stderr print. Every meld identity EMIT and verify's
+# emitted dict now launder through chat._dsan; the RAW convener/peer lives only
+# in state for recv's matching. The Section-F grep tripwire below keeps it that
+# way: a NEW raw from-field emit in ANY module trips the source-driven grep.
 class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
     HOSTILE = "lane" + ESC + "[2J" + BIDI + "pwn"
 
@@ -555,6 +563,23 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
             f.write(json.dumps(
                 {"ts": "2026-07-22T00:00:00", "id": rid, "from": self.HOSTILE,
                  "text": text}, ensure_ascii=False) + "\n")
+
+    def _plant_obj(self, room, obj):
+        """Append ONE raw jsonl row of an ARBITRARY shape — the meld/verify
+        sinks need custom from + text + protocol markers (READY/ABORT/DONE,
+        an epoch fence, a signed-MISMATCH payload)."""
+        import json
+        row = {"ts": "2026-07-22T00:00:00"}
+        row.update(obj)
+        with open(chat.room_path(room), "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _cap(fn):
+        o, e = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+            rv = fn()
+        return o.getvalue() + e.getvalue(), rv
 
     # -- 1. seats.deliver(): the tool-boundary nudge ---------------------------
     def test_deliver_boundary_nudge_is_inert(self):
@@ -598,6 +623,143 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
         self.assertIn("lane", text)                # …with the from laundered
         self.assertIn("pwn", text)
 
+    # -- 3b. meld.recv(): the OTHER three marker lines (r9 laundered all four,
+    #        the r9 sweep drove only YIELD — READY/ABORT/DONE were revert-blind).
+    def test_meld_recv_ready_abort_done_lines_are_inert(self):
+        # READY (convener/invited): the joiner's control row, hostile from.
+        r1 = "meld-recv-ready"
+        meld._write_state(r1, "conv2", {
+            "room": r1, "epoch": 123, "role": "convener", "self": "conv2",
+            "peer": "joiner", "idx": 0, "exchanges": 0, "cap": 8,
+            "status": "invited", "created": pk.now_ts()})
+        self._plant_obj(r1, {"from": self.HOSTILE,
+                             "text": "[MELD e:123] READY:123 (joined)"})
+        code, lines = meld.recv(r1, timeout=0.2, seat="conv2")
+        t = "\n".join(lines)
+        self._assert_inert("meld.recv READY", t)
+        self.assertEqual(code, 0)
+        self.assertIn("lane", t)
+        self.assertIn("pwn", t)
+        # ABORT (active joiner): fail-loud line renders the peer's from.
+        r2 = "meld-recv-abort"
+        meld._write_state(r2, "recvr3", {
+            "room": r2, "epoch": 9, "role": "joiner", "self": "recvr3",
+            "peer": self.HOSTILE, "idx": 0, "exchanges": 0, "cap": 8,
+            "status": "active", "created": pk.now_ts()})
+        self._plant_obj(r2, {"from": self.HOSTILE, "text": "boom [ABORT]"})
+        code, lines = meld.recv(r2, timeout=0.2, seat="recvr3")
+        t = "\n".join(lines)
+        self._assert_inert("meld.recv ABORT", t)
+        self.assertEqual(code, meld.EXIT_ABORT)
+        self.assertIn("lane", t)
+        # DONE (active joiner): peer-left line renders the from.
+        r3 = "meld-recv-done"
+        meld._write_state(r3, "recvr4", {
+            "room": r3, "epoch": 9, "role": "joiner", "self": "recvr4",
+            "peer": self.HOSTILE, "idx": 0, "exchanges": 0, "cap": 8,
+            "status": "active", "created": pk.now_ts()})
+        self._plant_obj(r3, {"from": self.HOSTILE, "text": "bye [DONE]"})
+        code, lines = meld.recv(r3, timeout=0.2, seat="recvr4")
+        t = "\n".join(lines)
+        self._assert_inert("meld.recv DONE", t)
+        self.assertEqual(code, 0)
+        self.assertIn("lane", t)
+
+    # -- 4. meld.join(): the MELD-JOINED display AND the promoted READY TEXT ----
+    #    convener is a SEED ROW's from — HIGH: it entered the POSTED text (@%s
+    #    [MELD…] READY), which chat._fmt then renders raw fleet-wide.
+    def test_meld_join_display_and_promoted_text_are_inert(self):
+        room = "meld-join-test"
+        self._plant_obj(room, {"from": self.HOSTILE,
+                               "text": "[MELD e:123] PROBLEM: x [HOLD]"})
+        lines = meld.join(room, seat="joiner")
+        disp = "\n".join(lines)
+        self._assert_inert("meld.join display", disp)
+        self.assertIn("lane", disp)
+        self.assertIn("pwn", disp)
+        rows, _ = chat.read(room)
+        ready = [r for r in rows if "READY" in (r.get("text") or "")][0]
+        # the convener was laundered BEFORE entering the posted text — the
+        # identity-into-text bypass is closed at the source of the promotion.
+        self._assert_inert("meld.join promoted READY text", ready["text"])
+        self.assertIn("lane", ready["text"])
+        self._assert_inert("meld.join READY _fmt", chat._fmt(ready))
+
+    # -- 5. meld.invite(): the @peer mention posted into TEXT + display lines ---
+    def test_meld_invite_mention_and_display_are_inert(self):
+        room, lines = meld.invite(self.HOSTILE, "topic here", seat="conv")
+        disp = "\n".join(lines)
+        self._assert_inert("meld.invite display", disp)
+        self.assertIn("lane", disp)
+        self.assertIn("pwn", disp)
+        rows, _ = chat.read(room)
+        inv = [r for r in rows if "MELD-INVITE" in (r.get("text") or "")][0]
+        self._assert_inert("meld.invite posted @mention text", inv["text"])
+        self.assertIn("lane", inv["text"])
+
+    # -- 6. meld.say(): the DONE/ABORT @peer mention posted into TEXT ----------
+    def test_meld_say_done_mention_is_inert(self):
+        room = "meld-say-test"
+        meld._write_state(room, "sayer", {
+            "room": room, "epoch": 55, "role": "convener", "self": "sayer",
+            "peer": self.HOSTILE, "idx": 0, "exchanges": 0, "cap": 8,
+            "status": "active", "created": pk.now_ts()})
+        lines = meld.say(room, "DONE", "closing state", seat="sayer")
+        self._assert_inert("meld.say return", "\n".join(lines))
+        rows, _ = chat.read(room)
+        done = [r for r in rows if "[DONE]" in (r.get("text") or "")][0]
+        self._assert_inert("meld.say posted DONE text", done["text"])
+        self.assertIn("lane", done["text"])
+        self.assertIn("pwn", done["text"])
+
+    # -- 7. meld.status(): the peer=%s display column --------------------------
+    def test_meld_status_display_is_inert(self):
+        room = "meld-status-test"
+        meld._write_state(room, "statr", {
+            "room": room, "epoch": 7, "role": "convener", "self": "statr",
+            "peer": self.HOSTILE, "idx": 0, "exchanges": 0, "cap": 8,
+            "status": "active", "created": pk.now_ts()})
+        text = "\n".join(meld.status(seat="statr"))
+        self._assert_inert("meld.status", text)
+        self.assertIn("lane", text)
+        self.assertIn("pwn", text)
+
+    # -- 8. chat.verify(): the emitted dict AND the CLI MISMATCH stderr print ---
+    def test_chat_verify_mismatch_row_is_inert(self):
+        room = "verify-test"
+        # a SIGNED row whose stored payload no longer recomputes = MISMATCH, the
+        # one verify state that reaches the stderr print (r["from"], raw pre-fix).
+        self._plant_obj(room, {"from": self.HOSTILE, "text": "x",
+                               "chain": "sig-abc", "payload": "WRONG-PAYLOAD"})
+        rep = chat.verify(room)
+        for r in rep:                              # every emitted from laundered
+            self._assert_inert("verify() dict from", r["from"])
+        bad = [r for r in rep if r["state"] == "MISMATCH"]
+        self.assertTrue(bad, "the planted signed row must verify MISMATCH")
+        self.assertIn("lane", bad[0]["from"])      # laundered, not vanished
+        self.assertIn("pwn", bad[0]["from"])
+        # the actual CLI stderr sink: the print reads r["from"] off the dict.
+        text, _ = self._cap(lambda: chat.cmd_chat(["verify", "--room", room]))
+        self._assert_inert("helm chat verify (stderr)", text)
+        self.assertIn("lane", text)
+
+    # -- 9. chat.log_flush(): the journal a `cat` renders (identity columns) ----
+    def test_log_flush_journal_is_inert(self):
+        room = "main"
+        self._plant_obj(room, {"from": self.HOSTILE, "id": "ee" * 6,
+                               "text": "@x hi there"})
+        n = chat.log_flush(rooms=[room])
+        self.assertGreaterEqual(n, 1)
+        path = os.path.join(chat.journal_dir(),
+                            "chat-%s.log" % time.strftime("%Y-%m-%d"))
+        with open(path, encoding="utf-8") as f:
+            body = f.read()
+        # the from column is _dsan-laundered; the message TEXT stays full-fidelity
+        self._assert_inert("chat log-flush journal", body)
+        self.assertIn("lane", body)                # laundered name survives
+        self.assertIn("pwn", body)
+        self.assertIn("hi there", body)            # the text rode through intact
+
     # -- proof the sweep BITES: the planted from-field is genuinely hostile ----
     def test_planted_from_field_is_actually_hostile(self):
         """Guards the guard: if the plant stopped carrying ESC/bidi the three
@@ -609,6 +771,182 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
         rows, _total = chat.read("main")
         self.assertIn(ESC, rows[0]["from"])        # stored key stays raw…
         self._assert_inert("chat._dsan", chat._dsan(self.HOSTILE))  # …emit inert
+
+
+# ── F. the SOURCE-DRIVEN grep tripwire for chat-ROW from-field emits ─────────
+#
+# THE FROM-FIELD ANALOG OF THE roster() TRIPWIRE (Section A,
+# RosterConsumerAllowlistTest). Section A greps every seats.roster() caller and
+# forces each into an allowlist with a reason; a new consumer in an unguarded
+# module fails by construction. This does the IDENTICAL thing for the chat-row
+# IDENTITY fields — the second unvalidated identity source that kept the ESC/
+# bidi class reopening (r7..r10): a foreign/planted row's from/tfrom/rfrom/dm,
+# and its meld relocations convener (join) + peer (meld state). Unlike
+# HELM_CHAT_NAME (rejected at the home.chat_name seam, Section C), a foreign row
+# CANNOT be rejected — so its only defense is PER-SINK laundering (chat._dsan),
+# and each round found one more sink. This grep ENDS that: it enumerates EVERY
+# helm/*.py site that reads a chat/meld row's identity field, and every module
+# reaching a sink must be allowlisted with a reason — LAUNDERED (the emitted
+# copy routes chat._dsan / public_rows / _fmt), INTERNAL-MATCHING-ONLY (the read
+# never reaches a sink — react/reply/deliverable keys), or NOT-A-CHAT-ROW. A NEW
+# raw from-field emit in ANY module then FAILS this grep by construction: it is
+# a new read site (count-pin trips) or lands in an unlisted module (allowlist
+# trips) — sink #14 can never ship unlaundered. The reason is the reviewer's
+# contract; the Section-E runtime sweep verifies the emits are actually inert.
+
+# IDENTITY-field dict accessors ( .get("X") / ["X"] ) — from/tfrom/rfrom/dm are
+# the chat-row NAME columns (chat._ID_FIELDS); peer is the meld state relocation
+# of a convener from-field (say/status emit it). The keys are ALWAYS quoted, so
+# this is code-only by nature (no prose match), exactly like _ROSTER_CALL.
+_FROM_FIELD_READ = re.compile(
+    r"""(?:\.get\(\s*|\[\s*)['"](?:from|tfrom|rfrom|dm|peer)['"]""")
+# the meld `convener` LOCAL, assigned from a seed row's `from` — matched as a
+# bare identifier in CODE only (docstrings + comments + the "convener" role
+# string literal are stripped before the match, see _from_field_read_sites).
+_CONVENER_LOCAL = re.compile(r"\bconvener\b")
+_STR_LITERAL = re.compile(r"""(['"]).*?\1""")
+
+
+def _code_visible(line, st):
+    """The part of `line` OUTSIDE any triple-quoted docstring, tracking the
+    open/close across lines via `st` — so a docstring that merely MENTIONS
+    'convener' (meld.join's) is never counted as a read site."""
+    out, i, n = [], 0, len(line)
+    while i < n:
+        if st["in"]:
+            idx = line.find(st["q"], i)
+            if idx == -1:
+                i = n
+            else:
+                i = idx + 3
+                st["in"] = False
+                st["q"] = None
+        else:
+            cands = [x for x in (line.find('"""', i), line.find("'''", i))
+                     if x != -1]
+            if not cands:
+                out.append(line[i:])
+                i = n
+            else:
+                nxt = min(cands)
+                out.append(line[i:nxt])
+                st["q"] = line[nxt:nxt + 3]
+                st["in"] = True
+                i = nxt + 3
+    return "".join(out)
+
+
+def _from_field_read_sites():
+    """[(module, lineno, text)] for every helm/*.py line that reads a chat/meld
+    row's IDENTITY field — a from/tfrom/rfrom/dm/peer dict accessor, or the
+    meld `convener` local. Source-driven, like _roster_call_sites: a new reader
+    shows up here with no edit to this test, then fails unless its module is
+    allowlisted (and its module count re-pinned)."""
+    sites = []
+    for fn in sorted(os.listdir(PKG)):
+        if not fn.endswith(".py"):
+            continue
+        st = {"in": False, "q": None}
+        with open(os.path.join(PKG, fn), encoding="utf-8") as fh:
+            for i, line in enumerate(fh, 1):
+                code = _code_visible(line, st).split("#", 1)[0]
+                hit = bool(_FROM_FIELD_READ.search(code))
+                if not hit and _CONVENER_LOCAL.search(_STR_LITERAL.sub("", code)):
+                    hit = True                  # bare convener local, no literal
+                if hit:
+                    sites.append((fn, i, line.strip()))
+    return sites
+
+
+# The allowlist IS the law (mirrors _ROSTER_CONSUMERS): every module that reads
+# a chat-row identity field must appear here with a reason. Keyed by basename.
+_FROM_FIELD_CONSUMERS = {
+    "chat.py": (
+        "LAUNDERED (publish owner): every identity column that reaches a sink "
+        "routes chat._dsan — _fmt (CLI/journal render), _fmt_body (log-flush "
+        "journal), verify() (the emitted dict, one-owner for the MISMATCH "
+        "stderr print), public_rows (the JSON wire). The remaining reads are "
+        "INTERNAL-MATCHING-ONLY: react-digest/react-state keys, reply/quote "
+        "resolution, rkey, _touch_poster_presence, the dm-room derivation — "
+        "none emit a raw name. Verified by ChatHostileNameSweep + "
+        "ChatRowFromFieldSinkSweep."),
+    "meld.py": (
+        "LAUNDERED: every meld identity EMIT routes chat._dsan — invite (@peer "
+        "posted text + MELD-INVITED display, d_peer), join (READY posted text + "
+        "MELD-JOINED display, d_convener), recv (READY/ABORT/DONE lines, "
+        "chat._dsan(frm)), say (DONE/ABORT @peer mention), status (peer column). "
+        "The RAW convener/peer is kept ONLY in state[peer] for recv's frm "
+        "matching (never emitted raw). Verified by ChatRowFromFieldSinkSweep's "
+        "join/invite/say/status/recv-all-markers tests."),
+    "seats.py": (
+        "LAUNDERED+INTERNAL: the two EMIT sites — deliver()'s boundary nudge and "
+        "stop_guard()'s undelivered block — launder via chat._dsan; the "
+        "deliverable-matching reads (frm/dm/rfrom in deliverable()) are "
+        "INTERNAL-MATCHING-ONLY, never emitted. Verified by "
+        "ChatRowFromFieldSinkSweep's deliver/stop_guard tests."),
+    "web.py": (
+        "LAUNDERED+INTERNAL: the owner-mention preview + ledger + channel-row "
+        "emits launder via chat._dsan (and the /api/chat body via "
+        "chat.public_rows); the mention-scan (str(from).lower() in names), the "
+        "recent-activity roster lookup (frm in roster), and the react-target "
+        "payload.get('tfrom') are INTERNAL-MATCHING-ONLY. Verified by "
+        "RosterSinkSweep's /api/chat + /api/ledger tests."),
+    "homes.py": (
+        "NOT-A-CHAT-ROW: meta.get('from') is a provider-migration SOURCE PATH "
+        "(the home's origin dir), never a chat/meld identity — it reaches no "
+        "chat sink. Listed so a future `.get(\"from\")` here is re-justified."),
+}
+
+# COUNT-PIN per module (mirrors _ROSTER_CALL_COUNTS): module-membership alone
+# lets a NEW read site slip into an already-allowlisted module unreviewed. Pin
+# the exact count so a new identity read — even in an allowlisted module —
+# trips until a human re-counts AND confirms the new site launders (or is
+# internal). Regenerate deliberately from _from_field_read_sites().
+_FROM_FIELD_READ_COUNTS = {
+    "chat.py": 29,
+    "homes.py": 1,
+    "meld.py": 9,
+    "seats.py": 6,
+    "web.py": 7,
+}
+
+
+class ChatRowFromFieldConsumerAllowlistTest(unittest.TestCase):
+    """The from-field analog of RosterConsumerAllowlistTest (Section A). Same
+    three teeth: every consuming module allowlisted with a reason, the per-
+    module read-count pinned, and no stale allowlist entry."""
+
+    def test_every_from_field_consumer_is_allowlisted(self):
+        sites = _from_field_read_sites()
+        self.assertTrue(sites, "found no from-field read sites — regex rotted")
+        offenders = sorted({m for m, _, _ in sites} - set(_FROM_FIELD_CONSUMERS))
+        self.assertFalse(
+            offenders,
+            "un-allowlisted chat-row identity consumer(s) %r — a from/tfrom/"
+            "rfrom/dm/convener/peer can reach a sink from a module no display-"
+            "launder guard covers (the exact way sinks #12..#14 were born). Add "
+            "each to _FROM_FIELD_CONSUMERS with a reason (LAUNDERED via "
+            "chat._dsan/public_rows/_fmt, INTERNAL-MATCHING-ONLY, or "
+            "NOT-A-CHAT-ROW) AND, if it emits, wire it into the Section-E "
+            "runtime sweep.\n  sites: %s"
+            % (offenders, [s for s in sites if s[0] in offenders]))
+
+    def test_from_field_read_counts_are_pinned(self):
+        from collections import Counter
+        actual = dict(Counter(m for m, _, _ in _from_field_read_sites()))
+        self.assertEqual(
+            actual, _FROM_FIELD_READ_COUNTS,
+            "chat-row identity read-site counts drifted from the pin. A new read "
+            "site (even in an allowlisted module) can reach a sink unreviewed — "
+            "verify each new site launders its emitted identity (or is internal/"
+            "not-a-chat-row), then update _FROM_FIELD_READ_COUNTS.\n"
+            "  actual: %s\n  pinned: %s" % (actual, _FROM_FIELD_READ_COUNTS))
+
+    def test_allowlist_has_no_stale_entries(self):
+        live = {m for m, _, _ in _from_field_read_sites()}
+        stale = sorted(set(_FROM_FIELD_CONSUMERS) - live)
+        self.assertFalse(stale, "from-field allowlist entries no longer read an "
+                         "identity field: %r" % stale)
 
 
 if __name__ == "__main__":

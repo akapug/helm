@@ -136,18 +136,24 @@ def invite(peer, topic, seat=None):
             "continuation. [HOLD]"
             % (epoch, topic, seat, _cap(), int(_recv_timeout())))
     _post(seed, room, seat)
+    # peer is an operator-supplied seat name that enters the @mention posted
+    # TEXT (rendered raw by chat._fmt on every reader's terminal) and the
+    # convener's own display lines — launder the EMITTED copies; the RAW peer
+    # stays in state for say()'s DONE/ABORT mention. topic is CONTENT, left
+    # full-fidelity by the class rule (only identity is laundered).
+    d_peer = chat._dsan(peer)
     inv = ("@%s [MELD-INVITE e:%d] room=%s JOIN: helm chat meld join %s "
            "THEN: helm chat meld recv %s || topic: %s"
-           % (peer, epoch, room, room, room, topic))
+           % (d_peer, epoch, room, room, room, topic))
     _post(inv, room, seat)
     _write_state(room, seat, {
         "room": room, "epoch": epoch, "role": "convener", "self": seat,
         "peer": peer, "idx": 0, "exchanges": 0, "cap": _cap(),
         "status": "invited", "created": pk.now_ts()})
     return room, [
-        "MELD-INVITED room=%s epoch=%d peer=%s" % (room, epoch, peer),
+        "MELD-INVITED room=%s epoch=%d peer=%s" % (room, epoch, d_peer),
         "the invite is a durable row — %s wakes at its next tool boundary "
-        "or beacon (never lost, only delayed)" % peer,
+        "or beacon (never lost, only delayed)" % d_peer,
         "next: helm chat meld recv %s   (returns on READY; then speak the "
         "first chunk: helm chat meld say %s --marker YIELD \"...\")"
         % (room, room)]
@@ -172,13 +178,20 @@ def join(room, seat=None):
     if convener == seat:
         raise SystemExit("helm meld: %s convened this meld — recv, don't "
                          "join" % seat)
+    # convener is a SEED ROW's from-field — planted/foreign (a pre-fix or
+    # foreign-node seed) it may carry ESC/bidi. Launder it before it enters
+    # BOTH the MELD-JOINED display line AND the posted READY text (chat._fmt
+    # renders posted text raw fleet-wide — the identity-into-text bypass). The
+    # RAW convener stays in state["peer"] for recv's peer matching, mirroring
+    # recv's chat._dsan(frm) pattern: launder the EMIT, keep the KEY raw.
+    d_convener = chat._dsan(convener)
     _post("@%s [MELD e:%d] READY:%d (%s joined %s)"
-          % (convener, epoch, epoch, seat, room), room, seat)
+          % (d_convener, epoch, epoch, seat, room), room, seat)
     _write_state(room, seat, {
         "room": room, "epoch": epoch, "role": "joiner", "self": seat,
         "peer": convener, "idx": 0, "exchanges": 0, "cap": _cap(),
         "status": "active", "created": pk.now_ts()})
-    return ["MELD-JOINED room=%s epoch=%d convener=%s" % (room, epoch, convener),
+    return ["MELD-JOINED room=%s epoch=%d convener=%s" % (room, epoch, d_convener),
             "next: helm chat meld recv %s   (the seeded problem statement "
             "is your first chunk)" % room]
 
@@ -292,7 +305,12 @@ def say(room, marker, text, seat=None):
     if not text:
         raise SystemExit("helm meld: say wants text — a bare marker is not "
                          "a chunk (text-or-it-didn't-happen)")
-    mention = "@%s " % st["peer"] if marker in ("DONE", "ABORT") else ""
+    # st["peer"] is the RELOCATED convener/invitee from-field (join stored the
+    # seed row's raw `from` here; invite stored the raw arg). Launder it before
+    # it enters the DONE/ABORT posted text — chat._fmt renders posted text raw
+    # fleet-wide, so a hostile peer would reshape every reader's terminal. Raw
+    # stays in state (only this mention emits it; recv matches on frm==seat).
+    mention = "@%s " % chat._dsan(st["peer"]) if marker in ("DONE", "ABORT") else ""
     _post("%s[MELD e:%d] %s [%s]" % (mention, st["epoch"], text, marker),
           room, seat)
     if marker == "DONE":
@@ -325,7 +343,8 @@ def status(seat=None):
         room = st.get("room") or n.split(".meld.")[0]
         out.append("  %s  role=%s status=%s exchanges=%s/%s peer=%s"
                    % (room, st.get("role"), st.get("status"),
-                      st.get("exchanges"), st.get("cap"), st.get("peer")))
+                      st.get("exchanges"), st.get("cap"),
+                      chat._dsan(st.get("peer") or "?")))  # identity laundered
     return out or ["helm meld: no live melds for seat %s" % seat]
 
 

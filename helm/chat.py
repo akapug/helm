@@ -982,7 +982,12 @@ def verify(room="main"):
         state = ("unsigned" if m.get("chain") is None else
                  ("ok" if stored == want else "MISMATCH") if stored else
                  "MISMATCH" if is_reply(m) else "legacy")
-        out.append({"n": i, "from": m.get("from") or "?", "state": state,
+        # DISPLAY-launder the from at the one owner (the emitted dict), the
+        # public_rows pattern: verify()'s only consumer is the CLI print, which
+        # writes r["from"] raw to stderr — a MISMATCH row planted with a
+        # hostile from would reshape the terminal there. The RAW row is
+        # untouched (payload_for re-derives off `m`, not this dict).
+        out.append({"n": i, "from": _dsan(m.get("from") or "?"), "state": state,
                     "payload": want, "stored": stored,
                     "reply_to": m.get("reply_to")})
     return out
@@ -1079,14 +1084,19 @@ def _fmt_body(m):
     including a reply's parent pointer, so the durable journal never loses the
     thread the RAM room showed."""
     tag = (" {chain %s}" % m["chain"]) if m.get("chain") is not None else " [unsigned]"
+    # the journal is a terminal sink: `cat chat-<date>.log` renders these lines,
+    # so the IDENTITY columns (from/tfrom/rfrom) are _dsan-laundered against a
+    # planted/foreign row's ESC/bidi. The message TEXT is left full-fidelity by
+    # law (voice pastes, emoji, U+2028) — same split as _fmt / _fmt_body's
+    # sibling render.
     if m.get("react"):
-        return "%s %s %s -> %s@%s%s" % (m.get("from") or "?",
+        return "%s %s %s -> %s@%s%s" % (_dsan(m.get("from") or "?"),
                                         "un-reacted" if m.get("un") else "reacted",
-                                        m["react"], m.get("tfrom") or "?",
+                                        m["react"], _dsan(m.get("tfrom") or "?"),
                                         m.get("tts") or "?", tag)
-    ref = (" ↳%s@%s" % (m.get("rfrom") or "?", m.get("rts") or m.get("reply_to")
+    ref = (" ↳%s@%s" % (_dsan(m.get("rfrom") or "?"), m.get("rts") or m.get("reply_to")
                         or "?")) if is_reply(m) else ""
-    return "%s%s: %s%s" % (m.get("from") or "?", ref, m.get("text") or "", tag)
+    return "%s%s: %s%s" % (_dsan(m.get("from") or "?"), ref, m.get("text") or "", tag)
 
 
 # ---------------------------------------------------------------------------
