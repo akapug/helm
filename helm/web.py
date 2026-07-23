@@ -841,11 +841,12 @@ def _room_seats(room, rows, roster):
     from . import seats as _s
     seen, out = set(), []
 
-    def _row(seat):
+    def _row(seat, ls=None):
         # the seat KEY rides the sidebar JSON raw — launder the emitted label
         # (the raw key still indexes roster[]/last_seen above) so a hostile
         # HELM_CHAT_NAME cannot spoof the channel roster or a non-browser reader.
-        ls = _s.last_seen(seat, roster[seat])
+        if ls is None:
+            ls = _s.last_seen(seat, roster[seat])
         return {"seat": _s._seat_label(seat),
                 "presence": _s.presence_of(ls), "last_seen": ls}
 
@@ -863,9 +864,23 @@ def _room_seats(room, rows, roster):
             break
         if seat in seen or not _s.room_in_scope(room, roster[seat]):
             continue
+        # Freshness pre-filter — the O(all)->O(fresh) turn. Only a seat with a
+        # recent presence beat can legitimately hold a live-sidebar slot, so
+        # gate the expensive room_active cursor walk (several pk.read_json disk
+        # reads per seat) behind it: a dead ephemeral review-SA that consumed
+        # this room hours ago is noise, not presence. last_seen is one cheap
+        # .seen stat (or the O(1) roster-carried beat when the file is gone) vs
+        # room_active's per-cursor reads, and reusing ls in _row means each
+        # survivor pays it once. Same FRESH_S/QUIET_S window presence_of paints
+        # (reuse, no new magic number) and the exact _live_seats() idiom — so a
+        # genuinely fresh never-posted consumer still reaches room_active and
+        # appears, while a stale one is skipped before any disk cursor read.
+        ls = _s.last_seen(seat, roster[seat])
+        if _s.presence_of(ls) == "absent":
+            continue
         if not _s.room_active(room, seat):  # bare EOF baselines are not presence
             continue
-        out.append(_row(seat))
+        out.append(_row(seat, ls))
     return out
 
 
@@ -900,10 +915,16 @@ def _rooms_summary(roster=None):
     return out
 
 
-# _rooms_summary is the ONE heavy read left on the chat poll path (~14s at
-# 224 seats x 13 rooms: _room_seats' consumers-fallback walks the whole sorted
+# _rooms_summary WAS the ONE heavy read left on the chat poll path (~14s at
+# 224 seats x 13 rooms: _room_seats' consumers-fallback walked the whole sorted
 # roster calling room_active — a per-seat-per-room cursor READ ~4.4ms — until
-# 6 slots fill; quiet rooms scan deepest). It ran UNCACHED on EVERY /api/chat
+# 6 slots filled; quiet rooms scanned deepest). The compute is now sub-second:
+# a freshness pre-filter (presence_of(last_seen) != "absent", the _live_seats
+# idiom) gates room_active so the cursor walk runs only on seats that could
+# legitimately be present — O(fresh), not O(all ~224); the dead ephemeral
+# review-SAs (absent beat) are skipped before any disk read. The single-flight
+# TTL cache below then caches a sub-second compute, not a 14s one. History:
+# it ran UNCACHED on EVERY /api/chat
 # poll (incremental included), so N clients x 2s stacked N ~14s computes ->
 # the ~60s /api/chat requests that starved the thread pool (the second half
 # of the 2026-07-23 UI-blank; the roster cache was brick #1). Same
