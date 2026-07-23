@@ -252,6 +252,34 @@ class TestWebChat(unittest.TestCase):
         self.assertEqual(seats.deliverable(row, "kimi", "main"),
                          seats.deliverable(plain, "kimi", "main"))
 
+    def test_reply_click_seeds_the_composer_with_the_authors_at(self):
+        """The reply affordance's visible face (owner ask 2026-07-22): the
+        endpoint half threads the payload's reply_to, and the SERVED page
+        carries the seed-@ mechanism — chatSetReply feeds the parent's author
+        into chatSeedMention, which prepends "@author " to the composer and
+        refuses a duplicate. Asserted against the mechanism's own statements,
+        not a comment."""
+        # endpoint half: the payload the seeded composer sends threads
+        self.req("/api/chat", {"text": "parent", "name": "codex"})
+        p = self.req("/api/chat?since=0")[1]["lines"][0]
+        d = self.req("/api/chat", {"text": "@codex on it",
+                                   "reply_to": p["id"]})[1]
+        self.assertEqual(d["msg"]["reply_to"], p["id"])
+        # template half: GET / (served fresh, token templated) — the click
+        # handler seeds with the PARENT'S author...
+        url = "http://127.0.0.1:%d/" % self.port
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            html = resp.read().decode("utf-8")
+        self.assertIn('chatSeedMention(String(p.from || '
+                      'div.dataset.from || "").trim())', html)
+        # ...the seed is the @-prefixed author PREPENDED to the composer...
+        self.assertIn('CHAT_REPLY_SEED = "@" + author + " "', html)
+        self.assertIn("el.value = CHAT_REPLY_SEED + el.value", html)
+        # ...an already-typed @author is never doubled (the dedupe regex)...
+        self.assertIn(r'new RegExp("(^|\\s)@" + author.replace', html)
+        # ...and cancel strips only the untouched seed (removable, not sticky)
+        self.assertIn("el.value.startsWith(CHAT_REPLY_SEED)", html)
+
     def test_poll_carries_the_live_roster_for_mention_completion(self):
         from helm import seats
         seats.write_roster("goodtimes-platform-codex", session="s-1")
