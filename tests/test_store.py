@@ -1564,5 +1564,85 @@ class ProvisionalTierTest(StoreBase):
             self.assertNotIn("xrev_by", f.read())
 
 
+class NotifyOnGraduationTest(StoreBase):
+    """Push-on-graduation (owner steer 2026-07-23: the provisional queue must
+    ROUTINELY reach the owner). xrev_clear fires ONE optional ntfy push when
+    HELM_NTFY_TOPIC is set. Hermetic: urllib.request.urlopen is mocked — no test
+    ever touches the network. Laws under test: bare-topic -> ntfy.sh URL, full
+    URL as-is, unset -> zero network calls, a down notifier is fail-open (the
+    graduation still lands + a one-line journal note), and plain candidate
+    CAPTURE never notifies (only graduation does)."""
+
+    def _candidate(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            store.cmd_store(["add", *args, "--candidate"])
+
+    def test_graduation_pushes_ntfy_on_a_bare_topic(self):
+        self._candidate("prior", "x-law | cleared belief | 0.7")
+        with mock.patch.dict(os.environ, {"HELM_NTFY_TOPIC": "helmqueue"}), \
+                mock.patch("urllib.request.urlopen") as uo:
+            e, err = store.xrev_clear("x-law", TS, by="codex-seat")
+        self.assertIsNone(err)
+        self.assertEqual(e["status"], "provisional")       # graduation succeeded
+        self.assertEqual(uo.call_count, 1)
+        req = uo.call_args[0][0]
+        self.assertEqual(uo.call_args[1]["timeout"], 3)     # 3s timeout
+        self.assertEqual(req.full_url, "https://ntfy.sh/helmqueue")
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.data, b"helm: prior x-law now provisionally live - "
+                                   b"review when convenient")
+        self.assertTrue(req.get_header("Title"))            # a Title header rides
+
+    def test_graduation_uses_a_full_url_as_is(self):
+        self._candidate("lexicon", "glorpterm | a cleared coinage")
+        with mock.patch.dict(os.environ,
+                             {"HELM_NTFY_TOPIC": "https://ntfy.example/team-helm"}), \
+                mock.patch("urllib.request.urlopen") as uo:
+            store.xrev_clear("glorpterm", TS, by="opus-seat")
+        req = uo.call_args[0][0]
+        self.assertEqual(req.full_url, "https://ntfy.example/team-helm")
+        self.assertEqual(req.data, b"helm: lexicon glorpterm now provisionally live "
+                                   b"- review when convenient")
+
+    def test_unset_topic_makes_no_network_call(self):
+        self._candidate("prior", "x-law | cleared belief | 0.7")
+        with mock.patch.dict(os.environ), \
+                mock.patch("urllib.request.urlopen",
+                           side_effect=AssertionError("no network call when unset")) as uo:
+            os.environ.pop("HELM_NTFY_TOPIC", None)
+            os.environ.pop("MELD_NTFY_TOPIC", None)  # the home.env legacy fallback too
+            e, err = store.xrev_clear("x-law", TS, by="codex-seat")
+        self.assertIsNone(err)
+        self.assertEqual(e["status"], "provisional")
+        self.assertEqual(uo.call_count, 0)
+
+    def test_down_notifier_is_fail_open_with_a_journal_note(self):
+        self._candidate("prior", "x-law | cleared belief | 0.7 | glorpwork")
+        with mock.patch.dict(os.environ, {"HELM_NTFY_TOPIC": "helmqueue"}), \
+                mock.patch("urllib.request.urlopen",
+                           side_effect=OSError("connection refused")):
+            e, err = store.xrev_clear("x-law", TS, by="codex-seat")
+        # fail-open: the graduation still lands, on disk and firing
+        self.assertIsNone(err)
+        self.assertEqual(e["status"], "provisional")
+        e = self.one(store.load_all(), "x-law")
+        self.assertEqual(e["status"], "provisional")
+        self.assertEqual([x["id"] for x in store.resolve_prompt("glorpwork now")],
+                         ["x-law"])
+        # and the miss is journaled as one line (never silent)
+        self.assertTrue(any(r.get("verb") == "store.notify_failed"
+                            and r.get("target") == "x-law"
+                            for r in pk.read_events(50)))
+
+    def test_plain_candidate_capture_never_notifies(self):
+        # candidates are agent-noise — only graduation to provisional pushes
+        with mock.patch.dict(os.environ, {"HELM_NTFY_TOPIC": "helmqueue"}), \
+                mock.patch("urllib.request.urlopen") as uo:
+            self._candidate("prior", "x-law | just captured | 0.7")
+        self.assertEqual(uo.call_count, 0)
+        self.assertEqual(self.one(store.candidates(), "x-law")["status"], "candidate")
+
+
 if __name__ == "__main__":
     unittest.main()
