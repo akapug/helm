@@ -764,6 +764,24 @@ class WhereTest(SpawnBase):
         self.assertEqual(rc, 0, err)
         self.assertIn("fake handle pane-1 — LIVE", out)
 
+    def test_where_reports_the_repaired_orca_handle(self):
+        d, _ = self._mint()
+        self._record(d, handle="old", harness_name="orca", session="s1")
+        fake = FakeOrcaAdapter(rows=[{
+            "handle": "new", "status": "connected", "writable": True,
+            "pty_id": "pty-1", "worktree_id": "workspace:/w"}],
+            resolved={"handle": "new", "pty_id": "pty-1"})
+        identity = {"pid": 42, "pane_key": "tab:leaf",
+                    "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_live_session_orca_identity",
+                               return_value=(identity, None)), \
+                mock.patch.object(harness, "detect", return_value=fake):
+            rc, out, err = self._where(["codex", "--json"])
+        self.assertEqual(rc, 0, err)
+        got = json.loads(out)
+        self.assertEqual(got["handle"], "new")
+        self.assertIs(got["alive"], True)
+
     def test_where_without_record_points_at_spawn(self):
         self._mint()
         rc, out, err = self._where(["codex"])

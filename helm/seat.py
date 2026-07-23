@@ -2729,6 +2729,8 @@ def _where(seat_name, rest):
         ad, handle, detail = _resolve_registered_pane(seat_name, d=d)
         if handle is not None:
             alive = True
+            if handle != rec.get("handle"):
+                rec = _spawn_record(d) or rec  # resolver repaired the register
         elif ad is not None and "is not live" in detail:
             alive = False
     if "--json" in rest:
