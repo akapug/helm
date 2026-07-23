@@ -944,12 +944,21 @@ def _rooms_summary_invalidate():
     summary'd state (read-ack zeroing an unread badge; a post/DM landing a row)
     rides web.py, so it busts the cache synchronously and the very next poll
     reflects it. Agent posts arrive via the CLI outside this process and stay
-    TTL-bounded (<=3s — the old 2s poll already tolerated that lag)."""
+    TTL-bounded (<=3s — the old 2s poll already tolerated that lag).
+
+    LOCK-COUPLED (codex-3 re-clear, deterministic repro): a bare pop raced an
+    in-flight compute — a _rooms_summary_cached call that entered its locked
+    compute BEFORE the pop published its now-stale summary AFTER it. Taking
+    the same lock serializes: the pop waits out any in-flight publish, so
+    nothing computed pre-invalidation can survive it. Worst-case stall for
+    the caller = one compute (~200ms post brick #3) — fine for the watcher's
+    250ms tick and trivial for the owner-write handlers."""
     from . import chat
-    try:
-        _ROOMS_SUM_CACHE.pop(str(chat.chat_dir()), None)
-    except Exception:
-        _ROOMS_SUM_CACHE.clear()
+    with _ROOMS_SUM_LOCK:
+        try:
+            _ROOMS_SUM_CACHE.pop(str(chat.chat_dir()), None)
+        except Exception:
+            _ROOMS_SUM_CACHE.clear()
 
 
 def _rooms_summary_cached(roster=None):
@@ -1920,6 +1929,171 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 }
 
 
+# ---------- the SSE doorbell (REARCH-web-0.2 leg 2: poll -> push) ----------
+# The lineage's settled pattern (builders.dev firehose / MC ramspace / glue):
+# push says "there's news", the EXISTING cursor read fetches it — events are
+# DOORBELLS, never payloads, so the read endpoints stay the one render truth.
+# ONE watcher thread stat-sweeps the chat room dir (tmpfs, ~13 files) every
+# 250ms and notifies a Condition; each /api/events client blocks on it
+# (thread-per-client is already this server's model). The 250ms tick is also
+# the coalescer: a burst of posts is at most 4 doorbells/s. Keepalive comment
+# every 20s + no-cache/no-transform (the glue anti-proxy-buffering pair);
+# EventSource gives the client auto-reconnect for free.
+# ---------- the SSE doorbell (REARCH-web-0.2 leg 2: poll -> push) ----------
+# The lineage's settled pattern (builders.dev firehose / MC ramspace / glue):
+# push says "there's news", the EXISTING cursor read fetches it — events are
+# DOORBELLS, never payloads, so the read endpoints stay the one render truth.
+#
+# LIFECYCLE IS PER-SERVER (meld-converged 2026-07-23, CD design + kimi
+# concurrency clear): each _Server owns its OWN watcher thread + state, so
+# the three round-4 races are UNEXPRESSIBLE rather than guarded — no
+# generation race (a closed server never re-arms), no refcount (nothing
+# shared to count), no cross-server kill (B never sees A's close). Doorbells
+# are content-free (data:{}), so there is no cross-server seq space to
+# preserve: any fresh watcher answers "did the fingerprint change" and the
+# content always arrives via the client's normal cursor poll (kimi's
+# dissolve-beats-mechanize verdict). The rooms-summary cache stays GLOBAL —
+# it is orthogonal, lock-coupled, and TTL-bounded (round-3 fix).
+_SSE_WATCH_S = 0.25
+_SSE_DEAD_S = 5.0    # a beat older than this = that server's watcher died
+
+
+def _sse_state():
+    """A fresh per-server watcher state (minted in make_server). `boot` is
+    the per-server THREAD-IDENTITY token: each arm bumps it, and a thread
+    acts only while it still holds the current boot — found by the meld's
+    own liveness pin: a T1 sleeping through stop+re-arm resumed looping on
+    the RESTORED flag (two loops), and a crashed T1's finally could stomp
+    T2's fresh running (prod-reachable via crash + fast re-arm). Per-server
+    dissolved the CROSS-server races; same-server thread identity still
+    needs this one token."""
+    return {"cond": threading.Condition(), "chat_fp": None, "seq": 0,
+            "running": False, "beat": 0.0, "boot": 0}
+
+
+def _chat_fingerprint():
+    """Order-independent combine over ONLY the canonical message logs:
+    <room>.jsonl at the dir top + dm/<seat>.jsonl one level down. The chat
+    dir also holds THOUSANDS of cursor/lock/stopwhisper state files (9,085
+    measured live) — statting them made 7/8 doorbells noise, and because DMs
+    live in the dm/ SUBDIR a flat listdir MISSED real DM appends entirely
+    (codex-3 xrev, both E2E-reproduced). The file NAME is folded into each
+    term so two logs swapping identical (mtime,size) cannot cancel
+    (collision-safe generation)."""
+    from . import chat
+    try:
+        d = chat.chat_dir()
+    except OSError:
+        return None
+    fp, seen = 0, False
+    for base in (d, os.path.join(d, "dm")):
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        seen = True
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                st = os.stat(os.path.join(base, name))
+            except OSError:
+                continue
+            fp ^= hash((base, name, st.st_mtime_ns, st.st_size))
+    return fp if seen else None
+
+
+def _sse_tick(srv, boot=None):
+    """One watcher heartbeat for THIS server: refresh its beat; on a
+    fingerprint change invalidate the (global) rooms-summary cache BEFORE
+    ringing — the poll a doorbell triggers must read FRESH state (round-2
+    finding). A stopped server's in-flight tick is a no-op (running checked
+    under the server's own cond — kimi pressure-test #2), and so is a
+    SUPERSEDED thread's (boot mismatch — direct/test callers pass None)."""
+    fp = _chat_fingerprint()
+    sse = srv._sse
+    with sse["cond"]:
+        if not sse["running"] or \
+                (boot is not None and sse["boot"] != boot):
+            return False        # stopped, or a superseded thread — no-op
+        sse["beat"] = time.time()
+        if fp == sse["chat_fp"]:
+            return False
+        sse["chat_fp"] = fp
+        _rooms_summary_invalidate()
+        sse["seq"] += 1
+        sse["cond"].notify_all()
+        return True
+
+
+def _sse_watcher_dead(sse):
+    """The stream loop's health predicate, scoped to THAT SERVER's state
+    (kimi's one CLEAR condition): not running, or armed-but-silent past
+    _SSE_DEAD_S. A dead watcher must END its server's streams — otherwise
+    keepalives keep ES_LIVE true and every client sits on the stretched 10s
+    poll forever. One server's death can never false-trigger another's."""
+    return (not sse["running"]) or \
+        (time.time() - sse["beat"] > _SSE_DEAD_S)
+
+
+def _sse_watcher(srv, boot):
+    sse = srv._sse
+    try:
+        while True:
+            with sse["cond"]:
+                if not sse["running"] or sse["boot"] != boot:
+                    return      # stopped, or superseded — exit clean
+            time.sleep(_SSE_WATCH_S)
+            _sse_tick(srv, boot)
+    finally:
+        # containment for a CRASH (tick raised): drop running so this
+        # server's streams end and its NEXT client re-arms — but ONLY while
+        # we still hold the boot: a superseded thread's finally must never
+        # stomp its successor's running (the crash+fast-re-arm stomp)
+        with sse["cond"]:
+            if sse["running"] and sse["boot"] == boot:
+                sse["running"] = False
+                sse["beat"] = 0.0
+                sse["cond"].notify_all()
+
+
+def _sse_ensure_watcher(srv):
+    """Arm THIS server's watcher if none runs; True = one is running. The
+    per-server cond serializes racing streams (kimi pressure-test #1); the
+    state rolls back if Thread.start refuses (round-3 fix) so a start
+    failure is an honest 503, never a permanently-armed flag."""
+    sse = srv._sse
+    with sse["cond"]:
+        if sse["running"]:
+            return True
+        sse["boot"] += 1                       # mint this thread's identity
+        my_boot = sse["boot"]
+        sse["running"] = True
+        sse["beat"] = time.time()
+        sse["chat_fp"] = _chat_fingerprint()   # baseline, no boot storm
+    try:
+        threading.Thread(target=_sse_watcher, args=(srv, my_boot),
+                         daemon=True, name="helm-sse-watcher").start()
+        return True
+    except Exception:
+        with sse["cond"]:
+            if sse["boot"] == my_boot:         # never clobber a newer arm
+                sse["running"] = False
+                sse["beat"] = 0.0
+        return False
+
+
+def _sse_stop(srv):
+    """Stop THIS server's watcher (server_close): drop running — the loop
+    exits within a tick — and wake its streams so the death-aware wait ends
+    them NOW, not at timeout (round-4 P2)."""
+    sse = srv._sse
+    with sse["cond"]:
+        sse["running"] = False
+        sse["beat"] = 0.0
+        sse["cond"].notify_all()
+
+
 class Handler(BaseHTTPRequestHandler):
     def _same_origin(self):
         """DNS-rebinding defense: a bound-to-127.0.0.1 server still answers
@@ -1949,6 +2123,8 @@ class Handler(BaseHTTPRequestHandler):
             path = path.rstrip("/")
         if path == "/":
             return self._ui()
+        if path == "/api/events":
+            return self._sse()
         qfn = QUERY_API.get(path)
         if qfn is not None:
             try:
@@ -1995,6 +2171,81 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
         self._json(obj, status)
 
+    def _sse(self):
+        """text/event-stream: block on the watcher's Condition; emit a `chat`
+        doorbell per state change (id = the watcher seq) and a keepalive
+        comment on 5s of quiet (the short tick doubles as the health/teardown
+        cadence). The client's EventSource reconnects itself; a vanished
+        client just raises into the quiet except below. Three exits beyond
+        client-gone (codex-3 xrev, all E2E-reproduced): a RECONNECT with a
+        stale Last-Event-ID gets an IMMEDIATE catch-up doorbell (events are
+        contentless, so one ring replays any gap — the cursor read carries
+        the payload); a DEAD WATCHER ends the stream (keepalives from a
+        watcherless server would pin ES_LIVE and wedge every client on the
+        stretched poll); a CLOSED SERVER socket ends it (streams must not
+        outlive server_close)."""
+        if not _sse_ensure_watcher(self.server):
+            # no watcher could arm — honest 503, the client's ES errors and
+            # its 2s poll fallback carries the UI (never a doorbell-less
+            # stream that LOOKS live)
+            return self._json({"error": "sse watcher unavailable"}, 503)
+        sse = self.server._sse
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.end_headers()
+        # a stream is never keep-alive-reusable: when this handler returns
+        # (dead watcher / server close / client gone) the SOCKET must close so
+        # the client's EventSource sees the end — without this the base
+        # handler's keep-alive loop just waits for a next request and the
+        # "ended" stream looks alive forever (caught by the wire test). Set
+        # AFTER the headers: send_header("Connection", "keep-alive") silently
+        # RESETS close_connection to False inside the base handler, which is
+        # why that header is gone (HTTP/1.1 keeps the connection by default;
+        # the stream stays open exactly as long as this loop runs).
+        self.close_connection = True
+        with sse["cond"]:
+            seq = sse["seq"]
+        # Last-Event-ID = the reconnect cursor EventSource sends by itself:
+        # a mismatch means doorbells rang while this client was away
+        catch_up = False
+        last_id = self.headers.get("Last-Event-ID")
+        if last_id is not None:
+            try:
+                catch_up = int(last_id) != seq
+            except ValueError:
+                catch_up = True
+        try:
+            self.wfile.write(b": helm sse doorbell\n\n")
+            if catch_up:
+                self.wfile.write(
+                    ("event: chat\nid: %d\ndata: {}\n\n" % seq).encode())
+            self.wfile.flush()
+            while True:
+                with sse["cond"]:
+                    # death-aware predicate (round 4 P2): a stop's notify must
+                    # RELEASE this wait — a seq-only predicate re-slept it and
+                    # streams lingered to the full timeout
+                    sse["cond"].wait_for(
+                        lambda: sse["seq"] != seq or _sse_watcher_dead(sse),
+                        timeout=5.0)
+                    fired = sse["seq"] != seq
+                    seq = sse["seq"]
+                    dead = _sse_watcher_dead(sse)
+                if dead:
+                    return   # end the stream -> client ES errors -> 2s polls
+                try:
+                    if self.server.socket.fileno() == -1:
+                        return   # server_close ran — do not outlive it
+                except (OSError, AttributeError):
+                    return
+                self.wfile.write(
+                    ("event: chat\nid: %d\ndata: {}\n\n" % seq).encode()
+                    if fired else b": keepalive\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return   # the client went away — the normal end of a stream
+
     def _ui(self):
         try:
             with open(UI_PATH, "rb") as f:
@@ -2027,11 +2278,23 @@ class Handler(BaseHTTPRequestHandler):
         pass  # a personal localhost tool; request noise helps no one
 
 
+class _Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer that OWNS its own SSE watcher: state minted per
+    instance, stopped by ITS OWN server_close — cross-server interference is
+    unexpressible (the meld-converged per-server lifecycle). Idempotent:
+    a double close just re-stops an already-stopped watcher."""
+    def server_close(self):
+        if getattr(self, "_sse", None) is not None:
+            _sse_stop(self)
+        super().server_close()
+
+
 def make_server(port=DEFAULT_PORT):
     """Bound-but-not-serving ThreadingHTTPServer on 127.0.0.1. port=0 -> ephemeral
     (tests); the real port is server_address[1]."""
-    srv = ThreadingHTTPServer((BIND, port), Handler)
+    srv = _Server((BIND, port), Handler)
     srv.daemon_threads = True
+    srv._sse = _sse_state()
     return srv
 
 
