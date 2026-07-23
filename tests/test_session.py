@@ -1141,7 +1141,10 @@ class HeadlessCensusTest(unittest.TestCase):
         # the direction that refuses certification, never the one that greens.
         for target in ("pipe:[4242]", "socket:[9]", "/dev/null", "/tmp/in"):
             self.assertTrue(session._stdin_redirected(target), target)
-        for target in ("/dev/pts/4", "/dev/tty2", "/dev/console", "", None):
+        # /dev/ptmx is the pty MASTER — isatty-true, a live terminal, never
+        # redirection proof (fable delta-adversarial LOW)
+        for target in ("/dev/pts/4", "/dev/tty2", "/dev/console",
+                       "/dev/ptmx", "", None):
             self.assertFalse(session._stdin_redirected(target), target)
 
     def test_a_flag_in_a_value_position_declares_nothing(self):
@@ -1282,6 +1285,81 @@ class HeadlessCensusTest(unittest.TestCase):
                                  "-r", self.SID_B, "-r"]),
             self.SID_A)
         self.assertFalse(session._is_headless(["claude", "--", "-pr"]))
+
+    def test_a_cluster_in_a_value_position_is_opaque(self):
+        # fable delta-adversarial HIGH pair: commander hands `--model` the
+        # next token RAW, so in `--model -cp` the cluster is the MODEL NAME
+        # (measured: `claude --model -cr` errors about --print input — no
+        # continue, no resume parsed). Expanding it defeated the
+        # value-position guard with fragments of the very token commander
+        # swallowed whole, resurrecting the inert-flag green — and `--model
+        # -cr <uuid>` minted a resume the CLI never granted, the module's own
+        # named worst direction.
+        argv = ["claude", "--model", "-cp", "--no-session-persistence"]
+        self.assertFalse(session._is_headless(argv))
+        # the flag AFTER the consumed value is real again — and inert outside
+        # print mode, so a tty row still never certifies green
+        self.assertTrue(session._is_nonpersistent(argv))
+        self.assertFalse(session._sessionless_oneshot(
+            {"headless": False, "nonpersistent": True, "identity": "unknown",
+             "declared": None, "resume": None}))
+        self.assertIsNone(session._resume_sid(
+            ["claude", "--model", "-cr", self.SID_A]))
+        # both cluster orders are opaque — safety is not ordering-dependent
+        self.assertFalse(session._is_headless(["claude", "--model", "-pc"]))
+
+    def test_prose_in_a_value_slot_never_poisons_a_real_holder(self):
+        # the legit-case regression (fable delta-adversarial MED): prompt
+        # prose that merely LOOKS like a short cluster must stay opaque —
+        # expanding it poisoned the parse and demoted a proven holder
+        self.assertEqual(
+            session._resume_sid(["claude", "--append-system-prompt",
+                                 "-pr be brief", "--resume", self.SID_A]),
+            self.SID_A)
+
+    def test_a_long_resume_in_a_value_position_mints_nothing(self):
+        # measured: `claude --model --resume --version` prints the version —
+        # --model swallowed `--resume` whole and the CLI parsed no resume.
+        # _argv_flag and _resume_sid walk the SAME (token, consumed) pairs,
+        # so the docstring symmetry claim is true by construction.
+        self.assertIsNone(session._resume_sid(
+            ["claude", "--model", "--resume", self.SID_A]))
+        # with the value slot filled, the resume is real again
+        self.assertEqual(
+            session._resume_sid(["claude", "--model", "opus",
+                                 "--resume", self.SID_A]),
+            self.SID_A)
+
+    def test_measured_booleans_cannot_orphan_their_neighbor(self):
+        # the regression the first value-position guard shipped (fable
+        # delta-composition LOW): with only three measured booleans,
+        # `claude --dangerously-skip-permissions -p` — the fleet's single
+        # most common spawn shape — fell to UNKNOWN on a tty. Every flag here
+        # is MEASURED boolean against the real CLI (2.1.218, 2026-07-22):
+        # `claude <flag> --version` prints the version iff the flag cannot
+        # consume its neighbor.
+        for flag in ("--dangerously-skip-permissions", "--verbose",
+                     "--fork-session", "--strict-mcp-config", "--ide",
+                     "--safe-mode", "--bare", "--chrome",
+                     "--allow-dangerously-skip-permissions"):
+            self.assertTrue(
+                session._is_headless(["claude", flag, "-p", "hi"]), flag)
+        # and the fleet's live pane shape keeps its proven holder
+        self.assertEqual(
+            session._resume_sid(["claude", "--dangerously-skip-permissions",
+                                 "--resume", self.SID_A]),
+            self.SID_A)
+
+    def test_a_value_slot_consumes_even_the_terminator(self):
+        # measured: `claude --model -- --version` prints the version — the
+        # terminator itself was swallowed as the model name, so the options
+        # after it are real, not prose
+        self.assertTrue(
+            session._is_headless(["claude", "--model", "--", "-p"]))
+        self.assertEqual(
+            session._resume_sid(["claude", "--model", "--",
+                                 "--resume", self.SID_A]),
+            self.SID_A)
 
     def test_option_terminator_ends_the_flag_scan(self):
         # past the standard `--` terminator every token is positional: a boot

@@ -271,44 +271,81 @@ NONPERSISTENT_FLAG = "--no-session-persistence"
 _SHORT_BOOL = {"c": "--continue", "p": "--print"}
 _SHORT_VALUED = {"r": "--resume"}
 
+# Long flags MEASURED as boolean — never consuming the next token — against
+# the real CLI (2.1.218, probe 2026-07-22: `claude <flag> --version` prints
+# the version iff the flag cannot swallow `--version`; a value-taker eats it
+# and the short-circuit never fires). Every other option is presumed capable
+# of consuming its neighbor, because commander hands a required
+# option-argument the next token RAW even when it is flag-shaped.
+# `--bg`/`--background` probed INCONCLUSIVE (they dispatch before the version
+# action fires) and stay presumed value-taking — the fail-closed side.
+_MEASURED_BOOL_FLAGS = frozenset((
+    "--print", "--continue", NONPERSISTENT_FLAG,
+    "--allow-dangerously-skip-permissions", "--ax-screen-reader", "--bare",
+    "--brief", "--chrome", "--dangerously-skip-permissions",
+    "--disable-slash-commands", "--exclude-dynamic-system-prompt-sections",
+    "--fork-session", "--forward-subagent-text", "--ide",
+    "--include-hook-events", "--include-partial-messages", "--no-chrome",
+    "--replay-user-messages", "--safe-mode", "--strict-mcp-config",
+    "--verbose"))
+
 
 def _expand_options(argv):
-    """argv with every OPTION-region short cluster rewritten to canonical
-    long form, exactly as commander parses it: leading boolean shorts split
-    off one by one, then a value-taking short absorbs the remainder as its
-    attached value (`-pr X` -> `--print --resume X`; `-rX` -> `--resume=X`;
-    `-r=X` -> the literal value `=X`, invalid, poisoning downstream). A
-    cluster led by an unmapped short stays verbatim — its remainder belongs
-    to THAT flag, and minting a resume or a mode out of it would attribute
-    identity the CLI never granted. Past the standard ``--`` terminator every
-    token is positional prose and passes through untouched, so the scanners'
-    option-region law is preserved verbatim."""
+    """The OPTION region parsed ONCE, under one law, into (token, consumed)
+    pairs every scanner shares. `consumed` marks a token sitting in the value
+    slot of the unmeasured option before it: commander hands a required
+    option-argument the next token RAW even when it is flag-shaped, a short
+    cluster, or the ``--`` terminator itself (measured: `claude --model --
+    --version` prints the version — the terminator was swallowed as the model
+    name). A consumed token is OPAQUE — never expanded, never a flag, never
+    poison. Expanding it minted identity the CLI never granted (`--model -cr
+    <uuid>` is a model named "-cr" plus prompt prose, not a resume), defeated
+    the value-position guard with fragments of the very token commander
+    swallowed whole (`--model -cp --no-session-persistence`), and poisoned a
+    real holder on prompt prose that merely looked like a cluster.
+
+    Unconsumed short clusters are rewritten to canonical long form exactly as
+    commander parses them: leading boolean shorts split off one by one, then
+    a value-taking short absorbs the remainder as its attached value (`-pr X`
+    -> `--print --resume X`; `-rX` -> `--resume=X`; `-r=X` -> the literal
+    value `=X`, invalid, poisoning downstream). A cluster led by an unmapped
+    short stays verbatim — its remainder belongs to THAT flag — and a BARE
+    unmapped short (`-d`) is presumed to consume its neighbor like any other
+    unmeasured option. Past the standard ``--`` terminator every token is
+    positional prose and passes through untouched."""
     out = []
+    pending = False
+
+    def emit(token, takes_value):
+        nonlocal pending
+        out.append((token, False))
+        pending = takes_value
+
     for i, arg in enumerate(argv):
+        if pending:
+            out.append((arg, True))
+            pending = False
+            continue
         if arg == "--":
-            out.extend(argv[i:])
+            out.extend((a, False) for a in argv[i:])
             break
         if len(arg) > 1 and arg[0] == "-" and arg[1] != "-":
             rest = arg[1:]
             while rest and rest[0] in _SHORT_BOOL:
-                out.append(_SHORT_BOOL[rest[0]])
+                emit(_SHORT_BOOL[rest[0]], False)
                 rest = rest[1:]
             if rest and rest[0] in _SHORT_VALUED:
                 long = _SHORT_VALUED[rest[0]]
-                out.append(long if len(rest) == 1 else long + "=" + rest[1:])
+                if len(rest) == 1:
+                    emit(long, True)
+                else:
+                    emit(long + "=" + rest[1:], False)
             elif rest:
-                out.append("-" + rest)
+                emit("-" + rest, len(rest) == 1)
             continue
-        out.append(arg)
+        emit(arg, len(arg) > 2 and arg[:2] == "--" and "=" not in arg
+             and arg not in _MEASURED_BOOL_FLAGS)
     return out
-
-
-# Long flags this module has MEASURED as boolean (never consuming the next
-# token). Every other option is presumed capable of consuming its neighbor,
-# because commander hands a required option-argument the next token even when
-# that token is flag-shaped.
-_MEASURED_BOOL_FLAGS = frozenset(
-    ("--print", "--continue", NONPERSISTENT_FLAG))
 
 
 def _argv_flag(argv, names, prefixes=()):
@@ -318,23 +355,21 @@ def _argv_flag(argv, names, prefixes=()):
     clusters are expanded first, so `-pr <sid>` declares print mode exactly
     as `-p` does — the short alias of a flag is the flag.
 
-    A flag-shaped token in the VALUE position of the option before it is
-    evidence of NOTHING: `--append-system-prompt --no-session-persistence`
-    hands the flag to commander as prompt text, and reading it as declared
-    nonpersistence would certify green a session the CLI persists. The same
-    ambiguity poisons _resume_sid fail-closed; here fail-closed means the
-    occurrence never counts — only a token whose predecessor provably cannot
-    consume it (a positional, a measured boolean, or an ``=``-attached form)
-    declares the flag."""
-    argv = _expand_options(argv)
-    for i, a in enumerate(argv):
-        if a == "--":
+    A token CONSUMED as the value of the option before it is evidence of
+    NOTHING: `--append-system-prompt --no-session-persistence` hands the flag
+    to commander as prompt text, and reading it as declared nonpersistence
+    would certify green a session the CLI persists. That verdict is
+    _expand_options' — both this scanner and _resume_sid walk the SAME pairs
+    under the same value-position law, so the two can never read one argv two
+    ways. Fail-closed here means the occurrence never counts — only a token
+    no predecessor could consume (after a positional, a measured boolean, or
+    an ``=``-attached form) declares the flag."""
+    for token, consumed in _expand_options(argv):
+        if consumed:
+            continue
+        if token == "--":
             return False
-        if a in names or (prefixes and a.startswith(prefixes)):
-            prev = argv[i - 1] if i else ""
-            if (len(prev) > 1 and prev[0] == "-" and "=" not in prev
-                    and prev not in _MEASURED_BOOL_FLAGS):
-                continue
+        if token in names or (prefixes and token.startswith(prefixes)):
             return True
     return False
 
@@ -362,13 +397,15 @@ def _stdin_redirected(target):
     """True when a /proc fd/0 readlink target PROVES stdin is not a terminal
     — the condition under which the claude CLI enters print mode with no `-p`
     at all (see _is_headless). A pipe/socket/file/`/dev/null` stdin is that
-    proof; a pty/tty is a live terminal; and an absent or unreadable target
-    proves nothing, failing toward interactive — the direction that refuses
-    to certify, never the one that greens."""
+    proof; a pty/tty is a live terminal — including the pty MASTER
+    `/dev/ptmx`, isatty-true and interactive however exotic as a child's
+    stdin; and an absent or unreadable target proves nothing, failing toward
+    interactive — the direction that refuses to certify, never the one that
+    greens."""
     if not target:
         return False
     return not (target.startswith("/dev/pts/") or target.startswith("/dev/tty")
-                or target == "/dev/console")
+                or target in ("/dev/console", "/dev/ptmx"))
 
 
 def _is_nonpersistent(argv):
@@ -466,23 +503,31 @@ def _resume_sid(argv):
     as _argv_flag: past it every token is positional prose, so `claude -p --
     --resume <uuid>` carries prompt text, never a session identity — and
     post-terminator prose can never conflict away a real pre-terminator
-    resume. Within the option region the parse is FAIL-CLOSED over every
-    resume occurrence, short or long: a bare/trailing ``--resume``/``-r``, a
-    flag consumed as its value, a prefix or otherwise invalid value (`-r=X`
-    carries the literal value `=X`; `-rp` resumes by TITLE "p", unresolvable
-    from argv), and conflicting repeats each poison the WHOLE parse — a valid
-    occurrence beside an invalid one is contradictory evidence, not a
-    majority vote. A false holder is worse than falling through to another
-    rung."""
+    resume. The scan walks the same (token, consumed) pairs as _argv_flag —
+    one law, never two readings of one argv — so a resume token CONSUMED as
+    the value of the option before it is opaque prose: it neither mints a
+    holder (`--model -cr <uuid>` names a model, and `--model --resume <uuid>`
+    swallows the long flag whole — measured, the CLI parses no resume) nor
+    poisons a real one (`--append-system-prompt '-pr be brief' --resume
+    <sid>` keeps the proven holder). Within the option region the parse is
+    FAIL-CLOSED over every UNCONSUMED resume occurrence, short or long: a
+    bare/trailing ``--resume``/``-r``, a flag consumed as its value, a prefix
+    or otherwise invalid value (`-r=X` carries the literal value `=X`; `-rp`
+    resumes by TITLE "p", unresolvable from argv), and conflicting repeats
+    each poison the WHOLE parse — a valid occurrence beside an invalid one is
+    contradictory evidence, not a majority vote. A false holder is worse than
+    falling through to another rung."""
     found = []
-    argv = _expand_options(argv)
-    for i, arg in enumerate(argv):
-        if arg == "--":
+    tokens = _expand_options(argv)
+    for i, (token, consumed) in enumerate(tokens):
+        if consumed:
+            continue
+        if token == "--":
             break
-        if arg == "--resume":
-            value = argv[i + 1] if i + 1 < len(argv) else None
-        elif arg.startswith("--resume="):
-            value = arg.split("=", 1)[1]
+        if token == "--resume":
+            value = tokens[i + 1][0] if i + 1 < len(tokens) else None
+        elif token.startswith("--resume="):
+            value = token.split("=", 1)[1]
         else:
             continue
         if not (isinstance(value, str) and _SID_RE.fullmatch(value)):
