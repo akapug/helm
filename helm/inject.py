@@ -1226,10 +1226,13 @@ def cmd_inject(args):
             project = project_for_cwd(cwd)
             scope_via = cwd if project else None
     else:
-        text = "" if sys.stdin.isatty() else sys.stdin.read()
-        for a in args:
-            if not a.startswith("--") and a != project:
-                text = a  # allow inline text for quick tests
+        # scan args for the inline-text positional FIRST; only read stdin when
+        # no inline text was given — reading sys.stdin.read() unconditionally
+        # under captured (non-tty) stdin raises OSError in test harnesses.
+        inline = next((a for a in args
+                       if not a.startswith("-") and a != project), None)
+        text = inline if inline is not None else (
+            "" if sys.stdin.isatty() else sys.stdin.read())
     if "--explain" in args:
         if scope_via:
             print("[scope: %s via %s]" % (project, scope_via))

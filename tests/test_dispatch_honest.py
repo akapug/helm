@@ -702,12 +702,15 @@ FLAG_READER_EXEMPT = {
 
 
 def _flag_membership(node):
-    """Flag literals the fn reads via `'-x' in args` or `args.index('-x')` —
-    a flag consumed by membership rather than positional dispatch."""
+    """Flag literals the fn reads via `'-x' in args`, `'-x' not in args`, or
+    `args.index('-x')` — a flag consumed by membership rather than positional
+    dispatch. Both ast.In and ast.NotIn count: the ORIGINAL drift bug shape was
+    `snapshot = "--peek" not in args` (NotIn), so matching only In let a reader
+    reborn in that exact founding shape slip past the detector silently."""
     flags = set()
     for n in ast.walk(node):
         if isinstance(n, ast.Compare) and len(n.ops) == 1 \
-                and isinstance(n.ops[0], ast.In) \
+                and isinstance(n.ops[0], (ast.In, ast.NotIn)) \
                 and _is_str_const(n.left) and n.left.value.startswith("-") \
                 and any(isinstance(c, ast.Name) and c.id == "args"
                         for c in n.comparators):
@@ -773,6 +776,18 @@ class MembershipFlagReadersGuarded(unittest.TestCase):
             rc, _, _ = _call("inject", "cmd_inject", ["hello world"])
         self.assertEqual(rc, 0)
         self.assertTrue(g.called)
+
+    def test_detector_catches_not_in_founding_shape(self):
+        # PIN: the ORIGINAL drift drift-bug shape was `snapshot = "--peek" not
+        # in args` (ast.NotIn). A reader reborn in that exact founding shape
+        # must NOT slip past — _flag_membership has to surface its flag, so the
+        # guard would FAIL (flag its module unguarded) rather than pass silent.
+        src = ("def cmd_planted(args):\n"
+               "    snapshot = \"--x\" not in args\n"
+               "    return snapshot\n")
+        node = ast.parse(src).body[0]
+        self.assertIn("--x", _flag_membership(node),
+                      "founding `not in args` shape escaped the detector")
 
     def test_guarded_readers_refuse_unknown_flag(self):
         # end-to-end proof the five named + evolve now refuse their junk tail.
