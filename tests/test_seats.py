@@ -2544,14 +2544,27 @@ class RoomLockTest(SeatsBase):
 
 class WebRosterTest(SeatsBase):
     def test_endpoint_shape_and_fail_open(self):
+        # the endpoint serves through the single-flight TTL cache now, so this
+        # test owns its cache state (start clean, leave clean)
+        web._ROSTER_REP_CACHE.clear()
+        self.addCleanup(web._ROSTER_REP_CACHE.clear)
         seats.join(seat="alice", cwd="/tmp/p")
         obj, code = web._api_chat_roster({})
         self.assertEqual(code, 200)
         self.assertEqual(obj["seats"][0]["seat"], "alice")
         with mock.patch.object(seats, "roster_report", side_effect=RuntimeError):
+            # WITHIN the TTL a backend failure serves the cached rep — the
+            # grace the cache exists for: a transient seats hiccup must not
+            # blank the owner's panel (the 2026-07-23 UI-blank class)
             obj, code = web._api_chat_roster({})
-        self.assertEqual(code, 200)
-        self.assertEqual(obj, {"seats": [], "claims": [], "unavailable": True})
+            self.assertEqual(code, 200)
+            self.assertEqual(obj["seats"][0]["seat"], "alice")
+            # PAST the TTL the failure is honest: fail open to unavailable
+            at, rep = web._ROSTER_REP_CACHE["main"]
+            web._ROSTER_REP_CACHE["main"] = (at - (web._ROSTER_REP_TTL + 1), rep)
+            obj, code = web._api_chat_roster({})
+            self.assertEqual(code, 200)
+            self.assertEqual(obj, {"seats": [], "claims": [], "unavailable": True})
 
 
 class RoomsSummarySeatsTest(SeatsBase):
