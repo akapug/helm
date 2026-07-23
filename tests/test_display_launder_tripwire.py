@@ -794,12 +794,16 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
 # trips) — sink #14 can never ship unlaundered. The reason is the reviewer's
 # contract; the Section-E runtime sweep verifies the emits are actually inert.
 
-# IDENTITY-field dict accessors ( .get("X") / ["X"] ) — from/tfrom/rfrom/dm are
-# the chat-row NAME columns (chat._ID_FIELDS); peer is the meld state relocation
-# of a convener from-field (say/status emit it). The keys are ALWAYS quoted, so
-# this is code-only by nature (no prose match), exactly like _ROSTER_CALL.
+# IDENTITY-field dict accessors ( .get/.pop/.setdefault("X") / ["X"] ) —
+# from/tfrom/rfrom/dm are the chat-row NAME columns (chat._ID_FIELDS); peer is
+# the meld state relocation of a convener from-field (say/status emit it). The
+# keys are ALWAYS quoted, so this is code-only by nature (no prose match),
+# exactly like _ROSTER_CALL. get/pop/setdefault all READ the value into a sink
+# (r10 adversarial: a raw .pop("from") emit would otherwise evade the sweep);
+# %-dict ("%(from)s") and itemgetter remain a documented LOW residual — exotic
+# enough that no current sink uses them and a future one is caught at review.
 _FROM_FIELD_READ = re.compile(
-    r"""(?:\.get\(\s*|\[\s*)['"](?:from|tfrom|rfrom|dm|peer)['"]""")
+    r"""(?:\.(?:get|pop|setdefault)\(\s*|\[\s*)['"](?:from|tfrom|rfrom|dm|peer)['"]""")
 # the meld `convener` LOCAL, assigned from a seed row's `from` — matched as a
 # bare identifier in CODE only (docstrings + comments + the "convener" role
 # string literal are stripped before the match, see _from_field_read_sites).
