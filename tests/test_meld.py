@@ -242,6 +242,24 @@ class TestSay(MeldBase):
         code, _ = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
         self.assertEqual(code, 2)                     # sealed is sealed
 
+    def test_say_into_a_sealed_meld_is_refused_not_a_silent_regression(self):
+        """say DONE into a SEALED (done-mutual) meld must REFUSE like recv does
+        — NOT silently regress done-mutual -> done and re-post an @peer mention.
+        Pre-fix that regression made `meld status` lie and drove a phantom 90s
+        countersign watch for an already-consumed countersign — the exact
+        double-command an agent replays after compaction/resume (fable dual-gate
+        finding, 2026-07-23)."""
+        room, _ = self.open_meld()
+        meld.say(room, "DONE", "closing", seat="seat-a")       # a -> done
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)   # watch, no countersign
+        meld.say(room, "DONE", "ack", seat="seat-b")           # b -> done
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)   # countersign -> done-mutual
+        self.assertEqual(meld.state(room, "seat-a")["status"], "done-mutual")
+        with self.assertRaises(SystemExit):                    # sealed refuses say too
+            meld.say(room, "DONE", "again", seat="seat-a")
+        self.assertEqual(meld.state(room, "seat-a")["status"],  # NOT regressed to "done"
+                         "done-mutual")
+
 
 class TestConvergenceLoop(MeldBase):
     def test_full_meld_end_to_end(self):

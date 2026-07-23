@@ -398,6 +398,14 @@ def say(room, marker, text, seat=None, via="meld"):
                          "first" % (via, room))
     if st["status"] == "aborted":
         raise SystemExit("helm %s: room %s is ABORTED" % (via, room))
+    if st["status"] == "done-mutual":
+        # SEALED: recv refuses it too (both sides closed). Without this, a DONE
+        # into a sealed meld re-posts an @peer mention AND regresses the status
+        # done-mutual -> done (below), so `meld status` lies and the printed
+        # hint drives a phantom 90s countersign watch for an already-consumed
+        # countersign — the exact double-command an agent replays post-compaction.
+        raise SystemExit("helm %s: room %s is sealed (done-mutual) — both "
+                         "sides closed; nothing further posts" % (via, room))
     text = (text or "").strip()
     if not text:
         raise SystemExit("helm %s: say wants text — a bare marker is not "
