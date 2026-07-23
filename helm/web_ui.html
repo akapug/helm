@@ -3048,7 +3048,7 @@ function rosterSeats(rep) {
     '<span class="mono copy" data-copy="' + esc(s.seat) + '" title="seat — click to copy">' + esc(s.seat) + '</span>' +
     '<span class="lbadge' + (s.presence === "fresh" ? " final" : s.presence === "quiet" ? " tent" : "") + '">' + esc(presenceLabel(s.presence)) + '</span>' +
     (s.pending ? '<span class="lbadge tent">' + s.pending + ' pending</span>' : '') +
-    '<button class="seatrn" data-seat="' + esc(s.seat) + '" title="rename this seat — @newname delivers to the same agent">rename</button>' +
+    '<button class="seatrn" data-seat="' + esc(s.seat) + '" data-rnkey="' + esc(s.session || s.seat) + '" title="rename this seat — @newname delivers to the same agent">rename</button>' +
     '<span class="lage">' + (s.last_seen ? lago(s.last_seen) : "—") + '</span></div>' +
     '<div class="lmeta">' + [s.project ? esc(s.project) : '', seatHome(s),
       // VERBS law: all three surfaces glance identically — an explicit line
@@ -3067,11 +3067,15 @@ function rosterSeats(rep) {
   $("#ledgerseats").innerHTML = html;
   // the one seats-panel mutation: bind a live agent to a memorable @name
   $("#ledgerseats").querySelectorAll(".seatrn").forEach(b => b.onclick = async () => {
-    const cur = b.dataset.seat;
+    const cur = b.dataset.seat;          // laundered label — shown, never sent
+    // rename by a STABLE id (the session id rename_seat resolves), so a
+    // hostile/garbled seat KEY whose laundered label no longer matches the raw
+    // roster key is still addressable — the seats you most want to rename.
+    const key = b.dataset.rnkey || cur;
     const nn = (prompt('rename seat "' + cur + '" — the new @name (letters, digits, . _ -):', cur) || "").trim();
     if (!nn || nn === cur) return;
     try {
-      const r = await post("/api/chat/seat", {action: "rename", seat: cur, new: nn});
+      const r = await post("/api/chat/seat", {action: "rename", seat: key, new: nn});
       toast("seat renamed: " + cur + " → " + nn + " — @" + nn + " now delivers to it");
       if (r && r.note && /beacon/.test(r.note)) console.log(r.note);
       pollLedger();

@@ -358,42 +358,111 @@ class RosterLaunderCompletenessTest(PresenceBase):
         self.assertIn("lane", seats_out)          # the label survives, inert
         self.assertIn("pwn", seats_out)
 
-    def test_report_json_launders_every_string_field(self):
-        """The source-driven completeness guard: walk EVERY string in the
-        roster_report seat rows (+ claims) and assert none carries the
-        payload. Enumerates the output schema — a new roster-borne string
-        field added without routing through _pub_row fails here automatically,
-        as does the JSON a CLI consumer prints raw."""
+    # ---- the guard enumerates SURFACES, not just fields of ONE report ----
+    # r4 lesson: the fix that was supposed to CLOSE this class shipped the 5TH
+    # surface (presence_report) in the same branch — because the guard walked
+    # ONLY roster_report, blind to every SIBLING surface that rebuilds the
+    # roster data elsewhere. So the guard now enumerates every roster-consuming
+    # REPORT surface below and walks EACH one's full output. A new surface that
+    # rebuilds roster rows (a 6th report, a new JSON endpoint) fails this test
+    # BY CONSTRUCTION the moment it is added here — and the point is that ANY
+    # roster-consuming surface MUST be added here (that is the enforced law),
+    # so a surface that routes through _pub_row passes and one that ships raw
+    # rows fails. Each entry: (name, zero-arg callable returning the surface's
+    # published structure). The mutation-helper return messages — a DIFFERENT
+    # class of surface (echoed to the CLI, not a report dict) — are guarded
+    # separately in test_mutation_helpers_launder_echoed_seat below.
+    def _report_surfaces(self):
+        return [
+            ("roster_report.seats", lambda: seats.roster_report()["seats"]),
+            ("roster_report.claims", lambda: seats.roster_report()["claims"]),
+            # the fleet presence bar — the sibling surface that ESCAPED r4's
+            # roster_report-only guard; it rebuilds per-seat rows OUTSIDE the
+            # choke point and shipped the RAW seat KEY + status until r4-fix.
+            ("presence_report", seats.presence_report),
+        ]
+
+    def test_every_report_surface_launders_every_string(self):
+        """The source-driven, SURFACE-COMPLETE completeness guard: for EVERY
+        enumerated roster-consuming report surface, walk EVERY string in its
+        output and assert none carries the ESC/bidi payload. Enumerates the
+        output schema per surface — a new roster-borne string field added
+        without routing through _pub_row fails here, AND a whole new sibling
+        surface that rebuilds roster rows raw fails the moment it is enumerated
+        (the law: every roster-consuming surface belongs in _report_surfaces)."""
+        self._plant()
+        for name, fn in self._report_surfaces():
+            strings = list(_walk_strings(fn()))
+            self.assertTrue(strings, "%s walked no content" % name)
+            for s in strings:
+                self.assertNotIn(ESC, s, "%s leaked ESC in %r" % (name, s))
+                self.assertNotIn(BIDI, s, "%s leaked bidi in %r" % (name, s))
+
+    def test_report_surfaces_keep_their_fields(self):
+        """The launder must not be a field-drop: assert each report surface
+        still PRESENTS its roster-borne fields (a scrub that silently deleted
+        the seat column would 'pass' the leak walk while blanking the bar)."""
         self._plant()
         rep = seats.roster_report()
-        strings = list(_walk_strings(rep["seats"])) + \
-            list(_walk_strings(rep["claims"]))
-        self.assertTrue(strings)                  # we actually walked content
-        # every roster-borne field enumerated as present in the report
-        present = set(rep["seats"][0].keys())
         for field in ("seat", "project", "cwd", "home_room",
                       "home_room_source", "status", "status_by", "line",
                       "source", "todo"):
-            self.assertIn(field, present, "report dropped field %r" % field)
-        for s in strings:
-            self.assertNotIn(ESC, s, "report leaked ESC in %r" % s)
-            self.assertNotIn(BIDI, s, "report leaked bidi in %r" % s)
+            self.assertIn(field, rep["seats"][0],
+                          "roster_report dropped field %r" % field)
+        pres = seats.presence_report()
+        for field in ("seat", "presence", "dot", "status", "status_by",
+                      "line", "source"):
+            self.assertIn(field, pres[0],
+                          "presence_report dropped field %r" % field)
+        # the seat label must SURVIVE (laundered, inert), not vanish
+        self.assertTrue(any("lane" in r["seat"] and "pwn" in r["seat"]
+                            for r in pres), "presence dropped the seat label")
+
+    def test_mutation_helpers_launder_echoed_seat(self):
+        """The OTHER surface class: the mutation helpers echo a message the CLI
+        prints verbatim. Under a hostile seat KEY (+ a hostile home_room) each
+        of set_mute / set_status / rename_seat / rehome_seat must return an
+        ESC/bidi-free message — the raw key still drives the dict write, only
+        the echoed label is laundered (_seat_label)."""
+        self._plant()
+        cases = [
+            ("set_mute", lambda: seats.set_mute(self.SEAT, "main", True)),
+            ("set_unmute", lambda: seats.set_mute(self.SEAT, "main", False)),
+            ("set_status", lambda: seats.set_status(self.SEAT, "on it")),
+            ("status_clear", lambda: seats.set_status(self.SEAT, "")),
+            ("rehome", lambda: seats.rehome_seat(self.SEAT, "otherroom")),
+            ("rehome_clear", lambda: seats.rehome_seat(self.SEAT, "main")),
+            ("rename", lambda: seats.rename_seat(self.SEAT, "safename")),
+        ]
+        for name, fn in cases:
+            _, msg = fn()
+            self.assertNotIn(ESC, msg, "%s echoed raw ESC: %r" % (name, msg))
+            self.assertNotIn(BIDI, msg, "%s echoed raw bidi: %r" % (name, msg))
 
     def test_pub_row_is_field_agnostic(self):
         """The choke point itself: _pub_row scrubs EVERY string value, even a
-        field name it has never seen — the mechanism is enumeration over the
-        row, not a fixed per-field list. This is what stops the 5th surface:
-        a future `seats.append({... "newthing": row.get("newthing")})` is
-        laundered the moment it joins the dict."""
+        field name it has never seen, and RECURSES into nested dicts/lists —
+        the mechanism is enumeration over the row, not a fixed per-field list
+        or a hand-added nested special case. This is what stops the next
+        surface: a future `seats.append({... "newthing": row.get("newthing")})`
+        (or a new nested cell) is laundered the moment it joins the dict."""
         row = seats._pub_row({
             "seat": self.SEAT, "session": "sid" + ESC + BIDI,
             "future_field": "surprise" + ESC + "[2J" + BIDI + "!",
             "nested_todo": {"active": "x" + ESC + BIDI + "y"},
+            "nested_list": ["a" + ESC + BIDI + "b", {"deep": "c" + ESC + "d"}],
             "count": 7, "flag": True, "empty": None})
         self.assertNotIn(ESC, row["future_field"])
         self.assertNotIn(BIDI, row["future_field"])
         self.assertNotIn(ESC, row["seat"])
         self.assertNotIn(ESC, row["session"])
+        # the nested dict is laundered by recursion, not a special case
+        self.assertNotIn(ESC, row["nested_todo"]["active"])
+        self.assertNotIn(BIDI, row["nested_todo"]["active"])
+        # nested list items — string AND dict — are laundered too
+        self.assertNotIn(ESC, row["nested_list"][0])
+        self.assertNotIn(BIDI, row["nested_list"][0])
+        self.assertNotIn(ESC, row["nested_list"][1]["deep"])
         self.assertEqual(row["count"], 7)         # non-strings pass through
         self.assertIs(row["flag"], True)
         self.assertIsNone(row["empty"])

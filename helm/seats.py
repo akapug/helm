@@ -740,14 +740,15 @@ def rename_seat(old, new):
         r[new] = r.pop(seat)
         pk.write_json(roster_path(), r)
         _move_seat_state(seat, new)
-    return True, ("seat %s -> %s: @%s now delivers to it. If it armed a "
-                  "beacon on the old name, re-arm: Monitor(command: \"helm "
+    old_lbl = _seat_label(seat)   # raw key drove r[new]=r.pop(seat); echoed
+    return True, ("seat %s -> %s: @%s now delivers to it. If it armed a "  # old
+                  "beacon on the old name, re-arm: Monitor(command: \"helm "  # name
                   "chat wait --seat %s --follow\", persistent: true) — if Monitor "
                   "is not in your surface it is DEFERRED: ToolSearch(query: "
-                  "\"select:Monitor\") first. A seat "
-                  "launched with HELM_CHAT_NAME=%s re-registers the old name "
+                  "\"select:Monitor\") first. A seat "  # laundered (new is validated
+                  "launched with HELM_CHAT_NAME=%s re-registers the old name "  # safe)
                   "on its next session — relaunch to make the rename stick "
-                  "there." % (seat, new, new, new, seat))
+                  "there." % (old_lbl, new, new, new, old_lbl))
 
 
 def set_mute(seat, room, on=True):
@@ -767,11 +768,12 @@ def set_mute(seat, room, on=True):
         row["mute"] = sorted(mute)
         r[seat] = row
         pk.write_json(roster_path(), r)
-    if on:
+    lbl = _seat_label(seat)   # raw key drove the dict write above; the echoed
+    if on:                    # label is laundered (a hostile HELM_CHAT_NAME
         return True, ("%s muted for %s — @%s mentions and DMs still surface "
-                      "(unmute: helm chat seat unmute %s)"
-                      % (room, seat, seat, room))
-    return True, "%s unmuted for %s" % (room, seat)
+                      "(unmute: helm chat seat unmute %s)"  # must not reshape
+                      % (room, lbl, lbl, room))             # the CLI terminal)
+    return True, "%s unmuted for %s" % (room, lbl)
 
 
 def mutes(seat):
@@ -839,11 +841,15 @@ def rehome_seat(token, room):
                            % token)
         row = r.get(seat) or {}
         old = row.get("home_room")
+        # raw seat key drove _resolve_seat + the dict write; the echoed seat
+        # label AND the roster-borne old home_room are laundered so neither a
+        # hostile HELM_CHAT_NAME nor a planted home_room reshapes the terminal.
+        lbl, old_lbl = _seat_label(seat), _seat_label(old) if old else old
         if clear and not old and row.get("home_room_source") == "operator":
-            return True, "seat %s is already un-homed (all rooms)" % seat
+            return True, "seat %s is already un-homed (all rooms)" % lbl
         if not clear and home_room == old \
                 and row.get("home_room_source") == "operator":
-            return True, "seat %s is already homed to #%s" % (seat, home_room)
+            return True, "seat %s is already homed to #%s" % (lbl, home_room)
         new_home = None if clear else home_room
         newly_admitted = _rooms_to_baseline(old, new_home)
         _baseline_rooms(seat, row, newly_admitted)
@@ -857,10 +863,10 @@ def rehome_seat(token, room):
         if clear:
             return True, ("seat %s re-homed %s -> un-homed (all rooms); "
                           "takes effect on its next delivery scan"
-                          % (seat, old or "un-homed"))
+                          % (lbl, old_lbl or "un-homed"))
     return True, ("seat %s re-homed %s -> #%s; delivery is now { #%s, #main } "
                   "— takes effect on its next delivery scan (no relaunch)"
-                  % (seat, old or "un-homed", home_room, home_room))
+                  % (lbl, old_lbl or "un-homed", home_room, home_room))
 
 
 # ---------------------------------------------------------------------------
@@ -2076,8 +2082,9 @@ def set_status(seat, text, by=None):
         r[seat] = row
         pk.write_json(roster_path(), r)
     touch_seen(by or seat)
-    return True, ("%s ▸ %s" % (seat, line) if line
-                  else "%s status cleared" % seat)
+    lbl = _seat_label(seat)   # raw key drove the write; echoed label laundered
+    return True, ("%s ▸ %s" % (lbl, line) if line
+                  else "%s status cleared" % lbl)
 
 
 def _fmt_left(sec):
@@ -2190,17 +2197,23 @@ def presence_report():
             ls = last_seen(seat, row)
             p = presence_of(ls)
             line, source = status_line(row, by.get(seat))
-            out.append({"seat": seat, "presence": p, "dot": presence_dot(p),
+            # the fleet bar is a roster-consuming SURFACE too: every string it
+            # ships (seat KEY, status, status_by, line, source) rides the SAME
+            # publish boundary as roster_report — presence_report escaping this
+            # choke point is exactly how the 5th ESC surface was born (r4). One
+            # owner, not a scrub scattered per surface.
+            out.append(_pub_row({
+                        "seat": seat, "presence": p, "dot": presence_dot(p),
                         "last_seen": ls, "status": row.get("status"),
                         "status_age": _status_age(row),
                         "status_by": _status_by(row),
-                        "line": line, "source": source})
+                        "line": line, "source": source}))
         except Exception:   # per-row fail-open: one junk roster row renders
-            out.append({    # '?', it never blanks the whole fleet bar
+            out.append(_pub_row({    # '?', it never blanks the whole fleet bar
                 "seat": seat, "presence": "absent",
                 "dot": presence_dot("absent"), "last_seen": None,
                 "status": None, "status_age": None, "status_by": None,
-                "line": "?", "source": "home"})
+                "line": "?", "source": "home"}))
     out.sort(key=lambda s: (rank.get(s["presence"], 3), s["seat"]))
     return out
 
@@ -2402,15 +2415,6 @@ def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
     return rows, pruned
 
 
-def _pub(v, cap=80):
-    """Reader-side publish filter for roster-borne DISPLAY fields (home_room,
-    project, cwd…): scrub + clip, falsy passes through. The roster row keeps
-    what was written; only the report copy is laundered — a planted
-    home_room must not reshape the operator's terminal via the `home #…`
-    column (the same law status_line already applies to its winning tier)."""
-    return _clip(_scrub(str(v)).strip(), cap) if v else v
-
-
 def _seat_label(s):
     """Launder a seat KEY for terminal display (the `seat gc` listing and
     `status` bare-show read the roster dict directly, not roster_report).
@@ -2428,7 +2432,7 @@ def _seat_label(s):
 _ROW_CAPS = {"seat": SEAT_BYTES, "session": MAX_BYTES, "project": 80,
              "cwd": 160, "home_room": 40, "home_room_source": 40,
              "status": STATUS_BYTES, "status_by": 40, "line": STATUS_BYTES,
-             "source": 40, "preview": PREVIEW_CHARS}
+             "source": 40, "preview": PREVIEW_CHARS, "active": STATUS_BYTES}
 
 
 def _pub_row(d):
@@ -2436,18 +2440,24 @@ def _pub_row(d):
     field (Cc/Cf incl. bidi, Zl/Zp) at its per-field cap, so no roster-borne
     string — seat KEY, project, cwd, status, status_by, line, source,
     preview, and any FUTURE string field — can reshape an operator terminal
-    or reorder the fleet table. Non-string values (last_seen, pending, dot,
-    status_age) and falsy strings pass through; the nested todo cell's active
-    text is laundered too. The stored roster keeps its raw keys (rename/claim
-    match the dict itself); only this report copy is laundered — one owner,
-    not a scrub scattered across every print site."""
+    or reorder the fleet table. RECURSES into nested dicts and lists so a
+    nested cell (the todo mirror's `active` text, or any future nested
+    surface) is laundered by the same enumeration — not a hand-maintained
+    special case that the next nested field would silently escape. Non-string
+    values (last_seen, pending, dot, status_age) and falsy strings pass
+    through. The stored roster keeps its raw keys (rename/claim match the dict
+    itself); only this report copy is laundered — one owner, not a scrub
+    scattered across every print site."""
     for k, v in list(d.items()):
         if isinstance(v, str) and v:
             d[k] = _clip(_scrub(v).strip(), _ROW_CAPS.get(k, 80))
-    todo = d.get("todo")
-    if isinstance(todo, dict) and isinstance(todo.get("active"), str) \
-            and todo["active"]:
-        todo["active"] = _clip(_scrub(todo["active"]).strip(), STATUS_BYTES)
+        elif isinstance(v, dict):
+            _pub_row(v)
+        elif isinstance(v, list):
+            d[k] = [_pub_row(x) if isinstance(x, dict)
+                    else _clip(_scrub(x).strip(), _ROW_CAPS.get(k, 80))
+                    if isinstance(x, str) and x else x
+                    for x in v]
     return d
 
 
