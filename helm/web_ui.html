@@ -2586,6 +2586,27 @@ let CHAT_ROOMS_LAST = []; // last poll's rooms — instant sidebar repaint on sw
 let CHAT_BY_ID = {}, CHAT_BY_KEY = {}, CHAT_REPLYN = {}, CHAT_KIDS = {}, CHAT_REPLY_TO = null;
 let CHAT_ROSTER = [], CHAT_PRESENCE = {};   // @mention completion + seat ages
 let CHAT_DIVIDED = false, CHAT_AWAY = 0;    // the unread divider + jump button
+// ── lazy-load window (aligned 1:1 with builders.dev: recent-50 initial paint +
+// scroll-up older pages). CHAT_WIN is the one tunable knob; the server default
+// matches it. CHAT_OLDEST_BASE is the ABSOLUTE index of the topmost rendered
+// row — the cursor the older-page fetch scrolls back from (>0 means more above).
+const CHAT_WIN = 50;
+let CHAT_OLDEST_BASE = 0, CHAT_LOADING_OLDER = false; // single-flight, mirrors CHAT_POLLING
+// rotation cursor: the server stamps `gen` (a fingerprint of the room's HEAD
+// row) on every response. It is STABLE across appends and CHANGES the instant
+// the oldest half rotates out (chat._rotate reindexes the rows) — the one
+// reliable signal that our absolute `since` cursor went meaningless, so a
+// mismatch resets + repaints instead of quietly missing rows. Per-room (cached
+// on switch) so a room that rotated while we were away is caught on return.
+let CHAT_GEN = null;
+// parent ids the server CONFIRMED are gone from the room (a batch-id hydration
+// asked for them and they came back absent) — only these render "rotated out".
+// A parent merely above the loaded window is NOT here; it hydrates instead.
+let CHAT_GONE = new Set();
+// per-room render cache: instant channel-switch (repaint the cached DOM + state,
+// THEN the poll fetches only the delta from the cached cursor). Pure speedup —
+// an absent entry falls back to the fresh reset paint, so it can never wedge.
+const CHAT_CACHE = {};
 const CHAT_CLAMP_CHARS = 1200, CHAT_CLAMP_LINES = 14; // a ledger post must not bury the pane
 const CHAT_DIV_HTML = '<div id="chatdivider">new since you last looked</div>';
 
@@ -2621,18 +2642,53 @@ function chatParent(m) {
   return hits.length === 1 ? hits[0] : null;
 }
 
-/* the one-level quote (builders.dev style — never nested): author + snippet,
-   clickable to jump. An ORPHAN (parent rotated out of the RAM room) renders as
-   an explicit, un-clickable note — the reply still reads, nothing throws. */
+/* A reply's PARENT threadKey known from the CHILD alone — no parent row needed.
+   For an id reply (the web post path) reply_to IS the parent's id, which IS the
+   parent's threadKey (chatThreadKey = m.id || …). So a child can be filed under
+   its parent BEFORE the parent is ever loaded — the reply count survives the
+   parent living above the window. Pre-id replies fall back to the resolved row. */
+function chatParentKey(m) {
+  if (m.react) return null;
+  if (m.reply_to) return m.reply_to;
+  const p = chatParent(m);
+  return p ? chatThreadKey(p) : null;
+}
+
+/* the one-level quote (builders.dev style — never nested). FOUR states, so a
+   reply to a parent that is merely ABOVE the loaded window is NOT slandered as
+   "rotated out" (the P1 bug): resolved-in-DOM (clickable jump) · resolved-but-
+   above-the-window (author+snippet, click loads older then jumps) · PENDING
+   (an id parent we have not hydrated yet — chatHydrateParents resolves it) ·
+   gone (a pre-id reply with no surviving twin, OR an id the server confirmed is
+   rotated out). data-parent carries the id so chatReconcileQuotes can upgrade
+   the transient states in place as pages/hydrations arrive. */
+function chatQuoteResolved(p) {
+  const inDom = !!chatFind(p);
+  return '<div class="cquote' + (inDom ? "" : " above") +
+    '" data-jump="' + esc(chatThreadKey(p)) + '" data-parent="' + esc(p.id || "") +
+    '" title="' + (inDom ? "jump to the message this replies to"
+      : "the message this replies to is earlier in the room — click to load it") +
+    '">↳ <b>' + esc(String(p.from || "?")) + "</b> <span>" +
+    esc(chatSnip(p.text)) + "</span></div>";
+}
+function chatQuotePending(pid, rfrom) {
+  return '<div class="cquote pending" data-parent="' + esc(pid) +
+    '" data-rfrom="' + esc(rfrom || "?") +
+    '" title="loading the message this replies to…">↳ <span>…</span></div>';
+}
+function chatQuoteGone(rfrom) {
+  return '<div class="cquote orphan" title="the message this replies to is no ' +
+    'longer in the room (rotated out)">↳ <b>' + esc(rfrom || "?") +
+    "</b> <span>— original rotated out</span></div>";
+}
 function chatQuote(m) {
   if (m.react || !(m.reply_to || m.rts)) return "";
   const p = chatParent(m);
-  if (!p) return '<div class="cquote orphan" title="the message this replies to is no ' +
-    'longer in the room (rotated out)">↳ <b>' + esc(m.rfrom || "?") +
-    "</b> <span>— original rotated out</span></div>";
-  return '<div class="cquote" data-jump="' + esc(chatThreadKey(p)) +
-    '" title="jump to the message this replies to">↳ <b>' + esc(String(p.from || "?")) +
-    "</b> <span>" + esc(chatSnip(p.text)) + "</span></div>";
+  if (p) return chatQuoteResolved(p);
+  // an id reply whose parent we have not loaded is PENDING, never "gone" — only
+  // a batch hydration that comes back WITHOUT the id (CHAT_GONE) proves it out.
+  if (m.reply_to && !CHAT_GONE.has(m.reply_to)) return chatQuotePending(m.reply_to, m.rfrom);
+  return chatQuoteGone(m.rfrom);   // pre-id unresolved, or an id confirmed gone
 }
 
 function chatFind(p) {
@@ -2640,26 +2696,99 @@ function chatFind(p) {
   return log.querySelector('.chatmsg[data-thread="' + CSS.escape(chatThreadKey(p)) + '"]');
 }
 
-// a resolved reply bumps its parent's counter IN PLACE — the append-only poll
-// never re-renders an older row, so the count is applied, not recomputed
+// file a reply under its PARENT KEY and paint the parent's ↩N. Keyed off the
+// child alone (chatParentKey) so a child whose parent lives ABOVE the window is
+// still COUNTED — when an older page later renders that parent, chatSetReplyCount
+// shows the accrued total (fixes "older pages never repair existing counts").
+// IDEMPOTENT (kids dedup by child key) so replaying a row — an older-page reload,
+// a reconcile pass — can never double-count.
 function chatBumpReply(m) {
-  const p = chatParent(m);
-  if (!p) return;
-  const k = chatThreadKey(p);
-  CHAT_REPLYN[k] = (CHAT_REPLYN[k] | 0) + 1;
-  (CHAT_KIDS[k] = CHAT_KIDS[k] || []).push(chatThreadKey(m));
-  const el = chatFind(p), s = el && el.querySelector(".creplies");
-  if (!s) return;
-  s.textContent = "↩" + CHAT_REPLYN[k];
-  s.title = CHAT_REPLYN[k] + (CHAT_REPLYN[k] === 1 ? " reply" : " replies");
+  const k = chatParentKey(m);
+  if (!k) return;
+  const ck = chatThreadKey(m);
+  const kids = (CHAT_KIDS[k] = CHAT_KIDS[k] || []);
+  if (kids.indexOf(ck) === -1) kids.push(ck);
+  CHAT_REPLYN[k] = kids.length;
+  chatSetReplyCount(k);
+}
+function chatSetReplyCount(k) {
+  const el = $("#chatlog").querySelector('.chatmsg[data-thread="' + CSS.escape(k) +
+    '"] .creplies');
+  if (!el) return;                       // parent not on screen (above window) — noop
+  const n = CHAT_REPLYN[k] | 0;
+  el.textContent = n ? "↩" + n : "";
+  el.title = n + (n === 1 ? " reply" : " replies");
+}
+
+/* Repair the transient reply quotes (pending / above) IN PLACE as pages and
+   hydrations arrive — the append-only log never re-renders a row, so a quote
+   that could not resolve at paint time is upgraded here, not by a repaint:
+   pending -> resolved once the parent id lands in the index (or -> "rotated out"
+   once a hydration confirms it gone); above -> in-DOM-clickable once an older
+   page brings the parent onto the screen. Also (re)paints every rendered
+   parent's ↩N from the accrued counts, so a parent loaded AFTER its children
+   shows their total. Idempotent + cheap (windowed DOM, one querySelectorAll). */
+function chatReconcileQuotes() {
+  const log = $("#chatlog");
+  log.querySelectorAll(".cquote.pending, .cquote.above").forEach(q => {
+    const id = q.getAttribute("data-parent");
+    if (!id) return;
+    const p = CHAT_BY_ID[id];
+    let next;
+    if (p) next = chatQuoteResolved(p);           // hydrated or paged in
+    else if (CHAT_GONE.has(id)) next = chatQuoteGone(q.getAttribute("data-rfrom"));
+    else return;                                   // still pending — leave it
+    if (next) q.outerHTML = next;
+  });
+  // repaint counts for every parent currently on screen (older-page parents included)
+  log.querySelectorAll(".chatmsg[data-thread]").forEach(el => {
+    const k = el.getAttribute("data-thread");
+    if (CHAT_REPLYN[k]) chatSetReplyCount(k);
+  });
+}
+
+/* Batch-resolve the parents of PENDING quotes by id (builders' handleMessagesByIds
+   parity, cap 100). The response tells "above the window but still in the room"
+   (id present -> index it, the quote resolves to author+snippet) from "genuinely
+   rotated out" (id absent -> CHAT_GONE, only NOW does the quote read "rotated
+   out"). BODY-ONLY (no transport/signal here — that recomputes live on the poll,
+   DREGGTEGRITY intact). Never re-renders the log; only upgrades the quotes. */
+async function chatHydrateParents() {
+  const log = $("#chatlog");
+  const ids = [];
+  log.querySelectorAll(".cquote.pending[data-parent]").forEach(q => {
+    const id = q.getAttribute("data-parent");
+    if (id && !CHAT_BY_ID[id] && !CHAT_GONE.has(id) && ids.indexOf(id) === -1) ids.push(id);
+  });
+  if (!ids.length) return;
+  const want = CHAT_ROOM;
+  let d;
+  try {
+    d = await j("/api/chat?room=" + encodeURIComponent(want) + "&ids=" +
+      encodeURIComponent(ids.slice(0, 100).join(",")));
+  } catch (e) { return; }                          // fail-open: retry next paint
+  if (CHAT_ROOM !== want || !d || !Array.isArray(d.lines)) return;
+  const got = new Set();
+  for (const row of d.lines) {
+    if (row.id) { if (!CHAT_BY_ID[row.id]) CHAT_BY_ID[row.id] = row; got.add(row.id); }
+  }
+  for (const id of ids) if (!got.has(id)) CHAT_GONE.add(id);  // asked, absent => truly gone
+  chatReconcileQuotes();
 }
 
 // anchored navigation, both directions: a quote jumps UP to its parent, a
 // parent's ↩N jumps DOWN to its first reply. One level, no nesting, no
 // re-render — the chronological log stays the log.
-function chatJumpTo(key) {
+async function chatJumpTo(key) {
   const log = $("#chatlog");
-  const el = log.querySelector('.chatmsg[data-thread="' + CSS.escape(key) + '"]');
+  const find = () => log.querySelector('.chatmsg[data-thread="' + CSS.escape(key) + '"]');
+  let el = find();
+  // the target may be a parent ABOVE the loaded window (a resolved 'above' quote):
+  // page older history in until it lands (bounded) before giving up.
+  for (let i = 0; !el && i < 40 && CHAT_OLDEST_BASE > 0; i++) {
+    await chatLoadOlder();
+    el = find();
+  }
   if (!el) { toast("that message is no longer in this room"); return; }
   el.scrollIntoView({block: "center"});
   el.classList.add("flash");
@@ -2740,16 +2869,44 @@ async function pollChat() {
   try {
     let d;
     const want = CHAT_ROOM; // the room this request is FOR — a mid-flight switch drops the render
-    const base = CHAT_SINCE; // absolute index of d.lines[0] — the divider needs it
-    try { d = await j("/api/chat?room=" + encodeURIComponent(want) + "&since=" + base); } catch (e) { return; } // fail-open: keep the page, keep quiet
+    const sentSince = CHAT_SINCE; // the cursor we asked from — 0 => initial/reset (windowed) paint
+    // the initial/reset open asks for only the last CHAT_WIN rows (builders.dev
+    // getRecent parity); the incremental poll (since>0) stays exactly since=<n>,
+    // the untouched 22ms/54KB good path.
+    const url = "/api/chat?room=" + encodeURIComponent(want) + "&since=" + sentSince
+              + (sentSince === 0 ? "&win=" + CHAT_WIN : "");
+    try { d = await j(url); } catch (e) { return; } // fail-open: keep the page, keep quiet
     if (d.unavailable || !Array.isArray(d.lines)) { chatSignal(d); return; }
     if (Array.isArray(d.roster)) CHAT_ROSTER = d.roster; // @mention completion source
     chatRooms(d.rooms); // sidebar rides every poll (room-agnostic — render before the staleness bail)
     chatPresence(d.presence); // fleet presence bar — room-agnostic, every poll
     if (CHAT_ROOM !== want) return; // switched while in flight — the next tick repolls the new room
+    // ROTATION CURSOR: the head fingerprint changed => the oldest half rotated
+    // out and every absolute index reindexed, so this incremental response's
+    // slice (rows[sentSince:] on the rotated file) is the WRONG rows AND our
+    // rendered log holds dropped rows. Discard it, reset the cursor, and re-poll
+    // for a fresh windowed open. (total<since below only catches a rotation that
+    // ALSO shrank below the cursor; a rotate-then-regrow PAST it — the reported
+    // P1 — slips through, so the gen is the one reliable signal.)
+    if (typeof d.gen === "string" && sentSince > 0 && CHAT_GEN !== null && d.gen !== CHAT_GEN) {
+      CHAT_SINCE = 0; chatResetLog();     // clears CHAT_GEN too; the reset open restamps it
+      setTimeout(pollChat, 0);            // finally clears the lock first, then the windowed repaint
+      return;
+    }
+    if (typeof d.gen === "string") CHAT_GEN = d.gen;
     chatTransport(d.transport);
     const log = $("#chatlog");
     if (d.total < CHAT_SINCE) CHAT_SINCE = 0; // the room rotated — server resent everything
+    // absolute index of d.lines[0]: the windowed initial open stamps `base`
+    // (last-WIN slice starts mid-history); the incremental poll omits it and
+    // d.lines[0] sits exactly at the cursor we sent.
+    const absBase = (typeof d.base === "number") ? d.base : CHAT_SINCE;
+    // `base` rides ONLY the windowed initial/reset response (never the
+    // incremental poll), so its presence is the exact signal "the log was
+    // repainted from absBase" — the topmost rendered row, i.e. the older-page
+    // cursor. An incremental append leaves the topmost row (and CHAT_OLDEST_BASE)
+    // untouched.
+    if (typeof d.base === "number") CHAT_OLDEST_BASE = d.base;
     if (d.lines.length) {
       if (CHAT_SINCE === 0) chatResetLog(); // clear the empty-state (or the stale pre-rotation log)
       const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
@@ -2757,13 +2914,13 @@ async function pollChat() {
       if (msgs.length) {
         // the "new since you last looked" divider: placed ONCE, at the owner's
         // server-side read cursor, and only when he wasn't watching it land —
-        // an initial paint (base 0) or rows that arrived on a hidden tab
+        // an initial paint (the since=0 open) or rows that arrived on a hidden tab
         const away = !$("#view-chat").classList.contains("on") || document.hidden;
         const cut = d.owner_read | 0;
-        let html = "", abs = base;
+        let html = "", abs = absBase;
         for (const m of d.lines) {
           if (m.react) { abs++; continue; }
-          if (!CHAT_DIVIDED && cut > 0 && abs >= cut && (base === 0 || away)) {
+          if (!CHAT_DIVIDED && cut > 0 && abs >= cut && (sentSince === 0 || away)) {
             html += CHAT_DIV_HTML; CHAT_DIVIDED = true;
           }
           html += chatRow(m); abs++;
@@ -2777,6 +2934,8 @@ async function pollChat() {
       chatJumpSync();
     }
     CHAT_SINCE = d.total;
+    chatReconcileQuotes();   // upgrade transient quotes + repaint counts as the index grew
+    chatHydrateParents();    // resolve out-of-window reply parents by id (fire-and-forget)
     chatSignal(d);
   } finally { CHAT_POLLING = false; }
 }
@@ -2786,7 +2945,47 @@ async function pollChat() {
 function chatResetLog() {
   $("#chatlog").innerHTML = "";
   CHAT_REACTS = {}; CHAT_BY_ID = {}; CHAT_BY_KEY = {}; CHAT_REPLYN = {}; CHAT_KIDS = {};
-  CHAT_DIVIDED = false; CHAT_AWAY = 0;
+  CHAT_DIVIDED = false; CHAT_AWAY = 0; CHAT_OLDEST_BASE = 0; // no older page until the next paint stamps base
+  CHAT_GEN = null; CHAT_GONE = new Set(); // a reset re-derives the rotation cursor + the gone-set from scratch
+}
+
+/* lazy-load older history (builders.dev back-scroll parity — the analog of
+   getRecent(before, N)): the owner scrolled near the top, there is history
+   ABOVE the topmost rendered row (CHAT_OLDEST_BASE>0), so pull the prior page
+   and PREPEND it with the viewport pinned (scroll-anchor) — no re-render of the
+   rows already on screen (the append-only invariant the poll relies on holds in
+   both directions). The prepended rows are fed chatRow (which indexes them) +
+   chatBumpReply so a reply/jump/quote resolves across the newly-loaded window.
+   Single-flight (mirrors CHAT_POLLING) so a fast scroll can't double-fetch a
+   page. This response is BODY-ONLY — no transport/signal here; the signing
+   truth is recomputed live on the poll path, never from this cached slice. */
+async function chatLoadOlder() {
+  if (CHAT_LOADING_OLDER || !(CHAT_OLDEST_BASE > 0)) return;
+  CHAT_LOADING_OLDER = true;
+  try {
+    const want = CHAT_ROOM, before = CHAT_OLDEST_BASE;
+    let d;
+    try {
+      d = await j("/api/chat?room=" + encodeURIComponent(want) + "&before=" + before + "&win=" + CHAT_WIN);
+    } catch (e) { return; } // fail-open: leave the log as-is, retry on the next scroll
+    if (CHAT_ROOM !== want || !d || !Array.isArray(d.lines)) return; // switched mid-flight
+    // rotation guard: if the room rotated since our last paint, this `before`
+    // indexes a REINDEXED file — the slice would not abut our rendered top. Bail
+    // and let the live poll's gen check reset + repaint (which walks the cursor
+    // afresh); prepending a mismatched page would corrupt the log.
+    if (typeof d.gen === "string" && CHAT_GEN !== null && d.gen !== CHAT_GEN) return;
+    if (!d.lines.length) { CHAT_OLDEST_BASE = (typeof d.base === "number") ? d.base : 0; return; }
+    const log = $("#chatlog"), oldH = log.scrollHeight;
+    let html = "";
+    for (const m of d.lines) { if (!m.react) html += chatRow(m); } // chatRow indexes each row
+    log.insertAdjacentHTML("afterbegin", html);
+    d.lines.forEach(chatBumpReply);                 // reply/jump resolve across the loaded window
+    d.lines.filter(m => m.react).forEach(chatApplyReact);
+    CHAT_OLDEST_BASE = (typeof d.base === "number") ? d.base : 0; // walk the cursor further up
+    chatReconcileQuotes();   // a paged-in parent upgrades its children's 'above'/pending quotes + counts
+    chatHydrateParents();    // any still-unresolved parent id resolves by batch
+    log.scrollTop += (log.scrollHeight - oldH);      // scroll-anchor: the viewport does not jump
+  } finally { CHAT_LOADING_OLDER = false; }
 }
 
 /* jump-to-latest: scrolled off the bottom is the ONLY state where an arriving
@@ -2874,13 +3073,52 @@ function chatPresence(list) {
   bar.title = rows.length + ' online — click for the full roster';
 }
 
+/* snapshot / restore a room's whole render state — the log DOM plus every
+   per-room index (ids, keys, reply counts, kids, reactions, divider, away
+   count, the window cursors + scroll). Switching AWAY caches it; switching
+   BACK repaints it instantly and lets the very next poll fetch only the delta
+   from the cached cursor (since=cached total). Pure speedup, so it holds only
+   the immutable BODY — the transport/signing truth is never cached here; it is
+   recomputed live on the first poll after the switch. */
+function chatSnapshot() {
+  if (!CHAT_ROOM) return;
+  CHAT_CACHE[CHAT_ROOM] = {
+    html: $("#chatlog").innerHTML, scrollTop: $("#chatlog").scrollTop,
+    since: CHAT_SINCE, oldest: CHAT_OLDEST_BASE, divided: CHAT_DIVIDED, away: CHAT_AWAY,
+    byId: CHAT_BY_ID, byKey: CHAT_BY_KEY, replyn: CHAT_REPLYN, kids: CHAT_KIDS, reacts: CHAT_REACTS,
+    gen: CHAT_GEN, gone: CHAT_GONE,   // cache the rotation cursor so a room that rotated while away is caught on return
+  };
+}
+
+function chatRestore(room) {
+  const c = CHAT_CACHE[room];
+  if (!c) return false;
+  const log = $("#chatlog");
+  log.innerHTML = c.html;
+  CHAT_SINCE = c.since; CHAT_OLDEST_BASE = c.oldest; CHAT_DIVIDED = c.divided; CHAT_AWAY = c.away;
+  CHAT_BY_ID = c.byId; CHAT_BY_KEY = c.byKey; CHAT_REPLYN = c.replyn; CHAT_KIDS = c.kids; CHAT_REACTS = c.reacts;
+  // restore the cached gen: the very next poll compares it, so a room rotated
+  // while we were away resets on return instead of restoring a stale since cursor.
+  CHAT_GEN = ("gen" in c) ? c.gen : null; CHAT_GONE = c.gone || new Set();
+  log.scrollTop = c.scrollTop;   // restore the viewport where the owner left it
+  return true;
+}
+
 function chatSwitch(room) {
   room = chatSlug(room);
   if (!room || room === CHAT_ROOM) return;
+  chatSnapshot();                 // cache the room we are leaving for an instant return
   CHAT_ROOM = room;
   localStorage.setItem("helm.chatroom", room); // survive reload, like helm.chatname
-  CHAT_SINCE = 0; chatResetLog(); // the rotation-reset path repaints the log from 0
   chatClearReply();               // a reply target never survives its room
+  if (chatRestore(room)) {
+    // instant repaint from cache; the poll below fetches only the delta from
+    // the cached cursor (since>0 => the untouched incremental path)
+    chatRooms(CHAT_ROOMS_LAST);   // active row flips NOW; the poll refreshes counts
+    pollChat();
+    return;
+  }
+  CHAT_SINCE = 0; chatResetLog(); // fresh room: the reset path repaints from the windowed open
   $("#chatlog").innerHTML = '<div class="empty">#' + esc(room) +
     " — no messages yet. the first post creates the channel.</div>";
   chatRooms(CHAT_ROOMS_LAST); // active row flips NOW; the poll refreshes counts
@@ -3063,7 +3301,12 @@ function initChat() {
       const log = $("#chatlog");
       log.scrollTop = log.scrollHeight; CHAT_AWAY = 0; chatJumpSync();
     };
-    $("#chatlog").addEventListener("scroll", chatJumpSync);
+    $("#chatlog").addEventListener("scroll", () => {
+      chatJumpSync();
+      // near the top with history above -> pull the prior page (builders'
+      // SCROLL_THRESHOLD parity; single-flight guarded inside chatLoadOlder)
+      if ($("#chatlog").scrollTop < 80) chatLoadOlder();
+    });
     $("#chatlog").addEventListener("click", ev => {   // react / reply / expand / jump (delegated)
       const q = ev.target.closest(".cquote[data-jump]");
       if (q) { chatJumpTo(q.dataset.jump); return; }
