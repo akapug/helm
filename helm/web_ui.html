@@ -3098,7 +3098,35 @@ function initChat() {
 // the poll never gates on the chat view: the badge/notify beacon runs on
 // EVERY tab from page load (owner-notify law — a GUI-first owner on the
 // sessions tab must still see an @mention land).
-setInterval(pollChat, 2000);
+/* ---------- SSE doorbell (poll -> push, REARCH leg 2) ----------
+   The push leg: /api/events emits a `chat` doorbell whenever ANY room file
+   changes; the handlers just run the EXISTING cursor reads (pollChat's
+   ?since= catch-up), so the read endpoints stay the one render truth. While
+   the stream is healthy the 2s timers stretch to a 10s fallback heartbeat
+   (ES_LIVE gate below); on stream error EventSource auto-reconnects and the
+   timers snap back to 2s — belt and braces, never a dead UI. NOTE: this block
+   sits ABOVE the first esStretch() call site (the chat timer right below) —
+   a const is TDZ-dead until its line runs (caught live: the timer executed
+   first and killed the whole script). pollDregg/pollRoster are hoisted
+   function declarations referenced only inside closures, so their later
+   definition is fine. */
+let ES = null, ES_LIVE = false, ES_TICKS = 0;
+function esConnect() {
+  if (!window.EventSource) return;                 // no ES -> timers carry it
+  try { ES = new EventSource("/api/events"); } catch (e) { return; }
+  ES.onopen = () => { ES_LIVE = true; };
+  ES.onerror = () => { ES_LIVE = false; };         // ES reconnects by itself
+  ES.addEventListener("chat", () => {
+    pollChat();                                    // instant cursor catch-up
+    pollDregg();                                   // a signed post = a turn
+    if ($("#view-roster").classList.contains("on")) pollRoster();
+  });
+}
+// while the doorbell is live, a 2s timer only ACTS every 5th tick (10s
+// heartbeat); the moment the stream drops it acts every tick again
+const esStretch = fn => () => { if (ES_LIVE && (++ES_TICKS % 5)) return; fn(); };
+
+setInterval(esStretch(pollChat), 2000);   // 10s heartbeat while the SSE doorbell is live
 pollChat();
 
 /* ================= cave view — local multiplayer over the blind relay =================
@@ -3657,7 +3685,7 @@ async function pollRosterGit() {
 }
 function initRoster() {
   if (!ROSTER_TIMER) {
-    ROSTER_TIMER = setInterval(pollRoster, 2000);
+    ROSTER_TIMER = setInterval(esStretch(pollRoster), 2000);   // stretched while SSE live
     ROSTER_GIT_TIMER = setInterval(pollRosterGit, 60000);
     // the message-a-seat composer moved here from the ledger -- wire it once
     $("#seatform").addEventListener("submit", sendSeatMsg);
@@ -3851,5 +3879,6 @@ async function pollDregg() {
   if (strip) strip.onclick = () => showView("ledger");
   setInterval(pollDregg, 8000);
   pollDregg();
+  esConnect();   // the doorbell: push wakes the cursor reads
 }
 </script>

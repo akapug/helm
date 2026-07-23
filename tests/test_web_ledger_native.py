@@ -331,3 +331,35 @@ class TestRoomsSummarySingleFlightCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSseDoorbellWatcher(unittest.TestCase):
+    """The push leg's ground truth (REARCH leg 2): the fingerprint MUST move
+    when any room file changes (a doorbell that can't ring is a dead guard —
+    guard-needs-fires-on-violation), stay still when nothing changed, and the
+    watcher must arm exactly once."""
+
+    def test_fingerprint_moves_on_room_append_and_holds_still(self):
+        import tempfile, os as _os
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("helm.chat.chat_dir", return_value=d):
+                fp0 = web._chat_fingerprint()
+                self.assertEqual(fp0, web._chat_fingerprint())  # still = still
+                with open(_os.path.join(d, "main"), "a") as f:
+                    f.write('{"from":"x","text":"row"}\n')
+                fp1 = web._chat_fingerprint()
+                self.assertNotEqual(fp0, fp1)                   # append rings
+                self.assertEqual(fp1, web._chat_fingerprint())  # then still
+
+    def test_fingerprint_fails_open_on_missing_dir(self):
+        with mock.patch("helm.chat.chat_dir", return_value="/nonexistent-x"):
+            self.assertIsNone(web._chat_fingerprint())          # never raises
+
+    def test_watcher_arms_exactly_once(self):
+        before = web._SSE_STATE["watcher"]
+        web._sse_ensure_watcher()
+        web._sse_ensure_watcher()                               # idempotent
+        self.assertTrue(web._SSE_STATE["watcher"])
+        alive = [t.name for t in threading.enumerate()
+                 if t.name == "helm-sse-watcher"]
+        self.assertEqual(len(alive), 1 if not before else len(alive))

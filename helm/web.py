@@ -1741,6 +1741,60 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 }
 
 
+# ---------- the SSE doorbell (REARCH-web-0.2 leg 2: poll -> push) ----------
+# The lineage's settled pattern (builders.dev firehose / MC ramspace / glue):
+# push says "there's news", the EXISTING cursor read fetches it — events are
+# DOORBELLS, never payloads, so the read endpoints stay the one render truth.
+# ONE watcher thread stat-sweeps the chat room dir (tmpfs, ~13 files) every
+# 250ms and notifies a Condition; each /api/events client blocks on it
+# (thread-per-client is already this server's model). The 250ms tick is also
+# the coalescer: a burst of posts is at most 4 doorbells/s. Keepalive comment
+# every 20s + no-cache/no-transform (the glue anti-proxy-buffering pair);
+# EventSource gives the client auto-reconnect for free.
+_SSE_COND = threading.Condition()
+_SSE_STATE = {"chat_fp": None, "seq": 0, "watcher": False}
+_SSE_WATCH_S = 0.25
+
+
+def _chat_fingerprint():
+    """One cheap stat sweep over the room files — order-independent combine
+    of (mtime_ns, size), so ANY room's append/rotation moves the value."""
+    from . import chat
+    try:
+        d = chat.chat_dir()
+        fp = 0
+        for name in os.listdir(d):
+            try:
+                st = os.stat(os.path.join(d, name))
+                fp ^= st.st_mtime_ns ^ (st.st_size << 1)
+            except OSError:
+                continue
+        return fp
+    except OSError:
+        return None
+
+
+def _sse_watcher():
+    while True:
+        time.sleep(_SSE_WATCH_S)
+        fp = _chat_fingerprint()
+        with _SSE_COND:
+            if fp != _SSE_STATE["chat_fp"]:
+                _SSE_STATE["chat_fp"] = fp
+                _SSE_STATE["seq"] += 1
+                _SSE_COND.notify_all()
+
+
+def _sse_ensure_watcher():
+    with _SSE_COND:
+        if _SSE_STATE["watcher"]:
+            return
+        _SSE_STATE["watcher"] = True
+        _SSE_STATE["chat_fp"] = _chat_fingerprint()   # baseline, no boot storm
+    threading.Thread(target=_sse_watcher, daemon=True,
+                     name="helm-sse-watcher").start()
+
+
 class Handler(BaseHTTPRequestHandler):
     def _same_origin(self):
         """DNS-rebinding defense: a bound-to-127.0.0.1 server still answers
@@ -1770,6 +1824,8 @@ class Handler(BaseHTTPRequestHandler):
             path = path.rstrip("/")
         if path == "/":
             return self._ui()
+        if path == "/api/events":
+            return self._sse()
         qfn = QUERY_API.get(path)
         if qfn is not None:
             try:
@@ -1815,6 +1871,34 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json({"error": "%s: %s" % (type(e).__name__, e)}, 500)
         self._json(obj, status)
+
+    def _sse(self):
+        """text/event-stream: block on the watcher's Condition; emit a `chat`
+        doorbell per state change (id = the watcher seq) and a keepalive
+        comment on 20s of quiet. The client's EventSource reconnects itself;
+        a vanished client just raises into the quiet except below."""
+        _sse_ensure_watcher()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        with _SSE_COND:
+            seq = _SSE_STATE["seq"]
+        try:
+            self.wfile.write(b": helm sse doorbell\n\n")
+            self.wfile.flush()
+            while True:
+                with _SSE_COND:
+                    fired = _SSE_COND.wait_for(
+                        lambda: _SSE_STATE["seq"] != seq, timeout=20.0)
+                    seq = _SSE_STATE["seq"]
+                self.wfile.write(
+                    ("event: chat\nid: %d\ndata: {}\n\n" % seq).encode()
+                    if fired else b": keepalive\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return   # the client went away — the normal end of a stream
 
     def _ui(self):
         try:
