@@ -238,6 +238,8 @@ _USAGE = """usage: helm seat <verb> [args]
                                       --install-timer for the cadence)
   list | status                       seats, proxy liveness, cred expiry
   doctor                              binary + cred + seat health, read-only
+  doctor --ensure                     supervise: respawn any dead/wedged proxy,
+                                      rc 2 if any row stays UNKNOWN (cron it)
 families: %s""" % ", ".join(sorted(FAMILIES))
 
 
@@ -2556,6 +2558,105 @@ def _doctor(args):
     return 0 if b and c and not err else 1
 
 
+# A live proxy still binding its port at startup must never read as WEDGED —
+# the fable adversarial MED: two back-to-back 0.5s connect probes with no grace
+# let a just-launched proxy be SIGTERMed, and cron firing inside the boot window
+# churns kill->respawn->kill. Age source = pidfile mtime: _up writes the pidfile
+# atomically at spawn, so mtime ~= launch time and stays readable even when
+# /proc is restricted. Env-tunable for slow hosts / tests.
+_ENSURE_STARTUP_GRACE_S = float(os.environ.get("HELM_ENSURE_STARTUP_GRACE", "15"))
+
+
+def _proxy_age_s(family, seat):
+    """Seconds since this proxy's pidfile was written (~= launch time), or None
+    when there is no pidfile to age. mtime is the portable birth proxy: it does
+    not depend on /proc readability and _up stamps it at spawn."""
+    try:
+        return time.time() - os.path.getmtime(
+            os.path.join(_proxy_home(family, seat), "proxy.pid"))
+    except OSError:
+        return None
+
+
+def _ensure_row(family, seat):
+    """One proxy's supervise-verdict: (label, state, detail). state is
+    "healthy" | "respawned" | "unknown". The reconciler's whole job is to make
+    every row provably one of the first two; a row it cannot prove is UNKNOWN,
+    never a silent down/up (the fleet-truth fail-closed law)."""
+    label = family if seat == family else seat
+    port = _instance_port(family, seat)
+    rec = _proxy_pid_record(family, seat)
+    live = _running_pid(family, seat)
+    # The discriminant is the LIVENESS of the recorded pid, not record-presence:
+    #  - dead recorded pid   -> a STALE pidfile of a crashed proxy (the silent-
+    #    starvation case the watchdog exists to heal). Fall through to respawn;
+    #    _up's empty-check reads _running_pid (None for a corpse) and overwrites.
+    #  - ALIVE recorded pid but _running_pid None -> identity verification FAILED
+    #    on a live process: a REUSED pid now owned by a stranger (never signal)
+    #    or a legacy bare-pid proxy (running but unverifiable). Both UNKNOWN —
+    #    refuse to signal and refuse to respawn over a live foreign listener.
+    if rec and not live and _pid_alive(rec["pid"]):
+        return (label, "unknown",
+                "pidfile pid %d alive but unverifiable (reused or legacy "
+                "bare-pid) — refusing to signal or respawn over it" % rec["pid"])
+    if live and _port_open(port):
+        return (label, "healthy", "pid %d port %d" % (live, port))
+    # down (no live pid / stale record) or wedged (live pid, port not answering).
+    if live and not _port_open(port):
+        # STARTUP GRACE: a YOUNG non-answering proxy is STARTING, not wedged —
+        # never SIGTERM it. Surface as unknown (still binding) and leave it for
+        # the next cron cycle; only a proxy old enough to have bound AND still
+        # failing the probe is truly wedged.
+        age = _proxy_age_s(family, seat)
+        if age is not None and age < _ENSURE_STARTUP_GRACE_S:
+            return (label, "unknown",
+                    "pid %d launched %.0fs ago, port %d not answering yet — "
+                    "STARTING (grace %.0fs), not wedged; left for next cycle"
+                    % (live, age, port, _ENSURE_STARTUP_GRACE_S))
+        # wedged: a live verified process past its grace and still not serving.
+        # Signal it away, then respawn.
+        _down(family, seat)
+    rc = _up(family, quiet=True, seat=seat)
+    if rc != 0:
+        # concurrent-_up loser race (fable LOW): a seat launching in the same
+        # instant wins the flock, our _up reads 'already running' (rc 1) — that
+        # is not a failure, the row is now HEALTHY under the winner. Re-probe
+        # before crying UNKNOWN.
+        pid = _running_pid(family, seat)
+        if pid and _port_open(port):
+            return (label, "healthy",
+                    "pid %d port %d (a concurrent starter won the race)" %
+                    (pid, port))
+        return (label, "unknown", "respawn failed (rc %d); see proxy.log" % rc)
+    pid = _running_pid(family, seat)
+    if pid and _port_open(port):
+        return (label, "respawned", "pid %d port %d" % (pid, port))
+    return (label, "unknown", "post-respawn probe could not prove healthy")
+
+
+def _ensure(args):
+    """doctor --ensure: supervise every minted family+instance proxy. Reuse the
+    landed ownership primitives — never a second spawn path. rc 0 when every
+    row is healthy-or-respawned, rc 2 when any row is UNKNOWN (a row the
+    watchdog could not prove), so a cron line can page on 2 alone."""
+    unknown = 0
+    for family in sorted(FAMILIES):
+        if not os.path.exists(os.path.join(seat_dir(family), "config.yaml")):
+            continue                      # never minted: nothing to supervise
+        seats = [family] + _minted_instances(family)
+        for seat in seats:
+            label, state, detail = _ensure_row(family, seat)
+            if state == "unknown":
+                unknown += 1
+            print("%-10s %-9s %s" % (label, state.upper(), detail))
+    if unknown:
+        print("helm seat doctor --ensure: %d UNKNOWN row(s) — a proxy the "
+              "watchdog could not prove healthy; investigate" % unknown,
+              file=sys.stderr)
+        return 2
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2575,10 +2676,11 @@ def cmd_seat(args):
             return rc
         return _status(rest)
     if verb == "doctor":
-        rc = guard_tail("helm seat doctor", rest, usage=_USAGE)
+        rc = guard_tail("helm seat doctor", rest, flags=("--ensure",),
+                        usage=_USAGE)
         if rc is not None:
             return rc
-        return _doctor(rest)
+        return _ensure(rest) if "--ensure" in rest else _doctor(rest)
     if verb == "autocompact":
         from . import autocompact
         return autocompact.cmd_autocompact(rest)
