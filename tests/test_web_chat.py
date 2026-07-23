@@ -382,7 +382,12 @@ class TestWebChat(unittest.TestCase):
         """The badge computation the owner UX rides: a quiet room and a busy
         one are distinguishable WITHOUT opening either (the 4-row-vs-88-row
         failure)."""
-        from helm import seats
+        from helm import seats, web
+        # agent-path posts (direct chat.post) are TTL-bounded in the rooms
+        # summary by design (<=3s); this test time-compresses that leg, so
+        # elapse the TTL explicitly — the freshness SLA itself is pinned by
+        # TestRoomsSummarySingleFlightCache
+        web._ROOMS_SUM_CACHE.clear()
         seats.write_roster("noisy-seat", session="s-noisy")
         chat.post("quiet corner", room="team-quiet", who="noisy-seat")
         for i in range(8):
