@@ -1479,5 +1479,498 @@ class SeatMultiTest(unittest.TestCase):
         self.assertIn("--multi", err.getvalue())
 
 
+class SeatEnsureTest(unittest.TestCase):
+    """doctor --ensure (the proxy watchdog, codex-2 silent-starvation class):
+    supervise every minted family+instance proxy — healthy rows pass through,
+    dead/wedged rows respawn via the LANDED _up (never a second spawn path),
+    and any row the watchdog cannot PROVE healthy surfaces UNKNOWN (rc 2),
+    never a silent down/up. Hermetic: primitives mocked, no real proxy.
+    Borrows SeatTest's fixtures without subclassing."""
+
+    setUp = SeatTest.setUp
+    tearDown = SeatTest.tearDown
+    _plant = SeatTest._plant
+    _add = SeatTest._add
+
+    def _row(self, family="codex", seat_name="codex"):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            verdict = seat._ensure_row(family, seat_name)
+        return verdict
+
+    # -- the acceptance path: a DOWN proxy is respawned ---------------------
+    def test_ensure_respawns_dead_proxy(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        # no pidfile -> down; a successful _up flips the row to live+open so the
+        # post-respawn probe proves healthy (the seq-flip pattern: the initial
+        # probe must read DOWN, only the re-probe after _up reads live).
+        seq = {"live": False, "open": False}
+        up_calls = []
+
+        def fake_up(f, quiet=False, seat=None):
+            up_calls.append((f, seat))
+            seq.update(live=True, open=True)
+            return 0
+
+        with mock.patch.object(seat, "_proxy_pid_record", return_value=None), \
+                mock.patch.object(seat, "_running_pid",
+                                  lambda f, s=None: 4321 if seq["live"] else None), \
+                mock.patch.object(seat, "_port_open",
+                                  lambda p, timeout=0.5: seq["open"]), \
+                mock.patch.object(seat, "_up", fake_up), \
+                mock.patch.object(seat, "_down") as down:
+            label, state, detail = self._row()
+        self.assertEqual(label, "codex")
+        self.assertEqual(state, "respawned")
+        self.assertEqual(up_calls, [("codex", "codex")])
+        down.assert_not_called()          # nothing live to signal away
+
+    def test_ensure_healthy_row_untouched(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 4321, "identity": "x"}), \
+                mock.patch.object(seat, "_running_pid", return_value=4321), \
+                mock.patch.object(seat, "_port_open", return_value=True), \
+                mock.patch.object(seat, "_up") as up, \
+                mock.patch.object(seat, "_down") as down:
+            label, state, detail = self._row()
+        self.assertEqual(state, "healthy")
+        up.assert_not_called()
+        down.assert_not_called()
+
+    def test_ensure_wedged_proxy_signaled_then_respawned(self):
+        # live verified pid but the port does not answer -> _down clears it,
+        # then _up brings a fresh one up.
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        seq = {"live": True, "open": False}
+        down_calls, up_calls = [], []
+
+        def fake_up(f, quiet=False, seat=None):
+            up_calls.append((f, seat))
+            seq.update(live=True, open=True)   # fresh proxy up + answering
+            return 0
+
+        def fake_down(f, seat=None):
+            down_calls.append((f, seat))
+            seq.update(live=False, open=False)
+            return 0
+
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 4321, "identity": "x"}), \
+                mock.patch.object(seat, "_running_pid",
+                                  lambda f, s=None: 4321 if seq["live"] else None), \
+                mock.patch.object(seat, "_port_open",
+                                  lambda p, timeout=0.5: seq["open"]), \
+                mock.patch.object(seat, "_proxy_age_s",
+                                  return_value=120.0), \
+                mock.patch.object(seat, "_up", fake_up), \
+                mock.patch.object(seat, "_down", fake_down):
+            label, state, detail = self._row()
+        self.assertEqual(state, "respawned")
+        self.assertEqual(down_calls, [("codex", "codex")])
+        self.assertEqual(len(up_calls), 1)
+
+    def test_ensure_starting_proxy_within_grace_is_never_killed(self):
+        # THE fable adversarial MED: a HEALTHY just-launched proxy still binding
+        # its port reads 'live pid + port not answering' -> the OLD code SIGTERMed
+        # it. Within the startup-grace window it must be left alone (unknown /
+        # STARTING), _down NEVER called — cron firing in the boot window must not
+        # churn kill->respawn->kill.
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 4321, "identity": "x"}), \
+                mock.patch.object(seat, "_running_pid", return_value=4321), \
+                mock.patch.object(seat, "_port_open", return_value=False), \
+                mock.patch.object(seat, "_proxy_age_s", return_value=3.0), \
+                mock.patch.object(seat, "_up") as up, \
+                mock.patch.object(seat, "_down") as down:
+            label, state, detail = self._row()
+        self.assertEqual(state, "unknown")
+        self.assertIn("STARTING", detail)
+        down.assert_not_called()          # the whole point: never SIGTERM a boot
+        up.assert_not_called()            # nor double-spawn over it
+
+    def test_ensure_grace_boundary_old_proxy_still_wedged(self):
+        # past grace AND still not answering -> genuinely wedged -> signal+respawn
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        seq = {"live": True}
+        down_calls = []
+
+        def fake_down(f, seat=None):
+            down_calls.append((f, seat))
+            seq["live"] = False
+            return 0
+
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 4321, "identity": "x"}), \
+                mock.patch.object(seat, "_running_pid",
+                                  lambda f, s=None: 4321 if seq["live"] else None), \
+                mock.patch.object(seat, "_port_open", return_value=False), \
+                mock.patch.object(seat, "_proxy_age_s",
+                                  return_value=seat._ENSURE_STARTUP_GRACE_S + 1), \
+                mock.patch.object(seat, "_up", return_value=1), \
+                mock.patch.object(seat, "_down", fake_down):
+            label, state, detail = self._row()
+        self.assertEqual(down_calls, [("codex", "codex")])
+        self.assertEqual(state, "unknown")   # _up refused -> unresolved -> UNKNOWN
+
+    def test_ensure_unverifiable_live_pid_is_unknown_never_touched(self):
+        # a record whose pid is ALIVE but fails identity verification (a reused
+        # pid now owned by a stranger, or a legacy bare-pid proxy): the watchdog
+        # refuses to signal it AND refuses to respawn over a live foreign
+        # listener — UNKNOWN for a human. (The ds4pro-SIGKILL fix: only an
+        # ALIVE-but-unverifiable pid refuses; a DEAD one respawns.)
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 4321, "identity": None}), \
+                mock.patch.object(seat, "_running_pid", return_value=None), \
+                mock.patch.object(seat, "_pid_alive", return_value=True), \
+                mock.patch.object(seat, "_up") as up, \
+                mock.patch.object(seat, "_down") as down:
+            label, state, detail = self._row()
+        self.assertEqual(state, "unknown")
+        self.assertIn("unverifiable", detail)
+        up.assert_not_called()
+        down.assert_not_called()
+
+    def test_ensure_stale_dead_pidfile_respawns(self):
+        # the codex-2 silent-starvation case: a well-formed identity record
+        # whose pid has since DIED. _running_pid fails closed to None (corpse),
+        # but the record still parses — the watchdog must NOT read it as
+        # 'unverifiable, refuse'; the pid is dead, so this is a plain DOWN ->
+        # respawn via _up.
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        seq = {"live": False}
+        up_calls = []
+
+        def fake_up(f, quiet=False, seat=None):
+            up_calls.append((f, seat))
+            seq["live"] = True
+            return 0
+
+        with mock.patch.object(seat, "_proxy_pid_record",
+                               return_value={"pid": 9999, "identity": "proc:x"}), \
+                mock.patch.object(seat, "_running_pid",
+                                  lambda f, s=None: 5555 if seq["live"] else None), \
+                mock.patch.object(seat, "_pid_alive", return_value=False), \
+                mock.patch.object(seat, "_port_open",
+                                  lambda p, timeout=0.5: seq["live"]), \
+                mock.patch.object(seat, "_up", fake_up), \
+                mock.patch.object(seat, "_down") as down:
+            label, state, detail = self._row()
+        self.assertEqual(state, "respawned")
+        self.assertEqual(up_calls, [("codex", "codex")])
+        down.assert_not_called()          # corpse already gone; nothing to signal
+
+    def test_ensure_respawn_failure_is_unknown(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_proxy_pid_record", return_value=None), \
+                mock.patch.object(seat, "_running_pid", return_value=None), \
+                mock.patch.object(seat, "_port_open", return_value=False), \
+                mock.patch.object(seat, "_up", return_value=1):
+            label, state, detail = self._row()
+        self.assertEqual(state, "unknown")
+        self.assertIn("respawn failed", detail)
+
+    def test_ensure_concurrent_up_loser_reads_healthy_not_unknown(self):
+        # fable LOW: a seat launching in the same instant wins the flock; our
+        # _up returns rc 1 ('already running'). That is NOT a respawn failure —
+        # the row is now HEALTHY under the winner. Re-probe must recover it.
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        seq = {"live": False}   # winner flips this when it steals the start
+
+        def losing_up(f, quiet=False, seat=None):
+            seq["live"] = True   # the concurrent winner's proxy is now up
+            return 1             # ... so OUR _up loses the race
+
+        with mock.patch.object(seat, "_proxy_pid_record", return_value=None), \
+                mock.patch.object(seat, "_running_pid",
+                                  lambda f, s=None: 7777 if seq["live"] else None), \
+                mock.patch.object(seat, "_port_open",
+                                  lambda p, timeout=0.5: seq["live"]), \
+                mock.patch.object(seat, "_up", losing_up), \
+                mock.patch.object(seat, "_down"):
+            label, state, detail = self._row()
+        self.assertEqual(state, "healthy")
+        self.assertIn("concurrent starter won", detail)
+
+    def test_ensure_rc2_on_any_unknown_row(self):
+        # one healthy family + one wedged respawn that fails -> rc 2 overall
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_proxy_pid_record", return_value=None), \
+                mock.patch.object(seat, "_running_pid", return_value=None), \
+                mock.patch.object(seat, "_port_open", return_value=False), \
+                mock.patch.object(seat, "_up", return_value=1):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = seat._ensure([])
+        self.assertEqual(rc, 2)
+
+    def test_doctor_ensure_dispatches_and_guards_tail(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        with mock.patch.object(seat, "_ensure", return_value=0) as ens:
+            rc = seat.cmd_seat(["doctor", "--ensure"])
+        self.assertEqual(rc, 0)
+        ens.assert_called_once()
+        # junk after --ensure still refuses BEFORE any work
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["doctor", "--ensure", "--bogus"])
+        self.assertEqual(rc, 2)
+
+
+class SeatCpuCanaryTest(unittest.TestCase):
+    """The proxy-CPU canary (struggling-backend leading indicator): htop showed
+    cli-proxy-api pids pegged at 152%/90.6% while healthy siblings idled ~0% —
+    sustained-high CPU on a proxy = a thrashing backend BEFORE it goes silent.
+    Classification is windowed, never a point: stored-prior span when one
+    exists, else a double-read; startup bursts are grace; unreadable /proc is
+    UNKNOWN, not OK. Borrows SeatTest's fixtures without subclassing."""
+
+    def setUp(self):
+        SeatTest.setUp(self)
+        self._cpu_dir_prev = os.environ.get("HELM_PROXY_CPU_DIR")
+        os.environ["HELM_PROXY_CPU_DIR"] = os.path.join(self.tmp, "cpu-canary")
+
+    def tearDown(self):
+        if self._cpu_dir_prev is None:
+            os.environ.pop("HELM_PROXY_CPU_DIR", None)
+        else:
+            os.environ["HELM_PROXY_CPU_DIR"] = self._cpu_dir_prev
+        SeatTest.tearDown(self)
+
+    _plant = SeatTest._plant
+    _add = SeatTest._add
+
+    @staticmethod
+    def _sample(jiffies, ts, age_s=300.0, clk=100):
+        return {"jiffies": jiffies, "age_s": age_s, "clk": clk, "ts": ts}
+
+    def _prior(self, seat_name, pid, jiffies, ts):
+        path = seat._cpu_sample_path(seat_name)
+        with open(path, "w") as f:
+            json.dump({"pid": pid, "jiffies": jiffies, "ts": ts}, f)
+        return path
+
+    # -- the sample reader itself: real /proc, our own pid ------------------
+    def test_proc_cpu_sample_reads_self(self):
+        s = seat._proc_cpu_sample(os.getpid())
+        self.assertIsNotNone(s)
+        self.assertIsInstance(s["jiffies"], int)
+        self.assertGreaterEqual(s["age_s"], 0.0)
+        self.assertGreater(s["clk"], 0)
+
+    def test_proc_cpu_sample_unreadable_is_none(self):
+        # a pid that cannot exist: /proc/<huge>/stat is unreadable — None,
+        # so the canary surfaces UNKNOWN, never a silent OK.
+        self.assertIsNone(seat._proc_cpu_sample(2 ** 22 + 12345678))
+
+    # -- classification: OK vs THRASHING vs UNKNOWN, sustained not spike ----
+    def test_canary_unreadable_proc_is_unknown(self):
+        with mock.patch.object(seat, "_proc_cpu_sample", return_value=None):
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "unknown")
+        self.assertIn("unreadable", note)
+
+    def test_canary_first_sight_double_reads_low_cpu_ok(self):
+        # no stored prior: the canary takes TWO readings a window apart —
+        # 10 jiffies over 1s at clk 100 = 10% CPU -> ok.
+        samples = [self._sample(1000, 100.0), self._sample(1010, 101.0)]
+        with mock.patch.object(seat, "_proc_cpu_sample",
+                               side_effect=samples) as reads, \
+                mock.patch.object(seat.time, "sleep") as slept:
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "ok")
+        self.assertAlmostEqual(pct, 10.0)
+        self.assertAlmostEqual(window, 1.0)
+        self.assertEqual(reads.call_count, 2)
+        slept.assert_called_once()        # the double-read IS the window
+
+    def test_canary_first_sight_high_cpu_thrashing(self):
+        # 150 jiffies over 1s at clk 100 = 150% (the htop evidence shape),
+        # process 300s old (past grace) -> THRASHING.
+        samples = [self._sample(1000, 100.0), self._sample(1150, 101.0)]
+        with mock.patch.object(seat, "_proc_cpu_sample", side_effect=samples), \
+                mock.patch.object(seat.time, "sleep"):
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "thrashing")
+        self.assertAlmostEqual(pct, 150.0)
+        self.assertIn("80", note)         # the threshold rides the note
+
+    def test_canary_startup_burst_within_grace_is_ok(self):
+        # same pegged reading but the process is 5s old: model-load burst,
+        # not thrash — grace says OK and the note says why.
+        samples = [self._sample(1000, 100.0, age_s=4.0),
+                   self._sample(1150, 101.0, age_s=5.0)]
+        with mock.patch.object(seat, "_proc_cpu_sample", side_effect=samples), \
+                mock.patch.object(seat.time, "sleep"):
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "ok")
+        self.assertIn("startup", note)
+
+    def test_canary_sustained_via_stored_prior_no_sleep(self):
+        # a stored prior 60s back turns the reading into a REAL sustain:
+        # 9000 jiffies / clk 100 / 60s = 150% held for a minute -> THRASHING,
+        # no in-process sleep (the cron cadence was the window), and the store
+        # rolls forward so the next run measures the next span.
+        self._prior("codex", 4321, 1000, 1000.0)
+        now = self._sample(10000, 1060.0)
+        with mock.patch.object(seat, "_proc_cpu_sample",
+                               return_value=now) as reads, \
+                mock.patch.object(seat.time, "sleep") as slept:
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "thrashing")
+        self.assertAlmostEqual(pct, 150.0)
+        self.assertAlmostEqual(window, 60.0)
+        self.assertEqual(reads.call_count, 1)
+        slept.assert_not_called()
+        with open(seat._cpu_sample_path("codex")) as f:
+            rolled = json.load(f)
+        self.assertEqual(rolled, {"pid": 4321, "jiffies": 10000, "ts": 1060.0})
+
+    def test_canary_prior_for_other_pid_falls_back_to_double_read(self):
+        # the proxy respawned since the last sample: a prior keyed to the OLD
+        # pid must never fabricate a window for the new one.
+        self._prior("codex", 9999, 1000, 1000.0)
+        samples = [self._sample(1000, 1060.0), self._sample(1005, 1061.0)]
+        with mock.patch.object(seat, "_proc_cpu_sample",
+                               side_effect=samples) as reads, \
+                mock.patch.object(seat.time, "sleep") as slept:
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "ok")
+        self.assertEqual(reads.call_count, 2)
+        slept.assert_called_once()
+
+    def test_canary_threshold_env_tunable(self):
+        # HELM_PROXY_CPU_CANARY_PCT=95: a 90% reading (the htop 90.6% pid)
+        # stays OK under a raised bar — the knob is live, not decorative.
+        os.environ["HELM_PROXY_CPU_CANARY_PCT"] = "95"
+        try:
+            samples = [self._sample(1000, 100.0), self._sample(1090, 101.0)]
+            with mock.patch.object(seat, "_proc_cpu_sample",
+                                   side_effect=samples), \
+                    mock.patch.object(seat.time, "sleep"):
+                state, pct, _, _ = seat._cpu_canary("codex", "codex", 4321)
+        finally:
+            os.environ.pop("HELM_PROXY_CPU_CANARY_PCT", None)
+        self.assertEqual(state, "ok")
+        self.assertAlmostEqual(pct, 90.0)
+
+    def test_canary_pid_vanishing_mid_sample_is_unknown(self):
+        samples = [self._sample(1000, 100.0), None]
+        with mock.patch.object(seat, "_proc_cpu_sample", side_effect=samples), \
+                mock.patch.object(seat.time, "sleep"):
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "unknown")
+        self.assertIn("vanished", note)
+
+    # -- the surface: --ensure rows carry the canary, rc semantics ----------
+    def _ensure_with(self, row, canary, args=(), pid=4321):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(seat, "_ensure_row", return_value=row), \
+                mock.patch.object(seat, "_running_pid", return_value=pid), \
+                mock.patch.object(seat, "_cpu_canary", return_value=canary), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat._ensure(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_ensure_thrashing_row_surfaces_and_warns_rc1(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        rc, out, err = self._ensure_with(
+            ("codex", "healthy", "pid 4321 port 8317"),
+            ("thrashing", 152.0, 60.0, ">=80% threshold"))
+        self.assertEqual(rc, 1)           # THRASHING is a WARN, not a page
+        self.assertIn("THRASHING", out)
+        self.assertIn("152", out)
+        self.assertIn("struggling", err)
+
+    def test_ensure_ok_canary_rc0_with_cpu_suffix(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        rc, out, err = self._ensure_with(
+            ("codex", "healthy", "pid 4321 port 8317"),
+            ("ok", 3.0, 60.0, ""))
+        self.assertEqual(rc, 0)
+        self.assertIn("HEALTHY", out)
+        self.assertIn("cpu 3%", out)
+
+    def test_ensure_cpu_unknown_is_never_ok_rc1(self):
+        # requirement: an unreadable /proc is UNKNOWN, not OK — surfaced on
+        # the row and WARN-carried in rc, while liveness stays healthy.
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        rc, out, err = self._ensure_with(
+            ("codex", "healthy", "pid 4321 port 8317"),
+            ("unknown", None, None, "unreadable /proc/4321/stat"))
+        self.assertEqual(rc, 1)
+        self.assertIn("cpu UNKNOWN", out)
+
+    def test_ensure_liveness_unknown_still_rc2_over_warn(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(seat, "_ensure_row",
+                               return_value=("codex", "unknown", "x")), \
+                mock.patch.object(seat, "_cpu_canary") as canary, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat._ensure([])
+        self.assertEqual(rc, 2)           # the page outranks the warn
+        canary.assert_not_called()        # never canary an unproven row
+
+    def test_ensure_json_carries_canary_per_seat(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        rc, out, err = self._ensure_with(
+            ("codex", "healthy", "pid 4321 port 8317"),
+            ("thrashing", 152.0, 60.0, ">=80% threshold"),
+            args=("--ensure", "--json"))
+        self.assertEqual(rc, 1)
+        doc = json.loads(out)
+        self.assertEqual(doc["rc"], 1)
+        self.assertEqual(doc["thrashing"], 1)
+        row = doc["rows"][0]
+        self.assertEqual(row["seat"], "codex")
+        self.assertEqual(row["state"], "healthy")
+        self.assertEqual(row["shown"], "thrashing")
+        self.assertEqual(row["cpu"]["state"], "thrashing")
+        self.assertAlmostEqual(row["cpu"]["pct"], 152.0)
+        self.assertAlmostEqual(row["cpu"]["window_s"], 60.0)
+
+    def test_doctor_json_without_ensure_refused(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["doctor", "--json"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--ensure", err.getvalue())
+
+    def test_doctor_prints_canary_line(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        out = io.StringIO()
+        with mock.patch.object(seat, "_proxy_bin", return_value=None), \
+                mock.patch.object(seat, "_running_pid", return_value=4321), \
+                mock.patch.object(
+                    seat, "_cpu_canary",
+                    return_value=("thrashing", 152.0, 60.0,
+                                  ">=80% threshold")), \
+                contextlib.redirect_stdout(out):
+            seat._doctor([])
+        self.assertIn("cpu canary", out.getvalue())
+        self.assertIn("THRASHING", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -68,6 +68,15 @@ store under `~/.helm`:
 
 The relay's only authority is transport order. It is not the document authority.
 
+## try it (owner walkthrough)
+
+For a hands-on, gui-first test drive — open the cockpit **cave** tab, publish
+from a terminal, and watch two actors converge on a shared board with a live
+presence panel — see **[MULTIPLAYER_TESTDRIVE.md](MULTIPLAYER_TESTDRIVE.md)**.
+That walkthrough uses the built-in demo board: a last-writer-wins keyed map the
+*client* materializes (`helm multiplayer set|status`, and the cockpit's cave
+tab), while the relay stays blind.
+
 ## dogfood
 
 Two local participants can share opaque updates without sharing a harness:

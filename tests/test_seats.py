@@ -526,6 +526,70 @@ class WaitTest(SeatsBase):
         self.assertIsNone(line)
         self.assertEqual(captured, [])
 
+    def test_wait_follow_bounds_a_backlog_burst_so_the_beacon_cannot_firehose(self):
+        """A --follow beacon arming to a large backlog must NOT replay it as one
+        burst: each emit is a Monitor event, and >~10 in a burst trips Monitor's
+        firehose auto-stop -> SIGTERM, and the seat goes DEAF (live 2026-07-23: a
+        ~36-row backlog killed the beacon <8s every arm). ONE drain pass is
+        capped at BEACON_DRAIN_CAP emits + a single catch-up nudge, never the
+        whole backlog. Pre-fix this pass emitted all 40 (the firehose)."""
+        class _PassDone(Exception):
+            pass
+        seats.join(seat="alice", cwd="/tmp/p")     # baselines the cursor at join
+        for i in range(40):
+            chat.post("@alice backlog %d" % i, who="bob")
+        captured = []
+        # Run EXACTLY ONE drain pass: the post-drain sleep raises out of wait(),
+        # so `captured` holds precisely what a single arming burst would emit.
+        with mock.patch("time.sleep", side_effect=_PassDone):
+            with self.assertRaises(_PassDone):
+                seats.wait(seat="alice", follow=True, poll=0.01,
+                           emit=captured.append)
+        self.assertLessEqual(len(captured), seats.BEACON_DRAIN_CAP + 1)
+        self.assertLess(len(captured), 40)         # NOT the whole backlog
+        # still WAKES the agent and points it at the backlog to catch up
+        self.assertTrue(any("more pending" in c for c in captured))
+
+    def test_wait_any_follow_bounds_a_burst_and_streams_the_residue(self):
+        """The --any --follow watcher is the SAME firehose class as the seat
+        drain: >BEACON_DRAIN_CAP new rows in one poll must NOT emit as one
+        Monitor burst (auto-stop -> SIGTERM -> deaf). Each pass emits <=CAP + one
+        nudge and advances the watermark only PAST what it emitted, so the residue
+        streams the NEXT poll — never a since=total skip that drops rows."""
+        class _PassDone(Exception):
+            pass
+        cap = seats.BEACON_DRAIN_CAP
+        n = cap * 2 + 1                         # two full over-cap passes + a tail
+        rows = [{"id": "r%d" % i, "from": "bob", "text": "burst %d" % i}
+                for i in range(n)]
+        reads = {"n": 0}
+        loop_since = []
+        def fake_read(room="main", since=0):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return [], 0                   # the arm baseline -> since=0
+            loop_since.append(since)           # every loop read's watermark
+            return rows[since:], len(rows)
+        sleeps = {"n": 0}
+        def fake_sleep(*_a):
+            sleeps["n"] += 1
+            if sleeps["n"] >= 2:               # stop after exactly two poll passes
+                raise _PassDone
+        emitted = []
+        with mock.patch.object(seats.chat, "read", side_effect=fake_read):
+            with mock.patch("time.sleep", side_effect=fake_sleep):
+                with self.assertRaises(_PassDone):
+                    seats.wait(any_row=True, follow=True, poll=0.01,
+                               emit=emitted.append)
+        # residue preserved: pass 2 read from the ADVANCED watermark (cap), never
+        # from total — a since=total skip would have dropped rows[cap:] silently.
+        self.assertEqual(loop_since, [0, cap])
+        content = [c for c in emitted if "more pending" not in c]
+        nudges = [c for c in emitted if "more pending" in c]
+        self.assertEqual(len(nudges), 2)               # both passes were over-cap
+        self.assertEqual(len(content), 2 * cap)        # cap per pass, none dropped
+        self.assertLess(len(content), n)               # never the whole burst
+
     def test_wait_any_sees_only_rows_after_arming(self):
         import threading
         chat.post("pre-existing", who="bob")
@@ -1016,7 +1080,7 @@ class DMTest(SeatsBase):
                       seats.deliver_any(session="s-p", seat="team.a"))
 
     def test_dm_signed_like_a_post_and_renders_as_dm(self):
-        sent = {"sent": True, "turn_hash": "t" * 64, "receipt_hash": "r" * 64,
+        sent = {"sent": True, "turn_hash": "a" * 64, "receipt_hash": "b" * 64,
                 "chain_index": 9}
         with mock.patch.object(chat, "_sign_send", return_value=(sent, None)) as ss:
             row, err = seats.dm("zoe", "signed word", who="ada", sign=True)

@@ -256,13 +256,31 @@ def _usable(b):
     return bool(b and os.path.isfile(b) and os.access(b, os.X_OK))
 
 
+def bin_status():
+    """One signer-configuration truth for send + every status projection.
+    The configured path is deliberately not returned: diagnostics identify the
+    failure class without publishing a possibly hostile path string."""
+    b = bin_path()
+    if not b:
+        return {"configured": False, "usable": False, "state": "unset",
+                "reason": "HELM_CELL_BIN is unset"}
+    if not os.path.exists(b):
+        return {"configured": True, "usable": False, "state": "missing",
+                "reason": "HELM_CELL_BIN is set but the signer path does not exist"}
+    if not os.path.isfile(b):
+        return {"configured": True, "usable": False, "state": "not_file",
+                "reason": "HELM_CELL_BIN is set but the signer path is not a regular file"}
+    if not _usable(b):
+        return {"configured": True, "usable": False,
+                "state": "not_executable",
+                "reason": "HELM_CELL_BIN is set but the signer file is not executable"}
+    return {"configured": True, "usable": True, "state": "ready",
+            "reason": "signer ready"}
+
+
 def bin_ready():
-    """True only when the explicit HELM_CELL_BIN points at a real, executable
-    file — the ONE signer-availability answer every signing leg and status
-    surface asks before claiming (or attempting) a signed turn. False must
-    short-circuit: no node probe, no revive, no unlock — a missing (or
-    unusable) signer is a configuration fact, not a fault to recover from."""
-    return _usable(bin_path())
+    """True only when the configured signer is a real executable file."""
+    return bin_status()["usable"]
 
 
 def roster_path():
@@ -275,17 +293,17 @@ def run_bin(args, timeout=90, env_extra=None):
     reason when no binary is configured (HELM_CELL_BIN unset) or launch fails.
     env_extra lays over the mapped env."""
     b = bin_path()
-    if not _usable(b):
-        return None, "", ("a2a transport unavailable — set HELM_CELL_BIN to a "
-                          "cell binary (optional; helm attestation runs fully "
-                          "without it)")
+    status = bin_status()
+    if not status["usable"]:
+        return None, "", "a2a transport unavailable — " + status["reason"]
     env = build_env()
     env.update(env_extra or {})
     try:
         p = subprocess.run([b] + args, env=env, capture_output=True,
                            text=True, timeout=timeout)
     except OSError as exc:
-        return None, "", "cell binary failed to launch: %s" % exc
+        detail = exc.strerror or exc.__class__.__name__
+        return None, "", "configured signer could not execute (%s)" % detail
     except subprocess.TimeoutExpired:
         return None, "", "cell %s timed out after %ss" % (args[0], timeout)
     return p.returncode, p.stdout, p.stderr
@@ -347,12 +365,15 @@ def _status(args):
               "offline; the node is only an optional anchor)" % url)
     print("helm cell: " + _roster_summary())
     b = bin_path()
-    if _usable(b):
+    signer = bin_status()
+    if signer["usable"]:
         print("helm cell: optional a2a binary " + b)
+    elif signer["configured"]:
+        print("helm cell: optional a2a signer UNAVAILABLE — %s" % signer["reason"])
     else:
         print("helm cell: optional a2a transport OFF (no HELM_CELL_BIN) — "
               "attestation does not need it")
-    return 0 if live else 1
+    return 0 if live and (not signer["configured"] or signer["usable"]) else 1
 
 
 def cmd_cell(args):
@@ -370,9 +391,9 @@ def cmd_cell(args):
         print(_USAGE, file=sys.stderr)
         return 2
     b = bin_path()
-    if not _usable(b):
-        print("helm cell: a2a transport unavailable — set HELM_CELL_BIN to a "
-              "cell binary (optional; attestation is native and never needs it)",
+    signer = bin_status()
+    if not signer["usable"]:
+        print("helm cell: a2a transport unavailable — %s" % signer["reason"],
               file=sys.stderr)
         return 1
     try:

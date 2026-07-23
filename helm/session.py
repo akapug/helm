@@ -37,6 +37,7 @@ current substrate before answering).
 """
 import calendar
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -775,6 +776,288 @@ def _proc_claude_rows():
             "nonpersistent": _is_nonpersistent(snap.get("argv") or []),
         })
     return rows
+
+
+_GONE_ERRNOS = {errno.ENOENT, errno.ESRCH}
+
+
+def _gone(err):
+    """The pid left mid-scan (genuine absence) vs a failed PROBE on a pid that
+    persists (EACCES/EIO/anything else on a mandatory read)."""
+    return err.errno in _GONE_ERRNOS
+
+
+def _full_environ(raw):
+    """The bracketed environ, decoded WHOLE, or None when the bracketed read
+    failed. Exported on census rows so consumers (fleet's seat/deck/stamp
+    columns) read env facts from the SAME process generation the census proved
+    coherent, instead of re-opening /proc/<pid>/environ at a later moment a
+    reused pid could answer."""
+    if raw is None:
+        return None
+    return dict(kv.split("=", 1) for kv in
+                raw.decode("utf-8", "replace").split("\0") if "=" in kv)
+
+
+def _census_matches(pid, start, cmdline, environ=None, cwd=None):
+    """Tri-state sibling of _proc_matches for the census. True = the bracket is
+    proven intact; False = a read PROVED a different generation, or the pid
+    left mid-recheck (ENOENT/ESRCH) — genuine absence of the bracketed
+    generation; None = a mandatory recheck read FAILED (EACCES/EIO/...) while
+    the pid persists — a failed PROBE the census surfaces as UNKNOWN, never as
+    proven absence. (The plain _proc_matches stays bool-valued for its own
+    callers; the census needs the None rung to tell probe-failure from proven
+    reuse.)"""
+    try:
+        # Do not call _proc_start here: its legacy contract intentionally folds
+        # every OSError to None. The census must preserve EACCES/EIO as UNKNOWN
+        # and distinguish them from a gone pid or a proven generation change.
+        live_start = _starttime_from_stat(_proc_bytes(pid, "stat"))
+        if live_start is None:
+            return None  # stat was read but unparsable: failed probe, not absence
+        if live_start != start or _proc_bytes(pid, "cmdline") != cmdline:
+            return False
+        if environ is not None and _proc_bytes(pid, "environ") != environ:
+            return False
+        return cwd is None or os.readlink(
+            os.path.join(PROC, str(pid), "cwd")) == cwd
+    except OSError as e:
+        return False if _gone(e) else None
+
+
+def _census_snapshot(pid):
+    """Tri-state sibling of _proc_snapshot for the census, fail-closed — a pass
+    whose input was missing is vacuous:
+
+      ("ok", snap)      every mandatory fact proven.
+      ("absent", None)  structurally not ours (foreign uid, non-claude comm)
+                        or the process left mid-scan (ENOENT/ESRCH) — genuine
+                        absence, skipped.
+      ("unknown", stub) comm PROVED claude, then a mandatory read failed while
+                        the pid persists — the pid is KNOWN, its facts are
+                        unprovable; the census surfaces it, never drops it as
+                        proven absence.
+      ("partial", None) a mandatory read failed BEFORE comm could prove or
+                        refute claude on a pid that may be ours — the census
+                        cannot certify its own completeness (census_partial).
+
+    (The plain _proc_snapshot stays dict-or-None for its own callers, which
+    tri-state would break; this sibling adds the UNKNOWN/PARTIAL rungs the
+    fail-closed census needs.)"""
+    base = os.path.join(PROC, str(pid))
+    try:
+        uid = os.stat(base).st_uid
+    except OSError as e:
+        return ("absent", None) if _gone(e) else ("partial", None)
+    if uid != os.geteuid():
+        return "absent", None  # foreign uid: structurally not ours
+    try:
+        start = _starttime_from_stat(_proc_bytes(pid, "stat"))
+    except OSError as e:
+        return ("absent", None) if _gone(e) else ("partial", None)
+    if not start:
+        return "partial", None  # stat read but unparsable: a failed probe
+    try:
+        comm = _proc_bytes(pid, "comm").strip()
+    except OSError as e:
+        return ("absent", None) if _gone(e) else ("partial", None)
+    if comm != b"claude":
+        return "absent", None
+    try:
+        cmdline = _proc_bytes(pid, "cmdline")
+    except OSError as e:
+        if _gone(e):
+            return "absent", None
+        return "unknown", {"pid": pid, "uid": uid, "start": start}
+    try:
+        environ_raw = _proc_bytes(pid, "environ")
+        environ = _selected_environ(environ_raw)
+    except OSError:
+        environ_raw = environ = None
+    try:
+        cwd = os.readlink(os.path.join(base, "cwd"))
+    except OSError:
+        cwd = None
+    try:
+        stdin = os.readlink(os.path.join(base, "fd", "0"))
+    except OSError:
+        stdin = None
+    match = _census_matches(pid, start, cmdline, environ_raw, cwd)
+    if match is None:
+        # the bracket RECHECK failed while the pid persists: comm already
+        # PROVED claude, so the pid is KNOWN and its facts are unprovable —
+        # UNKNOWN, never a silent drop that certifies absence
+        return "unknown", {"pid": pid, "uid": uid, "start": start}
+    if not match:
+        return "absent", None
+    return "ok", {"pid": pid, "uid": uid, "start": start, "cmdline": cmdline,
+                  "environ": environ_raw,
+                  "argv": cmdline.decode("utf-8", "replace").split("\0"),
+                  "env": environ, "cwd": cwd, "stdin": stdin}
+
+
+def _proc_claude_census():
+    """Every same-uid live Claude process, PLUS the completeness of the GLOBAL
+    probes the table rests on, PLUS each row's bracket export. The fail-closed
+    superset of _proc_claude_rows that helm/fleet.py consumes: identical
+    resolution ladder and per-row identity (procStart-bound pid record ->
+    unambiguous full ``--resume`` UUID -> exact ``helm who`` attribution -> cwd
+    candidate set), but it never turns a failed probe into a proven-empty row.
+
+    ``listing_failed`` True: the /proc enumeration itself failed — zero rows
+    because nothing was READ, not because nothing runs; a consumer renders
+    estate-UNKNOWN, never certifies an empty estate. ``who_failed`` True: the
+    who rung was never probed, so an unresolved non-child row may only look
+    unresolved because its strongest remaining rung silently vanished.
+    ``census_partial`` True: a mandatory per-pid probe failed BEFORE the pid's
+    comm could prove or refute claude — the row count is a FLOOR ("at least
+    N"), never a certified estate total. A probe that fails AFTER comm proved
+    claude yields a ``probe_failed`` UNKNOWN row (pid known, facts unprovable)
+    rather than vanishing. Only ENOENT/ESRCH — the process left mid-scan — is
+    genuine absence.
+
+    Each row also exports its bracket: ``start`` (the pid generation every
+    fact was proven against — a consumer making LATER /proc reads must re-prove
+    it before composing them in), ``cwd``, ``root`` (canonical trusted config
+    root; None = config-untrusted) and ``environ`` (the bracketed environ,
+    whole, so env facts never need a second unbracketed read)."""
+    snapshots, unknown_stubs = [], []
+    listing_failed = census_partial = False
+    try:
+        pids = sorted((int(p) for p in os.listdir(PROC) if p.isdigit()))
+    except OSError:
+        pids, listing_failed = [], True
+    for pid in pids:
+        status, snap = _census_snapshot(pid)
+        if status == "ok":
+            snapshots.append(snap)
+        elif status == "unknown":
+            unknown_stubs.append(snap)
+        elif status == "partial":
+            census_partial = True
+    who_failed, who_failed_pids = False, set()
+    try:
+        from . import who
+        who_status = {}
+        scanned = who.scan(accounts=[], status=who_status)
+        who_rows = {r["pid"]: r for r in scanned
+                    if r.get("provider") == "anthropic"
+                    and r.get("child") is False}
+        who_failed = bool(who_status.get("listing_failed"))
+        who_failed_pids = set(who_status.get("failed_pids") or ())
+    except Exception:
+        # broad on purpose: who parses external proc/transcript state, so a
+        # malformed row can raise KeyError/TypeError just as plausibly as an
+        # OSError. Every shape of failure degrades to who_failed, never a
+        # successful negative attribution.
+        who_rows, who_failed = {}, True
+    cwd_candidates = {}
+    rows = []
+    for snap in snapshots:
+        pid, selected = snap["pid"], snap["env"]
+        env = selected or {}
+        invalid_home = (("CLAUDE_CONFIG_DIR" in env
+                         and env["CLAUDE_CONFIG_DIR"] is None)
+                        or (not env.get("CLAUDE_CONFIG_DIR") and "HOME" in env
+                            and env["HOME"] is None))
+        if selected is None:
+            declared, reason, root = None, "environ-unreadable", None
+        elif invalid_home:
+            declared, reason, root = None, "config-untrusted", None
+        else:
+            declared, reason, root = _session_record(
+                pid, env.get("CLAUDE_CONFIG_DIR"), env.get("HOME"),
+                snap["uid"], snap["start"])
+        resume = _resume_sid(snap["argv"])
+        child = env.get("CLAUDE_CODE_CHILD_SESSION") == "1"
+        who_row = who_rows.get(pid, {})
+        who_sid = None if child else _who_holder_sid(who_row)
+        # PID equality alone is not identity: who must have resolved the SAME
+        # bracketed config root and cwd as this census row. Otherwise a process
+        # with alternate HOME can inherit the inspector's ~/.claude transcript.
+        who_context_mismatch = bool(
+            who_sid and (not root or not who_row.get("home")
+                         or os.path.realpath(who_row["home"])
+                         != os.path.realpath(root)
+                         or who_row.get("cwd") != snap["cwd"]))
+        attributed = None if who_context_mismatch else who_sid
+        who_probe_failed = pid in who_failed_pids
+        possible = []
+        if (not (child or declared or resume or attributed)
+                and root and snap["cwd"]):
+            key = (root, snap["cwd"])
+            if key not in cwd_candidates:
+                cwd_candidates[key] = _cwd_session_ids(*key)
+            possible = cwd_candidates[key]
+        match = _census_matches(pid, snap["start"], snap["cmdline"],
+                                snap["environ"], snap["cwd"])
+        if match is None:
+            # the mid-loop rebracket FAILED while the pid persists (EACCES/
+            # EIO): comm proved claude at snapshot time, so the row must
+            # surface as a probe_failed UNKNOWN stub — a silent drop here would
+            # read as proven absence, the exact class this census legislates
+            # against
+            unknown_stubs.append({"pid": pid, "uid": snap["uid"],
+                                  "start": snap["start"]})
+            continue
+        if not match:
+            continue
+        session_id = declared or resume or attributed
+        rows.append({
+            "pid": pid,
+            "resume": resume,
+            "declared": declared,
+            "declared_reason": reason,
+            # exported composition context (consumed by helm/fleet.py so it can
+            # CALL this census instead of re-deriving it): the bracketed cwd,
+            # the canonical trusted config root (None = config-untrusted), the
+            # bracket generation, and the bracketed whole environ.
+            "cwd": snap["cwd"],
+            "root": root,
+            "start": snap["start"],
+            "environ": _full_environ(snap["environ"]),
+            "identity": ("declared" if declared else "resume" if resume
+                         else "who" if attributed else "unknown"),
+            "session": session_id,
+            "possible_sessions": possible,
+            "child": child,
+            "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
+            "force": env.get(FORCE_VAR) == "1",
+            "headless": (_is_headless(snap.get("argv") or [])
+                         or _stdin_redirected(snap.get("stdin"))),
+            "nonpersistent": _is_nonpersistent(snap.get("argv") or []),
+            "probe_failed": False,
+            "who_probe_failed": who_probe_failed,
+            "who_context_mismatch": who_context_mismatch,
+        })
+    for stub in unknown_stubs:
+        # comm proved claude, then a mandatory read failed while the pid
+        # persisted. Surface the pid as an UNKNOWN row — but only while its
+        # GENERATION still persists: a gone pid (ENOENT/ESRCH) is genuine
+        # absence, while an unreadable recheck stays fail-closed UNKNOWN.
+        try:
+            live_start = _starttime_from_stat(
+                _proc_bytes(stub["pid"], "stat"))
+            # A readable-but-torn stat is still a failed probe. Only a parsed
+            # different starttime proves this generation gone.
+            still = live_start is None or live_start == stub["start"]
+        except OSError as e:
+            still = not _gone(e)
+        if not still:
+            continue
+        rows.append({
+            "pid": stub["pid"], "resume": None, "declared": None,
+            "declared_reason": "probe-failed",
+            "cwd": None, "root": None, "start": stub["start"],
+            "environ": None, "identity": "unknown", "session": None,
+            "possible_sessions": [], "child": False, "ancestor_sid8": "",
+            "force": False, "headless": False, "nonpersistent": False,
+            "probe_failed": True, "who_probe_failed": False,
+            "who_context_mismatch": False,
+        })
+    rows.sort(key=lambda r: r["pid"])
+    return {"rows": rows, "listing_failed": listing_failed,
+            "who_failed": who_failed, "census_partial": census_partial}
 
 
 def live_sids(rows=None):

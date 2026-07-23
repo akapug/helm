@@ -15,6 +15,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,7 +23,9 @@ from helm import chat, web  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
-            "HELM_CELL_BIN", "MELD_CELL_BIN")
+            "HELM_CHAT_ROOM", "MELD_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
+            "MELD_CHAT_ROOM_SOURCE", "HELM_CELL_BIN", "MELD_CELL_BIN",
+            "HELM_CELL_PROFILE", "MELD_AGENT_PROFILE")
 
 
 class TestWebChat(unittest.TestCase):
@@ -46,6 +49,7 @@ class TestWebChat(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        failure_dir = chat.sign_failures_dir()
         cls.srv.shutdown()
         cls.srv.server_close()
         cls.thread.join(timeout=5)
@@ -55,10 +59,14 @@ class TestWebChat(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        shutil.rmtree(failure_dir, ignore_errors=True)
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
-        # each test starts with an empty room dir (rooms are per-test state)
+        # Retire any process-local fallback through the real ACK lifecycle before
+        # deleting this class's reused tmpfs owner between tests.
+        chat.acknowledge_sign_failures()
+        shutil.rmtree(chat.sign_failures_dir(), ignore_errors=True)
         shutil.rmtree(os.environ["HELM_CHAT_DIR"], ignore_errors=True)
 
     def req(self, path, payload=None, token=True):
@@ -85,7 +93,89 @@ class TestWebChat(unittest.TestCase):
         # the transport truth rides every poll: disabled env -> unsigned, no url
         self.assertEqual(d["transport"],
                          {"mode": "unsigned", "url": None, "head": None,
-                          "signer": False})
+                          "signer": False, "signer_configured": False})
+
+    def test_web_post_with_configured_missing_signer_is_persistently_degraded(self):
+        missing = os.path.join(self.tmp, "deleted\x1b[2J-token=secret-signer")
+        env = {"HELM_CELL_BIN": missing, "HELM_CELL_PROFILE": "web-seat",
+               "HELM_CHAT_NODE_URL": "http://127.0.0.1:1"}
+        with mock.patch.dict(os.environ, env):
+            status, posted = self.req("/api/chat", {"text": "still delivered"})
+            self.assertEqual(status, 200)
+            status, polled = self.req("/api/chat?since=0")
+            self.assertEqual(status, 200)
+        row = posted["msg"]
+        transport = polled["transport"]
+        self.assertEqual((row["transport"]["code"], transport["mode"],
+                          transport["code"], transport["signer_configured"]),
+                         ("signer_unavailable", "degraded",
+                          "signer_unavailable", True))
+        self.assertEqual(chat.sign_failures()[0]["profile"], "web-seat")
+        public = json.dumps({"posted": posted, "polled": polled},
+                            ensure_ascii=False)
+        self.assertNotIn(missing, public)
+        self.assertNotIn("secret", public)
+        self.assertNotIn("\x1b", public)
+
+    def test_web_poll_and_served_ui_show_precise_degraded_transport(self):
+        failure = chat._diag("send_failed", "second send failed")
+        with mock.patch.object(chat, "_sign_send", return_value=(None, failure)):
+            row = chat.post("still delivered", who="agent", profile="seat-a",
+                            sign=True)
+        self.assertEqual(row["transport"]["state"], "DEGRADED")
+        status, d = self.req("/api/chat")
+        self.assertEqual(status, 200)
+        t = d["transport"]
+        self.assertEqual((t["mode"], t["state"], t["profile"], t["reason"]),
+                         ("degraded", "DEGRADED", "seat-a",
+                          "second send failed"))
+        for key in ("first_failure", "last_failure", "age_s", "remediation"):
+            self.assertIn(key, t)
+        with urllib.request.urlopen("http://127.0.0.1:%d/" % self.port,
+                                    timeout=10) as resp:
+            html = resp.read().decode("utf-8")
+        self.assertIn('t.mode === "degraded"', html)
+        self.assertIn('t.label || t.mode || "unsigned"', html)
+        self.assertIn('tp.label || tp.mode', html)
+        self.assertIn('"DEGRADED · " + (t.profile', html)
+        self.assertIn("t.first_failure", html)
+        self.assertIn("t.last_failure", html)
+        self.assertIn("t.remediation", html)
+        self.assertIn('signing <span class="lbadge tent">DEGRADED</span>', html)
+        self.assertIn("tp.first_failure", html)
+        self.assertIn("tp.last_failure", html)
+        self.assertIn('tr.state === "DEGRADED"', html)
+        self.assertIn('class="cdiag"', html)
+        self.assertIn('⚠ DEGRADED', html)
+
+    def test_cell_profile_is_laundered_in_post_and_poll_json(self):
+        raw = "web\x1b[31m\x01\x85‮"
+        clean = chat._dsan(raw)
+        failure = chat._diag(
+            "send_failed", "node\x1b[2J\x01\x85‮ refused")
+        env = {"HELM_CELL_PROFILE": raw, "HELM_CELL_BIN": "/bin/true",
+               "HELM_CHAT_NODE_URL": "http://127.0.0.1:1"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(chat, "node_head", return_value={"chain_index": 1}), \
+             mock.patch.object(chat, "_sign_send", return_value=(None, failure)):
+            status, posted = self.req("/api/chat", {"text": "still lands"})
+            self.assertEqual(status, 200)
+            status, polled = self.req("/api/chat?since=0")
+            self.assertEqual(status, 200)
+
+        with open(chat.sign_failures_path()) as f:
+            self.assertIn(raw, json.load(f))
+        profiles = [posted["msg"]["transport"]["profile"],
+                    polled["lines"][0]["transport"]["profile"],
+                    polled["transport"]["profile"]]
+        profiles.extend(f["profile"]
+                        for f in polled["transport"]["failed_profiles"])
+        self.assertTrue(profiles)
+        self.assertEqual(set(profiles), {clean})
+        body = json.dumps({"posted": posted, "polled": polled},
+                          ensure_ascii=False)
+        for ch in ("\x1b", "\x00", "\x01", "\x85", "‮"):
+            self.assertNotIn(ch, body)
 
     def test_rooms_sidebar_lists_channels_with_cross_room_signal(self):
         """slice-1: /api/chat carries `rooms` (the channel sidebar) with a

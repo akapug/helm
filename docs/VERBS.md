@@ -1505,13 +1505,19 @@ poster's cell there: the turn payload carries the message digest
 (`chat:b2b:<blake2b-256>`), the RAM room carries the text (thin claim, fat
 corroboration — the same pattern as premise attestation, see
 [ATTESTATION.md](ATTESTATION.md)). Signed rows render clean (the web panel
-shows a subtle ✓ tick, chain index on hover); node down → the v1 path
-automatically, tagged `[unsigned]` — the message never dies, the signature is
-what degrades. No signer configured → the same honest tag with zero signing
-traffic (no probe, no unlock), and the status strip says
-`unsigned (no signer)` rather than letting a reachable node imply signed
-posts. Agents sign as `HELM_CELL_PROFILE` (else `helm-agent`); the
-owner's web posts sign server-side as `david`. `helm chat node up` provisions
+shows a subtle ✓ tick, chain index on hover). A node/sign/join/faucet failure
+falls open to the v1 row, tagged `[unsigned]` — the message never dies, but the
+failure is **LOUD and sticky**: the row records a secret-scrubbed structured
+`transport` diagnostic, the exact per-profile incident stays on tmpfs
+(`/dev/shm/helm-chat-failures/<room-key>/.sign-failures.json` when the room
+path itself is not tmpfs), and CLI/TUI/web/doctor all report `DEGRADED`
+with reason, profile, first/last failure, age, count, and remediation until a
+successful signed turn by that profile clears it. No signer configured is not
+an incident: it keeps the same honest tag with zero signing traffic (no probe,
+no unlock), and status says `unsigned (no signer)` rather than letting a
+reachable node imply signed posts. Agents sign as `HELM_CELL_PROFILE` (else
+`helm-agent`); the owner's web posts sign server-side as `david`. `helm chat
+node up` provisions
 the room node (`helm-chat-node.service`, `dregg-cave-node` on
 `/dev/shm/helm-chat-node`, port 8898, faucet ON — the node auto-funds joining
 cells and helm tops up before each turn: **chat turns never die on

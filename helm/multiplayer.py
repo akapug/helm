@@ -373,7 +373,12 @@ def _display(value):
 
 def _print(value, as_json):
     if as_json:
-        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+        # ensure_ascii=True: --json is a TERMINAL sink for attacker-influenceable
+        # relay/actor data, so C1 (U+009B) and bidi (U+202E) must escape to
+        # \\uXXXX — still valid JSON, machine-parseable, terminal-safe (the human
+        # -readable path already launders via _display). Same for every other
+        # --json emission below (gate FIX, 2026-07-23).
+        print(json.dumps(value, ensure_ascii=True, sort_keys=True))
         return
     if isinstance(value, list):
         for row in value:
@@ -388,10 +393,37 @@ def _print(value, as_json):
     print("cursor %s" % _display(value["cursor"]))
 
 
+def _print_status(doc, cave, cursor, view, peers):
+    """The demo board + peers, materialized for a human. Cell values ride the
+    blind relay from any actor, so launder every field like read/peers do — an
+    ESC/bidi payload must never reach a terminal through this view."""
+    print("board %s @ %s" % (_display(doc), _display(cave)))
+    for cell in view["board"]:
+        ago = "" if not cell.get("ts") else (
+            " (%.0fs ago)" % max(0, time.time() - cell["ts"]))
+        print("  %s = %s\t— %s%s" % (_display(cell["key"]), _display(cell["value"]),
+                                     _display(cell["actor"]), ago))
+    if not view["board"]:
+        print("  (no cells yet)")
+    if view["foreign"]:
+        print("  +%d opaque update(s) from other clients — relay stays blind"
+              % view["foreign"])
+    print("peers:")
+    for p in peers:
+        print("  %s@%s\t%s\t(seen %.1fs ago)" % (
+            _display(p["actor"]), _display(p["connection"]), _display(p["state"]),
+            max(0, time.time() - p.get("seen", time.time()))))
+    if not peers:
+        print("  (nobody connected)")
+    print("cursor %s" % _display(cursor))
+
+
 def cmd_multiplayer(args, adapter_factory=adapters):
-    """multiplayer publish|read|presence|peers|leave — local opaque updates + TTL presence."""
+    """multiplayer set|status|publish|read|presence|peers|leave — local opaque updates + TTL presence (set/status = the built-in LWW demo board)."""
     if not args:
-        print("usage: helm multiplayer publish <doc> --stdin [--cave C] [--actor A]\n"
+        print("usage: helm multiplayer set <doc> <key> <value> [--cave C] [--actor A]\n"
+              "       helm multiplayer status <doc> [--cave C] [--json]\n"
+              "       helm multiplayer publish <doc> --stdin [--cave C] [--actor A]\n"
               "       helm multiplayer read <doc> [--cave C] [--after CURSOR] [--json]\n"
               "       helm multiplayer presence [--cave C] [--actor A] [--connection ID] [--state S] [--ttl N]\n"
               "       helm multiplayer peers [--cave C] [--json]\n"
@@ -399,7 +431,8 @@ def cmd_multiplayer(args, adapter_factory=adapters):
         return 2
     try:
         verb = args[0]
-        if verb not in ("publish", "read", "presence", "peers", "leave"):
+        if verb not in ("set", "status", "publish", "read", "presence",
+                        "peers", "leave"):
             # refuse BEFORE the adapters are constructed — an unknown verb
             # must not create relay/presence state as a side effect.
             raise ValueError("invalid multiplayer command")
@@ -408,26 +441,47 @@ def cmd_multiplayer(args, adapter_factory=adapters):
         actor = values.get("actor") or actor_name()
         connection = values.get("connection") or connection_name(actor)
         relay, presence = adapter_factory(values.get("backend"))
-        if verb == "publish" and len(rest) == 1:
+        if verb == "set" and len(rest) >= 3:
+            # the demo LWW client: encode a cell, hand the relay an opaque
+            # string. `set doc key a b c` joins the tail so unquoted multi-word
+            # values work; quote for exactness. Raw `publish` stays the blind path.
+            from . import multiplayer_demo
+            update = multiplayer_demo.encode(rest[1], " ".join(rest[2:]), actor)
+            row = relay.publish(cave, rest[0], actor, update)
+            print(json.dumps(row, ensure_ascii=True, sort_keys=True))
+        elif verb == "status" and len(rest) == 1:
+            from . import multiplayer_demo
+            state = relay.updates(cave, rest[0], values.get("after", 0))
+            view = multiplayer_demo.materialize(state["updates"])
+            peers = presence.peers(cave)
+            if "--json" in flags:
+                print(json.dumps(
+                    {"cave": _identity(cave, "cave"),
+                     "doc": _identity(rest[0], "doc"), "cursor": state["cursor"],
+                     "board": view["board"], "foreign": view["foreign"],
+                     "peers": peers}, ensure_ascii=True, sort_keys=True))
+            else:
+                _print_status(rest[0], cave, state["cursor"], view, peers)
+        elif verb == "publish" and len(rest) == 1:
             if "--stdin" not in flags:
                 raise ValueError("publish requires --stdin (opaque updates never ride argv)")
             update = sys.stdin.read(MAX_UPDATE_BYTES + 1)
             if not update:
                 raise ValueError("publish received an empty opaque update")
             row = relay.publish(cave, rest[0], actor, update)
-            print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            print(json.dumps(row, ensure_ascii=True, sort_keys=True))
         elif verb == "read" and len(rest) == 1:
             _print(relay.updates(cave, rest[0], values.get("after", 0)),
                    "--json" in flags)
         elif verb == "presence" and not rest:
             row = presence.heartbeat(cave, actor, values.get("state", "active"),
                                      values.get("ttl", DEFAULT_TTL), connection)
-            print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            print(json.dumps(row, ensure_ascii=True, sort_keys=True))
         elif verb == "peers" and not rest:
             rows = presence.peers(cave)
             if "--json" in flags:
                 print(json.dumps({"cave": _identity(cave, "cave"), "peers": rows},
-                                 ensure_ascii=False, sort_keys=True))
+                                 ensure_ascii=True, sort_keys=True))
             else:
                 _print(rows, False)
         elif verb == "leave" and not rest:
