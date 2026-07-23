@@ -144,6 +144,44 @@ def global_dir():
     return os.path.join(helm_home(), GLOBAL)
 
 
+def seat_claude_roots():
+    """Every minted fleet seat's Claude projects root, family and instance.
+    These are harness transcript homes, not a second store."""
+    root = os.path.join(global_dir(), "seats")
+    out = []
+    try:
+        families = os.listdir(root)
+    except OSError:
+        return out
+    for family in families:
+        d = os.path.join(root, family)
+        p = os.path.join(d, "claude", "projects")
+        if os.path.isdir(p):
+            out.append(os.path.realpath(p))
+        inst = os.path.join(d, "instances")
+        try:
+            names = os.listdir(inst)
+        except OSError:
+            continue
+        for name in names:
+            p = os.path.join(inst, name, "claude", "projects")
+            if os.path.isdir(p):
+                out.append(os.path.realpath(p))
+    return sorted(set(out))
+
+
+def cv_env(base=None):
+    """Environment for any cv subprocess: preserve caller overrides and add all
+    fleet seat transcript roots through CV's generic multi-root contract."""
+    e = dict(os.environ if base is None else base)
+    roots = [p for p in e.get("CLUSTERVISION_CLAUDE_ROOTS", "").split(os.pathsep)
+             if p]
+    roots.extend(seat_claude_roots())
+    if roots:
+        e["CLUSTERVISION_CLAUDE_ROOTS"] = os.pathsep.join(dict.fromkeys(roots))
+    return e
+
+
 def project_dir(name):
     return os.path.join(helm_home(), name)
 

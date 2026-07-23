@@ -9,6 +9,8 @@ import os
 import shlex
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -86,14 +88,32 @@ class OrcaAdapterTest(unittest.TestCase):
 
     def test_list_parses_rows(self):
         with self._patch(_orca_reply({"terminals": [
-                {"handle": "t1", "title": "codex", "connected": True},
+                {"handle": "t1", "title": "codex", "connected": True,
+                 "writable": True, "ptyId": "pty-1", "tabId": "tab-1",
+                 "leafId": "leaf-1", "worktreeId": "wt-1",
+                 "worktreePath": "/w"},
                 {"handle": "t2", "connected": False}]})):
             rows = self.ad.list()
         self.assertEqual(rows, [
             {"handle": "t1", "title": "codex", "preview": "",
-             "status": "connected"},
+             "status": "connected", "writable": True, "pty_id": "pty-1",
+             "tab_id": "tab-1", "leaf_id": "leaf-1",
+             "worktree_id": "wt-1", "worktree": "/w"},
             {"handle": "t2", "title": "", "preview": "",
-             "status": "disconnected"}])
+             "status": "disconnected", "writable": False, "pty_id": None,
+             "tab_id": None, "leaf_id": None, "worktree_id": None,
+             "worktree": None}])
+
+    def test_resolve_pane_uses_remint_stable_key(self):
+        reply = {"terminal": {"handle": "new", "ptyId": "pty-1",
+                              "tabId": "tab-1", "leafId": "leaf-1"}}
+        with mock.patch.object(self.ad, "_runtime_call",
+                               return_value=reply) as call:
+            got = self.ad.resolve_pane("tab-old:leaf-old")
+        call.assert_called_once_with(
+            "terminal.resolvePane", {"paneKey": "tab-old:leaf-old"})
+        self.assertEqual(got, {"handle": "new", "pty_id": "pty-1",
+                               "tab_id": "tab-1", "leaf_id": "leaf-1"})
 
     def test_nonzero_rc_raises(self):
         with self._patch("", rc=1, stderr="boom"):
@@ -263,8 +283,11 @@ class SeatResumeTest(unittest.TestCase):
         self._env = {k: os.environ.get(k) for k in ("HELM_HOME", "MELD_HOME")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm-home")
         os.environ.pop("MELD_HOME", None)
+        self.timer = mock.patch.object(seat, "_ensure_autocompact_timer")
+        self.ensure_timer = self.timer.start()
 
     def tearDown(self):
+        self.timer.stop()
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -280,6 +303,12 @@ class SeatResumeTest(unittest.TestCase):
             f.write("#!/bin/sh\nexec env FAKE=1 claude \"$@\"\n")
         os.chmod(launch, 0o700)
         return d, launch
+
+    def _record(self, d, handle="p9", harness_name="fake"):
+        with open(os.path.join(d, "spawn.json"), "w") as f:
+            json.dump({"v": 1, "seat": "codex", "harness": harness_name,
+                       "handle": handle, "worktree": os.getcwd(),
+                       "room": "main"}, f)
 
     def _resume(self, args, adapter):
         out, err = io.StringIO(), io.StringIO()
@@ -301,6 +330,68 @@ class SeatResumeTest(unittest.TestCase):
         wla.assert_called_once()             # env refreshed to latest launch.sh
         self.assertIn("resumed codex via fake", out)
         self.assertIn("pane-1", out)
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["seat"], "codex")
+        self.assertEqual(rec["harness"], "fake")
+        self.assertEqual(rec["handle"], "pane-1")
+        self.ensure_timer.assert_called_once()
+
+    def test_concurrent_resumes_share_one_lifecycle_lock(self):
+        self._mint()
+        entered, release = threading.Event(), threading.Event()
+
+        class SerialAdapter(FakeAdapter):
+            def __init__(self):
+                super().__init__()
+                self.active = self.max_active = 0
+                self.guard = threading.Lock()
+
+            def spawn(self, command, title=None, cwd=None):
+                with self.guard:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                    n = len(self.spawned) + 1
+                    handle = "pane-%d" % n
+                    self.spawned.append((command, title, cwd))
+                if n == 1:
+                    entered.set()
+                    release.wait(2)
+                with self.guard:
+                    self.rows.append({"handle": handle, "title": title or "",
+                                      "status": "connected"})
+                    self.active -= 1
+                return handle
+
+            def stop(self, handle):
+                super().stop(handle)
+                self.rows = [row for row in self.rows
+                             if row.get("handle") != handle]
+
+        fake = SerialAdapter()
+        results = []
+
+        def run():
+            results.append(seat.cmd_seat(["resume", "codex"]))
+
+        with mock.patch.object(seat, "_write_launch_assets"), \
+                mock.patch.object(harness, "detect", return_value=fake), \
+                mock.patch("builtins.print"):
+            a, b = threading.Thread(target=run), threading.Thread(target=run)
+            a.start()
+            self.assertTrue(entered.wait(1))
+            b.start()
+            time.sleep(0.05)
+            self.assertEqual(fake.max_active, 1)
+            release.set()
+            a.join(2)
+            b.join(2)
+        self.assertEqual(results, [0, 0])
+        self.assertEqual(fake.max_active, 1)
+        self.assertEqual(len(fake.rows), 1)
+        d = seat._instance_dir("codex", "codex")
+        with open(os.path.join(d, "spawn.json")) as f:
+            self.assertEqual(json.load(f)["handle"], fake.rows[0]["handle"])
 
     def test_resume_uses_session_id_and_sniffed_cwd_when_resolvable(self):
         d, launch = self._mint()
@@ -316,21 +407,37 @@ class SeatResumeTest(unittest.TestCase):
         self.assertEqual(command, "%s --resume %s" % (shlex.quote(launch), sid))
         self.assertEqual(cwd, "/work/spot")
         self.assertIn("--resume", out)
+        with open(os.path.join(d, "spawn.json")) as f:
+            self.assertEqual(json.load(f)["session"], sid)
 
-    def test_resume_stops_stale_same_titled_pane_first(self):
-        self._mint()
-        fake = FakeAdapter(rows=[{"handle": "p9", "title": "codex", "status": "idle"},
-                                 {"handle": "p2", "title": "other", "status": "idle"}])
+    def test_resume_stops_registered_pane_first(self):
+        d, _ = self._mint()
+        self._record(d)
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "dynamic",
+                                  "status": "idle"}])
         rc, out, err, _ = self._resume(["codex"], fake)
         self.assertEqual(rc, 0, err)
         self.assertEqual(fake.stopped, ["p9"])
 
-    def test_resume_stops_stale_pane_before_reminting(self):
+    def test_resume_refuses_title_only_decoy_without_stopping_registered_pane(self):
+        d, _ = self._mint()
+        self._record(d)
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "dynamic"},
+                                 {"handle": "p2", "title": "codex"}])
+        rc, _, err, wla = self._resume(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("identity-by-title", err)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+
+    def test_resume_stops_registered_pane_before_reminting(self):
         """The re-mint rewrites launch.sh; a still-running stale pane's `sh`
         is reading that very file and the metaharness close is not
         process-synchronous — the stop MUST land before the rewrite."""
         d, _ = self._mint()
-        fake = FakeAdapter(rows=[{"handle": "p9", "title": "codex",
+        self._record(d)
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "dynamic",
                                   "status": "idle"}])
         order = []
         orig_wla = seat._write_launch_assets
@@ -342,10 +449,30 @@ class SeatResumeTest(unittest.TestCase):
         fake.stop = spy_stop
         with mock.patch.object(seat, "_write_launch_assets",
                                side_effect=spy_wla) as wla, \
-                mock.patch.object(harness, "detect", return_value=fake):
+                mock.patch.object(harness, "detect", return_value=fake), \
+                mock.patch("builtins.print"):
             rc = seat.cmd_seat(["resume", "codex"])
         self.assertEqual(rc, 0)
         self.assertEqual(order, ["stop", "remint"])  # stop strictly first
+
+    def test_resume_never_closes_an_unregistered_same_title_pane(self):
+        self._mint()
+        fake = FakeAdapter(rows=[{"handle": "decoy", "title": "codex",
+                                  "status": "idle"}])
+        rc, _, err, wla = self._resume(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        self.assertIn("identity-by-title", err)
+
+    def test_resume_register_failure_closes_new_pane(self):
+        self._mint()
+        fake = FakeAdapter()
+        with mock.patch.object(seat, "_register_spawn", return_value=False):
+            rc, _, _, _ = self._resume(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.stopped, ["pane-1"])
 
     def test_launch_sh_written_atomically(self):
         """The re-minted launch.sh is a tmp+rename, never an O_TRUNC-in-place

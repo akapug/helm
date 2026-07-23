@@ -485,7 +485,9 @@ class HelpBeforeWorkTest(ChatBase):
             self.assertIn("usage: helm chat %s" % verb, out)
 
     def test_node_and_meld_answer_help_without_dispatch(self):
-        for verb in ("node", "meld"):
+        # meld's species spellings (council/standup) answer in their own
+        # voice — each usage line names the typed verb, not the genus
+        for verb in ("node", "meld", "council", "standup"):
             rc, out, _ = self._no_dispatch([verb, "--help"])
             self.assertEqual(rc, 0, verb)
             self.assertIn("usage: helm chat %s" % verb, out)

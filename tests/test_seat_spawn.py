@@ -57,6 +57,19 @@ class FakeAdapter:
         self.order.append("stop")
 
 
+class FakeOrcaAdapter(FakeAdapter):
+    name, path = "orca", "/bin/orca"
+
+    def __init__(self, rows=(), resolved=None):
+        super().__init__(rows)
+        self.resolved = resolved or {}
+        self.pane_keys = []
+
+    def resolve_pane(self, pane_key):
+        self.pane_keys.append(pane_key)
+        return dict(self.resolved)
+
+
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_SPAWN_SEND_DELAY", "HELM_CHAT_NAME")
 
@@ -70,8 +83,11 @@ class SpawnBase(unittest.TestCase):
         os.environ["HELM_SPAWN_SEND_DELAY"] = "0"
         for k in ("MELD_HOME", "MELD_CHAT_DIR", "HELM_CHAT_NAME"):
             os.environ.pop(k, None)
+        self.timer = mock.patch.object(seat, "_ensure_autocompact_timer")
+        self.ensure_timer = self.timer.start()
 
     def tearDown(self):
+        self.timer.stop()
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -91,6 +107,16 @@ class SpawnBase(unittest.TestCase):
                     % (homing, pin))
         os.chmod(launch, 0o700)
         return d, launch
+
+    def _record(self, d, handle="p9", harness_name="fake", session=None,
+                **extra):
+        rec = {"v": 1, "seat": "codex", "harness": harness_name,
+               "handle": handle, "worktree": os.getcwd(), "room": "main"}
+        if session is not None:
+            rec["session"] = session
+        rec.update(extra)
+        with open(os.path.join(d, "spawn.json"), "w") as f:
+            json.dump(rec, f)
 
     def _spawn(self, args, adapter, popen=None):
         out, err = io.StringIO(), io.StringIO()
@@ -132,7 +158,8 @@ class HeadlessSpawnTest(SpawnBase):
         d, launch = self._mint()
         rc, _, err, _, _ = self._spawn(["codex", "--room", "team-z"], None)
         self.assertEqual(rc, 0, err)
-        rec = json.load(open(os.path.join(d, "spawn.json")))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
         self.assertEqual(rec["harness"], "headless")
         self.assertEqual(rec["pid"], 4242)
         self.assertEqual(rec["worktree"], os.getcwd())
@@ -141,20 +168,21 @@ class HeadlessSpawnTest(SpawnBase):
         row = seats.roster().get("codex")
         self.assertIsNotNone(row)                  # any agent resolves it
         self.assertEqual(row.get("home_room"), "team-z")
+        self.ensure_timer.assert_called_once()
 
     def test_headless_reaps_stale_same_name_pid_first(self):
         """The exact live bug: a prior bare same-name seat must die before
         the replacement spawns."""
         d, launch = self._mint()
         with open(os.path.join(d, "spawn.json"), "w") as f:
-            json.dump({"harness": "headless", "pid": 987654,
+            json.dump({"v": 1, "seat": "codex", "harness": "headless", "pid": 987654,
                        "pid_identity": "old-start"}, f)
         kills = []
         with mock.patch.object(seat, "_recorded_pid_alive",
                                side_effect=[True, False, False, False]), \
                 mock.patch.object(seat.os, "kill",
                                   side_effect=lambda p, s: kills.append((p, s))):
-            rc, out, err, _, popen = self._spawn(["codex"], None)
+            rc, out, err, _, popen = self._spawn(["codex", "--replace"], None)
         self.assertEqual(rc, 0, err)
         self.assertEqual(kills, [(987654, seat.signal.SIGTERM)])
         self.assertIn("reaped stale headless codex (pid 987654)", out)
@@ -163,7 +191,7 @@ class HeadlessSpawnTest(SpawnBase):
     def test_headless_pid_reuse_never_kills_unrelated_process(self):
         d, _ = self._mint()
         with open(os.path.join(d, "spawn.json"), "w") as f:
-            json.dump({"harness": "headless", "pid": 987654,
+            json.dump({"v": 1, "seat": "codex", "harness": "headless", "pid": 987654,
                        "pid_identity": "original-start"}, f)
         kills = []
         with mock.patch.object(seat, "_pid_alive", return_value=True), \
@@ -179,7 +207,8 @@ class HeadlessSpawnTest(SpawnBase):
     def test_unverifiable_live_headless_pid_aborts_replacement(self):
         d, _ = self._mint()
         with open(os.path.join(d, "spawn.json"), "w") as f:
-            json.dump({"harness": "headless", "pid": 987654}, f)
+            json.dump({"v": 1, "seat": "codex", "harness": "headless",
+                       "pid": 987654}, f)
         with mock.patch.object(seat, "_recorded_pid_alive", return_value=None):
             rc, _, err, wla, popen = self._spawn(["codex"], None)
         self.assertEqual(rc, 1)
@@ -230,26 +259,243 @@ class AdapterSpawnTest(SpawnBase):
         self.assertIn("helm chat wait --seat codex --follow", text)
         self.assertIn("@codex", text)
         self.assertIn("spawned codex via fake", out)
-        rec = json.load(open(os.path.join(d, "spawn.json")))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
         self.assertEqual(rec["harness"], "fake")
         self.assertEqual(rec["handle"], "pane-1")
+        self.ensure_timer.assert_called_once()
 
-    def test_adapter_reaps_stale_same_titled_pane_before_spawn(self):
-        self._mint()
+    def test_session_start_binds_new_session_to_spawn_register(self):
+        d, _ = self._mint()
+        fake = FakeOrcaAdapter()
+        rc, _, err, _, _ = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(d, "spawn.json")) as f:
+            self.assertIsNone(json.load(f)["session"])
+        from helm import seats
+        fields = {"handle": "pane-1", "pane_key": "tab:leaf",
+                  "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_sessionstart_pane_fields",
+                               return_value=(fields, None)):
+            seats.join(session="session-live", seat="codex", cwd=os.getcwd())
+        with open(os.path.join(d, "spawn.json")) as f:
+            self.assertEqual(json.load(f)["session"], "session-live")
+
+    def test_live_session_identity_reads_only_proven_process_orca_keys(self):
+        from helm import sessions
+        d, _ = self._mint()
+        sessions_dir = os.path.join(d, "claude", "sessions")
+        os.makedirs(sessions_dir, exist_ok=True)
+        with open(os.path.join(sessions_dir, "4242.json"), "w") as f:
+            json.dump({"sessionId": "session-live", "pid": 4242,
+                       "procStart": "123"}, f)
+        real_open = open
+
+        def open_selected(path, *args, **kwargs):
+            if path == "/proc/4242/environ":
+                return io.BytesIO(
+                    b"SECRET=never-returned\0ORCA_PANE_KEY=tab:leaf\0"
+                    b"ORCA_WORKTREE_ID=workspace:/w\0")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(sessions, "_pid_is_claude",
+                               return_value=True) as alive, \
+                mock.patch("builtins.open", side_effect=open_selected):
+            identity, err = seat._live_session_orca_identity(
+                d, "session-live")
+        self.assertIsNone(err)
+        self.assertEqual(identity, {"pid": 4242, "pane_key": "tab:leaf",
+                                    "worktree_id": "workspace:/w"})
+        self.assertNotIn("SECRET", identity)
+        alive.assert_called_once_with(4242, "123")
+
+    def test_spawn_backfills_session_when_sessionstart_won_the_race(self):
+        d, _ = self._mint()
+        self._record(d, harness_name="orca")
+        sessions_dir = os.path.join(d, "claude", "sessions")
+        os.makedirs(sessions_dir, exist_ok=True)
+        with open(os.path.join(sessions_dir, "42.json"), "w") as f:
+            json.dump({"sessionId": "session-live"}, f)
+        fake = FakeOrcaAdapter(rows=[{"handle": "p9"}])
+        fields = {"handle": "p9", "pane_key": "tab:leaf",
+                  "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_prove_orca_replacement",
+                               return_value=({}, fields, None)):
+            self.assertTrue(seat._backfill_spawn_session("codex", d, fake))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["session"], "session-live")
+        self.assertEqual(rec["pane_key"], "tab:leaf")
+
+    def test_session_start_identity_must_resolve_registered_orca_handle(self):
+        rec = {"harness": "orca", "handle": "p9"}
+        fake = FakeOrcaAdapter(rows=[{
+            "handle": "p9", "status": "connected", "writable": True,
+            "pty_id": "pty-1", "worktree_id": "workspace:/w"}],
+            resolved={"handle": "p9", "pty_id": "pty-1"})
+        with mock.patch.dict(os.environ, {
+                "ORCA_PANE_KEY": "tab:leaf",
+                "ORCA_WORKTREE_ID": "workspace:/w"}, clear=False), \
+                mock.patch.object(seat.shutil, "which", return_value="/bin/orca"), \
+                mock.patch.object(harness, "OrcaAdapter", return_value=fake):
+            fields, err = seat._sessionstart_pane_fields(rec)
+        self.assertIsNone(err)
+        self.assertEqual(fields["handle"], "p9")
+        self.assertEqual(fields["pane_key"], "tab:leaf")
+
+    def test_session_start_persists_orca_remint_identity(self):
+        d, _ = self._mint()
+        self._record(d, harness_name="orca")
+        fields = {"handle": "p9", "pane_key": "tab-1:leaf-1",
+                  "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_sessionstart_pane_fields",
+                               return_value=(fields, None)):
+            self.assertTrue(seat._bind_spawn_session("codex", "session-live"))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["session"], "session-live")
+        self.assertEqual(rec["pane_key"], "tab-1:leaf-1")
+        self.assertEqual(rec["worktree_id"], "workspace:/w")
+
+    def test_unrelated_session_start_cannot_rebind_registered_pane(self):
+        d, _ = self._mint()
+        self._record(d, harness_name="orca", session="good-session",
+                     pane_key="tab:leaf", worktree_id="workspace:/w")
+        fields = {"handle": "p9", "pane_key": "tab:leaf",
+                  "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_sessionstart_pane_fields",
+                               return_value=(fields, None)):
+            self.assertFalse(seat._bind_spawn_session(
+                "codex", "other-session", source="startup"))
+            self.assertTrue(seat._bind_spawn_session(
+                "codex", "clear-session", source="clear"))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["session"], "clear-session")
+        self.assertEqual(rec["handle"], "p9")
+
+    def test_stale_orca_handle_repairs_from_exact_live_session(self):
+        d, _ = self._mint()
+        sid = "8d2e1ff0-46c3-45b5-b817-8d82d7bc8d74"
+        self._record(d, handle="old", harness_name="orca", session=sid)
+        row = {"handle": "new", "title": "unrelated dynamic title",
+               "status": "connected", "writable": True,
+               "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        fake = FakeOrcaAdapter(
+            rows=[row], resolved={"handle": "new", "pty_id": "pty-1",
+                                  "tab_id": "reminted-tab",
+                                  "leaf_id": "reminted-leaf"})
+        identity = {"pid": 42, "pane_key": "old-tab:old-leaf",
+                    "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_live_session_orca_identity",
+                               return_value=(identity, None)):
+            ad, handle, detail = seat._resolve_registered_pane(
+                "codex", d=d, adapter=fake)
+        self.assertIs(ad, fake)
+        self.assertEqual(handle, "new")
+        self.assertIn("repaired spawn handle", detail)
+        self.assertEqual(fake.pane_keys,
+                         ["old-tab:old-leaf", "old-tab:old-leaf"])
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["handle"], "new")
+        self.assertEqual(rec["pane_key"], "old-tab:old-leaf")
+        self.assertEqual(rec["pty_id"], "pty-1")
+        self.assertEqual(rec["session"], sid)
+
+    def test_stale_orca_handle_ambiguity_fails_closed(self):
+        d, _ = self._mint()
+        self._record(d, handle="old", harness_name="orca", session="s1")
+        row = {"handle": "new", "status": "connected", "writable": True,
+               "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        fake = FakeOrcaAdapter(
+            rows=[row, dict(row)],
+            resolved={"handle": "new", "pty_id": "pty-1"})
+        identity = {"pid": 42, "pane_key": "tab:leaf",
+                    "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_live_session_orca_identity",
+                               return_value=(identity, None)):
+            ad, handle, detail = seat._resolve_registered_pane(
+                "codex", d=d, adapter=fake)
+        self.assertIs(ad, fake)
+        self.assertIsNone(handle)
+        self.assertIn("matched 2", detail)
+        with open(os.path.join(d, "spawn.json")) as f:
+            self.assertEqual(json.load(f)["handle"], "old")
+
+    def test_stale_orca_dry_run_resolves_without_rewriting_register(self):
+        d, _ = self._mint()
+        self._record(d, handle="old", harness_name="orca", session="s1")
+        fake = FakeOrcaAdapter(rows=[{
+            "handle": "new", "status": "connected", "writable": True,
+            "pty_id": "pty-1", "worktree_id": "workspace:/w"}],
+            resolved={"handle": "new", "pty_id": "pty-1"})
+        identity = {"pid": 42, "pane_key": "tab:leaf",
+                    "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_live_session_orca_identity",
+                               return_value=(identity, None)):
+            ad, handle, detail = seat._resolve_registered_pane(
+                "codex", d=d, adapter=fake, repair=False)
+        self.assertIs(ad, fake)
+        self.assertEqual(handle, "new")
+        self.assertIn("register unchanged in dry-run", detail)
+        with open(os.path.join(d, "spawn.json")) as f:
+            self.assertEqual(json.load(f)["handle"], "old")
+
+    def test_adapter_spawn_refuses_implicit_live_replacement(self):
+        d, _ = self._mint()
+        self._record(d)
         fake = FakeAdapter(rows=[
-            {"handle": "p9", "title": "codex", "status": "idle"},
-            {"handle": "p2", "title": "other", "status": "idle"}])
-        rc, out, err, _, _ = self._spawn(["codex"], fake)
+            {"handle": "p9", "title": "dynamic", "status": "working"}])
+        rc, _, err, wla, popen = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("pass --replace", err)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        popen.assert_not_called()
+
+    def test_disconnected_registered_handle_does_not_need_replace(self):
+        d, _ = self._mint()
+        self._record(d)
+        fake = FakeAdapter(rows=[
+            {"handle": "p9", "title": "dynamic", "status": "disconnected"}])
+        rc, _, err, _, _ = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(len(fake.spawned), 1)
+
+    def test_adapter_reaps_registered_pane_before_spawn(self):
+        d, _ = self._mint()
+        self._record(d)
+        fake = FakeAdapter(rows=[
+            {"handle": "p9", "title": "dynamic", "status": "idle"}])
+        rc, out, err, _, _ = self._spawn(["codex", "--replace"], fake)
         self.assertEqual(rc, 0, err)
         self.assertEqual(fake.stopped, ["p9"])
         self.assertEqual(fake.order[0], "stop")    # reap strictly first
         self.assertIn("reaped stale codex pane p9", out)
 
-    def test_adapter_reap_failure_aborts_replacement(self):
-        self._mint()
-        fake = FakeAdapter(rows=[{"handle": "p9", "title": "codex"}])
-        fake.stop = mock.Mock(side_effect=harness.HarnessError("close failed"))
+    def test_registered_pane_plus_title_only_decoy_refuses_without_stopping(self):
+        d, _ = self._mint()
+        self._record(d)
+        fake = FakeAdapter(rows=[
+            {"handle": "p9", "title": "dynamic", "status": "idle"},
+            {"handle": "p2", "title": "codex", "status": "idle"}])
         rc, _, err, wla, popen = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("identity-by-title", err)
+
+    def test_adapter_reap_failure_aborts_replacement(self):
+        d, _ = self._mint()
+        self._record(d)
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "dynamic"}])
+        fake.stop = mock.Mock(side_effect=harness.HarnessError("close failed"))
+        rc, _, err, wla, popen = self._spawn(["codex", "--replace"], fake)
         self.assertEqual(rc, 1)
         self.assertIn("pane p9 NOT reaped", err)
         self.assertIn("replacement aborted", err)
@@ -257,15 +503,41 @@ class AdapterSpawnTest(SpawnBase):
         wla.assert_not_called()
         popen.assert_not_called()
 
+    def test_unregistered_same_title_aborts_without_stopping(self):
+        self._mint()
+        fake = FakeAdapter(rows=[{"handle": "decoy", "title": "codex"}])
+        rc, _, err, wla, popen = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("identity-by-title", err)
+
+    def test_cross_seat_register_never_authorizes_reap(self):
+        d, _ = self._mint()
+        with open(os.path.join(d, "spawn.json"), "w") as f:
+            json.dump({"v": 1, "seat": "codex-2", "harness": "fake",
+                       "handle": "p9"}, f)
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "dynamic"}])
+        rc, _, err, wla, popen = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("identity mismatch", err)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        popen.assert_not_called()
+
     def test_recorded_other_harness_must_be_reapable(self):
         d, _ = self._mint()
         with open(os.path.join(d, "spawn.json"), "w") as f:
-            json.dump({"harness": "orca", "handle": "old-pane"}, f)
+            json.dump({"v": 1, "seat": "codex", "harness": "orca",
+                       "handle": "old-pane"}, f)
         fake = FakeAdapter()
         with mock.patch.object(seat.shutil, "which", return_value=None):
             rc, _, err, wla, _ = self._spawn(["codex"], fake)
         self.assertEqual(rc, 1)
-        self.assertIn("orca CLI is unavailable", err)
+        self.assertIn("recorded orca adapter is unavailable", err)
         self.assertEqual(fake.spawned, [])
         wla.assert_not_called()
 
@@ -290,7 +562,8 @@ class AdapterSpawnTest(SpawnBase):
         self.assertEqual(wla.call_args[0][2], "team-q")   # room preserved
         _, text, _ = fake.sent[0]
         self.assertIn("--room team-q", text)
-        rec = json.load(open(os.path.join(d, "spawn.json")))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
         self.assertEqual(rec["room"], "team-q")
 
     def test_spawn_remint_preserves_multi_shape(self):
@@ -313,7 +586,8 @@ class AdapterSpawnTest(SpawnBase):
         fake = FakeAdapter()
         rc, _, err, _, _ = self._spawn(["codex"], fake)
         self.assertEqual(rc, 0, err)
-        rec = json.load(open(os.path.join(d, "spawn.json")))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
         self.assertIsNone(rec["room"])             # never a defaulted 'main'
         self.assertIsNone(rec["room_source"])
         from helm import seats
@@ -337,7 +611,8 @@ class AdapterSpawnTest(SpawnBase):
         os.chmod(launch, 0o700)
         rc, _, err, _, _ = self._spawn(["codex"], FakeAdapter())
         self.assertEqual(rc, 0, err)
-        rec = json.load(open(os.path.join(d, "spawn.json")))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
         self.assertEqual((rec["room"], rec["room_source"]),
                          ("proj-x", "derived"))    # provenance recorded
         row = seats.roster()["codex"]
@@ -464,7 +739,7 @@ class AdapterSpawnTest(SpawnBase):
 
 
 class DryRunTest(SpawnBase):
-    def test_print_shows_adapter_calls_without_spawning(self):
+    def test_print_refuses_title_only_identity_without_spawning(self):
         d, launch = self._mint()
         fake = FakeAdapter(rows=[{"handle": "p9", "title": "codex",
                                   "status": "idle"}])
@@ -478,8 +753,21 @@ class DryRunTest(SpawnBase):
         self.assertFalse(os.path.exists(os.path.join(d, "spawn.json")))
         self.assertIn("fake.spawn(command=%s" % shlex.quote(launch), out)
         self.assertIn("fake.send(<handle>", out)
-        self.assertIn("fake stop pane p9", out)    # the reap it WOULD do
+        self.assertIn("REFUSE mutable-title-only", out)
         self.assertIn("helm chat wait --seat codex --follow", out)
+
+    def test_print_reports_the_registered_handle_it_would_stop(self):
+        d, _ = self._mint()
+        self._record(d)
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "dynamic"}])
+        rc, out, err, wla, popen = self._spawn(
+            ["codex", "--replace", "--print"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("fake stop registered pane p9", out)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        popen.assert_not_called()
 
     def test_dry_run_headless_shows_detached_plan(self):
         d, launch = self._mint()
@@ -523,13 +811,32 @@ class WhereTest(SpawnBase):
 
     def test_where_pane_record_checks_the_same_harness(self):
         d, _ = self._mint()
-        fake = FakeAdapter(rows=[{"handle": "pane-1", "title": "codex",
-                                  "status": "connected"}])
+        fake = FakeAdapter()
         self._spawn(["codex"], fake)
+        fake.rows = [{"handle": "pane-1", "title": "codex",
+                      "status": "connected"}]
         with mock.patch.object(harness, "detect", return_value=fake):
             rc, out, err = self._where(["codex"])
         self.assertEqual(rc, 0, err)
         self.assertIn("fake handle pane-1 — LIVE", out)
+
+    def test_where_reports_the_repaired_orca_handle(self):
+        d, _ = self._mint()
+        self._record(d, handle="old", harness_name="orca", session="s1")
+        fake = FakeOrcaAdapter(rows=[{
+            "handle": "new", "status": "connected", "writable": True,
+            "pty_id": "pty-1", "worktree_id": "workspace:/w"}],
+            resolved={"handle": "new", "pty_id": "pty-1"})
+        identity = {"pid": 42, "pane_key": "tab:leaf",
+                    "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_live_session_orca_identity",
+                               return_value=(identity, None)), \
+                mock.patch.object(harness, "detect", return_value=fake):
+            rc, out, err = self._where(["codex", "--json"])
+        self.assertEqual(rc, 0, err)
+        got = json.loads(out)
+        self.assertEqual(got["handle"], "new")
+        self.assertIs(got["alive"], True)
 
     def test_where_without_record_points_at_spawn(self):
         self._mint()

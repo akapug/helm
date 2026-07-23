@@ -296,8 +296,10 @@ def _build_from_cv():
         return None
     import subprocess
     try:
+        from . import home
         p = subprocess.run(["cv", "ls", "--json", "--limit", "1000000"],
-                           capture_output=True, text=True, timeout=90)
+                           capture_output=True, text=True, timeout=90,
+                           env=home.cv_env())
     except (OSError, subprocess.TimeoutExpired):
         return None
     if p.returncode != 0 or not p.stdout.strip().startswith("["):

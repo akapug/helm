@@ -84,7 +84,8 @@ Ground-truth cross-reference:
 - After four failed attempts, pivot hypothesis category or trace source-level
   ownership.
 - After five failed attempts, stop the loop and convene a focused review or
-  mindmeld with evidence.
+  meld with evidence (`helm chat meld invite <peer> <topic>` — or its
+  `council` spelling).
 
 ## Success Criteria
 

@@ -167,6 +167,11 @@ SA_FAMILIES = frozenset(("codex",))  # codexes-only (owner asks 2026-07-21/23)
 SA_LINES = ((SA_WHISPER, SA_WHISPER_ID),  # the budget-tail walk order: the
             (CLAIM_WHISPER, CLAIM_WHISPER_ID))  # later line degrades first
 
+COUNCIL_WHISPER_ID = "whisper:council-reach"  # the reach rung's ledger id
+COUNCIL_ROUNDS = 3      # ping-pong rounds with ONE peer before the nudge
+COUNCIL_TAIL = 16       # bounded room-tail lookback (attributed rows)
+COUNCIL_OFFER_CAP = 40  # streak fingerprints latched (oldest evicted past)
+
 _CACHE_VERSION = 1    # bump when store parsing/derivation changes entry shape
 
 
@@ -653,7 +658,105 @@ def _whisper(text, session):
         return []
 
 
-def gather(text, project=None, session=None, compare=None):
+def _council_path():
+    return os.path.join(home.global_dir(), ".state", "council-reach.json")
+
+
+def _council_reach(session, cwd):
+    """The COUNCIL REACH rung — (line, ledger-id) or None. Premise
+    council-is-the-number-one-feature + feature-and-rsh-must-both-be-wired:
+    the recorded buildr failure was SALIENCE — the meld verb existed and
+    agents never reached for it, because no per-turn surface advertised it.
+    Signal: this seat has ping-ponged >= COUNCIL_ROUNDS rounds with exactly
+    ONE other seat in its home room — async back-and-forth that a bounded
+    synchronous meld collapses. One bounded room-tail read (chat rooms are
+    tmpfs; the delivery lanes already pay this every boundary). Fires ONCE
+    per streak: fingerprint = room|peer|streak-start (the start OFFSET in
+    attributed rows — reactions/ambient rows/tail-cap growth never drift it;
+    a suffix saturating COUNCIL_TAIL hides the start and latches the pair
+    itself), latched in _global/.state/council-reach.json (a NEW streak
+    re-arms; more rounds of the SAME streak stay silent — no wallpaper).
+    Skips meld/dm rooms, owner
+    back-and-forth (a human conversation is not a meld candidate), and
+    pairs already mid-meld (the verb was reached; the rung's job is done).
+    Fail-open to None everywhere (reflex law: a whisper that can crash or
+    slow the hook is worse than no whisper)."""
+    from . import chat, seats
+    seat = home.chat_name() or seats.seat_for_session(session)
+    if not seat:
+        return None
+    room, _src = seats.resolve_homing(None, cwd)
+    room = room or "main"
+    if room.startswith("meld-") or room.startswith(chat.DM_PREFIX):
+        return None
+    rows, _total = chat.read(room)
+    kept = [m for m in rows
+            if m.get("from") and (m.get("text") or "").strip()
+            and not m.get("react") and not m.get("ambient")]
+    tail = kept[-COUNCIL_TAIL:]
+    owners = seats.owner_names()
+    peer = None
+    suffix = []                     # newest-first two-party run
+    for m in reversed(tail):
+        frm = str(m["from"])
+        if frm != seat:
+            if frm.lower() in owners:
+                break               # talking WITH the owner — a conversation
+            if peer is None:
+                peer = frm
+            elif frm != peer:
+                break               # a third voice ends the pair run
+        suffix.append(m)
+    if not peer or len(suffix) < 2 * COUNCIL_ROUNDS:
+        return None
+    names = [str(m["from"]) for m in suffix]
+    mine = names.count(seat)
+    changes = sum(1 for a, b in zip(names, names[1:]) if a != b)
+    if min(mine, len(names) - mine) < COUNCIL_ROUNDS \
+            or changes < 2 * COUNCIL_ROUNDS - 1:
+        return None                 # a monologue + one reply is no ping-pong
+    try:                            # already mid-meld with this peer: silent
+        key = ".meld.%s.json" % seats._seat_key(seat)
+        for n in os.listdir(chat.chat_dir()):
+            if not n.endswith(key):
+                continue
+            st = pk.read_json(os.path.join(chat.chat_dir(), n), None) or {}
+            if st.get("peer") == peer \
+                    and st.get("status") in ("invited", "active"):
+                return None
+    except OSError:
+        pass
+    # fingerprint = the streak's START offset in KEPT (attributed) coordinates
+    # — react/ambient rows and the COUNCIL_TAIL cap must never drift it (the
+    # shipped total-based offset re-fired every turn once a streak outgrew the
+    # cap and on any reaction row: wallpaper on exactly the agents deepest in
+    # ping-pong; live-probed 2026-07-23). A saturated suffix (len ==
+    # COUNCIL_TAIL) hides the true start — "deep" latches the PAIR: silent
+    # while any latched fp names it, one fire when none does; a NEW streak
+    # re-arms through its exact fp the turn it shows short of the cap (the
+    # break row shifts every later offset). Offset, not first-row ts: the
+    # second-resolution ts collides across two streaks inside one second.
+    pair = "%s|%s" % (room, peer)
+    deep = len(suffix) >= COUNCIL_TAIL
+    fp = pair + "|deep" if deep else "%s|%d" % (pair, len(kept) - len(suffix))
+    d = pk.read_json(_council_path())
+    offered = [str(x) for x in (d.get("offered") or ())] \
+        if isinstance(d, dict) else []
+    if fp in offered \
+            or (deep and any(x.startswith(pair + "|") for x in offered)):
+        return None
+    pk.write_json(_council_path(), {
+        "v": 1, "ts": pk.now_ts(),
+        "offered": (offered + [fp])[-COUNCIL_OFFER_CAP:]})
+    d_peer = chat._dsan(peer)
+    return ("REFLEX: %d async rounds with %s in #%s — this is a council: "
+            "converge live instead (helm chat council invite %s <topic> "
+            "--wait; bounded blocking beats ping-pong). Fires once per "
+            "streak." % (min(mine, len(names) - mine), d_peer, room, d_peer),
+            COUNCIL_WHISPER_ID)
+
+
+def gather(text, project=None, session=None, compare=None, cwd=None):
     """-> dict {whisper: [line], pinned: [line], jit: [line], reflex: [line]}
     (each may be empty).
     The pinned lane leads with the WHO digest (_who_lines) as its FIRST entry
@@ -670,7 +773,9 @@ def gather(text, project=None, session=None, compare=None):
     the honest test-injection seam (no monkeypatch); None consults the registry
     (_active_compare), which is None unless HELM_CF_ENDPOINT is set. The
     comparison step runs LAST and only READS the computed local ids, so the
-    returned sections are byte-identical whether the comparison is on or off."""
+    returned sections are byte-identical whether the comparison is on or off.
+    cwd: the hook's cwd — resolves the seat's home room for the council
+    reach rung (_council_reach); None degrades that rung to the env room."""
     t0 = time.time()
     try:
         pinned_entries, jit_all, entries = _lanes(text, project=project)
@@ -740,6 +845,13 @@ def gather(text, project=None, session=None, compare=None):
     if nudge:
         steers.append(nudge[0])
         reflex_ids.append(nudge[1])
+    try:  # the council reach rung — cwd rides in from the hook (home room)
+        reach = _council_reach(session, cwd)
+    except Exception:
+        reach = None
+    if reach:
+        steers.append(reach[0])
+        reflex_ids.append(reach[1])
     whisper = _whisper(text, session)  # the day's first turn leads with the brief
     sections = {"whisper": whisper, "pinned": pinned_lines, "jit": jit, "reflex": steers}
     row = {"v": 1, "ts": pk.now_ts(), "project": project,
@@ -1239,7 +1351,7 @@ def cmd_inject(args):
         return _lane_report(project=project)
     if "--compare-report" in args:
         return _compare_report(project=project)
-    session = scope_via = None
+    session = scope_via = cwd = None
     if "--hook-json" in args:
         text, cwd, session = parse_hook_json(
             "" if sys.stdin.isatty() else sys.stdin.read())
@@ -1260,7 +1372,7 @@ def cmd_inject(args):
         if scope_via:
             print("[scope: %s via %s]" % (project, scope_via))
         return _explain(text, project=project, session=session)
-    sections = gather(text, project=project, session=session)
+    sections = gather(text, project=project, session=session, cwd=cwd)
     if "--json" in args:
         print(json.dumps(sections, ensure_ascii=False))
         return 0

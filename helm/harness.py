@@ -35,8 +35,11 @@ text is truncated and comes only from the metaharness CLI's own stderr.
 import json
 import os
 import shutil
+import socket
 import subprocess
+import sys
 import time
+import uuid
 
 # The one-line optional-companion pitch (doctor + seat resume share it).
 RECOMMENDATION = ("no metaharness detected — helm is metaharness-agnostic and "
@@ -96,12 +99,91 @@ class _CLIAdapter:
 
 
 class OrcaAdapter(_CLIAdapter):
-    """orca's public terminal CLI (flags live-verified 2026-07-21):
-    create --worktree path:<cwd> --title T --command C --json  -> terminal.handle
-    list --json -> terminals[]; read --terminal H --limit N --json -> terminal.tail
-    send --terminal H --text T [--enter] --json; close --terminal H --json."""
+    """orca's terminal CLI plus its read-only pane-remint runtime method.
+
+    Public pane verbs use the CLI. `resolve_pane` calls the same local,
+    authenticated `terminal.resolvePane` RPC Orca's own orchestration CLI uses
+    when a long-lived shell's handle has gone stale. The auth token is read from
+    Orca's private runtime metadata and sent only over its Unix socket; it never
+    enters argv, logs, errors, or Helm state.
+    """
     name = "orca"
     bin = "orca"
+
+    @staticmethod
+    def _user_data_path():
+        explicit = os.environ.get("ORCA_USER_DATA_PATH")
+        if explicit:
+            return explicit
+        if sys.platform == "darwin":
+            return os.path.expanduser("~/Library/Application Support/orca")
+        if os.name == "nt":
+            return os.path.join(os.environ.get("APPDATA") or "", "orca")
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        return os.path.join(base, "orca")
+
+    def _runtime_call(self, method, params, timeout=5):
+        path = os.path.join(self._user_data_path(), "orca-runtime.json")
+        try:
+            with open(path) as f:
+                meta = json.load(f)
+        except (OSError, ValueError) as e:
+            raise HarnessError("orca runtime metadata unavailable: %s" % e)
+        transports = meta.get("transports")
+        if not isinstance(transports, list):
+            transports = [meta.get("transport")]
+        transport = next((t for t in transports if isinstance(t, dict) and
+                          t.get("kind") == "unix" and t.get("endpoint")), None)
+        token = meta.get("authToken")
+        if transport is None or not token or not hasattr(socket, "AF_UNIX"):
+            raise HarnessError("orca runtime has no usable local Unix transport")
+        request_id = str(uuid.uuid4())
+        request = {"id": request_id, "authToken": token,
+                   "method": method, "params": params}
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+                conn.settimeout(timeout)
+                conn.connect(transport["endpoint"])
+                conn.sendall((json.dumps(request, separators=(",", ":")) +
+                              "\n").encode("utf-8"))
+                buf = b""
+                while len(buf) <= 1024 * 1024:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        raw, buf = buf.split(b"\n", 1)
+                        if not raw.strip():
+                            continue
+                        reply = json.loads(raw.decode("utf-8"))
+                        if reply.get("_keepalive"):
+                            continue
+                        if reply.get("id") != request_id:
+                            raise HarnessError("orca runtime response id mismatch")
+                        runtime_id = (reply.get("_meta") or {}).get("runtimeId")
+                        if runtime_id and meta.get("runtimeId") and \
+                                runtime_id != meta["runtimeId"]:
+                            raise HarnessError("orca runtime changed during pane resolution")
+                        if reply.get("ok") is not True:
+                            err = reply.get("error") or {}
+                            msg = err.get("message") if isinstance(err, dict) else None
+                            raise HarnessError("orca runtime: %s" %
+                                               (msg or "pane resolution failed"))
+                        return reply.get("result") or {}
+        except HarnessError:
+            raise
+        except (OSError, ValueError, TypeError) as e:
+            raise HarnessError("orca runtime pane resolution failed: %s" % e)
+        raise HarnessError("orca runtime returned no pane resolution")
+
+    def resolve_pane(self, pane_key):
+        terminal = (self._runtime_call(
+            "terminal.resolvePane", {"paneKey": pane_key}).get("terminal") or {})
+        return {"handle": terminal.get("handle"),
+                "pty_id": terminal.get("ptyId"),
+                "tab_id": terminal.get("tabId"),
+                "leaf_id": terminal.get("leafId")}
 
     def spawn(self, command, title=None, cwd=None):
         args = ["terminal", "create"]
@@ -119,7 +201,12 @@ class OrcaAdapter(_CLIAdapter):
         # titles) match a seat's HELM_CHAT_NAME=<seat> in it instead.
         return [{"handle": t.get("handle"), "title": t.get("title") or "",
                  "preview": t.get("preview") or "",
-                 "status": "connected" if t.get("connected") else "disconnected"}
+                 "status": "connected" if t.get("connected") else "disconnected",
+                 "writable": t.get("writable") is True,
+                 "pty_id": t.get("ptyId"), "tab_id": t.get("tabId"),
+                 "leaf_id": t.get("leafId"),
+                 "worktree_id": t.get("worktreeId"),
+                 "worktree": t.get("worktreePath")}
                 for t in (r.get("terminals") or [])]
 
     def read(self, handle, limit=3000):

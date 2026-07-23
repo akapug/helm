@@ -404,6 +404,14 @@ def deliverable(m, seat, room="main", scope=None):
     text = m.get("text")
     if not text or m.get("react") or m.get("ambient") or m.get("ack"):
         return False        # an ack marker is state the SENDER pulls, not a wake
+    if not isinstance(text, str):
+        text = ""           # a malformed non-string text (foreign/corrupt jsonl
+                            # row) carries no @mention or broadcast token and
+                            # must never make a regex .search() raise mid-scan
+                            # (that would strand the whole backlog behind it).
+                            # It still delivers where dm/rfrom/home-room address
+                            # it; deliver() then skips it LOUDLY if its own
+                            # render fails. Valid rows (str text) are unaffected.
     frm = str(m.get("from") or "")
     if frm.casefold() == str(seat or "").casefold():
         # Own-post suppression casefolds like EVERY seat-identity match here
@@ -1303,9 +1311,29 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
         is_dm = room.startswith(chat.DM_PREFIX)           # a DM is a DM on
         where = (" dm" if is_dm                           # every surface —
                  else "" if room == "main" else " #%s" % room)  # never a room
-        line = "[helm chat%s → %s] %s: %s" % (            # the reply must land
-            where, seat, chat._dsan(row.get("from") or "?"),  # identity laundered
-            _clip(_scrub(row.get("text") or "")))          # (text carries unicode)
+        try:
+            line = "[helm chat%s → %s] %s: %s" % (        # the reply must land
+                where, seat, chat._dsan(row.get("from") or "?"),  # id laundered
+                _clip(_scrub(row.get("text") or "")))      # (text carries unicode)
+        except Exception as e:
+            # A row that PASSES deliverable() but can't be RENDERED — a malformed
+            # non-string from/text field on a foreign/corrupt jsonl row (_scrub
+            # does `for ch in s`; a truthy non-str raises) — throws HERE, before
+            # the cursor commits. Unhandled it re-raises every poll and strands
+            # the whole backlog behind it forever. Skip it: fail LOUD to stderr
+            # (never a silent drop) and advance the cursor PAST the offender so
+            # the rest drains. H7 holds — this wraps CONSTRUCTION only, never the
+            # emit below (an emit that dies must still NOT commit).
+            try:
+                os.write(2, ("[helm chat] skipped an unrenderable row %r in %s "
+                             "(%s) — advancing past it\n"
+                             % (row.get("id"), room, e)).encode("utf-8", "replace"))
+            except OSError:
+                pass          # a dead/closed stderr (daemonized) must NOT re-raise
+                              # here — that would strand the backlog it's skipping
+            _write_cursor(room, seat, dev, ino, end, row.get("id"),
+                          session=session, active=True, base=cbase)
+            return None
         if waiting:
             line += " (+%d waiting — helm chat read%s)" % (
                 waiting, " --dm" if is_dm
@@ -1401,7 +1429,7 @@ def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None,
 # ---------------------------------------------------------------------------
 
 def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
-         room_source=None):
+         room_source=None, session_source=None):
     """The autojoin: roster row + cursor initialized HERE + the identity line
     the hook injects as session context. The line DIRECTS the agent to arm its
     idle-wake beacon as a mandatory FIRST action — a self-armed Monitor is the
@@ -1426,6 +1454,19 @@ def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
         home_room = pk.slug(home_room) if home_room else None
     row = write_roster(seat, session=session, cwd=cwd, home_room=home_room,
                        home_room_source=source)
+    if session:
+        try:
+            from . import seat as _seat
+            if _seat._seat_family(seat)[1] is None:
+                bound = _seat._bind_spawn_session(
+                    seat, session, source=session_source)
+                if bound is False:
+                    print("helm chat join: WARN — could not bind session %s to "
+                          "spawn register for %s; autocompact stays fail-closed"
+                          % (session, seat), file=sys.stderr)
+        except Exception as e:
+            print("helm chat join: WARN — spawn-session bind failed for %s (%s); "
+                  "autocompact stays fail-closed" % (seat, e), file=sys.stderr)
     effective_home = row.get("home_room")
     lane = dm_lane(seat)
     for r in _scan_rooms(
@@ -3133,15 +3174,17 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
     args = list(args or [])
     if verb == "join":
         try:
-            session = cwd = None
+            session = cwd = session_source = None
             if "--hook-json" in args:
                 d = _hook_stdin()
                 session, cwd = d.get("session_id"), d.get("cwd")
+                session_source = d.get("source")
                 room, room_source = _payload_homing(cwd, room, room_source)
             seat, line = join(session=session, cwd=cwd or safe_cwd(),
                               seat=_flag(args, "--seat"), room=room,
                               room_explicit=room_explicit,
-                              room_source=room_source)
+                              room_source=room_source,
+                              session_source=session_source)
             if "--hook-json" in args:
                 _hook_emit("SessionStart")(line)
             else:
