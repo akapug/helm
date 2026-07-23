@@ -1836,7 +1836,7 @@ $ helm chat claim worktree-main --ttl 1800   # prints the lease id — keep it
 $ helm chat release worktree-main --lease 5f3c9a2d41b0e6f2
 ```
 
-### `helm chat meld` — the mindmeld preset
+### `helm chat meld` (aka `council`, `standup`) — the mindmeld preset
 
 Hyper-speed a2a real-time convergence (premise meld-discipline): both parties
 reply FAST with what they ALREADY know; a fork that needs research is NOT a
@@ -1847,25 +1847,46 @@ visible live in `helm chat rooms` and the web channel list like any room.
 Protocol lineage: mc-meld.sh / the MC mindmeld skill (epoch fencing, floor
 markers, bounds-as-behavior — the scars are kept, the channel is helm's).
 
-- **`meld invite <peer> <topic...>`** — the verb owns the wake atomically
-  (premise a2a-wake-foolproof-layers): seeds the problem statement (ending
-  `[HOLD]`, discipline line included) into the fresh room, then posts the
-  `@peer` invite with the protocol head FIRST — room + join command inside
-  the first 200 bytes, so the delivery clip can never eat the join
-  instruction (buildr #115). The invite is a durable row: a tracked peer's
-  delivery lane backfills the newborn room from offset 0, so it lands at the
-  peer's next tool boundary (busy) or beacon fire (idle) — never lost, only
-  delayed.
-- **`meld join <room>`** — parses epoch + convener from the seed, posts the
-  control-only `READY` **@convener** (the wake-back: a READY that lands
-  silently strands GO forever). The seeded problem is the joiner's first
-  recv chunk.
+NAMING (premise council-is-the-number-one-feature, owner canon 2026-07-23):
+MELD is the GENUS — agents converging quickly — and `meld` stays the primary
+verb. `standup` (informal 2+ convergence; today's 2-party mindmeld included)
+and `council` (the big FORMAL convergence — agenda/quorum/recorded verdict;
+the N-of-M verdict/reveal machinery is 0.3's) are SPECIES spellings routed
+to the same preset, never replacements. The spelling you type echoes back in
+every printed next-command, so a council-invoked flow speaks council. Every
+verb takes `--seat S` — explicit per-command identity for one-off seats
+(identity is otherwise env-first: `HELM_CHAT_NAME` wins over the roster,
+aligned with every other chat verb).
+
+- **`meld invite <peer> <topic...> [--wait]`** — the verb owns the wake
+  atomically (premise a2a-wake-foolproof-layers): seeds the problem
+  statement (ending `[HOLD]`, discipline line + `invited=<peer>` included)
+  into the fresh room, then posts the `@peer` invite with the protocol head
+  FIRST — room + join command inside the first 200 bytes, so the delivery
+  clip can never eat the join instruction (buildr #115). The invite is a
+  durable row: a tracked peer's delivery lane backfills the newborn room
+  from offset 0, so it lands at the peer's next tool boundary (busy) or
+  beacon fire (idle) — never lost, only delayed. An UNTRACKED peer gets a
+  loud roster warning instead of that promise (live-fire 2026-07-23: the
+  invite asserted delivery to a seat with no lane). `--wait` collapses
+  invite + the first recv into one call — every convener's literal next
+  command.
+- **`meld join <room>`** — parses epoch + convener + invited from the seed,
+  posts the control-only `READY` **@convener** (the wake-back: a READY that
+  lands silently strands GO forever). REFUSES a seat the seed did not
+  invite — a different-seat join is how melds got hijacked/mis-consummated
+  (live-fire 2026-07-23). The seeded problem is the joiner's first recv
+  chunk.
 - **`meld recv <room> [--timeout S]`** — the blocking marker-aware read
   (default 90 s): returns the next PEER chunk carrying a real floor marker;
   skips own/unattributable rows fail-closed, stale epochs (a reused room
-  never replays a dead meld), READY/GO control echoes, markerless chatter.
-  Bounds are BEHAVIOR: exchange cap (5) or timeout → exit 3 with the
-  fall-to-async instruction printed; `[ABORT]` → exit 4, fail-loud.
+  never replays a dead meld), READY/GO control echoes, markerless chatter,
+  and — the pinned-pair law — every row from a seat that is not the meld's
+  other half (noted in the output, never silently). Bounds are BEHAVIOR:
+  exchange cap (5) or timeout → exit 3 with the fall-to-async instruction
+  printed; `[ABORT]` → exit 4, fail-loud. After your own `[DONE]`, recv is
+  the COUNTERSIGN WATCH: it returns the peer's closing DONE (→ done-mutual,
+  counted) instead of refusing — the closer is never blind.
 - **`meld say <room> --marker YIELD|HOLD|DONE|ABORT <text...>`** — one
   bounded chunk, content + floor marker in the one text field. `[YIELD]`
   hands the floor, `[HOLD]` more coming, `[DONE]` leaves, `[ABORT]` kills.
@@ -1880,8 +1901,8 @@ post rides the v1 RAM append unsigned (`sign=False`) — no signing leg, no
 node round-trip, no disk write mid-meld; the out-of-band log-flush stays the
 durable record. State is RAM, keyed room × ACTOR (two seats share one chat
 dir — the mc-meld host-global-state clobber, refuted in its live dogfood, is
-structural here). v1 is 2-party; 3+ minds use a plain room + discipline, or
-council when independence is the point (a council is never a meld). Env:
+structural here). v1 is 2-party (the pinned pair); 3+ minds use a plain room
++ discipline until the 0.3 council machinery lands N-of-M. Env:
 `HELM_MELD_CAP`, `HELM_MELD_RECV_TIMEOUT_S`.
 
 ```console

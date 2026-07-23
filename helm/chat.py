@@ -1178,9 +1178,6 @@ HELP = {
                  "the disk journal)",
     "node": "usage: helm chat node up|down|status  (supervise the chat "
             "tmpfs node)",
-    "meld": "usage: helm chat meld invite <peer> <topic...> | join <room> | "
-            "recv <room> [--timeout S] | say <room> --marker "
-            "YIELD|HOLD|DONE|ABORT <text...> | status",
     # verdict/reveal EXIST as dispatchable verbs but are deferred to 0.3
     # (council — design doc §11): --help answers honestly with the deferral
     # instead of the bare rc-2 message the verb itself returns.
@@ -1191,6 +1188,22 @@ HELP = {
               "doc §11); until it lands the verb answers with the deferral: "
               "use the room + /premise",
 }
+# One preset, three spellings (premise council-is-the-number-one-feature:
+# MELD is the GENUS and stays the primary verb; standup = the informal 2+
+# convergence species — today's 2-party mindmeld included; council = the big
+# FORMAL species, whose N-of-M verdict machinery is 0.3's). Each spelling
+# answers help in its own voice and echoes itself in every printed
+# next-command (meld.cmd via=).
+MELD_VERBS = ("meld", "council", "standup")
+for _v in MELD_VERBS:
+    HELP[_v] = ("usage: helm chat %s invite <peer> <topic...> [--wait] | "
+                "join <room> | recv <room> [--timeout S] | say <room> "
+                "--marker YIELD|HOLD|DONE|ABORT <text...> | status   "
+                "[--seat S on any verb]\n"
+                "  One preset, three spellings: meld = the genus, "
+                "standup/council = species; the spelling you type echoes "
+                "back in every next-command." % _v)
+del _v
 # Free-text verbs scan only the LEADING position for a help ask — prose
 # ABOUT --help stays sendable (the same scope law as post's flag refusal:
 # leading option positions are policed, the body is never scanned).
@@ -1201,7 +1214,7 @@ HELP = {
 # shape too, and rc 0 here would SUCCESS-CODE a silently dropped message on
 # a comms substrate. `-- ` before the body sends it literally. Repo swept
 # for consumers of the parent's rc-2-on-bare---help shape: none exist.
-_TEXT_VERBS = ("post", "reply", "dm", "meld")
+_TEXT_VERBS = ("post", "reply", "dm") + MELD_VERBS
 
 
 def _help_ask(verb, tail):
@@ -1239,7 +1252,7 @@ def cmd_chat(args):
     reply <id|n> <text...> [--seat S] | verify [--room R] | read [--since N]
     [--follow] [--dm] | rooms | react <n> <emoji> [--seat S] | log-flush |
     dm <seat> <text...> [--seat S] | node up|down|status |
-    meld invite|join|recv|say|status |
+    meld|council|standup invite|join|recv|say|status |
     join|deliver|stop-guard [--hook-json] | wait [--any] [--follow] [--seat S]
     | seats [--all] | status [<one-line>|--clear] [--seat S]
     | seat rename <sid|oldname> <newname>
@@ -1313,9 +1326,9 @@ def cmd_chat(args):
     if verb == "node":
         from . import chatnode
         return chatnode.cmd_node(args[1:])
-    if verb == "meld":                  # the mindmeld preset — meld.py
+    if verb in MELD_VERBS:              # one preset, three spellings — meld.py
         from . import meld
-        return meld.cmd(args[1:])
+        return meld.cmd(args[1:], via=verb)
     if verb in SEAT_VERBS:
         from . import seats
         return seats.cmd(
@@ -1501,6 +1514,6 @@ def cmd_chat(args):
             print("  %s  %d msg%s%s%s" % (n, total, "s"[:total != 1], unread, last))
         return 0
     print("helm chat: unknown subcommand '%s' (post|reply|read|rooms|react|"
-          "verify|log-flush|node|meld|roster|%s)" % (verb, "|".join(SEAT_VERBS)),
-          file=sys.stderr)
+          "verify|log-flush|node|meld|council|standup|roster|%s)"
+          % (verb, "|".join(SEAT_VERBS)), file=sys.stderr)
     return 2

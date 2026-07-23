@@ -368,6 +368,21 @@ class TestCLI(MeldBase):
         self.assertEqual(
             meld.cmd(["invite", "seat-b", "x", "--seat", "e\x1bvil"]), 2)
 
+    def test_council_and_standup_spellings_route_and_echo(self):
+        """One preset, three spellings (premise
+        council-is-the-number-one-feature: meld = the genus; council/standup
+        = species, never replacements). The spelling typed echoes back in
+        the posted invite and every printed next-command."""
+        rc = chat.cmd_chat(["council", "invite", "seat-b", "wire", "format"])
+        self.assertEqual(rc, 0)
+        room = next(r for r in chat.list_rooms() if r.startswith("meld-"))
+        inv = chat.read(room)[0][1]["text"]
+        self.assertIn("helm chat council join %s" % room, inv)  # joiner side
+        head = seats._clip(seats._scrub(inv))                   # still clip-proof
+        self.assertIn("helm chat council join %s" % room, head)
+        rc = chat.cmd_chat(["standup", "status"])
+        self.assertEqual(rc, 0)
+
     def test_invite_wait_collapses_invite_and_first_recv(self):
         """--wait = invite + recv in one call (every convener's literal next
         command, live-fire want)."""
