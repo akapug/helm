@@ -98,7 +98,9 @@ _ROSTER_CALL_COUNTS = {
     "codexhomes.py": 1,
     "hooks.py": 1,
     "seat.py": 2,
-    "seats.py": 18,        # +3: _recipients, _recipient_cursor, pending (ack ladder)
+    "seats.py": 19,        # +3: _recipients, _recipient_cursor, pending (ack
+                           # ladder); +1: _is_seat membership check — reads
+                           # roster KEYS for a bool only, never emits one
     "todos.py": 1,
     "web.py": 2,
 }
@@ -936,7 +938,9 @@ _FROM_FIELD_READ_COUNTS = {
     "chat.py": 30,         # +1: _fmt's ack-marker render (laundered via _dsan)
     "homes.py": 1,
     "meld.py": 9,
-    "seats.py": 17,        # +11: the ack/consume-ladder reads (matching + laundered emits)
+    "seats.py": 18,        # +11: the ack/consume-ladder reads (matching +
+                           # laundered emits); +1: consume_state's dm-vs-room
+                           # branch reads .get("dm") for control flow only
     "web.py": 7,
 }
 

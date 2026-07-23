@@ -902,10 +902,10 @@ def _cursor(room, seat, session=None):
 
 
 def _write_cursor(room, seat, dev, ino, off, rid, session=None, active=False,
-                  skip=None):
+                  skip=None, base=0):
     chat._ensure_dir()
     row = {"dev": dev, "ino": ino, "off": off, "rid": rid,
-           "active": bool(active)}
+           "active": bool(active), "base": int(base or 0)}
     if skip:
         row["skip"] = skip
     pk.write_json(cursor_path(room, seat, session), row)
@@ -943,10 +943,10 @@ def _baseline_state(room, at_start=False):
         return None, None, 0, None
 
 
-def _write_cursor_path(path, state, active=False):
+def _write_cursor_path(path, state, active=False, base=0):
     dev, ino, off, rid = state
     pk.write_json(path, {"dev": dev, "ino": ino, "off": off, "rid": rid,
-                         "active": bool(active)})
+                         "active": bool(active), "base": int(base or 0)})
 
 
 def _cursor_paths(room, seat, sessions=()):
@@ -989,7 +989,7 @@ def _baseline_room_cursors(room, seat, sessions=()):
     state = _baseline_state(room)
     for path in _cursor_paths(room, seat, sessions):
         with _flocked(path + ".lock"):
-            _write_cursor_path(path, state)
+            _write_cursor_path(path, state, base=state[2])   # join offset
 
 
 def _init_cursor(room, seat, session=None, at_start=False):
@@ -1005,14 +1005,15 @@ def _init_cursor(room, seat, session=None, at_start=False):
     `active` distinguishes a bare EOF join from actual room consumption.
     -> True iff the baseline was inherited (already-tracked ground)."""
     if session:
-        base = _cursor(room, seat)
-        if base:
-            _write_cursor(room, seat, base.get("dev"), base.get("ino"),
-                          base["off"], base.get("rid"), session=session,
-                          active=base.get("active"), skip=base.get("skip"))
+        seatcur = _cursor(room, seat)
+        if seatcur:
+            _write_cursor(room, seat, seatcur.get("dev"), seatcur.get("ino"),
+                          seatcur["off"], seatcur.get("rid"), session=session,
+                          active=seatcur.get("active"), skip=seatcur.get("skip"),
+                          base=seatcur.get("base"))      # inherit join baseline
             return True
     state = _baseline_state(room, at_start=at_start)
-    _write_cursor(room, seat, *state, session=session)
+    _write_cursor(room, seat, *state, session=session, base=state[2])
     return False
 
 
@@ -1248,7 +1249,8 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
         if hit is None:
             _write_cursor(
                 room, seat, dev, ino, last_end, last_rid, session=session,
-                active=cur.get("active") or bool(entries), skip=skip)
+                active=cur.get("active") or bool(entries), skip=skip,
+                base=cur.get("base"))          # advance never moves the base
             return None
         i, row, end = hit
         waiting = sum(1 for r, _e in entries[i + 1:]
@@ -1266,7 +1268,8 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
         if emit is not None:
             emit(line)                  # output FIRST …
         _write_cursor(room, seat, dev, ino, end, row.get("id"),
-                      session=session, active=True)  # … commit after
+                      session=session, active=True,   # … commit after
+                      base=cur.get("base"))           # base carried forward
         return line
 
 
@@ -2637,12 +2640,23 @@ def _all_lanes():
     return list(chat.list_rooms()) + _dm_lanes()
 
 
-def _recipients(m, r=None):
+def _is_seat(name):
+    """Whether `name` is a known roster seat (casefold) — an address with
+    ground somewhere, vs an unresolved token (typo / a seat never online)."""
+    cf = str(name or "").casefold()
+    return any(cf == str(k).casefold() for k in roster())
+
+
+def _recipients(m, r=None, include_unresolved=False):
     """The seats a row DIRECTLY ADDRESSES — whose consume state the sender
     tracks. A DM names exactly one; otherwise the roster seats @mentioned plus
     a reply's parent author (rfrom), the same set deliverable() would wake.
     ack / react / ambient rows address nobody. Roster-resolved (casefold),
-    broadcast tokens dropped: only a seat with a cursor can be SEEN or ACTED."""
+    broadcast tokens dropped: only a seat with a cursor can be SEEN or ACTED.
+    include_unresolved (the sender's pending view ONLY — never ack's
+    authorization path) also yields a @mention that resolves to NO roster
+    seat: the deadest, most-stranded address, kept VISIBLE not silently
+    dropped. consume_state renders it 'unresolved'."""
     if not isinstance(m, dict) or m.get("ack") or m.get("react") \
             or m.get("ambient"):
         return []
@@ -2656,6 +2670,8 @@ def _recipients(m, r=None):
         if _BROADCAST.search("@" + tok):
             continue
         k = keys.get(tok.casefold())
+        if k is None and include_unresolved:
+            k = tok                      # keep the raw address visible
         if k and k.casefold() not in seen:
             out.append(k)
             seen.add(k.casefold())
@@ -2698,12 +2714,17 @@ def _recipient_cursor(room, seat):
 
 def consume_state(m, room, recipient, dev=None, ino=None, end_off=None,
                   acks=None):
-    """(state, ackstate) for ONE (recipient, row): 'acted' | 'seen' | 'sent'.
+    """(state, ackstate) for ONE (recipient, row):
+    'acted' | 'seen' | 'sent' | 'unresolved'.
     READ-ONLY over the existing plumbing — no cursor moves, no second ledger:
       acted  an ack row (this recipient, this row id) exists in the lane
       seen   the recipient's cursor passed the row's end offset, OR the seat
-             was active in a strictly-later second than the row (touch_seen)
+             was active in a strictly-later second than the row (touch_seen) —
+             BUT only for a row ABOVE the join baseline (a row at/below base
+             was never surfaced, so neither SEEN path may fire on it)
       sent   the row was written and neither holds — the stranded state
+      unresolved  a room @mention addressing no known seat: no cursor ground
+             anywhere, the deadest recipient — surfaced distinctly, never lost
     `acks` = {(target_id, from_cf): ackstate} for the lane; dev/ino/end_off
     are that same lane read (all recomputed when a caller omits them)."""
     tid = m.get("id")
@@ -2720,14 +2741,26 @@ def consume_state(m, room, recipient, dev=None, ino=None, end_off=None,
     if tid and (tid, rcf) in acks:
         return "acted", acks[(tid, rcf)]
     cur = _recipient_cursor(room, recipient)
-    if cur and end_off is not None \
-            and (dev, ino) == (cur.get("dev"), cur.get("ino")) \
-            and end_off <= cur.get("off", 0):
-        return "seen", None
-    ls = last_seen(recipient)
-    mts = _ts_epoch(m.get("ts"))
-    if ls is not None and mts is not None and int(ls) > mts:
-        return "seen", None       # touch_seen fallback (a later second)
+    if cur is None and not m.get("dm") and not _is_seat(recipient):
+        return "unresolved", None   # no ground, not a known seat: the deadest
+                                    # address — kept VISIBLE, never false-SEEN
+    # The join baseline: rows at/below the offset the seat baselined this room
+    # at (a room @mention posted BEFORE the join sits below EOF) were NEVER
+    # surfaced by deliver and never will be — neither cursor- nor touch_seen-
+    # SEEN can fire on them. base is carried forward unchanged as the cursor
+    # advances; it defaults to 0 (legacy cursors / DM lanes baseline at 0, so
+    # every row above 0 stays eligible — no regression). It is a valid offset
+    # only against the SAME lane file the cursor baselined against.
+    same = bool(cur) and (dev, ino) == (cur.get("dev"), cur.get("ino"))
+    base = cur.get("base", 0) if same else 0
+    below_base = end_off is not None and end_off <= base
+    if not below_base:
+        if same and end_off is not None and end_off <= cur.get("off", 0):
+            return "seen", None
+        ls = last_seen(recipient)
+        mts = _ts_epoch(m.get("ts"))
+        if ls is not None and mts is not None and int(ls) > mts:
+            return "seen", None   # touch_seen fallback (a later second)
     return "sent", None
 
 
@@ -2800,15 +2833,25 @@ def ack(target_id, state="done", note=None, who=None, session=None):
 
 def pending(seat=None, session=None, cap=50):
     """(items, total): the sender's outbound ADDRESSED rows not yet ACTED, one
-    entry per (recipient, row) — SENT-not-SEEN or SEEN-not-ACTED. Derived
-    read-only off the recipients' cursors + touch_seen; an acked pair drops off
-    (consumed). Ordered oldest-first (longest-stranded on top), bounded."""
+    entry per (recipient, row) — SENT-not-SEEN, SEEN-not-ACTED, or the deadest
+    UNRESOLVED (a mention no seat answers). Derived read-only off the
+    recipients' cursors + touch_seen; an acked pair drops off (consumed). An
+    UNREADABLE lane yields one 'unknown' entry (fail CLOSED — never a silent
+    empty that reads as all-clear). Ordered oldest-first, bounded."""
     seat = seat or seat_for_session(session) or derive_seat(session)
     scf = str(seat).casefold()
     r = roster()
     items = []
     for room in _all_lanes():
         dev, ino, rows = _row_offsets(room)
+        if dev is None:
+            # An unreadable lane is UNKNOWN, never a silent empty: fail CLOSED
+            # so the sender never gets a FALSE green all-clear over a lane we
+            # could not read (a room whose consume state is genuinely unknown).
+            items.append({"id": None, "room": room, "to": None,
+                          "state": "unknown", "ts": None,
+                          "dm": room.startswith(chat.DM_PREFIX), "text": ""})
+            continue
         acks = {}
         for m, _e in rows:
             if m.get("ack"):
@@ -2817,7 +2860,7 @@ def pending(seat=None, session=None, cap=50):
         for m, end_off in rows:
             if str(m.get("from") or "").casefold() != scf:
                 continue
-            for rc in _recipients(m, r):
+            for rc in _recipients(m, r, include_unresolved=True):
                 if str(rc).casefold() == scf:
                     continue
                 st, _a = consume_state(m, room, rc, dev, ino, end_off, acks)
@@ -2974,21 +3017,33 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             return 0
         now = time.time()
         n_sent = sum(1 for it in items if it["state"] == "sent")
+        n_seen = sum(1 for it in items if it["state"] == "seen")
+        n_unres = sum(1 for it in items if it["state"] == "unresolved")
+        n_unk = sum(1 for it in items if it["state"] == "unknown")
+        head = "%d SENT-not-SEEN, %d SEEN-not-ACTED" % (n_sent, n_seen)
+        if n_unres:
+            head += ", %d UNRESOLVED (no such seat)" % n_unres
+        if n_unk:
+            head += ", %d UNREADABLE lane%s" % (n_unk, "s"[:n_unk != 1])
         print("helm chat pending (as %s) — %d addressed row%s awaiting consume "
-              "(%d SENT-not-SEEN, %d SEEN-not-ACTED):"
-              % (_seat_label(seat), total, "s"[:total != 1], n_sent,
-                 total - n_sent))
+              "(%s):" % (_seat_label(seat), total, "s"[:total != 1], head))
         for it in items:
-            glyph, st = (("○", "SENT") if it["state"] == "sent"
-                         else ("◐", "SEEN"))
             where = ("dm" if it["dm"] else "main" if it["room"] == "main"
                      else "#" + it["room"])
+            if it["state"] == "unknown":
+                print("  ⚠ UNKN %-8s   %-14s %-7s        lane unreadable — "
+                      "state UNKNOWN, NOT consumed" % ("", "?", where))
+                continue
+            glyph, st = (("⊘", "GONE") if it["state"] == "unresolved"
+                         else ("○", "SENT") if it["state"] == "sent"
+                         else ("◐", "SEEN"))
             age = _fmt_age(now - (_ts_epoch(it["ts"]) or now))
             print("  %s %-4s %-8s → %-14s %-7s %4s  %s"
                   % (glyph, st, str(it["id"] or "")[:8], _seat_label(it["to"]),
                      where, age, _clip(_scrub(it["text"]), 60)))
         print("  ○ SENT = never surfaced (recipient dead / away / wedged?)   "
-              "◐ SEEN = surfaced, not acted   ·   they close it: helm chat "
+              "◐ SEEN = surfaced, not acted   ⊘ GONE = no seat answers that "
+              "@name (typo / never online)   ·   they close it: helm chat "
               "ack <id> done|blocked")
         return 0
     if verb == "seat":

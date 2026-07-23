@@ -114,6 +114,54 @@ class SentSeenTests(LadderBase):
         st, _a = seats.consume_state(row, seats.dm_lane("recipT"), "recipT")
         self.assertEqual(st, "sent")
 
+    def test_pre_join_room_mention_stays_SENT(self):
+        """A ROOM @mention posted BEFORE the recipient joins. Join baselines
+        the room cursor at EOF (pre-join backlog never floods), so the mention
+        sits at/below that JOIN BASELINE — deliver never surfaces it and never
+        will. It must read SENT (stranded), NOT falsely SEEN off the EOF
+        baseline cursor NOR off the touch_seen presence beat. This is the
+        coverage hole: every other room-mention test joins the recipient
+        FIRST, and the one pre-join test uses a DM (which baselines at 0 and
+        dodges the EOF skip). It FAILED before the join-baseline gate."""
+        m = chat.post("@recipT urgent — before you joined", room="main",
+                      who="senderS")
+        self.join("recipT")            # baselines main cursor at EOF > mention
+
+        surfaced = []                  # deliver surfaces nothing: below base
+        seats.deliver(session="sess-recipT", room="main", seat="recipT",
+                      emit=lambda ln: surfaced.append(ln))
+        self.assertEqual(surfaced, [])
+
+        # cursor-SEEN cannot fire: the row is at/below the join baseline
+        st, _a = seats.consume_state(m, "main", "recipT")
+        self.assertEqual(st, "sent")
+        # nor may touch_seen: recipT LIVE a strictly-later second than the row
+        # still reads SENT (both SEEN paths gated on the join baseline)
+        mts = seats._ts_epoch(m["ts"])
+        os.utime(seats.seen_path("recipT"), (mts + 5, mts + 5))
+        st, _a = seats.consume_state(m, "main", "recipT")
+        self.assertEqual(st, "sent")
+        # and it stays SENT even AFTER recipT consumes a post-join row (the
+        # cursor's active flag flips True but base pins the stranded mention)
+        chat.post("later unaddressed chatter", room="main", who="senderS")
+        seats.deliver(session="sess-recipT", room="main", seat="recipT",
+                      emit=lambda ln: None)
+        self.assertEqual(self.states(), [("recipT", "sent")])
+
+    def test_never_joined_seat_mention_stays_visible(self):
+        """A ROOM @mention of a seat that never joined has no cursor ground
+        and is not even in the roster — it must NOT vanish from pending (the
+        most-stranded, deadest-recipient case). It surfaces distinctly as
+        'unresolved', never a silent drop, never a false SEEN off a global
+        presence beat."""
+        chat.post("@ghostSeat are you there?", room="main", who="senderS")
+        self.assertEqual(self.states(), [("ghostSeat", "unresolved")])
+        rc, out, _ = self.run_cmd("pending", ["--seat", "senderS"])
+        self.assertEqual(rc, 0)
+        self.assertIn("GONE", out)
+        self.assertIn("ghostSeat", out)
+        self.assertNotIn("nothing outbound is waiting", out)
+
 
 class AckTests(LadderBase):
     def test_seen_then_acted_via_ack(self):
@@ -264,6 +312,26 @@ class PendingViewTests(LadderBase):
         seats.ack(row["id"], "done", who="t1")
         items, total = seats.pending(seat="senderS")
         self.assertEqual((items, total), ([], 0))
+
+    def test_unreadable_lane_surfaces_unknown_not_clear(self):
+        """A lane that cannot be read is UNKNOWN, never a silent empty: pending
+        must fail CLOSED — never the green all-clear over a lane whose consume
+        state it could not determine. Made unreadable by swapping the room's
+        backing file for a DIRECTORY (open() -> IsADirectoryError, an OSError)
+        — deterministic and uid-independent, unlike chmod 000 under root."""
+        chat.post("@t1 seed so the room file exists", room="trouble",
+                  who="other")
+        p = chat.room_path("trouble")
+        os.remove(p)
+        os.mkdir(p)                    # now unreadable: open() raises OSError
+        # senderS has NO readable outbound anywhere: WITHOUT the fix pending is
+        # empty -> a FALSE green clear; WITH it the lane surfaces UNKNOWN.
+        items, total = seats.pending(seat="senderS")
+        self.assertTrue(any(it["state"] == "unknown" for it in items))
+        rc, out, _ = self.run_cmd("pending", ["--seat", "senderS"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("nothing outbound is waiting", out)
+        self.assertIn("UNKNOWN", out)
 
     def test_pending_only_my_outbound(self):
         """pending is scoped to the querying sender — another seat's outbound
