@@ -2027,16 +2027,21 @@ def presence_dot(p):
     return PRESENCE_DOTS.get(p, PRESENCE_DOTS["absent"])
 
 
-def set_status(seat, text):
+def set_status(seat, text, by=None):
     """(ok, message). The seat's explicit one-line status ('what am I on') —
     `helm chat status <line>` / `--clear`. Rides THE roster writer's flock
     (a sibling of write_roster, mutating only the status fields — never a
     second writer path; the homing lane unified writers for a reason).
-    Scrubbed + byte-clipped like every roster-borne label; setting it is
-    also a presence beat (a seat announcing work is evidently alive)."""
+    Scrubbed + byte-clipped like every roster-borne label. Cross-seat writes
+    stay allowed (a coordinator annotating a wedged seat is the point), but
+    a writer that isn't the target is RECORDED as status_by — the same
+    attribution parity posts have; a self-set carries no by field. The
+    presence beat lands on the WRITER (the seat evidently alive is the one
+    announcing, not a wedged target being annotated)."""
     if not seat:
         return False, "no seat to set a status on (join first, or --seat S)"
     line = _clip(_scrub(str(text or "")).strip(), STATUS_BYTES) or None
+    by = _clip(_scrub(str(by or "")).strip(), 40) or None
     chat._ensure_dir()
     with _flocked(roster_path() + ".lock"):
         r = roster()
@@ -2048,12 +2053,17 @@ def set_status(seat, text):
         if line:
             row["status"] = line
             row["status_ts"] = time.time()
+            if by and by != seat:
+                row["status_by"] = by
+            else:
+                row.pop("status_by", None)
         else:
             row.pop("status", None)
             row.pop("status_ts", None)
+            row.pop("status_by", None)
         r[seat] = row
         pk.write_json(roster_path(), r)
-    touch_seen(seat)
+    touch_seen(by or seat)
     return True, ("%s ▸ %s" % (seat, line) if line
                   else "%s status cleared" % seat)
 
@@ -2067,25 +2077,69 @@ def _fmt_left(sec):
 
 _WORKTREE_RES = re.compile(r"^worktree:([^:]+):(.+)$")
 
+STATUS_FRESH_S = 4 * 3600   # how long an explicit status outranks LIVE truth:
+# past this age it yields to a live claim — a holding lease is fresher
+# evidence of what the seat is on than an hours-old announcement. A fresh
+# status still beats a claim; a stale status with NO claim still shows (with
+# its age on every surface). A missing/junk status_ts counts as stale:
+# unknown age must never outrank a live lease.
+
+
+def _status_age(row):
+    """Seconds since the explicit status was set, or None (no status, or a
+    planted row without a sane status_ts)."""
+    ts = row.get("status_ts")
+    if row.get("status") and isinstance(ts, (int, float)):
+        return max(0, int(time.time() - ts))
+    return None
+
+
+def _status_by(row):
+    """The recorded cross-seat writer for '(by X)', scrubbed reader-side."""
+    b = row.get("status_by")
+    return (_clip(_scrub(str(b)).strip(), 40) or None) if b else None
+
+
+def _fmt_age(sec):
+    sec = max(0, int(sec or 0))
+    if sec >= 86400:
+        return "%dd" % (sec // 86400)
+    if sec >= 3600:
+        return "%dh" % (sec // 3600)
+    return "%dm" % (sec // 60) if sec >= 60 else "<1m"
+
 
 def status_line(row, claim=None):
     """(line, source) — the ONE status line every surface shows, composed
-    from what already exists. Precedence: an explicit status (the seat said
-    so) > a live claim (the lease says what it holds) > the home room (where
-    it lives). source ∈ status|claim|home names the winning tier."""
-    s = (row.get("status") or "").strip()
-    if s:
-        return s, "status"
-    if claim:
-        left = _fmt_left(claim.get("remaining"))
-        m = _WORKTREE_RES.match(str(claim.get("resource") or ""))
-        if m:
-            return ("working lane/%s (%s), %s left"
-                    % (m.group(2), m.group(1), left)), "claim"
-        return "holds %s, %s left" % (claim.get("resource"), left), "claim"
-    if row.get("home_room"):
-        return "in #%s" % row["home_room"], "home"
-    return ("in %s" % row["project"] if row.get("project") else ""), "home"
+    from what already exists. Precedence: a FRESH explicit status (the seat
+    said so, within STATUS_FRESH_S) > a live claim (the lease says what it
+    holds) > a stale explicit status > the home room (where it lives).
+    source ∈ status|claim|home names the winning tier. Reader-side law:
+    WHICHEVER tier wins, the line leaves here scrubbed (Cc/Cf incl. bidi,
+    Zl/Zp) + clipped — a planted claim resource or roster field must not
+    reshape a terminal or reorder the seats table. Never raises: a junk row
+    reads '?' (one corrupt row must not blank the whole fleet bar)."""
+    try:
+        s = str(row.get("status") or "").strip()
+        age = _status_age(row)
+        fresh = age is not None and age <= STATUS_FRESH_S
+        if s and (fresh or not claim):
+            line, source = s, "status"
+        elif claim:
+            left = _fmt_left(claim.get("remaining"))
+            m = _WORKTREE_RES.match(str(claim.get("resource") or ""))
+            line, source = (("working lane/%s (%s), %s left"
+                             % (m.group(2), m.group(1), left)) if m else
+                            "holds %s, %s left"
+                            % (claim.get("resource"), left)), "claim"
+        elif row.get("home_room"):
+            line, source = "in #%s" % row["home_room"], "home"
+        else:
+            line, source = ("in %s" % row["project"]
+                            if row.get("project") else ""), "home"
+        return _clip(_scrub(str(line)).strip(), STATUS_BYTES), source
+    except Exception:
+        return "?", "home"
 
 
 def _claims_by_holder(cl=None):
@@ -2111,12 +2165,21 @@ def presence_report():
     rank = {"fresh": 0, "quiet": 1, "absent": 2}
     out = []
     for seat, row in sorted(roster().items()):
-        ls = last_seen(seat, row)
-        p = presence_of(ls)
-        line, source = status_line(row, by.get(seat))
-        out.append({"seat": seat, "presence": p, "dot": presence_dot(p),
-                    "last_seen": ls, "status": row.get("status"),
-                    "line": line, "source": source})
+        try:
+            ls = last_seen(seat, row)
+            p = presence_of(ls)
+            line, source = status_line(row, by.get(seat))
+            out.append({"seat": seat, "presence": p, "dot": presence_dot(p),
+                        "last_seen": ls, "status": row.get("status"),
+                        "status_age": _status_age(row),
+                        "status_by": _status_by(row),
+                        "line": line, "source": source})
+        except Exception:   # per-row fail-open: one junk roster row renders
+            out.append({    # '?', it never blanks the whole fleet bar
+                "seat": seat, "presence": "absent",
+                "dot": presence_dot("absent"), "last_seen": None,
+                "status": None, "status_age": None, "status_by": None,
+                "line": "?", "source": "home"})
     out.sort(key=lambda s: (rank.get(s["presence"], 3), s["seat"]))
     return out
 
@@ -2333,33 +2396,46 @@ def roster_report(room="main"):
         cl = []
     by_holder = _claims_by_holder(cl)
     for seat, row in sorted(roster().items()):
-        # pending is the MULTI-ROOM truth (the owner's panel must show a
-        # helm-dogfood mention, not just main), read off the row's newest
-        # session cursor (hook joins are session-keyed) with the seat-level
-        # fallback — cursors never move here.
-        hits = _pending_all(
-            room, seat, session=row.get("session"), scan_lane="report")
-        pending, preview = len(hits), None
-        if hits:
-            preview = _scrub(hits[-1][1].get("text") or "")[:PREVIEW_CHARS]
-        ls = last_seen(seat, row)
-        # the seat's CURRENT task, pulled (never pushed) off the todo mirror
-        # — this is what turns "who is here" into "who is working on what".
         try:
-            from . import todos as _todos
-            todo = _todos.seat_digest(row)
-        except Exception:
-            todo = None                  # fail-open: a roster read never 500s
-        line, source = status_line(row, by_holder.get(seat))
-        p = presence_of(ls)
-        seats.append({"seat": seat, "session": row.get("session"),
-                      "project": row.get("project"), "cwd": row.get("cwd"),
-                      "home_room": row.get("home_room"),
-                      "home_room_source": row.get("home_room_source"),
-                      "last_seen": ls, "presence": p,
-                      "dot": presence_dot(p), "status": row.get("status"),
-                      "line": line, "source": source,
-                      "pending": pending, "preview": preview, "todo": todo})
+            # pending is the MULTI-ROOM truth (the owner's panel must show a
+            # helm-dogfood mention, not just main), read off the row's newest
+            # session cursor (hook joins are session-keyed) with the
+            # seat-level fallback — cursors never move here.
+            hits = _pending_all(
+                room, seat, session=row.get("session"), scan_lane="report")
+            pending, preview = len(hits), None
+            if hits:
+                preview = _scrub(hits[-1][1].get("text") or "")[:PREVIEW_CHARS]
+            ls = last_seen(seat, row)
+            # the seat's CURRENT task, pulled (never pushed) off the todo
+            # mirror — what turns "who is here" into "who is working on what".
+            try:
+                from . import todos as _todos
+                todo = _todos.seat_digest(row)
+            except Exception:
+                todo = None              # fail-open: a roster read never 500s
+            line, source = status_line(row, by_holder.get(seat))
+            p = presence_of(ls)
+            seats.append({"seat": seat, "session": row.get("session"),
+                          "project": row.get("project"), "cwd": row.get("cwd"),
+                          "home_room": row.get("home_room"),
+                          "home_room_source": row.get("home_room_source"),
+                          "last_seen": ls, "presence": p,
+                          "dot": presence_dot(p), "status": row.get("status"),
+                          "status_age": _status_age(row),
+                          "status_by": _status_by(row),
+                          "line": line, "source": source,
+                          "pending": pending, "preview": preview,
+                          "todo": todo})
+        except Exception:   # per-row fail-open (the same law as the bar): a
+            seats.append({  # junk row reads '?', it never kills the report
+                "seat": seat, "session": None, "project": None, "cwd": None,
+                "home_room": None, "home_room_source": None,
+                "last_seen": None, "presence": "absent",
+                "dot": presence_dot("absent"), "status": None,
+                "status_age": None, "status_by": None,
+                "line": "?", "source": "home",
+                "pending": 0, "preview": None, "todo": None})
     return {"room": room, "seats": seats, "claims": cl}
 
 
@@ -2586,9 +2662,18 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             task = (" · %s (%d/%d)" % (t["active"][:44], t["done"], t["total"])
                     if t.get("active") else
                     " · %d/%d done" % (t["done"], t["total"]) if t else "")
-            # the same one-line status the web presence bar shows (explicit
-            # status > live claim > home) — home-tier is already the row
-            line = (" ▸ %s" % s["line"]
+            # the same one-line status the web presence bar shows (fresh
+            # explicit status > live claim > stale status > home) — home-tier
+            # is already the row. An explicit line carries its age (a 2-day-
+            # old away message must READ as 2 days old) + the cross-seat
+            # writer where one was recorded.
+            extra = ""
+            if s.get("source") == "status":
+                if s.get("status_age") is not None:
+                    extra = " (%s)" % _fmt_age(s["status_age"])
+                if s.get("status_by"):
+                    extra += " (by %s)" % s["status_by"]
+            line = (" ▸ %s%s" % (s["line"], extra)
                     if s.get("line") and s.get("source") != "home" else "")
             print("  %s %-*s  %-6s  pending %-3d %s · home %s%s%s%s" % (
                 s.get("dot") or presence_dot(s["presence"]),
@@ -2621,11 +2706,21 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                       file=sys.stderr)
                 return 1
             line, source = status_line(row, _claims_by_holder().get(who))
-            print("helm chat: %s %s ▸ %s (%s)" % (
+            extra = ""
+            if source == "status":
+                age, sb = _status_age(row), _status_by(row)
+                if age is not None:
+                    extra = " (%s)" % _fmt_age(age)
+                if sb:
+                    extra += " (by %s)" % sb
+            print("helm chat: %s %s ▸ %s (%s)%s" % (
                 presence_dot(presence_of(last_seen(who, row))), who,
-                line or "—", source))
+                line or "—", source, extra))
             return 0
-        ok, msg = set_status(who, None if clear else text)
+        # the WRITER is always the ambient identity — a cross-seat write
+        # (--seat != self) is allowed but recorded (status_by, post parity)
+        ok, msg = set_status(who, None if clear else text,
+                             by=derive_seat(_env_session()))
         print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
     if verb == "claim":
