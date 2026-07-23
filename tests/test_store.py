@@ -33,9 +33,15 @@ class StoreBase(unittest.TestCase):
         self.adopted = os.path.join(self.tmp, "adopted")
         os.makedirs(self.adopted)
         self.env_prior = {k: os.environ.get(k)
-                          for k in ("HELM_HOME", "HELM_ADOPTED_DIR")}
+                          for k in ("HELM_HOME", "HELM_ADOPTED_DIR",
+                                    "HELM_NTFY_TOPIC", "MELD_NTFY_TOPIC")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_ADOPTED_DIR"] = self.adopted
+        # a down/ambient notifier must NEVER be dialed by the suite — only the
+        # opt-in mocked NotifyOnGraduationTest exercises _notify_graduation. Pop
+        # both HELM_ and the legacy MELD_ fallback (home.env resolves both).
+        for k in ("HELM_NTFY_TOPIC", "MELD_NTFY_TOPIC"):
+            os.environ.pop(k, None)
 
     def tearDown(self):
         for k, v in self.env_prior.items():

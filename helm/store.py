@@ -1077,7 +1077,8 @@ def _notify_graduation(etype, eid):
     owner steer: the provisional queue must ROUTINELY reach the owner, never
     wait silently. HELM_NTFY_TOPIC (a full URL, else a bare topic ->
     https://ntfy.sh/<name>) opts in; UNSET -> no network call at all. stdlib
-    urllib POST, 3s timeout, a one-line body + a Title header. ALWAYS fail-open:
+    urllib POST, 3s per-op timeout (bounds each socket op, not total
+    wall-clock), a one-line body + a Title header. ALWAYS fail-open:
     any error (down notifier, DNS, timeout) is journaled as a one-line receipt
     and the graduation still succeeds — a notifier NEVER breaks the verb."""
     topic = (home.env("NTFY_TOPIC") or "").strip()
