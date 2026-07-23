@@ -76,6 +76,7 @@ class SeatsBase(unittest.TestCase):
         directly (one unbuffered os.write), invisible to redirect_stdout."""
         fake = types.SimpleNamespace(buffer=io.BytesIO(stdin or b"{}"))
         r, w = os.pipe()
+        sys.stdout.flush()  # do not capture buffered output from an earlier test
         saved = os.dup(1)
         os.dup2(w, 1)
         os.close(w)

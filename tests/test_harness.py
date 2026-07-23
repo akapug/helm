@@ -449,7 +449,8 @@ class SeatResumeTest(unittest.TestCase):
         fake.stop = spy_stop
         with mock.patch.object(seat, "_write_launch_assets",
                                side_effect=spy_wla) as wla, \
-                mock.patch.object(harness, "detect", return_value=fake):
+                mock.patch.object(harness, "detect", return_value=fake), \
+                mock.patch("builtins.print"):
             rc = seat.cmd_seat(["resume", "codex"])
         self.assertEqual(rc, 0)
         self.assertEqual(order, ["stop", "remint"])  # stop strictly first
