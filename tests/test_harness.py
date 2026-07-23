@@ -86,14 +86,32 @@ class OrcaAdapterTest(unittest.TestCase):
 
     def test_list_parses_rows(self):
         with self._patch(_orca_reply({"terminals": [
-                {"handle": "t1", "title": "codex", "connected": True},
+                {"handle": "t1", "title": "codex", "connected": True,
+                 "writable": True, "ptyId": "pty-1", "tabId": "tab-1",
+                 "leafId": "leaf-1", "worktreeId": "wt-1",
+                 "worktreePath": "/w"},
                 {"handle": "t2", "connected": False}]})):
             rows = self.ad.list()
         self.assertEqual(rows, [
             {"handle": "t1", "title": "codex", "preview": "",
-             "status": "connected"},
+             "status": "connected", "writable": True, "pty_id": "pty-1",
+             "tab_id": "tab-1", "leaf_id": "leaf-1",
+             "worktree_id": "wt-1", "worktree": "/w"},
             {"handle": "t2", "title": "", "preview": "",
-             "status": "disconnected"}])
+             "status": "disconnected", "writable": False, "pty_id": None,
+             "tab_id": None, "leaf_id": None, "worktree_id": None,
+             "worktree": None}])
+
+    def test_resolve_pane_uses_remint_stable_key(self):
+        reply = {"terminal": {"handle": "new", "ptyId": "pty-1",
+                              "tabId": "tab-1", "leafId": "leaf-1"}}
+        with mock.patch.object(self.ad, "_runtime_call",
+                               return_value=reply) as call:
+            got = self.ad.resolve_pane("tab-old:leaf-old")
+        call.assert_called_once_with(
+            "terminal.resolvePane", {"paneKey": "tab-old:leaf-old"})
+        self.assertEqual(got, {"handle": "new", "pty_id": "pty-1",
+                               "tab_id": "tab-1", "leaf_id": "leaf-1"})
 
     def test_nonzero_rc_raises(self):
         with self._patch("", rc=1, stderr="boom"):

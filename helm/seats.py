@@ -1457,11 +1457,12 @@ def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
     if session:
         try:
             from . import seat as _seat
-            if _seat._seat_family(seat)[1] is None and not \
-                    _seat._bind_spawn_session(seat, session):
-                print("helm chat join: WARN — could not bind session %s to "
-                      "spawn register for %s; autocompact stays fail-closed"
-                      % (session, seat), file=sys.stderr)
+            if _seat._seat_family(seat)[1] is None:
+                bound = _seat._bind_spawn_session(seat, session)
+                if bound is False:
+                    print("helm chat join: WARN — could not bind session %s to "
+                          "spawn register for %s; autocompact stays fail-closed"
+                          % (session, seat), file=sys.stderr)
         except Exception as e:
             print("helm chat join: WARN — spawn-session bind failed for %s (%s); "
                   "autocompact stays fail-closed" % (seat, e), file=sys.stderr)

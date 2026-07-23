@@ -163,6 +163,71 @@ class AutocompactTest(unittest.TestCase):
         self.assertEqual(res["fired"], [])
         self.assertEqual(ad.sent, [])
 
+    def test_repeated_400_overflow_waits_for_clear_then_reinjects_onboarding(self):
+        self.plant(180000)  # overflow recovery is pane-tail driven, below 90%
+        tail = ("API Error: 400 prompt is too long: context exceeds maximum\n"
+                "API Error: 400 prompt is too long: context exceeds maximum")
+        ad = FakeAdapter(tail=tail)
+        first = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(first["fired"][0]["mode"], "clear-pending")
+        self.assertEqual(ad.sent, [("h1", "/clear", True)])
+        again = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(again["fired"], [])
+        self.assertTrue(again["rows"][0].get("latched"))
+        self.assertEqual(len(ad.sent), 1)       # never queues duplicate /clear
+
+        # SessionStart is the completion evidence. It may bind the fresh session
+        # before that session has persisted a transcript, so the register alone
+        # must release the onboarding rebrief.
+        with open(os.path.join(self.d, "spawn.json")) as f:
+            rec = json.load(f)
+        rec["session"] = "22222222-2222-2222-2222-222222222222"
+        with open(os.path.join(self.d, "spawn.json"), "w") as f:
+            json.dump(rec, f)
+        os.unlink(os.path.join(self.proj, SID + ".jsonl"))
+        ad.tail = ""
+        third = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(third["fired"][0]["mode"], "cleared")
+        self.assertEqual(len(ad.sent), 2)
+        self.assertIn("helm chat wait --seat codex --follow", ad.sent[1][1])
+        self.assertIn("home room main", ad.sent[1][1])
+
+    def test_one_400_or_discussion_text_never_clears(self):
+        self.plant(180000)
+        for tail in (
+                "API Error: 400 prompt is too long: context exceeds maximum",
+                "discussion: API Error: 400 prompt is too long\n"
+                "discussion: API Error: 400 prompt is too long"):
+            with self.subTest(tail=tail):
+                ad = FakeAdapter(tail=tail)
+                res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+                self.assertEqual(res["fired"], [])
+                self.assertEqual(ad.sent, [])
+
+    def test_pending_clear_rebriefs_only_after_session_changes(self):
+        self.plant(180000)
+        tail = ("API Error: 400 prompt is too long: context exceeds maximum\n"
+                "API Error: 400 prompt is too long: context exceeds maximum\n"
+                "❯ /clear")
+        ad = FakeAdapter(tail=tail)
+        first = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(first["fired"][0]["mode"], "clear-pending")
+        self.assertEqual(ad.sent, [])
+        second = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(second["fired"], [])
+        sid = "22222222-2222-2222-2222-222222222222"
+        self.plant(1000, sid=sid)
+        with open(os.path.join(self.d, "spawn.json")) as f:
+            rec = json.load(f)
+        rec["session"] = sid
+        with open(os.path.join(self.d, "spawn.json"), "w") as f:
+            json.dump(rec, f)
+        ad.tail = ""
+        third = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(third["fired"][0]["mode"], "cleared")
+        self.assertEqual(len(ad.sent), 1)
+        self.assertIn("helm chat wait --seat codex --follow", ad.sent[0][1])
+
     def test_fires_at_90_and_injects_compact(self):
         self.plant(int(360000 * 0.91))
         ad = FakeAdapter()
@@ -188,6 +253,17 @@ class AutocompactTest(unittest.TestCase):
         third = autocompact.check(seats=["codex"], post=False, adapter=ad)
         self.assertEqual(third["fired"][0]["mode"], "injected")
         self.assertEqual(ad.sent, [("h1", "/compact", True)])
+
+    def test_rendered_compact_text_is_not_composer_identity(self):
+        self.plant(int(360000 * 0.96))
+        for tail in ("assistant markdown:\n> /compact",
+                     "❯ /compact\nassistant output continued"):
+            with self.subTest(tail=tail):
+                ad = FakeAdapter(tail=tail)
+                res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+                self.assertEqual(res["fired"][0]["mode"], "injected")
+                self.assertEqual(ad.sent, [("h1", "/compact", True)])
+                os.unlink(autocompact._state_path())
 
     def test_latch_blocks_refire_then_rearms(self):
         self.plant(int(360000 * 0.91))
@@ -233,9 +309,43 @@ class AutocompactTest(unittest.TestCase):
         autocompact.check(seats=["codex"], post=False, adapter=ad)
         sid = "22222222-2222-2222-2222-222222222222"
         self.plant(int(360000 * 0.93), sid=sid)
+        self.spawn("h1")
+        with open(os.path.join(self.d, "spawn.json")) as f:
+            rec = json.load(f)
+        rec["session"] = sid
+        with open(os.path.join(self.d, "spawn.json"), "w") as f:
+            json.dump(rec, f)
         res = autocompact.check(seats=["codex"], post=False, adapter=ad)
         self.assertEqual(len(res["fired"]), 1)
         self.assertEqual(len(ad.sent), 2)
+
+    def test_transcript_session_must_match_registered_pane_session(self):
+        old = SID
+        new = "22222222-2222-2222-2222-222222222222"
+        self.plant(int(360000 * 0.97), sid=old)
+        with open(os.path.join(self.d, "spawn.json")) as f:
+            rec = json.load(f)
+        rec["session"] = new
+        with open(os.path.join(self.d, "spawn.json"), "w") as f:
+            json.dump(rec, f)
+        ad = FakeAdapter()
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(res["rows"][0]["status"], "session-mismatch")
+        self.assertEqual(res["fired"], [])
+        self.assertEqual(ad.sent, [])
+
+    def test_missing_context_does_not_clear_injected_latch(self):
+        p = self.plant(int(360000 * 0.94))
+        ad = FakeAdapter()
+        autocompact.check(seats=["codex"], post=False, adapter=ad)
+        os.unlink(p)
+        gap = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(gap["rows"][0]["status"], "no-context-data")
+        self.plant(int(360000 * 0.95))
+        again = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(again["fired"], [])
+        self.assertTrue(again["rows"][0].get("latched"))
+        self.assertEqual(ad.sent, [("h1", "/compact", True)])
 
     def test_claude_model_never_fires(self):
         self.plant(int(360000 * 0.95), model="claude-opus-4")
@@ -262,6 +372,19 @@ class AutocompactTest(unittest.TestCase):
         row = autocompact.read("codex")
         self.assertEqual(row["status"], "stale")
         self.assertGreater(row["age_s"], 7 * 3600)
+        self.assertEqual(autocompact.check(
+            seats=["codex"], post=False, adapter=FakeAdapter())["fired"], [])
+
+    def test_recent_plain_log_line_cannot_freshen_old_usage_row(self):
+        p = os.path.join(seat.seat_dir("codex"), "proxy.log")
+        with open(p, "w") as f:
+            f.write('{"session_id":"%s","usage":{"input_tokens":350000}}\n'
+                    % SID)
+            f.write("recent gin line without usage\n")
+        row = autocompact.read("codex")
+        self.assertEqual(row["source"], "proxy.log")
+        self.assertEqual(row["status"], "context-undated")
+        self.assertIsNone(row["age_s"])
         self.assertEqual(autocompact.check(
             seats=["codex"], post=False, adapter=FakeAdapter())["fired"], [])
 
@@ -292,12 +415,11 @@ class AutocompactTest(unittest.TestCase):
                     json.dump({"v": 1, "seat": claimed, "harness": "fake",
                                "handle": "h1", "session": SID}, f)
                 ad = FakeAdapter()
-                res = autocompact.check(seats=["codex"], post=False,
-                                        adapter=ad)
-                self.assertEqual(res["fired"][0]["mode"], "manual")
-                self.assertIn("identity mismatch", res["fired"][0]["detail"])
+                got, handle, detail = autocompact.resolve_pane("codex", ad)
+                self.assertIsNone(got)
+                self.assertIsNone(handle)
+                self.assertIn("identity mismatch", detail)
                 self.assertEqual(ad.sent, [])
-                os.unlink(autocompact._state_path())
 
     def test_unregistered_content_and_title_never_become_identity(self):
         # Launch text is copyable and titles are mutable; neither authorizes a
@@ -308,10 +430,13 @@ class AutocompactTest(unittest.TestCase):
         ad = FakeAdapter(panes=(
             {"handle": "h8", "title": "codex",
              "preview": "running %s HELM_CHAT_NAME=codex " % launch},))
+        got, handle, detail = autocompact.resolve_pane("codex", ad)
+        self.assertIsNone(got)
+        self.assertIsNone(handle)
+        self.assertIn("no authoritative spawn handle", detail)
         res = autocompact.check(seats=["codex"], post=False, adapter=ad)
-        self.assertEqual(res["fired"][0]["mode"], "manual")
-        self.assertIn("no authoritative spawn handle",
-                      res["fired"][0]["detail"])
+        self.assertEqual(res["rows"][0]["status"], "session-unbound")
+        self.assertEqual(res["fired"], [])
         self.assertEqual(ad.sent, [])
 
     def test_stale_handle_never_falls_back_to_matching_title(self):
@@ -324,6 +449,18 @@ class AutocompactTest(unittest.TestCase):
         self.assertEqual(ad.sent, [])
         self.assertIn("registered handle gone is not live",
                       res["fired"][0]["detail"])
+
+    def test_disconnected_registered_handle_is_not_live(self):
+        self.plant(int(360000 * 0.91))
+        ad = FakeAdapter(panes=({"handle": "h1", "title": "codex",
+                                 "status": "disconnected"},))
+        got, handle, detail = autocompact.resolve_pane("codex", ad)
+        self.assertIs(got, ad)
+        self.assertIsNone(handle)
+        self.assertIn("disconnected", detail)
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(res["fired"][0]["mode"], "manual")
+        self.assertEqual(ad.sent, [])
 
     def test_headless_record_goes_manual_loud(self):
         self.spawn(None, harness="headless")
@@ -402,6 +539,9 @@ class AutocompactTest(unittest.TestCase):
     def test_timer_defaults_to_one_minute(self):
         _, service, _, timer = autocompact._timer_units()
         self.assertIn("helm seat autocompact --once", service)
+        self.assertNotIn("PYTHONPATH", service)
+        self.assertNotIn("helm-wt", service)
+        self.assertNotIn("sys.executable", service)
         self.assertIn("OnUnitActiveSec=60s", timer)
 
     def test_timer_apply_uses_validated_interval(self):

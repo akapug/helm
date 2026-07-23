@@ -206,6 +206,28 @@ _TOK = {k: re.compile(r'"%s"\s*:\s*(\d+)' % k) for k in
          "cache_creation_input_tokens")}
 _PROXY_SESSION = re.compile(
     r'"(?:session|session_id|sessionId)"\s*:\s*"([^"\\]+)"')
+_PROXY_TIME = re.compile(
+    r'"(?:timestamp|time|ts)"\s*:\s*"([^"\\]+)"')
+
+
+def _proxy_line_age(line, path, is_last):
+    stamp = _PROXY_TIME.search(line)
+    if stamp:
+        try:
+            from datetime import datetime, timezone
+            text = stamp.group(1).replace("Z", "+00:00")
+            at = datetime.fromisoformat(text)
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            return max(0, time.time() - at.timestamp())
+        except (ValueError, OverflowError):
+            return None
+    if not is_last:
+        return None                       # file mtime belongs to a later row
+    try:
+        return max(0, time.time() - os.path.getmtime(path))
+    except OSError:
+        return None
 
 
 def _proxy_log_ctx(family, seat_name):
@@ -219,11 +241,10 @@ def _proxy_log_ctx(family, seat_name):
     proxy_home = getattr(seat, "_proxy_home", seat._instance_dir)(
         family, seat_name)
     path = os.path.join(proxy_home, "proxy.log")
-    try:
-        age_s = max(0, time.time() - os.path.getmtime(path))
-    except OSError:
-        age_s = None
-    for ln in reversed(_tail_lines(path)):
+    lines = _tail_lines(path)
+    last = max((i for i, line in enumerate(lines) if line.strip()), default=-1)
+    for i in range(len(lines) - 1, -1, -1):
+        ln = lines[i]
         if "input_tokens" not in ln:
             continue
         parts = {k: rx.search(ln) for k, rx in _TOK.items()}
@@ -231,7 +252,8 @@ def _proxy_log_ctx(family, seat_name):
             continue
         sid = _PROXY_SESSION.search(ln)
         return (sum(int(m.group(1)) for m in parts.values() if m),
-                sid.group(1) if sid else None, age_s)
+                sid.group(1) if sid else None,
+                _proxy_line_age(ln, path, i == last))
     return None
 
 
@@ -428,7 +450,7 @@ def _rebrief_after_clear(seat_name, ad, handle):
 
 
 def _fire_clear(seat_name, ad, handle, detail, tail):
-    """Clear one proven overflow loop, then restore the seat's operating brief."""
+    """Queue /clear once; SessionStart proves completion before rebriefing."""
     from . import harness
     if _command_pending(tail, "clear"):
         return "clear-pending", "pane %s already has /clear queued" % handle
@@ -436,8 +458,8 @@ def _fire_clear(seat_name, ad, handle, detail, tail):
         ad.send(handle, "/clear", enter=True)
     except harness.HarnessError as e:
         return "clear-manual", str(e)
-    mode, brief_detail = _rebrief_after_clear(seat_name, ad, handle)
-    return mode, "%s; %s" % (detail, brief_detail)
+    return ("clear-pending", "%s; /clear injected into pane %s; waiting for "
+            "SessionStart before onboarding" % (detail, handle))
 
 
 def _retry_rebrief(seat_name, adapter):
@@ -491,6 +513,13 @@ def _fire_text(row, mode, detail):
                row["source"], detail))
 
 
+def _recovery_session_changed(entry, row):
+    """Whether SessionStart has bound a different session after /clear."""
+    prior = (entry or {}).get("session")
+    current = row.get("registered_session") or row.get("session")
+    return bool(prior and current and prior != current)
+
+
 def check(seats=None, thr=None, fire=True, post=True, adapter=None):
     """One bounded pass: scan -> latch -> fire -> latch-update. Returns
     {"rows": [...], "fired": [...]} where each fired row carries mode/detail.
@@ -512,7 +541,7 @@ def check(seats=None, thr=None, fire=True, post=True, adapter=None):
             recovery = (entry or {}).get("mode")
             if recovery == "clear-needs-brief" or (
                     recovery == "clear-pending" and
-                    entry.get("session") != row.get("session")):
+                    _recovery_session_changed(entry, row)):
                 row["would_rebrief"] = True
                 if not fire:
                     continue
@@ -654,8 +683,9 @@ WantedBy=timers.target
 
 
 def _timer_units(interval=DEFAULT_INTERVAL_S):
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    service = _UNIT_SERVICE % {"repo": repo, "python": sys.executable}
+    helm_bin = shutil.which("helm") or os.path.join(
+        os.path.expanduser("~"), ".local", "bin", "helm")
+    service = _UNIT_SERVICE % {"helm": helm_bin}
     timer = _UNIT_TIMER % {"interval": interval}
     udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
     return (os.path.join(udir, "helm-autocompact.service"), service,
