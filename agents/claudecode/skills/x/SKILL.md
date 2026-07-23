@@ -25,7 +25,7 @@ Pick the move by the junction. They differ only in **who** you dispatch and **ho
 
 **FIRST-GATE (comms-mode):** dispatch the move ASYNC and keep working (xrev/xprop/xverify
 post + return between actions) — only **xdiag** on a LIVE stall is a sync, parallel-convergence
-session. Don't block-wait on a dispatched refuter; the mindmeld skill holds the full picker.
+session. Don't block-wait on a dispatched refuter; the sync channel is the meld verb (`helm chat meld` / `council` — docs/VERBS.md §meld).
 
 **author ≠ the eyes** — the model that wrote it does not get to bless it. The one
 exception is **xdiag**: the author of a path is often its *best diagnoser*, so xdiag

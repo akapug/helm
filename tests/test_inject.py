@@ -1438,5 +1438,123 @@ class CompareBackendTest(InjectBase):
         self.assertFalse(os.path.exists(inject._compare_ledger_path()))
 
 
+class CouncilReachTest(InjectBase):
+    """The council reach rung (premise council-is-the-number-one-feature +
+    feature-and-rsh-must-both-be-wired): the recorded buildr failure was
+    SALIENCE — the meld verb existed and agents never reached for it. >= 3
+    ping-pong rounds with ONE peer in the home room -> one latched nudge
+    naming the exact council invite command; a new streak re-arms."""
+    EXTRA = ("HELM_CHAT_DIR", "MELD_CHAT_DIR", "HELM_CHAT_ROOM",
+             "MELD_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE", "HELM_CHAT_NAME",
+             "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
+             "HELM_CHAT_OWNER_NAMES", "CLAUDE_CODE_SESSION_ID",
+             "CLAUDE_SESSION_ID", "CODEX_SESSION_ID")
+
+    def setUp(self):
+        super().setUp()
+        self.extra_prior = {k: os.environ.get(k) for k in self.EXTRA}
+        for k in self.EXTRA:
+            os.environ.pop(k, None)
+        os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
+        os.environ["HELM_CHAT_NODE_URL"] = ""
+        os.environ["HELM_CHAT_ROOM"] = "workroom"
+        os.environ["HELM_CHAT_NAME"] = "seat-a"
+        os.environ["HELM_CHAT_OWNER_NAMES"] = "david"
+
+    def tearDown(self):
+        for k, v in self.extra_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def _pingpong(self, rounds=3, peer="seat-b", room="workroom"):
+        from helm import chat
+        for i in range(rounds):
+            chat.post("q%d" % i, room=room, who="seat-a")
+            chat.post("a%d" % i, room=room, who=peer)
+
+    def test_reach_fires_once_per_streak_then_rearms(self):
+        from helm import chat
+        self._pingpong(3)
+        got = inject._council_reach(None, None)
+        self.assertIsNotNone(got)
+        line, wid = got
+        self.assertIn("helm chat council invite seat-b", line)
+        self.assertEqual(wid, inject.COUNCIL_WHISPER_ID)
+        self.assertIsNone(inject._council_reach(None, None))   # latched
+        self._pingpong(1)                                      # SAME streak
+        self.assertIsNone(inject._council_reach(None, None))   # grows silent
+        chat.post("third voice", room="workroom", who="seat-c")
+        self._pingpong(3)                                      # NEW streak
+        self.assertIsNotNone(inject._council_reach(None, None))
+
+    def test_latch_holds_past_the_tail_cap_and_over_reactions(self):
+        """Live-probed 2026-07-23: fp = room|peer|(total-len(suffix)) mixed
+        coordinate systems — total counted ALL rows while suffix capped at
+        COUNCIL_TAIL attributed rows — so the rung RE-FIRED every turn once
+        a streak outgrew the cap, and re-fired on any reaction row: wallpaper
+        on exactly the agents deepest in ping-pong."""
+        from helm import chat
+        self._pingpong(3)
+        self.assertIsNotNone(inject._council_reach(None, None))   # latches
+        self._pingpong(6)      # 18 attributed rows — past COUNCIL_TAIL=16
+        self.assertIsNone(inject._council_reach(None, None))
+        self._pingpong(1)      # deeper still: every extra round re-fired
+        self.assertIsNone(inject._council_reach(None, None))
+        _row, err = chat.react(-1, "👍", room="workroom", who="seat-c")
+        self.assertIsNone(err)
+        self.assertIsNone(inject._council_reach(None, None))      # no drift
+        chat.post("break", room="workroom", who="seat-c")
+        self._pingpong(3)                                         # NEW streak
+        self.assertIsNotNone(inject._council_reach(None, None))   # re-arms
+
+    def test_reaction_mid_streak_before_the_cap_keeps_the_latch(self):
+        from helm import chat
+        self._pingpong(3)
+        self.assertIsNotNone(inject._council_reach(None, None))
+        _row, err = chat.react(-1, "👍", room="workroom", who="seat-c")
+        self.assertIsNone(err)
+        self._pingpong(1)                                         # SAME streak
+        self.assertIsNone(inject._council_reach(None, None))
+
+    def test_deep_streak_with_unknown_start_latches_the_pair(self):
+        """First observed already past the cap (start hidden by the window):
+        one fire, then the pair itself stays latched — no wallpaper even
+        when the streak's start offset is unknowable."""
+        self._pingpong(9)      # 18 rows: suffix saturates on first look
+        self.assertIsNotNone(inject._council_reach(None, None))
+        self._pingpong(1)
+        self.assertIsNone(inject._council_reach(None, None))
+
+    def test_under_threshold_owner_and_monologue_stay_silent(self):
+        from helm import chat
+        self._pingpong(2)
+        self.assertIsNone(inject._council_reach(None, None))   # 2 < 3 rounds
+        chat.post("q", room="workroom", who="seat-a")
+        chat.post("from the human", room="workroom", who="david")
+        self.assertIsNone(inject._council_reach(None, None))   # owner talk
+        for i in range(5):
+            chat.post("mono%d" % i, room="workroom", who="seat-b")
+        chat.post("one reply", room="workroom", who="seat-a")
+        self.assertIsNone(inject._council_reach(None, None))   # no ping-pong
+
+    def test_meld_room_and_mid_meld_pair_stay_silent(self):
+        from helm import meld
+        self._pingpong(3)
+        meld.invite("seat-b", "the topic", seat="seat-a")      # verb reached
+        self.assertIsNone(inject._council_reach(None, None))
+
+    def test_rides_the_reflex_lane_and_ledger(self):
+        self._pingpong(3)
+        sections = inject.gather("carry on", session="sid-r", cwd=None)
+        joined = "\n".join(sections["reflex"])
+        self.assertIn("helm chat council invite seat-b", joined)
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            rows = [json.loads(ln) for ln in f if ln.strip()]
+        self.assertIn(inject.COUNCIL_WHISPER_ID, rows[-1]["fired"]["reflex"])
+
+
 if __name__ == "__main__":
     unittest.main()

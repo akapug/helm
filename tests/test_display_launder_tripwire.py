@@ -634,10 +634,13 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
     #        the r9 sweep drove only YIELD — READY/ABORT/DONE were revert-blind).
     def test_meld_recv_ready_abort_done_lines_are_inert(self):
         # READY (convener/invited): the joiner's control row, hostile from.
+        # peer pins to the SAME hostile name — recv's pinned-pair law drops
+        # any non-peer row before it can render, so the sink only fires for
+        # the meld's own (hostile-named, planted-outside-the-seam) peer.
         r1 = "meld-recv-ready"
         meld._write_state(r1, "conv2", {
             "room": r1, "epoch": 123, "role": "convener", "self": "conv2",
-            "peer": "joiner", "idx": 0, "exchanges": 0, "cap": 8,
+            "peer": self.HOSTILE, "idx": 0, "exchanges": 0, "cap": 8,
             "status": "invited", "created": pk.now_ts()})
         self._plant_obj(r1, {"from": self.HOSTILE,
                              "text": "[MELD e:123] READY:123 (joined)"})
@@ -692,17 +695,32 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
         self.assertIn("lane", ready["text"])
         self._assert_inert("meld.join READY _fmt", chat._fmt(ready))
 
-    # -- 5. meld.invite(): the @peer mention posted into TEXT + display lines ---
-    def test_meld_invite_mention_and_display_are_inert(self):
-        room, lines = meld.invite(self.HOSTILE, "topic here", seat="conv")
-        disp = "\n".join(lines)
-        self._assert_inert("meld.invite display", disp)
-        self.assertIn("lane", disp)
-        self.assertIn("pwn", disp)
-        rows, _ = chat.read(room)
-        inv = [r for r in rows if "MELD-INVITE" in (r.get("text") or "")][0]
-        self._assert_inert("meld.invite posted @mention text", inv["text"])
-        self.assertIn("lane", inv["text"])
+    # -- 5. meld.invite(): a hostile peer ARG is now REFUSED at the validated
+    #    seam (home.validate_seat_arg — the same law that closed launch
+    #    --seat), one layer ABOVE the display launder: nothing is posted, no
+    #    room is born, and the refusal itself renders inert (_safe_name).
+    def test_meld_invite_hostile_peer_is_refused_inert(self):
+        before = set(chat.list_rooms())
+        with self.assertRaises(SystemExit) as cm:
+            meld.invite(self.HOSTILE, "topic here", seat="conv")
+        msg = str(cm.exception)
+        self._assert_inert("meld.invite refusal", msg)
+        self.assertIn("pwn", msg)                  # named, laundered
+        self.assertEqual(before, set(chat.list_rooms()))  # nothing posted
+
+    # -- 5b. inject._council_reach(): the reach whisper's peer emit ------------
+    def test_council_reach_whisper_is_inert(self):
+        from helm import inject
+        os.environ["HELM_CHAT_NAME"] = "reachr"    # _ENV-listed, restored
+        for i in range(3):
+            chat.post("q%d" % i, room="main", who="reachr")
+            self._plant("main", ("%02d" % i) * 6, "a%d" % i)
+        got = inject._council_reach(None, None)
+        self.assertIsNotNone(got)
+        line, _wid = got
+        self._assert_inert("inject council-reach whisper", line)
+        self.assertIn("lane", line)                # emitted laundered,
+        self.assertIn("pwn", line)                 # not vanished
 
     # -- 6. meld.say(): the DONE/ABORT @peer mention posted into TEXT ----------
     def test_meld_say_done_mention_is_inert(self):
@@ -952,6 +970,12 @@ _FROM_FIELD_CONSUMERS = {
         "NOT-A-CHAT-ROW: meta.get('from') is a provider-migration SOURCE PATH "
         "(the home's origin dir), never a chat/meld identity — it reaches no "
         "chat sink. Listed so a future `.get(\"from\")` here is re-justified."),
+    "inject.py": (
+        "LAUNDERED+INTERNAL: _council_reach's from reads (the ping-pong "
+        "suffix walk, the owner check, the mid-meld state peer match) are "
+        "INTERNAL-MATCHING-ONLY; the ONE emit — the council-reach whisper "
+        "line — launders the peer via chat._dsan before it rides the reflex "
+        "lane. Verified by ChatRowFromFieldSinkSweep's council-reach test."),
 }
 
 # COUNT-PIN per module (mirrors _ROSTER_CALL_COUNTS): module-membership alone
@@ -962,7 +986,8 @@ _FROM_FIELD_CONSUMERS = {
 _FROM_FIELD_READ_COUNTS = {
     "chat.py": 30,         # +1: _fmt's ack-marker render (laundered via _dsan)
     "homes.py": 1,
-    "meld.py": 9,
+    "inject.py": 4,   # _council_reach: suffix walk x3 + mid-meld peer match
+    "meld.py": 10,    # +1: recv's pinned-pair peer read (st.get("peer"))
     "seats.py": 18,        # +11: the ack/consume-ladder reads (matching +
                            # laundered emits); +1: consume_state's dm-vs-room
                            # branch reads .get("dm") for control flow only
