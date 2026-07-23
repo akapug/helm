@@ -121,7 +121,7 @@ helm store pinned [--stats]                the always-on lane (--stats: budget
 helm store add <type> <id> | <statement> [| ...]
     prior:     <id> | <statement> [| conf [| keywords [| domain]]]   belief, default 0.6
     premise:   <id> | <statement> [| keywords [| domain]]            certain, conf 1.0
-    lexicon:   <term> | <definition> [| kind [| ex1 || ex2]]
+    lexicon:   <term> | <definition> [| kind [| keywords [| domain]]]
     heuristic: <id> | <move> [| trigger-csv [| domain]]
     reference: <id> | <summary> [| url [| keywords [| domain]]]
     flags: [--source S] [--rationale <text...>] [--candidate]

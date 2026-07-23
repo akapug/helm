@@ -23,8 +23,8 @@ Entry TYPES (filename prefix is the classifier, matching drain/doctor):
              the live/retired/delete_eligible lifecycle, one-line-JSON
              evidence_log/confidence_history, the certain-prior
              contradiction-logged-not-applied rule, the record law (retire keeps the file).
-  lexicon    lex-*.md — term/definition; matches when the TERM appears in the
-             turn text (word-boundary).
+  lexicon    lex-*.md — term/definition; matches when the TERM or a keyword
+             appears in the turn text (word-boundary).
   heuristic  heuristic-*.md — a MOVE you apply; confidence 1.0 by construction
              and load_class always jit (the only question is whether its
              trigger-pattern fires THIS turn).
@@ -294,8 +294,9 @@ _PRIOR_DEFAULTS = {
 }
 
 _LEX_DEFAULTS = {"term": "", "scope": "global", "definition": "", "kind": "",
-                 "source": "", "examples": [], "updated_ts": "", "hits": "0",
-                 "status": "live", "retired_ts": "", "retired_why": "",
+                 "keywords": "", "domain": "", "source": "", "examples": [],
+                 "updated_ts": "", "hits": "0", "status": "live",
+                 "retired_ts": "", "retired_why": "",
                  "xrev_by": "", "xrev_ts": ""}
 
 _HEUR_DEFAULTS = {
@@ -336,9 +337,21 @@ def _parse_lexicon(path):
         return None
     e["term_scope"] = e.pop("scope")  # authored scope; entry scope is root-derived
     status = e.get("status") or STATUS_LIVE  # a candidate lexicon is non-live
+    kw = (e.get("keywords") or "").strip()
+    # legacy mis-file: the add verb once filed the keywords CSV into kind: (a
+    # real kind is a single taxonomy slug, never CSV) — those files must keep
+    # resolving, unrewritten. The comma gate keeps taxonomy words ("phrase",
+    # "bug-class") out of the probe vocabulary.
+    kind = (e.get("kind") or "").strip()
+    if not kw and "," in kind:
+        kw = kind
+        kind = "phrase"  # the CSV was never a taxonomy slug — any rewrite
+        # (redefine/confirm/supersede) now persists the migrated shape instead
+        # of carrying the mis-file forever
     e.update({"type": "lexicon", "id": e["term"], "statement": e["definition"],
               "confidence": 1.0, "class": "lexicon", "load_class": "jit",
-              "status": status, "keywords": "", "domain": "", "pinned": False})
+              "status": status, "keywords": kw, "kind": kind,
+              "domain": (e.get("domain") or "").strip(), "pinned": False})
     return e
 
 
@@ -600,8 +613,8 @@ def _probe_hits(e, low):
 
 
 def resolve_prompt(text, project=None, cap=4, entries=None):
-    """JIT: live, non-dormant entries whose id/keywords (lexicon: term)
-    word-boundary-match the turn text, DF-WEIGHTED: each matched probe
+    """JIT: live, non-dormant entries whose id/keywords (lexicon: term +
+    keywords) word-boundary-match the turn text, DF-WEIGHTED: each matched probe
     contributes 1/df (df = how many candidate entries carry that probe, one
     in-memory pass per call), summed then confidence-weighted — one rare
     keyword outranks a pile of shared ones, so the cap-4 winners are earned,
@@ -742,16 +755,21 @@ def write_prior(e, root_dir=None, path=None):
     return path
 
 
+def _lexicon_path(term, scope, root_dir=None):
+    """The mc term_path law: global -> lex-<term>.md; narrower authored scope
+    prefixes lex-<scope-slug>--<term>.md so a project define never clobbers
+    global."""
+    name = "lex-" + _slug(term) + ".md" if scope == "global" \
+        else "lex-" + _slug(scope) + "--" + _slug(term) + ".md"
+    return os.path.join(root_dir or _default_dir("lexicon"), name)
+
+
 def write_lexicon(e, root_dir=None, path=None):
-    """Write a lex-*.md (mc lexicon._write_term shape). Filename follows the mc
-    term_path law: global -> lex-<term>.md; narrower authored scope prefixes
-    lex-<scope-slug>--<term>.md so a project define never clobbers global."""
+    """Write a lex-*.md (mc lexicon._write_term shape)."""
     term = e.get("term") or str(e.get("id") or "")
     scope = e.get("term_scope") or "global"
     if path is None:
-        name = "lex-" + _slug(term) + ".md" if scope == "global" \
-            else "lex-" + _slug(scope) + "--" + _slug(term) + ".md"
-        path = os.path.join(root_dir or _default_dir("lexicon"), name)
+        path = _lexicon_path(term, scope, root_dir)
     d = (e.get("definition") or e.get("statement") or "").replace('"', "'")
     body = [
         "---",
@@ -768,6 +786,12 @@ def write_lexicon(e, root_dir=None, path=None):
         "  hits: " + str(e.get("hits") or "0"),
         "  definition: " + re.sub(r"\s+", " ", e.get("definition") or e.get("statement") or "").strip(),
     ]
+    kw = re.sub(r"\s+", " ", e.get("keywords") or "").strip()
+    if kw:
+        body.append("  keywords: " + kw)
+    dom = (e.get("domain") or "").strip()
+    if dom:
+        body.append("  domain: " + dom)
     # a candidate carries an explicit status line (excluded from inject until
     # confirmed); a live lexicon keeps its historical byte-shape (no status key)
     status = str(e.get("status") or STATUS_LIVE)
@@ -1425,7 +1449,7 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
   add <type> <id> | <statement> [| ...]       type: prior|premise|lexicon|heuristic|reference
       prior:     <id> | <statement> [| conf [| keywords [| domain]]]  (belief, default 0.6)
       premise:   <id> | <statement> [| keywords [| domain]]           (certain, conf 1.0)
-      lexicon:   <term> | <definition> [| kind [| ex1 || ex2]]
+      lexicon:   <term> | <definition> [| kind [| keywords [| domain]]]  (kind: ONE slug, e.g. phrase|coinage|bug-class)
       heuristic: <id> | <move> [| trigger-csv [| domain]]
       reference: <id> | <summary> [| url [| keywords [| domain]]]
       flags: [--source S] [--rationale <text...>] [--candidate]
@@ -1780,16 +1804,34 @@ def cmd_store(args):
             return 0
 
         if etype == "lexicon":
+            # the pipe contract is closed: a field the store will not keep is
+            # REFUSED, never silently filed under the wrong key (the live
+            # incident: a keywords CSV in field 3 died as kind:)
+            kind = parts[2] if len(parts) > 2 and parts[2] else ""
+            if "," in kind or len(parts) > 5:
+                print("helm store add: lexicon is <term> | <definition> "
+                      "[| kind [| keywords,csv [| domain]]] — kind is ONE "
+                      "taxonomy slug (phrase|coinage|bug-class), field 4 "
+                      "carries the keywords CSV", file=sys.stderr)
+                return 2
             scope = ("project:" + project) if project else "global"
             status = STATUS_CANDIDATE if candidate else STATUS_LIVE
+            # redefine MERGES, never strips: an absent optional field keeps the
+            # existing entry's value — the coach landing verb's bare 2-field
+            # sharpen must not destroy the symptom vocabulary this closed
+            # contract exists to protect (the incident class, via a legal verb)
+            path = _lexicon_path(parts[0], scope, _default_dir("lexicon", project))
+            prev = _parse_lexicon(path) or {}
             e = {"term": parts[0], "definition": parts[1],
-                 "kind": parts[2] if len(parts) > 2 and parts[2] else "phrase",
+                 "kind": kind or prev.get("kind") or "phrase",
+                 "keywords": parts[3] if len(parts) > 3 and parts[3] else prev.get("keywords", ""),
+                 "domain": parts[4] if len(parts) > 4 and parts[4] else prev.get("domain", ""),
+                 "examples": prev.get("examples") or [],
                  "term_scope": scope, "status": status,
-                 "source": source or ("inferred" if candidate else "define"),
-                 "updated_ts": ts, "hits": "0"}
-            if len(parts) > 3 and parts[3]:
-                e["examples"] = [x.strip() for x in parts[3].split("||") if x.strip()]
-            p = write_lexicon(e, root_dir=_default_dir("lexicon", project))
+                 "source": source or prev.get("source")
+                 or ("inferred" if candidate else "define"),
+                 "updated_ts": ts, "hits": prev.get("hits") or "0"}
+            p = write_lexicon(e, path=path)
             pk.event("store.add", parts[0],
                      ("lexicon candidate — " if candidate else "lexicon — ") + parts[1])
             if candidate:
@@ -1807,8 +1849,8 @@ def cmd_store(args):
             e = _parse_heuristic(path) or {}
             for stale in _STALE_ON_REMINT:  # fresh lifecycle on re-mint
                 e.pop(stale, None)
-            trig = parts[2] if len(parts) > 2 else (e.get("trigger") or "")
-            dom = parts[3] if len(parts) > 3 else e.get("domain", "")
+            trig = parts[2] if len(parts) > 2 and parts[2] else (e.get("trigger") or "")
+            dom = parts[3] if len(parts) > 3 and parts[3] else e.get("domain", "")
             e.update({"id": parts[0], "move": parts[1], "statement": parts[1],
                       "trigger": trig, "domain": dom,
                       "status": STATUS_CANDIDATE if candidate else STATUS_LIVE,
@@ -1836,9 +1878,9 @@ def cmd_store(args):
         for stale in _STALE_ON_REMINT:  # fresh lifecycle on re-mint
             e.pop(stale, None)
         e.update({"id": parts[0], "statement": parts[1], "summary": parts[1],
-                  "url": parts[2] if len(parts) > 2 else e.get("url", ""),
-                  "keywords": parts[3] if len(parts) > 3 else e.get("keywords", ""),
-                  "domain": parts[4] if len(parts) > 4 else e.get("domain", ""),
+                  "url": parts[2] if len(parts) > 2 and parts[2] else e.get("url", ""),
+                  "keywords": parts[3] if len(parts) > 3 and parts[3] else e.get("keywords", ""),
+                  "domain": parts[4] if len(parts) > 4 and parts[4] else e.get("domain", ""),
                   "status": STATUS_CANDIDATE if candidate else STATUS_LIVE,
                   "stated_ts": e.get("stated_ts") or ts, "last_updated": ts,
                   "source": source or ("inferred" if candidate
