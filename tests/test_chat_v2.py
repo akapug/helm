@@ -294,6 +294,131 @@ class TransportTest(V2Base):
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0]["profile"], clean)
 
+    def test_incident_state_read_failure_is_publicly_degraded_until_recovery(self):
+        raw = "reader\x1b[31m"
+        os.environ["HELM_CELL_PROFILE"] = raw
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with mock.patch.object(chat.time, "time", return_value=100), \
+             mock.patch.object(pk, "now_ts", return_value="persisted"):
+            chat._record_sign_failure(raw, chat._diag("send_failed", "real incident"))
+        path = chat.sign_failures_path()
+        backup = path + ".readable"
+        os.replace(path, backup)
+        os.mkdir(path)  # strict owner read deterministically raises IsADirectoryError
+        try:
+            out = io.StringIO()
+            with mock.patch.object(chat.time, "time", return_value=200), \
+                 mock.patch.object(pk, "now_ts", return_value="unreadable"), \
+                 mock.patch.object(cellmod, "bin_ready", return_value=True), \
+                 mock.patch.object(chat, "node_head",
+                                   return_value={"chain_index": 8}), \
+                 contextlib.redirect_stdout(out):
+                failures = chat.sign_failures()
+                st = chat.transport_status()
+                rc = chat.cmd_chat(["transport", "status"])
+            self.assertEqual(failures[0]["code"], "incident_state_unreadable")
+            self.assertEqual(failures[0]["profile"], chat._dsan(raw))
+            self.assertEqual((st["mode"], st["code"]),
+                             ("degraded", "incident_state_unreadable"))
+            self.assertEqual(rc, 1)
+            self.assertIn("incident state unreadable", out.getvalue())
+            self.assertNotIn("\x1b", out.getvalue())
+        finally:
+            os.rmdir(path)
+            os.replace(backup, path)
+
+        self.assertEqual(chat.sign_failures()[0]["reason"], "real incident")
+        self.assertTrue(chat._clear_sign_failure(raw, succeeded_at=300))
+        self.assertEqual(chat.sign_failures(), [])
+        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(chat, "node_head", return_value={"chain_index": 9}):
+            self.assertEqual(chat.transport_status()["mode"], "signed")
+
+    def test_write_failure_retains_exact_profiles_counts_order_and_lifecycle(self):
+        raw = "writer\x1b[32m"
+        other = "other"
+        failures = ((100, "first", raw), (150, "other", other),
+                    (200, "latest", raw))
+        with mock.patch.object(
+                pk, "atomic_write",
+                side_effect=OSError(28, "No space left on device")) as write:
+            for epoch, reason, profile in failures:
+                with mock.patch.object(chat.time, "time", return_value=epoch), \
+                     mock.patch.object(pk, "now_ts", return_value=str(epoch)):
+                    row = chat._stamp_sign_failure(
+                        {}, profile, chat._diag("send_failed", reason))
+                self.assertEqual(row["transport"]["state"], "DEGRADED")
+                self.assertIn("process-local fallback active",
+                              row["transport"]["remediation"])
+        self.assertEqual(write.call_count, 3)
+        private = chat._SIGN_FAILURE_FALLBACK[
+            os.path.abspath(chat.sign_failures_path())]
+        self.assertIn(raw, private)
+        rows = chat.sign_failures()
+        self.assertEqual([r["profile"] for r in rows],
+                         [chat._dsan(raw), other])
+        self.assertEqual((rows[0]["reason"], rows[0]["failure_count"]),
+                         ("latest", 2))
+        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(chat, "node_head", return_value={"chain_index": 10}):
+            st = chat.transport_status()
+        self.assertEqual((st["mode"], st["code"], st["failure_count"]),
+                         ("degraded", "send_failed", 2))
+
+        with mock.patch.object(chat, "_sign_send", return_value=(dict(SENT), None)):
+            recovered = chat.post("recovered", who="a1", profile=raw, sign=True)
+        self.assertEqual(recovered["chain"], 7)
+        self.assertEqual([r["profile"] for r in chat.sign_failures()], [other])
+        self.assertEqual(chat.acknowledge_sign_failures(other), [other])
+        self.assertEqual(chat.sign_failures(), [])
+
+    def test_write_failure_fallback_is_concurrency_safe(self):
+        import threading
+        profile = "concurrent-profile"
+        barrier = threading.Barrier(8)
+        errors = []
+
+        def fail(i):
+            try:
+                d = chat._diag("send_failed", "failure-%d" % i,
+                               event_epoch=100 + i, event_ts=str(100 + i))
+                barrier.wait()
+                chat._stamp_sign_failure({}, profile, d)
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+                pk, "atomic_write",
+                side_effect=OSError(28, "No space left on device")):
+            threads = [threading.Thread(target=fail, args=(i,)) for i in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        row = chat.sign_failures()[0]
+        self.assertEqual((row["profile"], row["reason"], row["failure_count"]),
+                         (profile, "failure-7", 8))
+        self.assertTrue(chat._clear_sign_failure(profile, succeeded_at=200))
+        self.assertEqual(chat.sign_failures(), [])
+
+    def test_lock_failure_retains_incident_until_exact_signed_success(self):
+        import fcntl
+        raw = "locked-profile"
+        with mock.patch.object(
+                fcntl, "flock", side_effect=PermissionError(13, "lock denied")):
+            row = chat._stamp_sign_failure(
+                {}, raw, chat._diag("join_failed", "cannot lock owner"))
+        self.assertEqual((row["transport"]["profile"],
+                          row["transport"]["failure_count"]), (raw, 1))
+        self.assertEqual(chat.sign_failures()[0]["reason"], "cannot lock owner")
+        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(chat, "node_head", return_value={"chain_index": 11}):
+            self.assertEqual(chat.transport_status()["mode"], "degraded")
+        self.assertTrue(chat._clear_sign_failure(raw))
+        self.assertEqual(chat.sign_failures(), [])
+
     def test_configured_ready_signer_with_unreachable_node_is_degraded(self):
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
         for outcome in (None, OSError("probe exploded")):

@@ -62,7 +62,9 @@ class TestWebChat(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
-        # each test starts with an empty room + RAM incident dir
+        # Retire any process-local fallback through the real ACK lifecycle before
+        # deleting this class's reused tmpfs owner between tests.
+        chat.acknowledge_sign_failures()
         shutil.rmtree(chat.sign_failures_dir(), ignore_errors=True)
         shutil.rmtree(os.environ["HELM_CHAT_DIR"], ignore_errors=True)
 

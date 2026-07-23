@@ -96,7 +96,9 @@ import json
 import math
 import os
 import re
+import stat
 import sys
+import threading
 import time
 import unicodedata
 
@@ -117,6 +119,8 @@ FIELD_SEP = "\x1e"          # ASCII RS: fields cannot be slid into one another
 QUOTE_CHARS = 72            # the quoted parent's snippet budget (one line)
 SIGN_FAILURES_FILE = ".sign-failures.json"  # RAM-only per-profile owner truth
 SIGN_FAILURES_ROOT = "/dev/shm/helm-chat-failures"
+_SIGN_FAILURE_FALLBACK = {}  # owner path -> exact raw profile -> private state
+_SIGN_FAILURE_FALLBACK_LOCK = threading.RLock()
 _QUOTED_VALUE = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
 _UNCLOSED_QUOTED_VALUE = r'''(?:"[^\r\n;}]*|'[^\r\n;}]*')'''
 _AUTH_VALUE = re.compile(
@@ -143,6 +147,7 @@ _REMEDIATION = {
     "join_failed": "repair this profile's room-node join, then retry",
     "send_failed": "inspect `helm chat node status` and this profile's balance, then retry",
     "signing_exception": "inspect `helm doctor` and the named exception, then retry",
+    "incident_state_unreadable": "repair incident-state ownership/permissions/space, then retry; transport ack cannot retire an unreadable owner",
 }
 
 
@@ -382,19 +387,111 @@ def _normal_diag(value, code="signing_exception"):
     return _diag(code, value)
 
 
+def _validate_sign_failure_owner():
+    """Reject deterministic tmpfs-key squats before trusting or mutating them."""
+    uid = os.geteuid()
+    d = sign_failures_dir()
+    if os.path.lexists(d):
+        s = os.stat(d, follow_symlinks=False)
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != uid:
+            raise PermissionError("incident-state directory is not owned by this uid")
+        if not os.access(d, os.R_OK | os.W_OK | os.X_OK):
+            raise PermissionError("incident-state directory is not accessible")
+    for p in (_sign_failures_lock_path(), sign_failures_path()):
+        if not os.path.lexists(p):
+            continue
+        s = os.stat(p, follow_symlinks=False)
+        if not stat.S_ISREG(s.st_mode) or s.st_uid != uid:
+            raise PermissionError("incident-state file is not owned by this uid")
+
+
 @contextlib.contextmanager
 def _sign_failure_lock():
     """Serialize the shared RAM map across fleet poster processes."""
     import fcntl
     d = sign_failures_dir()
     os.makedirs(d, mode=0o700, exist_ok=True)
+    _validate_sign_failure_owner()
     os.chmod(d, 0o700)
     with open(_sign_failures_lock_path(), "a") as f:
+        if os.fstat(f.fileno()).st_uid != os.geteuid():
+            raise PermissionError("incident-state lock is not owned by this uid")
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _read_sign_failure_state():
+    """Strict owner read: unlike pk.read_json, I/O and JSON errors stay loud."""
+    p = sign_failures_path()
+    if not os.path.exists(p):
+        return {}
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _fallback_sign_failure_state():
+    return _SIGN_FAILURE_FALLBACK.setdefault(
+        os.path.abspath(sign_failures_path()), {})
+
+
+def _combined_sign_failure_state(*records):
+    """One exact-profile private state from persisted and process-local views."""
+    records = [r for r in records if isinstance(r, dict)]
+    if not records:
+        return {}
+    success = max(_epoch(r.get("_success_epoch")) for r in records)
+    active = [r for r in records if _active_failure(r)]
+    if not active:
+        out = dict(max(records, key=lambda r: _epoch(r.get("_success_epoch"))))
+        out.pop("reason", None)
+        out["_success_epoch"] = success
+        return out
+    out = dict(max(active, key=lambda r: _epoch(r.get("_last_epoch"))))
+    first = min(active, key=lambda r: _epoch(
+        r.get("_first_epoch"), float("inf")))
+    out["first_failure"] = first.get("first_failure", out.get("first_failure"))
+    out["_first_epoch"] = min(_epoch(r.get("_first_epoch"),
+                                    _epoch(out.get("_last_epoch")))
+                              for r in active)
+    out["failure_count"] = max(_count(r.get("failure_count"), 1)
+                               for r in active)
+    out["_success_epoch"] = success
+    return out
+
+
+def _next_sign_failure(old, profile, diag):
+    """Apply one event-clock-ordered failure to one exact profile state."""
+    now, stamp = diag["_event_epoch"], diag["_event_ts"]
+    candidate = {"profile": profile, "code": diag["code"],
+                 "reason": diag["reason"], "first_failure": stamp,
+                 "last_failure": stamp, "failure_count": 1,
+                 "remediation": diag["remediation"],
+                 "_first_epoch": now, "_last_epoch": now}
+    old = old if isinstance(old, dict) else {}
+    success = _epoch(old.get("_success_epoch"))
+    last = _epoch(old.get("_last_epoch"))
+    if success >= now:
+        return old, candidate, False
+    active = _active_failure(old)
+    if last > now:
+        if not active:
+            return old, candidate, False
+        out = dict(old)
+        out["failure_count"] = _count(out.get("failure_count")) + 1
+        first = _epoch(out.get("_first_epoch"), last)
+        if now < first:
+            out.update(first_failure=stamp, _first_epoch=now)
+        return out, out, True
+    candidate.update(
+        first_failure=old.get("first_failure")
+        if active and isinstance(old.get("first_failure"), str) else stamp,
+        failure_count=(_count(old.get("failure_count")) if active else 0) + 1,
+        _first_epoch=_epoch(old.get("_first_epoch"), now) if active else now,
+        _success_epoch=success)
+    return candidate, candidate, True
 
 
 def _failure_public(rec, now=None):
@@ -421,20 +518,10 @@ def _failure_public(rec, now=None):
             "last_age_s": max(0, int(now - last))}
 
 
-def sign_failures():
-    """Every uncleared profile failure, newest first, projected without the
-    internal epoch fields. Reads the same RAM owner that send updates. The
-    no-incident read path is side-effect free (doctor/status stay read-only)."""
-    if not os.path.exists(sign_failures_path()):
-        return []
-    try:
-        with _sign_failure_lock():
-            state = pk.read_json(sign_failures_path(), {}) or {}
-    except Exception:
-        return []
+def _sign_failure_rows(state, now=None):
+    now, rows = _epoch(now, time.time()), []
     if not isinstance(state, dict):
-        return []
-    now, rows = time.time(), []
+        return rows
     for p, rec in state.items():
         if not _active_failure(rec):
             continue
@@ -447,70 +534,106 @@ def sign_failures():
     return sorted(rows, key=lambda r: r.get("last_failure") or "", reverse=True)
 
 
+def _incident_state_unreadable(exc, now=None):
+    from . import cell
+    reason = "incident state unreadable (%s: %s)" % (
+        exc.__class__.__name__, exc)
+    d = _diag("incident_state_unreadable", reason, event_epoch=now)
+    rec = {"profile": _profile(cell.profile_name()), "code": d["code"],
+           "reason": d["reason"], "first_failure": d["_event_ts"],
+           "last_failure": d["_event_ts"], "failure_count": 1,
+           "remediation": d["remediation"],
+           "_first_epoch": d["_event_epoch"],
+           "_last_epoch": d["_event_epoch"]}
+    return _failure_public(rec, d["_event_epoch"])
+
+
+def sign_failures():
+    """Every uncleared profile failure, newest first, projected without the
+    internal epoch fields. Persisted and process-local owner views are merged;
+    an unreadable owner is itself a public degradation, never healthy/empty."""
+    now = time.time()
+    with _SIGN_FAILURE_FALLBACK_LOCK:
+        fallback = {p: dict(r) for p, r in
+                    _fallback_sign_failure_state().items()
+                    if isinstance(r, dict)}
+        try:
+            _validate_sign_failure_owner()
+            if not os.path.exists(sign_failures_path()):
+                state = {}
+            else:
+                with _sign_failure_lock():
+                    state = _read_sign_failure_state()
+        except Exception as exc:
+            rows = [_incident_state_unreadable(exc, now)]
+            rows.extend(_sign_failure_rows(fallback, now))
+            return sorted(rows, key=lambda r: r.get("last_failure") or "",
+                          reverse=True)
+    if not isinstance(state, dict):
+        state = {}
+    merged = {}
+    profiles = list(state) + [p for p in fallback if p not in state]
+    for p in profiles:
+        if isinstance(p, str):
+            merged[p] = _combined_sign_failure_state(state.get(p),
+                                                     fallback.get(p))
+    return _sign_failure_rows(merged, now)
+
+
 def _record_sign_failure(profile, failure):
-    """Upsert one exact profile. Event time owns reason/last; every active
-    failure still increments count even when its process reaches the lock late."""
+    """Upsert one exact profile. The process fallback is updated before the
+    shared write, so lock/write failure cannot erase the incident."""
     p = _profile(profile)
     d = _normal_diag(failure)
-    now, stamp = d["_event_epoch"], d["_event_ts"]
-    candidate = {"profile": p, "code": d["code"], "reason": d["reason"],
-                 "first_failure": stamp, "last_failure": stamp,
-                 "failure_count": 1, "remediation": d["remediation"],
-                 "_first_epoch": now, "_last_epoch": now}
-    with _sign_failure_lock():
-        state = pk.read_json(sign_failures_path(), {}) or {}
-        if not isinstance(state, dict):
-            state = {}
-        old = state.get(p) if isinstance(state.get(p), dict) else {}
-        success = _epoch(old.get("_success_epoch"))
-        last = _epoch(old.get("_last_epoch"))
-        if success >= now:
-            return _failure_public(candidate, now)
-        active = _active_failure(old)
-        if last > now:
-            if active:
-                old = dict(old)
-                old["failure_count"] = _count(old.get("failure_count")) + 1
-                first = _epoch(old.get("_first_epoch"), last)
-                if now < first:
-                    old.update(first_failure=stamp, _first_epoch=now)
-                state[p] = old
-                pk.write_json(sign_failures_path(), state)
-                return _failure_public(old, time.time())
-            return _failure_public(candidate, now)
-        candidate.update(
-            first_failure=old.get("first_failure")
-            if active and isinstance(old.get("first_failure"), str) else stamp,
-            failure_count=(_count(old.get("failure_count")) if active else 0) + 1,
-            _first_epoch=_epoch(old.get("_first_epoch"), now) if active else now,
-            _success_epoch=success)
-        state[p] = candidate
-        pk.write_json(sign_failures_path(), state)
-    return _failure_public(candidate, now)
+    remembered = False
+    with _SIGN_FAILURE_FALLBACK_LOCK:
+        fallback = _fallback_sign_failure_state()
+        try:
+            with _sign_failure_lock():
+                state = _read_sign_failure_state()
+                if not isinstance(state, dict):
+                    state = {}
+                old = _combined_sign_failure_state(state.get(p), fallback.get(p))
+                stored, shown, changed = _next_sign_failure(old, p, d)
+                if stored:
+                    fallback[p] = stored
+                remembered = True
+                if changed:
+                    state[p] = stored
+                    pk.write_json(sign_failures_path(), state)
+                return _failure_public(shown, d["_event_epoch"])
+        except Exception:
+            if not remembered:
+                stored, shown, changed = _next_sign_failure(fallback.get(p), p, d)
+                if changed:
+                    fallback[p] = stored
+            raise
 
 
 def _clear_sign_failure(profile, succeeded_at=None):
-    """Record a per-profile signed-success watermark in RAM. Keeping the
-    watermark (not just deleting a failure) prevents a delayed older failure
-    process from re-degrading after recovery. A success older than the current
-    failure clears nothing."""
+    """Record a per-profile signed-success watermark in both owner views. The
+    fallback changes only after the shared watermark write succeeds."""
     p = _profile(profile)
     succeeded_at = _epoch(succeeded_at, time.time())
     try:
-        with _sign_failure_lock():
-            state = pk.read_json(sign_failures_path(), {}) or {}
-            if not isinstance(state, dict):
-                state = {}
-            old = state.get(p) if isinstance(state.get(p), dict) else {}
-            last = _epoch(old.get("_last_epoch"))
-            prior = _epoch(old.get("_success_epoch"))
-            active = _active_failure(old)
-            if last > succeeded_at:
-                return False
-            state[p] = {"profile": p,
-                        "_success_epoch": max(prior, succeeded_at)}
-            pk.write_json(sign_failures_path(), state)
-            return active
+        with _SIGN_FAILURE_FALLBACK_LOCK:
+            fallback = _fallback_sign_failure_state()
+            with _sign_failure_lock():
+                state = _read_sign_failure_state()
+                if not isinstance(state, dict):
+                    state = {}
+                old = _combined_sign_failure_state(state.get(p), fallback.get(p))
+                last = _epoch(old.get("_last_epoch"))
+                prior = _epoch(old.get("_success_epoch"))
+                active = _active_failure(old)
+                if last > succeeded_at:
+                    return False
+                cleared = {"profile": p,
+                           "_success_epoch": max(prior, succeeded_at)}
+                state[p] = cleared
+                pk.write_json(sign_failures_path(), state)
+                fallback[p] = cleared
+                return active
     except Exception:
         return False
 
@@ -521,24 +644,29 @@ def acknowledge_sign_failures(profile=None):
     resurrecting the incident. Returns acknowledged exact profile names."""
     now, stamp = time.time(), pk.now_ts()
     try:
-        with _sign_failure_lock():
-            state = pk.read_json(sign_failures_path(), {}) or {}
-            if not isinstance(state, dict):
-                state = {}
-            targets = [_profile(profile)] if profile is not None else [
-                p for p, rec in state.items()
-                if isinstance(p, str) and _active_failure(rec)]
-            done = []
-            for p in targets:
-                rec = state.get(p)
-                if not _active_failure(rec):
-                    continue
-                state[p] = {"profile": p, "_success_epoch": now,
-                            "acknowledged_at": stamp}
-                done.append(p)
-            if done:
-                pk.write_json(sign_failures_path(), state)
-            return done
+        with _SIGN_FAILURE_FALLBACK_LOCK:
+            fallback = _fallback_sign_failure_state()
+            with _sign_failure_lock():
+                state = _read_sign_failure_state()
+                if not isinstance(state, dict):
+                    state = {}
+                profiles = list(state) + [p for p in fallback if p not in state]
+                targets = [_profile(profile)] if profile is not None else [
+                    p for p in profiles if isinstance(p, str) and _active_failure(
+                        _combined_sign_failure_state(state.get(p), fallback.get(p)))]
+                done, cleared = [], {}
+                for p in targets:
+                    rec = _combined_sign_failure_state(state.get(p), fallback.get(p))
+                    if not _active_failure(rec):
+                        continue
+                    cleared[p] = {"profile": p, "_success_epoch": now,
+                                  "acknowledged_at": stamp}
+                    state[p] = cleared[p]
+                    done.append(p)
+                if done:
+                    pk.write_json(sign_failures_path(), state)
+                    fallback.update(cleared)
+                return done
     except Exception:
         return []
 
@@ -550,15 +678,19 @@ def _stamp_sign_failure(row, profile, failure):
     try:
         rec = _record_sign_failure(profile, failure)
     except Exception as exc:
+        p = _profile(profile)
+        with _SIGN_FAILURE_FALLBACK_LOCK:
+            private = _fallback_sign_failure_state().get(p)
+            rec = _failure_public(private) if private else None
         d = _normal_diag(failure)
         stamp = d["_event_ts"]
-        rec = {"profile": _profile(profile),
-               "code": d["code"], "reason": d["reason"],
-               "first_failure": stamp, "last_failure": stamp,
-               "failure_count": 1, "age_s": 0, "last_age_s": 0,
-               "remediation": "%s; RAM incident retention also failed: %s" % (
-                   d["remediation"], _safe_reason(
-                       "%s: %s" % (exc.__class__.__name__, exc)))}
+        rec = rec or {"profile": p, "code": d["code"], "reason": d["reason"],
+                      "first_failure": stamp, "last_failure": stamp,
+                      "failure_count": 1, "age_s": 0, "last_age_s": 0,
+                      "remediation": d["remediation"]}
+        rec["remediation"] = "%s; shared incident retention failed: %s; process-local fallback active" % (
+            rec["remediation"], _safe_reason(
+                "%s: %s" % (exc.__class__.__name__, exc)))
     row["transport"] = _public_transport(dict(rec, state="DEGRADED"))
     return row
 
