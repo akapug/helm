@@ -900,6 +900,153 @@ class SeatTest(unittest.TestCase):
         with open(p) as f:
             self.assertEqual(json.load(f), {"mine": True})  # never clobbered
 
+    def test_fresh_instance_seeds_freshest_same_family_feature_cache(self):
+        """A new instance inherits ONLY the freshest complete cache carrying
+        Claude's real deferred-tool gate. Cache timestamp, not unrelated file
+        mtime, owns freshness; a newer partial map is ignored."""
+        host = os.path.join(self.tmp, "host-feature-source")
+        os.makedirs(host)
+        with open(os.path.join(host, ".claude.json"), "w") as f:
+            json.dump({"hasCompletedOnboarding": True}, f)
+
+        now = int(time.time() * 1000)
+        parent = os.path.join(seat.seat_dir("codex"), "claude", ".claude.json")
+        sibling = os.path.join(seat._instance_dir("codex", "codex-3"),
+                               "claude", ".claude.json")
+        partial = os.path.join(seat._instance_dir("codex", "codex-4"),
+                               "claude", ".claude.json")
+        rows = (
+            (parent, {"tengu_deferred_stub_tool": True, "parent": True},
+             [], now - 2000,
+             {"oauthAccount": {"email": "must-not-cross@example.com"}}),
+            (sibling, {"tengu_deferred_stub_tool": True, "winner": True},
+             ["exp-a"], now - 1000,
+             {"lastSessionId": "must-not-cross"}),
+            (partial, {"unrelated": True}, [], now, {}),
+        )
+        for p, features, experiments, fetched, extra in rows:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                json.dump(dict(extra,
+                               cachedGrowthBookFeatures=features,
+                               cachedExperimentFeatures=experiments,
+                               cachedGrowthBookFeaturesAt=fetched), f)
+        os.utime(parent, (300, 300))
+        os.utime(sibling, (100, 100))
+
+        target = seat._instance_dir("codex", "codex-2")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}), \
+                contextlib.redirect_stderr(err):
+            seat._write_launch_assets("codex", target, seat="codex-2",
+                                      workdir=self.tmp)
+        with open(os.path.join(target, "claude", ".claude.json")) as f:
+            seeded = json.load(f)
+        self.assertEqual(seat._FEATURE_CACHE_GATE, "tengu_deferred_stub_tool")
+        self.assertEqual(seeded["cachedGrowthBookFeatures"],
+                         {"tengu_deferred_stub_tool": True, "winner": True})
+        self.assertEqual(seeded["cachedExperimentFeatures"], ["exp-a"])
+        self.assertEqual(seeded["cachedGrowthBookFeaturesAt"], now - 1000)
+        self.assertNotIn("oauthAccount", seeded)
+        self.assertNotIn("lastSessionId", seeded)
+        self.assertNotIn("feature cache not seeded", err.getvalue())
+
+    def test_cacheless_existing_instance_repairs_when_source_appears(self):
+        """A first cacheless mint is not terminal: each launch warns until a
+        valid sibling appears, then merges only the allowlisted tuple while
+        preserving every seat-owned field."""
+        host = os.path.join(self.tmp, "host-repair")
+        os.makedirs(host)
+        with open(os.path.join(host, ".claude.json"), "w") as f:
+            json.dump({"hasCompletedOnboarding": True}, f)
+        target = seat._instance_dir("codex", "codex-2")
+        env = {"CLAUDE_CONFIG_DIR": host}
+        first = io.StringIO()
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stderr(first):
+            seat._write_launch_assets("codex", target, seat="codex-2",
+                                      workdir=self.tmp)
+        state_path = os.path.join(target, "claude", ".claude.json")
+        with open(state_path) as f:
+            state = json.load(f)
+        state.update({"mine": True, "lastSessionId": "seat-owned"})
+        with open(state_path, "w") as f:
+            json.dump(state, f)
+        self.assertIn("feature cache not seeded", first.getvalue())
+
+        source = os.path.join(seat.seat_dir("codex"), "claude", ".claude.json")
+        os.makedirs(os.path.dirname(source), exist_ok=True)
+        now = int(time.time() * 1000)
+        with open(source, "w") as f:
+            json.dump({"cachedGrowthBookFeatures":
+                           {seat._FEATURE_CACHE_GATE: True},
+                       "cachedExperimentFeatures": [],
+                       "cachedGrowthBookFeaturesAt": now,
+                       "oauthAccount": {"email": "must-not-cross@example.com"}}, f)
+        second = io.StringIO()
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stderr(second):
+            seat._write_launch_assets("codex", target, seat="codex-2",
+                                      workdir=self.tmp)
+        with open(state_path) as f:
+            repaired = json.load(f)
+        self.assertTrue(repaired["mine"])
+        self.assertEqual(repaired["lastSessionId"], "seat-owned")
+        self.assertTrue(repaired["cachedGrowthBookFeatures"]
+                        [seat._FEATURE_CACHE_GATE])
+        self.assertEqual(repaired["cachedGrowthBookFeaturesAt"], now)
+        self.assertNotIn("oauthAccount", repaired)
+        self.assertNotIn("feature cache not seeded", second.getvalue())
+
+    def test_cacheless_instance_rejects_poisoned_and_escaped_sources(self):
+        """Partial, stale, future, non-finite, and symlink-escaped caches cannot
+        suppress the loud warning or cross the same-family trust boundary."""
+        host = os.path.join(self.tmp, "host-without-cache")
+        os.makedirs(host)
+        with open(os.path.join(host, ".claude.json"), "w") as f:
+            json.dump({"hasCompletedOnboarding": True}, f)
+        now = int(time.time() * 1000)
+        bad = (
+            ({"unrelated": True}, now),
+            ({seat._FEATURE_CACHE_GATE: True},
+             now - seat._FEATURE_CACHE_MAX_AGE_MS - 1),
+            ({seat._FEATURE_CACHE_GATE: True},
+             now + seat._FEATURE_CACHE_FUTURE_SKEW_MS + 60_000),
+            ({seat._FEATURE_CACHE_GATE: True}, float("nan")),
+        )
+        for i, (features, fetched) in enumerate(bad, 3):
+            p = os.path.join(seat._instance_dir("codex", "codex-%d" % i),
+                             "claude", ".claude.json")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                json.dump({"cachedGrowthBookFeatures": features,
+                           "cachedExperimentFeatures": [],
+                           "cachedGrowthBookFeaturesAt": fetched}, f)
+
+        foreign = os.path.join(seat.seat_dir("kimi"), "claude", ".claude.json")
+        os.makedirs(os.path.dirname(foreign), exist_ok=True)
+        with open(foreign, "w") as f:
+            json.dump({"cachedGrowthBookFeatures":
+                           {seat._FEATURE_CACHE_GATE: True, "foreign": True},
+                       "cachedExperimentFeatures": [],
+                       "cachedGrowthBookFeaturesAt": now}, f)
+        escaped = os.path.join(seat._instance_dir("codex", "codex-7"),
+                               "claude", ".claude.json")
+        os.makedirs(os.path.dirname(escaped), exist_ok=True)
+        os.symlink(foreign, escaped)
+
+        target = seat._instance_dir("codex", "codex-2")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": host}), \
+                contextlib.redirect_stderr(err):
+            seat._write_launch_assets("codex", target, seat="codex-2",
+                                      workdir=self.tmp)
+        with open(os.path.join(target, "claude", ".claude.json")) as f:
+            seeded = json.load(f)
+        for key in seat._FEATURE_CACHE_KEYS:
+            self.assertNotIn(key, seeded)
+        self.assertIn("WARNING — feature cache not seeded", err.getvalue())
+        self.assertIn(seat._FEATURE_CACHE_GATE, err.getvalue())
+        self.assertIn("Monitor", err.getvalue())
+
     def test_launch_line_room_homing(self):
         """Seat presets clear ambient homing, then bake either an explicit room
         or a project-derived room with truthful provenance into launch.sh."""

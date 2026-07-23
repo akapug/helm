@@ -63,6 +63,7 @@ Import-safe, stdlib-only.
 import base64
 import glob
 import json
+import math
 import os
 import re
 import shlex
@@ -856,6 +857,82 @@ _ONBOARD_KEYS = ("hasCompletedOnboarding", "lastOnboardingVersion", "theme",
                  "numStartups", "tipsHistory", "bypassPermissionsModeAccepted",
                  "hasAcknowledgedCostThreshold")
 
+# Claude Code gates deferred tools (including Monitor) behind GrowthBook state.
+# Proxy seats cannot reliably refresh that state themselves, so a fresh instance
+# borrows ONLY these cache fields from a working same-family seat. Never widen
+# this tuple to identity, auth, project, session, or metric state.
+_FEATURE_CACHE_KEYS = ("cachedGrowthBookFeatures", "cachedExperimentFeatures",
+                       "cachedGrowthBookFeaturesAt")
+_FEATURE_CACHE_GATE = "tengu_deferred_stub_tool"
+_FEATURE_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+_FEATURE_CACHE_FUTURE_SKEW_MS = 5 * 60 * 1000
+
+
+def _feature_cache_complete(state, now_ms=None):
+    """Whether state can preserve the deferred-tool surface this seed exists for."""
+    if not isinstance(state, dict):
+        return False
+    features = state.get("cachedGrowthBookFeatures")
+    experiments = state.get("cachedExperimentFeatures")
+    fetched = state.get("cachedGrowthBookFeaturesAt")
+    if (not isinstance(features, dict)
+            or features.get(_FEATURE_CACHE_GATE) is not True
+            or not isinstance(experiments, list)
+            or isinstance(fetched, bool)
+            or not isinstance(fetched, (int, float))
+            or not math.isfinite(fetched)):
+        return False
+    now_ms = time.time() * 1000 if now_ms is None else now_ms
+    return (now_ms - _FEATURE_CACHE_MAX_AGE_MS <= fetched
+            <= now_ms + _FEATURE_CACHE_FUTURE_SKEW_MS)
+
+
+def _feature_cache_seed(family, dst):
+    """The freshest complete same-family regular-file cache, excluding dst.
+
+    Freshness is the cache's own millisecond timestamp; file mtime only breaks a
+    tie because Claude rewrites unrelated state independently. Resolved paths
+    must remain inside the family root, so a symlink cannot import another
+    account/family's GrowthBook state.
+    """
+    from . import pk
+    root = os.path.realpath(seat_dir(family))
+    refs = [os.path.join(root, "claude", ".claude.json")]
+    refs.extend(glob.glob(os.path.join(
+        root, "instances", "*", "claude", ".claude.json")))
+    dst = os.path.realpath(dst)
+    best = None
+    for ref in refs:
+        if os.path.islink(ref) or not os.path.isfile(ref):
+            continue
+        real = os.path.realpath(ref)
+        try:
+            inside = os.path.commonpath((root, real)) == root
+        except ValueError:
+            inside = False
+        if not inside or real == dst:
+            continue
+        state = pk.read_json(real, None)
+        if not _feature_cache_complete(state):
+            continue
+        try:
+            mtime = os.path.getmtime(real)
+        except OSError:
+            mtime = 0
+        rank = (state["cachedGrowthBookFeaturesAt"], mtime, real)
+        if best is None or rank > best[0]:
+            best = rank, state
+    if best is None:
+        return None
+    return {k: best[1][k] for k in _FEATURE_CACHE_KEYS}
+
+
+def _warn_feature_cache(cdir):
+    print("helm seat: WARNING — feature cache not seeded for %s; no recent "
+          "same-family seat has a complete %s cache. A launched seat may omit "
+          "deferred tools including Monitor until Claude refreshes it"
+          % (cdir, _FEATURE_CACHE_GATE), file=sys.stderr)
+
 
 def _onboarded_refs():
     """Config files to borrow onboarding flags from, best first: the minting
@@ -883,21 +960,41 @@ def _git_toplevel(path):
     return None
 
 
-def _seed_onboarding(cdir, workdir=None):
-    """A fresh seat config dir triggers CC's first-run wizard, which blocks the
-    seat at an interactive prompt (proven 2026-07-21: codex-2 stalled at the
-    theme picker, never joined chat). Seed <cdir>/.claude.json with the
-    onboarding-complete flags so a launched seat boots straight to work. Never
-    clobber a seat's own state; copy the flags from an onboarded sibling (version
-    match), else write a minimal complete marker. Also UNCONDITIONALLY trusts the
-    seat's intended workdir (+ its git root) — the folder-trust dialog is an
-    exact-match on the git-root realpath and no ref config carries helm-trust
-    (root cause of the codex-3 trust stall), so it must be synthesized, not
-    copied. Best-effort, non-fatal."""
+def _seed_onboarding(cdir, workdir=None, family=None):
+    """Seed a fresh seat's safe boot state without copying identity or sessions.
+
+    Onboarding/trust state skips two interactive wizards. Same-family feature
+    cache state preserves Claude Code's deferred tool surface (proven 2026-07-22:
+    cache-less codex-2 omitted Monitor while a cache-backed A/B launch exposed
+    it). Never clobber a seat's own state. Best-effort, non-fatal, but a missing
+    feature source is loud because the launched seat may be unwakeable.
+    """
     from . import pk
     dst = os.path.join(cdir, ".claude.json")
-    if os.path.exists(dst):
-        return                       # the seat owns its state once it exists
+    if os.path.lexists(dst):
+        if os.path.islink(dst) or not os.path.isfile(dst):
+            print("helm seat: WARNING — refusing non-regular seat state %s; "
+                  "feature cache cannot be repaired" % dst, file=sys.stderr)
+            return
+        state = pk.read_json(dst, None)
+        if not isinstance(state, dict):
+            print("helm seat: WARNING — unreadable seat state %s; refusing to "
+                  "overwrite it for feature-cache repair" % dst, file=sys.stderr)
+            return
+        if _feature_cache_complete(state):
+            return
+        cache = _feature_cache_seed(family, dst) if family else None
+        if cache is None:
+            _warn_feature_cache(cdir)
+            return
+        state.update(cache)          # preserve every seat-owned field; repair allowlist only
+        try:
+            pk.write_json(dst, state)
+        except OSError as e:
+            print("helm seat: feature cache not repaired for %s (%s); a launched "
+                  "seat may omit deferred tools including Monitor" % (cdir, e),
+                  file=sys.stderr)
+        return
     seed = {"hasCompletedOnboarding": True, "theme": "dark"}
     for ref in _onboarded_refs():
         r = pk.read_json(ref, None)
@@ -918,6 +1015,11 @@ def _seed_onboarding(cdir, workdir=None):
             if trusted:
                 seed["projects"] = trusted
             break
+    cache = _feature_cache_seed(family, dst) if family else None
+    if cache is None:
+        _warn_feature_cache(cdir)
+    else:
+        seed.update(cache)
     # synthesize trust for the intended workdir (+ its git root) — exact-match
     # keys the dialog needs; helm already made the stronger bypass call.
     projects = seed.setdefault("projects", {})
@@ -1049,7 +1151,7 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
     cdir = os.path.join(d, "claude")
     os.makedirs(cdir, exist_ok=True)
     _link_skills(cdir)       # seat agents get the host's /learn, /premise, /afk, …
-    _seed_onboarding(cdir, workdir)   # skip the onboarding/trust wizards
+    _seed_onboarding(cdir, workdir, family)  # onboarding/trust + feature cache
     from . import hooks
     action, detail = hooks.install_home(cdir, specs=hooks.DELIVERY_SPECS)
     if action == "fail":
