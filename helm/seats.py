@@ -1302,6 +1302,23 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main"):
 _SEAT_TOKEN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")   # what an @mention can say
 
 
+def resolve_recipient(to):
+    """Validate and case-snap one exact seat token.  This is the canonical
+    addressee resolver shared by DM and compound dispatch-send operations."""
+    to = (to or "").strip().lstrip("@")
+    if not _SEAT_TOKEN.match(to):
+        return None, ("recipient %r must be 1-64 chars of [A-Za-z0-9._-] — "
+                      "the exact seat token" % to)
+    r = roster()
+    if to not in r:
+        hits = [k for k in r if k.casefold() == to.casefold()]
+        if len(hits) == 1:
+            to = hits[0]
+        elif len(hits) > 1:
+            return None, "recipient %r is ambiguous by case" % to
+    return to, None
+
+
 def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None,
        reply_to=None):
     """One TRUE 1:1 message -> (row, None) or (None, reason). The recipient
@@ -1314,15 +1331,9 @@ def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None,
     first in the scan. A DM to a not-yet-joined seat waits in its lane; the
     join baselines that lane at 0, so it delivers. `reply_to` (a parent row id
     or ordinal IN THAT LANE) threads the DM — chat.post owns the resolve."""
-    to = (to or "").strip().lstrip("@")
-    if not _SEAT_TOKEN.match(to):
-        return None, ("recipient %r must be 1-64 chars of [A-Za-z0-9._-] — "
-                      "the exact seat token" % to)
-    r = roster()
-    if to not in r:
-        hits = [k for k in r if k.casefold() == to.casefold()]
-        if len(hits) == 1:
-            to = hits[0]        # case-snap to the live seat, nothing looser
+    to, err = resolve_recipient(to)
+    if err:
+        return None, err
     sender = who or seat_for_session(session) or derive_seat(session)
     if str(sender).casefold() == to.casefold():
         return None, "a DM to yourself would never deliver (own posts don't)"
@@ -1591,7 +1602,11 @@ def _ask_candidate():
     to None: ledger trouble = silence."""
     try:
         from . import ownerasks
-        r = ownerasks.oldest_unreported()
+        r, unavailable = ownerasks.stop_candidate()
+        if unavailable:
+            return ("ask:ledger-unavailable",
+                    "owner-ask ledger UNAVAILABLE — owner debt is UNKNOWN, not "
+                    "zero; repair/read `helm asks list` before stopping")
         if not r:
             return None
         return ("ask:%s:%s" % (r.get("id"), r.get("status")),
@@ -1600,6 +1615,57 @@ def _ask_candidate():
                 % (r.get("id"),
                    "done-UNREPORTED" if r.get("status") == "done" else "open",
                    _clip(_scrub(str(r.get("ask") or "")), 48), r.get("id")))
+    except Exception:
+        return None
+
+
+def _dispatch_candidate():
+    """The DISPATCH rung — sits directly under the owner-ask rung: work you
+    handed to another seat and have not checked on. One cheap local read of
+    the dispatch ledger; whispers the OLDEST OVERDUE row, never the list.
+
+    This is the durable half of the owner's ask (2026-07-21): "we definitely
+    need some timer fallback for anything that is sent to them, to make sure
+    it is remembered to check on their progress". Per-session Monitor
+    watchdogs die at compaction; this rung re-fires from disk in whatever
+    session is running.
+
+    The whisper says CHECK IN, never reassign — an overdue row means the
+    deadline passed, not that the seat is dead, and tonight a lane quiet 47
+    minutes turned out to be a long turn. The fp carries status/delivery so a
+    state transition re-fires exactly once. Fail-closed to None."""
+    try:
+        from . import dispatches
+        r, kind, unavailable = dispatches.stop_candidate()
+        if unavailable:
+            return ("dispatch:ledger-unavailable",
+                    "dispatch ledger UNAVAILABLE — obligations are UNKNOWN, not "
+                    "zero; repair/read `helm dispatch list` before stopping")
+        if not r:
+            return None
+        tip = str(r.get("tip") or r.get("ref") or "<reviewed-tip>")
+        lane = _clip(_scrub(str(r.get("lane") or "")), 32)
+        if kind == "redispatch":
+            return ("dispatch:%s:needs-redispatch" % r.get("id"),
+                    "dispatch %s to @%s (%s) NEEDS REDISPATCH — this historical "
+                    "row lacks an exact tip so no verdict can ever close it; "
+                    "redispatch the work with `helm dispatch send ... --ref "
+                    "<tip>` (the old row stays visible as history)"
+                    % (r.get("id"), r.get("recipient"), lane))
+        if kind == "confirm":
+            return ("dispatch:%s:needs-confirmation" % r.get("id"),
+                    "dispatch %s to @%s (%s) delivery is NEEDS CONFIRMATION — "
+                    "confirm at @%s that the hand-off actually arrived; do NOT "
+                    "resend automatically (one operation = at most one send)"
+                    % (r.get("id"), r.get("recipient"), lane,
+                       r.get("recipient")))
+        return ("dispatch:%s:%s:%s" % (r.get("id"), r.get("status"), tip),
+                "dispatch %s to @%s (%s) NEEDS CHECK-IN (OVERDUE) and is "
+                "PENDING VERDICT — verify at the exact recipient; do NOT "
+                "reassign on age alone. Close the exact reviewed tip with: "
+                "helm dispatch verdict %s %s <evidence>"
+                % (r.get("id"), r.get("recipient"), lane, r.get("id"),
+                   _clip(_scrub(tip), 16)))
     except Exception:
         return None
 
@@ -1708,6 +1774,9 @@ def _whisper_candidates(session, pending, inbox_blocked):
     ask = _ask_candidate()   # owner-ask rung: unsurfaced owner debt outranks all
     if ask:
         out.append(ask)
+    dsp = _dispatch_candidate()   # then: work handed out and never checked on
+    if dsp:
+        out.append(dsp)
     c = {}
     if session:
         try:

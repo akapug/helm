@@ -1698,7 +1698,13 @@ frames; this lane is called *delivery*.)
   UNREPORTED owner ask (top of the ladder: the owner-ask ledger's OLDEST row
   not yet `reported` — open or done-but-unreported — named one at a time with
   its `helm asks report` pointer; fp carries the row's status, so open→done
-  re-fires once), stuck
+  re-fires once), then dispatch state reloaded from disk on each stop: ledger
+  **UNAVAILABLE / obligations UNKNOWN** first, then the oldest historical row
+  that **NEEDS REDISPATCH**, then the oldest **NEEDS CONFIRMATION** row
+  (delivery unproven — verify at the recipient, never resend), then the
+  oldest overdue **NEEDS CHECK-IN / PENDING VERDICT** row with its exact-tip
+  verdict command (advisory only and
+  never an automatic reassignment), stuck
   session (`stuck-streak`≥3: surface the blocker), a RED gate (record.py's
   command-log shows a test-runner whose LATEST run exited nonzero — fix or
   surface before stopping; a green rerun silences it), unlanded owner/mention
@@ -1969,8 +1975,57 @@ culture). **`done` does not close a row** — `report <id> <chat-post-id>` is
 the ONLY closer, and its argument is the chat post that told the OWNER
 (owner-surface-is-the-bar: work merely finished is invisible work). Any row
 not yet `reported` rides the stop-whisper's TOP rung (see `stop-guard`
-above) until the owner has actually heard it. Fail-open: an unwritable
-ledger never raises, and a failed `add` says NOT RECORDED loudly.
+above) until the owner has actually heard it. A missing ledger is known-empty;
+an unsafe/unreadable ledger is **UNAVAILABLE / owner debt UNKNOWN** on both
+`list` (nonzero) and stop-whisper, never silently rendered as zero. Mutations
+still never traceback, and a failed `add` says NOT RECORDED loudly.
+
+### `helm dispatch send <recipient> <lane> <message...> --ref TIP [--key K] | add <recipient> <lane> --ref TIP | verdict <id> <full-reviewed-tip> <evidence> | list [--open|--overdue] [--json]`
+
+The DISPATCH ledger is the durable obligation behind work handed to another
+seat. The shipping surface is deliberately small — three events, immutable
+rows, no exactly-once machinery:
+
+* **`send`** persists the obligation FIRST, then attempts exactly one DM. The
+  optional `--key` names the operation (namespaced by canonical sender + Git
+  repository; derived from the semantic request fields when omitted). **One
+  operation sends at most once, ever**: retrying an existing operation never
+  re-DMs — a prior attempt whose delivery evidence is missing is AMBIGUOUS,
+  not absent, and resending is exactly the duplicate-message hazard the
+  reduced core refuses to automate away. Ambiguous delivery stays open as
+  **NEEDS CONFIRMATION**: verify at the recipient, never resend blind.
+* **`add`** records a handoff performed by another transport; it still
+  requires `--ref`, so no new row is ever born without the exact tip its
+  verdict must name. Its delivery starts NEEDS CONFIRMATION.
+* **`verdict`** is the ONLY closer. It takes the full exact reviewed commit
+  id and refuses unless it equals the row's dispatched tip — a stale verdict
+  can never close moved work. Identical verdict retries are idempotent;
+  conflicting ones are refused.
+
+There is **no ack, bind, or retarget** — those verbs are gone. Historical
+ref-less rows (the short-lived v2 schema) stay visible as **NEEDS
+REDISPATCH**: redispatch the work with an exact `--ref`; the old row remains
+as history. Rows the old schemas already wrote keep replaying truthfully, but
+only rows stamped before the reduced core landed (`LEGACY_COMPAT_BOUNDARY`)
+can drive those historical transitions — an event appended today, however
+well-shaped (including non-string timestamps), is inert at replay, and a
+type-corrupt row is skipped without blinding the ledger.
+
+Rows are append-only events in `~/.helm/_global/dispatches.jsonl`, separate
+from owner asks while sharing the same hardened event-ledger primitive:
+stable flock, incomplete-tail repair before append, one bounded `O_APPEND`
+write, file + directory-entry fsync, partial-write rollback, 0600 private
+regular files, symlink/hardlink refusal, and per-row fail-safe replay. An
+absent ledger is known-empty; an unsafe/unreadable ledger is **UNAVAILABLE /
+obligations UNKNOWN** (CLI nonzero and stop-whisper loud), never silently
+rendered as zero.
+
+Deadlines are advisory. An overdue row says **NEEDS CHECK-IN** and rides the
+stop-whisper after owner asks; it never reassigns work, because a long turn
+is observationally identical to a dead seat. The stop-whisper ranks
+redispatch needs, then unconfirmed delivery, then overdue check-ins. UTC
+timestamps use calendar semantics; future or malformed timestamps read as
+NEW, never false-overdue.
 
 ## ops — health, evolution, the browser
 

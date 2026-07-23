@@ -16,7 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import home, ownerasks, pk, record, seats  # noqa: E402
+from helm import eventledger, home, ownerasks, pk, record, seats  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -241,6 +241,18 @@ class AskWhisperTest(AsksBase):
         self.assertNotIn("wedged", err)                  # stuck waits its turn
         line = next(l for l in err.splitlines() if "stop-whisper" in l)
         self.assertLessEqual(len(line.encode("utf-8")), seats.STOP_WHISPER_CAP)
+
+    def test_unavailable_ledger_is_unknown_on_cli_and_stop_whisper(self):
+        seats.join(seat="wisp", cwd="/tmp/p")
+        with mock.patch.object(eventledger, "checked_events",
+                               return_value=([], "PermissionError: denied")):
+            rc, _out, err = self.asks("list")
+            self.assertEqual(rc, 1)
+            self.assertIn("owner debt UNKNOWN", err)
+            rc, _out, err = self.guard(args=["--seat", "wisp"])
+            self.assertEqual(rc, 2)
+            self.assertIn("owner-ask ledger UNAVAILABLE", err)
+            self.assertIn("UNKNOWN", err)
 
     def test_fail_closed_and_kill_switch(self):
         seats.join(seat="wisp", cwd="/tmp/p")
