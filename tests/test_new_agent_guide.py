@@ -304,26 +304,18 @@ class NewAgentGuideTest(unittest.TestCase):
             "default must resolve there; guide section 2 and this pin flip "
             "together")
 
-    def test_canary_launch_line_shared_port_and_inline_token(self):
-        # ============================ MERGE-TIME CANARY =====================
-        # This test pins TODAY'S launch-line FORM — the runtime truth behind
-        # BOTH dual-world paragraphs in guide section 6 (the two prose
-        # (lane/per-instance-codex-proxies) markers the span grammar cannot
-        # reach): the printed `helm seat launch codex -i 2` line carries the
-        # SHARED family port (not the instance's own base+N port) and embeds
-        # the bearer token INLINE (not a 0600-token-file read at exec time).
-        #
-        # WHEN THIS TEST FAILS AFTER lane/per-instance-codex-proxies MERGES,
-        # THAT IS THE CANARY FIRING, NOT A REGRESSION: flip ALL together —
-        #   1. guide section 6: rewrite both "Landed:/Not landed:" and
-        #      "Once ... lands ... until then" paragraphs in the present
-        #      tense and DROP both (lane/per-instance-codex-proxies) markers
-        #      ("run it, don't quote it" stays true in both worlds);
-        #   2. this test: assert the -i 2 line carries the instance's OWN
-        #      port (base+N, e.g. 8319 for codex-2) and NO inline token
-        #      (the line reads its 0600 token file at exec time).
-        # Do not delete the test and do not touch the paragraphs without the
-        # pin, or the guide silently goes stale (adversarial MED 2).
+    def test_launch_line_instance_port_and_token_file(self):
+        # ===================== LANDED-STATE REGRESSION GUARD ================
+        # Post lane/per-instance-codex-proxies (the merge-time canary fired at
+        # land and both guide-section-6 paragraphs were flipped to present
+        # tense). This pin now guards the LANDED invariant, both directions:
+        # the printed `helm seat launch codex -i 2` line MUST carry the
+        # instance's OWN base+N port (e.g. 8319 for codex-2), MUST NOT carry
+        # the shared family port (8317 — shared-port multiplication was the
+        # silent-hang vector), and MUST read the bearer from a 0600 token file
+        # at exec time rather than embedding it inline (transcripts are the
+        # corpus). A revert to the shared-port/inline-token form re-fires this
+        # and names guide section 6 to re-sync. Do not delete the test.
         # ====================================================================
         add = subprocess.run(
             [sys.executable, HELM, "seat", "add", "codex"], cwd=self.tmp,
@@ -336,21 +328,25 @@ class NewAgentGuideTest(unittest.TestCase):
         line = p.stdout.strip()
         base = seat.FAMILIES["codex"]["port"]
         self.assertIn(
-            "ANTHROPIC_BASE_URL=http://127.0.0.1:%d" % base, line,
-            "the -i 2 launch line no longer carries the shared family port "
-            "— if lane/per-instance-codex-proxies just merged this is the "
-            "CANARY: flip guide section 6 and this pin together (see "
-            "comment above)")
+            "ANTHROPIC_BASE_URL=http://127.0.0.1:%d" % (base + 2), line,
+            "the -i 2 launch line must carry the instance's OWN proxy port "
+            "(base+N) — per-instance proxies are landed; a revert to the "
+            "shared family port reintroduces the silent-hang vector (guide "
+            "section 6)")
         self.assertNotIn(
-            ":%d" % (base + 2), line,
-            "the -i 2 launch line carries an instance-own port — per-"
-            "instance proxies landed; flip guide section 6 and this pin "
-            "together (see comment above)")
-        self.assertRegex(
+            "ANTHROPIC_BASE_URL=http://127.0.0.1:%d " % base, line,
+            "the -i 2 launch line must NOT carry the shared family port — "
+            "shared-port multiplication was the silent-hang vector (guide "
+            "section 6)")
+        self.assertNotRegex(
             line, r"ANTHROPIC_AUTH_TOKEN=[0-9a-f]{16,}",
-            "the launch line no longer embeds the bearer inline (token-file "
-            "read landed?) — flip guide section 6 and this pin together "
-            "(see comment above)")
+            "the launch line must NOT embed the bearer inline — it reads the "
+            "0600 token file at exec time (transcripts are the corpus; guide "
+            "section 6)")
+        self.assertIn(
+            "ANTHROPIC_AUTH_TOKEN=$(cat ", line,
+            "the launch line must read the bearer from its 0600 token file "
+            "at exec time (guide section 6)")
 
 
 if __name__ == "__main__":
