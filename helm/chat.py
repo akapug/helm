@@ -175,7 +175,8 @@ def whoname():
     if sid:
         try:
             from . import seats
-            return seats.seat_for_session(sid) or seats.auto_name(sid, os.getcwd())
+            return seats.seat_for_session(sid) \
+                or seats.auto_name(sid, seats.safe_cwd())
         except Exception:
             return "agent-" + sid[:8]
     return "agent"
@@ -1096,17 +1097,18 @@ def cmd_chat(args):
     join|deliver|stop-guard [--hook-json] | wait [--any] [--follow] [--seat S]
     | seats [--all] | seat rename <sid|oldname> <newname>
     | seat mute|unmute <room> [--seat S] | seat mutes [--seat S]
-    | claim|release <resource> | claims  [--room R]"""
+    | seat gc [--apply] | claim|release <resource> | claims  [--room R]"""
     args = list(args or [])
-    # HELM_CHAT_ROOM homes a seat in a team channel (slice 3): every no---room
-    # verb — posts, reads, join, deliver, the hooks pass no --room — defaults
-    # to its room. Homed delivery scans only {home, main}; un-homed seats retain
-    # the legacy all-room inbox. Unset ⇒ main for this one verb invocation.
-    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
-    room = env_room or "main"
+    # Every no---room verb — posts, reads, join, deliver, the hooks pass no
+    # --room — defaults to THE one homing precedence (seats.resolve_homing:
+    # env seam > cwd project derivation), the SAME resolver the SessionStart
+    # join writes the roster through. A private 'env or main' default here was
+    # a second truth (roster-scatter class): a seat the join homed to proj-a
+    # posted and read 'main' by default, zero rows reaching its home. Un-homed
+    # contexts (no env, no project cwd) keep main. Homed delivery scans only
+    # {home, main}; un-homed seats retain the legacy all-room inbox.
     room_given = "--room" in args
-    room_source = "derived" \
-        if not room_given and env_source == "derived" else None
+    room, room_source = "main", None
     if room_given:
         i = args.index("--room")
         if i + 1 >= len(args):
@@ -1114,6 +1116,17 @@ def cmd_chat(args):
             return 2
         room = args[i + 1]
         del args[i:i + 2]
+    else:
+        from . import seats     # deferred: seats imports chat at module top
+        # seats.safe_cwd, NEVER a bare os.getcwd(): this prologue runs before
+        # verb dispatch AND before the hook branches' fail-open try blocks —
+        # an eager getcwd here crashed every default verb + all three
+        # delivery hooks for a session whose cwd was deleted (a pruned lane
+        # worktree is routine). None ⇒ un-homed ⇒ #main; the session lives.
+        resolved, source = seats.resolve_homing(None, seats.safe_cwd())
+        if resolved:
+            room = resolved
+            room_source = "derived" if source == "derived" else None
     verb = args[0] if args else "read"
     if verb == "roster":            # roster: a friendlier alias for `seats`
         verb = "seats"

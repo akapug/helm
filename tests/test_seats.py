@@ -2165,45 +2165,48 @@ class RosterReportTest(SeatsBase):
         self.assertIn("fresh", out)
 
 
-class RosterReaperTest(SeatsBase):
-    """G-roster-reaper: the roster only ever grew — permanently-absent /tmp
-    throwaways piled up with orphan cursor/seen/latch files."""
+class ReportNeverMutatesTest(SeatsBase):
+    """codex-2 HIGH: roster_report auto-ran the legacy reap_roster, which
+    deleted ANY stale row on presence alone — an inactive-but-fully-persisted
+    seat lost its row to a 3s web poll, bypassing gc's transcript/process
+    evidence and the manual dry-run gate. The legacy path is DELETED, not
+    fenced: a report is a READ, cleanup has exactly one owner (gc_roster)."""
 
-    def test_stale_row_and_orphan_state_reaped_fresh_survives(self):
-        seats.join(seat="fresh", session="s-f", cwd="/tmp/p")
-        seats.join(seat="stale", session="s-s", cwd="/tmp/p")
-        with open(seats._stop_fp_path("main", "stale", "s-s"), "w") as f:
-            f.write("fp")                       # a stop latch orphan too
-        old = time.time() - 2 * seats.REAP_S
-        os.utime(seats.seen_path("stale"), (old, old))
-        reaped = seats.reap_roster()
-        self.assertEqual(reaped, ["stale"])
-        self.assertNotIn("stale", seats.roster())
-        self.assertIn("fresh", seats.roster())          # fresh row survives
+    def test_legacy_auto_reap_is_gone(self):
+        self.assertFalse(hasattr(seats, "reap_roster"))
+
+    def test_report_keeps_a_stale_seat_row_identical(self):
+        """codex-2's exact probe: persisted seat present before
+        roster_report(), row byte-identical after — no matter how stale its
+        presence is, the report consults NO deletion evidence at all."""
+        seats.join(seat="idle-persisted", session="s-idle", cwd="/tmp/p")
+        with open(seats._stop_fp_path("main", "idle-persisted", "s-idle"),
+                  "w") as f:
+            f.write("fp")                       # keyed state must survive too
+        old = time.time() - 10 * seats.REAP_S
+        os.utime(seats.seen_path("idle-persisted"), (old, old))
+        before = seats.roster()["idle-persisted"]
+        rep = seats.roster_report("main")
+        self.assertEqual(seats.roster()["idle-persisted"], before)
+        self.assertIn("idle-persisted", [s["seat"] for s in rep["seats"]])
         names = os.listdir(chat.chat_dir())
-        self.assertFalse([n for n in names
-                          if seats._seat_key("stale") in n])   # whole tail gone
         self.assertTrue([n for n in names
-                         if seats._seat_key("fresh") in n])    # fresh state kept
+                         if seats._seat_key("idle-persisted") in n])
 
-    def test_report_reaps_and_cli_hides_absent_behind_all(self):
+    def test_cli_hides_absent_rows_but_deletes_nothing(self):
         seats.join(seat="live", session="s-l", cwd="/tmp/p")
         seats.join(seat="gone", session="s-g", cwd="/tmp/p")
         old = time.time() - 2 * seats.REAP_S
         os.utime(seats.seen_path("gone"), (old, old))
-        rep = seats.roster_report("main")               # the report's GC leg
-        self.assertEqual([s["seat"] for s in rep["seats"]], ["live"])
-        # absent-but-not-yet-reap-age rows hide behind --all in the CLI
-        seats.write_roster("napping")
-        nap = time.time() - seats.QUIET_S - 60
-        os.utime(seats.seen_path("napping"), (nap, nap))
         rc, out, _ = self.cmd("seats")
         self.assertEqual(rc, 0)
         self.assertIn("live", out)
-        self.assertNotIn("napping", out)
+        self.assertNotIn("gone", out)           # hidden, never deleted
         self.assertIn("hidden", out)
+        self.assertIn("seat gc", out)           # the one cleanup owner, named
         rc, out, _ = self.cmd("seats", ["--all"])
-        self.assertIn("napping", out)
+        self.assertIn("gone", out)
+        self.assertIn("gone", seats.roster())   # the row itself survived
 
     def test_fresh_roster_poll_never_writes(self):
         """The web panel polls the report every 3s — an all-fresh roster must
@@ -2427,6 +2430,518 @@ class ReplyWakesParentTest(unittest.TestCase):
             sys.modules[__name__])
         flat = str(list(mod_tests))
         self.assertIn("ReplyWakesParentTest", flat)
+
+class HomingOneTruthTest(SeatsBase):
+    """The as-prevented roster-scatter law (owner mandate 2026-07-21): a live
+    roster held THREE home_room truths for one team — 'main' (a defaulted
+    spawn-mirror write), '<project>' (a cwd derivation), '<env room>' (the
+    launch seam) — because every writer re-derived the precedence privately.
+    Now seats.resolve_homing is the ONE precedence, write_roster the ONE
+    enforcement gate, and a derived value can NEVER downgrade an explicit/
+    operator home."""
+
+    def _repo(self, name="proj-alpha"):
+        import subprocess
+        repo = os.path.join(self.tmp, name)
+        os.makedirs(repo, exist_ok=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True,
+                       capture_output=True)
+        state = pk.read_json(home.registry_path(), {"projects": {}})
+        state.setdefault("projects", {})[os.path.basename(repo)] = {"path": repo}
+        pk.write_json(home.registry_path(), state)
+        return repo
+
+    def test_resolve_homing_is_the_one_precedence(self):
+        repo = self._repo()
+        # cli beats env beats derivation
+        os.environ["HELM_CHAT_ROOM"] = "helm-dogfood"
+        self.assertEqual(seats.resolve_homing("team-cli", repo),
+                         ("team-cli", "explicit"))
+        self.assertEqual(seats.resolve_homing(None, repo),
+                         ("helm-dogfood", "explicit"))
+        # the launch seam's derived marker survives the env hop
+        os.environ["HELM_CHAT_ROOM_SOURCE"] = "derived"
+        self.assertEqual(seats.resolve_homing(None, repo),
+                         ("helm-dogfood", "derived"))
+        del os.environ["HELM_CHAT_ROOM"], os.environ["HELM_CHAT_ROOM_SOURCE"]
+        # no cli, no env: the project room, derived
+        self.assertEqual(seats.resolve_homing(None, repo),
+                         ("proj-alpha", "derived"))
+        # nothing at all: un-homed
+        self.assertEqual(seats.resolve_homing(None, self.tmp), (None, None))
+
+    def _chat_hook(self, args, payload):
+        """chat.cmd_chat (the REAL hook entry — the process-cwd pre-resolution
+        lives in its prologue) with hook-JSON stdin + FD-1 capture."""
+        fake = types.SimpleNamespace(buffer=io.BytesIO(payload))
+        r, w = os.pipe()
+        saved = os.dup(1)
+        os.dup2(w, 1)
+        os.close(w)
+        try:
+            with mock.patch.object(sys, "stdin", fake), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = chat.cmd_chat(list(args))
+            sys.stdout.flush()
+        finally:
+            os.dup2(saved, 1)
+            os.close(saved)
+        chunks = []
+        while True:
+            b = os.read(r, 65536)
+            if not b:
+                break
+            chunks.append(b)
+        os.close(r)
+        return rc, b"".join(chunks).decode("utf-8")
+
+    def test_hook_join_homes_from_the_payload_cwd_not_the_hook_process(self):
+        """The hook payload's cwd is the SESSION's ground truth; the hook
+        PROCESS may run elsewhere (metaharness seam). cmd_chat pre-resolves
+        the default room from its own cwd — a derived pre-resolution must be
+        re-resolved against the payload cwd, or the seat homes to the hook
+        runner's project instead of its own."""
+        repo_a, repo_b = self._repo("proj-alpha"), self._repo("proj-beta")
+        prior = os.getcwd()
+        os.chdir(repo_b)                    # the hook PROCESS cwd: proj-beta
+        try:
+            rc, _ = self._chat_hook(
+                ["join", "--hook-json"],
+                json.dumps({"session_id": "s-payload",
+                            "cwd": repo_a}).encode("utf-8"))
+        finally:
+            os.chdir(prior)
+        self.assertEqual(rc, 0)
+        seat = seats.seat_for_session("s-payload")
+        row = seats.roster()[seat]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("proj-alpha", "derived"))
+
+    def test_hook_join_with_projectless_payload_cwd_stays_unhomed(self):
+        """A project-less payload cwd must not inherit the hook process's
+        derived room either — the seat stays un-homed (legacy all-room)."""
+        repo_b = self._repo("proj-beta")
+        bare = os.path.join(self.tmp, "no-project")
+        os.makedirs(bare)
+        prior = os.getcwd()
+        os.chdir(repo_b)
+        try:
+            rc, _ = self._chat_hook(
+                ["join", "--hook-json"],
+                json.dumps({"session_id": "s-bare",
+                            "cwd": bare}).encode("utf-8"))
+        finally:
+            os.chdir(prior)
+        self.assertEqual(rc, 0)
+        row = seats.roster()[seats.seat_for_session("s-bare")]
+        self.assertIsNone(row.get("home_room"))
+
+    def test_historical_writers_converge_on_the_unified_answer(self):
+        """Each historical writer's shape, same context -> ONE answer.
+        (a) the hook join (chat.py passes room='main', nothing explicit);
+        (b) the launch/env seam (HELM_CHAT_ROOM in the child env);
+        (c) the spawn-mirror write_roster (unlabeled home_room)."""
+        repo = self._repo()
+        # (a) hook join, no env: derives the project room — never 'main'
+        seats.join(session="s-hook", seat="w-hook", cwd=repo, room="main")
+        row = seats.roster()["w-hook"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("proj-alpha", "derived"))
+        # (b) the env seam agrees with seat.py's add/launch resolver
+        os.environ["HELM_CHAT_ROOM"] = "proj-alpha"
+        from helm import seat as seat_mod
+        self.assertEqual(seat_mod._resolve_homing(None)[0], "proj-alpha")
+        seats.join(session="s-env", seat="w-env", cwd=repo, room="proj-alpha")
+        row = seats.roster()["w-env"]
+        del os.environ["HELM_CHAT_ROOM"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("proj-alpha", "explicit"))
+        # (c) the spawn mirror's unlabeled write fills the same room, as
+        # derived — never as a fake 'explicit'
+        seats.write_roster("w-mirror", cwd=repo, home_room="proj-alpha")
+        row = seats.roster()["w-mirror"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("proj-alpha", "derived"))
+
+    def test_unlabeled_mirror_write_cannot_downgrade_an_explicit_home(self):
+        """THE old hole: _register_spawn's unlabeled write_roster stamped
+        itself 'explicit' and clobbered a deliberate home with 'main'."""
+        seats.join(session="s-x", seat="pinned", cwd="/tmp/p", room="team-a")
+        self.assertEqual(seats.roster()["pinned"]["home_room_source"],
+                         "explicit")
+        seats.write_roster("pinned", home_room="main")          # old mirror shape
+        row = seats.roster()["pinned"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("team-a", "explicit"))
+        seats.write_roster("pinned", home_room="elsewhere",
+                           home_room_source="derived")          # labeled derived
+        self.assertEqual(seats.roster()["pinned"]["home_room"], "team-a")
+
+    def test_pre_upgrade_unlabeled_home_takes_the_weakest_tier(self):
+        """codex's exact probe row: {home_room: 'main', home_room_source:
+        None} — write_roster's contract says an unlabeled existing home reads
+        as DERIVED, but the old branches only moved a labeled-derived or
+        never-homed row, so the stale scattered value froze forever. An
+        unlabeled home now follows a derived join and loses to every labeled
+        writer."""
+        repo = self._repo("proj-b")
+        r = seats.roster()
+        r["legacy"] = {"home_room": "main"}       # pre-upgrade, no source
+        pk.write_json(seats.roster_path(), r)
+        seats.join(session="s-l", seat="legacy", cwd=repo)   # a derived join
+        row = seats.roster()["legacy"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("proj-b", "derived"))   # unfrozen, labeled honestly
+        # …and the unlabeled tier loses to a labeled explicit writer too
+        r = seats.roster()
+        r["legacy2"] = {"home_room": "main"}
+        pk.write_json(seats.roster_path(), r)
+        seats.write_roster("legacy2", home_room="team-e",
+                           home_room_source="explicit")
+        row = seats.roster()["legacy2"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("team-e", "explicit"))
+
+    def test_operator_rehome_survives_derived_rejoin_and_mirror(self):
+        repo = self._repo()
+        seats.join(session="s-op", seat="oper", cwd=repo)
+        ok, msg = seats.rehome_seat("oper", "team-z")
+        self.assertTrue(ok, msg)
+        # a derived re-join (resume in the project cwd) must NOT downgrade
+        seats.join(session="s-op2", seat="oper", cwd=repo)
+        row = seats.roster()["oper"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("team-z", "operator"))
+        # nor an unlabeled mirror write
+        seats.write_roster("oper", home_room="proj-alpha")
+        row = seats.roster()["oper"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("team-z", "operator"))
+
+    def test_explicit_env_rejoin_still_deliberately_moves(self):
+        """The precedence's top tier: an explicit HELM_CHAT_ROOM re-join
+        outranks the existing explicit/operator value (the deliberate move);
+        only DERIVED is forbidden from downgrading."""
+        seats.join(session="s-m", seat="mover2", cwd="/tmp/p", room="team-a")
+        os.environ["HELM_CHAT_ROOM"] = "team-b"
+        seats.join(session="s-m2", seat="mover2", cwd="/tmp/p")
+        del os.environ["HELM_CHAT_ROOM"]
+        row = seats.roster()["mover2"]
+        self.assertEqual((row["home_room"], row["home_room_source"]),
+                         ("team-b", "explicit"))
+
+
+class RosterGcTest(SeatsBase):
+    """`helm chat seat gc` — the MANUAL junk-row pruner. Refusal is the
+    default: any live evidence (fresh presence, a transcript for any
+    remembered session, a live process naming one) keeps the row."""
+
+    def _stale(self, seat):
+        old = time.time() - 7200
+        os.utime(seats.seen_path(seat), (old, old))
+
+    def _row(self, seat, session=None, stale=True):
+        seats.write_roster(seat, session=session)
+        if stale:
+            self._stale(seat)
+
+    def _empty_dirs(self):
+        roots = os.path.join(self.tmp, "no-transcripts")
+        proc = os.path.join(self.tmp, "proc")
+        os.makedirs(roots, exist_ok=True)
+        os.makedirs(proc, exist_ok=True)
+        return [roots], proc
+
+    def test_state_unlink_and_move_stop_at_the_key_boundary(self):
+        """Substring cross-fire (fable adversarial B3): seat 'foo' (key
+        foo-<h1>) must not match the state files of a live seat literally
+        NAMED 'foo-<h1>' (its key foo-<h1>-<h2>) — the bare substring test
+        let pruning or renaming 'foo' destroy the OTHER seat's delivery
+        ground (the gc state cross-fire class, substring flavor)."""
+        chat._ensure_dir()
+        d = chat.chat_dir()
+        key = seats._seat_key("foo")
+        okey = seats._seat_key(key)             # the adversarial twin's key
+        self.assertTrue(okey.startswith(key))   # the collision shape is real
+        own = ["main.cursor.%s" % key, "main.cursor.%s.k1" % key,
+               "main.cursor.%s.lock" % key, ".seen.%s" % key]
+        twin = ["main.cursor.%s" % okey, "main.cursor.%s.k1" % okey,
+                ".seen.%s" % okey]
+        for n in own + twin:
+            open(os.path.join(d, n), "w").close()
+        seats._unlink_seat_state("foo")
+        for n in own:
+            self.assertFalse(os.path.exists(os.path.join(d, n)), n)
+        for n in twin:
+            self.assertTrue(os.path.exists(os.path.join(d, n)), n)
+        # the rename mover shares the matcher: foo -> bar moves ONLY foo's
+        for n in own:
+            open(os.path.join(d, n), "w").close()
+        seats._move_seat_state("foo", "bar")
+        nk = seats._seat_key("bar")
+        for n in twin:
+            self.assertTrue(os.path.exists(os.path.join(d, n)), n)
+        self.assertTrue(
+            os.path.exists(os.path.join(d, "main.cursor.%s" % nk)))
+        self.assertFalse(
+            os.path.exists(os.path.join(d, "main.cursor.%s" % key)))
+
+    def test_move_keeps_a_room_slug_that_embeds_the_key(self):
+        """PRE-EXISTING boundary-blind rename substitution (fable adversarial
+        probe C10): a room whose slug merely EMBEDS the seat's full key
+        ('<key>-updates') had its ROOM segment rewritten by the raw
+        str.replace on rename — the cursor silently detached from its room
+        (delivery ground lost to an EOF re-baseline, orphan file left).
+        _bounded_sub swaps the key only where it fills a whole '.'-field —
+        bare, or dm-prefixed for the dm-lane room segment, which carries the
+        key TWICE and must still fully move."""
+        chat._ensure_dir()
+        d = chat.chat_dir()
+        ok, nk = seats._seat_key("foo"), seats._seat_key("zed")
+        embed = "%s-updates.cursor.%s" % (ok, ok)   # the reviewer's probe
+        dmlane = "dm-%s.cursor.%s" % (ok, ok)       # key twice: both move
+        for n in (embed, dmlane):
+            open(os.path.join(d, n), "w").close()
+        seats._move_seat_state("foo", "zed")
+        self.assertTrue(os.path.exists(os.path.join(       # room segment kept,
+            d, "%s-updates.cursor.%s" % (ok, nk))))        # seat field moved
+        self.assertFalse(os.path.exists(os.path.join(
+            d, "%s-updates.cursor.%s" % (nk, nk))))
+        self.assertTrue(os.path.exists(os.path.join(
+            d, "dm-%s.cursor.%s" % (nk, nk))))
+
+    def test_gc_refuses_fresh_presence(self):
+        self._row("alive", session="sid-alive-1", stale=False)
+        roots, proc = self._empty_dirs()
+        rows, pruned = seats.gc_roster(apply=True, roots=roots, proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("presence beat", rows[0]["why"])
+        self.assertEqual(pruned, [])
+        self.assertIn("alive", seats.roster())
+
+    def test_gc_refuses_rows_with_a_transcript(self):
+        self._row("hist", session="sid-hist-42")
+        roots, proc = self._empty_dirs()
+        tdir = os.path.join(roots[0], "proj-slug")
+        os.makedirs(tdir)
+        open(os.path.join(tdir, "sid-hist-42.jsonl"), "w").close()
+        rows, pruned = seats.gc_roster(apply=True, roots=roots, proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("transcript exists", rows[0]["why"])
+        self.assertIn("hist", seats.roster())
+
+    def test_gc_refuses_rows_with_a_live_process(self):
+        self._row("busy", session="sid-busy-77")
+        roots, proc = self._empty_dirs()
+        pdir = os.path.join(proc, "4321")
+        os.makedirs(pdir)
+        with open(os.path.join(pdir, "cmdline"), "wb") as f:
+            f.write(b"claude\x00--resume\x00sid-busy-77\x00")
+        rows, pruned = seats.gc_roster(apply=True, roots=roots, proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("live process", rows[0]["why"])
+        self.assertIn("busy", seats.roster())
+
+    def test_gc_fail_closed_when_proc_table_unreadable(self):
+        self._row("junk", session="sid-junk-1")
+        roots, _proc = self._empty_dirs()
+        rows, pruned = seats.gc_roster(
+            apply=True, roots=roots,
+            proc_dir=os.path.join(self.tmp, "no-such-proc"))
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertEqual(pruned, [])
+
+    def test_gc_dry_run_reports_and_touches_nothing(self):
+        self._row("tmp-claude-junk", session="sid-tmp-junk-9")
+        roots, proc = self._empty_dirs()
+        rows, pruned = seats.gc_roster(roots=roots, proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["prune"])
+        self.assertEqual(pruned, [])
+        self.assertIn("tmp-claude-junk", seats.roster())   # dry-run: untouched
+
+    def test_gc_apply_prunes_junk_and_its_state(self):
+        self._row("tmp-claude-junk", session="sid-tmp-junk-9")
+        self._row("kept-live", session="sid-live-2", stale=False)
+        roots, proc = self._empty_dirs()
+        seen = seats.seen_path("tmp-claude-junk")
+        self.assertTrue(os.path.exists(seen))
+        rows, pruned = seats.gc_roster(apply=True, roots=roots, proc_dir=proc)
+        self.assertEqual(pruned, ["tmp-claude-junk"])
+        self.assertNotIn("tmp-claude-junk", seats.roster())
+        self.assertIn("kept-live", seats.roster())
+        self.assertFalse(os.path.exists(seen))             # state went with it
+
+    def test_gc_trusts_the_census_for_helm_seat_home_transcripts(self):
+        """codex-2 HIGH (finding 1): the old hand-rolled root list omitted
+        ~/.helm/_global/seats/**/claude/projects, so an inactive-but-fully-
+        persisted proxy seat probed as junk (codex-2's own transcript root
+        was missing). roots=None now delegates to session's persistence
+        census — the ONE truth owner — which walks the seat homes."""
+        from helm import home as _home, transcripts
+        self._row("proxy", session="sid-proxy-1")
+        proj = os.path.join(_home.global_dir(), "seats", "codex",
+                            "instances", "codex-2", "claude", "projects",
+                            "slug-x")
+        os.makedirs(proj)
+        open(os.path.join(proj, "sid-proxy-1.jsonl"), "w").close()
+        _roots, proc = self._empty_dirs()
+        with mock.patch.object(transcripts, "get_catalog",
+                               return_value={"rows": []}):
+            rows, pruned = seats.gc_roster(apply=True, roots=None,
+                                           proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("transcript exists", rows[0]["why"])
+        self.assertEqual(pruned, [])
+        self.assertIn("proxy", seats.roster())
+
+    def test_gc_incomplete_census_fails_closed(self):
+        """A census that could not finish proves nothing — the row stays."""
+        from helm import session
+        self._row("murky", session="sid-murky-1")
+        _roots, proc = self._empty_dirs()
+        bad = session._PersistenceCensus({}, complete=False)
+        with mock.patch.object(session, "_persisting_sids",
+                               return_value=bad):
+            rows, pruned = seats.gc_roster(apply=True, roots=None,
+                                           proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("census incomplete", rows[0]["why"])
+        self.assertEqual(pruned, [])
+        self.assertIn("murky", seats.roster())
+
+    def test_gc_apply_recheck_keeps_row_when_transcript_lands_late(self):
+        """codex-2 HIGH (finding 3): victims were computed before the lock
+        and the under-lock recheck was presence-only — a transcript flushing
+        between scan and apply still lost the row. The FULL evidence probe
+        now re-runs fresh under the roster lock."""
+        self._row("late", session="sid-late-9")
+        roots, proc = self._empty_dirs()
+        tdir = os.path.join(roots[0], "proj-slug")
+        os.makedirs(tdir)
+        real = seats._flocked
+
+        @contextlib.contextmanager
+        def landing(path):
+            open(os.path.join(tdir, "sid-late-9.jsonl"), "w").close()
+            with real(path):
+                yield
+        with mock.patch.object(seats, "_flocked", landing):
+            rows, pruned = seats.gc_roster(apply=True, roots=roots,
+                                           proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["prune"])  # scan-time
+        self.assertEqual(pruned, [])            # the locked recheck refused
+        self.assertIn("late", seats.roster())
+        self.assertTrue(os.path.exists(seats.seen_path("late")))
+
+    def test_gc_unlink_rides_the_roster_lock_no_rejoin_gap(self):
+        """codex-2 HIGH (exact-SHA probe): the row delete committed under the
+        roster lock but the derived-state unlink ran AFTER release. A
+        SessionStart rejoin slipping into that gap recreated the row plus
+        fresh .seen/cursor/DM state — and the old gc invocation then
+        unlinked the NEW seat's state (a live seat instantly reading absent,
+        its queued DMs and cursors destroyed). Row delete + unlink are now
+        ONE locked critical section: a lock-respecting rejoin can only land
+        after gc finishes, and everything it creates survives."""
+        self._row("phoenix", session="sid-phx-old-1")
+        roots, proc = self._empty_dirs()
+        key = seats._seat_key("phoenix")
+        dm = chat.room_path(chat.DM_PREFIX + key)
+        cursor = seats.cursor_path("main", "phoenix", "sid-phx-new-2")
+
+        def rejoin():                 # what SessionStart recreates
+            seats.write_roster("phoenix", session="sid-phx-new-2")
+            seats.touch_seen("phoenix")
+            os.makedirs(os.path.dirname(dm), exist_ok=True)
+            with open(dm, "w") as f:  # the freshly queued DM lane
+                f.write('{"text": "for the new seat"}\n')
+            with open(cursor, "w") as f:
+                f.write('{"off": 0}')
+
+        state = {"deferred": False}
+        real_unlink = seats._unlink_seat_state
+
+        def racing_unlink(seat):
+            # A lock-RESPECTING rejoin racing the unlink boundary: probe the
+            # roster flock non-blocking from a second open file description
+            # (flock conflicts across OFDs even in one process). Unfixed —
+            # unlink after release — the lock is FREE here, the rejoin lands
+            # first, then gc destroys its fresh state. Fixed — unlink under
+            # the lock — the probe refuses and the rejoin can only land
+            # after gc returns.
+            import fcntl
+            with open(seats.roster_path() + ".lock", "a") as f:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    state["deferred"] = True   # gc still holds the lock
+                else:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    rejoin()
+            real_unlink(seat)
+
+        with mock.patch.object(seats, "_unlink_seat_state", racing_unlink):
+            rows, pruned = seats.gc_roster(apply=True, roots=roots,
+                                           proc_dir=proc)
+        self.assertEqual(pruned, ["phoenix"])
+        self.assertTrue(state["deferred"])     # the boundary was closed
+        rejoin()                               # the rejoin lands AFTER gc
+        row = seats.roster().get("phoenix")    # …and ALL its state survives
+        self.assertIsNotNone(row)
+        self.assertEqual(row.get("session"), "sid-phx-new-2")
+        self.assertTrue(os.path.exists(seats.seen_path("phoenix")))
+        self.assertTrue(os.path.exists(cursor))
+        self.assertTrue(os.path.exists(dm))
+
+    def test_gc_process_read_oserror_keeps_the_row(self):
+        """codex-2 HIGH (finding 3): a same-uid process whose cmdline/environ
+        cannot be read is probe TROUBLE, not absence — the row stays."""
+        self._row("murkyproc", session="sid-murkyproc-5")
+        roots, proc = self._empty_dirs()
+        os.makedirs(os.path.join(proc, "5150", "cmdline"))  # open -> EISDIR
+        rows, pruned = seats.gc_roster(apply=True, roots=roots, proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("fail closed", rows[0]["why"])
+        self.assertEqual(pruned, [])
+        self.assertIn("murkyproc", seats.roster())
+
+    def test_gc_exited_process_is_absence_not_trouble(self):
+        """A pid that vanished mid-scan (ENOENT) is proven not-live — it must
+        NOT fail-close the whole gc into a no-op."""
+        self._row("plainjunk", session="sid-plainjunk-2")
+        roots, proc = self._empty_dirs()
+        os.makedirs(os.path.join(proc, "777"))   # exited: no cmdline/environ
+        rows, pruned = seats.gc_roster(apply=True, roots=roots, proc_dir=proc)
+        self.assertEqual(pruned, ["plainjunk"])
+
+    def test_gc_keeps_sidless_row_with_live_helm_chat_name(self):
+        """codex-2 HIGH (finding 3): a row with NO remembered session had no
+        process evidence at all. A live environ carrying HELM_CHAT_NAME=<seat>
+        is a live seat, never junk."""
+        self._row("envseat")                     # no session remembered
+        roots, proc = self._empty_dirs()
+        pdir = os.path.join(proc, "6001")
+        os.makedirs(pdir)
+        with open(os.path.join(pdir, "environ"), "wb") as f:
+            f.write(b"PATH=/usr/bin\x00HELM_CHAT_NAME=envseat\x00LANG=C\x00")
+        rows, pruned = seats.gc_roster(apply=True, roots=roots, proc_dir=proc)
+        self.assertEqual([r["verdict"] for r in rows], ["keep"])
+        self.assertIn("HELM_CHAT_NAME=envseat", rows[0]["why"])
+        self.assertEqual(pruned, [])
+        self.assertIn("envseat", seats.roster())
+
+    def test_gc_cli_dry_run_default(self):
+        from helm import session
+        self._row("cli-junk", session="sid-cli-junk-3")
+        empty = session._PersistenceCensus({}, complete=True)
+        with mock.patch.object(session, "_persisting_sids",
+                               return_value=empty):
+            rc, out, err = self.cmd("seat", ["gc"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("dry-run", out)
+        self.assertIn("cli-junk", seats.roster())          # verb never applied
+        rc, _out, err = self.cmd("seat", ["gc", "--bogus"])
+        self.assertEqual(rc, 2)
+        self.assertIn("usage", err)
 
 
 if __name__ == "__main__":

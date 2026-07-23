@@ -20,7 +20,10 @@ if os.path.isdir(_LEGACY_CACHE_DIR) and not os.path.isdir(CACHE_DIR):
 CACHE = os.path.join(CACHE_DIR, "catalog-cache.json")
 
 # extra transcript roots (colon-separated) via env — machine-local paths never live in code
-CLAUDE_ROOTS = [f"{HOME}/.claude/projects"] + \
+# ~/.claude-homes/<acct>/projects is scanned too: usually a symlink back to
+# ~/.claude/projects (inode dedup folds it) but a REAL per-account store must
+# still count — the roster gc trusts this catalog as its transcript truth.
+CLAUDE_ROOTS = [f"{HOME}/.claude/projects", f"{HOME}/.claude-homes/*/projects"] + \
     [r for r in os.environ.get("HELM_CLAUDE_ROOTS", os.environ.get("SESH_CLAUDE_ROOTS", "")).split(":") if r]
 CODEX_ROOTS = [f"{HOME}/.codex/sessions", f"{HOME}/.codex-homes"] + \
     [r for r in os.environ.get("HELM_CODEX_ROOTS", os.environ.get("SESH_CODEX_ROOTS", "")).split(":") if r]
