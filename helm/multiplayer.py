@@ -373,7 +373,12 @@ def _display(value):
 
 def _print(value, as_json):
     if as_json:
-        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+        # ensure_ascii=True: --json is a TERMINAL sink for attacker-influenceable
+        # relay/actor data, so C1 (U+009B) and bidi (U+202E) must escape to
+        # \\uXXXX — still valid JSON, machine-parseable, terminal-safe (the human
+        # -readable path already launders via _display). Same for every other
+        # --json emission below (gate FIX, 2026-07-23).
+        print(json.dumps(value, ensure_ascii=True, sort_keys=True))
         return
     if isinstance(value, list):
         for row in value:
@@ -443,7 +448,7 @@ def cmd_multiplayer(args, adapter_factory=adapters):
             from . import multiplayer_demo
             update = multiplayer_demo.encode(rest[1], " ".join(rest[2:]), actor)
             row = relay.publish(cave, rest[0], actor, update)
-            print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            print(json.dumps(row, ensure_ascii=True, sort_keys=True))
         elif verb == "status" and len(rest) == 1:
             from . import multiplayer_demo
             state = relay.updates(cave, rest[0], values.get("after", 0))
@@ -454,7 +459,7 @@ def cmd_multiplayer(args, adapter_factory=adapters):
                     {"cave": _identity(cave, "cave"),
                      "doc": _identity(rest[0], "doc"), "cursor": state["cursor"],
                      "board": view["board"], "foreign": view["foreign"],
-                     "peers": peers}, ensure_ascii=False, sort_keys=True))
+                     "peers": peers}, ensure_ascii=True, sort_keys=True))
             else:
                 _print_status(rest[0], cave, state["cursor"], view, peers)
         elif verb == "publish" and len(rest) == 1:
@@ -464,19 +469,19 @@ def cmd_multiplayer(args, adapter_factory=adapters):
             if not update:
                 raise ValueError("publish received an empty opaque update")
             row = relay.publish(cave, rest[0], actor, update)
-            print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            print(json.dumps(row, ensure_ascii=True, sort_keys=True))
         elif verb == "read" and len(rest) == 1:
             _print(relay.updates(cave, rest[0], values.get("after", 0)),
                    "--json" in flags)
         elif verb == "presence" and not rest:
             row = presence.heartbeat(cave, actor, values.get("state", "active"),
                                      values.get("ttl", DEFAULT_TTL), connection)
-            print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            print(json.dumps(row, ensure_ascii=True, sort_keys=True))
         elif verb == "peers" and not rest:
             rows = presence.peers(cave)
             if "--json" in flags:
                 print(json.dumps({"cave": _identity(cave, "cave"), "peers": rows},
-                                 ensure_ascii=False, sort_keys=True))
+                                 ensure_ascii=True, sort_keys=True))
             else:
                 _print(rows, False)
         elif verb == "leave" and not rest:

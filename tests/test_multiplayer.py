@@ -257,6 +257,24 @@ class MultiplayerTest(unittest.TestCase):
         self.assertNotIn(chr(0x9b), out)
         self.assertIn("\\u009b31mred", out)
 
+    def test_cli_json_launders_relay_supplied_values(self):
+        # the --json sinks are ALSO a terminal seam (TESTDRIVE points the owner
+        # at --json). The presence API guards actor/connection via _identity, so
+        # the real unguarded surface is the BLIND relay: a planted cell value +
+        # envelope actor carry C1 (U+009B) / bidi RLO (U+202E) undecoded, and
+        # they must escape in --json, never reach the terminal raw.
+        from helm import multiplayer_demo
+        payload = chr(0x9b) + "31m" + chr(0x202e) + "evil"
+        self.relay.publish("demo", "board", chr(0x202e) + "attacker",
+                           multiplayer_demo.encode("k", payload, "attacker"))
+        for args in (["status", "board", "--cave", "demo", "--json"],
+                     ["read", "board", "--cave", "demo", "--json"]):
+            rc, out, _ = self._run(args)
+            self.assertEqual(rc, 0, args)
+            self.assertNotIn(chr(0x9b), out, args)     # C1 CSI never raw
+            self.assertNotIn(chr(0x202e), out, args)   # bidi RLO never raw
+            self.assertIn("\\u009b", out, args)        # escaped instead
+
     def test_cli_stdin_only_and_safe_human_output(self):
         self.assertEqual(self._run(["publish", "doc", "--stdin"], stdin="--cave")[0], 0)
         self.assertEqual(self._run(["publish", "doc", "raw-argv"])[0], 2)

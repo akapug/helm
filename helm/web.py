@@ -1481,9 +1481,11 @@ def _api_mp_publish(payload):
     actor = _mp_actor()
     try:
         update = multiplayer_demo.encode(key, value, actor)
+        # relay.publish raises ValueError on the update/doc size caps — that is
+        # bad INPUT (400), not a server fault (uncaught it would 500). (gate LOW)
+        ack = relay.publish(cave, doc, actor, update)
     except ValueError as e:
         return {"error": str(e)}, 400
-    ack = relay.publish(cave, doc, actor, update)
     # writing keeps the owner present without waiting for the next poll tick
     presence.heartbeat(cave, actor, "editing", multiplayer.DEFAULT_TTL,
                        MP_OWNER_CONNECTION)
