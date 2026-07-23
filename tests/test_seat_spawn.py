@@ -267,13 +267,17 @@ class AdapterSpawnTest(SpawnBase):
 
     def test_session_start_binds_new_session_to_spawn_register(self):
         d, _ = self._mint()
-        fake = FakeAdapter()
+        fake = FakeOrcaAdapter()
         rc, _, err, _, _ = self._spawn(["codex"], fake)
         self.assertEqual(rc, 0, err)
         with open(os.path.join(d, "spawn.json")) as f:
             self.assertIsNone(json.load(f)["session"])
         from helm import seats
-        seats.join(session="session-live", seat="codex", cwd=os.getcwd())
+        fields = {"handle": "pane-1", "pane_key": "tab:leaf",
+                  "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_sessionstart_pane_fields",
+                               return_value=(fields, None)):
+            seats.join(session="session-live", seat="codex", cwd=os.getcwd())
         with open(os.path.join(d, "spawn.json")) as f:
             self.assertEqual(json.load(f)["session"], "session-live")
 
@@ -305,18 +309,70 @@ class AdapterSpawnTest(SpawnBase):
         self.assertNotIn("SECRET", identity)
         alive.assert_called_once_with(4242, "123")
 
+    def test_spawn_backfills_session_when_sessionstart_won_the_race(self):
+        d, _ = self._mint()
+        self._record(d, harness_name="orca")
+        sessions_dir = os.path.join(d, "claude", "sessions")
+        os.makedirs(sessions_dir, exist_ok=True)
+        with open(os.path.join(sessions_dir, "42.json"), "w") as f:
+            json.dump({"sessionId": "session-live"}, f)
+        fake = FakeOrcaAdapter(rows=[{"handle": "p9"}])
+        fields = {"handle": "p9", "pane_key": "tab:leaf",
+                  "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_prove_orca_replacement",
+                               return_value=({}, fields, None)):
+            self.assertTrue(seat._backfill_spawn_session("codex", d, fake))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["session"], "session-live")
+        self.assertEqual(rec["pane_key"], "tab:leaf")
+
+    def test_session_start_identity_must_resolve_registered_orca_handle(self):
+        rec = {"harness": "orca", "handle": "p9"}
+        fake = FakeOrcaAdapter(rows=[{
+            "handle": "p9", "status": "connected", "writable": True,
+            "pty_id": "pty-1", "worktree_id": "workspace:/w"}],
+            resolved={"handle": "p9", "pty_id": "pty-1"})
+        with mock.patch.dict(os.environ, {
+                "ORCA_PANE_KEY": "tab:leaf",
+                "ORCA_WORKTREE_ID": "workspace:/w"}, clear=False), \
+                mock.patch.object(seat.shutil, "which", return_value="/bin/orca"), \
+                mock.patch.object(harness, "OrcaAdapter", return_value=fake):
+            fields, err = seat._sessionstart_pane_fields(rec)
+        self.assertIsNone(err)
+        self.assertEqual(fields["handle"], "p9")
+        self.assertEqual(fields["pane_key"], "tab:leaf")
+
     def test_session_start_persists_orca_remint_identity(self):
         d, _ = self._mint()
         self._record(d, harness_name="orca")
-        with mock.patch.dict(os.environ, {
-                "ORCA_PANE_KEY": "tab-1:leaf-1",
-                "ORCA_WORKTREE_ID": "workspace:/w"}, clear=False):
+        fields = {"handle": "p9", "pane_key": "tab-1:leaf-1",
+                  "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_sessionstart_pane_fields",
+                               return_value=(fields, None)):
             self.assertTrue(seat._bind_spawn_session("codex", "session-live"))
         with open(os.path.join(d, "spawn.json")) as f:
             rec = json.load(f)
         self.assertEqual(rec["session"], "session-live")
         self.assertEqual(rec["pane_key"], "tab-1:leaf-1")
         self.assertEqual(rec["worktree_id"], "workspace:/w")
+
+    def test_unrelated_session_start_cannot_rebind_registered_pane(self):
+        d, _ = self._mint()
+        self._record(d, harness_name="orca", session="good-session",
+                     pane_key="tab:leaf", worktree_id="workspace:/w")
+        fields = {"handle": "p9", "pane_key": "tab:leaf",
+                  "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_sessionstart_pane_fields",
+                               return_value=(fields, None)):
+            self.assertFalse(seat._bind_spawn_session(
+                "codex", "other-session", source="startup"))
+            self.assertTrue(seat._bind_spawn_session(
+                "codex", "clear-session", source="clear"))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["session"], "clear-session")
+        self.assertEqual(rec["handle"], "p9")
 
     def test_stale_orca_handle_repairs_from_exact_live_session(self):
         d, _ = self._mint()

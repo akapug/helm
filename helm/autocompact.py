@@ -414,17 +414,50 @@ def _overflow_400(tail):
     return hits >= 2
 
 
-def _overflow_probe(seat_name, adapter):
-    """The identity-proven pane + tail only when it is in a 400 overflow loop."""
+def _pane_action(row, adapter, action, repair=True, require_context=False):
+    """Run one pane read/write inside the seat's lifecycle transaction."""
+    from . import seat
+    family, err = seat._seat_family(row["seat"])
+    if err:
+        return None, err
+    d = seat._instance_dir(family, row["seat"])
+    with seat._seat_lifecycle_lock(d):
+        rec = seat._spawn_record(d)
+        if not rec or rec.get("seat") != row["seat"]:
+            return None, "spawn identity changed after context scan"
+        registered = row.get("registered_session")
+        if not registered:
+            return None, "spawn register has no bound session identity"
+        if rec.get("session") != registered:
+            return None, "registered session changed after context scan"
+        if require_context and (not row.get("session") or
+                                rec.get("session") != row["session"]):
+            return None, "context session changed before pane actuation"
+        ad, handle, detail = seat._resolve_registered_pane(
+            row["seat"], d=d, adapter=adapter, repair=repair, locked=True)
+        if ad is None or handle is None:
+            return None, detail
+        return action(ad, handle, detail), None
+
+
+def _overflow_action(row, adapter, fire):
+    """Detect and optionally clear one overflow, atomically with pane identity."""
     from . import harness
-    ad, handle, detail = resolve_pane(seat_name, adapter)
-    if ad is None or handle is None:
-        return None
-    try:
-        tail = ad.read(handle, limit=12000)
-    except harness.HarnessError:
-        return None
-    return (ad, handle, detail, tail) if _overflow_400(tail) else None
+
+    def action(ad, handle, detail):
+        try:
+            tail = ad.read(handle, limit=12000)
+        except harness.HarnessError:
+            return False, None, None
+        if not _overflow_400(tail):
+            return False, None, None
+        if not fire:
+            return True, None, detail
+        mode, result = _fire_clear(row["seat"], ad, handle, detail, tail)
+        return True, mode, result
+
+    result, err = _pane_action(row, adapter, action, repair=fire)
+    return result if result is not None else (False, None, err)
 
 
 def _onboarding(seat_name):
@@ -462,27 +495,31 @@ def _fire_clear(seat_name, ad, handle, detail, tail):
             "SessionStart before onboarding" % (detail, handle))
 
 
-def _retry_rebrief(seat_name, adapter):
-    ad, handle, detail = resolve_pane(seat_name, adapter)
-    if ad is None or handle is None:
-        return "clear-needs-brief", detail
-    mode, brief_detail = _rebrief_after_clear(seat_name, ad, handle)
-    return mode, "%s; %s" % (detail, brief_detail)
+def _retry_rebrief(row, adapter):
+    def action(ad, handle, detail):
+        mode, brief_detail = _rebrief_after_clear(row["seat"], ad, handle)
+        return mode, "%s; %s" % (detail, brief_detail)
+
+    result, err = _pane_action(row, adapter, action)
+    return result if result is not None else ("clear-needs-brief", err)
 
 
-def _fire(seat_name, adapter):
-    """Inject '/compact' + Enter into one identity-proven seat pane."""
+def _fire(row, adapter):
+    """Inject /compact only while the measured session still owns the pane."""
     from . import harness
-    ad, handle, detail = resolve_pane(seat_name, adapter)
-    if ad is None or handle is None:
-        return "manual", detail
-    try:
-        if _compact_pending(ad, handle):
-            return "pending", "pane %s already has /compact queued" % handle
-        ad.send(handle, "/compact", enter=True)
-    except harness.HarnessError as e:
-        return "manual", str(e)
-    return "injected", detail
+
+    def action(ad, handle, detail):
+        try:
+            if _compact_pending(ad, handle):
+                return "pending", "pane %s already has /compact queued" % handle
+            ad.send(handle, "/compact", enter=True)
+        except harness.HarnessError as e:
+            return "manual", str(e)
+        return "injected", detail
+
+    result, err = _pane_action(
+        row, adapter, action, require_context=True)
+    return result if result is not None else ("manual", err)
 
 
 def _fire_text(row, mode, detail):
@@ -545,11 +582,16 @@ def check(seats=None, thr=None, fire=True, post=True, adapter=None):
                 row["would_rebrief"] = True
                 if not fire:
                     continue
-                mode, detail = _retry_rebrief(row["seat"], adapter)
+                mode, detail = _retry_rebrief(row, adapter)
                 row["mode"], row["detail"] = mode, detail
-                st[row["seat"]] = {
-                    "fired_at": now, "session": row.get("session"),
-                    "pct": row.get("pct"), "mode": mode}
+                if mode == "cleared":
+                    st.pop(row["seat"], None)  # recovery complete: re-arm
+                else:
+                    st[row["seat"]] = {
+                        "fired_at": now,
+                        "session": row.get("registered_session") or
+                        row.get("session"),
+                        "pct": row.get("pct"), "mode": mode}
                 fired.append(row)
                 continue
             if recovery == "clear-pending":
@@ -559,20 +601,24 @@ def check(seats=None, thr=None, fire=True, post=True, adapter=None):
                 st.pop(row["seat"], None)
                 entry = None                     # episode over — re-arm
 
-            overflow = _overflow_probe(row["seat"], adapter)
+            clear_entry = entry if (entry or {}).get("mode") in (
+                "cleared", "clear-manual") else None
+            clear_blocked = bool(
+                clear_entry and _latch_blocks(clear_entry, row, now))
+            overflow, mode, detail = _overflow_action(
+                row, adapter, fire=fire and not clear_blocked)
             if overflow:
                 row["overflow"], row["would_clear"] = True, True
-                clear_entry = entry if (entry or {}).get("mode") in (
-                    "cleared", "clear-manual") else None
-                if clear_entry and _latch_blocks(clear_entry, row, now):
+                if clear_blocked:
                     row["latched"] = True
                     continue
                 if not fire:
                     continue
-                mode, detail = _fire_clear(row["seat"], *overflow)
                 row["mode"], row["detail"] = mode, detail
                 st[row["seat"]] = {
-                    "fired_at": now, "session": row.get("session"),
+                    "fired_at": now,
+                    "session": row.get("registered_session") or
+                    row.get("session"),
                     "pct": row.get("pct"), "mode": mode}
                 fired.append(row)
                 continue
@@ -585,7 +631,7 @@ def check(seats=None, thr=None, fire=True, post=True, adapter=None):
                 continue
             if not fire:
                 continue
-            mode, detail = _fire(row["seat"], adapter)
+            mode, detail = _fire(row, adapter)
             row["mode"], row["detail"] = mode, detail
             st[row["seat"]] = {"fired_at": now, "session": row.get("session"),
                                "pct": row["pct"], "mode": mode}
@@ -683,8 +729,8 @@ WantedBy=timers.target
 
 
 def _timer_units(interval=DEFAULT_INTERVAL_S):
-    helm_bin = shutil.which("helm") or os.path.join(
-        os.path.expanduser("~"), ".local", "bin", "helm")
+    # A persistent unit must never capture a disposable worktree's PATH entry.
+    helm_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "helm")
     service = _UNIT_SERVICE % {"helm": helm_bin}
     timer = _UNIT_TIMER % {"interval": interval}
     udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")

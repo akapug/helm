@@ -9,6 +9,8 @@ import os
 import shlex
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -334,6 +336,62 @@ class SeatResumeTest(unittest.TestCase):
         self.assertEqual(rec["harness"], "fake")
         self.assertEqual(rec["handle"], "pane-1")
         self.ensure_timer.assert_called_once()
+
+    def test_concurrent_resumes_share_one_lifecycle_lock(self):
+        self._mint()
+        entered, release = threading.Event(), threading.Event()
+
+        class SerialAdapter(FakeAdapter):
+            def __init__(self):
+                super().__init__()
+                self.active = self.max_active = 0
+                self.guard = threading.Lock()
+
+            def spawn(self, command, title=None, cwd=None):
+                with self.guard:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                    n = len(self.spawned) + 1
+                    handle = "pane-%d" % n
+                    self.spawned.append((command, title, cwd))
+                if n == 1:
+                    entered.set()
+                    release.wait(2)
+                with self.guard:
+                    self.rows.append({"handle": handle, "title": title or "",
+                                      "status": "connected"})
+                    self.active -= 1
+                return handle
+
+            def stop(self, handle):
+                super().stop(handle)
+                self.rows = [row for row in self.rows
+                             if row.get("handle") != handle]
+
+        fake = SerialAdapter()
+        results = []
+
+        def run():
+            results.append(seat.cmd_seat(["resume", "codex"]))
+
+        with mock.patch.object(seat, "_write_launch_assets"), \
+                mock.patch.object(harness, "detect", return_value=fake), \
+                mock.patch("builtins.print"):
+            a, b = threading.Thread(target=run), threading.Thread(target=run)
+            a.start()
+            self.assertTrue(entered.wait(1))
+            b.start()
+            time.sleep(0.05)
+            self.assertEqual(fake.max_active, 1)
+            release.set()
+            a.join(2)
+            b.join(2)
+        self.assertEqual(results, [0, 0])
+        self.assertEqual(fake.max_active, 1)
+        self.assertEqual(len(fake.rows), 1)
+        d = seat._instance_dir("codex", "codex")
+        with open(os.path.join(d, "spawn.json")) as f:
+            self.assertEqual(json.load(f)["handle"], fake.rows[0]["handle"])
 
     def test_resume_uses_session_id_and_sniffed_cwd_when_resolvable(self):
         d, launch = self._mint()

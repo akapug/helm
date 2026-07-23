@@ -1921,7 +1921,7 @@ def _ensure_autocompact_timer():
     return ok
 
 
-def _resume(seat_name, rest):
+def _resume(seat_name, rest, _locked=False):
     """seat resume <seat> — relaunch the seat's pane at its drain point via
     the detected metaharness: the pane runs the seat's freshly re-minted
     launch.sh (latest env/identity/hooks) with claude's own continuity flag
@@ -1941,6 +1941,9 @@ def _resume(seat_name, rest):
         print("helm seat: " + gate, file=sys.stderr)
         return 2
     d = _instance_dir(family, seat_name)
+    if not _locked:
+        with _seat_lifecycle_lock(d):
+            return _resume(seat_name, rest, _locked=True)
     launch_sh = os.path.join(d, "launch.sh")
     if not os.path.exists(launch_sh):
         print("helm seat: no %s seat minted (%s missing) — `helm seat add %s` "
@@ -1962,7 +1965,8 @@ def _resume(seat_name, rest):
     # Stop only the authoritative recorded process/pane BEFORE re-minting: its
     # `sh` is executing THIS launch.sh. Mutable titles are never identity; an
     # unregistered same-title pane blocks the resume instead of being destroyed.
-    notes, errors = _reap_stale(seat_name, d, ad, allow_live=True)
+    notes, errors = _reap_stale(
+        seat_name, d, ad, allow_live=True, locked=True)
     for note in notes:
         print("  " + note)
     if errors:
@@ -2007,6 +2011,11 @@ def _resume(seat_name, rest):
             print("helm seat: WARNING — unregistered resumed pane %s could not "
                   "be closed: %s" % (handle, e), file=sys.stderr)
         return 1
+    if isinstance(ad, harness.OrcaAdapter) and not \
+            _backfill_spawn_session(seat_name, d, ad):
+        print("helm seat: WARN — resumed pane session identity is not yet "
+              "proven; SessionStart must bind it before autocompact can act",
+              file=sys.stderr)
     _ensure_autocompact_timer()
     print("helm seat: resumed %s via %s — pane %s, %s; env refreshed from %s"
           % (seat_name, ad.name, handle,
@@ -2079,6 +2088,16 @@ def onboarding_prompt(seat_name, room=None):
 
 def _spawn_path(d):
     return os.path.join(d, "spawn.json")
+
+
+@_contextlib.contextmanager
+def _seat_lifecycle_lock(d):
+    """Serialize every read/prove/act/write transition for one seat."""
+    import fcntl
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    with open(os.path.join(d, ".spawn.lock"), "a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
 
 
 def _spawn_record(d):
@@ -2406,7 +2425,86 @@ def _register_spawn(seat_name, d, rec):
     return True
 
 
-def _bind_spawn_session(seat_name, session):
+def _backfill_spawn_session(seat_name, d, ad):
+    """Recover a SessionStart that raced the initial spawn register write."""
+    from . import pk
+    rec = _spawn_record(d)
+    if not rec or rec.get("seat") != seat_name or rec.get("harness") != "orca":
+        return False
+    sessions = [rec.get("session")] if rec.get("session") else []
+    if not sessions:
+        for path in glob.glob(os.path.join(d, "claude", "sessions", "*.json")):
+            try:
+                with open(path) as f:
+                    sid = json.load(f).get("sessionId")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if sid and sid not in sessions:
+                sessions.append(sid)
+    try:
+        rows = ad.list()
+    except Exception:
+        return False
+    candidates = []
+    for sid in sessions:
+        probe = dict(rec, session=sid)
+        _, fields, err = _prove_orca_replacement(d, probe, ad, rows)
+        if not err and fields and fields["handle"] == rec.get("handle"):
+            candidates.append((sid, fields))
+    if len(candidates) != 1:
+        return False
+    sid, fields = candidates[0]
+    rec["session"] = sid
+    rec.update(fields)
+    try:
+        pk.write_json(_spawn_path(d), rec)
+    except OSError:
+        return False
+    return True
+
+
+def _sessionstart_pane_fields(rec):
+    """Prove this hook process belongs to the registered pane/process."""
+    kind = rec.get("harness")
+    if kind == "headless":
+        if os.getppid() != rec.get("pid") or _recorded_pid_alive(rec) is not True:
+            return None, "SessionStart is not a child of the registered headless process"
+        return {}, None
+    if kind != "orca":
+        return None, "SessionStart binding is unsupported for harness %r" % kind
+    pane_key = os.environ.get("ORCA_PANE_KEY")
+    worktree_id = os.environ.get("ORCA_WORKTREE_ID")
+    if not pane_key or not worktree_id:
+        return None, "SessionStart has no complete Orca pane/worktree identity"
+    if rec.get("pane_key") and rec["pane_key"] != pane_key:
+        return None, "SessionStart pane key conflicts with the spawn register"
+    if rec.get("worktree_id") and rec["worktree_id"] != worktree_id:
+        return None, "SessionStart worktree identity conflicts with the spawn register"
+    from . import harness
+    path = shutil.which(harness.OrcaAdapter.bin)
+    if not path:
+        return None, "Orca adapter unavailable during SessionStart binding"
+    ad = harness.OrcaAdapter(path)
+    try:
+        resolved = ad.resolve_pane(pane_key)
+        rows = ad.list()
+    except harness.HarnessError as e:
+        return None, str(e)
+    handle, pty = resolved.get("handle"), resolved.get("pty_id")
+    matches = [row for row in rows if row.get("handle") == handle and
+               row.get("pty_id") == pty and
+               row.get("worktree_id") == worktree_id and
+               row.get("writable") is True and _pane_live(row)]
+    if len(matches) != 1:
+        return None, ("SessionStart pane identity matched %d connected, writable "
+                      "inventory rows" % len(matches))
+    if not rec.get("pane_key") and rec.get("handle") != handle:
+        return None, "initial SessionStart pane does not match the spawned handle"
+    return {"handle": handle, "pane_key": pane_key, "pty_id": pty,
+            "worktree_id": worktree_id}, None
+
+
+def _bind_spawn_session(seat_name, session, source=None):
     """Bind SessionStart's live session id to this seat's spawn register.
 
     Spawn cannot know the new Claude session before the process starts. The
@@ -2430,14 +2528,14 @@ def _bind_spawn_session(seat_name, session):
                 return None                 # direct/manual seat, nothing to bind
             if rec.get("seat") != seat_name:
                 return False
+            fields, identity_err = _sessionstart_pane_fields(rec)
+            if identity_err:
+                return False
+            prior = rec.get("session")
+            if prior and prior != session and source != "clear":
+                return False
             rec["session"] = session
-            if rec.get("harness") == "orca":
-                pane_key = os.environ.get("ORCA_PANE_KEY")
-                worktree_id = os.environ.get("ORCA_WORKTREE_ID")
-                if pane_key:
-                    rec["pane_key"] = pane_key
-                if worktree_id:
-                    rec["worktree_id"] = worktree_id
+            rec.update(fields)
             pk.write_json(_spawn_path(d), rec)
             return True
     except OSError:
@@ -2694,6 +2792,11 @@ def _spawn(seat_name, rest, _locked=False):
             print("helm seat: WARNING — unregistered pane %s could not be "
                   "closed: %s" % (handle, e), file=sys.stderr)
         return 1
+    if isinstance(ad, harness.OrcaAdapter) and not \
+            _backfill_spawn_session(seat_name, d, ad):
+        print("helm seat: WARN — spawned pane session identity is not yet "
+              "proven; SessionStart must bind it before autocompact can act",
+              file=sys.stderr)
     _ensure_autocompact_timer()
     print("helm seat: spawned %s via %s — pane %s; onboarding sent "
           "(beacon-arm + @%s work); `helm seat where %s` resolves it"

@@ -191,6 +191,14 @@ class AutocompactTest(unittest.TestCase):
         self.assertEqual(len(ad.sent), 2)
         self.assertIn("helm chat wait --seat codex --follow", ad.sent[1][1])
         self.assertIn("home room main", ad.sent[1][1])
+        with open(autocompact._state_path()) as f:
+            self.assertNotIn("codex", json.load(f))
+
+        sid = "22222222-2222-2222-2222-222222222222"
+        self.plant(int(360000 * 0.97), sid=sid)
+        fourth = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(fourth["fired"][0]["mode"], "injected")
+        self.assertEqual(ad.sent[-1], ("h1", "/compact", True))
 
     def test_one_400_or_discussion_text_never_clears(self):
         self.plant(180000)
@@ -334,6 +342,29 @@ class AutocompactTest(unittest.TestCase):
         self.assertEqual(res["fired"], [])
         self.assertEqual(ad.sent, [])
 
+    def test_session_change_between_scan_and_send_never_actuates_new_pane(self):
+        self.plant(int(360000 * 0.97))
+        outer = self
+
+        class ReplacingAdapter(FakeAdapter):
+            def read(self, handle, limit=3000):
+                if handle == "h1":
+                    sid = "22222222-2222-2222-2222-222222222222"
+                    with open(os.path.join(outer.d, "spawn.json")) as f:
+                        rec = json.load(f)
+                    rec.update(handle="h2", session=sid)
+                    with open(os.path.join(outer.d, "spawn.json"), "w") as f:
+                        json.dump(rec, f)
+                    self.panes = [{"handle": "h2", "title": "replacement",
+                                   "status": "connected"}]
+                return ""
+
+        ad = ReplacingAdapter()
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        self.assertEqual(res["fired"][0]["mode"], "manual")
+        self.assertIn("session changed", res["fired"][0]["detail"])
+        self.assertEqual(ad.sent, [])
+
     def test_missing_context_does_not_clear_injected_latch(self):
         p = self.plant(int(360000 * 0.94))
         ad = FakeAdapter()
@@ -399,6 +430,30 @@ class AutocompactTest(unittest.TestCase):
         # dry-run must not latch: a real pass afterwards still fires
         res2 = autocompact.check(seats=["codex"], post=False, adapter=ad)
         self.assertEqual(len(res2["fired"]), 1)
+
+    def test_dry_run_never_repairs_a_stale_orca_register(self):
+        self.plant(int(360000 * 0.91))
+        self.spawn("old", harness="orca")
+
+        class OrcaAdapter(FakeAdapter):
+            name = "orca"
+
+            def resolve_pane(self, pane_key):
+                return {"handle": "new", "pty_id": "pty-1"}
+
+        ad = OrcaAdapter(panes=({
+            "handle": "new", "title": "dynamic", "status": "connected",
+            "writable": True, "pty_id": "pty-1",
+            "worktree_id": "workspace:/w"},))
+        identity = {"pid": 42, "pane_key": "tab:leaf",
+                    "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_live_session_orca_identity",
+                               return_value=(identity, None)):
+            res = autocompact.check(
+                seats=["codex"], post=False, adapter=ad, fire=False)
+        self.assertTrue(res["rows"][0].get("would_fire"))
+        with open(os.path.join(self.d, "spawn.json")) as f:
+            self.assertEqual(json.load(f)["handle"], "old")
 
     def test_registered_handle_ignores_dynamic_title(self):
         self.plant(int(360000 * 0.91))
@@ -491,8 +546,8 @@ class AutocompactTest(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         calls, results = [], []
 
-        def slow_fire(seat_name, adapter):
-            calls.append(seat_name)
+        def slow_fire(row, adapter):
+            calls.append(row["seat"])
             entered.set()
             release.wait(2)
             return "injected", "test"
@@ -543,6 +598,13 @@ class AutocompactTest(unittest.TestCase):
         self.assertNotIn("helm-wt", service)
         self.assertNotIn("sys.executable", service)
         self.assertIn("OnUnitActiveSec=60s", timer)
+
+    def test_timer_never_captures_a_path_worktree_helm(self):
+        with mock.patch.object(autocompact.shutil, "which",
+                               return_value="/tmp/helm-wt/gone/bin/helm"):
+            _, service, _, _ = autocompact._timer_units()
+        self.assertIn(os.path.expanduser("~/.local/bin/helm"), service)
+        self.assertNotIn("/tmp/helm-wt", service)
 
     def test_timer_apply_uses_validated_interval(self):
         with mock.patch.object(autocompact, "ensure_timer",
