@@ -45,6 +45,7 @@ import glob
 import hashlib
 import json
 import os
+import signal
 import stat
 import sys
 import tempfile
@@ -103,7 +104,32 @@ _HEAL_GUARDS = (
 # backup-before-heal survives even a harness that runs same-event hooks
 # concurrently.
 GUARD_SPECS = _BACKUP_GUARDS + _HEAL_GUARDS
-GUARD_SPEC = GUARD_SPECS[0]      # the name the SessionStart-only callers know
+
+# The heal hook auto-types --apply and --quiet swallows every warning, so the
+# unattended path REFUSES what the manual path merely warns about: a stale
+# pre-image (stale-preimage), a family ever seen live in another home
+# (revocation-risk via lineage), a capture-bracket tear (torn-pair). Warnings
+# are for humans; a hook that can only warn itself protects no one.
+
+# Family LINEAGE: which home NAMES each live token family has been observed
+# in, persisted across turns at backup_root()/family-lineage.json. The
+# live-bytes clash check alone is rotation-blind — one borrower refresh after
+# a byte-copy borrow, the hashes diverge and the clash vanishes — so the
+# refusal has to remember: a snapshot whose family was EVER seen live in a
+# home other than its restore target is never restored (its refresh token was
+# rotated, i.e. CONSUMED, there; restoring the copy trips server-side reuse
+# detection and revokes the whole family, bricking the live borrower).
+LINEAGE_FILE = "family-lineage.json"
+LINEAGE_KEEP = 512               # newest families kept; a rotated-away family ages out
+
+# Capture-bracket tear windows (ms). A backup that fires mid-/login can pair
+# one account's freshly-landed TOKENS with another account's still-old
+# IDENTITY block — claude's two-file login write order is UNVERIFIED
+# upstream, so nothing here assumes atomicity. The torn signature: the token
+# file was written moments before capture (a write sequence in flight) while
+# the identity file lags far behind it.
+PAIR_FRESH_MS = 5000
+PAIR_GAP_MS = 5000
 
 
 def backup_root():
@@ -311,6 +337,68 @@ def _snapshot_family(snapshot_path):
     return hashlib.sha256(tok.encode()).hexdigest()[:10]
 
 
+def _family_of_blob(blob):
+    """Token-family fingerprint of raw credential bytes — hash in memory,
+    digest prefix only, same law as _snapshot_family."""
+    doc = _json_bytes(blob) or {}
+    tok = (doc.get("claudeAiOauth") or {}).get("refreshToken") \
+        if isinstance(doc, dict) else None
+    if not isinstance(tok, str) or not tok:
+        return None
+    return hashlib.sha256(tok.encode()).hexdigest()[:10]
+
+
+# ---------------------------------------------------------- family lineage ---
+def _lineage_path():
+    return os.path.join(backup_root(), LINEAGE_FILE)
+
+
+def _lineage_load():
+    doc = _read_json(_lineage_path())
+    fams = doc.get("families") if isinstance(doc, dict) else None
+    return fams if isinstance(fams, dict) else {}
+
+
+def _lineage_homes(fam):
+    """Home NAMES this family was ever recorded live in. Empty when unknown —
+    the lineage is one refusal layer among several, never the only one."""
+    entry = _lineage_load().get(fam)
+    names = entry.get("homes") if isinstance(entry, dict) else None
+    return ({n for n in names if isinstance(n, str)}
+            if isinstance(names, list) else set())
+
+
+def _lineage_record(pairs):
+    """Merge (family, home-name) observations into the persisted lineage.
+    Called only from APPLY paths (dry-runs stay recursive-metadata no-ops).
+    Best-effort by design: a failed write costs future lineage coverage, but
+    the live-bytes clash check and the hook's stale refusal still stand."""
+    seen = [(f, n) for f, n in pairs if f and n]
+    if not seen:
+        return
+    fams = _lineage_load()
+    now = int(time.time())
+    for fam, home_name in seen:
+        entry = fams.get(fam)
+        if not isinstance(entry, dict) or not isinstance(entry.get("homes"), list):
+            entry = {"homes": []}
+        entry["homes"] = sorted({h for h in entry["homes"]
+                                 if isinstance(h, str)} | {home_name})
+        entry["ts"] = now
+        fams[fam] = entry
+    if len(fams) > LINEAGE_KEEP:
+        stale = sorted(fams, key=lambda f: (fams[f].get("ts")
+                                            if isinstance(fams[f], dict) else 0) or 0)
+        for fam in stale[:len(fams) - LINEAGE_KEEP]:
+            del fams[fam]
+    try:
+        _secure_dir(backup_root())
+        _atomic_private(_lineage_path(), json.dumps(
+            {"families": fams}, indent=2, sort_keys=True).encode())
+    except OSError:
+        pass
+
+
 # ----------------------------------------------------------------- backups ---
 def folded_dir(folded):
     return os.path.join(backup_root(), folded)
@@ -333,6 +421,8 @@ def _snapshots_in(d):
                     "source_name": meta.get("source_name"),
                     "source_home": meta.get("source_home"),
                     "digest": meta.get("digest"),
+                    "family": meta.get("family"),
+                    "pair": meta.get("pair"),
                     "has_creds": _stat_key(os.path.join(p, "credentials.json")) is not None})
     return out
 
@@ -457,11 +547,40 @@ def _identical(snapshot, blob, oa):
         os.path.join(snapshot["path"], "account.json")) or {}) == oa
 
 
+def _foreign_family(fam, email):
+    """The OTHER account whose snapshots already claim this token family, or
+    None. The bytes-vs-identity coherence check for a mixed home: one home =
+    one family, and a family belongs to exactly one account, so token bytes
+    whose family is filed under a different account's snapshots cannot
+    coherently be bound to `email` — that pairing is the torn/mixed-home
+    signature, and snapshotting it would mint a poisoned pre-image that
+    passes every digest check downstream."""
+    if not fam:
+        return None
+    expected = _email_or_none(email)
+    for d in sorted(glob.glob(os.path.join(backup_root(), "*"))):
+        if not os.path.isdir(d) or os.path.islink(d):
+            continue
+        for s in _snapshots_in(d):
+            if not s["account"] or s["account"] == expected:
+                continue
+            sfam = s.get("family") or _snapshot_family(s["path"])
+            if sfam and sfam == fam:
+                return s["account"]
+    return None
+
+
 def _capture_home(real):
     """Stable credential + identity pre-image, or a secret-free reason. Both
     files are read through checked descriptors and their inode/stat keys are
     bracketed; a concurrent /login can therefore make capture REFUSE, never
-    file one account's tokens under another account's identity."""
+    file one account's tokens under another account's identity. Where the
+    estate's own history makes it checkable (_foreign_family), a home whose
+    token bytes belong to ANOTHER account's snapshots is refused outright —
+    the post-SIGKILL mixed-home shape no bracket can see. The capture also
+    records both files' stat brackets (mtime/size) plus a capture timestamp,
+    so heal can later refuse a pair whose write times betray a mid-/login
+    tear."""
     cfg, auth = os.path.join(real, ACCOUNT_JSON), os.path.join(real, AUTH_JSON)
     for _ in range(2):
         before = (_stat_key(cfg), _stat_key(auth))
@@ -486,7 +605,19 @@ def _capture_home(real):
         if not email:
             return None, "oauthAccount carries no valid emailAddress"
         oa = dict(oa, emailAddress=email)
+        fam = _family_of_blob(blob)
+        other = _foreign_family(fam, email)
+        if other:
+            return None, ("credential bytes carry a token family already "
+                          "snapshotted for another account (%s) — a mixed or "
+                          "torn home; refusing to bind them to %s"
+                          % (other, email))
+        pair = {"cfg": {"mtime_ns": before[0][0], "size": before[0][1],
+                        "sha12": hashlib.sha256(cfg_blob).hexdigest()[:12]},
+                "auth": {"mtime_ns": before[1][0], "size": before[1][1]},
+                "captured_at_ms": int(time.time() * 1000)}
         return {"blob": blob, "oa": oa, "email": email,
+                "family": fam, "pair": pair,
                 "uuid": _str_or_none(oa.get("accountUuid")),
                 "org": _str_or_none(oa.get("organizationName"))}, None
     return None, "credential files changed during pre-image capture"
@@ -526,8 +657,10 @@ def backup(config_dir, apply=False):
             "account": email, "uuid": cap["uuid"], "org": cap["org"],
             "source_home": real, "source_name": name, "digest": digest,
             "bytes": len(blob), "ts": os.path.basename(dest),
-            "note": "digest is a sha256 PREFIX (content fingerprint); token bytes "
-                    "live only in credentials.json, 0600, never printed",
+            "family": cap["family"], "pair": cap["pair"],
+            "note": "digest/family are sha256 PREFIXES (content fingerprints); "
+                    "token bytes live only in credentials.json, 0600, never "
+                    "printed; pair records both files' capture stat brackets",
         }, indent=2).encode())
         _fsync_dir(dest)
         _fsync_dir(account_dir(email))
@@ -536,6 +669,7 @@ def backup(config_dir, apply=False):
         return {"ok": False, "action": "skip", "home": real, "name": name,
                 "account": email,
                 "reason": "snapshot write failed (%s)" % e.__class__.__name__}
+    _lineage_record([(cap["family"], name)])
     pruned = _prune(email)
     return {"ok": True, "action": "backup", "home": real, "name": name,
             "account": email, "dest": dest, "digest": digest,
@@ -618,6 +752,34 @@ def _rollback_files(pre):
     return ok
 
 
+# Catchable termination signals blocked across restore's two-file commit. The
+# heal hook runs under `timeout 10` (hooks.py spec_command) — a SCHEDULED
+# SIGTERM, not crash luck — and a kill landing between the two os.replace
+# calls would leave a MIXED home: restored credentials under the occupant's
+# identity. SIGKILL/power-loss cannot be masked; that residue is why
+# _capture_home refuses to snapshot a home whose token bytes already belong
+# to another account's snapshots.
+_COMMIT_SIGNALS = frozenset(
+    getattr(signal, n) for n in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT")
+    if hasattr(signal, n))
+
+
+def _block_commit_signals():
+    try:
+        return signal.pthread_sigmask(signal.SIG_BLOCK, _COMMIT_SIGNALS)
+    except (AttributeError, ValueError, OSError):
+        return None                # platform without pthread_sigmask: best effort
+
+
+def _unblock_commit_signals(old):
+    if old is None:
+        return
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+    except (ValueError, OSError):
+        pass
+
+
 def _snapshot_files(snapshot_path):
     """Checked snapshot payload. The snapshot itself and both files must be
     plain objects under the configured backup root; symlinks never restore."""
@@ -693,6 +855,14 @@ def restore(snapshot_path, config_dir, require_free=False):
             _unlink(tmp)
         return {"ok": False, "error": "write failed (%s)" % e.__class__.__name__}
     if require_free:
+        # IRREDUCIBLE TOCTOU residual, on the record: without an flock on the
+        # home, a session launching into this drifted dir in the few ms
+        # between this probe and the replaces below starts on bytes we are
+        # about to swap. Three probes bracket the window (plan, post-backup
+        # re-probe, here), sesh never launches into DRIFT homes, the occupant
+        # is snapshotted first so nothing is lost, and that session's own
+        # next credential write re-drifts the home so heal refuses (held)
+        # thereafter. Accepted residual — not fixable at this layer.
         held = holders_of(real)
         if held is None or held:
             for _, tmp in staged:
@@ -707,39 +877,47 @@ def restore(snapshot_path, config_dir, require_free=False):
             return {"ok": False, "error": "home changed during restore — refusing"}
     changed = []
     dir_changed = False
+    # The whole commit — replaces, verify, AND any rollback — runs with
+    # catchable termination signals blocked: the pair lands together or is
+    # rolled back together, never left half-swapped by the hook's own
+    # `timeout 10` SIGTERM.
+    mask = _block_commit_signals()
     try:
-        os.chmod(real, 0o700, follow_symlinks=False)
-        dir_changed = home_mode != 0o700
-        for path, tmp in staged:
-            os.replace(tmp, path)
-            changed.append(path)
-        _fsync_dir(real)
-        got, mode = _read_regular(auth)
-        if got != blob or mode != 0o600:
-            raise OSError("credential verification failed")
-        cfg_blob, cfg_mode = _read_regular(cfg)
-        cfg_doc = _json_bytes(cfg_blob)
-        if (stat.S_IMODE(os.lstat(real).st_mode) != 0o700
-                or cfg_mode != 0o600 or not isinstance(cfg_doc, dict)
-                or _email_or_none((cfg_doc.get("oauthAccount") or {}).get(
-                    "emailAddress")) != oa["emailAddress"]):
-            raise OSError("identity verification failed")
-    except OSError as e:
-        for _, tmp in staged:
-            _unlink(tmp)
-        rolled = _rollback_files({p: pre[p] for p in changed}) if changed else True
-        if dir_changed:
-            try:
-                os.chmod(real, home_mode, follow_symlinks=False)
-                _fsync_dir(real)
-            except OSError:
-                rolled = False
-        cache_clear()
-        if not rolled:
-            return {"ok": False, "error": "write failed (%s) and exact rollback failed"
+        try:
+            os.chmod(real, 0o700, follow_symlinks=False)
+            dir_changed = home_mode != 0o700
+            for path, tmp in staged:
+                os.replace(tmp, path)
+                changed.append(path)
+            _fsync_dir(real)
+            got, mode = _read_regular(auth)
+            if got != blob or mode != 0o600:
+                raise OSError("credential verification failed")
+            cfg_blob, cfg_mode = _read_regular(cfg)
+            cfg_doc = _json_bytes(cfg_blob)
+            if (stat.S_IMODE(os.lstat(real).st_mode) != 0o700
+                    or cfg_mode != 0o600 or not isinstance(cfg_doc, dict)
+                    or _email_or_none((cfg_doc.get("oauthAccount") or {}).get(
+                        "emailAddress")) != oa["emailAddress"]):
+                raise OSError("identity verification failed")
+        except OSError as e:
+            for _, tmp in staged:
+                _unlink(tmp)
+            rolled = _rollback_files({p: pre[p] for p in changed}) if changed else True
+            if dir_changed:
+                try:
+                    os.chmod(real, home_mode, follow_symlinks=False)
+                    _fsync_dir(real)
+                except OSError:
+                    rolled = False
+            cache_clear()
+            if not rolled:
+                return {"ok": False, "error": "write failed (%s) and exact rollback failed"
+                        % e.__class__.__name__}
+            return {"ok": False, "error": "write failed (%s); exact pre-image restored"
                     % e.__class__.__name__}
-        return {"ok": False, "error": "write failed (%s); exact pre-image restored"
-                % e.__class__.__name__}
+    finally:
+        _unblock_commit_signals(mask)
     cache_clear()
     return {"ok": True, "account": oa["emailAddress"]}
 
@@ -876,27 +1054,68 @@ def _held_note(holders, cap=3):
 
 
 # -------------------------------------------------------------------- heal ---
-def _family_live_elsewhere(snapshot, target, estate):
-    """The home whose LIVE credentials already carry this snapshot's token
-    family, if any (never the target itself). helm's oldest credential law:
-    one home = one token family; a byte-copy across two homes is the
-    revocation bomb (homes.py's shared-family audit). Restoring a snapshot
-    that another home still holds would MINT that state, so heal refuses."""
-    fam = _snapshot_family(snapshot["path"])
+def _family_elsewhere(snapshot, target, estate):
+    """(home, live) — the home other than the target whose credentials carry
+    this snapshot's token family NOW (live=True), or EVER per the recorded
+    lineage (live=False); (None, False) when neither. helm's oldest
+    credential law: one home = one token family; a byte-copy across two homes
+    is the revocation bomb (homes.py's shared-family audit). Restoring a
+    snapshot another home still holds would MINT that state — and restoring
+    one a borrower ever REFRESHED (rotating, i.e. consuming, the snapshot's
+    copy) trips server-side reuse detection, which revokes the whole family
+    and bricks the live borrower. The live-bytes compare goes blind one
+    borrower rotation later; the lineage does not."""
+    fam = snapshot.get("family") or _snapshot_family(snapshot["path"])
     if not fam:
-        return None
+        return None, False
     for other in estate:
         if other["real"] != target["real"] and other.get("family") == fam:
-            return _display_path(other["name"])
-    return None
+            return _display_path(other["name"]), True
+    mine = ({target["name"], os.path.basename(target["real"])}
+            | set(target.get("aliases") or []))
+    seen = sorted(h for h in _lineage_homes(fam) if h not in mine)
+    if seen:
+        return _display_path(seen[0]), False
+    return None, False
 
 
-def heal_plan(name=None):
+def _pair_torn(snapshot):
+    """True when the snapshot's recorded capture brackets betray a mid-/login
+    tear: the token file landed moments before capture (a dual-file write
+    sequence in flight) while the identity file lags far behind it — the pair
+    may bind one account's tokens to another account's identity, and NOTHING
+    downstream can detect that once it is filed. claude's /login write
+    ordering is unverified upstream, so this assumes no atomicity; the
+    opposite tear (fresh identity over stale tokens) is caught at capture by
+    _foreign_family, since the stale tokens' family is already snapshotted
+    under the previous account. Legacy snapshots without brackets pass — the
+    check is one refusal layer, not the only one."""
+    pair = snapshot.get("pair")
+    if not isinstance(pair, dict):
+        return False
+    try:
+        auth_ms = int(pair["auth"]["mtime_ns"]) // 1000000
+        cfg_ms = int(pair["cfg"]["mtime_ns"]) // 1000000
+        cap_ms = int(pair["captured_at_ms"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (auth_ms - cfg_ms > PAIR_GAP_MS
+            and cap_ms - auth_ms < PAIR_FRESH_MS)
+
+
+def heal_plan(name=None, record=False):
     """One plan per DRIFTED home: what heal WOULD do, and why it can't.
-    status: ready | held | cannot-probe | no-backup | revocation-risk
-    (apply adds: restored | failed | no-preimage)."""
+    status: ready | held | cannot-probe | no-backup | ambiguous-backup |
+    revocation-risk | torn-pair (apply adds: restored | failed | no-preimage,
+    and the hook path adds stale-preimage). record=True (the apply path only
+    — dry-runs stay filesystem no-ops) also persists the family-lineage
+    census of the current estate, so a later plan can refuse a snapshot whose
+    family was EVER live in another home even after the borrower rotates."""
     plans = []
     estate = rows()
+    if record:
+        _lineage_record([(r.get("family"), os.path.basename(r["real"]))
+                         for r in estate])
     for r in estate:
         if r["verdict"] != "DRIFT":
             continue
@@ -907,7 +1126,8 @@ def heal_plan(name=None):
         snaps = [s for s in snapshots_for_home_name(want) if s["has_creds"]]
         snap_accounts = {s["account"] for s in snaps if s["account"]}
         holders = holders_of(r["real"], default=r["default"])
-        clash = _family_live_elsewhere(snaps[-1], r, estate) if snaps else None
+        clash, clash_live = (_family_elsewhere(snaps[-1], r, estate)
+                             if snaps else (None, False))
         plan = {"name": _display_path(r["name"]), "path": r["real"], "holds": r["account"],
                 "wants_account_folded": want,
                 "restore_from": snaps[-1]["path"] if snaps else None,
@@ -927,12 +1147,28 @@ def heal_plan(name=None):
             plan["status"], plan["reason"] = "ambiguous-backup", (
                 "snapshots under %s claim multiple or missing account identities — "
                 "the folded directory name is not enough to choose safely" % want)
-        elif clash:
+        elif clash and clash_live:
             plan["status"], plan["reason"] = "revocation-risk", (
                 "that snapshot's token family is LIVE in %s — restoring it here "
                 "would leave byte-copies of ONE refresh token in two homes, and "
                 "reuse detection revokes the whole family. Fresh login instead: %s"
                 % (clash, _login_cmd(r["real"])))
+        elif clash:
+            plan["status"], plan["reason"] = "revocation-risk", (
+                "that snapshot's token family was seen LIVE in %s — whatever "
+                "refreshed it there ROTATED (consumed) the snapshot's copy, and "
+                "a consumed refresh token is what reuse detection revokes a "
+                "whole family over. A family ever live in another home never "
+                "restores. Fresh login instead: %s"
+                % (clash, _login_cmd(r["real"])))
+        elif _pair_torn(snaps[-1]):
+            plan["status"], plan["reason"] = "torn-pair", (
+                "that snapshot's token file landed moments before capture while "
+                "its identity file lags behind it — a backup that fires "
+                "mid-/login can bind one account's tokens to another account's "
+                "identity (claude's two-file login write is not known atomic), "
+                "and restoring the pair would misroute a credential. Fresh "
+                "login instead: %s" % _login_cmd(r["real"]))
         else:
             # STALENESS is the temporal twin of the shared-family bomb: an
             # access token that had already expired means whoever held this
@@ -958,16 +1194,29 @@ def heal_plan(name=None):
     return plans
 
 
-def heal(name=None, apply=False):
+def heal(name=None, apply=False, hook=False):
     """DRY-RUN BY DEFAULT. With apply=True, for every `ready` plan: re-probe
     holders (the window between plan and act is where a race lives), snapshot
-    the CURRENT occupant so the undo is undoable, restore, then VERIFY the home
-    now reads as the expected account — rolling back if it does not."""
-    plans = heal_plan(name)
+    the CURRENT occupant so the undo is undoable, restore, then VERIFY the
+    home now reads as the expected account AND its token family is live
+    nowhere else — rolling back if either fails. hook=True is the unattended
+    guard path (--quiet): a plan the manual path would only WARN about
+    (stale_pre_image) is REFUSED outright, because the hook auto-types
+    --apply and swallows the warning no owner will ever read."""
+    plans = heal_plan(name, record=apply)
     if not apply:
         return {"apply": False, "plans": plans}
     for plan in plans:
         if plan["status"] != "ready":
+            continue
+        if hook and plan.get("stale_pre_image"):
+            plan["status"], plan["reason"] = "stale-preimage", (
+                "snapshot predates a token refresh (its access token had "
+                "already expired), so its refresh token may be consumed — and "
+                "a consumed refresh token is what reuse detection revokes a "
+                "whole family over. Auto-restore refused; `helm cred heal "
+                "--apply` by hand accepts the risk knowingly, or log in "
+                "fresh: %s" % _login_cmd(plan["path"]))
             continue
         holders = holders_of(plan["path"])
         if holders is None or holders:
@@ -999,15 +1248,29 @@ def heal(name=None, apply=False):
             plan["status"], plan["reason"] = "failed", res["error"]
             continue
         got = account_of(plan["path"])
-        if got["ok"] and homes.canonical_name(got["email"]) == plan["wants_account_folded"]:
+        problem = None
+        if not (got["ok"] and homes.canonical_name(got["email"])
+                == plan["wants_account_folded"]):
+            problem = "post-restore identity is %s" % (got["email"] or got["error"])
+        else:
+            # Post-restore family cross-check: a borrower that came alive
+            # between the plan's census and the commit would leave byte-copies
+            # of one refresh token in two homes — the exact state heal refuses
+            # to mint. Verify what is checkable, roll back what is not clean.
+            fam = _snapshot_family(plan["restore_from"])
+            alive = ([o for o in rows() if o["real"] != plan["path"]
+                      and o.get("family") == fam] if fam else [])
+            if alive:
+                problem = ("the restored token family is LIVE in %s (arrived "
+                           "mid-heal) — byte-copies of one refresh token in "
+                           "two homes" % _display_path(alive[0]["name"]))
+        if problem is None:
             plan["status"] = "restored"
             plan["reason"] = ("%s is home again (creds may be stale — refresh "
                               "tokens rotate; if claude rejects them, log in "
                               "fresh into this home)" % got["email"])
             continue
-        plan["status"], plan["reason"] = "failed", (
-            "post-restore identity is %s — rolled back"
-            % (got["email"] or got["error"]))
+        plan["status"], plan["reason"] = "failed", problem + " — rolled back"
         if pre.get("dest"):
             rolled = restore(pre["dest"], plan["path"], require_free=True)
             if not rolled["ok"]:
@@ -1266,7 +1529,7 @@ def _print_heal(args):
         if not quiet:
             print("helm cred heal: invalid arguments", file=sys.stderr)
         return 2
-    res = heal(rest[0] if rest else None, apply=apply)
+    res = heal(rest[0] if rest else None, apply=apply, hook=quiet)
     if quiet:
         # hook mode: stdout would land in the session's context — total
         # silence either way; the exit code alone says whether every plan

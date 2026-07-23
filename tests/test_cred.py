@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import stat
 import tempfile
 import time
@@ -323,8 +324,10 @@ class BackupTest(CredBase):
             self.assertEqual(stat.S_IMODE(os.stat(s["path"]).st_mode), 0o700)
 
     def test_backup_all_covers_every_authed_home(self):
-        self.plant("david-example-invalid", "owner@example.invalid")
-        self.plant("team-example-com", "hey@simbi.com")
+        # distinct tokens: one family belongs to ONE account — two accounts
+        # sharing bytes is the mixed-home shape capture now refuses
+        self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-DAVID")
+        self.plant("team-example-com", "hey@simbi.com", token="FAKE-SIMBI")
         self.plant("no-creds-com", "no@creds.com", token=None)
         done = {r["account"] for r in cred.backup_all(apply=True) if r["action"] == "backup"}
         self.assertEqual(done, {"owner@example.invalid", "hey@simbi.com"})
@@ -1157,6 +1160,137 @@ class GuardHealTest(CredBase):
         self.assertEqual((rc, out, err), (0, "", ""))
         rc, out, err = self.out(cred.cmd_cred, ["heal", "--quiet"])
         self.assertEqual((rc, out, err), (0, "", ""))
+
+
+class LineageTest(CredBase):
+    """The review pair's demonstrated revocation bomb, pinned: the live-bytes
+    clash check goes blind ONE borrower rotation after a byte-copy borrow —
+    the hashes diverge, the clash vanishes, and the guard's auto-heal would
+    restore the CONSUMED token, whose first refresh trips server-side reuse
+    detection and revokes the whole family, bricking the live borrower. The
+    family lineage remembers what the hashes forget."""
+
+    def test_a_borrower_rotation_never_unblinds_the_auto_heal(self):
+        """The executed repro, end-to-end through the exact hook command."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-S")
+        cred.backup(cto, apply=True)          # the guard's snapshot of token S
+        # token S byte-copied into a live borrower home (agreeing name, so
+        # only cto-example-com ever drifts in this replay)
+        self.plant("x-else-com", "x@else.com", token="FAKE-S")
+        # a fleet turn boundary passes: the heal leg's census records where
+        # each family is LIVE, exactly as the installed hook runs it
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))
+        # /login pollutes cto's home; then the borrower refreshes, ROTATING
+        # its copy of S — the live-bytes hash clash vanishes right here
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        self.plant("x-else-com", "x@else.com", token="FAKE-S-ROTATED")
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((out, err), ("", ""))
+        self.assertEqual(rc, 1)               # silent, honest refusal
+        self.assertEqual(cred.account_of(cto)["email"], "owner@example.invalid")
+        creds = json.load(open(os.path.join(cto, ".credentials.json")))
+        self.assertEqual(creds["claudeAiOauth"]["refreshToken"], "FAKE-DAVID")
+        plan = cred.heal()["plans"][0]
+        self.assertEqual(plan["status"], "revocation-risk")
+        self.assertIn("x-else-com", plan["reason"])
+        self.assertIn("claude /login", plan["reason"])
+
+    def test_the_hook_refuses_the_stale_pre_image_the_manual_path_warns_about(self):
+        """Warnings are for humans: the hook auto-types --apply and --quiet
+        swallows every line, so what the CLI surfaces the hook must REFUSE."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        with open(os.path.join(cto, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {"refreshToken": "FAKE-CTO",
+                                         "expiresAt": 1}}, f)          # long dead
+        cred.cache_clear()
+        cred.backup(cto, apply=True)
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        before = open(os.path.join(cto, ".credentials.json"), "rb").read()
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (1, "", ""))
+        self.assertEqual(open(os.path.join(cto, ".credentials.json"), "rb").read(),
+                         before)              # untouched
+        plan = cred.heal(apply=True, hook=True)["plans"][0]
+        self.assertEqual(plan["status"], "stale-preimage")
+        self.assertIn("reuse detection", plan["reason"])
+        # the manual path still restores: the owner read the warning and
+        # typed --apply — the risk is accepted knowingly, not by a hook
+        res = cred.heal(apply=True)
+        self.assertEqual(res["plans"][0]["status"], "restored")
+        self.assertEqual(cred.account_of(cto)["email"], "cto@example.invalid")
+
+
+class TornPairTest(CredBase):
+    """A backup that fires mid-/login can pair one account's freshly-landed
+    TOKENS with another account's still-old IDENTITY — claude's two-file
+    login write order is UNVERIFIED upstream, so nothing here assumes
+    atomicity. The defense is layered: the capture brackets are recorded and
+    heal refuses the torn signature; a mixed home whose token bytes already
+    belong to another account's snapshots never becomes a snapshot at all;
+    and the restore commit itself is signal-masked so the guard's own
+    `timeout 10` SIGTERM cannot mint the mixed home."""
+
+    def test_a_capture_bracketing_a_login_tear_is_never_restored(self):
+        """The adversarial repro, pinned: alice's tokens landed moments ago,
+        david's identity file is a minute behind — a /login in flight. The
+        misbound snapshot is filed, but heal refuses to restore it."""
+        home = self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-ALICE-LANDED")
+        old = time.time() - 60
+        os.utime(os.path.join(home, ".claude.json"), (old, old))
+        cred.cache_clear()
+        self.assertTrue(cred.backup(home, apply=True)["ok"])
+        self.plant("david-example-invalid", "bob@ex.com", token="FAKE-BOB")     # later drift
+        before = open(os.path.join(home, ".credentials.json"), "rb").read()
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((out, err), ("", ""))
+        self.assertEqual(rc, 1)
+        self.assertEqual(open(os.path.join(home, ".credentials.json"), "rb").read(),
+                         before)              # the misroute never happened
+        plan = cred.heal()["plans"][0]
+        self.assertEqual(plan["status"], "torn-pair")
+        self.assertIn("claude /login", plan["reason"])
+
+    def test_a_mixed_home_never_becomes_a_snapshot(self):
+        """The post-tear mixed home — account A's token bytes under account
+        B's identity — is refused at CAPTURE, where the estate's own snapshot
+        history makes the misbinding checkable. No poisoned pre-image is ever
+        filed for a later restore to trust."""
+        a = self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-DAVID")
+        self.assertTrue(cred.backup(a, apply=True)["ok"])   # david's family on record
+        mixed = self.plant("bob-ex-com", "bob@ex.com", token="FAKE-DAVID")
+        res = cred.backup(mixed, apply=True)
+        self.assertFalse(res["ok"])
+        self.assertIn("another account", res["reason"])
+        self.assertEqual(cred.snapshots("bob@ex.com"), [])
+
+    def test_the_two_file_commit_is_signal_masked(self):
+        """The heal hook runs under `timeout 10` — a SCHEDULED SIGTERM, not
+        crash luck. One landing between the two os.replace calls would leave
+        restored credentials under the occupant's identity; the commit blocks
+        catchable termination signals, so the kill only lands after BOTH
+        files (and the verify) are done."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        cred.backup(cto, apply=True)
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        snap = cred.snapshots("cto@example.invalid")[-1]["path"]
+        landed, delivered = [], []
+        prev = signal.signal(signal.SIGTERM,
+                             lambda *a: delivered.append(len(landed)))
+        self.addCleanup(signal.signal, signal.SIGTERM, prev)
+        real_replace = os.replace
+        def kill_mid_commit(src, dst, *a, **kw):
+            real_replace(src, dst, *a, **kw)
+            landed.append(dst)
+            if len(landed) == 1:              # right between the two replaces
+                os.kill(os.getpid(), signal.SIGTERM)
+        with mock.patch.object(cred.os, "replace", kill_mid_commit):
+            res = cred.restore(snap, cto)
+        self.assertTrue(res["ok"])
+        self.assertEqual(delivered, [2])      # the kill waited out the commit
+        self.assertEqual(cred.account_of(cto)["email"], "cto@example.invalid")
+        creds = json.load(open(os.path.join(cto, ".credentials.json")))
+        self.assertEqual(creds["claudeAiOauth"]["refreshToken"], "FAKE-CTO")
 
 
 class SecrecyTest(CredBase):
