@@ -453,17 +453,14 @@ details.cfgsec>summary:hover{color:var(--fg)}
 #chatnewroom{margin-top:6px;width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:5px 8px;font-size:var(--f1)}
 #chatnewroom:focus{border-color:var(--accent);outline:none}
 #chatmain{flex:1;display:flex;flex-direction:column;min-width:0}
-/* the fleet presence bar — ICQ/slack-style: one row per seat, every room */
-#chatpresence{flex:0 0 auto;max-height:7.5em;overflow-y:auto;border-bottom:1px solid var(--line);padding:4px 12px;font-size:var(--f1)}
-.pr{display:flex;align-items:baseline;gap:6px;min-width:0;padding:1px 0;color:var(--mut)}
-.pr .prdot{flex:0 0 auto;font-size:var(--f0)}
-.pr.absent{opacity:.55}
-.pr .prseat{font-weight:var(--w-med);color:var(--fg);flex:0 0 auto}
-.pr.absent .prseat{color:var(--mut)}
-.pr .prline{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pr .prline.status{color:var(--fg)}
-.pr .prline.status.stale{color:var(--mut)} /* >4h old explicit line reads dim */
-.pr .prage{flex:0 0 auto;font-size:var(--f0);color:var(--sub);font-variant-numeric:tabular-nums}
+/* the fleet presence STRIP — one glance line; click it for the full dense
+   roster table (its own tab). Replaced the ICQ-style multi-row bar, which was
+   duplicate roster ink — the roster tab is the one home for it now. */
+#chatpresence{flex:0 0 auto;border-bottom:1px solid var(--line);padding:5px 12px;font-size:var(--f1);color:var(--mut);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#chatpresence:hover{background:var(--hover)}
+#chatpresence .psseat{color:var(--fg);font-weight:var(--w-med)}
+#chatpresence .psmore{color:var(--sub)}
+#chatpresence .pslink{color:var(--accent)}
 #chatlog{flex:1;overflow-y:auto;padding:14px 16px}
 .chatmsg{margin:0 0 10px;font-size:var(--f2)}
 .chatmsg .cwho{font-weight:700}
@@ -554,6 +551,35 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .spv{color:var(--fg);font-size:var(--f1);word-break:break-word}
 .spjump{margin-top:10px;width:100%;text-align:left;font-size:var(--f1);padding:6px 10px;border-radius:7px;background:color-mix(in srgb,var(--accent) 14%,transparent);border:1px solid var(--accent);color:var(--accent);cursor:pointer}
 .spjump:hover{background:color-mix(in srgb,var(--accent) 24%,transparent)}
+/* ---------- roster tab: one dense Tuftian table for the whole fleet ---------- */
+table.roster{width:100%;border-collapse:collapse;font-size:var(--f2);table-layout:auto}
+table.roster th{text-align:left;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);padding:6px 9px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none;white-space:nowrap}
+table.roster th.num{text-align:right}
+table.roster th:hover{color:var(--fg)}
+table.roster th .sar{opacity:.6;font-size:.85em}
+table.roster td{padding:6px 9px;border-bottom:1px solid var(--line);vertical-align:baseline;white-space:nowrap}
+table.roster tr:last-child td{border-bottom:none}
+table.roster td.num{text-align:right;font-variant-numeric:tabular-nums}
+table.roster tbody tr:hover td{background:color-mix(in srgb,var(--hl) 55%,transparent)}
+table.roster tr.absent td{opacity:.55}
+table.roster tr.eph td{opacity:.5;font-style:italic}
+.rdot{font-size:var(--f1)}
+.rdot.fresh{color:var(--ok)}.rdot.quiet{color:var(--warn)}.rdot.absent{color:var(--mut)}
+.rseat{font-family:ui-monospace,monospace;font-weight:var(--w-med);cursor:pointer;border-radius:5px;padding:0 3px;margin:0 -3px}
+.rseat:hover{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
+.rdoing.claim,.rdoing.status{color:var(--fg)}.rdoing.home,.rdoing.stale{color:var(--mut)}
+.rpend{font-size:var(--f0);font-weight:700;padding:1px 6px;border-radius:5px;background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+.rmsg{color:var(--sub);max-width:26ch;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
+.rsess{font-family:ui-monospace,monospace;color:var(--mut);font-size:var(--f0)}
+#rosterbar{display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap}
+#rosterbar .rcount{font-weight:var(--w-med)}
+#rosterq{background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:5px 10px;font-size:var(--f1);min-width:170px}
+#rosterq:focus{border-color:var(--accent);outline:none}
+#rosterclaims{color:var(--mut);font-size:var(--f1);margin:10px 0 0}
+#rosterorphans{margin-top:10px;color:var(--sub);font-size:var(--f1)}
+#rosterorphans>summary{cursor:pointer;color:var(--sub)}
+.spren{margin-top:8px;width:100%;text-align:left;font-size:var(--f0);padding:5px 10px;border-radius:7px;background:none;border:1px solid var(--line);color:var(--mut);cursor:pointer}
+.spren:hover{border-color:var(--accent);color:var(--accent)}
 .seatrn:hover{border-color:var(--accent);color:var(--accent)}
 .lmeta{font-size:var(--f1);color:var(--mut);margin-top:2px;word-break:break-all}
 .lbadge{font-size:var(--f0);font-weight:700;padding:2px 7px;border-radius:5px;white-space:nowrap;background:color-mix(in srgb,var(--mut) 14%,transparent);color:var(--mut)}
@@ -591,6 +617,7 @@ details.cfgsec>summary:hover{color:var(--fg)}
   <button class="navtab" data-v="sessions">sessions</button>
   <button class="navtab" data-v="configs">configs</button>
   <button class="navtab" data-v="chat">chat</button>
+  <button class="navtab" data-v="roster">roster</button>
   <button class="navtab" data-v="cave">cave</button>
   <button class="navtab" data-v="ledger">ledger</button>
   <span class="spacer"></span>
@@ -735,6 +762,30 @@ details.cfgsec>summary:hover{color:var(--fg)}
   </div>
 </div>
 
+<div class="view" id="view-roster">
+  <div class="lcard" style="margin-bottom:14px">
+    <h3>message a seat <span class="lsub" id="seatpickcount">rides the groupchat</span></h3>
+    <form id="seatform" autocomplete="off">
+      <div class="seatpick">
+        <input id="seatkey" placeholder="pick a live seat — or type @all / a name" maxlength="120" aria-label="seat name" title="live seats from the roster; free-type @all or a not-yet-joined seat" role="combobox" aria-autocomplete="list" aria-controls="seatlist" aria-expanded="false">
+        <div id="seatlist" role="listbox"></div>
+      </div>
+      <input id="seatline" placeholder="one-line message…" maxlength="400" required aria-label="message">
+      <button class="chip" id="seatsend" type="submit">send →</button>
+      <div id="seatmsg">a named seat gets a private DM (its lane only); @all posts to #main for the fleet.</div>
+    </form>
+  </div>
+  <div id="rosterbar">
+    <span class="rcount" id="rostercount">connecting…</span>
+    <input id="rosterq" placeholder="filter seat / project / doing…" autocomplete="off" aria-label="filter roster">
+    <button class="chip" id="togAbsent" title="show absent (gone) seats">absent <span id="cntAbsent">0</span></button>
+    <button class="chip" id="togSAs" title="show completed ephemeral review subagents">SAs <span id="cntSAs">0</span></button>
+  </div>
+  <div style="overflow-x:auto"><table class="roster"><thead id="rthead"></thead><tbody id="rtbody"><tr><td class="empty">connecting…</td></tr></tbody></table></div>
+  <div id="rosterclaims"></div>
+  <details id="rosterorphans" hidden></details>
+</div>
+
 <div class="view" id="view-ledger">
   <div id="ledgerstrip">connecting…</div>
   <div id="ledgersplit">
@@ -756,30 +807,6 @@ details.cfgsec>summary:hover{color:var(--fg)}
       </div>
     </div>
     <div class="lside">
-      <div class="lcard">
-        <h3>message a seat <span class="lsub" id="seatpickcount">rides the groupchat</span></h3>
-        <form id="seatform" autocomplete="off">
-          <div class="seatpick">
-            <input id="seatkey" placeholder="pick a live seat — or type @all / a name" maxlength="120" aria-label="seat name" title="live seats from the roster; free-type @all or a not-yet-joined seat" role="combobox" aria-autocomplete="list" aria-controls="seatlist" aria-expanded="false">
-            <div id="seatlist" role="listbox"></div>
-          </div>
-          <input id="seatline" placeholder="one-line message…" maxlength="400" required aria-label="message">
-          <button class="chip" id="seatsend" type="submit">send →</button>
-          <div id="seatmsg">a named seat gets a private DM (its lane only); @all posts to #main for the fleet.</div>
-        </form>
-      </div>
-      <div class="lcard">
-        <h3>seat activity <span class="lsub">live delivery roster · who I can message right now</span></h3>
-        <div class="llegend"><span><span class="ldot active"></span> active &lt;2m</span>
-          <span><span class="ldot quiet"></span> quiet &lt;15m</span>
-          <span><span class="ldot"></span> absent</span>
-          <span style="margin-left:auto">off the chat rail · presence + pending</span></div>
-        <div class="lrows" id="ledgerseats"><div class="empty">no seats joined yet — a session joins on its next start (helm hooks install wires it)</div></div>
-      </div>
-      <div class="lcard">
-        <h3>fleet todos <span class="lsub">who is working on what · pulled, never pushed</span></h3>
-        <div class="lrows" id="ledgertodos"><div class="empty">no seat has mirrored a todo yet</div></div>
-      </div>
       <div class="lcard">
         <h3>signed-turn cells <span class="lsub">on the node · stale when signing is off</span></h3>
         <div class="llegend"><span><span class="ldot active"></span> active &lt;2m</span>
@@ -923,7 +950,7 @@ function toast(m, ms) {
 }
 
 /* ---------- nav (sesh navtab pattern; helm is the default view) ---------- */
-const VIEWS = ["helm", "quota", "sessions", "configs", "chat", "cave", "ledger"];
+const VIEWS = ["helm", "quota", "sessions", "configs", "chat", "roster", "cave", "ledger"];
 function showView(v) {
   $$(".navtab").forEach(t => t.classList.toggle("on", t.dataset.v === v));
   $$(".view").forEach(p => p.classList.toggle("on", p.id === "view-" + v));
@@ -933,6 +960,7 @@ function showView(v) {
   if (v === "sessions") initSessions();
   if (v === "configs") { cfgInit(); srevInit(); }
   if (v === "chat") initChat();
+  if (v === "roster") initRoster();
   if (v === "cave") initCave();
   if (v === "ledger") initLedger();
 }
@@ -2813,34 +2841,26 @@ function chatRooms(rooms) {
 function chatPresence(list) {
   const bar = $("#chatpresence");
   if (!bar) return;
-  // "Online Friends" (owner feature 2026-07-23): the bar shows who is ACTUALLY
-  // ON right now — ACTIVE (🟢 <2m) + IDLE (🟡 <15m) real agents only. Drop the
-  // absent (⚫ gone) rows and the ephemeral review-SAs (agent-<hex>, done), so
-  // a glance answers "who's here" instead of scrolling the whole roster.
+  // A one-line STRIP: who is actually on right now (active + idle real agents),
+  // then a link into the roster tab — the full dense table is the one home for
+  // the whole fleet now, so this stays a glance, not a scroll. Absent +
+  // ephemeral review-SAs dropped. Click anywhere on the strip → the roster tab.
   const rows = (Array.isArray(list) ? list : [])
-    .filter(s => s && s.seat && s.presence !== "absent" && !s.ephemeral);
+    .filter(s => s && s.seat && s.presence !== "absent" && !s.ephemeral)
+    .sort((a, b) => (a.presence === "fresh" ? 0 : 1) - (b.presence === "fresh" ? 0 : 1) || (b.last_seen || 0) - (a.last_seen || 0));
   bar.hidden = !rows.length;
+  bar.onclick = () => showView("roster");
   if (!rows.length) { bar.innerHTML = ""; return; }
-  bar.innerHTML = rows.map(s => {
-    const age = s.last_seen ? chatAgo(Date.now() / 1e3 - s.last_seen) : "";
-    // an explicit status carries its own age (server-stamped status_age):
-    // a days-old away message must READ as old — stale (> the server's
-    // STATUS_FRESH_S, 4h; past which a live claim outranks it) also dims.
-    const isStatus = s.source === "status";
-    const sage = isStatus && s.status_age != null ? chatAgo(s.status_age) : "";
-    const stale = isStatus && s.status_age != null && s.status_age > 4 * 3600;
-    const tip = s.seat + " — " + (s.presence || "?") +
-      (age ? ", last seen " + age + " ago" : "") +
-      (s.line ? "; " + s.line + " (" + (s.source || "") + ")" : "") +
-      (sage ? "; status set " + sage + " ago" : "") +
-      (s.status_by ? " (by " + s.status_by + ")" : "");
-    return '<div class="pr ' + esc(s.presence || "") + '" title="' + esc(tip) + '">' +
-      '<span class="prdot">' + esc(s.dot || "⚫") + '</span>' +
-      '<span class="prseat">' + esc(chatShort(s.seat)) + '</span>' +
-      '<span class="prline' + (isStatus ? " status" + (stale ? " stale" : "") : "") + '">' +
-      esc(s.line || "") + (sage ? " (" + esc(sage) + ")" : "") + '</span>' +
-      (age ? '<span class="prage">' + esc(age) + '</span>' : '') + '</div>';
-  }).join("");
+  const quiet = rows.filter(s => s.presence === "quiet").length;
+  const NAMES = 7;
+  const shown = rows.slice(0, NAMES)
+    .map(s => '<span class="psseat">' + esc(chatShort(s.seat)) + '</span>').join(" · ");
+  const extra = rows.length - Math.min(rows.length, NAMES);
+  bar.innerHTML = '<span style="color:var(--ok)">●</span> ' + shown +
+    (extra > 0 ? ' <span class="psmore">+' + extra + '</span>' : '') +
+    (quiet ? ' <span class="psmore">◐ ' + quiet + ' idle</span>' : '') +
+    ' <span class="pslink">roster →</span>';
+  bar.title = rows.length + ' online — click for the full roster';
 }
 
 function chatSwitch(room) {
@@ -3405,76 +3425,8 @@ function ledgerCells(cells) {
 // to the owner-facing word ("active"/"quiet"/"absent") — same word the seat
 // picker and the cave-cells legend use, so the whole tab speaks one dialect.
 const presenceLabel = p => p === "fresh" ? "active" : p;
-const seatHome = s => 'home ' + (s.home_room ? '#' + esc(s.home_room) : 'all rooms') +
-  (s.home_room_source ? ' (' + esc(s.home_room_source) + ')' : '');
 
 let LAST_ROSTER = null;
-function rosterSeats(rep) {
-  LAST_ROSTER = rep;                                   // seatPop reads facts here
-  const allSeats = (rep && rep.seats) || [], claims = (rep && rep.claims) || [];
-  const seats = allSeats.filter(s => !s.ephemeral);   // live rows render as before
-  const ephSeats = allSeats.filter(s => s.ephemeral); // done review-SAs -> collapsed
-  if (!seats.length && !ephSeats.length && !claims.length) {
-    $("#ledgerseats").innerHTML = '<div class="empty">no seats joined yet — a session joins on its next start (helm hooks install wires it)</div>';
-    return;
-  }
-  const dot = p => p === "fresh" ? "active" : p === "quiet" ? "quiet" : "";
-  let html = seats.map(s =>
-    '<div class="lrow"><div class="lhead"><span class="ldot ' + dot(s.presence) + '"></span>' +
-    '<span class="mono seatjump" data-seat="' + esc(s.seat) + '" data-sess="' + esc(s.session || '') + '" title="open this agent’s sessions + transcript">' + esc(s.seat) + '</span>' +
-    '<span class="lbadge' + (s.presence === "fresh" ? " final" : s.presence === "quiet" ? " tent" : "") + '">' + esc(presenceLabel(s.presence)) + '</span>' +
-    (s.pending ? '<span class="lbadge tent">' + s.pending + ' pending</span>' : '') +
-    '<button class="seatrn" data-seat="' + esc(s.seat) + '" data-rnkey="' + esc(s.session || s.seat) + '" title="rename this seat — @newname delivers to the same agent">rename</button>' +
-    '<span class="lage">' + (s.last_seen ? lago(s.last_seen) : "—") + '</span></div>' +
-    '<div class="lmeta">' + [s.project ? esc(s.project) : '', seatHome(s),
-      // VERBS law: all three surfaces glance identically — an explicit line
-      // carries its AGE (server-stamped status_age) + '(by X)' provenance
-      // here too, not just on the bar and the CLI row.
-      s.line && s.source !== 'home' ? '<span title="status — ' + esc(s.source === 'status' ? 'the seat set it (helm chat status)' : 'its live claim') + '">▸ ' + esc(s.line) +
-        (s.source === 'status' && s.status_age != null ? ' (' + esc(chatAgo(s.status_age)) + ')' : '') +
-        (s.source === 'status' && s.status_by ? ' (by ' + esc(s.status_by) + ')' : '') + '</span>' : '',
-      s.todo && s.todo.active ? '<span title="current task — the todo mirror">\u25b6 ' + esc(s.todo.active) + '</span>' : '',
-      s.preview ? '<span title="newest pending delivery">\u201c' + esc(s.preview) + '\u201d</span>' : '']
-      .filter(Boolean).join(' \u00b7 ') + '</div></div>').join("");
-  if (claims.length) {
-    html += '<div class="lmeta" style="margin-top:6px">claims: ' + claims.map(c =>
-      esc(c.resource) + ' → <b>' + esc(c.holder || "?") + '</b> (' + c.remaining + 's left)').join(" · ") + '</div>';
-  }
-  if (ephSeats.length) {
-    // Done ephemeral review-SAs (tonight's fan-out) collapse under a fold — the
-    // live list stays glanceable, they stay here + queryable (owner steer
-    // 2026-07-23). Each still deep-links to its own transcript.
-    const erows = ephSeats.map(s =>
-      '<div class="lrow"><div class="lhead"><span class="ldot"></span>' +
-      '<span class="mono seatjump" data-seat="' + esc(s.seat) + '" data-sess="' + esc(s.session || '') + '" title="open this agent’s sessions/transcript">' + esc(s.seat) + '</span>' +
-      '<span class="lbadge">' + esc(presenceLabel(s.presence)) + '</span>' +
-      '<span class="lage">' + (s.last_seen ? lago(s.last_seen) : "—") + '</span></div></div>').join("");
-    html += '<details class="ephsa" style="margin-top:8px"><summary style="cursor:pointer;color:var(--sub);font-size:var(--f2);padding:4px 0">' +
-      ephSeats.length + ' completed review SA' + (ephSeats.length === 1 ? '' : 's') +
-      ' — ephemeral fan-out (tmp home, done)</summary>' + erows + '</details>';
-  }
-  $("#ledgerseats").innerHTML = html;
-  // the one seats-panel mutation: bind a live agent to a memorable @name
-  $("#ledgerseats").querySelectorAll(".seatrn").forEach(b => b.onclick = async () => {
-    const cur = b.dataset.seat;          // laundered label — shown, never sent
-    // rename by a STABLE id (the session id rename_seat resolves), so a
-    // hostile/garbled seat KEY whose laundered label no longer matches the raw
-    // roster key is still addressable — the seats you most want to rename.
-    const key = b.dataset.rnkey || cur;
-    const nn = (prompt('rename seat "' + cur + '" — the new @name (letters, digits, . _ -):', cur) || "").trim();
-    if (!nn || nn === cur) return;
-    try {
-      const r = await post("/api/chat/seat", {action: "rename", seat: key, new: nn});
-      toast("seat renamed: " + cur + " → " + nn + " — @" + nn + " now delivers to it");
-      if (r && r.note && /beacon/.test(r.note)) console.log(r.note);
-      pollLedger();
-    } catch (e) { toast("rename refused: " + e.message); }
-  });
-  // click a seat name -> a small Tuftian popup that deep-links to THAT agent's
-  // sessions/transcript (owner feature 2026-07-23: "cool and tuftian").
-  $("#ledgerseats").querySelectorAll(".seatjump").forEach(el =>
-    el.onclick = ev => { ev.stopPropagation(); seatPop(el, el.dataset.seat, el.dataset.sess); });
-}
 
 // A small anchored, data-dense card for one seat: its live facts + one deep
 // link into the sessions tab (its transcript). Minimal chrome — one card reused,
@@ -3483,6 +3435,7 @@ function rosterSeats(rep) {
 function seatPop(anchor, seat, sess) {
   closeSeatPop();
   const s = ((LAST_ROSTER && LAST_ROSTER.seats) || []).find(x => x.seat === seat) || {seat: seat, session: sess};
+  const full = s.session || sess || "";
   const fact = (k, v) => v ? '<div class="spk">' + esc(k) + '</div><div class="spv">' + esc(v) + '</div>' : '';
   const pop = document.createElement("div");
   pop.className = "seatpop";
@@ -3494,16 +3447,31 @@ function seatPop(anchor, seat, sess) {
       fact("last seen", s.last_seen ? lago(s.last_seen) : "—") +
       fact("home", (s.home_room || "—")) +
       fact("project", s.project) +
+      fact("cwd", s.cwd) +
       fact("pending", s.pending ? (s.pending + " undelivered") : "") +
       fact("task", s.todo && s.todo.active) +
-      fact("session", (s.session || sess || "").slice(0, 8)) +
+      fact("session", full) +
     '</div>' +
-    '<button type="button" class="spjump">→ open sessions + transcript</button>';
+    '<button type="button" class="spjump">→ open sessions + transcript</button>' +
+    '<button type="button" class="spren" data-rnkey="' + esc(full || s.seat) + '">rename @' + esc(chatShort(s.seat)) + '</button>';
   document.body.appendChild(pop);
   const r = anchor.getBoundingClientRect();
   pop.style.left = Math.min(r.left, window.innerWidth - pop.offsetWidth - 12) + "px";
   pop.style.top = (r.bottom + 6) + "px";
-  pop.querySelector(".spjump").onclick = () => { seatToSessions(seat, s.session || sess); closeSeatPop(); };
+  pop.querySelector(".spjump").onclick = () => { seatToSessions(seat, full); closeSeatPop(); };
+  // rename: the same rename_seat flow the old activity panel had, keyed by the
+  // stable session id (or seat) so a garbled label stays addressable.
+  pop.querySelector(".spren").onclick = async () => {
+    const cur = s.seat, key = pop.querySelector(".spren").dataset.rnkey || cur;
+    const nn = (prompt('rename seat "' + cur + '" — the new @name (letters, digits, . _ -):', cur) || "").trim();
+    if (!nn || nn === cur) return;
+    try {
+      const rr = await post("/api/chat/seat", {action: "rename", seat: key, new: nn});
+      toast("seat renamed: " + cur + " → " + nn + " — @" + nn + " now delivers to it");
+      if (rr && rr.note && /beacon/.test(rr.note)) console.log(rr.note);
+      closeSeatPop(); pollRoster();
+    } catch (e) { toast("rename refused: " + e.message); }
+  };
   setTimeout(() => document.addEventListener("mousedown", _seatPopAway), 0);
   document.addEventListener("keydown", _seatPopEsc);
 }
@@ -3523,27 +3491,161 @@ function seatToSessions(seat, sess) {
   toast("sessions for " + seat);
 }
 
-// The fleet todo panel: the owner's answer to "who is working on what",
-// without a CLI. Pure PULL — /api/todos reads the mirror the recorder fills;
-// nothing here ever pushes, mentions, or wakes a seat.
-function fleetTodos(rep) {
-  const rows = (((rep && rep.seats) || []).concat((rep && rep.orphans) || [])).filter(r => r.total);
-  if (!rows.length) {
-    $("#ledgertodos").innerHTML = '<div class="empty">no seat has mirrored a todo yet — this fills as agents write their todo lists</div>';
-    return;
+/* ---------- roster tab: the whole fleet, one dense Tuftian table ----------
+   Consolidates the three old surfaces (chat presence strip, ledger seat-
+   activity + fleet-todos, message-a-seat) into ONE sortable table + the
+   preserved seat popup. Own 2s poll, gated on the tab being open + visible,
+   with an in-flight guard (the CHAT_POLLING pattern). web.py / seats.py are
+   unchanged: /api/chat/roster already ships every column; /api/todos feeds the
+   TASK column + the orphans fold. */
+let ROSTER_TIMER = null, ROSTER_POLLING = false;
+let ROSTER_SORT = {key: "presence", dir: 1};
+let ROSTER_SHOW = {absent: false, sas: false};
+let ROSTER_TODOS = {};                                   // seat -> /api/todos digest
+const rrank = p => p === "fresh" ? 0 : p === "quiet" ? 1 : 2;
+const rdotGlyph = p => p === "fresh" ? '<span class="rdot fresh">\u25cf</span>'
+  : p === "quiet" ? '<span class="rdot quiet">\u25d0</span>'
+  : '<span class="rdot absent">\u25cb</span>';
+const RCOLS = [
+  {k: "presence", l: "", c: ""}, {k: "seat", l: "seat", c: ""},
+  {k: "last_seen", l: "last", c: "num"}, {k: "doing", l: "doing", c: ""},
+  {k: "task", l: "task", c: ""}, {k: "pending", l: "pend", c: "num"},
+  {k: "preview", l: "last msg", c: ""}, {k: "project", l: "project", c: ""},
+  {k: "session", l: "sess", c: ""},
+];
+// DOING = one line, server precedence in s.source: explicit status > live claim
+// > home room. status carries its age + (by X); a >4h status dims (a live claim
+// outranks it server-side anyway).
+function rosterDoing(s) {
+  if (s.source === "status") {
+    const age = s.status_age != null ? " (" + chatAgo(s.status_age) + ")" : "";
+    const by = s.status_by ? " (by " + s.status_by + ")" : "";
+    const stale = s.status_age != null && s.status_age > 4 * 3600;
+    return {cls: "status" + (stale ? " stale" : ""), text: (s.line || "") + age + by};
   }
-  rows.sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0) || (b.ts || 0) - (a.ts || 0));
-  $("#ledgertodos").innerHTML = rows.map(r =>
-    '<div class="lrow"><div class="lhead"><span class="ldot ' + (r.active ? "active" : "") + '"></span>' +
-    '<span class="mono">' + esc(r.seat) + '</span>' +
-    '<span class="lbadge' + (r.total && r.done === r.total ? " final" : " tent") + '">' + r.done + '/' + r.total + '</span>' +
-    '<span class="lage">' + (r.ts ? lago(r.ts) : "—") + '</span></div>' +
-    '<div class="lmeta">' + (r.active ? esc(r.active) : "<i>no task in progress</i>") +
-    (r.project ? ' · ' + esc(r.project) : '') + '</div></div>').join("") +
-    ((rep && rep.orphans_hidden) ? '<div class="lmeta" style="margin-top:6px">' +
-      rep.orphans_hidden + ' older unclaimed session' +
-      (rep.orphans_hidden === 1 ? '' : 's') + ' hidden</div>' : '');
+  if (s.source === "claim" && s.line) return {cls: "claim", text: "\u25b8 " + s.line};
+  return {cls: "home", text: "in " + (s.home_room ? "#" + s.home_room : "all rooms")};
 }
+// TASK = the todo digest (2/7 . active) from /api/todos when present, else the
+// roster row's own todo.active. Never a subprocess on the 2s poll path.
+function rosterTask(s) {
+  const t = ROSTER_TODOS[s.seat];
+  if (t && t.total) return t.done + "/" + t.total + (t.active ? " \u00b7 " + t.active : "");
+  return (s.todo && s.todo.active) || "";
+}
+function renderRoster(rep) {
+  LAST_ROSTER = rep;                                     // seatPop reads facts here
+  const all = (rep && rep.seats) || [], claims = (rep && rep.claims) || [];
+  const q = (($("#rosterq") && $("#rosterq").value) || "").trim().toLowerCase();
+  const setc = (id, n) => { const e = $(id); if (e) e.textContent = n; };
+  setc("#cntAbsent", all.filter(s => s.presence === "absent" && !s.ephemeral).length);
+  setc("#cntSAs", all.filter(s => s.ephemeral).length);
+  // visibility: live non-ephemeral by default; a seat with pending (stranded)
+  // deliveries is ALWAYS a visible object (ack-ladder law); the chips reveal
+  // the absent + ephemeral rest.
+  let rows = all.filter(s => {
+    if (s.pending) return true;
+    if (s.ephemeral) return ROSTER_SHOW.sas;
+    if (s.presence === "absent") return ROSTER_SHOW.absent;
+    return true;
+  });
+  if (q) rows = rows.filter(s =>
+    [s.seat, s.project, rosterDoing(s).text, rosterTask(s)].join(" ").toLowerCase().includes(q));
+  const sk = ROSTER_SORT.key, dir = ROSTER_SORT.dir;
+  const val = s => sk === "seat" ? (s.seat || "")
+    : sk === "last_seen" ? -(s.last_seen || 0)
+    : sk === "pending" ? -(s.pending || 0)
+    : sk === "doing" ? rosterDoing(s).text.toLowerCase()
+    : sk === "task" ? rosterTask(s).toLowerCase()
+    : sk === "preview" ? (s.preview || "").toLowerCase()
+    : sk === "project" ? (s.project || "").toLowerCase()
+    : sk === "session" ? (s.session || "").toLowerCase() : 0;
+  const cmp = sk === "presence"
+    ? (a, b) => rrank(a.presence) - rrank(b.presence) || (b.pending || 0) - (a.pending || 0) || (b.last_seen || 0) - (a.last_seen || 0)
+    : (a, b) => { const x = val(a), y = val(b); return x < y ? -1 : x > y ? 1 : 0; };
+  rows.sort((a, b) => cmp(a, b) * dir);
+  $("#rthead").innerHTML = "<tr>" + RCOLS.map(c =>
+    '<th class="' + c.c + '" data-k="' + c.k + '">' + esc(c.l) +
+    (sk === c.k ? ' <span class="sar">' + (dir > 0 ? "\u25b2" : "\u25bc") + '</span>' : '') + "</th>").join("") + "</tr>";
+  $("#rthead").querySelectorAll("th").forEach(th => th.onclick = () => {
+    const k = th.dataset.k;
+    if (ROSTER_SORT.key === k) ROSTER_SORT.dir *= -1; else { ROSTER_SORT.key = k; ROSTER_SORT.dir = 1; }
+    if (LAST_ROSTER) renderRoster(LAST_ROSTER);
+  });
+  if (!rows.length) {
+    $("#rtbody").innerHTML = '<tr><td colspan="9" class="empty">no seats match \u2014 toggle the chips or clear the filter</td></tr>';
+  } else {
+    $("#rtbody").innerHTML = rows.map(s => {
+      const d = rosterDoing(s), task = rosterTask(s);
+      const cls = s.ephemeral ? "eph" : s.presence === "absent" ? "absent" : "";
+      return '<tr' + (cls ? ' class="' + cls + '"' : '') + '>' +
+        '<td>' + rdotGlyph(s.presence) + '</td>' +
+        '<td><span class="rseat" data-seat="' + esc(s.seat) + '" data-sess="' + esc(s.session || '') + '" title="facts + transcript">' + esc(chatShort(s.seat)) + '</span></td>' +
+        '<td class="num">' + (s.last_seen ? esc(lago(s.last_seen)) : "\u2014") + '</td>' +
+        '<td class="rdoing ' + d.cls + '" title="' + esc(d.text) + '">' + esc(d.text) + '</td>' +
+        '<td>' + (task ? esc(task) : '<span style="opacity:.4">\u2014</span>') + '</td>' +
+        '<td class="num">' + (s.pending ? '<span class="rpend">' + s.pending + '</span>' : '') + '</td>' +
+        '<td>' + (s.preview ? '<span class="rmsg" title="' + esc(s.preview) + '">\u201c' + esc(s.preview) + '\u201d</span>' : '') + '</td>' +
+        '<td>' + esc(s.project || "") + '</td>' +
+        '<td><span class="rsess">' + esc((s.session || "").slice(0, 8)) + '</span></td></tr>';
+    }).join("");
+    $("#rtbody").querySelectorAll(".rseat").forEach(el =>
+      el.onclick = ev => { ev.stopPropagation(); seatPop(el, el.dataset.seat, el.dataset.sess); });
+  }
+  const live = all.filter(s => s.presence !== "absent" && !s.ephemeral).length;
+  $("#rostercount").innerHTML = '<b>' + live + ' live</b> \u00b7 ' + all.length + ' total';
+  $("#rosterclaims").innerHTML = claims.length
+    ? 'claims: ' + claims.map(c => esc(c.resource) + ' \u2192 <b>' + esc(c.holder || "?") + '</b> (' + c.remaining + 's)').join(" \u00b7 ")
+    : "";
+}
+function rosterOrphans(rep) {
+  const box = $("#rosterorphans"); if (!box) return;
+  const orph = ((rep && rep.orphans) || []).filter(r => r.total);
+  if (!orph.length) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  orph.sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0) || (b.ts || 0) - (a.ts || 0));
+  box.innerHTML = '<summary style="cursor:pointer;color:var(--sub)">' + orph.length +
+    ' unclaimed session' + (orph.length === 1 ? '' : 's') + ' with todos' +
+    ((rep && rep.orphans_hidden) ? ' \u00b7 ' + rep.orphans_hidden + ' more hidden' : '') + '</summary>' +
+    orph.map(r => '<div style="padding:3px 0 3px 14px">' +
+      '<span class="rsess">' + esc(r.seat || (r.session || "").slice(0, 8) || "session") + '</span> ' +
+      '<span class="num" style="color:var(--mut)">' + r.done + '/' + r.total + '</span> ' +
+      (r.active ? esc(r.active) : '<i>idle</i>') +
+      (r.project ? ' \u00b7 ' + esc(r.project) : '') + '</div>').join("");
+}
+async function pollRoster() {
+  if (!$("#view-roster").classList.contains("on") || document.hidden) return;
+  if (ROSTER_POLLING) return;
+  ROSTER_POLLING = true;
+  try {
+    try {
+      const t = await j("/api/todos");
+      ROSTER_TODOS = {};
+      ((t && t.seats) || []).forEach(r => { if (r.seat) ROSTER_TODOS[r.seat] = r; });
+      rosterOrphans(t);
+    } catch (e) { /* todos fail quiet -- TASK falls back to the roster's own active */ }
+    try { const rep = await j("/api/chat/roster"); renderRoster(rep); seatPicker(rep); }
+    catch (e) { /* roster fails quiet -- the tab stays usable */ }
+  } finally { ROSTER_POLLING = false; }
+}
+function initRoster() {
+  if (!ROSTER_TIMER) {
+    ROSTER_TIMER = setInterval(pollRoster, 2000);
+    // the message-a-seat composer moved here from the ledger -- wire it once
+    $("#seatform").addEventListener("submit", sendSeatMsg);
+    const key = $("#seatkey");
+    key.addEventListener("focus", renderSeatPicker);
+    key.addEventListener("input", renderSeatPicker);
+    key.addEventListener("keydown", seatPickerKeydown);
+    key.addEventListener("blur", () => setTimeout(closeSeatPicker, 0));
+    $("#rosterq").addEventListener("input", () => { if (LAST_ROSTER) renderRoster(LAST_ROSTER); });
+    const chip = (id, f) => { const b = $(id); if (b) b.onclick = () => { f(); b.classList.toggle("on"); if (LAST_ROSTER) renderRoster(LAST_ROSTER); }; };
+    chip("#togAbsent", () => ROSTER_SHOW.absent = !ROSTER_SHOW.absent);
+    chip("#togSAs", () => ROSTER_SHOW.sas = !ROSTER_SHOW.sas);
+  }
+  pollRoster();
+}
+
 
 // The "message a seat" picker is a real anchored popup rather than a browser
 // <datalist>: Chromium can place native datalist chrome against the page instead
@@ -3617,11 +3719,6 @@ function seatPickerKeydown(ev) {
 
 async function pollLedger() {
   if (!$("#view-ledger").classList.contains("on")) return; // poll only while open
-  // ONE roster read feeds both the delivery-roster panel and the seat picker.
-  try { const rep = await j("/api/chat/roster"); rosterSeats(rep); seatPicker(rep); }
-  catch (e) { /* roster + picker fail quiet — the tab stays usable */ }
-  // fleet todos: who is working on what (pull-only, fails quiet like the rest)
-  try { fleetTodos(await j("/api/todos")); } catch (e) { /* panel stays as-is */ }
   // The activity feed is LOCAL — it renders even when the cave node is down.
   try { const n = await j("/api/ledger/native"); nativeHead(n.chain || {}); nativeChat(n.chat); nativeRows(n); }
   catch (e) { /* activity card fails quiet — the cave projection still renders */ }
@@ -3662,15 +3759,7 @@ async function sendSeatMsg(ev) {
 }
 
 function initLedger() {
-  if (!LEDGER_TIMER) {
-    LEDGER_TIMER = setInterval(pollLedger, 3000);
-    $("#seatform").addEventListener("submit", sendSeatMsg);
-    const key = $("#seatkey");
-    key.addEventListener("focus", renderSeatPicker);
-    key.addEventListener("input", renderSeatPicker);
-    key.addEventListener("keydown", seatPickerKeydown);
-    key.addEventListener("blur", () => setTimeout(closeSeatPicker, 0));
-  }
+  if (!LEDGER_TIMER) LEDGER_TIMER = setInterval(pollLedger, 3000);
   pollLedger();
 }
 
