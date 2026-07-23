@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -203,6 +204,58 @@ class TestSeatEphemeralTag(unittest.TestCase):
     def test_fail_safe_on_junk(self):
         self.assertFalse(web._seat_ephemeral({}))
         self.assertFalse(web._seat_ephemeral({"seat": None}))
+
+
+class TestRosterSingleFlightCache(unittest.TestCase):
+    """The poll-fan-in guard: roster_report is the one heavy read on the 2s
+    poll path; uncached, N concurrent polls stacked N computes and blanked the
+    owner's UI (live incident 2026-07-23). The cache must be SINGLE-FLIGHT
+    (concurrent pollers share one compute), TTL-fresh, and publish-ready
+    (ephemeral baked in) — decision-spirit #22: memory is the read-path."""
+
+    def setUp(self):
+        web._ROSTER_REP_CACHE.clear()
+        self.calls = {"n": 0}
+
+    def _fake_report(self, room):
+        self.calls["n"] += 1
+        return {"seats": [{"seat": "agent-047d53ef", "home_room": None,
+                           "cwd": "/tmp/claude-x/s"}], "claims": []}
+
+    def test_concurrent_pollers_share_one_compute(self):
+        with mock.patch("helm.seats.roster_report", self._fake_report):
+            threads = [threading.Thread(target=web._roster_cached, args=("main",))
+                       for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(self.calls["n"], 1)   # single-flight, not 8 stacked
+
+    def test_ttl_expiry_recomputes_and_freshness_serves_cache(self):
+        with mock.patch("helm.seats.roster_report", self._fake_report):
+            web._roster_cached("main")
+            web._roster_cached("main")          # within TTL -> cache hit
+            self.assertEqual(self.calls["n"], 1)
+            at, rep = web._ROSTER_REP_CACHE["main"]
+            web._ROSTER_REP_CACHE["main"] = (at - (web._ROSTER_REP_TTL + 1), rep)
+            web._roster_cached("main")          # expired -> one recompute
+            self.assertEqual(self.calls["n"], 2)
+
+    def test_cached_rep_is_publish_ready(self):
+        # the ephemeral tag is baked at compute time, so every consumer
+        # (panel read + roster-git scan) gets the SAME fully-tagged rep
+        with mock.patch("helm.seats.roster_report", self._fake_report):
+            rep = web._roster_cached("main")
+        self.assertTrue(rep["seats"][0]["ephemeral"])   # agent-<hex> + /tmp
+
+    def test_rooms_cache_independently(self):
+        with mock.patch("helm.seats.roster_report", self._fake_report):
+            web._roster_cached("main")
+            web._roster_cached("helm-dogfood")
+        self.assertEqual(self.calls["n"], 2)
+        self.assertIn("main", web._ROSTER_REP_CACHE)
+        self.assertIn("helm-dogfood", web._ROSTER_REP_CACHE)
 
 
 if __name__ == "__main__":
