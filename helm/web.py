@@ -44,6 +44,7 @@ MUTATION_TOKEN = (os.environ.get("HELM_API_TOKEN")
 # One store entry projects to these keys on the wire — the strip never needs bodies.
 ENTRY_KEYS = ("id", "type", "confidence", "load_class", "scope")
 ENTRY_CAP = 500
+REVIEW_STMT_CAP = 400  # the review panel shows the statement head, not the body
 
 
 def _api_registry():
@@ -77,6 +78,77 @@ def _api_store():
         return out
     except Exception:
         return {"unavailable": True}
+
+
+def _api_store_review():
+    """The owner store-review queue: candidate (fires NOTHING) + provisional
+    (xrev-cleared, fires WITH a [provisional] tag) entries — the browse/approve/
+    reject surface near the configs view (owner canon: the technical auto-learns
+    may go provisionally live once a cross-family review clears them, and the
+    owner still gets a way to ratify/reject in the WEB UI). Same graceful degrade
+    as the store: absent/raising -> unavailable, never 500."""
+    try:
+        from . import store
+        rows = []
+        for e in store.reviewable():
+            rows.append({
+                "id": str(e.get("id") or ""),
+                "type": e.get("type") or "",
+                "status": e.get("status") or "",
+                "statement": (e.get("statement") or "")[:REVIEW_STMT_CAP],
+                "source": e.get("source") or "",       # captured-by (inferred/asked/explicit)
+                "captured_ts": str(e.get("stated_ts") or e.get("updated_ts") or ""),
+                "scope": e.get("scope") or "",
+                "confidence": e.get("confidence"),
+                "xrev_by": e.get("xrev_by") or "",     # who attested the /x review
+                "xrev_ts": e.get("xrev_ts") or "",
+            })
+        counts = {"candidate": 0, "provisional": 0}
+        for r in rows:
+            if r["status"] in counts:
+                counts[r["status"]] += 1
+        out = {"entries": rows, "counts": counts}
+        json.dumps(out)  # unserializable shapes degrade too
+        return out
+    except Exception:
+        return {"unavailable": True}
+
+
+def _api_store_confirm(payload):
+    """Owner ratify: candidate/provisional -> live, through the SAME store.confirm
+    the CLI calls (one writer path, atomic-write rails inside the store). id
+    required; optional statement (an inline --edit) + type (disambiguate a slug
+    shared across reviewable types)."""
+    from . import pk, store
+    eid = str(payload.get("id") or "").strip()
+    if not eid:
+        return {"error": "id is required"}, 400
+    e, err = store.confirm(eid, pk.now_ts(),
+                           new_statement=(payload.get("statement") or None),
+                           project=(payload.get("project") or None),
+                           ctype=(payload.get("type") or None))
+    if err:
+        return {"error": err}, 400
+    return {"ok": True, "id": str(e["id"]), "type": e["type"],
+            "status": e["status"]}, 200
+
+
+def _api_store_reject(payload):
+    """Owner reject: candidate/provisional -> retired IN PLACE (the record law:
+    the file stays), through the SAME store.reject the CLI calls. id required;
+    optional reason (the reject reason box) + type."""
+    from . import pk, store
+    eid = str(payload.get("id") or "").strip()
+    if not eid:
+        return {"error": "id is required"}, 400
+    e, err = store.reject(eid, pk.now_ts(),
+                          why=str(payload.get("reason") or "").strip(),
+                          project=(payload.get("project") or None),
+                          ctype=(payload.get("type") or None))
+    if err:
+        return {"error": err}, 400
+    return {"ok": True, "id": str(e["id"]), "type": e["type"],
+            "status": e["status"], "retired_why": e.get("retired_why") or ""}, 200
 
 
 def _api_whoami():
@@ -1256,6 +1328,7 @@ def _api_prune_post(payload):
 API = {
     "/api/registry": _api_registry,
     "/api/store": _api_store,
+    "/api/store/review": _api_store_review,
     "/api/whoami": _api_whoami,
     "/api/sessions": _api_sessions,
     "/api/configs": _api_configs,
@@ -1290,6 +1363,8 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
 }
 
 POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
+    "/api/store/confirm": _api_store_confirm,
+    "/api/store/reject": _api_store_reject,
     "/api/skills/toggle": _api_skills_toggle,
     "/api/skills/delete": _api_skills_delete,
     "/api/homes": _api_homes_post,
