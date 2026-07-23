@@ -2,6 +2,21 @@
 
 ## Unreleased (0.2)
 
+- Proxy-seat autocompaction is now operational rather than alert-only. The
+  90% actuator resolves the authoritative `spawn.json` pane handle and verifies
+  it against the matching live adapter; mutable Claude Code titles and copied
+  launch text are no longer trusted. One strict seat+harness+handle resolver now
+  owns injection, duplicate-seat reap, dry-run, and `seat where`. Unregistered
+  panes fail loudly until spawn/resume records their handle. Resume refreshes the
+  handle registry; queued `/compact` input blocks a second injection, and the
+  flock-serialized latch re-arms only after context drops or the session changes,
+  never from elapsed time alone. Every launch/spawn/resume refreshes the external
+  60-second systemd cadence. Missing, headless, stale-handle, or ambiguous panes
+  fail loudly to the fleet room. The CV seam is fleet-complete too: Helm appends
+  all family and instance seat transcript roots through
+  `CLUSTERVISION_CLAUDE_ROOTS` on every CV subprocess, and the corresponding
+  CV-core multi-root discovery change preserves the one recall index across
+  custom `CLAUDE_CONFIG_DIR` homes.
 - Homing review round (fable composition + adversarial lenses @ 8313d9f).
   HIGH closed: the homing prologue's EAGER `os.getcwd()` crashed every
   default chat verb and all three delivery hooks (join/deliver/stop-guard)

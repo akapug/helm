@@ -409,7 +409,8 @@ def cmd_handoff(args):
         import subprocess
         cmdv = ["cv", "show", sid, "--pre-compaction"]
         try:
-            return subprocess.run(cmdv, timeout=120).returncode
+            return subprocess.run(cmdv, timeout=120,
+                                  env=home.cv_env()).returncode
         except FileNotFoundError:
             print("helm handoff recover: cv not on PATH — the one recall index "
                   "(architecture law 4); run: " + " ".join(cmdv), file=sys.stderr)

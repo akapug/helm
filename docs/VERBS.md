@@ -2252,7 +2252,7 @@ helm path):
 
 **A note on `helm seat`:** the multimodel-seat verb (giving a non-Claude
 model family the full claude-code harness through a local wire proxy —
-`seat add|up|down|launch|spawn|where|resume|smoke|list|status|doctor`) is
+`seat add|up|down|launch|spawn|where|resume|smoke|autocompact|list|status|doctor`) is
 wired into the dispatcher; see
 [MULTIMODEL_SEATS_ADDENDUM.md](MULTIMODEL_SEATS_ADDENDUM.md)
 while its live proving rounds finish.
@@ -2299,7 +2299,28 @@ delivery hooks — a live session's environment/settings are fixed at start.
 `--room` and an inherited explicit `HELM_CHAT_ROOM` win. Generated `launch.sh`
 presets preserve `HELM_CHAT_ROOM_SOURCE=derived` across `helm seat resume`, so a
 refresh cannot turn a project default into an explicit room and undo a later
-operator rehome/clear. Resume also preserves the seat's `--multi` shape.
+operator rehome/clear. Resume also preserves the seat's `--multi` shape and
+refreshes `spawn.json` with the new pane handle.
+
+**`helm seat autocompact` — pre-empt the proxy-model 100% context hang.** One
+bounded pass reads Claude Code's own latest main-chain usage record from every
+proxy seat transcript, divides by that family's declared context window, and
+at 90% injects `/compact` into the identity-proven pane. The actuator uses the
+seat's authoritative `spawn.json` handle and verifies it against the matching
+adapter's live inventory. The same resolver owns duplicate-seat reap and
+`seat where`; copied launch text and mutable pane titles are never identity.
+Missing/headless/stale-register panes produce a loud room alert instead of a
+guessed injection. Before sending, the actuator reads the composer and refuses
+a second `/compact` when one is already queued. A locked latch permits one fire
+per context episode and re-arms only after the context drops or the session
+changes; elapsed time never double-injects a queued, running, or failed compact.
+
+`--dry-run` reports decisions without injecting or latching; `--seat S` limits
+the pass; `--threshold N`, `--json`, and `--quiet` shape it. `--install-timer
+[--interval SEC] --apply` installs the external systemd user cadence (60s by
+default). `seat launch`, `seat spawn`, and `seat resume` refresh and enable that
+timer automatically; a system without systemd gets a warning and can schedule
+the same bounded command another way.
 
 ### `helm router [up|run|down|status|line|probes]` + `helm seat launch|smoke --multi`
 

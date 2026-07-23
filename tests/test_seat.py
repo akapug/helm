@@ -69,8 +69,11 @@ class SeatTest(unittest.TestCase):
         self._codex_homes = seat.CODEX_HOMES
         seat.CODEX_HOMES = os.path.join(self.tmp, "codex-homes")
         os.makedirs(seat.CODEX_HOMES)
+        self.timer = mock.patch.object(seat, "_ensure_autocompact_timer")
+        self.timer.start()
 
     def tearDown(self):
+        self.timer.stop()
         seat.CODEX_HOMES = self._codex_homes
         seat.HERMES_AUTH = self._hermes_auth
         seat.OPENCODE_AUTHSTORE = self._opencode_authstore

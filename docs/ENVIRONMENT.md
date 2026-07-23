@@ -127,9 +127,18 @@ credentials and never calls a real endpoint in tests.
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
 | `HELM_PROXY_BIN` | `~/.local/bin/cli-proxy-api`, else `cli-proxy-api` on `PATH` | the seat module (`helm/seat.py`) — the local Anthropic-wire proxy binary | `MELD_PROXY_BIN` |
+| `HELM_AUTOCOMPACT_THRESHOLD` | `90` | proxy-seat autocompact — context percentage at which `/compact` is injected | — |
+| `HELM_AUTOCOMPACT_ASSUME_WINDOW` | `200000` (`0`/`off` disables fallback) | proxy-seat autocompact — Claude Code's assumed context window when a family does not declare `max_context` | — |
+| `HELM_AUTOCOMPACT_FRESH_S` | `21600` (6h) | proxy-seat autocompact — maximum transcript age accepted as live context | — |
+| `HELM_AUTOCOMPACT_LATCH_TTL` | `900` (15m) | proxy-seat autocompact — repeat delay for a manual-action alert only. Injected or already-pending `/compact` stays latched until the recorded context drops or the session changes; time alone never authorizes a duplicate injection | — |
 | `KIMI_API_KEY` | — | `helm seat add kimi` only — the Moonshot outbound key for the kimi proxy-key seat. A **raw provider variable**: no `HELM_` prefix, no legacy fallback, **not** auto-loaded from any `.env`. Export it (or pass `--key-from <env-file>` carrying a `KIMI_API_KEY=` line) for the one `add` run; the key is baked into the seat's 0600 `config.yaml` and never read from the environment again | — |
 
-## one non-HELM variable helm reads
+## non-HELM integration variables
+
+`CLUSTERVISION_CLAUDE_ROOTS` — CV's platform-separated additional Claude
+`projects/` roots. Helm preserves any caller-provided roots and appends every
+minted family/instance seat root to every CV subprocess, so proxy-seat
+transcripts participate in the one recall index without a second scanner.
 
 `MC_HOME` — `helm whoami` merges its profile scaffold from a Mission Control
 user-profile at `$MC_HOME/user-profile/profile.json` (default

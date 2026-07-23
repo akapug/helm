@@ -70,8 +70,11 @@ class SpawnBase(unittest.TestCase):
         os.environ["HELM_SPAWN_SEND_DELAY"] = "0"
         for k in ("MELD_HOME", "MELD_CHAT_DIR", "HELM_CHAT_NAME"):
             os.environ.pop(k, None)
+        self.timer = mock.patch.object(seat, "_ensure_autocompact_timer")
+        self.ensure_timer = self.timer.start()
 
     def tearDown(self):
+        self.timer.stop()
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -91,6 +94,12 @@ class SpawnBase(unittest.TestCase):
                     % (homing, pin))
         os.chmod(launch, 0o700)
         return d, launch
+
+    def _record(self, d, handle="p9", harness_name="fake"):
+        with open(os.path.join(d, "spawn.json"), "w") as f:
+            json.dump({"v": 1, "seat": "codex", "harness": harness_name,
+                       "handle": handle, "worktree": os.getcwd(),
+                       "room": "main"}, f)
 
     def _spawn(self, args, adapter, popen=None):
         out, err = io.StringIO(), io.StringIO()
@@ -132,7 +141,8 @@ class HeadlessSpawnTest(SpawnBase):
         d, launch = self._mint()
         rc, _, err, _, _ = self._spawn(["codex", "--room", "team-z"], None)
         self.assertEqual(rc, 0, err)
-        rec = json.load(open(os.path.join(d, "spawn.json")))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
         self.assertEqual(rec["harness"], "headless")
         self.assertEqual(rec["pid"], 4242)
         self.assertEqual(rec["worktree"], os.getcwd())
@@ -141,13 +151,14 @@ class HeadlessSpawnTest(SpawnBase):
         row = seats.roster().get("codex")
         self.assertIsNotNone(row)                  # any agent resolves it
         self.assertEqual(row.get("home_room"), "team-z")
+        self.ensure_timer.assert_called_once()
 
     def test_headless_reaps_stale_same_name_pid_first(self):
         """The exact live bug: a prior bare same-name seat must die before
         the replacement spawns."""
         d, launch = self._mint()
         with open(os.path.join(d, "spawn.json"), "w") as f:
-            json.dump({"harness": "headless", "pid": 987654,
+            json.dump({"v": 1, "seat": "codex", "harness": "headless", "pid": 987654,
                        "pid_identity": "old-start"}, f)
         kills = []
         with mock.patch.object(seat, "_recorded_pid_alive",
@@ -163,7 +174,7 @@ class HeadlessSpawnTest(SpawnBase):
     def test_headless_pid_reuse_never_kills_unrelated_process(self):
         d, _ = self._mint()
         with open(os.path.join(d, "spawn.json"), "w") as f:
-            json.dump({"harness": "headless", "pid": 987654,
+            json.dump({"v": 1, "seat": "codex", "harness": "headless", "pid": 987654,
                        "pid_identity": "original-start"}, f)
         kills = []
         with mock.patch.object(seat, "_pid_alive", return_value=True), \
@@ -179,7 +190,8 @@ class HeadlessSpawnTest(SpawnBase):
     def test_unverifiable_live_headless_pid_aborts_replacement(self):
         d, _ = self._mint()
         with open(os.path.join(d, "spawn.json"), "w") as f:
-            json.dump({"harness": "headless", "pid": 987654}, f)
+            json.dump({"v": 1, "seat": "codex", "harness": "headless",
+                       "pid": 987654}, f)
         with mock.patch.object(seat, "_recorded_pid_alive", return_value=None):
             rc, _, err, wla, popen = self._spawn(["codex"], None)
         self.assertEqual(rc, 1)
@@ -230,24 +242,41 @@ class AdapterSpawnTest(SpawnBase):
         self.assertIn("helm chat wait --seat codex --follow", text)
         self.assertIn("@codex", text)
         self.assertIn("spawned codex via fake", out)
-        rec = json.load(open(os.path.join(d, "spawn.json")))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
         self.assertEqual(rec["harness"], "fake")
         self.assertEqual(rec["handle"], "pane-1")
+        self.ensure_timer.assert_called_once()
 
-    def test_adapter_reaps_stale_same_titled_pane_before_spawn(self):
-        self._mint()
+    def test_adapter_reaps_registered_pane_before_spawn(self):
+        d, _ = self._mint()
+        self._record(d)
         fake = FakeAdapter(rows=[
-            {"handle": "p9", "title": "codex", "status": "idle"},
-            {"handle": "p2", "title": "other", "status": "idle"}])
+            {"handle": "p9", "title": "dynamic", "status": "idle"}])
         rc, out, err, _, _ = self._spawn(["codex"], fake)
         self.assertEqual(rc, 0, err)
         self.assertEqual(fake.stopped, ["p9"])
         self.assertEqual(fake.order[0], "stop")    # reap strictly first
         self.assertIn("reaped stale codex pane p9", out)
 
+    def test_registered_pane_plus_title_only_decoy_refuses_without_stopping(self):
+        d, _ = self._mint()
+        self._record(d)
+        fake = FakeAdapter(rows=[
+            {"handle": "p9", "title": "dynamic", "status": "idle"},
+            {"handle": "p2", "title": "codex", "status": "idle"}])
+        rc, _, err, wla, popen = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("identity-by-title", err)
+
     def test_adapter_reap_failure_aborts_replacement(self):
-        self._mint()
-        fake = FakeAdapter(rows=[{"handle": "p9", "title": "codex"}])
+        d, _ = self._mint()
+        self._record(d)
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "dynamic"}])
         fake.stop = mock.Mock(side_effect=harness.HarnessError("close failed"))
         rc, _, err, wla, popen = self._spawn(["codex"], fake)
         self.assertEqual(rc, 1)
@@ -257,15 +286,41 @@ class AdapterSpawnTest(SpawnBase):
         wla.assert_not_called()
         popen.assert_not_called()
 
+    def test_unregistered_same_title_aborts_without_stopping(self):
+        self._mint()
+        fake = FakeAdapter(rows=[{"handle": "decoy", "title": "codex"}])
+        rc, _, err, wla, popen = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("identity-by-title", err)
+
+    def test_cross_seat_register_never_authorizes_reap(self):
+        d, _ = self._mint()
+        with open(os.path.join(d, "spawn.json"), "w") as f:
+            json.dump({"v": 1, "seat": "codex-2", "harness": "fake",
+                       "handle": "p9"}, f)
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "dynamic"}])
+        rc, _, err, wla, popen = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("identity mismatch", err)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        popen.assert_not_called()
+
     def test_recorded_other_harness_must_be_reapable(self):
         d, _ = self._mint()
         with open(os.path.join(d, "spawn.json"), "w") as f:
-            json.dump({"harness": "orca", "handle": "old-pane"}, f)
+            json.dump({"v": 1, "seat": "codex", "harness": "orca",
+                       "handle": "old-pane"}, f)
         fake = FakeAdapter()
         with mock.patch.object(seat.shutil, "which", return_value=None):
             rc, _, err, wla, _ = self._spawn(["codex"], fake)
         self.assertEqual(rc, 1)
-        self.assertIn("orca CLI is unavailable", err)
+        self.assertIn("recorded orca adapter is unavailable", err)
         self.assertEqual(fake.spawned, [])
         wla.assert_not_called()
 
@@ -290,7 +345,8 @@ class AdapterSpawnTest(SpawnBase):
         self.assertEqual(wla.call_args[0][2], "team-q")   # room preserved
         _, text, _ = fake.sent[0]
         self.assertIn("--room team-q", text)
-        rec = json.load(open(os.path.join(d, "spawn.json")))
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
         self.assertEqual(rec["room"], "team-q")
 
     def test_spawn_remint_preserves_multi_shape(self):
@@ -464,7 +520,7 @@ class AdapterSpawnTest(SpawnBase):
 
 
 class DryRunTest(SpawnBase):
-    def test_print_shows_adapter_calls_without_spawning(self):
+    def test_print_refuses_title_only_identity_without_spawning(self):
         d, launch = self._mint()
         fake = FakeAdapter(rows=[{"handle": "p9", "title": "codex",
                                   "status": "idle"}])
@@ -478,8 +534,20 @@ class DryRunTest(SpawnBase):
         self.assertFalse(os.path.exists(os.path.join(d, "spawn.json")))
         self.assertIn("fake.spawn(command=%s" % shlex.quote(launch), out)
         self.assertIn("fake.send(<handle>", out)
-        self.assertIn("fake stop pane p9", out)    # the reap it WOULD do
+        self.assertIn("REFUSE mutable-title-only", out)
         self.assertIn("helm chat wait --seat codex --follow", out)
+
+    def test_print_reports_the_registered_handle_it_would_stop(self):
+        d, _ = self._mint()
+        self._record(d)
+        fake = FakeAdapter(rows=[{"handle": "p9", "title": "dynamic"}])
+        rc, out, err, wla, popen = self._spawn(["codex", "--print"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("fake stop registered pane p9", out)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        wla.assert_not_called()
+        popen.assert_not_called()
 
     def test_dry_run_headless_shows_detached_plan(self):
         d, launch = self._mint()
@@ -523,9 +591,10 @@ class WhereTest(SpawnBase):
 
     def test_where_pane_record_checks_the_same_harness(self):
         d, _ = self._mint()
-        fake = FakeAdapter(rows=[{"handle": "pane-1", "title": "codex",
-                                  "status": "connected"}])
+        fake = FakeAdapter()
         self._spawn(["codex"], fake)
+        fake.rows = [{"handle": "pane-1", "title": "codex",
+                      "status": "connected"}]
         with mock.patch.object(harness, "detect", return_value=fake):
             rc, out, err = self._where(["codex"])
         self.assertEqual(rc, 0, err)

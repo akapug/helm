@@ -46,8 +46,11 @@ class Slice6Base(unittest.TestCase):
                             "port: 8317\n", mode=0o600)
         seat._write_private(os.path.join(seat.seat_dir("codex"), "token"),
                             "test-token\n", mode=0o600)
+        self.timer = mock.patch.object(seat, "_ensure_autocompact_timer")
+        self.timer.start()
 
     def tearDown(self):
+        self.timer.stop()
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
