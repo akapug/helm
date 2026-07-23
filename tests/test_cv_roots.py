@@ -1,4 +1,5 @@
 """CV fleet-root integration: every Helm seat transcript reaches CV calls."""
+import json
 import os
 import shutil
 import tempfile
@@ -52,6 +53,30 @@ class CvRootsTest(unittest.TestCase):
         self.assertEqual(stats["source"], "cv ls --json")
         self.assertEqual(run.call_args.kwargs["env"]["CLUSTERVISION_CLAUDE_ROOTS"],
                          root)
+
+    def test_installed_cv_discovers_planted_seat_transcript(self):
+        if not shutil.which("cv"):
+            self.skipTest("installed cv integration binary unavailable")
+        root = self.root("kimi")
+        project = os.path.join(root, "-work-live")
+        os.makedirs(project, exist_ok=True)
+        sid = "11111111-2222-3333-4444-555555555555"
+        with open(os.path.join(project, sid + ".jsonl"), "w") as f:
+            f.write(json.dumps({
+                "type": "user", "uuid": sid + "-u0", "sessionId": sid,
+                "timestamp": "2026-07-23T10:30:00Z", "cwd": "/work/live",
+                "message": {"role": "user", "content": "fleet root proof"},
+            }) + "\n")
+        fake_home = os.path.join(self.tmp, "user-home")
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": fake_home,
+               "CLUSTERVISION_HOME": os.path.join(self.tmp, "cv-home"),
+               "XDG_CACHE_HOME": os.path.join(fake_home, ".cache"),
+               "XDG_CONFIG_HOME": os.path.join(fake_home, ".config"),
+               "XDG_DATA_HOME": os.path.join(fake_home, ".local", "share")}
+        rc, out, err = session._cv("ls", "--json", env=env)
+        self.assertEqual(rc, 0, err)
+        rows = json.loads(out)
+        self.assertIn(sid, {row.get("id") for row in rows})
 
 
 if __name__ == "__main__":
