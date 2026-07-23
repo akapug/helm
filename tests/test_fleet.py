@@ -437,6 +437,25 @@ class CensusRecheckFailureTest(unittest.TestCase):
                                return_value=b"41 (claude) malformed"):
             self.assertIsNone(session._census_matches(41, "g1", b"claude\0"))
 
+    def test_torn_stat_during_unknown_stub_recheck_keeps_unknown_row(self):
+        stub = {"pid": 41, "uid": os.geteuid(), "start": "g1"}
+
+        def scan(accounts=None, status=None):
+            status.update({"listing_failed": False, "failed_pids": set()})
+            return []
+
+        with mock.patch.object(session.os, "listdir", return_value=["41"]), \
+             mock.patch.object(session, "_census_snapshot",
+                               return_value=("unknown", stub)), \
+             mock.patch.object(session, "_proc_bytes",
+                               return_value=b"41 (claude) malformed"), \
+             mock.patch.object(who, "scan", side_effect=scan):
+            census = session._proc_claude_census()
+        self.assertEqual(len(census["rows"]), 1)
+        self.assertEqual(census["rows"][0]["pid"], 41)
+        self.assertTrue(census["rows"][0]["probe_failed"])
+        self.assertFalse(census["census_partial"])
+
 
 class WhoCensusContextTest(unittest.TestCase):
     def _census(self, who_rows, failed_pids=()):

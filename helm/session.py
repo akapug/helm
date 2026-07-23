@@ -1036,8 +1036,11 @@ def _proc_claude_census():
         # GENERATION still persists: a gone pid (ENOENT/ESRCH) is genuine
         # absence, while an unreadable recheck stays fail-closed UNKNOWN.
         try:
-            still = _starttime_from_stat(
-                _proc_bytes(stub["pid"], "stat")) == stub["start"]
+            live_start = _starttime_from_stat(
+                _proc_bytes(stub["pid"], "stat"))
+            # A readable-but-torn stat is still a failed probe. Only a parsed
+            # different starttime proves this generation gone.
+            still = live_start is None or live_start == stub["start"]
         except OSError as e:
             still = not _gone(e)
         if not still:
