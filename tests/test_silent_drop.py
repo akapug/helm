@@ -122,6 +122,26 @@ class SilentDropTest(unittest.TestCase):
         self.assertEqual(len(r2["alerted"]), 0)
         self.assertTrue(r2["findings"][0]["latched"])
 
+    def test_storm_suppresses_distinct_drops_per_seat(self):
+        # attention-budget: a drop-STORM (distinct-ts drops within LATCH_TTL)
+        # alerts ONCE per seat, not once per drop — a NEW distinct drop within
+        # the window is latched, and its count rides the NEXT alert.
+        self.plant([asst([], ot=50, ts=_rts(3))])
+        r1 = silent_drop.check(seats=["codex"], post=False)
+        self.assertEqual(len(r1["alerted"]), 1)
+        # a genuinely different drop (new ts) still in the window -> suppressed
+        self.plant([asst([], ot=61, ts=_rts(2))])
+        r2 = silent_drop.check(seats=["codex"], post=False)
+        self.assertEqual(len(r2["alerted"]), 0)
+        self.assertTrue(r2["findings"][0]["latched"])
+
+    def test_storm_count_rides_the_next_alert(self):
+        # the suppressed count is carried into the alert text so ONE message
+        # conveys the storm size instead of N wakes.
+        f = {"seat": "codex", "output_tokens": 40, "session": SID,
+             "ts": "2026-07-23T10:00:00Z", "suppressed_since_last": 7}
+        self.assertIn("+7 more drops", silent_drop._alert_text(f))
+
     def test_alert_text_names_seat_tokens_and_integrator(self):
         txt = silent_drop._alert_text(
             {"seat": "codex", "output_tokens": 103, "session": SID,

@@ -147,17 +147,22 @@ def _state_path():
 
 
 def _alert_text(f):
+    n = f.get("suppressed_since_last") or 0
+    storm = ((" (+%d more drops on this seat suppressed since the last alert — "
+              "a drop-storm; known upstream reasoning-only class, watchdog "
+              "caught each, seat self-recovers)" % n) if n else "")
     return ("@%(seat)s @opus-integrator SILENT-DROP detected: codex "
             "produced %(output_tokens)s output_tokens but the completion "
             "arrived EMPTY (proxy drop-after-generate, not a refusal). The "
             "turn ended silently — nothing surfaced. transcript %(session)s "
             "at %(ts)s. If this was security/crypto work, the answer was "
             "generated then lost — consider re-asking. [silent-drop "
-            "watchdog]" % {
+            "watchdog]%(storm)s" % {
                 "seat": f["seat"],
                 "output_tokens": f.get("output_tokens"),
                 "session": f.get("session"),
                 "ts": f.get("ts"),
+                "storm": storm,
             })
 
 
@@ -176,13 +181,22 @@ def check(seats=None, post=True, quiet=False):
         alerted = []
         for f in findings:
             entry = st.get(f["seat"])
-            # re-alert only after the latch TTL (a recurring drop stays loud)
-            if entry and now - (entry.get("alerted_at") or 0) < LATCH_TTL_S \
-                    and entry.get("ts") == f.get("ts"):
+            # PER-SEAT rate-limit (attention-budget): once a seat has alerted,
+            # suppress further drops for LATCH_TTL_S REGARDLESS of the drop ts.
+            # A known drop-class (codex reasoning-only completions, ~50% on
+            # some seats) is ONE signal per window, not N wakes — the old
+            # per-(seat,ts) latch re-fired on every DISTINCT drop and flooded
+            # the fleet. A genuinely new seat's FIRST drop still alerts at once
+            # (no prior entry); the suppressed COUNT rides the next alert so one
+            # message conveys the storm size.
+            if entry and now - (entry.get("alerted_at") or 0) < LATCH_TTL_S:
                 f["latched"] = True
+                entry["suppressed"] = (entry.get("suppressed") or 0) + 1
+                st[f["seat"]] = entry
                 continue
             f["latched"] = False
-            st[f["seat"]] = {"alerted_at": now, "ts": f.get("ts")}
+            f["suppressed_since_last"] = (entry.get("suppressed") or 0) if entry else 0
+            st[f["seat"]] = {"alerted_at": now, "ts": f.get("ts"), "suppressed": 0}
             alerted.append(f)
         pk.write_json(p, st)
 
