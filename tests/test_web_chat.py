@@ -574,6 +574,49 @@ class TestWebChat(unittest.TestCase):
         self.assertNotEqual([m["text"] for m in again["lines"]],
                             [m["text"] for m in first["lines"]])   # never the dropped rows
 
+    def test_older_cache_hit_revalidates_the_stat_and_serves_live_total(self):
+        """P2 TOCTOU (codex-3): the stale design sampled the room stat at KEY
+        BUILD — before the hit — so an append landing between that sample and the
+        serve returned a cached stale total (served 10 while the file already held
+        11). The fix validates the stat AT the hit (against the stat stored with
+        the body, sampled AFTER its read), so an append in that window is a MISS
+        and the live total is served. Modeled deterministically: the append is
+        injected at the cache lookup — the exact window the old key straddled."""
+        for i in range(10):
+            chat.post("row %d" % i, room="toc", who="a")
+        primed = self.req("/api/chat?room=toc&before=5&win=5")[1]   # caches the 10-row slice
+        self.assertEqual(primed["total"], 10)
+
+        class _RacingCache(dict):
+            fired = False
+            def get(self, *a, **k):
+                if not self.fired:                 # land an append IN the lookup window
+                    self.fired = True              # (between the old key's stat sample + serve)
+                    chat.post("row 10", room="toc", who="a")   # file 10 -> 11 mid-request
+                return super().get(*a, **k)
+
+        racing = _RacingCache(web._CHAT_OLDER_CACHE)   # carry the primed entry across
+        with mock.patch.object(web, "_CHAT_OLDER_CACHE", racing):
+            served = self.req("/api/chat?room=toc&before=5&win=5")[1]
+        self.assertEqual(chat.read("toc")[1], 11)      # the file really did grow
+        self.assertEqual(served["total"], 11)          # live total, NEVER the cached 10
+        self.assertEqual([m["text"] for m in served["lines"]],   # immutable slice intact
+                         ["row %d" % i for i in range(0, 5)])
+
+    def test_older_cache_evicts_prior_versions_bounded_to_one_per_room(self):
+        """P2 growth (codex-3): the versioned key (…, stat) NEVER evicted, so
+        every append minted a fresh entry — 12 appends left 12 entries, unbounded.
+        The fix evicts a room's prior-version pages when a new version is written,
+        so the cache holds at most one live entry per room whatever the churn."""
+        for i in range(3):
+            chat.post("r%d" % i, room="grow", who="a")
+        web._CHAT_OLDER_CACHE.clear()
+        for i in range(12):
+            chat.post("more %d" % i, room="grow", who="a")       # each append reindexes the file
+            self.req("/api/chat?room=grow&before=%d&win=2" % (i + 3))
+        room_keys = [k for k in web._CHAT_OLDER_CACHE if k[1] == "grow"]
+        self.assertLessEqual(len(room_keys), 1)                   # bounded — not one-per-append
+
     def test_batch_id_hydration_distinguishes_out_of_window_from_rotated_out(self):
         """P1 reply reconciliation: a parent ABOVE the loaded window is resolved
         by id (still present in the room), so its reply renders correctly —

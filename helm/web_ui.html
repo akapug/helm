@@ -2762,17 +2762,25 @@ async function chatHydrateParents() {
   });
   if (!ids.length) return;
   const want = CHAT_ROOM;
-  let d;
-  try {
-    d = await j("/api/chat?room=" + encodeURIComponent(want) + "&ids=" +
-      encodeURIComponent(ids.slice(0, 100).join(",")));
-  } catch (e) { return; }                          // fail-open: retry next paint
-  if (CHAT_ROOM !== want || !d || !Array.isArray(d.lines)) return;
-  const got = new Set();
-  for (const row of d.lines) {
-    if (row.id) { if (!CHAT_BY_ID[row.id]) CHAT_BY_ID[row.id] = row; got.add(row.id); }
+  // Hydrate in <=100-id CHUNKS (the server caps ids= at 100) and mark an id GONE
+  // only within the chunk that actually REQUESTED it. The round-1 bug sent
+  // ids.slice(0,100) yet marked EVERY pending id absent, so with 101 pending
+  // parents the 101st — never sent — was falsely branded "rotated out" though its
+  // parent still lives in the room. Never mark absent an id that was never asked.
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    let d;
+    try {
+      d = await j("/api/chat?room=" + encodeURIComponent(want) + "&ids=" +
+        encodeURIComponent(chunk.join(",")));
+    } catch (e) { return; }                        // fail-open: retry next paint
+    if (CHAT_ROOM !== want || !d || !Array.isArray(d.lines)) return;
+    const got = new Set();
+    for (const row of d.lines) {
+      if (row.id) { if (!CHAT_BY_ID[row.id]) CHAT_BY_ID[row.id] = row; got.add(row.id); }
+    }
+    for (const id of chunk) if (!got.has(id)) CHAT_GONE.add(id);  // asked, absent => truly gone
   }
-  for (const id of ids) if (!got.has(id)) CHAT_GONE.add(id);  // asked, absent => truly gone
   chatReconcileQuotes();
 }
 
@@ -2893,10 +2901,17 @@ async function pollChat() {
       setTimeout(pollChat, 0);            // finally clears the lock first, then the windowed repaint
       return;
     }
-    if (typeof d.gen === "string") CHAT_GEN = d.gen;
     chatTransport(d.transport);
     const log = $("#chatlog");
     if (d.total < CHAT_SINCE) CHAT_SINCE = 0; // the room rotated — server resent everything
+    // RESET BEFORE STAMPING gen/base: chatResetLog() zeroes CHAT_GEN and
+    // CHAT_OLDEST_BASE, so stamping them FIRST (then resetting) wiped the freshly
+    // stamped generation + older-cursor of this very windowed open — a rotation OR
+    // a lazy-page immediately after ANY reset then silently missed rows (the gen
+    // check no longer fired) / could not page older (base was 0). Reset first,
+    // stamp after, so the post-reset state carries THIS response's gen + base.
+    if (CHAT_SINCE === 0 && d.lines.length) chatResetLog(); // clear the empty-state (or the stale pre-rotation log)
+    if (typeof d.gen === "string") CHAT_GEN = d.gen;
     // absolute index of d.lines[0]: the windowed initial open stamps `base`
     // (last-WIN slice starts mid-history); the incremental poll omits it and
     // d.lines[0] sits exactly at the cursor we sent.
@@ -2908,7 +2923,6 @@ async function pollChat() {
     // untouched.
     if (typeof d.base === "number") CHAT_OLDEST_BASE = d.base;
     if (d.lines.length) {
-      if (CHAT_SINCE === 0) chatResetLog(); // clear the empty-state (or the stale pre-rotation log)
       const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
       const msgs = d.lines.filter(m => !m.react);
       if (msgs.length) {
