@@ -41,6 +41,7 @@ LAWS (violating these is how accounts get bricked):
     identity from a directory name.
   * EVERY MUTATING PATH BACKS UP FIRST (heal, and keepalive's rotation).
 """
+import fcntl
 import glob
 import hashlib
 import json
@@ -107,29 +108,28 @@ GUARD_SPECS = _BACKUP_GUARDS + _HEAL_GUARDS
 
 # The heal hook auto-types --apply and --quiet swallows every warning, so the
 # unattended path REFUSES what the manual path merely warns about: a stale
-# pre-image (stale-preimage), a family ever seen live in another home
-# (revocation-risk via lineage), a capture-bracket tear (torn-pair). Warnings
-# are for humans; a hook that can only warn itself protects no one.
+# pre-image (stale-preimage), an expiry it cannot even read (expiry-unknown),
+# a snapshot whose token family shows identity-discontinuity evidence of a
+# mid-/login tear (torn-pair). A family ever seen live in another home
+# (revocation-risk via lineage) is refused on BOTH paths. Warnings are for
+# humans; a hook that can only warn itself protects no one.
 
-# Family LINEAGE: which home NAMES each live token family has been observed
-# in, persisted across turns at backup_root()/family-lineage.json. The
-# live-bytes clash check alone is rotation-blind — one borrower refresh after
-# a byte-copy borrow, the hashes diverge and the clash vanishes — so the
-# refusal has to remember: a snapshot whose family was EVER seen live in a
-# home other than its restore target is never restored (its refresh token was
-# rotated, i.e. CONSUMED, there; restoring the copy trips server-side reuse
-# detection and revokes the whole family, bricking the live borrower).
+# Family LINEAGE: which home NAMES (and account emails) each live token
+# family has been observed with, persisted across turns at
+# backup_root()/family-lineage.json. The live-bytes clash check alone is
+# rotation-blind — one borrower refresh after a byte-copy borrow, the hashes
+# diverge and the clash vanishes — so the refusal has to remember: a snapshot
+# whose family was EVER seen live in a home other than its restore target is
+# never restored (its refresh token was rotated, i.e. CONSUMED, there;
+# restoring the copy trips server-side reuse detection and revokes the whole
+# family, bricking the live borrower). The account column is the tear
+# detector's memory: a family recorded live under one account can never be
+# captured or restored bound to another.
 LINEAGE_FILE = "family-lineage.json"
 LINEAGE_KEEP = 512               # newest families kept; a rotated-away family ages out
-
-# Capture-bracket tear windows (ms). A backup that fires mid-/login can pair
-# one account's freshly-landed TOKENS with another account's still-old
-# IDENTITY block — claude's two-file login write order is UNVERIFIED
-# upstream, so nothing here assumes atomicity. The torn signature: the token
-# file was written moments before capture (a write sequence in flight) while
-# the identity file lags far behind it.
-PAIR_FRESH_MS = 5000
-PAIR_GAP_MS = 5000
+# The count cap yields to the invariant: a family still claimed by any
+# surviving snapshot's meta is never evicted, because the snapshot it guards
+# (a possibly consumed token) outlives any count of newer families.
 
 
 def backup_root():
@@ -368,35 +368,87 @@ def _lineage_homes(fam):
             if isinstance(names, list) else set())
 
 
-def _lineage_record(pairs):
-    """Merge (family, home-name) observations into the persisted lineage.
-    Called only from APPLY paths (dry-runs stay recursive-metadata no-ops).
-    Best-effort by design: a failed write costs future lineage coverage, but
-    the live-bytes clash check and the hook's stale refusal still stand."""
-    seen = [(f, n) for f, n in pairs if f and n]
+def _lineage_accounts(fam):
+    """Account emails this family was ever recorded live under. Empty when
+    unknown (entries predating the account column, or a census that could not
+    read the home's identity) — one refusal layer, never the only one."""
+    entry = _lineage_load().get(fam)
+    accts = entry.get("accounts") if isinstance(entry, dict) else None
+    if not isinstance(accts, list):
+        return set()
+    return {a for a in (_email_or_none(x) for x in accts) if a}
+
+
+def _snapshot_families_on_disk():
+    """Every family a surviving snapshot's meta still claims — the set the
+    lineage prune must never evict: the snapshot outlives any count of newer
+    families, and evicting its lineage entry would expire the ever-live-
+    elsewhere refusal while the consumed token it guards is still restorable."""
+    fams = set()
+    for d in sorted(glob.glob(os.path.join(backup_root(), "*"))):
+        if not os.path.isdir(d) or os.path.islink(d):
+            continue
+        for s in _snapshots_in(d):
+            fam = s.get("family") or _snapshot_family(s["path"])
+            if fam:
+                fams.add(fam)
+    return fams
+
+
+def _lineage_record(rows_seen):
+    """Merge (family, home-name[, account]) observations into the persisted
+    lineage. Called only from APPLY paths (dry-runs stay recursive-metadata
+    no-ops). The read-merge-write runs under an flock so two concurrent hooks
+    (one session's Stop, another's SessionStart) cannot silently drop each
+    other's census. Best-effort by design: a failed lock or write costs
+    future lineage coverage, but the live-bytes clash check and the hook's
+    stale refusal still stand."""
+    seen = [r for r in rows_seen if r[0] and r[1]]
     if not seen:
         return
-    fams = _lineage_load()
-    now = int(time.time())
-    for fam, home_name in seen:
-        entry = fams.get(fam)
-        if not isinstance(entry, dict) or not isinstance(entry.get("homes"), list):
-            entry = {"homes": []}
-        entry["homes"] = sorted({h for h in entry["homes"]
-                                 if isinstance(h, str)} | {home_name})
-        entry["ts"] = now
-        fams[fam] = entry
-    if len(fams) > LINEAGE_KEEP:
-        stale = sorted(fams, key=lambda f: (fams[f].get("ts")
-                                            if isinstance(fams[f], dict) else 0) or 0)
-        for fam in stale[:len(fams) - LINEAGE_KEEP]:
-            del fams[fam]
+    lock = None
     try:
         _secure_dir(backup_root())
-        _atomic_private(_lineage_path(), json.dumps(
-            {"families": fams}, indent=2, sort_keys=True).encode())
+        lock = os.fdopen(os.open(_lineage_path() + ".lock",
+                                 os.O_WRONLY | os.O_CREAT, 0o600), "w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
     except OSError:
-        pass
+        lock = None          # unlocked fallback — no worse than the old race
+    try:
+        fams = _lineage_load()
+        now = int(time.time())
+        for row in seen:
+            fam, home_name = row[0], row[1]
+            acct = _email_or_none(row[2]) if len(row) > 2 else None
+            entry = fams.get(fam)
+            if not isinstance(entry, dict) or not isinstance(entry.get("homes"), list):
+                entry = {"homes": []}
+            entry["homes"] = sorted({h for h in entry["homes"]
+                                     if isinstance(h, str)} | {home_name})
+            prior = entry.get("accounts")
+            accts = ({a for a in prior if isinstance(a, str)}
+                     if isinstance(prior, list) else set())
+            if acct:
+                accts.add(acct)
+            entry["accounts"] = sorted(accts)
+            entry["ts"] = now
+            fams[fam] = entry
+        if len(fams) > LINEAGE_KEEP:
+            held = _snapshot_families_on_disk()
+            stale = [f for f in sorted(
+                fams, key=lambda f: (fams[f].get("ts")
+                                     if isinstance(fams[f], dict) else 0) or 0)
+                if f not in held]
+            for fam in stale[:len(fams) - LINEAGE_KEEP]:
+                del fams[fam]
+        try:
+            _atomic_private(_lineage_path(), json.dumps(
+                {"families": fams}, indent=2, sort_keys=True).encode())
+        except OSError:
+            pass
+    finally:
+        if lock:
+            lock.close()
 
 
 # ----------------------------------------------------------------- backups ---
@@ -612,6 +664,18 @@ def _capture_home(real):
                           "snapshotted for another account (%s) — a mixed or "
                           "torn home; refusing to bind them to %s"
                           % (other, email))
+        # The no-history half of the same check: a home never snapshotted has
+        # no _foreign_family record, but the lineage census (which sees every
+        # live home each turn boundary) may still know whose account these
+        # token bytes were live under. Fresh identity over another account's
+        # stale tokens (the opposite tear) is refused here even on the
+        # first-ever capture of a home.
+        owners = _lineage_accounts(fam)
+        if owners and email not in owners:
+            return None, ("credential bytes carry a token family the lineage "
+                          "has only seen live under another account (%s) — a "
+                          "mixed or torn home; refusing to bind them to %s"
+                          % (sorted(owners)[0], email))
         pair = {"cfg": {"mtime_ns": before[0][0], "size": before[0][1],
                         "sha12": hashlib.sha256(cfg_blob).hexdigest()[:12]},
                 "auth": {"mtime_ns": before[1][0], "size": before[1][1]},
@@ -637,6 +701,13 @@ def backup(config_dir, apply=False):
     blob, oa, email = cap["blob"], cap["oa"], cap["email"]
     snaps = snapshots(email)
     if snaps and _identical(snaps[-1], blob, oa):
+        if apply:
+            # The observation still counts even when the bytes are already
+            # filed: keepalive's pre-rotation capture lands here whenever the
+            # home was snapshotted at the last turn boundary, and WITHOUT the
+            # census the family it is about to rotate away would never enter
+            # the lineage (dry-runs stay recursive-metadata no-ops).
+            _lineage_record([(cap["family"], name, email)])
         return {"ok": True, "action": "skip", "home": real, "name": name,
                 "account": email, "dest": snaps[-1]["path"],
                 "reason": "identical snapshot already exists"}
@@ -669,7 +740,7 @@ def backup(config_dir, apply=False):
         return {"ok": False, "action": "skip", "home": real, "name": name,
                 "account": email,
                 "reason": "snapshot write failed (%s)" % e.__class__.__name__}
-    _lineage_record([(cap["family"], name)])
+    _lineage_record([(cap["family"], name, email)])
     pruned = _prune(email)
     return {"ok": True, "action": "backup", "home": real, "name": name,
             "account": email, "dest": dest, "digest": digest,
@@ -1079,43 +1150,57 @@ def _family_elsewhere(snapshot, target, estate):
     return None, False
 
 
-def _pair_torn(snapshot):
-    """True when the snapshot's recorded capture brackets betray a mid-/login
-    tear: the token file landed moments before capture (a dual-file write
-    sequence in flight) while the identity file lags far behind it — the pair
-    may bind one account's tokens to another account's identity, and NOTHING
-    downstream can detect that once it is filed. claude's /login write
-    ordering is unverified upstream, so this assumes no atomicity; the
-    opposite tear (fresh identity over stale tokens) is caught at capture by
-    _foreign_family, since the stale tokens' family is already snapshotted
-    under the previous account. Legacy snapshots without brackets pass — the
-    check is one refusal layer, not the only one."""
-    pair = snapshot.get("pair")
-    if not isinstance(pair, dict):
-        return False
-    try:
-        auth_ms = int(pair["auth"]["mtime_ns"]) // 1000000
-        cfg_ms = int(pair["cfg"]["mtime_ns"]) // 1000000
-        cap_ms = int(pair["captured_at_ms"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    return (auth_ms - cfg_ms > PAIR_GAP_MS
-            and cap_ms - auth_ms < PAIR_FRESH_MS)
+def _pair_misbound(snapshot, target):
+    """The identity-discontinuity EVIDENCE that a snapshot filed under one
+    account carries ANOTHER account's token bytes — the real mid-/login tear
+    — or None. A tear is an identity discontinuity, never a timing skew: the
+    routine same-account refresh-rotation also rewrites the token file
+    moments before the Stop-hook capture while the identity file sits
+    legitimately older, and THAT snapshot is the normal pre-image (the
+    freshly rotated token is exactly what the guard exists to keep); flagging
+    it torn would refuse the only valid recovery. Token bytes carry no
+    identity of their own, so the discontinuity is judged on family claims:
+    the snapshot's family under another account's snapshots (the completing
+    /login files them at the next turn boundary), under another account in
+    the lineage census, or live in the target home under the very occupant
+    heal would evict. A tear that left none of those traces (torn capture
+    chased by a second /login before any turn boundary) stays invisible —
+    one refusal layer among several, backed by _capture_home's stat brackets
+    (recorded in meta for forensics) and the post-restore identity+family
+    verify. The opposite tear (fresh identity over stale tokens) is caught
+    at capture by _foreign_family and the lineage-account check, which also
+    covers the first-ever capture of a home."""
+    fam = snapshot.get("family") or _snapshot_family(snapshot["path"])
+    if not fam:
+        return None
+    other = _foreign_family(fam, snapshot["account"])
+    if other:
+        return "its token family is claimed by %s's snapshots" % other
+    foreign = sorted(_lineage_accounts(fam) - {snapshot["account"]})
+    if foreign:
+        return ("the lineage records its token family live under %s"
+                % foreign[0])
+    if (target.get("family") == fam and target["account"]
+            and target["account"] != snapshot["account"]):
+        return ("its token bytes are the ones the current occupant (%s) "
+                "holds live" % target["account"])
+    return None
 
 
 def heal_plan(name=None, record=False):
     """One plan per DRIFTED home: what heal WOULD do, and why it can't.
     status: ready | held | cannot-probe | no-backup | ambiguous-backup |
-    revocation-risk | torn-pair (apply adds: restored | failed | no-preimage,
-    and the hook path adds stale-preimage). record=True (the apply path only
-    — dry-runs stay filesystem no-ops) also persists the family-lineage
-    census of the current estate, so a later plan can refuse a snapshot whose
-    family was EVER live in another home even after the borrower rotates."""
+    revocation-risk (apply adds: restored | failed | no-preimage, and the
+    hook path adds stale-preimage | torn-pair | expiry-unknown). record=True
+    (the apply path only — dry-runs stay filesystem no-ops) also persists the
+    family-lineage census of the current estate (family, home, account), so
+    a later plan can refuse a snapshot whose family was EVER live in another
+    home even after the borrower rotates."""
     plans = []
     estate = rows()
     if record:
-        _lineage_record([(r.get("family"), os.path.basename(r["real"]))
-                         for r in estate])
+        _lineage_record([(r.get("family"), os.path.basename(r["real"]),
+                          r["account"]) for r in estate])
     for r in estate:
         if r["verdict"] != "DRIFT":
             continue
@@ -1161,27 +1246,32 @@ def heal_plan(name=None, record=False):
                 "whole family over. A family ever live in another home never "
                 "restores. Fresh login instead: %s"
                 % (clash, _login_cmd(r["real"])))
-        elif _pair_torn(snaps[-1]):
-            plan["status"], plan["reason"] = "torn-pair", (
-                "that snapshot's token file landed moments before capture while "
-                "its identity file lags behind it — a backup that fires "
-                "mid-/login can bind one account's tokens to another account's "
-                "identity (claude's two-file login write is not known atomic), "
-                "and restoring the pair would misroute a credential. Fresh "
-                "login instead: %s" % _login_cmd(r["real"]))
         else:
             # STALENESS is the temporal twin of the shared-family bomb: an
             # access token that had already expired means whoever held this
             # home next had to refresh, and the grant ROTATES the refresh
             # token — the snapshot's copy may already be consumed, and a
             # consumed refresh token is what reuse detection revokes families
-            # over. Not a refusal (this is still the only recovery on disk),
-            # but the owner sees it before typing --apply.
+            # over. A TORN pair (identity-discontinuity evidence that the
+            # snapshot binds one account's tokens to another's identity) is
+            # its spatial twin. Neither is a manual refusal (this is still
+            # the only recovery on disk — the owner sees the warning before
+            # typing --apply), but the hook path REFUSES all three: stale,
+            # torn, and an expiry it cannot even read.
             exp = _snapshot_expiry(snaps[-1]["path"])
             plan["stale_pre_image"] = bool(exp is not None
                                            and exp < time.time() * 1000)
+            plan["expiry_unknown"] = exp is None
+            plan["torn_pair"] = _pair_misbound(snaps[-1], r)
             plan["status"], plan["reason"] = "ready", (
                 "restore %s from %s" % (snaps[-1]["account"] or want, snaps[-1]["ts"]))
+            if plan["torn_pair"]:
+                plan["reason"] += (
+                    " — WARNING: %s, so this snapshot may bind one account's "
+                    "tokens to another account's identity (a backup that fired "
+                    "mid-/login); restoring it can misroute a credential. A "
+                    "fresh login is the safe move: %s"
+                    % (plan["torn_pair"], _login_cmd(r["real"])))
             if plan["stale_pre_image"]:
                 plan["reason"] += (
                     " — WARNING: that snapshot's access token was already expired, "
@@ -1190,6 +1280,11 @@ def heal_plan(name=None, record=False):
                     "and a spent refresh token is what reuse detection revokes a "
                     "family over. A fresh login is the safe move: %s"
                     % _login_cmd(r["real"]))
+            if plan["expiry_unknown"]:
+                plan["reason"] += (
+                    " — note: the snapshot carries no readable access-token "
+                    "expiry, so its freshness cannot be proven; the unattended "
+                    "guard refuses what it cannot prove")
         plans.append(plan)
     return plans
 
@@ -1201,13 +1296,23 @@ def heal(name=None, apply=False, hook=False):
     home now reads as the expected account AND its token family is live
     nowhere else — rolling back if either fails. hook=True is the unattended
     guard path (--quiet): a plan the manual path would only WARN about
-    (stale_pre_image) is REFUSED outright, because the hook auto-types
-    --apply and swallows the warning no owner will ever read."""
+    (torn_pair, stale_pre_image, expiry_unknown) is REFUSED outright,
+    because the hook auto-types --apply and swallows the warning no owner
+    will ever read."""
     plans = heal_plan(name, record=apply)
     if not apply:
         return {"apply": False, "plans": plans}
     for plan in plans:
         if plan["status"] != "ready":
+            continue
+        if hook and plan.get("torn_pair"):
+            plan["status"], plan["reason"] = "torn-pair", (
+                "%s — a backup that fires mid-/login can bind one account's "
+                "tokens to another account's identity, and restoring the pair "
+                "would misroute a credential. Auto-restore refused; `helm "
+                "cred heal --apply` by hand accepts the risk knowingly, or "
+                "log in fresh: %s"
+                % (plan["torn_pair"], _login_cmd(plan["path"])))
             continue
         if hook and plan.get("stale_pre_image"):
             plan["status"], plan["reason"] = "stale-preimage", (
@@ -1217,6 +1322,15 @@ def heal(name=None, apply=False, hook=False):
                 "whole family over. Auto-restore refused; `helm cred heal "
                 "--apply` by hand accepts the risk knowingly, or log in "
                 "fresh: %s" % _login_cmd(plan["path"]))
+            continue
+        if hook and plan.get("expiry_unknown"):
+            plan["status"], plan["reason"] = "expiry-unknown", (
+                "the snapshot carries no readable access-token expiry, so its "
+                "freshness cannot be proven — and the unattended path never "
+                "restores what it cannot prove (an unparseable expiry must "
+                "fail closed, not open). `helm cred heal --apply` by hand "
+                "accepts the risk knowingly, or log in fresh: %s"
+                % _login_cmd(plan["path"]))
             continue
         holders = holders_of(plan["path"])
         if holders is None or holders:

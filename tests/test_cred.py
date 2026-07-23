@@ -67,8 +67,13 @@ class CredBase(unittest.TestCase):
                 "organizationName": org}}, f)
         if token is not None:
             with open(os.path.join(d, ".credentials.json"), "w") as f:
-                json.dump({"claudeAiOauth": {"refreshToken": token,
-                                             "accessToken": token + "-A"}}, f)
+                # a live-looking expiry: real credential files always carry
+                # one, and the unattended heal REFUSES a snapshot whose
+                # freshness it cannot prove (expiry-unknown) — tests of that
+                # refusal write their own credential file without it
+                json.dump({"claudeAiOauth": {
+                    "refreshToken": token, "accessToken": token + "-A",
+                    "expiresAt": int((time.time() + 3600) * 1000)}}, f)
         cred.cache_clear()
         return d
 
@@ -1220,36 +1225,215 @@ class LineageTest(CredBase):
         self.assertEqual(res["plans"][0]["status"], "restored")
         self.assertEqual(cred.account_of(cto)["email"], "cto@example.invalid")
 
+    def test_the_hook_refuses_a_snapshot_whose_expiry_it_cannot_read(self):
+        """An absent or unparseable expiresAt must fail CLOSED on the
+        unattended path: freshness that cannot be proven is not freshness.
+        The manual path warns and proceeds, as with stale."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        with open(os.path.join(cto, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {"refreshToken": "FAKE-CTO",
+                                         "accessToken": "FAKE-CTO-A",
+                                         "expiresAt": "soon"}}, f)  # unparseable
+        cred.cache_clear()
+        self.assertTrue(cred.backup(cto, apply=True)["ok"])
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        before = open(os.path.join(cto, ".credentials.json"), "rb").read()
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (1, "", ""))
+        self.assertEqual(open(os.path.join(cto, ".credentials.json"), "rb").read(),
+                         before)              # untouched
+        plan = cred.heal(apply=True, hook=True)["plans"][0]
+        self.assertEqual(plan["status"], "expiry-unknown")
+        self.assertIn("fail closed", plan["reason"])
+        res = cred.heal(apply=True)
+        self.assertEqual(res["plans"][0]["status"], "restored")
+        self.assertEqual(cred.account_of(cto)["email"], "cto@example.invalid")
+
+    def test_count_pruning_never_evicts_a_family_a_snapshot_still_claims(self):
+        """LINEAGE_KEEP caps the FORGETTABLE families only: while a surviving
+        snapshot's meta claims a family, its lineage entry outlives any count
+        of newer families — otherwise the ever-live-elsewhere refusal would
+        expire while the consumed token it guards is still restorable."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-S")
+        cred.backup(cto, apply=True)
+        self.plant("x-else-com", "x@else.com", token="FAKE-S")
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))          # census: S lives in both
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        self.plant("x-else-com", "x@else.com", token="FAKE-S-ROTATED")
+        # 600 newer distinct families flood the lineage, far past the cap
+        cred._lineage_record([("fam%04d" % i, "flood-home", None)
+                              for i in range(600)])
+        fams = cred._lineage_load()
+        self.assertEqual(len(fams), cred.LINEAGE_KEEP)         # the cap held...
+        fam = hashlib.sha256(b"FAKE-S").hexdigest()[:10]
+        self.assertIn(fam, fams)                               # ...but S survived
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((out, err), ("", ""))
+        self.assertEqual(rc, 1)                                # still refused
+        plan = cred.heal()["plans"][0]
+        self.assertEqual(plan["status"], "revocation-risk")
+        self.assertIn("x-else-com", plan["reason"])
+
+    def test_an_identical_skip_backup_still_censuses_the_family(self):
+        """keepalive's pre-rotation capture lands on the identical-skip path
+        whenever the home was already snapshotted at the last turn boundary;
+        the observation must still enter the lineage, or a byte-copy borrowed
+        elsewhere could be auto-restored after the grant consumes it."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-S")
+        cred.backup(cto, apply=True)
+        os.unlink(cred._lineage_path())       # forget every observation
+        res = cred.backup(cto, apply=True)
+        self.assertEqual(res["action"], "skip")
+        fam = hashlib.sha256(b"FAKE-S").hexdigest()[:10]
+        entry = cred._lineage_load()[fam]
+        self.assertEqual(entry["homes"], ["cto-example-com"])
+        self.assertEqual(entry["accounts"], ["cto@example.invalid"])
+        # ...and the dry-run stays a filesystem no-op
+        os.unlink(cred._lineage_path())
+        before = self.tree_state()
+        cred.backup(cto, apply=False)
+        self.assertEqual(self.tree_state(), before)
+
+    def test_first_ever_capture_refuses_tokens_the_lineage_binds_elsewhere(self):
+        """The no-history gap, closed: _foreign_family needs a snapshot on
+        record, but the lineage census sees every live home each turn
+        boundary — so a fresh identity over another account's stale tokens
+        (the opposite tear) is refused even on the FIRST-ever backup of a
+        home."""
+        home = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))          # census only
+        self.assertEqual(cred.snapshots("cto@example.invalid"), [])     # never snapshotted
+        # a /login writes the identity file first; the token file still holds
+        # cto's credentials — the opposite tear, mid-flight
+        with open(os.path.join(home, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {"emailAddress": "eve@ex.com",
+                                        "accountUuid": "u-e",
+                                        "organizationName": "O"}}, f)
+        cred.cache_clear()
+        res = cred.backup(home, apply=True)
+        self.assertFalse(res["ok"])
+        self.assertIn("another account", res["reason"])
+        self.assertEqual(cred.snapshots("eve@ex.com"), [])     # nothing poisoned
+
+    def test_lineage_record_merges_and_survives_a_failed_lock(self):
+        """The read-modify-write runs under an flock; a lock that cannot be
+        taken degrades to the old best-effort write, never to a crash."""
+        cred._lineage_record([("famaaaaaa01", "h1", "a@x.com")])
+        with mock.patch.object(cred.fcntl, "flock", side_effect=OSError):
+            cred._lineage_record([("famaaaaaa02", "h2", "b@x.com")])
+        fams = cred._lineage_load()
+        self.assertEqual(fams["famaaaaaa01"]["accounts"], ["a@x.com"])
+        self.assertEqual(fams["famaaaaaa02"]["homes"], ["h2"])
+        st = os.stat(cred._lineage_path() + ".lock")
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
+
 
 class TornPairTest(CredBase):
     """A backup that fires mid-/login can pair one account's freshly-landed
     TOKENS with another account's still-old IDENTITY — claude's two-file
     login write order is UNVERIFIED upstream, so nothing here assumes
-    atomicity. The defense is layered: the capture brackets are recorded and
-    heal refuses the torn signature; a mixed home whose token bytes already
-    belong to another account's snapshots never becomes a snapshot at all;
+    atomicity. A tear is an IDENTITY DISCONTINUITY, never a timing skew: the
+    routine same-account refresh-rotation produces the exact same write
+    shape (token file rewritten moments before the Stop capture, identity
+    file legitimately older) and that snapshot is the NORMAL pre-image — the
+    freshly rotated token is the very thing the guard exists to keep. The
+    defense is layered: heal refuses (hook) or warns (manual) on family-claim
+    evidence of a misbind; a mixed home whose token bytes already belong to
+    another account's snapshots or lineage never becomes a snapshot at all;
     and the restore commit itself is signal-masked so the guard's own
     `timeout 10` SIGTERM cannot mint the mixed home."""
 
-    def test_a_capture_bracketing_a_login_tear_is_never_restored(self):
-        """The adversarial repro, pinned: alice's tokens landed moments ago,
-        david's identity file is a minute behind — a /login in flight. The
-        misbound snapshot is filed, but heal refuses to restore it."""
-        home = self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-ALICE-LANDED")
+    def rotation_pre_image(self):
+        """The r3 false positive's fixture, verbatim: cto's home refreshes
+        mid-session (ROTATING the token — only .credentials.json rewritten,
+        .claude.json a minute older), and the Stop hook snapshots it moments
+        later. Same account in both files: the normal captured pre-image."""
+        home = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO-OLD")
         old = time.time() - 60
         os.utime(os.path.join(home, ".claude.json"), (old, old))
         cred.cache_clear()
+        with open(os.path.join(home, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {
+                "refreshToken": "FAKE-CTO-ROTATED",
+                "accessToken": "FAKE-CTO-ROTATED-A",
+                "expiresAt": int((time.time() + 3600) * 1000)}}, f)
+        cred.cache_clear()
         self.assertTrue(cred.backup(home, apply=True)["ok"])
-        self.plant("david-example-invalid", "bob@ex.com", token="FAKE-BOB")     # later drift
+        return home
+
+    def test_a_same_account_rotation_pre_image_is_never_torn(self):
+        """The false positive, pinned dead: the rotation-fresh snapshot is
+        the exact pre-image the guard captures, and the guard's own hook
+        command restores it — the evicted account is NOT bricked."""
+        home = self.rotation_pre_image()
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))
+        self.assertEqual(cred.account_of(home)["email"], "cto@example.invalid")
+        creds = json.load(open(os.path.join(home, ".credentials.json")))
+        self.assertEqual(creds["claudeAiOauth"]["refreshToken"],
+                         "FAKE-CTO-ROTATED")
+
+    def test_a_real_tear_is_refused_on_identity_discontinuity_evidence(self):
+        """The realistic tear, end to end: alice's /login lands her tokens in
+        david's home moments before the Stop capture (identity file still
+        david's — the misbound snapshot is filed under david), alice's login
+        completes, a turn boundary censuses her live in that home, then bob
+        pollutes it. The hook refuses the torn snapshot; the manual path
+        warns and proceeds — the owner accepts the risk knowingly."""
+        home = self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-AL")
+        old = time.time() - 60
+        os.utime(os.path.join(home, ".claude.json"), (old, old))
+        cred.cache_clear()
+        self.assertTrue(cred.backup(home, apply=True)["ok"])   # misbound: filed under david
+        self.plant("david-example-invalid", "alice@ex.com", token="FAKE-AL")  # login completes
+        # a fleet turn boundary passes: the census records alice live with
+        # that family — while she HOLDS the home, heal refuses on occupant
+        # evidence (her own tokens are the snapshot's bytes)
+        with mock.patch.object(cred, "holders_of",
+                               lambda p, default=False: [(4242, "claude")]):
+            rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (1, "", ""))          # held, censused
+        self.plant("david-example-invalid", "bob@ex.com", token="FAKE-BOB")   # later drift
         before = open(os.path.join(home, ".credentials.json"), "rb").read()
         rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
         self.assertEqual((out, err), ("", ""))
         self.assertEqual(rc, 1)
         self.assertEqual(open(os.path.join(home, ".credentials.json"), "rb").read(),
                          before)              # the misroute never happened
-        plan = cred.heal()["plans"][0]
+        plan = cred.heal(apply=True, hook=True)["plans"][0]
         self.assertEqual(plan["status"], "torn-pair")
+        self.assertIn("alice@ex.com", plan["reason"])
         self.assertIn("claude /login", plan["reason"])
+        # the manual dry-run WARNS on the same evidence, and manual --apply
+        # proceeds: the owner read the warning and typed --apply
+        plan = cred.heal()["plans"][0]
+        self.assertEqual(plan["status"], "ready")
+        self.assertIn("WARNING", plan["reason"])
+        self.assertIn("alice@ex.com", plan["reason"])
+        res = cred.heal(apply=True)
+        self.assertEqual(res["plans"][0]["status"], "restored")
+        self.assertEqual(cred.account_of(home)["email"], "owner@example.invalid")
+
+    def test_a_torn_snapshot_is_refused_while_its_token_owner_occupies(self):
+        """Occupant evidence alone (no census ever ran): the snapshot's token
+        bytes are what the current occupant holds live — restoring would
+        rebind the occupant's own tokens under the evicted identity."""
+        home = self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-AL")
+        old = time.time() - 60
+        os.utime(os.path.join(home, ".claude.json"), (old, old))
+        cred.cache_clear()
+        self.assertTrue(cred.backup(home, apply=True)["ok"])
+        self.plant("david-example-invalid", "alice@ex.com", token="FAKE-AL")  # login completes
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((out, err), ("", ""))
+        self.assertEqual(rc, 1)
+        plan = cred.heal(apply=True, hook=True)["plans"][0]
+        self.assertEqual(plan["status"], "torn-pair")
+        self.assertIn("alice@ex.com", plan["reason"])
+        self.assertEqual(cred.account_of(home)["email"], "alice@ex.com")
 
     def test_a_mixed_home_never_becomes_a_snapshot(self):
         """The post-tear mixed home — account A's token bytes under account

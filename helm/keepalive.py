@@ -152,6 +152,10 @@ def refresh_home(home_path, early_horizon_s=60, force=False, apply=False):
 
     # Capture before the grant. The endpoint rotates the refresh token, so
     # taking the snapshot afterwards is already too late if storage is broken.
+    # This is also the pre-rotation lineage census: cred.backup records the
+    # about-to-be-rotated family live in THIS home (even on the identical-skip
+    # path), so a byte-copy borrowed elsewhere can never be auto-restored
+    # after this grant consumes it — no fleet turn boundary required.
     snap = cred.backup(home_path, apply=True)
     if not snap["ok"]:
         return rec({"action": "error",
