@@ -2020,6 +2020,174 @@ class StopWhisperVerifyRungsTest(SeatsBase):
         self.assertNotIn("text", rows[0])
 
 
+class WorkOfferTest(SeatsBase):
+    """AX primitive #1 — the fleet self-saturation rung (bottom of the ladder):
+    a GENUINELY idle seat is offered ONE terse take-it-or-pass for the top
+    UNOWNED backlog row. Hermetic: the dispatch ledger is planted as raw
+    event-sourced rows (no git), claims/roster in tmp. Offerable = an OBSERVED,
+    not-overdue open dispatch whose recipient is this seat or an absent/gone
+    seat (never a different LIVE seat), and whose `dispatch:<id8>` claim key is
+    free."""
+
+    def guard(self, payload=None, args=()):
+        stdin = json.dumps(payload).encode() if isinstance(payload, dict) else payload
+        return self.cmd("stop-guard", ["--hook-json", *args], stdin=stdin or b"{}")
+
+    def plant_dispatch(self, rid, recipient, lane="review the canary",
+                       ts=None, observed=True):
+        """One OPEN dispatch (+ a delivered event unless observed=False) written
+        straight to the ledger — an observed, not-overdue row that dispatches.
+        stop_candidate() ignores (so the dispatch RUNG stays quiet and the seat
+        reads idle), but open_rows() surfaces as offerable backlog."""
+        from helm import dispatches
+        ts = ts or pk.now_ts()
+        rows = [{"v": 3, "event": "dispatch", "seq": 0, "id": rid, "ts": ts,
+                 "recipient": recipient, "lane": lane, "tip": "a" * 40,
+                 "ref": "abc", "deadline_s": 2700, "status": "open"}]
+        if observed:
+            rows.append({"v": 3, "event": "delivered", "seq": 1, "id": rid,
+                         "ts": ts, "delivery_ref": "dm-x"})
+        p = dispatches.ledger_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    def test_idle_seat_offered_top_backlog_with_claim_cmd(self):
+        seats.join(session="s-o1", seat="ds4pro", cwd="/tmp/p")
+        self.plant_dispatch("a1b2c3d4e5f60011", "ghost")   # recipient absent
+        rc, _o, err = self.guard({"session_id": "s-o1"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("[helm stop-whisper]", err)
+        self.assertIn("you're free", err)
+        self.assertIn("top of backlog is a1b2c3d4", err)   # short id, glanceable
+        self.assertIn("review the canary", err)            # the one plain line
+        self.assertIn("helm chat claim dispatch:a1b2c3d4", err)   # exact claim cmd
+        self.assertIn("or pass", err)
+        # latch: same backlog HEAD, a re-stop passes — never spam every stop
+        rc, _o, err = self.guard({"session_id": "s-o1"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("stop-whisper", err)
+
+    def test_dispatch_assigned_to_this_seat_is_offerable(self):
+        seats.join(session="s-o1b", seat="ds4pro", cwd="/tmp/p")
+        self.plant_dispatch("aa11bb22cc33dd44", "ds4pro")   # assigned to me, unstarted
+        rc, _o, err = self.guard({"session_id": "s-o1b"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("you're free", err)
+        self.assertIn("helm chat claim dispatch:aa11bb22", err)
+
+    def test_busy_seat_mid_claim_gets_no_offer(self):
+        seats.join(session="s-o2", seat="ds4pro", cwd="/tmp/p")
+        self.plant_dispatch("b1b2c3d4e5f60022", "ghost")
+        seats.claim("worktree-x", "ds4pro", ttl=300, session="s-o2")
+        rc, _o, err = self.guard({"session_id": "s-o2"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 2)                     # the claim-lease BLOCK fires
+        self.assertIn("worktree-x", err)
+        self.assertNotIn("you're free", err)        # mid-claim ⇒ not idle ⇒ no offer
+
+    def test_own_dispatch_obligation_outranks_and_suppresses_offer(self):
+        seats.join(session="s-o3", seat="ds4pro", cwd="/tmp/p")
+        # a NEEDS-CONFIRMATION dispatch is the seat's own obligation (dispatch rung)
+        self.plant_dispatch("c1c2c3d4e5f60033", "ghost", observed=False)
+        rc, _o, err = self.guard({"session_id": "s-o3"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 2)
+        self.assertIn("NEEDS CONFIRMATION", err)    # own work first
+        self.assertNotIn("you're free", err)
+
+    def test_pending_inbox_suppresses_offer(self):
+        seats.join(session="s-o3b", seat="ds4pro", cwd="/tmp/p")
+        self.plant_dispatch("cc11dd22ee33ff44", "ghost")
+        chat.post("@ds4pro look at this", who="david")   # an undelivered mention
+        rc, _o, err = self.guard({"session_id": "s-o3b"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 2)
+        self.assertIn("undelivered", err)           # the inbox block owns the stop
+        self.assertNotIn("you're free", err)
+
+    def test_all_claimed_backlog_gets_no_offer(self):
+        seats.join(session="s-o4", seat="ds4pro", cwd="/tmp/p")
+        self.plant_dispatch("d1d2c3d4e5f60044", "ghost")
+        # another idle seat already claimed this exact row's key
+        seats.claim("dispatch:d1d2c3d4", "other", ttl=300, session="s-other")
+        rc, _o, err = self.guard({"session_id": "s-o4"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 0, err)                 # nothing unowned → clean stop
+        self.assertNotIn("you're free", err)
+
+    def test_never_poaches_a_row_owned_by_another_live_seat(self):
+        seats.join(session="s-a", seat="ds4pro", cwd="/tmp/p")
+        seats.join(session="s-b", seat="worker-b", cwd="/tmp/p")   # a LIVE recipient
+        self.plant_dispatch("e1e2c3d4e5f60055", "worker-b")
+        rc, _o, err = self.guard({"session_id": "s-a"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 0, err)                 # in-flight to a live seat — theirs
+        self.assertNotIn("you're free", err)
+
+    def test_offers_the_oldest_backlog_row_first(self):
+        seats.join(session="s-r", seat="ds4pro", cwd="/tmp/p")
+        now = time.time()
+        iso = lambda dt: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dt))
+        # both recent (not overdue), different ts — open_rows sorts oldest first
+        self.plant_dispatch("f1110000aaaa1111", "ghost", lane="newer review",
+                            ts=iso(now - 60))
+        self.plant_dispatch("f2220000bbbb2222", "ghost", lane="older review",
+                            ts=iso(now - 600))
+        rc, _o, err = self.guard({"session_id": "s-r"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("older review", err)           # oldest ts wins
+        self.assertIn("f2220000", err)
+        self.assertNotIn("newer review", err)
+
+    def test_no_backlog_no_offer_clean_stop(self):
+        seats.join(session="s-e", seat="ds4pro", cwd="/tmp/p")
+        rc, _o, err = self.guard({"session_id": "s-e"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 0, err)                 # fail-closed on empty backlog
+        self.assertNotIn("you're free", err)
+        self.assertIn("inbox clean", err)            # the ordinary clean-idle warn
+
+    def test_unreadable_claims_fail_closed_no_offer(self):
+        seats.join(session="s-f", seat="ds4pro", cwd="/tmp/p")
+        self.plant_dispatch("a9a9c3d4e5f60099", "ghost")
+        chat._ensure_dir()
+        with open(seats.claims_path(), "w") as f:
+            f.write("not json{{")                    # claims UNKNOWN → unsure
+        rc, _o, err = self.guard({"session_id": "s-f"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 0, err)                 # never poach on uncertainty
+        self.assertNotIn("you're free", err)
+
+    def test_kill_switch_silences_the_offer(self):
+        seats.join(session="s-k", seat="ds4pro", cwd="/tmp/p")
+        self.plant_dispatch("b9b9c3d4e5f60088", "ghost")
+        os.environ["HELM_STOP_GUARD_WHISPER"] = "0"
+        rc, _o, err = self.guard({"session_id": "s-k"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("you're free", err)
+
+    def test_offer_line_stays_within_the_byte_cap(self):
+        seats.join(session="s-cap", seat="d" * 40, cwd="/tmp/p")
+        self.plant_dispatch("c9c9c3d4e5f60077", "ghost", lane="x" * 80)
+        rc, _o, err = self.guard({"session_id": "s-cap"}, args=["--seat", "d" * 40])
+        self.assertEqual(rc, 2, err)
+        line = next(l for l in err.splitlines() if "stop-whisper" in l)
+        self.assertLessEqual(len(line.encode()), seats.STOP_WHISPER_CAP)
+        self.assertIn("helm chat claim dispatch:c9c9c3d4", err)   # cmd never clipped
+
+    def test_new_head_after_a_take_offers_once(self):
+        seats.join(session="s-n", seat="ds4pro", cwd="/tmp/p")
+        now = time.time()
+        iso = lambda dt: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(dt))
+        self.plant_dispatch("11aa11aa11aa11aa", "ghost", lane="first", ts=iso(now - 600))
+        self.plant_dispatch("22bb22bb22bb22bb", "ghost", lane="second", ts=iso(now - 60))
+        rc, _o, err = self.guard({"session_id": "s-n"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("first", err)                  # head #1
+        # the seat took it: claim its key → head advances to #2, offered once
+        seats.claim("dispatch:11aa11aa", "ds4pro", ttl=300, session="s-other2")
+        rc, _o, err = self.guard({"session_id": "s-n"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("second", err)                 # new head, new fp → one offer
+        rc, _o, err = self.guard({"session_id": "s-n"}, args=["--seat", "ds4pro"])
+        self.assertEqual(rc, 0, err)                 # latched again
+
+
 class ClaimsTest(SeatsBase):
     def test_lease_is_the_capability_composite_binding(self):
         ok, msg, lease = seats.claim("worktree-main", "alice", ttl=60, session="sA")

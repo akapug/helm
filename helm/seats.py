@@ -1769,14 +1769,140 @@ def _unbanked_candidate(dirty, edits, latest):
             % _clip(_scrub(str(g.get("token") or "?")), 40))
 
 
-def _whisper_candidates(session, pending, inbox_blocked):
+# ── work-offer: the fleet self-saturation rung (AX primitive #1) ───────────
+# The owner-flagged gap: an idle seat let a dispatched review sit — the fleet
+# does not self-saturate (idle ds4pro never picked up a canary review). This
+# rung is the BOTTOM of the ladder (lowest salience): OWN work first (the ask /
+# dispatch / pending-inbox / claim signals all outrank it), then, only when the
+# seat is genuinely idle, ONE terse offer of the top UNOWNED backlog row. It
+# soft-holds once per backlog HEAD (fp = the row id) — never every stop — and
+# fails closed to silence.
+#
+# UNOWNED = not owned by a DIFFERENT live seat and not already claimed. A
+# dispatch is owned by its recipient: a row assigned to THIS idle seat, or
+# stranded to an absent/gone recipient, is offerable; a row in-flight to
+# another LIVE seat is theirs — never poach it (the litmus's "offer only
+# unowned work"). Two DELIBERATE non-sources: owner-asks — the ask rung above
+# already surfaces every unreported ask (own work first) and the idle gate
+# requires none, so an idle seat's realized offer never draws from them; and
+# the todo mirror — a pull surface with no claim-handoff verb (todos.py) whose
+# fleet read is O(sessions), off the stop hot path by design.
+
+def _live_seats():
+    """Casefolded seat names with a recent presence beat (fresh/quiet, not
+    absent) — one roster read. This is the ownership truth for the offer
+    filter: an absent recipient's work is stranded, a live recipient's is
+    in-flight and off-limits."""
+    live = set()
+    for seat, row in roster().items():
+        if presence_of(last_seen(seat, row)) != "absent":
+            live.add(str(seat).casefold())
+    return live
+
+
+def _live_claims():
+    """The live (unexpired) claim leases as a swept dict, or None when the
+    claims file EXISTS but cannot be read/parsed — 'unsure', which every caller
+    fails closed on. A MISSING file is not unsure: no file ⇒ no claims ⇒ {}
+    (pk.read_json masks a corrupt file as {}, so this reads directly to tell the
+    two apart)."""
+    try:
+        with open(claims_path(), encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return _sweep(raw)
+    except Exception:
+        return None
+
+
+def _session_holds_claim(session):
+    """Does THIS session hold any live claim lease? Mid-claim ⇒ not idle ⇒ no
+    offer. FAIL-CLOSED: a claims file we cannot read reads as busy (never offer
+    on uncertainty)."""
+    if not session:
+        return False
+    c = _live_claims()
+    if c is None:
+        return True
+    return any(isinstance(v, dict) and v.get("session") == str(session)
+               for r, v in c.items() if r != "_fence")
+
+
+def _offer_rows(seat):
+    """Ranked (oldest/highest-priority first) UNOWNED, unclaimed dispatch
+    backlog this idle `seat` could take: [(id8, line, claim_cmd)]. open_rows()
+    is already (ts, id)-sorted, so rows[0] is the head. The claim resource is
+    `dispatch:<id8>` — a stable key any idle seat computes identically, so two
+    seats offered the same head collide on the claim and only one takes it. []
+    on any trouble, or when the live-claim set is UNKNOWN (fail-closed: an
+    unreadable claims file must never let us poach)."""
+    from . import dispatches
+    rows = dispatches.open_rows()
+    if not rows:
+        return []
+    c = _live_claims()
+    if c is None:
+        return []
+    live = _live_seats()
+    claimed = {r for r in c if r != "_fence"}
+    me = str(seat or "").casefold()
+    out = []
+    for r in rows:
+        rid = str(r.get("id") or "")
+        if len(rid) < 8:
+            continue
+        res = "dispatch:" + rid[:8]
+        if res in claimed:
+            continue                     # already taken by another idle seat
+        recip = str(r.get("recipient") or "").casefold()
+        if recip and recip != me and recip in live:
+            continue                     # in-flight to another live seat — theirs
+        line = _clip(_scrub(str(r.get("lane") or "review")).strip(), 48) \
+            or "review"
+        out.append((rid[:8], line, "helm chat claim " + res))
+    return out
+
+
+def _work_offer_candidate(session, seat, ask, dsp, pending, inbox_blocked):
+    """The BOTTOM rung: offer the top unowned backlog row to a GENUINELY idle
+    seat. IDLE GATE — every own-work signal must be clear: the ask + dispatch
+    rungs produced nothing, no undelivered inbox row, and this session holds no
+    live claim lease. Any of those ⇒ not idle ⇒ no offer (own work first, then
+    offered work). Even after a higher rung LATCHES, this gate keeps the offer
+    silent while the obligation stands. fp = offer:<id8> so ONE offer lands per
+    backlog HEAD (a re-stop on the same head passes; a new head offers once).
+    FAIL-CLOSED to None."""
+    if not seat or ask or dsp or pending or inbox_blocked:
+        return None
+    if _session_holds_claim(session):
+        return None
+    try:
+        rows = _offer_rows(seat)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    rid, line, claim = rows[0]
+    return ("offer:%s" % rid,
+            "you're free — top of backlog is %s: %s. Take it (%s) or pass."
+            % (rid, line, claim))
+
+
+def _whisper_candidates(session, seat, pending, inbox_blocked):
     """[(fp, line)] of LIVE whisper signals, salience-ordered: owner-ask >
-    stuck > red-gate > stale-pending > unverified > unbanked-green > dirty.
-    Signals are cheap local reads only (reflex law): the session's record.py
-    counters + verify-grounding logs (command-log/edit-targets) + the pending
-    rows the guard already computed. Each fp carries a LEVEL bucket so a
+    stuck > red-gate > stale-pending > unverified > unbanked-green > dirty >
+    work-offer. Signals are cheap local reads only (reflex law): the session's
+    record.py counters + verify-grounding logs (command-log/edit-targets) + the
+    pending rows the guard already computed. Each fp carries a LEVEL bucket so a
     worsening streak re-fires (reflex escalate law) and a new pending set,
-    red run, or green state re-arms."""
+    red run, or green state re-arms. The work-offer rung sits LAST (own work
+    before offered work) and only fires for a genuinely idle seat."""
     out = []
     ask = _ask_candidate()   # owner-ask rung: unsurfaced owner debt outranks all
     if ask:
@@ -1839,6 +1965,9 @@ def _whisper_candidates(session, pending, inbox_blocked):
                     "%d dirtying ops with no commit at stop — bank the green "
                     "slice before idling; hot context is fuel (pull: git "
                     "status, then commit)" % dirty))
+    off = _work_offer_candidate(session, seat, ask, dsp, pending, inbox_blocked)
+    if off:                  # the BOTTOM rung: offered work, only when idle
+        out.append(off)
     return out
 
 
@@ -1849,7 +1978,7 @@ def _stop_whisper(session, room, seat, pending, inbox_blocked):
     and appends one measurability row to the stop-whisper ledger (ids only,
     never text — the fire-ledger law). FAIL-CLOSED TO NOTHING: any state or
     ledger trouble yields silence, never a raise, never a louder lane."""
-    cands = _whisper_candidates(session, pending, inbox_blocked)
+    cands = _whisper_candidates(session, seat, pending, inbox_blocked)
     if not cands:
         return None
     path = _stop_fp_path(room, seat, session, kind="stopwhisper")
@@ -1891,9 +2020,11 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
       (c) WHISPER — the contextual continuation lane (_stop_whisper): ONE
           budgeted nudge from the live signals (stuck/dirty counters, the
           verify-grounding rungs — red gate, unverified edits, unbanked
-          green — and the latched-but-unlanded pending set), once per (signal, level)
-          fingerprint, riding an existing block or soft-holding alone;
-          HELM_STOP_GUARD_WHISPER=0 disables; fail-closed to nothing.
+          green — the latched-but-unlanded pending set, and, at the BOTTOM,
+          the work-offer of the top unowned backlog row to a genuinely idle
+          seat), once per (signal, level) fingerprint, riding an existing
+          block or soft-holding alone; HELM_STOP_GUARD_WHISPER=0 disables;
+          fail-closed to nothing.
       (d) WARN — clean stop: one line reminding to arm the idle-wake beacon.
       (e) silent mechanical — `helm index cap --apply` best-effort in-process
           (the documented Stop line, docs/VERBS.md): never blocks, never

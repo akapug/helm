@@ -63,7 +63,10 @@ _ROSTER_CONSUMERS = {
         "PUBLISH OWNER: every roster-borne string emits through "
         "_pub_row / _seat_label (roster_report, presence_report, the CLI "
         "glance verbs, the mutation-helper echoes); field-complete guard is "
-        "tests/test_presence.py::RosterLaunderCompletenessTest."),
+        "tests/test_presence.py::RosterLaunderCompletenessTest. The "
+        "work-offer rung's _live_seats() is INTERNAL-MATCHING-ONLY — it reads "
+        "keys into a casefolded set for the poaching filter and never emits "
+        "one (the offer line carries a dispatch id + lane, no roster key)."),
     "todos.py": (
         "LAUNDERED: fleet()/_row run the seat KEY + project through _lbl "
         "(_scrub + _clip) before the fleet table AND the /api/todos JSON; "
@@ -94,7 +97,7 @@ _ROSTER_CALL_COUNTS = {
     "codexhomes.py": 1,
     "hooks.py": 1,
     "seat.py": 2,
-    "seats.py": 15,
+    "seats.py": 16,
     "todos.py": 1,
     "web.py": 2,
 }
