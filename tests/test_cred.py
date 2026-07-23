@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import stat
 import tempfile
 import time
@@ -66,8 +67,13 @@ class CredBase(unittest.TestCase):
                 "organizationName": org}}, f)
         if token is not None:
             with open(os.path.join(d, ".credentials.json"), "w") as f:
-                json.dump({"claudeAiOauth": {"refreshToken": token,
-                                             "accessToken": token + "-A"}}, f)
+                # a live-looking expiry: real credential files always carry
+                # one, and the unattended heal REFUSES a snapshot whose
+                # freshness it cannot prove (expiry-unknown) — tests of that
+                # refusal write their own credential file without it
+                json.dump({"claudeAiOauth": {
+                    "refreshToken": token, "accessToken": token + "-A",
+                    "expiresAt": int((time.time() + 3600) * 1000)}}, f)
         cred.cache_clear()
         return d
 
@@ -323,8 +329,10 @@ class BackupTest(CredBase):
             self.assertEqual(stat.S_IMODE(os.stat(s["path"]).st_mode), 0o700)
 
     def test_backup_all_covers_every_authed_home(self):
-        self.plant("david-example-invalid", "owner@example.invalid")
-        self.plant("team-example-com", "hey@simbi.com")
+        # distinct tokens: one family belongs to ONE account — two accounts
+        # sharing bytes is the mixed-home shape capture now refuses
+        self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-DAVID")
+        self.plant("team-example-com", "hey@simbi.com", token="FAKE-SIMBI")
         self.plant("no-creds-com", "no@creds.com", token=None)
         done = {r["account"] for r in cred.backup_all(apply=True) if r["action"] == "backup"}
         self.assertEqual(done, {"owner@example.invalid", "hey@simbi.com"})
@@ -693,6 +701,198 @@ class HealTest(CredBase):
         finally:
             self._holders.start()
 
+    def foreign(self, pid):
+        """Patch the uid seam so `pid` reads as another user's process, and
+        deny every read under its /proc dir — the kernel's behavior for a
+        foreign environ. create=True so the patch also applies to code that
+        lacks the seam (the stash-verified pre-fix behavior)."""
+        marker = os.sep + str(pid)
+        me = os.geteuid()
+        uidp = mock.patch.object(
+            cred, "_proc_uid", create=True,
+            new=lambda pdir: me + 1 if pdir.endswith(marker) else me)
+        real_open = open
+
+        def denied(path, *a, **kw):
+            if marker + os.sep in str(path):
+                raise PermissionError("synthetic foreign-uid environ")
+            return real_open(path, *a, **kw)
+
+        openp = mock.patch("builtins.open", side_effect=denied)
+        return uidp, openp
+
+    def test_foreign_uid_unreadable_pids_do_not_poison_the_scan(self):
+        """The live-probed bug: on any real host, other users' pids raise
+        EACCES on environ, and ONE such pid turned the whole scan into
+        uncertainty — heal was a permanent no-op. A holder of our 0600
+        credentials is necessarily our uid; foreign pids are structurally
+        not holders, never uncertainty."""
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, _ = self.fake_proc(4242, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            self.fake_proc(5555, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            uidp, openp = self.foreign(5555)
+            with mock.patch.object(cred, "PROC_ROOT", root), uidp, openp:
+                self.assertEqual(cred.holders_of(d), [(4242, "claude")])
+        finally:
+            self._holders.start()
+
+    def test_same_uid_read_error_is_still_uncertainty(self):
+        """Scoping to our uid must not soften the fail-closed core: a SAME-UID
+        pid whose environ cannot be read while the pid persists stays None."""
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, p = self.fake_proc(4242, b"")
+            real_open = open
+
+            def denied(path, *a, **kw):
+                if str(path).endswith(os.path.join(str(4242), "environ")):
+                    raise PermissionError("synthetic")
+                return real_open(path, *a, **kw)
+
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    mock.patch("builtins.open", side_effect=denied):
+                self.assertIsNone(cred.holders_of(d))
+        finally:
+            self._holders.start()
+
+    def test_pid_vanishing_mid_scan_is_absence_not_uncertainty(self):
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, _ = self.fake_proc(4242, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            _, p9 = self.fake_proc(9999, b"")
+            real_open = open
+
+            def vanishing(path, *a, **kw):
+                if (os.sep + "9999" + os.sep) in str(path):
+                    shutil.rmtree(p9, ignore_errors=True)
+                    raise FileNotFoundError(path)
+                return real_open(path, *a, **kw)
+
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    mock.patch("builtins.open", side_effect=vanishing):
+                self.assertEqual(cred.holders_of(d), [(4242, "claude")])
+        finally:
+            self._holders.start()
+
+    def deny_environ(self, *pids):
+        """The kernel's shape for a ptrace-protected same-uid pid: environ is
+        EACCES while comm (0444, world-readable even for non-dumpable
+        processes) still answers."""
+        real_open = open
+        markers = tuple(os.sep + str(p) + os.sep + "environ" for p in pids)
+        def denied(path, *a, **kw):
+            if str(path).endswith(markers):
+                raise PermissionError("synthetic ptrace-protected environ")
+            return real_open(path, *a, **kw)
+        return mock.patch("builtins.open", side_effect=denied)
+
+    def test_protected_non_claude_comm_is_structurally_not_a_holder(self):
+        """The live residue the uid-scoping fix surfaced: ~239 same-uid pids
+        (systemd --user, git helpers, ssh-agent, sandbox children) hold EACCES
+        environs FOREVER, keeping heal at cannot-probe for good. Their
+        world-readable comm proves they are not claude-harness processes — a
+        claude session cannot wear `systemd`'s comm — so they are structurally
+        not holders, never uncertainty."""
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, _ = self.fake_proc(4242, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            for pid, comm in ((9001, "systemd"), (9002, "git"), (9003, "ssh-agent")):
+                self.fake_proc(pid, b"", comm=comm)
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    self.deny_environ(9001, 9002, 9003):
+                self.assertEqual(cred.holders_of(d), [(4242, "claude")])
+        finally:
+            self._holders.start()
+
+    def test_protected_claude_family_comm_stays_uncertainty(self):
+        """The pin's other half: a non-dumpable pid that COULD be a claude
+        host (comm `claude`, or the node comms a claude estate actually shows)
+        keeps the scan at None — fail closed where a live session could be
+        evicted."""
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            for pid, comm in ((9001, "claude"), (9002, "node"),
+                              (9003, "node-MainThread"), (9004, "claude-code")):
+                root, p = self.fake_proc(pid, b"", comm=comm)
+                with mock.patch.object(cred, "PROC_ROOT", root), self.deny_environ(pid):
+                    self.assertIsNone(cred.holders_of(d), comm)
+                shutil.rmtree(p)
+        finally:
+            self._holders.start()
+
+    def test_protected_pid_with_unreadable_comm_stays_uncertainty(self):
+        self._holders.stop()
+        try:
+            d = self.plant("david-example-invalid", "owner@example.invalid")
+            root, _ = self.fake_proc(9001, b"", comm="systemd")
+            real_open = open
+            suffixes = tuple(os.path.join("9001", f) for f in ("environ", "comm"))
+            def denied(path, *a, **kw):
+                if str(path).endswith(suffixes):
+                    raise PermissionError("synthetic")
+                return real_open(path, *a, **kw)
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    mock.patch("builtins.open", side_effect=denied):
+                self.assertIsNone(cred.holders_of(d))
+        finally:
+            self._holders.start()
+
+    def test_heal_reaches_ready_through_ptrace_protected_system_pids(self):
+        """End-to-end pin of the policy on the live-box shape: with only
+        protected NON-claude pids in the table, a free drifted home plans
+        `ready` instead of the forever cannot-probe it planned before."""
+        self._holders.stop()
+        try:
+            self.drifted()
+            root, _ = self.fake_proc(9001, b"", comm="systemd")
+            self.fake_proc(9002, b"", comm="git")
+            with mock.patch.object(cred, "PROC_ROOT", root), \
+                    self.deny_environ(9001, 9002):
+                plan = cred.heal()["plans"][0]
+            self.assertEqual(plan["status"], "ready", plan)
+            self.assertEqual(plan["holders"], [])
+        finally:
+            self._holders.start()
+
+    def test_heal_dry_run_reaches_ready_through_the_real_probe(self):
+        """End-to-end pin of the bug: a free drifted home with a snapshot must
+        plan `ready` even though the process table holds foreign-uid pids —
+        before the fix this was cannot-probe on every real multi-user host."""
+        self._holders.stop()
+        try:
+            d = self.drifted()
+            root, _ = self.fake_proc(5555, b"CLAUDE_CONFIG_DIR=" + os.fsencode(d) + b"\0")
+            uidp, openp = self.foreign(5555)
+            with mock.patch.object(cred, "PROC_ROOT", root), uidp, openp:
+                res = cred.heal()
+            plan = res["plans"][0]
+            self.assertEqual(plan["status"], "ready", plan)
+            self.assertEqual(plan["holders"], [])
+        finally:
+            self._holders.start()
+
+    def test_cannot_probe_reason_matches_the_actual_platform(self):
+        """`no /proc` was reported even where /proc was right there. The two
+        distinct uncertainties get two distinct reasons."""
+        self.drifted()
+        with mock.patch.object(cred, "holders_of", lambda p, default=False: None):
+            with mock.patch.object(cred, "PROC_ROOT",
+                                   os.path.join(self.tmp, "no-such-proc")):
+                plan = cred.heal()["plans"][0]
+                self.assertEqual(plan["status"], "cannot-probe")
+                self.assertIn("no /proc on this platform", plan["reason"])
+            with mock.patch.object(cred, "PROC_ROOT", self.tmp):
+                plan = cred.heal()["plans"][0]
+                self.assertEqual(plan["status"], "cannot-probe")
+                self.assertIn("same-uid", plan["reason"])
+                self.assertNotIn("no /proc", plan["reason"])
+
 
 class DoctorTest(CredBase):
     def test_drift_row_names_the_account_and_the_verb(self):
@@ -834,28 +1034,50 @@ class GuardFreshnessTest(CredBase):
     def test_the_guard_rides_the_turn_boundary_as_well_as_session_start(self):
         events = {s["event"] for s in cred.GUARD_SPECS}
         self.assertEqual(events, {"SessionStart", "Stop"})
-        self.assertEqual(len({s["name"] for s in cred.GUARD_SPECS}), 2)
+        self.assertEqual(len({s["name"] for s in cred.GUARD_SPECS}), 4)
         for s in cred.GUARD_SPECS:                    # hooks.py spec contract
-            self.assertEqual(s["args"], "cred backup --apply --quiet")
+            self.assertIn(s["args"], ("cred backup --apply --quiet",
+                                      "cred heal --apply --quiet"))
             self.assertIn("timeout", s)
-        self.assertIsNone(dict(  # Stop takes no matcher (hooks.SPECS' law)
-            (s["event"], s["matcher"]) for s in cred.GUARD_SPECS)["Stop"])
+            # Stop takes no matcher (hooks.SPECS' law); SessionStart takes *
+            self.assertEqual(s["matcher"], {"Stop": None}.get(s["event"], "*"))
+        for verb in ("backup", "heal"):               # each leg rides BOTH events
+            self.assertEqual({s["event"] for s in cred.GUARD_SPECS
+                              if verb in s["args"]}, {"SessionStart", "Stop"})
 
-    def test_install_writes_both_events_into_every_home(self):
+    def test_backup_precedes_heal_structurally(self):
+        """backup-before-heal is BY CONSTRUCTION: every backup spec sorts
+        before every heal spec, so _merge_event's append order puts the
+        snapshot hook ahead of the heal hook in each event's list."""
+        idx = {v: [i for i, s in enumerate(cred.GUARD_SPECS) if v in s["args"]]
+               for v in ("backup", "heal")}
+        self.assertTrue(idx["backup"] and idx["heal"])
+        self.assertLess(max(idx["backup"]), min(idx["heal"]))
+        self.assertEqual(cred.GUARD_SPECS, cred._BACKUP_GUARDS + cred._HEAL_GUARDS)
+
+    def install_estate(self, d):
         from helm import configs
-        d = self.plant("david-example-invalid", "owner@example.invalid")
         orig = (configs.HOME_ROOTS, configs.BACKUP_DIR)
         configs.HOME_ROOTS = [d]                      # the fake estate's gate
         configs.BACKUP_DIR = os.path.join(self.tmp, "config-backups")
         self.addCleanup(lambda: setattr(configs, "HOME_ROOTS", orig[0]))
         self.addCleanup(lambda: setattr(configs, "BACKUP_DIR", orig[1]))
-        rc, out, err = self.out(cred.cmd_cred, ["switch-guard", "--install", "--apply"])
+        return self.out(cred.cmd_cred, ["switch-guard", "--install", "--apply"])
+
+    def test_install_writes_both_events_into_every_home(self):
+        d = self.plant("david-example-invalid", "owner@example.invalid")
+        rc, out, err = self.install_estate(d)
         self.assertEqual(rc, 0, err)
         sp = os.path.join(homes.ROOTS["claude"], "david-example-invalid", "settings.json")
         cfg = json.load(open(sp))
         for event in ("SessionStart", "Stop"):
             cmds = [h["command"] for g in cfg["hooks"][event] for h in g["hooks"]]
-            self.assertTrue(any("cred backup --apply --quiet" in c for c in cmds), event)
+            for verb in ("cred backup --apply --quiet", "cred heal --apply --quiet"):
+                self.assertTrue(any(verb in c for c in cmds), (event, verb))
+            # ordering survives into the settings file itself
+            self.assertLess(next(i for i, c in enumerate(cmds) if "cred backup" in c),
+                            next(i for i, c in enumerate(cmds) if "cred heal" in c),
+                            event)
         # idempotent
         rc, out, _ = self.out(cred.cmd_cred, ["switch-guard", "--install", "--apply"])
         self.assertEqual(json.load(open(sp)), cfg)
@@ -889,6 +1111,418 @@ class GuardFreshnessTest(CredBase):
         plan = cred.heal()["plans"][0]
         self.assertFalse(plan["stale_pre_image"])
         self.assertNotIn("WARNING", plan["reason"])
+
+
+class GuardHealTest(CredBase):
+    """The guard's heal leg, run exactly as the installed hook runs it
+    (`cred heal --apply --quiet`) — the cto-example incident's replay: a home whose
+    credential was overwritten while a snapshot of the rightful account
+    exists."""
+
+    def incident(self):
+        """cto-example-com held cto@example.invalid, the guard's backup leg snapshotted it,
+        then a /login overwrote the home with owner@example.invalid."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        cred.backup(cto, apply=True)
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        return cto
+
+    def test_guard_command_restores_a_holder_free_home_silently(self):
+        d = self.incident()
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))
+        self.assertEqual(cred.account_of(d)["email"], "cto@example.invalid")
+        creds = json.load(open(os.path.join(d, ".credentials.json")))
+        self.assertEqual(creds["claudeAiOauth"]["refreshToken"], "FAKE-CTO")
+
+    def test_guard_command_never_evicts_a_live_borrower(self):
+        d = self.incident()
+        before = open(os.path.join(d, ".credentials.json"), "rb").read()
+        with mock.patch.object(cred, "holders_of",
+                               lambda p, default=False: [(4242, "claude")]):
+            rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((out, err), ("", ""))   # silent even on refusal
+        self.assertEqual(rc, 1)                  # honest exit; the hook's || true absorbs it
+        self.assertEqual(open(os.path.join(d, ".credentials.json"), "rb").read(),
+                         before)
+        self.assertEqual(cred.account_of(d)["email"], "owner@example.invalid")
+
+    def test_guard_heal_snapshots_the_overwritten_credential_before_restore(self):
+        """Nothing is ever lost in either direction: the occupant heal evicts
+        is itself snapshotted BEFORE the restore commits."""
+        d = self.incident()
+        self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        david = cred.snapshots("owner@example.invalid")
+        self.assertEqual(len(david), 1)
+        blob = json.load(open(os.path.join(david[-1]["path"], "credentials.json")))
+        self.assertEqual(blob["claudeAiOauth"]["refreshToken"], "FAKE-DAVID")
+        self.assertEqual(cred.account_of(d)["email"], "cto@example.invalid")
+
+    def test_quiet_no_op_prints_nothing_and_exits_zero(self):
+        """Hook law: silence on no-op — a clean estate injects zero context."""
+        self.plant("david-example-invalid", "owner@example.invalid")
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))
+
+
+class LineageTest(CredBase):
+    """The review pair's demonstrated revocation bomb, pinned: the live-bytes
+    clash check goes blind ONE borrower rotation after a byte-copy borrow —
+    the hashes diverge, the clash vanishes, and the guard's auto-heal would
+    restore the CONSUMED token, whose first refresh trips server-side reuse
+    detection and revokes the whole family, bricking the live borrower. The
+    family lineage remembers what the hashes forget."""
+
+    def test_a_borrower_rotation_never_unblinds_the_auto_heal(self):
+        """The executed repro, end-to-end through the exact hook command."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-S")
+        cred.backup(cto, apply=True)          # the guard's snapshot of token S
+        # token S byte-copied into a live borrower home (agreeing name, so
+        # only cto-example-com ever drifts in this replay)
+        self.plant("x-else-com", "x@else.com", token="FAKE-S")
+        # a fleet turn boundary passes: the heal leg's census records where
+        # each family is LIVE, exactly as the installed hook runs it
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))
+        # /login pollutes cto's home; then the borrower refreshes, ROTATING
+        # its copy of S — the live-bytes hash clash vanishes right here
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        self.plant("x-else-com", "x@else.com", token="FAKE-S-ROTATED")
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((out, err), ("", ""))
+        self.assertEqual(rc, 1)               # silent, honest refusal
+        self.assertEqual(cred.account_of(cto)["email"], "owner@example.invalid")
+        creds = json.load(open(os.path.join(cto, ".credentials.json")))
+        self.assertEqual(creds["claudeAiOauth"]["refreshToken"], "FAKE-DAVID")
+        plan = cred.heal()["plans"][0]
+        self.assertEqual(plan["status"], "revocation-risk")
+        self.assertIn("x-else-com", plan["reason"])
+        self.assertIn("claude /login", plan["reason"])
+
+    def test_the_hook_refuses_the_stale_pre_image_the_manual_path_warns_about(self):
+        """Warnings are for humans: the hook auto-types --apply and --quiet
+        swallows every line, so what the CLI surfaces the hook must REFUSE."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        with open(os.path.join(cto, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {"refreshToken": "FAKE-CTO",
+                                         "expiresAt": 1}}, f)          # long dead
+        cred.cache_clear()
+        cred.backup(cto, apply=True)
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        before = open(os.path.join(cto, ".credentials.json"), "rb").read()
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (1, "", ""))
+        self.assertEqual(open(os.path.join(cto, ".credentials.json"), "rb").read(),
+                         before)              # untouched
+        plan = cred.heal(apply=True, hook=True)["plans"][0]
+        self.assertEqual(plan["status"], "stale-preimage")
+        self.assertIn("reuse detection", plan["reason"])
+        # the manual path still restores: the owner read the warning and
+        # typed --apply — the risk is accepted knowingly, not by a hook
+        res = cred.heal(apply=True)
+        self.assertEqual(res["plans"][0]["status"], "restored")
+        self.assertEqual(cred.account_of(cto)["email"], "cto@example.invalid")
+
+    def test_the_hook_refuses_a_snapshot_whose_expiry_it_cannot_read(self):
+        """An absent or unparseable expiresAt must fail CLOSED on the
+        unattended path: freshness that cannot be proven is not freshness.
+        The manual path warns and proceeds, as with stale."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        with open(os.path.join(cto, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {"refreshToken": "FAKE-CTO",
+                                         "accessToken": "FAKE-CTO-A",
+                                         "expiresAt": "soon"}}, f)  # unparseable
+        cred.cache_clear()
+        self.assertTrue(cred.backup(cto, apply=True)["ok"])
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        before = open(os.path.join(cto, ".credentials.json"), "rb").read()
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (1, "", ""))
+        self.assertEqual(open(os.path.join(cto, ".credentials.json"), "rb").read(),
+                         before)              # untouched
+        plan = cred.heal(apply=True, hook=True)["plans"][0]
+        self.assertEqual(plan["status"], "expiry-unknown")
+        self.assertIn("fail closed", plan["reason"])
+        res = cred.heal(apply=True)
+        self.assertEqual(res["plans"][0]["status"], "restored")
+        self.assertEqual(cred.account_of(cto)["email"], "cto@example.invalid")
+
+    def test_count_pruning_never_evicts_a_family_a_snapshot_still_claims(self):
+        """LINEAGE_KEEP caps the FORGETTABLE families only: while a surviving
+        snapshot's meta claims a family, its lineage entry outlives any count
+        of newer families — otherwise the ever-live-elsewhere refusal would
+        expire while the consumed token it guards is still restorable."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-S")
+        cred.backup(cto, apply=True)
+        self.plant("x-else-com", "x@else.com", token="FAKE-S")
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))          # census: S lives in both
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        self.plant("x-else-com", "x@else.com", token="FAKE-S-ROTATED")
+        # 600 newer distinct families flood the lineage, far past the cap
+        cred._lineage_record([("fam%04d" % i, "flood-home", None)
+                              for i in range(600)])
+        fams = cred._lineage_load()
+        self.assertEqual(len(fams), cred.LINEAGE_KEEP)         # the cap held...
+        fam = hashlib.sha256(b"FAKE-S").hexdigest()[:10]
+        self.assertIn(fam, fams)                               # ...but S survived
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((out, err), ("", ""))
+        self.assertEqual(rc, 1)                                # still refused
+        plan = cred.heal()["plans"][0]
+        self.assertEqual(plan["status"], "revocation-risk")
+        self.assertIn("x-else-com", plan["reason"])
+
+    def test_an_identical_skip_backup_still_censuses_the_family(self):
+        """keepalive's pre-rotation capture lands on the identical-skip path
+        whenever the home was already snapshotted at the last turn boundary;
+        the observation must still enter the lineage, or a byte-copy borrowed
+        elsewhere could be auto-restored after the grant consumes it."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-S")
+        cred.backup(cto, apply=True)
+        os.unlink(cred._lineage_path())       # forget every observation
+        res = cred.backup(cto, apply=True)
+        self.assertEqual(res["action"], "skip")
+        fam = hashlib.sha256(b"FAKE-S").hexdigest()[:10]
+        entry = cred._lineage_load()[fam]
+        self.assertEqual(entry["homes"], ["cto-example-com"])
+        self.assertEqual(entry["accounts"], ["cto@example.invalid"])
+        # ...and the dry-run stays a filesystem no-op
+        os.unlink(cred._lineage_path())
+        before = self.tree_state()
+        cred.backup(cto, apply=False)
+        self.assertEqual(self.tree_state(), before)
+
+    def test_first_ever_capture_refuses_tokens_the_lineage_binds_elsewhere(self):
+        """The no-history gap, closed: _foreign_family needs a snapshot on
+        record, but the lineage census sees every live home each turn
+        boundary — so a fresh identity over another account's stale tokens
+        (the opposite tear) is refused even on the FIRST-ever backup of a
+        home."""
+        home = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))          # census only
+        self.assertEqual(cred.snapshots("cto@example.invalid"), [])     # never snapshotted
+        # a /login writes the identity file first; the token file still holds
+        # cto's credentials — the opposite tear, mid-flight
+        with open(os.path.join(home, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {"emailAddress": "eve@ex.com",
+                                        "accountUuid": "u-e",
+                                        "organizationName": "O"}}, f)
+        cred.cache_clear()
+        res = cred.backup(home, apply=True)
+        self.assertFalse(res["ok"])
+        self.assertIn("another account", res["reason"])
+        self.assertEqual(cred.snapshots("eve@ex.com"), [])     # nothing poisoned
+
+    def test_lineage_record_merges_and_survives_a_failed_lock(self):
+        """The read-modify-write runs under an flock; a lock that cannot be
+        taken degrades to the old best-effort write, never to a crash."""
+        cred._lineage_record([("famaaaaaa01", "h1", "a@x.com")])
+        with mock.patch.object(cred.fcntl, "flock", side_effect=OSError):
+            cred._lineage_record([("famaaaaaa02", "h2", "b@x.com")])
+        fams = cred._lineage_load()
+        self.assertEqual(fams["famaaaaaa01"]["accounts"], ["a@x.com"])
+        self.assertEqual(fams["famaaaaaa02"]["homes"], ["h2"])
+        st = os.stat(cred._lineage_path() + ".lock")
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
+
+    def test_a_login_mid_census_never_records_a_cross_account_pairing(self):
+        """The census/login race, pinned dead. The estate census reads a home's
+        token FAMILY (.credentials.json, via homes_list) and its ACCOUNT
+        (.claude.json, via verdict_for) with a window between the two. A /login
+        completing inside that window makes the census pair the EVICTED
+        account's family with the ARRIVING account's identity — a pairing that
+        never existed on disk. Because the lineage accounts column is union-only
+        and never pruned, that phantom pairing would thereafter auto-heal-refuse
+        cto's own legitimate snapshots as torn. The stat-bracketed re-read drops
+        the mid-write home this cycle instead of recording the tear."""
+        home = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        cto_real = os.path.realpath(home)
+        fam_cto = hashlib.sha256(b"FAKE-CTO").hexdigest()[:10]
+        fam_david = hashlib.sha256(b"FAKE-DAVID").hexdigest()[:10]
+        orig = homes._token_family
+        fired = []
+
+        def teared(provider, h):
+            # Fire once, on the census's FIRST family read of cto's home: return
+            # cto's real (old) family, THEN let david's /login land in the same
+            # home — so the account read that follows sees david, not cto.
+            if provider == "claude" and os.path.realpath(h) == cto_real and not fired:
+                fired.append(1)
+                fam = orig(provider, h)
+                with open(os.path.join(cto_real, ".claude.json"), "w") as f:
+                    json.dump({"oauthAccount": {"emailAddress": "owner@example.invalid",
+                                                "accountUuid": "u-d",
+                                                "organizationName": "O"}}, f)
+                with open(os.path.join(cto_real, ".credentials.json"), "w") as f:
+                    json.dump({"claudeAiOauth": {
+                        "refreshToken": "FAKE-DAVID",
+                        "accessToken": "FAKE-DAVID-A",
+                        "expiresAt": int((time.time() + 3600) * 1000)}}, f)
+                cred.cache_clear()
+                return fam
+            return orig(provider, h)
+
+        with mock.patch.object(homes, "_token_family", teared):
+            cred.heal(apply=True)                 # the apply-path census (record=True)
+        self.assertTrue(fired)                    # the race was actually exercised
+        # cto's family must NOT have been filed under david — the phantom pair
+        # that would brick cto's own snapshots on every later heal.
+        self.assertNotIn("owner@example.invalid", cred._lineage_accounts(fam_cto))
+        self.assertEqual(cred._lineage_accounts(fam_cto), set())   # dropped this cycle
+        # and the true, coherent state that landed IS recorded — the census still
+        # works, it only refuses the torn read.
+        self.assertEqual(cred._lineage_accounts(fam_david), {"owner@example.invalid"})
+
+
+class TornPairTest(CredBase):
+    """A backup that fires mid-/login can pair one account's freshly-landed
+    TOKENS with another account's still-old IDENTITY — claude's two-file
+    login write order is UNVERIFIED upstream, so nothing here assumes
+    atomicity. A tear is an IDENTITY DISCONTINUITY, never a timing skew: the
+    routine same-account refresh-rotation produces the exact same write
+    shape (token file rewritten moments before the Stop capture, identity
+    file legitimately older) and that snapshot is the NORMAL pre-image — the
+    freshly rotated token is the very thing the guard exists to keep. The
+    defense is layered: heal refuses (hook) or warns (manual) on family-claim
+    evidence of a misbind; a mixed home whose token bytes already belong to
+    another account's snapshots or lineage never becomes a snapshot at all;
+    and the restore commit itself is signal-masked so the guard's own
+    `timeout 10` SIGTERM cannot mint the mixed home."""
+
+    def rotation_pre_image(self):
+        """The r3 false positive's fixture, verbatim: cto's home refreshes
+        mid-session (ROTATING the token — only .credentials.json rewritten,
+        .claude.json a minute older), and the Stop hook snapshots it moments
+        later. Same account in both files: the normal captured pre-image."""
+        home = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO-OLD")
+        old = time.time() - 60
+        os.utime(os.path.join(home, ".claude.json"), (old, old))
+        cred.cache_clear()
+        with open(os.path.join(home, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {
+                "refreshToken": "FAKE-CTO-ROTATED",
+                "accessToken": "FAKE-CTO-ROTATED-A",
+                "expiresAt": int((time.time() + 3600) * 1000)}}, f)
+        cred.cache_clear()
+        self.assertTrue(cred.backup(home, apply=True)["ok"])
+        return home
+
+    def test_a_same_account_rotation_pre_image_is_never_torn(self):
+        """The false positive, pinned dead: the rotation-fresh snapshot is
+        the exact pre-image the guard captures, and the guard's own hook
+        command restores it — the evicted account is NOT bricked."""
+        home = self.rotation_pre_image()
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (0, "", ""))
+        self.assertEqual(cred.account_of(home)["email"], "cto@example.invalid")
+        creds = json.load(open(os.path.join(home, ".credentials.json")))
+        self.assertEqual(creds["claudeAiOauth"]["refreshToken"],
+                         "FAKE-CTO-ROTATED")
+
+    def test_a_real_tear_is_refused_on_identity_discontinuity_evidence(self):
+        """The realistic tear, end to end: alice's /login lands her tokens in
+        david's home moments before the Stop capture (identity file still
+        david's — the misbound snapshot is filed under david), alice's login
+        completes, a turn boundary censuses her live in that home, then bob
+        pollutes it. The hook refuses the torn snapshot; the manual path
+        warns and proceeds — the owner accepts the risk knowingly."""
+        home = self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-AL")
+        old = time.time() - 60
+        os.utime(os.path.join(home, ".claude.json"), (old, old))
+        cred.cache_clear()
+        self.assertTrue(cred.backup(home, apply=True)["ok"])   # misbound: filed under david
+        self.plant("david-example-invalid", "alice@ex.com", token="FAKE-AL")  # login completes
+        # a fleet turn boundary passes: the census records alice live with
+        # that family — while she HOLDS the home, heal refuses on occupant
+        # evidence (her own tokens are the snapshot's bytes)
+        with mock.patch.object(cred, "holders_of",
+                               lambda p, default=False: [(4242, "claude")]):
+            rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((rc, out, err), (1, "", ""))          # held, censused
+        self.plant("david-example-invalid", "bob@ex.com", token="FAKE-BOB")   # later drift
+        before = open(os.path.join(home, ".credentials.json"), "rb").read()
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((out, err), ("", ""))
+        self.assertEqual(rc, 1)
+        self.assertEqual(open(os.path.join(home, ".credentials.json"), "rb").read(),
+                         before)              # the misroute never happened
+        plan = cred.heal(apply=True, hook=True)["plans"][0]
+        self.assertEqual(plan["status"], "torn-pair")
+        self.assertIn("alice@ex.com", plan["reason"])
+        self.assertIn("claude /login", plan["reason"])
+        # the manual dry-run WARNS on the same evidence, and manual --apply
+        # proceeds: the owner read the warning and typed --apply
+        plan = cred.heal()["plans"][0]
+        self.assertEqual(plan["status"], "ready")
+        self.assertIn("WARNING", plan["reason"])
+        self.assertIn("alice@ex.com", plan["reason"])
+        res = cred.heal(apply=True)
+        self.assertEqual(res["plans"][0]["status"], "restored")
+        self.assertEqual(cred.account_of(home)["email"], "owner@example.invalid")
+
+    def test_a_torn_snapshot_is_refused_while_its_token_owner_occupies(self):
+        """Occupant evidence alone (no census ever ran): the snapshot's token
+        bytes are what the current occupant holds live — restoring would
+        rebind the occupant's own tokens under the evicted identity."""
+        home = self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-AL")
+        old = time.time() - 60
+        os.utime(os.path.join(home, ".claude.json"), (old, old))
+        cred.cache_clear()
+        self.assertTrue(cred.backup(home, apply=True)["ok"])
+        self.plant("david-example-invalid", "alice@ex.com", token="FAKE-AL")  # login completes
+        rc, out, err = self.out(cred.cmd_cred, ["heal", "--apply", "--quiet"])
+        self.assertEqual((out, err), ("", ""))
+        self.assertEqual(rc, 1)
+        plan = cred.heal(apply=True, hook=True)["plans"][0]
+        self.assertEqual(plan["status"], "torn-pair")
+        self.assertIn("alice@ex.com", plan["reason"])
+        self.assertEqual(cred.account_of(home)["email"], "alice@ex.com")
+
+    def test_a_mixed_home_never_becomes_a_snapshot(self):
+        """The post-tear mixed home — account A's token bytes under account
+        B's identity — is refused at CAPTURE, where the estate's own snapshot
+        history makes the misbinding checkable. No poisoned pre-image is ever
+        filed for a later restore to trust."""
+        a = self.plant("david-example-invalid", "owner@example.invalid", token="FAKE-DAVID")
+        self.assertTrue(cred.backup(a, apply=True)["ok"])   # david's family on record
+        mixed = self.plant("bob-ex-com", "bob@ex.com", token="FAKE-DAVID")
+        res = cred.backup(mixed, apply=True)
+        self.assertFalse(res["ok"])
+        self.assertIn("another account", res["reason"])
+        self.assertEqual(cred.snapshots("bob@ex.com"), [])
+
+    def test_the_two_file_commit_is_signal_masked(self):
+        """The heal hook runs under `timeout 10` — a SCHEDULED SIGTERM, not
+        crash luck. One landing between the two os.replace calls would leave
+        restored credentials under the occupant's identity; the commit blocks
+        catchable termination signals, so the kill only lands after BOTH
+        files (and the verify) are done."""
+        cto = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        cred.backup(cto, apply=True)
+        self.plant("cto-example-com", "owner@example.invalid", token="FAKE-DAVID")
+        snap = cred.snapshots("cto@example.invalid")[-1]["path"]
+        landed, delivered = [], []
+        prev = signal.signal(signal.SIGTERM,
+                             lambda *a: delivered.append(len(landed)))
+        self.addCleanup(signal.signal, signal.SIGTERM, prev)
+        real_replace = os.replace
+        def kill_mid_commit(src, dst, *a, **kw):
+            real_replace(src, dst, *a, **kw)
+            landed.append(dst)
+            if len(landed) == 1:              # right between the two replaces
+                os.kill(os.getpid(), signal.SIGTERM)
+        with mock.patch.object(cred.os, "replace", kill_mid_commit):
+            res = cred.restore(snap, cto)
+        self.assertTrue(res["ok"])
+        self.assertEqual(delivered, [2])      # the kill waited out the commit
+        self.assertEqual(cred.account_of(cto)["email"], "cto@example.invalid")
+        creds = json.load(open(os.path.join(cto, ".credentials.json")))
+        self.assertEqual(creds["claudeAiOauth"]["refreshToken"], "FAKE-CTO")
 
 
 class SecrecyTest(CredBase):

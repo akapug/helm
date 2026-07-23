@@ -965,6 +965,15 @@ class ProcSnapshotTest(unittest.TestCase):
         with mock.patch.object(session, "_proc_matches", return_value=False):
             self.assertIsNone(session._proc_snapshot(41))
 
+    def test_snapshot_captures_stdin_redirection(self):
+        # fd/0 is the print-mode evidence _proc_claude_rows composes into
+        # `headless`; unreadable fd stays None (proves nothing)
+        base = self.plant()
+        self.assertIsNone(session._proc_snapshot(41)["stdin"])
+        os.makedirs(os.path.join(base, "fd"))
+        os.symlink("pipe:[777]", os.path.join(base, "fd", "0"))
+        self.assertEqual(session._proc_snapshot(41)["stdin"], "pipe:[777]")
+
     def test_environment_change_breaks_process_bracket(self):
         self.plant()
         snap = session._proc_snapshot(41)
@@ -1060,6 +1069,596 @@ class ProcCensusTest(unittest.TestCase):
         rows = self.rows([self.snap()],
                          {41: (self.NEW, "record-ok", "/cfg")}, matches=False)
         self.assertEqual(rows, [])
+
+    def test_a_piped_spawn_without_p_is_still_a_sessionless_oneshot(self):
+        # the CLI enters print mode by itself when stdin is not a terminal,
+        # so the census composes the argv scan with the proven stdin
+        # redirection: the legit piped one-shot that omitted -p keeps its
+        # certification green even after headless joined the sessionless
+        # conjunct
+        snap = self.snap(argv=["claude", "--no-session-persistence"])
+        snap["stdin"] = "pipe:[4242]"
+        row = self.rows([snap], {41: (None, "record-missing", "/cfg")})[0]
+        self.assertTrue(row["headless"])
+        self.assertTrue(row["nonpersistent"])
+        self.assertTrue(session._sessionless_oneshot(row))
+
+    def test_a_tty_pane_with_the_inert_flag_stays_a_pane(self):
+        # the other direction of the same conjunct: on a live terminal the
+        # flag is inert, print mode never engages, and the row must stay in
+        # the census as an unresolved pane rather than certify sessionless
+        snap = self.snap(argv=["claude", "--no-session-persistence"])
+        snap["stdin"] = "/dev/pts/7"
+        row = self.rows([snap], {41: (None, "record-missing", "/cfg")})[0]
+        self.assertFalse(row["headless"])
+        self.assertTrue(row["nonpersistent"])
+        self.assertFalse(session._sessionless_oneshot(row))
+
+
+class HeadlessCensusTest(unittest.TestCase):
+    """A SESSIONLESS one-shot is not an agent pane, and the census must not
+    count it as one — but `headless` is only an INTERACTION MODE, never proof
+    of sessionlessness: print mode persists unless --no-session-persistence is
+    requested, and `claude -p --resume <sid>` is a proven live holder. What
+    leaves the health arithmetic is decided by _sessionless_oneshot (mode AND
+    no explicit session identity), never by -p alone."""
+
+    def test_the_live_remember_plugin_invocation_is_sessionless(self):
+        # verbatim argv measured 2026-07-22 — the call that flipped a CERTIFIED
+        # estate to a memory-only FAIL twenty minutes later. It is excluded on
+        # its EXPLICIT nonpersistence evidence, not on -p alone.
+        argv = ["/home/owner/.local/bin/claude", "-p", "--output-format", "json",
+                "--no-session-persistence", "--exclude-dynamic-system-prompt"]
+        self.assertTrue(session._is_headless(argv))
+        self.assertTrue(session._is_nonpersistent(argv))
+        self.assertTrue(session._sessionless_oneshot(
+            {"headless": True, "nonpersistent": True, "identity": "unknown",
+             "declared": None, "resume": None}))
+
+    def test_headless_and_nonpersistent_are_separate_axes(self):
+        # --no-session-persistence states sessionless intent outright; -p is
+        # merely an interaction mode — conflating them is the defect both
+        # reviewers converged on
+        self.assertFalse(session._is_headless(["claude", "--no-session-persistence"]))
+        self.assertTrue(session._is_nonpersistent(["claude", "--no-session-persistence"]))
+        self.assertTrue(session._is_headless(["claude", "-p", "hi"]))
+        self.assertFalse(session._is_nonpersistent(["claude", "-p", "hi"]))
+
+    def test_the_inert_flag_outside_print_mode_never_certifies(self):
+        # fable review MED: the CLI documents --no-session-persistence
+        # '(only works with --print)' — in an interactive pane the flag is
+        # INERT and a real session persists, so the flag alone must never
+        # green the row. Sessionless is proven only by flag AND print mode.
+        self.assertFalse(session._sessionless_oneshot(
+            {"headless": False, "nonpersistent": True, "identity": "unknown",
+             "declared": None, "resume": None}))
+
+    def test_stdin_redirection_is_print_mode_evidence(self):
+        # measured 2026-07-22: `claude </dev/null` with no flags errors 'when
+        # using --print' — the CLI enters print mode on its own when stdin is
+        # not a terminal, so a piped spawn that omitted -p is still headless.
+        # An absent/unreadable target proves nothing and fails interactive —
+        # the direction that refuses certification, never the one that greens.
+        for target in ("pipe:[4242]", "socket:[9]", "/dev/null", "/tmp/in"):
+            self.assertTrue(session._stdin_redirected(target), target)
+        # /dev/ptmx is the pty MASTER — isatty-true, a live terminal, never
+        # redirection proof (fable delta-adversarial LOW)
+        for target in ("/dev/pts/4", "/dev/tty2", "/dev/console",
+                       "/dev/ptmx", "", None):
+            self.assertFalse(session._stdin_redirected(target), target)
+
+    def test_a_flag_in_a_value_position_declares_nothing(self):
+        # fable review LOW: commander hands a required option-argument the
+        # next token even when flag-shaped, so in `--append-system-prompt
+        # --no-session-persistence` the flag is PROMPT TEXT. Reading it as
+        # declared nonpersistence would green a session the CLI persists —
+        # the same ambiguity _resume_sid poisons, held to the same
+        # fail-closed law here.
+        self.assertFalse(session._is_nonpersistent(
+            ["claude", "-p", "--append-system-prompt",
+             "--no-session-persistence"]))
+        self.assertFalse(session._is_headless(
+            ["claude", "--append-system-prompt", "--print"]))
+        # with the option's value filled, the following flag is real again
+        self.assertTrue(session._is_nonpersistent(
+            ["claude", "-p", "--append-system-prompt", "be brief",
+             "--no-session-persistence"]))
+        # a MEASURED boolean cannot consume its neighbor, and the flag right
+        # after it stays declared (the remember-plugin shape must keep green)
+        self.assertTrue(session._is_nonpersistent(
+            ["claude", "-p", "--no-session-persistence"]))
+        self.assertTrue(session._is_headless(["claude", "-c", "--print"]))
+
+    def test_an_interactive_pane_is_not_headless(self):
+        for argv in (["claude", "--resume", "abc", "--dangerously-skip-permissions"],
+                     ["claude", "--continue"],
+                     ["claude", "--model", "opus"]):
+            self.assertFalse(session._is_headless(argv), argv)
+
+    def test_a_resumed_pane_whose_prompt_mentions_p_is_not_headless(self):
+        # the boot prompt is a positional ARG, never a flag — matching on
+        # substrings rather than exact tokens would misread a seat as headless
+        # and silently drop a real pane out of the census
+        self.assertFalse(session._is_headless(
+            ["claude", "--resume", "abc", "You are seat 'codex-3'; use -p sparingly"]))
+
+    SID_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    SID_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    def test_resume_sid_honors_the_option_terminator(self):
+        # codex round-2 HIGH 1, exact probe: a resume token entirely after
+        # `--` is positional prompt prose under the same option-region law as
+        # _argv_flag — it must never mint a proven session identity and enter
+        # live-holder/DOUBLE-OPEN arithmetic
+        argv = ["claude", "-p", "--", "--resume", self.SID_A]
+        self.assertTrue(session._is_headless(argv))
+        self.assertIsNone(session._resume_sid(argv))
+
+    def test_post_terminator_prose_never_drops_the_real_resume(self):
+        # the converse defect: a real pre-terminator resume plus a different
+        # post-terminator token must not read as two conflicting IDs that
+        # erase the real holder from the census
+        self.assertEqual(
+            session._resume_sid(["claude", "--resume", self.SID_A, "--",
+                                 "--resume", self.SID_B]),
+            self.SID_A)
+
+    def test_a_resume_meeting_the_terminator_stays_unknown(self):
+        # `--resume` refuses the terminator as its value (optional-value law)
+        # and stays a BARE resume; the post-terminator UUID is prose, not its
+        # value
+        self.assertIsNone(session._resume_sid(
+            ["claude", "--resume", "--", self.SID_A]))
+
+    def test_an_invalid_resume_occurrence_poisons_a_valid_one(self):
+        # codex-2 round-3 MED: the fleet lane's fail-closed law, kept intact
+        # while adding the terminator — a valid occurrence beside an invalid
+        # one is contradictory evidence, not a majority vote
+        for argv in (["claude", "--resume", self.SID_A, "--resume"],
+                     ["claude", "--resume=" + self.SID_A, "--resume=bad"],
+                     ["claude", "--resume", "--print",
+                      "--resume", self.SID_A]):
+            self.assertIsNone(session._resume_sid(argv), argv)
+        # a repeat of the SAME valid value is not a conflict
+        self.assertEqual(
+            session._resume_sid(["claude", "--resume", self.SID_A,
+                                 "--resume=" + self.SID_A]),
+            self.SID_A)
+        # and post-terminator tokens can neither poison nor conflict
+        self.assertEqual(
+            session._resume_sid(["claude", "--resume", self.SID_A, "--",
+                                 "--resume", "--resume=bad"]),
+            self.SID_A)
+
+    def test_short_resume_alias_attributes_the_holder(self):
+        # codex advisory HIGH: the real CLI resumes via `-r <sid>`, attached
+        # `-r<sid>`, and cluster `-pr <sid>` (commander splits boolean shorts
+        # off before a value-taking one) — all measured against the binary.
+        # A holder spawned through the short alias must not silently vanish.
+        self.assertEqual(
+            session._resume_sid(["claude", "-r", self.SID_A]), self.SID_A)
+        self.assertEqual(
+            session._resume_sid(["claude", "-r" + self.SID_A]), self.SID_A)
+        self.assertEqual(
+            session._resume_sid(["claude", "-pr", self.SID_A]), self.SID_A)
+        # `-pr` is print mode too, and `-cp` splits into --continue --print
+        self.assertTrue(session._is_headless(["claude", "-pr", self.SID_A]))
+        self.assertTrue(session._is_headless(["claude", "-cp"]))
+        # `-c` alone continues; it is neither print mode nor a resume
+        self.assertFalse(session._is_headless(["claude", "-c"]))
+        self.assertIsNone(session._resume_sid(["claude", "-c"]))
+
+    def test_short_resume_alias_is_fail_closed(self):
+        # the lane's poison law holds for the alias exactly as for the long
+        # form: bare/trailing, invalid value, and mixed valid+invalid all
+        # yield UNKNOWN. `-r=X` carries the LITERAL value `=X` (the CLI does
+        # not strip `=` on short flags — measured: rejected as not a UUID),
+        # and `-rp` resumes by TITLE "p", unresolvable from argv.
+        for argv in (["claude", "-r"],
+                     ["claude", "-r", self.SID_A, "-r"],
+                     ["claude", "-r=" + self.SID_A],
+                     ["claude", "-rp"],
+                     ["claude", "-r", self.SID_A, "--resume=bad"],
+                     ["claude", "-r", self.SID_A, "-r", self.SID_B]):
+            self.assertIsNone(session._resume_sid(argv), argv)
+        # same value through both spellings is agreement, not conflict
+        self.assertEqual(
+            session._resume_sid(["claude", "-r", self.SID_A,
+                                 "--resume", self.SID_A]),
+            self.SID_A)
+
+    def test_value_taking_short_clusters_stay_opaque(self):
+        # `-d [filter]` absorbs its cluster remainder as its attached value,
+        # so `-dr` is a debug filter "r" — it must neither mint a resume nor
+        # poison a real one, and `-dp` is a filter "p", never print mode
+        self.assertIsNone(session._resume_sid(["claude", "-dr"]))
+        self.assertEqual(
+            session._resume_sid(["claude", "-dr", "--resume", self.SID_A]),
+            self.SID_A)
+        self.assertFalse(session._is_headless(["claude", "-dp"]))
+
+    def test_optional_value_options_skip_a_flag_shaped_neighbor(self):
+        # r7's regression, live-probed on 2.1.218: commander is greedy ONLY
+        # for REQUIRED-value options. `claude -d --resume <uuid> -p
+        # --no-session-persistence hi` REALLY resumes the uuid (`claude -d
+        # --resume BAD -p hi` errors 'not a UUID'), yet the one-consumption
+        # presumption read the resume as -d's debug filter — returning
+        # resume=None, certifying sessionless green, and dropping the holder
+        # from DOUBLE-OPEN arithmetic. Base 690b669 found this holder.
+        argv = ["claude", "-d", "--resume", self.SID_A, "-p",
+                "--no-session-persistence", "hi"]
+        self.assertEqual(session._resume_sid(argv), self.SID_A)
+        self.assertTrue(session._is_headless(argv))
+        self.assertTrue(session._is_nonpersistent(argv))
+        self.assertFalse(session._sessionless_oneshot(
+            {"headless": True, "nonpersistent": True, "identity": "resume",
+             "declared": None, "resume": self.SID_A}))
+        # the greedy control: `--model --resume <uuid>` still mints nothing —
+        # required-value options keep consuming their flag-shaped neighbor
+        self.assertIsNone(session._resume_sid(
+            ["claude", "--model", "--resume", self.SID_A]))
+        # every MEASURED optional-value long flag skips a flag-shaped
+        # neighbor (`claude <flag> --version` prints the version, 2.1.218)
+        for flag in ("--debug", "--from-pr", "--prompt-suggestions",
+                     "--remote-control", "--worktree"):
+            self.assertEqual(
+                session._resume_sid(["claude", flag, "--resume",
+                                     self.SID_A]),
+                self.SID_A, flag)
+            self.assertTrue(
+                session._is_headless(["claude", flag, "-p", "hi"]), flag)
+        # ... but consumes a NON-dash neighbor as its value (measured:
+        # `claude -p -d hi` errors 'Input must be provided' — `hi` became
+        # the filter), so that value is opaque prose, never a flag
+        self.assertTrue(session._is_headless(["claude", "-d", "api", "-p"]))
+        self.assertEqual(
+            session._resume_sid(["claude", "-w", "feature", "--resume",
+                                 self.SID_A]),
+            self.SID_A)
+        # bare short aliases carry the same optional-value law
+        self.assertTrue(session._is_headless(["claude", "-d", "-p", "hi"]))
+        self.assertTrue(session._is_headless(["claude", "-w", "-p", "hi"]))
+
+    def test_optional_value_options_leave_the_terminator_alone(self):
+        # measured: `claude -d -- --version` runs `--version` as prompt
+        # prose (the required-greedy `--model --` swallows the terminator
+        # whole) — so past it every token is positional, and a resume whose
+        # would-be value is the terminator stays bare, poisoning the parse
+        self.assertFalse(session._is_headless(["claude", "-d", "--", "-p"]))
+        self.assertIsNone(session._resume_sid(
+            ["claude", "-d", "--", "--resume", self.SID_A]))
+
+    def test_a_flag_refused_by_optional_resume_leaves_it_bare(self):
+        # `--resume` is itself optional-value: commander refuses a
+        # flag-shaped neighbor as its value, so `--resume -p` is a BARE
+        # resume (poison) AND the neighbor is a real flag again
+        argv = ["claude", "--resume", "-p", "hi"]
+        self.assertIsNone(session._resume_sid(argv))
+        self.assertTrue(session._is_headless(argv))
+
+    def test_short_aliases_are_prose_past_the_terminator(self):
+        # the option-region law is alias-blind: post-terminator `-r`/`-pr`
+        # tokens are prompt prose, never identity and never poison
+        self.assertIsNone(session._resume_sid(
+            ["claude", "-p", "--", "-r", self.SID_A]))
+        self.assertEqual(
+            session._resume_sid(["claude", "-r", self.SID_A, "--",
+                                 "-r", self.SID_B, "-r"]),
+            self.SID_A)
+        self.assertFalse(session._is_headless(["claude", "--", "-pr"]))
+
+    def test_a_cluster_in_a_value_position_is_opaque(self):
+        # fable delta-adversarial HIGH pair: commander hands `--model` the
+        # next token RAW, so in `--model -cp` the cluster is the MODEL NAME
+        # (measured: `claude --model -cr` errors about --print input — no
+        # continue, no resume parsed). Expanding it defeated the
+        # value-position guard with fragments of the very token commander
+        # swallowed whole, resurrecting the inert-flag green — and `--model
+        # -cr <uuid>` minted a resume the CLI never granted, the module's own
+        # named worst direction.
+        argv = ["claude", "--model", "-cp", "--no-session-persistence"]
+        self.assertFalse(session._is_headless(argv))
+        # the flag AFTER the consumed value is real again — and inert outside
+        # print mode, so a tty row still never certifies green
+        self.assertTrue(session._is_nonpersistent(argv))
+        self.assertFalse(session._sessionless_oneshot(
+            {"headless": False, "nonpersistent": True, "identity": "unknown",
+             "declared": None, "resume": None}))
+        self.assertIsNone(session._resume_sid(
+            ["claude", "--model", "-cr", self.SID_A]))
+        # both cluster orders are opaque — safety is not ordering-dependent
+        self.assertFalse(session._is_headless(["claude", "--model", "-pc"]))
+
+    def test_prose_in_a_value_slot_never_poisons_a_real_holder(self):
+        # the legit-case regression (fable delta-adversarial MED): prompt
+        # prose that merely LOOKS like a short cluster must stay opaque —
+        # expanding it poisoned the parse and demoted a proven holder
+        self.assertEqual(
+            session._resume_sid(["claude", "--append-system-prompt",
+                                 "-pr be brief", "--resume", self.SID_A]),
+            self.SID_A)
+
+    def test_a_long_resume_in_a_value_position_mints_nothing(self):
+        # measured: `claude --model --resume --version` prints the version —
+        # --model swallowed `--resume` whole and the CLI parsed no resume.
+        # _argv_flag and _resume_sid walk the SAME (token, consumed) pairs,
+        # so the docstring symmetry claim is true by construction.
+        self.assertIsNone(session._resume_sid(
+            ["claude", "--model", "--resume", self.SID_A]))
+        # with the value slot filled, the resume is real again
+        self.assertEqual(
+            session._resume_sid(["claude", "--model", "opus",
+                                 "--resume", self.SID_A]),
+            self.SID_A)
+
+    def test_measured_booleans_cannot_orphan_their_neighbor(self):
+        # the regression the first value-position guard shipped (fable
+        # delta-composition LOW): with only three measured booleans,
+        # `claude --dangerously-skip-permissions -p` — the fleet's single
+        # most common spawn shape — fell to UNKNOWN on a tty. Every flag here
+        # is MEASURED boolean against the real CLI (2.1.218, 2026-07-22):
+        # `claude <flag> --version` prints the version iff the flag cannot
+        # consume its neighbor.
+        for flag in ("--dangerously-skip-permissions", "--verbose",
+                     "--fork-session", "--strict-mcp-config", "--ide",
+                     "--safe-mode", "--bare", "--chrome",
+                     "--allow-dangerously-skip-permissions"):
+            self.assertTrue(
+                session._is_headless(["claude", flag, "-p", "hi"]), flag)
+        # and the fleet's live pane shape keeps its proven holder
+        self.assertEqual(
+            session._resume_sid(["claude", "--dangerously-skip-permissions",
+                                 "--resume", self.SID_A]),
+            self.SID_A)
+
+    def test_a_value_slot_consumes_even_the_terminator(self):
+        # measured: `claude --model -- --version` prints the version — the
+        # terminator itself was swallowed as the model name, so the options
+        # after it are real, not prose
+        self.assertTrue(
+            session._is_headless(["claude", "--model", "--", "-p"]))
+        self.assertEqual(
+            session._resume_sid(["claude", "--model", "--",
+                                 "--resume", self.SID_A]),
+            self.SID_A)
+
+    def test_option_terminator_ends_the_flag_scan(self):
+        # past the standard `--` terminator every token is positional: a boot
+        # prompt exactly equal to -p/--print is prose there, never a flag
+        self.assertFalse(session._is_headless(["claude", "--", "-p"]))
+        self.assertFalse(session._is_headless(
+            ["claude", "--resume", "abc", "--", "--print"]))
+        self.assertFalse(session._is_nonpersistent(
+            ["claude", "--", "--no-session-persistence"]))
+        # a real flag BEFORE the terminator still declares the mode/intent
+        self.assertTrue(session._is_headless(["claude", "-p", "--", "prompt"]))
+        self.assertTrue(session._is_nonpersistent(
+            ["claude", "--no-session-persistence", "--", "prompt"]))
+
+    def test_sessionless_rows_leave_the_memory_only_census(self):
+        # pid 1's session hint carries NO canonical identity rung (identity
+        # unknown) — an ordinary background print worker echoing a SID, not a
+        # pane with work at risk. Exclusion keys the ABSENT identity, never
+        # the interaction mode alone.
+        rows = [{"pid": 1, "session": "sid-a", "headless": True,
+                 "identity": "unknown"},
+                {"pid": 2, "session": "sid-b", "headless": False,
+                 "identity": "who"}]
+        got = session.memory_only_panes(rows=rows, persisting={})
+        self.assertEqual([r["pid"] for r in got], [2])
+
+    def test_a_print_row_with_explicit_identity_stays_in_memory_only(self):
+        # a proven SID never leaves the count merely because the process will
+        # exit after one response
+        rows = [{"pid": 1, "session": "sid-a", "declared": "sid-a",
+                 "identity": "declared", "headless": True}]
+        got = session.memory_only_panes(rows=rows, persisting={})
+        self.assertEqual([r["pid"] for r in got], [1])
+
+    def row(self, pid, session_id, headless, **kw):
+        base = {"pid": pid, "resume": None, "declared": None,
+                "declared_reason": None, "session": session_id,
+                "possible_sessions": [], "child": False,
+                "ancestor_sid8": "", "force": False, "headless": headless,
+                "nonpersistent": False}
+        base.update(kw)
+        # identity mirrors the census derivation (codex-2 round-3: synthetic
+        # rows must not manufacture shapes _proc_claude_rows never emits — a
+        # real row with a session but no declared/resume is who-attributed);
+        # tests probing the defensive unknown-hint shape override explicitly
+        base.setdefault("identity",
+                        "declared" if base["declared"] else
+                        "resume" if base["resume"] else
+                        "who" if base["session"] else "unknown")
+        return base
+
+    def ls(self, rows, persisting, certify=False):
+        fn = session.cmd_doctor_panes if certify else session.cmd_ls
+        with mock.patch.object(session, "_proc_claude_rows", return_value=rows), \
+             mock.patch.object(session, "_persisting_sids",
+                               return_value=persisting):
+            return run(fn, [])
+
+    def test_a_headless_row_is_still_rendered_not_hidden(self):
+        # excluding from the COUNT must never mean hiding from the OPERATOR:
+        # a helm seat running headless is a law violation and has to be visible
+        rc, out, err = self.ls([self.row(8, None, True, nonpersistent=True),
+                                self.row(9, None, True)], {})
+        self.assertEqual(rc, 0, err)
+        self.assertIn("pid 8", out)
+        self.assertIn("headless one-shot", out)
+        self.assertIn("pid 9", out)
+        self.assertIn("[headless]", out)
+
+    def test_an_explicitly_nonpersistent_row_never_certifies_unknown(self):
+        # only --no-session-persistence proves sessionless BY REQUEST — that
+        # row has no session by design, is not an unresolved pane, and
+        # doctor-panes --certify must not fail the estate over it
+        rc, out, err = self.ls([self.row(9, None, True, nonpersistent=True)],
+                               {}, certify=True)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("headless one-shot", out)
+        self.assertNotIn("UNKNOWN", out)
+
+    def test_an_interactive_pane_with_the_inert_flag_fails_closed(self):
+        # fable review MED, exact probe row: interactive `claude
+        # --no-session-persistence` has the flag INERT and a real persisted
+        # session — before the fix it certified rc=0 under the false label
+        # 'headless one-shot'. It is an UNRESOLVED session, and the render
+        # says why the operator's flag did nothing.
+        rc, out, err = self.ls([self.row(9, None, False, nonpersistent=True)],
+                               {}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("UNKNOWN", out)
+        self.assertIn("inert outside print mode", out)
+        self.assertNotIn("headless one-shot", out)
+
+    def test_plain_print_mode_without_identity_fails_closed_as_unknown(self):
+        # codex round-2 HIGH 2, exact probe: plain -p persists a transcript by
+        # default, so a -p row with no resolvable SID is an UNRESOLVED
+        # session, never "no session by design" — certify must refuse rc=0
+        rc, out, err = self.ls([self.row(9, None, True)], {}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("UNKNOWN", out)
+        self.assertIn("[headless]", out)
+        self.assertNotIn("headless one-shot", out)
+
+    def test_a_headless_row_never_manufactures_a_double_open(self):
+        # a worker ECHOING its parent's proven SID with NO canonical identity
+        # rung of its own (identity unknown — no --resume, no pid record, no
+        # exact who attribution) is not a second holder. Defensive shape:
+        # the real census only ever sets `session` from a canonical rung, so
+        # this pins the fail-direction should an unproven hint ever leak in.
+        rows = [self.row(1, "sid-x", False),
+                self.row(2, "sid-x", True, identity="unknown")]
+        self.assertEqual(session.live_sids(rows), {"sid-x": [1]})
+        rc, out, err = self.ls(rows, {"sid-x": __file__}, certify=True)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("DOUBLE-OPEN", out)
+        self.assertIn("persisted", out)
+        self.assertIn("[headless]", out)
+
+    def test_a_transcriptless_inherited_worker_alarms_its_holder_not_itself(self):
+        # holder-arithmetic exclusion and the render must AGREE: the worker's
+        # missing transcript is its HOLDER's risk, so the worker is neither
+        # counted nor labeled MEMORY-ONLY — the alarm (and the certify FAIL)
+        # lands on the holder row, and the exclusion never becomes a
+        # sessionless claim (no "one-shot" label without nonpersistence)
+        holder = self.row(1, "sid-x", False)
+        worker = self.row(2, "sid-x", True, identity="unknown")
+        self.assertEqual(
+            [r["pid"] for r in session.memory_only_panes(
+                rows=[holder, worker], persisting={})],
+            [1])
+        rc, out, err = self.ls([holder, worker], {}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("MEMORY-ONLY", out)
+        self.assertIn("inherited-session print worker", out)
+        self.assertNotIn("headless one-shot", out)
+
+    def test_an_inherited_hint_with_no_live_holder_fails_closed(self):
+        # fable review (composition lens): "risk belongs to its holder" names
+        # NOBODY when no holder row exists in the census. The shape is
+        # impossible today — _proc_claude_rows only sets `session` from
+        # canonical rungs — and an impossible shape must fail closed as
+        # UNKNOWN, not certify a transcriptless live session green.
+        rows = [self.row(2, "sid-x", True, identity="unknown")]
+        self.assertEqual(session.memory_only_panes(rows=rows, persisting={}),
+                         [])
+        rc, out, err = self.ls(rows, {}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("UNKNOWN", out)
+        self.assertIn("no live holder", out)
+        self.assertNotIn("MEMORY-ONLY", out)
+        self.assertNotIn("headless one-shot", out)
+
+    def test_who_attribution_is_the_processes_own_identity_not_a_hint(self):
+        # codex-2 round-3 HIGH, exact probe row: _proc_claude_rows suppresses
+        # who for child processes and who dedupes shared sessions, so a
+        # surviving identity=='who' row is the process's OWN exact canonical
+        # attribution — a proven holder that must stay in live-holder
+        # arithmetic. Before the fix this exact row produced live_sids={}.
+        r = self.row(2, "sid-x", True)
+        self.assertEqual(r["identity"], "who")  # helper mirrors the census
+        self.assertEqual(session.live_sids([r]), {"sid-x": [2]})
+        self.assertEqual(session.open_pids("sid-x", [r]), [2])
+
+    def test_a_who_attributed_print_row_is_a_real_double_open(self):
+        # overlapping an interactive holder of the same session, the
+        # who-attributed print row IS the second holder — hiding it violated
+        # law 1 and let the certifier pass rc=0 on a live overlap
+        rows = [self.row(1, "sid-x", False),
+                self.row(2, "sid-x", True)]
+        self.assertEqual(session.live_sids(rows), {"sid-x": [1, 2]})
+        rc, out, err = self.ls(rows, {"sid-x": __file__}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("DOUBLE-OPEN", out)
+
+    def test_nonpersistence_never_flips_a_who_attributed_holder_sessionless(self):
+        # codex-2's second probe arm: adding nonpersistent to the who row made
+        # _sessionless_oneshot true — certifying green a process whose exact
+        # attribution proves it operates on session X while it lives
+        r = self.row(2, "sid-x", True, nonpersistent=True)
+        self.assertEqual(r["identity"], "who")
+        self.assertFalse(session._sessionless_oneshot(r))
+        self.assertFalse(session._inherited_hint_worker(r))
+        self.assertEqual(session.live_sids([r]), {"sid-x": [2]})
+
+    def test_a_transcriptless_who_attributed_print_row_is_memory_only(self):
+        # its transcript risk is its OWN — a who-attributed print row with no
+        # transcript on disk counts as memory-only, never as an inherited
+        # worker whose alarm belongs elsewhere
+        rows = [self.row(2, "sid-x", True)]
+        self.assertEqual(
+            [r["pid"] for r in session.memory_only_panes(rows=rows,
+                                                         persisting={})],
+            [2])
+
+    def test_a_print_mode_resume_is_a_real_holder_and_double_open(self):
+        # BOTH reviewers' HIGH: `claude -p --resume X` operates on a proven
+        # resumable session; overlapping an interactive holder of X it IS a
+        # DOUBLE-OPEN, and excluding it on -p alone hides the violation
+        rows = [self.row(1, "sid-x", False),
+                self.row(2, "sid-x", True, resume="sid-x")]
+        self.assertEqual(session.live_sids(rows), {"sid-x": [1, 2]})
+        rc, out, err = self.ls(rows, {"sid-x": __file__}, certify=True)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("DOUBLE-OPEN", out)
+
+    def test_certifier_and_launch_guard_agree_on_a_print_resume_row(self):
+        # codex's probe: before the fix, live_sids={} while open_pids(SID)=[2]
+        # — the health certifier and the launch guard disagreed about the same
+        # process. One truth now.
+        rows = [self.row(2, "sid-x", True, resume="sid-x")]
+        self.assertEqual(session.live_sids(rows), {"sid-x": [2]})
+        self.assertEqual(session.open_pids("sid-x", rows), [2])
+
+    def test_nonpersistence_never_removes_a_proven_sid_from_holders(self):
+        # even `--no-session-persistence --resume X` still READS session X
+        # while it lives; a proven SID stays in holder arithmetic, fail closed
+        rows = [self.row(2, "sid-x", True, resume="sid-x", nonpersistent=True)]
+        self.assertEqual(session.live_sids(rows), {"sid-x": [2]})
+
+    def test_a_print_resume_holder_renders_its_session_not_a_design_claim(self):
+        # the old label "no session by design" was FALSE for print mode —
+        # print persists unless nonpersistence is requested outright
+        rc, out, err = self.ls(
+            [self.row(2, "sid-x", True, resume="sid-x")],
+            {"sid-x": __file__})
+        self.assertEqual(rc, 0, err)
+        self.assertIn("persisted", out)
+        self.assertIn("[headless]", out)
+        self.assertIn("session=sid-x", out)
+        self.assertNotIn("headless one-shot", out)
+        self.assertNotIn("no session by design", out)
+
+    def test_an_unknown_row_still_never_enters_the_pass_bucket(self):
+        # the headless exclusion must not weaken the tri-state guarantee
+        rows = [{"pid": 3, "session": None, "headless": False}]
+        self.assertEqual(session.memory_only_panes(rows=rows, persisting={}), [])
+        rc, out, err = self.ls([self.row(3, None, False)], {}, certify=True)
+        self.assertEqual(rc, 1)
+        self.assertIn("UNKNOWN", out)
 
 
 if __name__ == "__main__":

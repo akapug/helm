@@ -103,18 +103,31 @@ helm store list [--type T] [--all] [--candidates]
 helm store get <id>                        one entry, full record
 helm store resolve <text>                  JIT lookup — what fires for this prompt
                                            (or pipe the prompt on stdin)
-helm store confirm <id> [--edit <def...>]  promote a candidate -> live (lexicon v1)
+helm store xrev-clear <id> --by <who> [--type T]
+                                           candidate -> PROVISIONAL: a cross-family
+                                           /x review cleared it (the reviewer
+                                           attests; the verb never runs the review).
+                                           Provisional FIRES with a [provisional]
+                                           tag, awaiting owner ratify
+helm store confirm <id> [--type T] [--edit <stmt...>]
+                                           owner ratify -> live (candidate OR
+                                           provisional)
+helm store reject <id> [--type T] [why...] reject a candidate/provisional —
+                                           retired in place (file kept as record)
+                                           (--type on any: disambiguate a slug
+                                           shared across reviewable types)
 helm store pinned [--stats]                the always-on lane (--stats: budget
                                            walk + ledger made-it/starved counts)
 helm store add <type> <id> | <statement> [| ...]
     prior:     <id> | <statement> [| conf [| keywords [| domain]]]   belief, default 0.6
     premise:   <id> | <statement> [| keywords [| domain]]            certain, conf 1.0
-    lexicon:   <term> | <definition> [| kind [| ex1 || ex2]]
+    lexicon:   <term> | <definition> [| kind [| keywords [| domain]]]
     heuristic: <id> | <move> [| trigger-csv [| domain]]
     reference: <id> | <summary> [| url [| keywords [| domain]]]
     flags: [--source S] [--rationale <text...>] [--candidate]
-           --candidate (lexicon v1): SAFE inferred capture — writes a non-live
-           candidate EXCLUDED from inject/resolve until `confirm`ed
+           --candidate (prior|lexicon|heuristic|reference): SAFE inferred
+           capture — writes a non-live candidate EXCLUDED from inject/resolve
+           until `confirm`ed (premise refused: certainty is human-only)
 helm store evidence <ts> <id> <delta> <reason...>  move a belief (logged + clamped)
 helm store supersede <ts> <old-id> <new-id> [reason]  TOMBSTONE old (file kept)
 helm store retire <ts> <id> [why...]               retire (file kept as the record)
@@ -135,24 +148,58 @@ LIVE in scope is a hard refuse — never a silent overwrite — and the refusal
 prints the exact `evidence`/`supersede` commands to run instead. A *different*
 id whose statement is near-identical (token-set overlap ≥ 0.8) warns loudly,
 names the other id and the supersede command, and proceeds — similarity alone
-never blocks. Lexicon is exempt: redefining a term is its update lane.
+never blocks. Lexicon is exempt: redefining a term is its update lane — except
+a `--candidate` add over a LIVE term, which is refused (writing
+`status:candidate` in place would DE-canonize the confirmed definition;
+capture may coin, never demote — redefine live or pick a distinct id).
 
 `resolve` ranks JIT hits DF-weighted: each matched probe scores 1/df (df = how
 many entries carry that keyword), summed and confidence-weighted — one rare
 keyword outranks a pile of shared ones. Ties break most-recently-updated,
 never alphabetical. `helm inject --explain` shows the per-probe contributions.
 
-**Candidate tier (safe inferred capture).** An agent-inferred entry lands as
-`status:candidate` (v1: lexicon; `add lexicon ... --candidate`, `source:
-inferred`). A candidate is a *non-live* status, so the resolver's live-filter
-already EXCLUDES it from resolve / pinned / inject — the hard law: nothing
-inferred is ever silently authoritative. `list --candidates` surfaces them (and
-coach's dup-search reads `store.candidates()`); `helm store confirm <id>
-[--edit <def...>]` promotes candidate → live (`source:explicit`) with an events
-receipt. Decay is operator-visible, never a silent job: `helm drain
---expire-candidates [--days N] [--apply]` archives-then-prunes unconfirmed
-candidates older than N days (14 default; a no-timestamp candidate never
-expires; dry-run default; net + receipt).
+**Candidate tier (safe inferred capture — capture everything, canonize
+nothing automatically).** An agent-inferred entry lands as `status:candidate`
+(`add <type> ... --candidate`, `source:inferred` — every capturable type:
+prior, lexicon, heuristic, reference; **premise is refused**: an inference may
+not claim certainty even in escrow, the 1.0 rail stays human-only — capture it
+as a prior belief instead). A candidate is a *non-live* status, so the
+resolver's live-filter already EXCLUDES it from resolve / pinned / inject —
+the hard law: nothing inferred is ever silently authoritative. `list
+--candidates` surfaces them (and coach's dup-search reads
+`store.candidates()`).
+
+**Provisional tier (xrev-cleared → provisionally live).** Owner canon: a lot of
+the technical auto-learns will be Greek to the owner, so they may go
+*provisionally live* — but ONLY after a cross-family `/x` review clears them
+(xrev is the gate, not the owner). `helm store xrev-clear <id> --by <reviewer>`
+graduates candidate → `status:provisional`, recording the who/when in
+`xrev_by`/`xrev_ts` (all types) + the prior's own evidence_log + the events
+journal. The reviewer **attests** a cross-family review happened — the verb
+never runs the review itself. A provisional entry FIRES through resolve / inject
+like live (it is usable knowledge) but renders with a visible `[provisional]`
+tag everywhere (CLI `list`, `resolve`, the inject line, the web panel) so an
+agent can weight it as not-yet-owner-ratified. An un-cleared candidate still
+fires NOTHING.
+
+Exits (all receipted, none silent): `helm store confirm <id> [--edit <stmt...>]`
+is the owner ratify — it works on BOTH a candidate and a provisional, promoting
+→ live (`source:explicit`; a prior keeps its captured confidence — confirming
+ratifies the capture, never inflates the belief — and carries the who/when
+receipt in its own evidence_log; the xrev provenance survives). `helm store
+reject <id> [why...]` retires the wrong inference (candidate OR provisional) IN
+PLACE (file kept as the record, never deleted). `xrev-clear`/`confirm`/`reject`
+resolve against the reviewable set (candidate + provisional) first, and a slug
+shared across types is refused without `--type T` (never act on the wrong
+entry). The **owner's review surface is the web UI**: near the configs view, a
+*store review* panel lists candidate + provisional entries with Approve
+(confirm), Reject (reason box), and the per-row xrev-clear display — the owner
+actions route through the SAME store functions as the CLI (one writer path).
+Decay is operator-visible, never a silent job: `helm drain --expire-candidates
+[--days N] [--apply]` archives-then-prunes unconfirmed **candidates** of every
+type older than N days (14 default; a no-timestamp candidate never expires;
+a provisional is never age-expired — xrev cleared it; dry-run default; net +
+receipt).
 
 **Adopted project roots.** With `--project P`, the store also reads P's OWN
 claude memory dir(s) as `adopted-project` roots (canonical cwd + observed
@@ -1337,6 +1384,80 @@ The umbrella: census + hooks sync + mcp sync + worktree gc, all in DRY-RUN, one
 consolidated owner-facing report — *here is everything that would change*.
 `--apply` runs them all backup-first.
 
+## rearm — land-to-live compression
+
+Code lands on main and every fresh `helm` invocation is a process off main, so
+a CLI-class land is live AT LAND. But LONG-LIVED processes keep running the code
+they loaded at start: an armed `helm chat wait --follow` inbox beacon, the web
+service, seat proxies/daemons. Until each re-arms, the fix has not reached them.
+The fleet re-arms them ad hoc today, and an UNOWNED mass-SIGTERM of waiters is a
+known incident class (three beacons killed in one minute, unexplained to their
+owners). `helm rearm` is the CHEAP OWNED pass that closes the gap minutes after
+a land batch (premise `land-to-live-compression-owner-directive`).
+
+### `helm rearm [--apply] [--json]`
+**Dry-run is the DEFAULT** — it reports, mutates NOTHING: (a) every live `helm
+chat wait` waiter with its owning seat and start time, marked **STALE** if it
+started before main's current HEAD commit time; (b) the web-service unit
+(`helm-web`, active + since) and whether it predates HEAD; (c) every OTHER
+long-lived helm process predating HEAD (proxies, daemons — by cmdline match) as
+an **advisory** respawn candidate. It ends on a plain summary line: *N waiters
+stale, web stale?, M advisory*.
+
+`--apply` runs the OWNED re-arm pass, in order: **(1)** posts ONE owned
+**ambient** ANNOUNCE row to `#main` (ambient = renders everywhere, wakes nobody)
+saying the pass is cycling waiters and why; **(2)** SIGTERMs ONLY the stale
+waiters — each owning agent gets its Monitor-exit notification and re-arms on
+the new code at its OWN turn boundary (this is the OWNED version of the
+beacon-killer incident class); **(3)** restarts the web unit **iff** it is active
+AND stale; **(4)** NEVER touches proxies/daemons/seats — they print as advisory
+only. Idempotent by convergence: staleness is recomputed from live state each
+run, so once the signaled waiters exit a second `--apply` finds nothing stale (a
+re-signal of a still-dying pid is a harmless no-op).
+
+**Safety — failed-probe-is-not-absence.** Only a process whose cmdline argv
+EXACTLY matches the waiter shape (a `helm` executable token immediately followed
+by `chat wait`) is ever signaled; the bash Monitor wrapper carries the same
+string inside a single `-c` argument, has no standalone `helm` token, and is
+excluded by construction. Ownership is the `--seat` token; a stale waiter with
+no readable seat, an unreadable start, or an unreachable HEAD (staleness
+unprovable) is SKIPPED and reported, NEVER signaled. The argv shape and stat
+starttime are re-checked immediately before each SIGTERM, so a waiter that
+exited into a recycled pid during the announce round-trip is never hit; and if
+the announce itself fails to land, the pass is **fail-closed** — nothing is
+signaled or restarted. Reads `/proc` cmdline + stat only.
+
+**The ANNOUNCE row carries the re-arm incantation.** An idle owner is *woken*
+by the Monitor-exit event and re-arms at that turn; a busy owner keeps its
+mid-turn hook delivery — so the deaf window is bounded to the re-arm turn. But a
+resumed/cleared agent can lose its beacon context entirely, so the row spells
+out the exact incantation
+(`Monitor(command: "helm chat wait --seat <your-seat> --follow", persistent: true)`)
+and names the seats it cycled. This is the rearm-INITIATED path (the waiter dies
+from outside); the SELF-rotation recipe an agent uses to swap its OWN beacon
+without a deaf window is the reverse — **arm the successor Monitor FIRST, verify
+one live event lands through it, THEN `TaskStop` the old** (`helm chat wait` has
+no handoff, so a stop-then-arm has a real deaf window).
+
+**Proxies never self-propagate a land.** A per-instance or family cli-proxy
+keeps running the config it loaded until respawned; `rearm` lists each pre-HEAD
+proxy/daemon as advisory with the recipe
+`helm seat down <seat> && helm seat up <seat>` (or the daemon's own restart) —
+per-seat respawn stays the operator's call, never `rearm`'s signal.
+
+```console
+$ helm rearm
+helm rearm — land-to-live: live processes still holding pre-HEAD code (dry-run; `helm rearm --apply` cycles the stale waiters)
+  HEAD 265e8af committed 12m ago
+  waiters (helm chat wait):
+    STALE   pid 1656     seat codex-3                started 41m ago
+    current pid 4174464  seat codex                  started 3m ago
+  web-service: helm-web stale since 40m ago  [--apply restarts]
+  advisory (pre-HEAD long-lived helm procs — respawn candidates, NEVER signaled):
+    pid 88123    helm router         started 2h ago
+helm rearm: 1 waiter stale, web stale, 1 advisory
+```
+
 ```console
 $ helm tidy
 ========================================================================
@@ -1520,8 +1641,10 @@ frames; this lane is called *delivery*.)
   action** to arm the idle-wake beacon — `Monitor(command: "helm chat wait
   --seat <seat> --follow", persistent: true)` — because nothing external can
   re-invoke a PTY agent (native-wake-only-agent-armed), so the self-armed
-  Monitor is the only thing that wakes an idle session. Never posts to the room
-  (presence lives in the roster panel, not the transcript).
+  Monitor is the only thing that wakes an idle session. The line ends with the
+  onboarding pointer — new seats read
+  [NEW_AGENT_GUIDE.md](NEW_AGENT_GUIDE.md) for their bearings. Never posts to
+  the room (presence lives in the roster panel, not the transcript).
 - **`helm chat deliver [--hook-json] [--seat S]`** — the PostToolUse nudge:
   an agent deep in an autonomous turn is unreachable by turn-start injection;
   this delivers between tool calls. At most ONE row per boundary (oldest
@@ -1575,7 +1698,13 @@ frames; this lane is called *delivery*.)
   UNREPORTED owner ask (top of the ladder: the owner-ask ledger's OLDEST row
   not yet `reported` — open or done-but-unreported — named one at a time with
   its `helm asks report` pointer; fp carries the row's status, so open→done
-  re-fires once), stuck
+  re-fires once), then dispatch state reloaded from disk on each stop: ledger
+  **UNAVAILABLE / obligations UNKNOWN** first, then the oldest historical row
+  that **NEEDS REDISPATCH**, then the oldest **NEEDS CONFIRMATION** row
+  (delivery unproven — verify at the recipient, never resend), then the
+  oldest overdue **NEEDS CHECK-IN / PENDING VERDICT** row with its exact-tip
+  verdict command (advisory only and
+  never an automatic reassignment), stuck
   session (`stuck-streak`≥3: surface the blocker), a RED gate (record.py's
   command-log shows a test-runner whose LATEST run exited nonzero — fix or
   surface before stopping; a green rerun silences it), unlanded owner/mention
@@ -1875,8 +2004,57 @@ culture). **`done` does not close a row** — `report <id> <chat-post-id>` is
 the ONLY closer, and its argument is the chat post that told the OWNER
 (owner-surface-is-the-bar: work merely finished is invisible work). Any row
 not yet `reported` rides the stop-whisper's TOP rung (see `stop-guard`
-above) until the owner has actually heard it. Fail-open: an unwritable
-ledger never raises, and a failed `add` says NOT RECORDED loudly.
+above) until the owner has actually heard it. A missing ledger is known-empty;
+an unsafe/unreadable ledger is **UNAVAILABLE / owner debt UNKNOWN** on both
+`list` (nonzero) and stop-whisper, never silently rendered as zero. Mutations
+still never traceback, and a failed `add` says NOT RECORDED loudly.
+
+### `helm dispatch send <recipient> <lane> <message...> --ref TIP [--key K] | add <recipient> <lane> --ref TIP | verdict <id> <full-reviewed-tip> <evidence> | list [--open|--overdue] [--json]`
+
+The DISPATCH ledger is the durable obligation behind work handed to another
+seat. The shipping surface is deliberately small — three events, immutable
+rows, no exactly-once machinery:
+
+* **`send`** persists the obligation FIRST, then attempts exactly one DM. The
+  optional `--key` names the operation (namespaced by canonical sender + Git
+  repository; derived from the semantic request fields when omitted). **One
+  operation sends at most once, ever**: retrying an existing operation never
+  re-DMs — a prior attempt whose delivery evidence is missing is AMBIGUOUS,
+  not absent, and resending is exactly the duplicate-message hazard the
+  reduced core refuses to automate away. Ambiguous delivery stays open as
+  **NEEDS CONFIRMATION**: verify at the recipient, never resend blind.
+* **`add`** records a handoff performed by another transport; it still
+  requires `--ref`, so no new row is ever born without the exact tip its
+  verdict must name. Its delivery starts NEEDS CONFIRMATION.
+* **`verdict`** is the ONLY closer. It takes the full exact reviewed commit
+  id and refuses unless it equals the row's dispatched tip — a stale verdict
+  can never close moved work. Identical verdict retries are idempotent;
+  conflicting ones are refused.
+
+There is **no ack, bind, or retarget** — those verbs are gone. Historical
+ref-less rows (the short-lived v2 schema) stay visible as **NEEDS
+REDISPATCH**: redispatch the work with an exact `--ref`; the old row remains
+as history. Rows the old schemas already wrote keep replaying truthfully, but
+only rows stamped before the reduced core landed (`LEGACY_COMPAT_BOUNDARY`)
+can drive those historical transitions — an event appended today, however
+well-shaped (including non-string timestamps), is inert at replay, and a
+type-corrupt row is skipped without blinding the ledger.
+
+Rows are append-only events in `~/.helm/_global/dispatches.jsonl`, separate
+from owner asks while sharing the same hardened event-ledger primitive:
+stable flock, incomplete-tail repair before append, one bounded `O_APPEND`
+write, file + directory-entry fsync, partial-write rollback, 0600 private
+regular files, symlink/hardlink refusal, and per-row fail-safe replay. An
+absent ledger is known-empty; an unsafe/unreadable ledger is **UNAVAILABLE /
+obligations UNKNOWN** (CLI nonzero and stop-whisper loud), never silently
+rendered as zero.
+
+Deadlines are advisory. An overdue row says **NEEDS CHECK-IN** and rides the
+stop-whisper after owner asks; it never reassigns work, because a long turn
+is observationally identical to a dead seat. The stop-whisper ranks
+redispatch needs, then unconfirmed delivery, then overdue check-ins. UTC
+timestamps use calendar semantics; future or malformed timestamps read as
+NEW, never false-overdue.
 
 ## ops — health, evolution, the browser
 

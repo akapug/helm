@@ -384,6 +384,10 @@ def cmd_ship(args):
     if args and args[0] == "pull":
         return cmd_pull(args[1:])
     if args and args[0] == "hosts":
+        from .cli import guard_tail
+        rc = guard_tail("helm ship hosts", args[1:], usage="ship hosts")
+        if rc is not None:
+            return rc
         return hosts()
     apply_flag, remote, message = False, None, None
     i = 0

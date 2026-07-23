@@ -550,11 +550,39 @@ def _age(mt):
 def cmd_sessions(args):
     """sessions [<project>] [--limit N] [--all] | sessions resume <id-prefix>"""
     if args and args[0] == "resume":
+        usage = ("sessions resume <session-id-prefix> [--go] [--title T] "
+                 "[--note TEXT] [--skip-permissions] [--force]")
         if len(args) < 2:
-            print("usage: helm sessions resume <session-id-prefix> [--go] [--title T] [--note TEXT]")
+            print("usage: helm " + usage)
             return 2
         pref = args[1]
         rest = args[2:]
+        flags = ("--go", "--skip-permissions", "--force")
+        valued = ("--title", "--note")
+        from .cli import guard_tail
+        if pref in ("-h", "--help"):
+            # help-FIRST still guards the tail: `resume --help --bogus` used
+            # to print usage and exit 0, a soft false existence probe for
+            # --bogus. Junk beats help, same as everywhere else.
+            rc = guard_tail("helm sessions resume", rest, flags=flags,
+                            valued=valued, usage=usage)
+            if rc is not None:
+                return rc
+            print("helm " + usage)
+            return 0
+        if pref.startswith("-"):
+            print("helm sessions: resume wants an <id-prefix>, got '%s' (%s)"
+                  % (pref, usage), file=sys.stderr)
+            return 2
+        # the tail is guarded BEFORE rows_for/spawn: an unknown flag exits 2
+        # pre-action (`resume <id> --go --bogus` used to spawn anyway with
+        # --help pretending success), and --title/--note must carry a
+        # non-flag value exactly once — a missing value used to crash AFTER
+        # the pane was already spawned.
+        rc = guard_tail("helm sessions resume", rest,
+                        flags=flags, valued=valued, usage=usage)
+        if rc is not None:
+            return rc
         go = "--go" in rest
         title = rest[rest.index("--title") + 1] if "--title" in rest else None
         hits = [r for r in rows_for(include_synthetic=True)
@@ -635,14 +663,50 @@ def cmd_sessions(args):
             print("  warn: " + w, file=sys.stderr)
         return 0
 
-    project = None
+    # the bare-list path: ONE optional positional (the <project> filter, the
+    # docstring's contract) — unknown flag-shaped args refuse instead of
+    # silently listing as if they existed.
+    rest = list(args)
     limit = 25
-    if "--limit" in args:
-        limit = int(args[args.index("--limit") + 1])
-    for a in args:
-        if not a.startswith("--") and (not args.index(a) or args[args.index(a) - 1] != "--limit"):
-            project = a
-    rows = rows_for(project=project, include_synthetic="--all" in args, limit=limit)
+    if "--limit" in rest:
+        i = rest.index("--limit")
+        try:
+            limit = int(rest[i + 1])
+        except (IndexError, ValueError):
+            print("helm sessions: --limit wants an integer", file=sys.stderr)
+            return 2
+        if limit < 1:
+            # a negative/zero limit used to silently truncate the listing to
+            # one row (rows_for's `len(out) >= limit` fires immediately) —
+            # nonsense values refuse like non-integers do.
+            print("helm sessions: --limit wants a positive integer",
+                  file=sys.stderr)
+            return 2
+        del rest[i:i + 2]
+    include_synthetic = "--all" in rest
+    rest = [a for a in rest if a != "--all"]
+    # -h/--help on an OTHERWISE-CLEAN tail is a help request, not junk:
+    # `sessions --all --help` used to refuse rc 2 lying that --help is an
+    # unknown arg. Junk still beats help (an unknown flag alongside --help
+    # refuses — the existence probe stays honest).
+    want_help = any(a in ("-h", "--help") for a in rest)
+    rest = [a for a in rest if a not in ("-h", "--help")]
+    junk = [a for a in rest if a.startswith("-")]
+    if junk:
+        print("helm sessions: unknown arg '%s' (sessions [<project>] "
+              "[--limit N] [--all] | sessions resume <id-prefix>)" % junk[0],
+              file=sys.stderr)
+        return 2
+    if len(rest) > 1:
+        print("helm sessions: one <project> filter at most (got: %s)"
+              % ", ".join(rest), file=sys.stderr)
+        return 2
+    if want_help:
+        print("sessions [<project>] [--limit N] [--all] | "
+              "sessions resume <id-prefix>")
+        return 0
+    project = rest[0] if rest else None
+    rows = rows_for(project=project, include_synthetic=include_synthetic, limit=limit)
     if not rows:
         print("helm sessions: none%s." % (" for project '%s'" % project if project else ""))
         return 0

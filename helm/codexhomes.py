@@ -540,15 +540,26 @@ def cmd_codex(args):
     gate (runbook fix #3) ahead of the seat-launch mint."""
     args = list(args)
     verb, rest = (args[0], args[1:]) if args else ("list", [])
-    if verb == "list":
-        return _print_list()
-    if verb == "pooled":
-        return _print_pooled()
-    if verb == "capacity":
-        return _print_capacity()
+    from .cli import guard_tail
+    if verb in ("list", "pooled", "capacity"):
+        rc = guard_tail("helm codex " + verb, rest, usage="codex " + verb)
+        if rc is not None:
+            return rc
+        return {"list": _print_list, "pooled": _print_pooled,
+                "capacity": _print_capacity}[verb]()
     if verb == "launch":
         force = "--force" in rest
         rest = [a for a in rest if a != "--force"]
+        # junk refuses BEFORE launch_gate: a failing pool gate (rc 1) used to
+        # mask the unknown flag entirely, printing gate diagnostics as if it
+        # existed. Mirrors seat's launch tail (the downstream authority);
+        # drift refuses loudly here rather than silently passing junk on.
+        rc = guard_tail("helm codex launch", rest, flags=("--multi",),
+                        valued=("--room", "--model", "-i", "--instance"),
+                        usage="codex launch [-i N] [--force] [--room R] "
+                              "[--model M] [--multi]")
+        if rc is not None:
+            return rc
         inst = 1
         for flag in ("-i", "--instance"):
             if flag in rest:
@@ -566,6 +577,9 @@ def cmd_codex(args):
         if not rest:
             print("usage: helm codex pool <name>", file=sys.stderr)
             return 2
+        rc = guard_tail("helm codex pool", rest[1:], usage="codex pool <name>")
+        if rc is not None:
+            return rc
         res = codex_pool(rest[0])
         if "error" in res:
             return _fail(res)
@@ -584,6 +598,10 @@ def cmd_codex(args):
         if not rest:
             print("usage: helm codex unpool <name>", file=sys.stderr)
             return 2
+        rc = guard_tail("helm codex unpool", rest[1:],
+                        usage="codex unpool <name>")
+        if rc is not None:
+            return rc
         res = codex_unpool(rest[0])
         if "error" in res:
             return _fail(res)

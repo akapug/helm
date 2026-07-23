@@ -140,6 +140,30 @@ class TestChecks(DoctorBase):
             adopted_dir=os.path.join(self.tmp.name, "nope"))
         self.assertTrue(any("adopted store missing" in m for m in levels(results, doctor.WARN)))
 
+    def test_lexicon_dead_vocabulary_flags_spaced_kind_only(self):
+        # a space-separated multi-word kind with no keywords is DEAD symptom
+        # vocabulary (the comma gate cannot rescue it); a comma CSV kind is
+        # rescued by the legacy fallback and a clean entry is silent
+        d = os.path.join(home.global_dir(), "lexicon")
+        os.makedirs(d)
+        lex = lambda term, kind: (
+            "---\nname: lex-%s\ndescription: \"lexicon: %s = def\"\n"
+            "metadata:\n  node_type: memory\n  type: lexicon\n"
+            "  term: %s\n  scope: global\n  kind: %s\n"
+            "  definition: def of %s\n---\n" % (term, term, term, kind, term))
+        for term, kind in (("cli-proxy", "cli-proxy proxy codex kimi seat"),
+                           ("rescued", "snowflake, avalanche"),
+                           ("clean", "phrase")):
+            pk.atomic_write(os.path.join(d, "lex-%s.md" % term), lex(term, kind))
+        empty = os.path.join(self.tmp.name, "adopted-empty")
+        os.makedirs(empty)
+        with mock.patch.dict(os.environ, {"HELM_ADOPTED_DIR": empty}):
+            res = doctor.check_lexicon_dead_vocabulary()
+        self.assertEqual([lvl for lvl, _ in res], [doctor.WARN])
+        self.assertIn("lexicon 'cli-proxy'", res[0][1])
+        self.assertIn("helm store add lexicon \"cli-proxy | def of cli-proxy | "
+                      "phrase | cli-proxy, proxy, codex, kimi, seat\"", res[0][1])
+
     def test_know_your_user_empty_warns_then_ok(self):
         results = doctor.check_know_your_user()
         self.assertTrue(any("know-your-user leg is empty" in m and "helm interview" in m

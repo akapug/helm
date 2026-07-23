@@ -398,12 +398,16 @@ def cmd_multiplayer(args, adapter_factory=adapters):
               "       helm multiplayer leave [--cave C] [--actor A] [--connection ID]", file=sys.stderr)
         return 2
     try:
+        verb = args[0]
+        if verb not in ("publish", "read", "presence", "peers", "leave"):
+            # refuse BEFORE the adapters are constructed — an unknown verb
+            # must not create relay/presence state as a side effect.
+            raise ValueError("invalid multiplayer command")
         values, flags, rest = _opts(args[1:])
         cave = values.get("cave") or default_cave()
         actor = values.get("actor") or actor_name()
         connection = values.get("connection") or connection_name(actor)
         relay, presence = adapter_factory(values.get("backend"))
-        verb = args[0]
         if verb == "publish" and len(rest) == 1:
             if "--stdin" not in flags:
                 raise ValueError("publish requires --stdin (opaque updates never ride argv)")

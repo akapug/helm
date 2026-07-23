@@ -308,6 +308,13 @@ def cmd_evolve(args):
     """evolve [--project P] — one observe/propose cycle. Proposes; edits no
     knowledge (the sync observer's registry write + scaffold is the one
     documented bookkeeping side effect — see the module docstring)."""
+    # flags-only membership reader — guard the tail before cycle():
+    # `evolve --bogus` silently ran the observe/propose cycle and exited 0.
+    from .cli import guard_tail
+    rc = guard_tail("helm evolve", args, valued=("--project",),
+                    usage="evolve [--project P]")
+    if rc is not None:
+        return rc
     project = None
     if "--project" in args:
         project = args[args.index("--project") + 1]
