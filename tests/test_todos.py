@@ -607,8 +607,11 @@ class RosterAndWebTest(TodosBase):
             os.path.abspath(__file__))), "helm", "web_ui.html")
         with open(path, encoding="utf-8") as f:
             html = f.read()
-        self.assertIn('id="ledgertodos"', html)
-        self.assertIn("fleetTodos", html)
+        # fleet-todos consolidated into the roster tab's TASK column
+        # (rosterTask reads /api/todos via ROSTER_TODOS) — the standalone
+        # #ledgertodos/fleetTodos panel was retired in the roster consolidation.
+        self.assertIn("function rosterTask", html)
+        self.assertIn("ROSTER_TODOS", html)
         self.assertIn("/api/todos", html)
 
 

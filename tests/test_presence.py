@@ -715,14 +715,15 @@ class WebPresenceTest(PresenceBase):
         self.assertIn("function chatPresence", html)
 
     def test_ledger_seats_panel_annotates_age_and_provenance(self):
-        """VERBS: the web bar, `helm chat seats`, and the LEDGER seats panel
-        glance identically — rosterSeats must render status_age + '(by X)'
-        (roster_report ships both), not just the bare line."""
+        """VERBS: the web bar, `helm chat seats`, and the roster tab's DOING
+        cell glance identically — rosterDoing must render status_age + '(by X)'
+        (roster_report ships both), not just the bare line. (The standalone
+        rosterSeats panel was retired into the roster tab in the consolidation.)"""
         st, body = self.get("/")
         self.assertEqual(st, 200)
         html = body.decode("utf-8")
-        panel = html.split("function rosterSeats")[1].split(
-            "function fleetTodos")[0]
+        panel = html.split("function rosterDoing")[1].split(
+            "function rosterTask")[0]
         self.assertIn("status_age", panel)
         self.assertIn("status_by", panel)
 
