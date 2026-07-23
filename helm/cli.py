@@ -40,6 +40,10 @@ def cmd_sync(args):
 
 def cmd_projects(args):
     """projects [--all] — the real project list, newest activity first."""
+    rc = guard_tail("helm projects", args, flags=("--all",),
+                    usage="projects [--all]")
+    if rc is not None:
+        return rc
     reg = registry.load()
     projects = list(reg["projects"].values())
     if not projects:
@@ -73,6 +77,9 @@ def cmd_show(args):
     if not args:
         print("usage: helm show <project>", file=sys.stderr)
         return 2
+    rc = guard_tail("helm show", args[1:], usage="show <project>")
+    if rc is not None:
+        return rc
     import json
     p = registry.get(args[0])
     if p is None:
@@ -80,6 +87,55 @@ def cmd_show(args):
         return 1
     print(json.dumps(p, indent=2, ensure_ascii=False))
     return 0
+
+
+def suggest(word, candidates):
+    """The one nearest-match hint — pure, shared by the root's unknown-verb
+    refusal, guard_tail's unknown-arg refusal, and every subdispatcher's
+    unknown-subverb refusal, so a typo anywhere in the tree says what its
+    author probably meant instead of only the generic usage line."""
+    import difflib
+    near = difflib.get_close_matches(word, list(candidates), n=1)
+    return (" — did you mean '%s'?" % near[0]) if near else ""
+
+
+def guard_tail(prog, args, flags=(), valued=(), usage=None):
+    """The nested-dispatcher honesty contract, companion to main()'s
+    unknown-verb refusal: once a subverb is matched, every REMAINING token
+    must be a known flag. Trailing junk refuses with exit 2 BEFORE any work
+    runs (`seat down codex --bogus` used to stop the seat and exit 0), and
+    `--help` after junk still refuses — the existence probe stays honest.
+    A clean tail carrying -h/--help prints `usage` and returns 0. `valued`
+    flags must carry a non-flag value exactly once. Returns None to proceed,
+    else the exit code for the caller to return."""
+    args = list(args or [])
+    junk, want_help, seen = [], False, set()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            want_help = True
+        elif a in valued:
+            if a in seen:
+                print("%s: duplicate %s" % (prog, a), file=sys.stderr)
+                return 2
+            seen.add(a)
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                print("%s: %s wants a value" % (prog, a), file=sys.stderr)
+                return 2
+            i += 1
+        elif a not in flags:
+            junk.append(a)
+        i += 1
+    if junk:
+        print("%s: unknown arg '%s'%s%s" % (
+            prog, junk[0], suggest(junk[0], tuple(flags) + tuple(valued)),
+            (" (%s)" % usage) if usage else ""), file=sys.stderr)
+        return 2
+    if want_help:
+        print(usage or prog)
+        return 0
+    return None
 
 
 def _lazy(module, fn):
@@ -130,6 +186,7 @@ VERBS = {
     "human": _lazy("human", "cmd_human"),
     "premise": _lazy("premise", "cmd_premise"),
     "asks": _lazy("ownerasks", "cmd_asks"),
+    "dispatch": _lazy("dispatches", "cmd_dispatch"),
     "coach": _lazy("coach", "cmd_coach"),
     "premise-check": _lazy("premise", "cmd_premise_check"),
     "seat": _lazy("seat", "cmd_seat"),
@@ -156,7 +213,16 @@ VERBS = {
     "mcp": _lazy("envtidy", "cmd_mcp"),
     "worktree": _lazy("envtidy", "cmd_worktree"),
     "tidy": _lazy("envtidy", "cmd_tidy"),
+    "rearm": _lazy("rearm", "cmd_rearm"),
 }
+
+# Verbs whose handlers read NO arguments at all: nothing below main() will
+# ever look at the tail, so the ROOT guards it — `helm sync --bogus --help`
+# must refuse (exit 2) BEFORE the (possibly mutating) leaf runs, not run
+# sync while --help pretends the flag existed. The sweep test DERIVES this
+# set from the source (AST: the handler never loads its args param) and
+# fails when a new no-arg leaf is born outside it, so the class stays closed.
+NOARG_VERBS = ("home", "sync", "doctor", "human")
 
 _VERB_HELP = {
     "brief": "brief [--hours N] [--json] — the operator's morning brief: sessions, knowledge delta (incl. pinned-starvation tail), seats, owner gates (read-only, never probes)",
@@ -186,12 +252,14 @@ _VERB_HELP = {
     "configs": "configs [list|show|cascade <cwd>] — every config across every home, read-only",
     "hooks": "hooks [install [--dry]|status|sync [--apply]] — self-wire the per-turn inject hook into every claude home; sync reconciles every home to the NAMED canonical hook set (dry-run default)",
     "cell": "cell join|send|recv|heartbeat|roster|status — the a2a substrate, helm-named",
-    "chat": "chat post|read [--since N|--follow]|rooms|react <n> <emoji>|log-flush|node up|down|status|join|deliver|wait|seats|claim|release|claims [--room R] — the human-included groupchat (RAM room + signed dregg transport; web panel = the owner's surface) + the delivery lane (tool-boundary nudge, roster presence, advisory session-bound claims)",
+    "chat": "chat post|read [--since N|--follow]|rooms|react <n> <emoji>|log-flush|node up|down|status|join|deliver|wait|seats|seat gc [--apply]|claim|release|claims [--room R] — the human-included groupchat (RAM room + signed dregg transport; web panel = the owner's surface) + the delivery lane (tool-boundary nudge, roster presence, advisory session-bound claims)",
     "multiplayer": "multiplayer publish|read|presence|peers|leave — metaharness-agnostic local multiplayer: blind opaque-update relay + decoupled TTL presence",
     "launch": "launch [--seat S] [--home H] [--room R] [--no-install] [--] [claude args…] — the metaharness seam: wire hooks, seat the roster, exec claude under a stable addressable name",
     "human": "human (or helm --human) — the operator's curses TUI: chat room + status strip, posts as you",
     "premise": "premise <id> | <statement> — capture a certain truth, attested on the ledger; --supersede <old-id> <new-id> | <statement> evolves the chain (one signed linking turn)",
     "asks": "asks add <text>|done <id> <evidence>|report <id> <chat-post-id>|list [--open] [--json] — the durable OWNER-ASK ledger (agents self-add); 'done' stays OPEN until 'report' names the chat post that told the OWNER (owner-surface-is-the-bar); unreported asks ride the stop-whisper's top rung",
+    "dispatch": "dispatch send <recipient> <lane> <message...> --ref TIP [--key K]|add <recipient> <lane> --ref TIP|verdict <id> <full-reviewed-tip> <evidence>|list [--open|--overdue] [--json] — durable DISPATCH ledger, three events only. A dispatch persists before delivery; one operation sends AT MOST ONCE (a retry never re-DMs — confirm at the recipient); ambiguous delivery stays open NEEDS CONFIRMATION; only a matching exact-tip verdict closes. Historical ref-less rows read NEEDS REDISPATCH (redispatch with --ref; no bind/retarget/ack verbs exist). Unavailable storage means obligations UNKNOWN",
+
     "coach": "coach <lesson...> [--apply] [--as L] [--id ID] [--project P] [--supersede OLD] [--json] — the capture front door with the 4-step GATE (reframe->place->search-first->simplify); propose-only unless --apply (low-confidence -> drain intake, lossless)",
     "premise-check": "premise-check <id> [--chain] — verify digest + quote the finality tier; --chain walks the supersession chain (attested biography)",
     "seat": "seat add|up|down|launch|spawn|where|resume|smoke|autocompact|list|status — multimodel seats (codex family via local proxy); spawn <seat> = harness-agnostic SELF-ONBOARDING spawn (reaps a stale same-name seat; orca/herdr pane + onboarding injection, or detached HEADLESS with the onboarding as boot first-prompt when no metaharness; --print dry-runs the exact calls); where <seat> resolves the spawn register (harness/handle/pid/worktree/room/liveness); launch/smoke --multi = mixed-model fleet (no subagent pin, per-agent frontmatter routes, conductor-log-verified fan-out); resume <seat> relaunches the pane via the detected metaharness (orca/herdr), freshest launch.sh + claude --resume/--continue; autocompact = proxy-seat context watchdog (inject /compact at ~90% before the 100% hang)",
@@ -218,6 +286,7 @@ _VERB_HELP = {
     "mcp": "mcp sync [--apply] — reconcile canonical MCP servers into every home (dry-run default; additive + fail-closed; backup-first, superset-refusal)",
     "worktree": "worktree gc [--apply] — prune orphan worktree-* branches + landed worktrees (dry-run default; rescue-dirty-first, locked/occupied-immune, unmerged-blocked; composes `helm work gc` for lane rooms)",
     "tidy": "tidy [--apply] — the umbrella: census + hooks sync + mcp sync + worktree gc, all dry-run; one consolidated report (--apply runs them all backup-first)",
+    "rearm": "rearm [--apply] [--json] — land-to-live: report (dry-run default) which long-lived processes still hold pre-HEAD code (helm chat wait waiters, the web unit, advisory proxies/daemons); --apply announces (ambient), SIGTERMs ONLY the stale waiters so each owner re-arms on new code at its own turn boundary (the OWNED beacon-cycle), and restarts a stale web unit — proxies/daemons/seats never signaled",
 }
 
 
@@ -239,12 +308,25 @@ def main(argv=None):
     verb = argv[0]
     fn = VERBS.get(verb)
     if fn is None:
-        print("helm: unknown verb '%s' (helm --help)" % verb, file=sys.stderr)
+        # Honest even under --help: an unknown verb NEVER falls through to the
+        # global usage with exit 0 — that false positive taught the fleet to
+        # distrust `helm <verb> --help` as an existence probe.
+        print("helm: unknown verb '%s'%s (helm --help)" % (verb, suggest(verb, VERBS)),
+              file=sys.stderr)
         return 2
     rest = argv[1:]
     if rest and rest[0] in ("-h", "--help"):
+        # help-FIRST short-circuits with the tail unread — deliberately: the
+        # root does not know a verb's flag surface, so refusing `--help
+        # --json` here would lie about real flags. No work ever runs on this
+        # path; junk-beats-help binds where a handler parses its own tail.
         print("helm " + (_VERB_HELP.get(verb) or (fn.__doc__ or verb).strip().split("\n")[0]))
         return 0
+    if verb in NOARG_VERBS:
+        rc = guard_tail("helm " + verb, rest, usage=_VERB_HELP.get(verb)
+                        or (fn.__doc__ or verb).strip().split("\n")[0])
+        if rc is not None:
+            return rc
     return fn(rest)
 
 

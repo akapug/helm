@@ -191,21 +191,15 @@ def _proc_start(pid):
 def _proc_matches(pid, start, cmdline, environ=None, cwd=None):
     """The same pid generation and process image still brackets the reads.
     starttime catches exit/PID reuse; cmdline+environ catch exec; cwd prevents
-    inference from composing two working-directory moments. Tri-state:
-    True = the bracket is proven intact; False = a read PROVED a different
-    generation, or the pid left mid-recheck (ENOENT/ESRCH) — genuine absence
-    of the bracketed generation; None = a mandatory recheck read FAILED
-    (EACCES/EIO/...) while the pid persists — a failed PROBE, which a caller
-    must surface as UNKNOWN, never treat as proven absence."""
+    inference from composing two working-directory moments."""
     try:
-        if (_starttime_from_stat(_proc_bytes(pid, "stat")) != start
-                or _proc_bytes(pid, "cmdline") != cmdline):
+        if _proc_start(pid) != start or _proc_bytes(pid, "cmdline") != cmdline:
             return False
         if environ is not None and _proc_bytes(pid, "environ") != environ:
             return False
         return cwd is None or os.readlink(os.path.join(PROC, str(pid), "cwd")) == cwd
-    except OSError as e:
-        return False if _gone(e) else None
+    except OSError:
+        return False
 
 
 def _selected_environ(raw):
@@ -228,69 +222,20 @@ def _selected_environ(raw):
     return out
 
 
-def _full_environ(raw):
-    """The bracketed environ, decoded WHOLE, or None when the bracketed read
-    failed. Exported on census rows so consumers (fleet's seat/deck/stamp
-    columns) read env facts from the SAME process generation the census
-    proved coherent, instead of re-opening /proc/<pid>/environ at a later
-    moment a reused pid could answer."""
-    if raw is None:
-        return None
-    return dict(kv.split("=", 1) for kv in
-                raw.decode("utf-8", "replace").split("\0") if "=" in kv)
-
-
-_GONE_ERRNOS = {errno.ENOENT, errno.ESRCH}
-
-
-def _gone(err):
-    """The pid left mid-scan (genuine absence) vs a failed PROBE on a pid
-    that persists (EACCES/EIO/anything else on a mandatory read)."""
-    return err.errno in _GONE_ERRNOS
-
-
 def _proc_snapshot(pid):
     """One same-uid Claude process, bracketed before later record/who reads.
-    Tri-state, fail-closed — a pass whose input was missing is vacuous:
-
-      ("ok", snap)      every mandatory fact proven.
-      ("absent", None)  structurally not ours (foreign uid, non-claude comm)
-                        or the process left mid-scan (ENOENT/ESRCH) — genuine
-                        absence, skipped.
-      ("unknown", stub) comm PROVED claude, then a mandatory read failed while
-                        the pid persists — the pid is KNOWN, its facts are
-                        unprovable; the census must surface it, never drop it
-                        as proven absence.
-      ("partial", None) a mandatory read failed BEFORE comm could prove or
-                        refute claude on a pid that may be ours — the census
-                        cannot certify its own completeness (census_partial).
-
     Optional environ/cwd failures keep a visible UNKNOWN-capable row."""
     base = os.path.join(PROC, str(pid))
     try:
         uid = os.stat(base).st_uid
-    except OSError as e:
-        return ("absent", None) if _gone(e) else ("partial", None)
-    if uid != os.geteuid():
-        return "absent", None  # foreign uid: structurally not ours
-    try:
-        start = _starttime_from_stat(_proc_bytes(pid, "stat"))
-    except OSError as e:
-        return ("absent", None) if _gone(e) else ("partial", None)
-    if not start:
-        return "partial", None  # stat read but unparsable: a failed probe
-    try:
-        comm = _proc_bytes(pid, "comm").strip()
-    except OSError as e:
-        return ("absent", None) if _gone(e) else ("partial", None)
-    if comm != b"claude":
-        return "absent", None
-    try:
+        start = _proc_start(pid)
+        if uid != os.geteuid() or not start:
+            return None
+        if _proc_bytes(pid, "comm").strip() != b"claude":
+            return None
         cmdline = _proc_bytes(pid, "cmdline")
-    except OSError as e:
-        if _gone(e):
-            return "absent", None
-        return "unknown", {"pid": pid, "uid": uid, "start": start}
+    except OSError:
+        return None
     try:
         environ_raw = _proc_bytes(pid, "environ")
         environ = _selected_environ(environ_raw)
@@ -300,33 +245,330 @@ def _proc_snapshot(pid):
         cwd = os.readlink(os.path.join(base, "cwd"))
     except OSError:
         cwd = None
-    match = _proc_matches(pid, start, cmdline, environ_raw, cwd)
-    if match is None:
-        # the bracket RECHECK failed while the pid persists: comm already
-        # PROVED claude, so the pid is KNOWN and its facts are unprovable —
-        # UNKNOWN, never a silent drop that certifies absence
-        return "unknown", {"pid": pid, "uid": uid, "start": start}
-    if not match:
-        return "absent", None
-    return "ok", {"pid": pid, "uid": uid, "start": start, "cmdline": cmdline,
-                  "environ": environ_raw,
-                  "argv": cmdline.decode("utf-8", "replace").split("\0"),
-                  "env": environ, "cwd": cwd}
+    try:
+        stdin = os.readlink(os.path.join(base, "fd", "0"))
+    except OSError:
+        stdin = None
+    if not _proc_matches(pid, start, cmdline, environ_raw, cwd):
+        return None
+    return {"pid": pid, "uid": uid, "start": start, "cmdline": cmdline,
+            "environ": environ_raw,
+            "argv": cmdline.decode("utf-8", "replace").split("\0"),
+            "env": environ, "cwd": cwd, "stdin": stdin}
+
+
+HEADLESS_FLAGS = ("-p", "--print")
+NONPERSISTENT_FLAG = "--no-session-persistence"
+
+# The claude CLI's short aliases, measured against the real binary 2026-07-22:
+# `-r <sid>` and `-r<sid>` both resume (commander attaches the token
+# remainder as the value, so `-r=<sid>` carries the LITERAL value `=<sid>` —
+# rejected: "Provided value \"=<sid>\" is not a UUID"), and commander splits
+# boolean shorts off a cluster before a value-taking one, so `-pr <sid>`
+# resumes in print mode. Booleans commander splits off; value-takers consume
+# the cluster remainder — `-dr` is a debug filter, never a resume. A short
+# absent from both maps (`-n <name>`) swallows the remainder itself, so its
+# cluster stays OPAQUE verbatim.
+_SHORT_BOOL = {"c": "--continue", "p": "--print"}
+_SHORT_OPTIONAL = {"d": "--debug", "r": "--resume", "w": "--worktree"}
+
+# Long flags MEASURED as boolean — never consuming the next token — against
+# the real CLI (2.1.218, probe 2026-07-22: `claude <flag> --version` prints
+# the version iff the flag cannot swallow `--version`; a value-taker eats it
+# and the short-circuit never fires). Every option outside this set and
+# _MEASURED_OPTIONAL_FLAGS is presumed capable of consuming its neighbor,
+# because commander hands a required option-argument the next token RAW even
+# when it is flag-shaped.
+# `--bg`/`--background` probed INCONCLUSIVE (they dispatch before the version
+# action fires) and stay presumed value-taking — the fail-closed side.
+_MEASURED_BOOL_FLAGS = frozenset((
+    "--print", "--continue", NONPERSISTENT_FLAG,
+    "--allow-dangerously-skip-permissions", "--ax-screen-reader", "--bare",
+    "--brief", "--chrome", "--dangerously-skip-permissions",
+    "--disable-slash-commands", "--exclude-dynamic-system-prompt-sections",
+    "--fork-session", "--forward-subagent-text", "--ide",
+    "--include-hook-events", "--include-partial-messages", "--no-chrome",
+    "--replay-user-messages", "--safe-mode", "--strict-mcp-config",
+    "--verbose"))
+
+# Long flags MEASURED as OPTIONAL-value — help declares `[value]`, and each
+# passes the same discriminator as the boolean set (2.1.218, probe
+# 2026-07-22: `claude <flag> --version` prints the version, so the flag
+# cannot swallow a flag-shaped neighbor; `claude --model --version` still
+# swallows). Commander consumes an optional option-argument only when the
+# next token is NOT flag-shaped (live: `claude -d --resume BAD -p hi` errors
+# 'not a UUID' — the resume was parsed, not eaten as a debug filter) and
+# leaves even the ``--`` terminator alone (`claude -d -- --version` runs
+# `--version` as prompt prose; `--model --` swallows the terminator). A
+# NON-dash neighbor it does consume: `claude -p -d hi` errors 'Input must be
+# provided' — `hi` became the debug filter, not the prompt.
+_MEASURED_OPTIONAL_FLAGS = frozenset((
+    "--debug", "--from-pr", "--prompt-suggestions", "--remote-control",
+    "--resume", "--worktree"))
+
+
+def _expand_options(argv):
+    """The OPTION region parsed ONCE, under one law, into (token, consumed)
+    pairs every scanner shares. `consumed` marks a token sitting in the value
+    slot of the unmeasured option before it: commander hands a required
+    option-argument the next token RAW even when it is flag-shaped, a short
+    cluster, or the ``--`` terminator itself (measured: `claude --model --
+    --version` prints the version — the terminator was swallowed as the model
+    name). A consumed token is OPAQUE — never expanded, never a flag, never
+    poison. Expanding it minted identity the CLI never granted (`--model -cr
+    <uuid>` is a model named "-cr" plus prompt prose, not a resume), defeated
+    the value-position guard with fragments of the very token commander
+    swallowed whole (`--model -cp --no-session-persistence`), and poisoned a
+    real holder on prompt prose that merely looked like a cluster.
+
+    One law, THREE measured token classes: a measured boolean never takes a
+    value; a measured OPTIONAL-value option consumes its neighbor only when
+    the neighbor is not flag-shaped (a lone ``-`` is a value; ``-x``/``--x``
+    are options; the ``--`` terminator stays a terminator — all measured, see
+    _MEASURED_OPTIONAL_FLAGS); everything else is presumed REQUIRED-greedy,
+    the fail-closed side. Collapsing the optional class into the greedy one
+    was r7's regression: `claude -d --resume <uuid> -p` REALLY resumes, yet
+    the presumption read the resume as a debug filter — certifying green and
+    dropping a proven holder from DOUBLE-OPEN.
+
+    Unconsumed short clusters are rewritten to canonical long form exactly as
+    commander parses them: leading boolean shorts split off one by one, then
+    a value-taking short absorbs the remainder as its attached value (`-pr X`
+    -> `--print --resume X`; `-rX` -> `--resume=X`; `-r=X` -> the literal
+    value `=X`, invalid, poisoning downstream; `-dr` -> `--debug=r`, a debug
+    filter, never a resume) — a BARE mapped short (`-d`, `-r`, `-w`) takes
+    its long form's optional-value law. A cluster led by an unmapped short
+    stays verbatim — its remainder belongs to THAT flag — and a BARE unmapped
+    short (`-n`) is presumed to consume its neighbor like any other
+    unmeasured option. Past the standard ``--`` terminator every token is
+    positional prose and passes through untouched."""
+    out = []
+    pending = None
+
+    def emit(token, takes):
+        nonlocal pending
+        out.append((token, False))
+        pending = takes
+
+    for i, arg in enumerate(argv):
+        if pending == "required" or (pending == "optional"
+                                     and not (len(arg) > 1 and arg[0] == "-")):
+            out.append((arg, True))
+            pending = None
+            continue
+        pending = None
+        if arg == "--":
+            out.extend((a, False) for a in argv[i:])
+            break
+        if len(arg) > 1 and arg[0] == "-" and arg[1] != "-":
+            rest = arg[1:]
+            while rest and rest[0] in _SHORT_BOOL:
+                emit(_SHORT_BOOL[rest[0]], None)
+                rest = rest[1:]
+            if rest and rest[0] in _SHORT_OPTIONAL:
+                long = _SHORT_OPTIONAL[rest[0]]
+                if len(rest) == 1:
+                    emit(long, "optional")
+                else:
+                    emit(long + "=" + rest[1:], None)
+            elif rest:
+                emit("-" + rest, "required" if len(rest) == 1 else None)
+            continue
+        if arg in _MEASURED_OPTIONAL_FLAGS:
+            emit(arg, "optional")
+            continue
+        emit(arg, "required" if len(arg) > 2 and arg[:2] == "--"
+             and "=" not in arg and arg not in _MEASURED_BOOL_FLAGS else None)
+    return out
+
+
+def _argv_flag(argv, names, prefixes=()):
+    """Flag presence in the OPTION region of argv only: past the standard
+    ``--`` terminator every token is positional (a boot prompt that happens to
+    equal ``-p`` is prose, not a flag), so scanning stops there. Short
+    clusters are expanded first, so `-pr <sid>` declares print mode exactly
+    as `-p` does — the short alias of a flag is the flag.
+
+    A token CONSUMED as the value of the option before it is evidence of
+    NOTHING: `--append-system-prompt --no-session-persistence` hands the flag
+    to commander as prompt text, and reading it as declared nonpersistence
+    would certify green a session the CLI persists. That verdict is
+    _expand_options' — both this scanner and _resume_sid walk the SAME pairs
+    under the same value-position law, so the two can never read one argv two
+    ways. Fail-closed here means the occurrence never counts — only a token
+    no predecessor could consume (after a positional, a measured boolean, or
+    an ``=``-attached form) declares the flag."""
+    for token, consumed in _expand_options(argv):
+        if consumed:
+            continue
+        if token == "--":
+            return False
+        if token in names or (prefixes and token.startswith(prefixes)):
+            return True
+    return False
+
+
+def _is_headless(argv):
+    """True when this process runs in PRINT MODE (`-p`/`--print`).
+
+    Headless is an INTERACTION MODE, not proof the process holds no session.
+    Claude Code supports `--resume` together with `--print`, and print mode
+    persists a transcript unless `--no-session-persistence` is also requested —
+    so `claude -p --resume <sid>` is a short-lived process operating on a
+    proven resumable session, every bit a holder while it lives. Whether a row
+    leaves the health arithmetic is decided by _sessionless_oneshot, which
+    reads this mode TOGETHER with the row's session-identity evidence.
+
+    Argv is one rung of the mode evidence, not the whole of it: the CLI also
+    enters print mode ON ITS OWN whenever stdin is not a terminal (measured
+    2026-07-22: `claude </dev/null` with no flags errors 'when using
+    --print'), so _proc_claude_rows composes this scan with the process's
+    proven stdin redirection (_stdin_redirected)."""
+    return _argv_flag(argv, HEADLESS_FLAGS, ("-p=", "--print="))
+
+
+def _stdin_redirected(target):
+    """True when a /proc fd/0 readlink target PROVES stdin is not a terminal
+    — the condition under which the claude CLI enters print mode with no `-p`
+    at all (see _is_headless). A pipe/socket/file/`/dev/null` stdin is that
+    proof; a pty/tty is a live terminal — including the pty MASTER
+    `/dev/ptmx`, isatty-true and interactive however exotic as a child's
+    stdin; and an absent or unreadable target proves nothing, failing toward
+    interactive — the direction that refuses to certify, never the one that
+    greens."""
+    if not target:
+        return False
+    return not (target.startswith("/dev/pts/") or target.startswith("/dev/tty")
+                or target in ("/dev/console", "/dev/ptmx"))
+
+
+def _is_nonpersistent(argv):
+    """True when argv declares `--no-session-persistence` outright — the one
+    flag that states sessionless intent rather than merely an interaction
+    mode. Kept as its own axis so print mode is never mistaken for it."""
+    return _argv_flag(argv, (NONPERSISTENT_FLAG,))
+
+
+def _own_session_identity(r):
+    """A session identity that belongs to THIS process — any canonical rung:
+    a procStart-bound pid record (`declared`), an unambiguous ``--resume``
+    (`resume`), or ``helm who``'s fresh exact attribution (identity ``who``).
+
+    `who` is canonical here, not a hint: _proc_claude_rows suppresses who
+    attribution for child processes (both the CLAUDE_CODE_CHILD_SESSION stamp
+    and who's own agent-ancestor marking), and who's session dedupe demotes
+    every younger same-session process to a candidate — so a row that SURVIVES
+    with identity=='who' carries the process's own exact attribution, never
+    its parent's. Treating who rows as inherited hints hid a proven holder
+    from live-holder/DOUBLE-OPEN arithmetic (codex-2 round-3 HIGH)."""
+    return bool(r.get("declared") or r.get("resume")
+                or r.get("identity") == "who")
+
+
+def _sessionless_oneshot(r):
+    """True only when the row PROVES sessionless intent: explicit
+    `--no-session-persistence` IN PRINT MODE with no explicit session
+    identity of its own. These rows leave every health count AND certify
+    green — their missing transcript is the design working, not work at risk.
+    Measured 2026-07-22, twenty minutes after this census first certified the
+    fleet: the `remember` plugin ran `claude -p --output-format json
+    --no-session-persistence` to compress memory, and the estate flipped to a
+    memory-only FAIL advising `helm session rescue` on a process that had
+    already exited. That row is excluded on its EXPLICIT nonpersistence
+    evidence.
+
+    The flag alone is NOT that proof: the CLI documents it '(only works with
+    --print)', so in an interactive pane it is INERT and a real session
+    persists. The print-mode conjunct is the row's `headless` bit, which
+    _proc_claude_rows derives from argv OR from proven stdin redirection —
+    the CLI enters print mode on its own when stdin is not a terminal — so a
+    piped spawn that omitted `-p` still certifies, while an interactive pane
+    mislaunched with the inert flag falls through to UNKNOWN fail-closed.
+
+    Plain `-p` is NOT that proof. Print mode persists a transcript by default,
+    so a `-p` row whose SID cannot be resolved is an UNRESOLVED session, not
+    an absent one — it fails closed as UNKNOWN in certification like any other
+    unresolved row (see _cmd_ls). Whether such a row enters HOLDER arithmetic
+    is the separate axis _inherited_hint_worker decides.
+
+    The line that must never move: a row with a CANONICAL session identity of
+    its own — pid record, unambiguous ``--resume``, or exact who attribution
+    (_own_session_identity) — is a proven holder and stays in every count no
+    matter how it interacts or how soon it exits (`--no-session-persistence
+    --resume X` still READS X while it lives).
+
+    This narrows WHAT IS COUNTED, never what is allowed: a helm SEAT that
+    shows up headless is still a law violation, and it stays visible in
+    `session ls` tagged as such rather than being hidden."""
+    return bool(r.get("nonpersistent") and r.get("headless")
+                and not _own_session_identity(r))
+
+
+def _inherited_hint_worker(r):
+    """True for a print-mode/nonpersistent row with NO canonical session
+    identity of its own (identity 'unknown' — no pid record, no unambiguous
+    ``--resume``, no exact who attribution): any SID such a row still carries
+    is at best inherited/echoed from the pane that spawned it, so it is never
+    a SECOND holder of that session. Such rows leave HOLDER arithmetic —
+    live_sids/DOUBLE-OPEN and the memory-only pane census — or an ordinary
+    background print worker echoing its parent's SID would manufacture a
+    false DOUBLE-OPEN against the very pane it serves.
+
+    Exclusion is based on the ABSENCE of every canonical rung, never on the
+    interaction mode alone: identity=='who' is the process's own exact
+    attribution (who suppresses child processes and dedupes shared sessions —
+    see _own_session_identity), so a who-attributed print row stays a holder.
+
+    Deliberately distinct from _sessionless_oneshot: leaving holder
+    arithmetic never certifies a row green. Without explicit nonpersistence a
+    plain `-p` row with no resolvable SID still fails closed as UNKNOWN —
+    print mode normally persists, so 'not a second holder' is a claim about
+    double-open arithmetic, never proof of sessionlessness."""
+    return bool((r.get("headless") or r.get("nonpersistent"))
+                and not _own_session_identity(r))
 
 
 def _resume_sid(argv):
-    """One unambiguous full UUID from argv. FAIL-CLOSED over every ``--resume``
-    occurrence: a bare/trailing ``--resume``, a flag consumed as its value, a
-    prefix or otherwise invalid value, and conflicting repeats each poison the
-    WHOLE parse — a valid occurrence beside an invalid one is contradictory
-    evidence, not a majority vote. A false holder is worse than falling
-    through to another rung."""
+    """One unambiguous full UUID from the OPTION region of argv. Short
+    aliases are expanded first (`-r <sid>`, attached `-r<sid>`, and cluster
+    forms like `-pr <sid>` all resume — measured against the real CLI), so a
+    holder spawned through the short alias never silently vanishes from the
+    census. The scan honors the standard ``--`` terminator under the same law
+    as _argv_flag: past it every token is positional prose, so `claude -p --
+    --resume <uuid>` carries prompt text, never a session identity — and
+    post-terminator prose can never conflict away a real pre-terminator
+    resume. The scan walks the same (token, consumed) pairs as _argv_flag —
+    one law, never two readings of one argv — so a resume token CONSUMED as
+    the value of the option before it is opaque prose: it neither mints a
+    holder (`--model -cr <uuid>` names a model, and `--model --resume <uuid>`
+    swallows the long flag whole — measured, the CLI parses no resume) nor
+    poisons a real one (`--append-system-prompt '-pr be brief' --resume
+    <sid>` keeps the proven holder). Only a MEASURED greedy predecessor
+    consumes that way: `-d [filter]` is optional-value, so `claude -d
+    --resume <uuid> -p` REALLY resumes (measured — `-d --resume BAD -p hi`
+    errors 'not a UUID') and the holder stays attributed. `--resume` itself
+    is optional-value, so only a CONSUMED neighbor is its value — a
+    flag-shaped neighbor commander refuses (`--resume --print`) leaves the
+    resume BARE. Within the option region the parse is FAIL-CLOSED over
+    every UNCONSUMED resume occurrence, short or long: a bare/trailing
+    ``--resume``/``-r``, a prefix or otherwise invalid value (`-r=X` carries
+    the literal value `=X`; `-rp` resumes by TITLE "p", unresolvable from
+    argv), and conflicting repeats each poison the WHOLE parse — a valid
+    occurrence beside an invalid one is contradictory evidence, not a
+    majority vote. A false holder is worse than falling through to another
+    rung."""
     found = []
-    for i, arg in enumerate(argv):
-        if arg == "--resume":
-            value = argv[i + 1] if i + 1 < len(argv) else None
-        elif arg.startswith("--resume="):
-            value = arg.split("=", 1)[1]
+    tokens = _expand_options(argv)
+    for i, (token, consumed) in enumerate(tokens):
+        if consumed:
+            continue
+        if token == "--":
+            break
+        if token == "--resume":
+            after = tokens[i + 1] if i + 1 < len(tokens) else None
+            value = after[0] if after and after[1] else None
+        elif token.startswith("--resume="):
+            value = token.split("=", 1)[1]
         else:
             continue
         if not (isinstance(value, str) and _SID_RE.fullmatch(value)):
@@ -467,56 +709,26 @@ def _sid_from_session_file(pid, config_dir, home_dir=None, uid=None,
     return _session_record(pid, config_dir, home_dir, uid, proc_start)[0]
 
 
-def _proc_claude_census():
-    """Every same-uid live Claude process, PLUS the completeness of the two
-    GLOBAL probes the table rests on. Resolution ladder, strongest first:
+def _proc_claude_rows():
+    """Every same-uid live Claude process. Resolution ladder, strongest first:
     procStart-bound pid record -> unambiguous full ``--resume`` UUID -> exact
     ``helm who`` attribution -> cwd candidate set. Every per-pid read is
-    bracketed; one bad record only demotes its own rung.
-
-    ``listing_failed`` True means the /proc enumeration itself failed: zero
-    rows because nothing was READ, not because nothing runs — a consumer must
-    render estate-UNKNOWN, never certify an empty estate. ``who_failed`` True
-    means the who rung was never probed: an unresolved non-child row may only
-    look unresolved because its strongest remaining rung silently vanished —
-    a failed probe, not a proven blank. ``census_partial`` True means a
-    mandatory per-pid probe failed BEFORE the pid's comm could prove or
-    refute claude while the pid persists: the row count is a FLOOR ("at
-    least N"), never a certified estate total — surfaced the same way as
-    listing_failed, never dropped as proven absence. A mandatory probe that
-    fails AFTER comm proved claude yields a ``probe_failed`` UNKNOWN row
-    (pid known, facts unprovable) instead of vanishing. Only ENOENT/ESRCH —
-    the process left mid-scan — is genuine absence.
-
-    Each row also exports its bracket: ``start`` (the pid generation every
-    fact was proven against — a consumer making LATER /proc reads must
-    re-prove it before composing them in) and ``environ`` (the bracketed
-    environ, whole, so env facts never need a second unbracketed read)."""
-    snapshots, unknown_stubs = [], []
-    listing_failed = census_partial = False
+    bracketed; one bad record only demotes its own rung."""
+    snapshots = []
     try:
         pids = sorted((int(p) for p in os.listdir(PROC) if p.isdigit()))
     except OSError:
-        pids, listing_failed = [], True
+        pids = []
     for pid in pids:
-        status, snap = _proc_snapshot(pid)
-        if status == "ok":
+        snap = _proc_snapshot(pid)
+        if snap:
             snapshots.append(snap)
-        elif status == "unknown":
-            unknown_stubs.append(snap)
-        elif status == "partial":
-            census_partial = True
-    who_failed = False
     try:
         from . import who
         who_rows = {r["pid"]: r for r in who.scan(accounts=[])
                     if r.get("provider") == "anthropic" and not r.get("child")}
-    except Exception:
-        # broad on purpose (same pattern as fleet._roster): who.scan parses
-        # external JSON/state, so a malformed row can raise KeyError/TypeError
-        # just as plausibly as OSError/ValueError — every shape of failure
-        # must degrade to who_failed, never crash the whole census
-        who_rows, who_failed = {}, True
+    except (OSError, ValueError):
+        who_rows = {}
     cwd_candidates = {}
     rows = []
     for snap in snapshots:
@@ -543,14 +755,227 @@ def _proc_claude_census():
             if key not in cwd_candidates:
                 cwd_candidates[key] = _cwd_session_ids(*key)
             possible = cwd_candidates[key]
-        match = _proc_matches(pid, snap["start"], snap["cmdline"],
-                              snap["environ"], snap["cwd"])
+        if not _proc_matches(pid, snap["start"], snap["cmdline"],
+                             snap["environ"], snap["cwd"]):
+            continue
+        session_id = declared or resume or attributed
+        rows.append({
+            "pid": pid,
+            "resume": resume,
+            "declared": declared,
+            "declared_reason": reason,
+            "identity": ("declared" if declared else "resume" if resume
+                         else "who" if attributed else "unknown"),
+            "session": session_id,
+            "possible_sessions": possible,
+            "child": child,
+            "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
+            "force": env.get(FORCE_VAR) == "1",
+            "headless": (_is_headless(snap.get("argv") or [])
+                         or _stdin_redirected(snap.get("stdin"))),
+            "nonpersistent": _is_nonpersistent(snap.get("argv") or []),
+        })
+    return rows
+
+
+_GONE_ERRNOS = {errno.ENOENT, errno.ESRCH}
+
+
+def _gone(err):
+    """The pid left mid-scan (genuine absence) vs a failed PROBE on a pid that
+    persists (EACCES/EIO/anything else on a mandatory read)."""
+    return err.errno in _GONE_ERRNOS
+
+
+def _full_environ(raw):
+    """The bracketed environ, decoded WHOLE, or None when the bracketed read
+    failed. Exported on census rows so consumers (fleet's seat/deck/stamp
+    columns) read env facts from the SAME process generation the census proved
+    coherent, instead of re-opening /proc/<pid>/environ at a later moment a
+    reused pid could answer."""
+    if raw is None:
+        return None
+    return dict(kv.split("=", 1) for kv in
+                raw.decode("utf-8", "replace").split("\0") if "=" in kv)
+
+
+def _census_matches(pid, start, cmdline, environ=None, cwd=None):
+    """Tri-state sibling of _proc_matches for the census. True = the bracket is
+    proven intact; False = a read PROVED a different generation, or the pid
+    left mid-recheck (ENOENT/ESRCH) — genuine absence of the bracketed
+    generation; None = a mandatory recheck read FAILED (EACCES/EIO/...) while
+    the pid persists — a failed PROBE the census surfaces as UNKNOWN, never as
+    proven absence. (The plain _proc_matches stays bool-valued for its own
+    callers; the census needs the None rung to tell probe-failure from proven
+    reuse.)"""
+    try:
+        if (_proc_start(pid) != start
+                or _proc_bytes(pid, "cmdline") != cmdline):
+            return False
+        if environ is not None and _proc_bytes(pid, "environ") != environ:
+            return False
+        return cwd is None or os.readlink(
+            os.path.join(PROC, str(pid), "cwd")) == cwd
+    except OSError as e:
+        return False if _gone(e) else None
+
+
+def _census_snapshot(pid):
+    """Tri-state sibling of _proc_snapshot for the census, fail-closed — a pass
+    whose input was missing is vacuous:
+
+      ("ok", snap)      every mandatory fact proven.
+      ("absent", None)  structurally not ours (foreign uid, non-claude comm)
+                        or the process left mid-scan (ENOENT/ESRCH) — genuine
+                        absence, skipped.
+      ("unknown", stub) comm PROVED claude, then a mandatory read failed while
+                        the pid persists — the pid is KNOWN, its facts are
+                        unprovable; the census surfaces it, never drops it as
+                        proven absence.
+      ("partial", None) a mandatory read failed BEFORE comm could prove or
+                        refute claude on a pid that may be ours — the census
+                        cannot certify its own completeness (census_partial).
+
+    (The plain _proc_snapshot stays dict-or-None for its own callers, which
+    tri-state would break; this sibling adds the UNKNOWN/PARTIAL rungs the
+    fail-closed census needs.)"""
+    base = os.path.join(PROC, str(pid))
+    try:
+        uid = os.stat(base).st_uid
+    except OSError as e:
+        return ("absent", None) if _gone(e) else ("partial", None)
+    if uid != os.geteuid():
+        return "absent", None  # foreign uid: structurally not ours
+    try:
+        start = _starttime_from_stat(_proc_bytes(pid, "stat"))
+    except OSError as e:
+        return ("absent", None) if _gone(e) else ("partial", None)
+    if not start:
+        return "partial", None  # stat read but unparsable: a failed probe
+    try:
+        comm = _proc_bytes(pid, "comm").strip()
+    except OSError as e:
+        return ("absent", None) if _gone(e) else ("partial", None)
+    if comm != b"claude":
+        return "absent", None
+    try:
+        cmdline = _proc_bytes(pid, "cmdline")
+    except OSError as e:
+        if _gone(e):
+            return "absent", None
+        return "unknown", {"pid": pid, "uid": uid, "start": start}
+    try:
+        environ_raw = _proc_bytes(pid, "environ")
+        environ = _selected_environ(environ_raw)
+    except OSError:
+        environ_raw = environ = None
+    try:
+        cwd = os.readlink(os.path.join(base, "cwd"))
+    except OSError:
+        cwd = None
+    try:
+        stdin = os.readlink(os.path.join(base, "fd", "0"))
+    except OSError:
+        stdin = None
+    match = _census_matches(pid, start, cmdline, environ_raw, cwd)
+    if match is None:
+        # the bracket RECHECK failed while the pid persists: comm already
+        # PROVED claude, so the pid is KNOWN and its facts are unprovable —
+        # UNKNOWN, never a silent drop that certifies absence
+        return "unknown", {"pid": pid, "uid": uid, "start": start}
+    if not match:
+        return "absent", None
+    return "ok", {"pid": pid, "uid": uid, "start": start, "cmdline": cmdline,
+                  "environ": environ_raw,
+                  "argv": cmdline.decode("utf-8", "replace").split("\0"),
+                  "env": environ, "cwd": cwd, "stdin": stdin}
+
+
+def _proc_claude_census():
+    """Every same-uid live Claude process, PLUS the completeness of the GLOBAL
+    probes the table rests on, PLUS each row's bracket export. The fail-closed
+    superset of _proc_claude_rows that helm/fleet.py consumes: identical
+    resolution ladder and per-row identity (procStart-bound pid record ->
+    unambiguous full ``--resume`` UUID -> exact ``helm who`` attribution -> cwd
+    candidate set), but it never turns a failed probe into a proven-empty row.
+
+    ``listing_failed`` True: the /proc enumeration itself failed — zero rows
+    because nothing was READ, not because nothing runs; a consumer renders
+    estate-UNKNOWN, never certifies an empty estate. ``who_failed`` True: the
+    who rung was never probed, so an unresolved non-child row may only look
+    unresolved because its strongest remaining rung silently vanished.
+    ``census_partial`` True: a mandatory per-pid probe failed BEFORE the pid's
+    comm could prove or refute claude — the row count is a FLOOR ("at least
+    N"), never a certified estate total. A probe that fails AFTER comm proved
+    claude yields a ``probe_failed`` UNKNOWN row (pid known, facts unprovable)
+    rather than vanishing. Only ENOENT/ESRCH — the process left mid-scan — is
+    genuine absence.
+
+    Each row also exports its bracket: ``start`` (the pid generation every
+    fact was proven against — a consumer making LATER /proc reads must re-prove
+    it before composing them in), ``cwd``, ``root`` (canonical trusted config
+    root; None = config-untrusted) and ``environ`` (the bracketed environ,
+    whole, so env facts never need a second unbracketed read)."""
+    snapshots, unknown_stubs = [], []
+    listing_failed = census_partial = False
+    try:
+        pids = sorted((int(p) for p in os.listdir(PROC) if p.isdigit()))
+    except OSError:
+        pids, listing_failed = [], True
+    for pid in pids:
+        status, snap = _census_snapshot(pid)
+        if status == "ok":
+            snapshots.append(snap)
+        elif status == "unknown":
+            unknown_stubs.append(snap)
+        elif status == "partial":
+            census_partial = True
+    who_failed = False
+    try:
+        from . import who
+        who_rows = {r["pid"]: r for r in who.scan(accounts=[])
+                    if r.get("provider") == "anthropic" and not r.get("child")}
+    except Exception:
+        # broad on purpose (same pattern as fleet._roster): who.scan parses
+        # external JSON/state, so a malformed row can raise KeyError/TypeError
+        # just as plausibly as OSError/ValueError — every shape of failure must
+        # degrade to who_failed, never crash the whole census
+        who_rows, who_failed = {}, True
+    cwd_candidates = {}
+    rows = []
+    for snap in snapshots:
+        pid, selected = snap["pid"], snap["env"]
+        env = selected or {}
+        invalid_home = (("CLAUDE_CONFIG_DIR" in env
+                         and env["CLAUDE_CONFIG_DIR"] is None)
+                        or (not env.get("CLAUDE_CONFIG_DIR") and "HOME" in env
+                            and env["HOME"] is None))
+        if selected is None:
+            declared, reason, root = None, "environ-unreadable", None
+        elif invalid_home:
+            declared, reason, root = None, "config-untrusted", None
+        else:
+            declared, reason, root = _session_record(
+                pid, env.get("CLAUDE_CONFIG_DIR"), env.get("HOME"),
+                snap["uid"], snap["start"])
+        resume = _resume_sid(snap["argv"])
+        child = env.get("CLAUDE_CODE_CHILD_SESSION") == "1"
+        attributed = None if child else _who_holder_sid(who_rows.get(pid, {}))
+        possible = []
+        if (not (child or declared or resume or attributed)
+                and root and snap["cwd"]):
+            key = (root, snap["cwd"])
+            if key not in cwd_candidates:
+                cwd_candidates[key] = _cwd_session_ids(*key)
+            possible = cwd_candidates[key]
+        match = _census_matches(pid, snap["start"], snap["cmdline"],
+                                snap["environ"], snap["cwd"])
         if match is None:
             # the mid-loop rebracket FAILED while the pid persists (EACCES/
             # EIO): comm proved claude at snapshot time, so the row must
-            # surface as a probe_failed UNKNOWN stub — a silent drop here
-            # would read as proven absence, the exact class this census
-            # legislates against
+            # surface as a probe_failed UNKNOWN stub — a silent drop here would
+            # read as proven absence, the exact class this census legislates
+            # against
             unknown_stubs.append({"pid": pid, "uid": snap["uid"],
                                   "start": snap["start"]})
             continue
@@ -577,6 +1002,9 @@ def _proc_claude_census():
             "child": child,
             "ancestor_sid8": (env.get("CLAUDE_CODE_SESSION_ID") or "")[:8],
             "force": env.get(FORCE_VAR) == "1",
+            "headless": (_is_headless(snap.get("argv") or [])
+                         or _stdin_redirected(snap.get("stdin"))),
+            "nonpersistent": _is_nonpersistent(snap.get("argv") or []),
             "probe_failed": False,
         })
     for stub in unknown_stubs:
@@ -597,28 +1025,28 @@ def _proc_claude_census():
             "cwd": None, "root": None, "start": stub["start"],
             "environ": None, "identity": "unknown", "session": None,
             "possible_sessions": [], "child": False, "ancestor_sid8": "",
-            "force": False, "probe_failed": True,
+            "force": False, "headless": False, "nonpersistent": False,
+            "probe_failed": True,
         })
     rows.sort(key=lambda r: r["pid"])
     return {"rows": rows, "listing_failed": listing_failed,
             "who_failed": who_failed, "census_partial": census_partial}
 
 
-def _proc_claude_rows():
-    """The census rows alone — the holder/liveness callers' shape. A consumer
-    that must not turn a failed GLOBAL probe into proven absence (helm fleet)
-    calls _proc_claude_census() and honors its completeness bits instead."""
-    return _proc_claude_census()["rows"]
-
-
 def live_sids(rows=None):
     """{sid: [pid,...]} of proven live copies. The procStart-bound pid record
     wins, then canonical resume/who evidence. An inherited stamp SID is only the
-    spawning ancestor and never enters this map."""
+    spawning ancestor and never enters this map, and neither does a print-mode
+    worker with NO canonical identity of its own — a background worker echoing
+    its parent's SID must not manufacture a false DOUBLE-OPEN. But headless is
+    only an interaction mode: a print-mode row with a canonical pid-record /
+    ``--resume`` / exact-who identity is a proven live holder and MUST enter,
+    or a real overlapping holder hides from the certifier while the launch
+    guard still sees it (see _inherited_hint_worker)."""
     out = {}
     for r in (rows if rows is not None else _proc_claude_rows()):
         sid = r.get("session") or r.get("resume")
-        if sid:
+        if sid and not _inherited_hint_worker(r):
             out.setdefault(sid, []).append(r["pid"])
     return out
 
@@ -650,11 +1078,24 @@ def open_pids(sid, rows=None):
 
 
 def memory_only_panes(rows=None, persisting=None):
-    """Proven live panes with NO transcript on disk. UNKNOWN candidate rows are
-    deliberately excluded: they are neither persistence PASS nor memory-only."""
+    """Proven live AGENT PANES with NO transcript on disk. Two exclusions, and
+    they are different in kind:
+
+    UNKNOWN candidate rows are excluded because they are neither a persistence
+    PASS nor memory-only — a check that passes on absent input reports the
+    opposite of the truth.
+
+    Print-mode workers with no canonical session identity of their OWN are
+    excluded because they are not panes: an explicitly nonpersistent one-shot
+    has no transcript by design, and an inherited-hint worker's transcript
+    risk belongs to the pane that actually holds that session. But a
+    print-mode row with a CANONICAL identity — pid record, ``--resume``, or
+    exact who attribution — stays: headless is an interaction mode, and print
+    mode persists unless nonpersistence was requested outright (see
+    _inherited_hint_worker)."""
     rows = rows if rows is not None else _proc_claude_rows()
     persisting = persisting if persisting is not None else _persisting_sids()
-    return [r for r in rows if r.get("session")
+    return [r for r in rows if r.get("session") and not _inherited_hint_worker(r)
             and _sid_on_disk(r["session"], persisting) is False]
 
 
@@ -728,6 +1169,16 @@ def _persisting_sids():
     persistence surface that lies about the seats is worse than none — it is
     what the fleet uses to decide whether an agent's work is safe to lose."""
     out, complete = {}, True
+    # Known bound (documented, accepted): the catalog GLOBS its roots, so a
+    # missing/unreadable/offline store (e.g. a network-mounted ~/.claude-homes)
+    # reads as [] — indistinguishable from legitimately empty — and `complete`
+    # stays True. Accepted because transcript proof is gc's LAST tier: the
+    # presence window and the FAIL-CLOSED live-process scan both precede it,
+    # so a live seat with an invisible store is still kept; the worst case
+    # (idle past REAP_S, no live process, store offline) loses only the
+    # roster row + cursors, and the next join self-heals at EOF. A
+    # mount-aware completeness probe would false-trip every host without
+    # per-account stores, which is the common shape.
     try:
         from . import transcripts
         for r in transcripts.get_catalog().get("rows", []):
@@ -787,27 +1238,86 @@ def _cmd_ls(args, certify=False):
     # at-risk count is only panes we RESOLVED and found transcript-less.
     disk = {r["pid"]: _sid_on_disk(r.get("session"), persisting)
             for r in rows if r.get("session")}
+    # Two exclusion axes, deliberately different in reach. HOLDER arithmetic
+    # (memory-only, double-open) excludes every print-mode row with no
+    # CANONICAL session identity of its own (_inherited_hint_worker) — a
+    # worker echoing its parent's SID is not a second holder. But
+    # CERTIFICATION green is earned only by proof: an explicitly nonpersistent
+    # one-shot (_sessionless_oneshot) is sessionless by request; a plain `-p`
+    # row with no resolvable SID is an UNRESOLVED session — print mode
+    # persists by default — and fails closed as UNKNOWN. A print-mode row
+    # with a canonical pid-record/--resume/exact-who identity is a proven
+    # holder that stays in every count. Excluded rows stay rendered below;
+    # exclusion narrows what is COUNTED, never what the operator can SEE.
     mo = memory_only_panes(rows, persisting)
-    unknown = [r for r in rows if not r.get("session")
-               or disk.get(r["pid"]) is None]
+    # An inherited-hint worker's transcript alarm belongs to its HOLDER — but
+    # only a holder actually PRESENT in the census can carry it. A
+    # transcriptless hint row with no live holder anywhere (impossible today:
+    # _proc_claude_rows only sets `session` from canonical rungs) is an
+    # impossible shape, and impossible shapes fail closed as UNKNOWN rather
+    # than green — nobody else is left to alarm.
+    holders = {r["session"] for r in rows
+               if r.get("session") and _own_session_identity(r)}
+    orphan_hint = {r["pid"] for r in rows
+                   if _inherited_hint_worker(r) and r.get("session")
+                   and disk.get(r["pid"]) is False
+                   and r["session"] not in holders}
+    unknown = [r for r in rows if not _sessionless_oneshot(r)
+               and (not r.get("session") or disk.get(r["pid"]) is None
+                    or r["pid"] in orphan_hint)]
     live = live_sids(rows)
     dbl = {s: ps for s, ps in live.items() if len(ps) > 1}
     print("helm session ls — %d live claude panes" % len(rows))
     for r in sorted(rows, key=lambda x: x["pid"]):
         sid = r.get("session") or r.get("resume")
         why = (" (rescued)" if r["force"] else " (stamped)" if r["child"] else "")
-        if not sid:
+        if _sessionless_oneshot(r):
+            # SHOWN, never hidden. Excluding it from the health counts above is
+            # about what gets COUNTED; withholding it from the operator would
+            # be about what can be SEEN, and a helm SEAT running headless is a
+            # law violation that has to stay visible to be caught. Only
+            # explicit nonpersistence earns this label: plain print mode
+            # persists by default, so a `-p` row with no resolvable SID is
+            # UNRESOLVED, not sessionless, and falls through to UNKNOWN below.
+            state = ("headless one-shot (--no-session-persistence; "
+                     "sessionless by request)")
+        elif not sid:
             reason = r.get("declared_reason")
             detail = "; pid record %s" % reason if reason else ""
+            # an interactive pane mislaunched with the inert flag lands here:
+            # the flag proves nothing outside print mode, so its session is
+            # UNRESOLVED, never sessionless — say why so the operator can fix
+            # the launch instead of trusting a label
+            if r.get("nonpersistent") and not r.get("headless"):
+                detail += ("; --no-session-persistence is inert outside "
+                           "print mode")
             state = "UNKNOWN (sid unresolved%s — verify by hand)" % detail + why
         elif disk[r["pid"]] is True:
             state = "persisted" + why
         elif disk[r["pid"]] is None:
             state = "UNKNOWN (transcript census incomplete — verify by hand)" + why
+        elif r["pid"] in orphan_hint:
+            # the render must agree with the UNKNOWN count above: with no
+            # live holder present, "risk belongs to its holder" would name
+            # nobody, and certifying green on an impossible shape is the
+            # dangerous direction
+            state = ("UNKNOWN (inherited session hint with no live holder "
+                     "in the census — verify by hand)")
+        elif _inherited_hint_worker(r):
+            # transcript absent, but this worker's only SID evidence is
+            # inherited/attributed — the persistence alarm belongs to the pane
+            # that actually holds the session, so this row never enters the
+            # memory-only count above; the render must agree with the count
+            state = ("inherited-session print worker (no identity of its own; "
+                     "transcript risk belongs to its holder)")
         elif r["child"] and not r["force"]:
             state = "MEMORY-ONLY (stamped, no FORCE)"
         else:
             state = "MEMORY-ONLY (no transcript on disk)"
+        if r.get("headless") and not _sessionless_oneshot(r):
+            # a print-mode HOLDER — counted like any pane, tagged so the
+            # operator sees the interaction mode too
+            state += " [headless]"
         possible = len(r.get("possible_sessions") or [])
         res = ((" session=%s" % sid[:12]) if sid else
                (" session=? (%d cwd candidates)" % possible if possible else ""))

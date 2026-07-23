@@ -8,9 +8,9 @@ fleet owner-ask list (premise: builtin-tasklist-mirrored-to-dregg is the
 fleet coordination primitive; agents SELF-ADD, a2a-self-add culture). Every
 mutation appends a full SNAPSHOT row (event-sourced: last line per id wins),
 so writes are O(1) — one unbuffered O_APPEND write, never a read — and the
-history is never lost. FAIL-OPEN: ledger trouble never raises; an add that
-did not land says so loudly (a silent success-lie would re-create the very
-bug this ledger fixes).
+history is never lost. Mutations never raise and a refused add says so loudly;
+reads distinguish absent/empty from UNAVAILABLE, so owner debt is UNKNOWN on
+CLI/stop surfaces rather than silently disappearing.
 
 Row schema (every snapshot carries the full shape):
   {id, ts, ask, source, status: open|done|reported,
@@ -22,54 +22,34 @@ OWNER — moves a row to `reported`. Anything not `reported` is still open
 fleet debt, and the stop-whisper's top rung (seats._ask_candidate) keeps
 naming the oldest such row until the owner has actually been told.
 """
-import hashlib
 import json
 import os
 import sys
 
-from . import home, pk
+from . import eventledger, home, pk
 
 STATUSES = ("open", "done", "reported")
 
 
-def ledger_path():
-    return os.path.join(home.global_dir(), "owner-asks.jsonl")
+def ledger_path(name="owner-asks.jsonl"):
+    return os.path.join(home.global_dir(), name)
 
 
-def _append(row):
-    """The O(1) append: makedirs + ONE unbuffered O_APPEND os.write (torn-line
-    proof under concurrent appenders — kernel appends are atomic for one small
-    write; the emit-law kin). Fail-open: False on any trouble, never a raise.
-    No rotation — this ledger is DURABLE record, not telemetry exhaust."""
-    try:
-        path = ledger_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-        try:
-            os.write(fd, (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
-        finally:
-            os.close(fd)
-        return True
-    except Exception:
-        return False
+def _append(row, path=None):
+    """Append one durable event.  The shared primitive owns symlink defense,
+    serialization, one-write O_APPEND, fsync, short-write rollback, and 0600
+    permissions.  False is the fail-open mutation result; callers surface it."""
+    return eventledger.append(path or ledger_path(), row)
 
 
-def rows():
-    """id -> latest snapshot (last line per id wins). Fail-open to {}:
-    garbled lines skip, a missing/unreadable ledger reads as empty."""
-    out = {}
-    try:
-        with open(ledger_path(), encoding="utf-8", errors="replace") as f:
-            for ln in f:
-                try:
-                    d = json.loads(ln)
-                except ValueError:
-                    continue
-                if isinstance(d, dict) and d.get("id"):
-                    out[str(d["id"])] = d
-    except OSError:
-        pass
-    return out
+def snapshot(path=None):
+    """(rows, unavailable). Missing is known-empty; unsafe/unreadable storage
+    is UNKNOWN and must surface on owner-debt list/stop paths."""
+    return eventledger.latest_checked(path or ledger_path())
+
+
+def rows(path=None):
+    return snapshot(path)[0]
 
 
 def add(ask, source=None):
@@ -79,8 +59,7 @@ def add(ask, source=None):
     if not ask:
         return None
     ts = pk.now_ts()
-    rid = hashlib.blake2b(("%s|%s|%d" % (ts, ask, os.getpid())).encode("utf-8"),
-                          digest_size=4).hexdigest()
+    rid = os.urandom(4).hex()
     row = {"id": rid, "ts": ts, "ask": ask,
            "source": source or home.session_id() or "cli",
            "status": "open", "done_ref": None, "report_ref": None,
@@ -92,18 +71,26 @@ def add(ask, source=None):
 
 
 def _update(rid, status, **patch):
-    """Append the row's next snapshot. -> (row, None) | (None, why)."""
-    r = rows().get(str(rid or ""))
-    if not r:
-        return None, "no such ask: %s (helm asks list)" % rid
-    if r.get("status") == "reported":
-        return None, "ask %s already reported (closed) — add a new ask" % rid
-    row = dict(r)
-    row.update(patch)
-    row["status"] = status
-    row["last_updated"] = pk.now_ts()
-    if not _append(row):
-        return None, "ledger unwritable (%s) — update NOT recorded" % ledger_path()
+    """Append the row's next snapshot under one read/validate/write lock.
+    Concurrent done/report calls therefore cannot reopen a reported ask."""
+    path = ledger_path()
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "ledger unwritable (%s) — update NOT recorded" % path
+        current, unavailable = eventledger.latest_checked(path)
+        if unavailable:
+            return None, "owner-ask ledger unavailable: %s" % unavailable
+        r = current.get(str(rid or ""))
+        if not r:
+            return None, "no such ask: %s (helm asks list)" % rid
+        if r.get("status") == "reported":
+            return None, "ask %s already reported (closed) — add a new ask" % rid
+        row = dict(r)
+        row.update(patch)
+        row["status"] = status
+        row["last_updated"] = pk.now_ts()
+        if not eventledger.append_unlocked(path, row):
+            return None, "ledger unwritable (%s) — update NOT recorded" % path
     pk.event("asks-" + status, str(rid), str(patch.get("done_ref")
                                              or patch.get("report_ref") or ""))
     return row, None
@@ -134,6 +121,15 @@ def unreported():
 def oldest_unreported():
     rs = unreported()
     return rs[0] if rs else None
+
+
+def stop_candidate():
+    current, unavailable = snapshot()
+    if unavailable:
+        return None, unavailable
+    rs = [r for r in current.values() if r.get("status") != "reported"]
+    rs.sort(key=lambda r: (str(r.get("ts") or ""), str(r.get("id") or "")))
+    return (rs[0] if rs else None), None
 
 
 USAGE = ("usage: helm asks add <text> [--source S] | done <id> <evidence> | "
@@ -180,7 +176,12 @@ def cmd_asks(args):
             print("ask %s reported — closed (post %s)" % (rid, ref))
         return 0
     if verb == "list":
-        rs = sorted(rows().values(),
+        current, unavailable = snapshot()
+        if unavailable:
+            print("helm asks: ledger unavailable; owner debt UNKNOWN: %s"
+                  % unavailable, file=sys.stderr)
+            return 1
+        rs = sorted(current.values(),
                     key=lambda r: (str(r.get("ts") or ""), str(r.get("id") or "")))
         if "--open" in rest:
             rs = [r for r in rs if r.get("status") != "reported"]

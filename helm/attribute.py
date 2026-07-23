@@ -176,6 +176,15 @@ def cmd_attribute(args):
     """attribute [--by project|model|cred] [--since Nd|Nh] [--limit N]
     [--project P] [--json] — token-effort rollup over the session catalog."""
     args = list(args)
+    # flags-only membership reader — guard the tail before the catalog scan:
+    # `attribute --bogus` silently printed the rollup and exited 0.
+    from .cli import guard_tail
+    rc = guard_tail("helm attribute", args, flags=("--json",),
+                    valued=("--by", "--since", "--limit", "--project"),
+                    usage="attribute [--by project|model|cred] [--since Nd|Nh] "
+                          "[--limit N] [--project P] [--json]")
+    if rc is not None:
+        return rc
     opt = {"--by": "project", "--since": "7d", "--limit": "200", "--project": None}
     for name in list(opt):
         if name in args:

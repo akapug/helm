@@ -1,26 +1,24 @@
 ---
 name: build
 description: >
-  The central mc physics - the guidelines that keep a team of coding agents on track over long
+  The central helm physics - the guidelines that keep a team of coding agents on track over long
   horizons. Use at the start of any non-trivial slice of work, and reload before a large/new task.
   /build is the resident operating skill: the work loop, the decide-don't-ask audit, the always-on
-  reflexes, and the index of mc's rules + hooks. The per-turn reflexes (rules/dev-process.md) are
-  the compressed digest of THIS skill; /build is the full version. Early gate in the loop = /refine;
-  evolve the mc physics itself = /learn; same physics at team scope = /lead, at many-teams scope =
-  /manage-teams, in the REPAIR basin = /fix (fixing/debugging, where ground-truth + verify erode under
-  pressure).
+  reflexes, and the index of helm's reflexes + hooks. The per-turn reflexes (`helm reflex`, delivered
+  by `helm inject`) are the compressed digest of THIS skill; /build is the full version. Early gate
+  in the loop = /refine; evolve the helm physics itself = /learn; in the REPAIR basin = /fix
+  (fixing/debugging, where ground-truth + verify erode under pressure).
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
 # /build - keep the team on track
 
-`/build` is the engine. It is the same physics at every scope: a worker runs `/build`; a leader runs
-it over one team (`/lead`); a coordinator runs it across leaders (`/manage-teams`). One source of
-truth; the per-turn injected reflexes are its digest; this is the full version you reload before large
-work.
+`/build` is the engine. It is the same physics at every scope, from a single seat to the whole
+fleet. One source of truth; the per-turn injected reflexes are its digest; this is the full version
+you reload before large work.
 
 ## The loop (every slice of work, in order)
 
@@ -49,11 +47,11 @@ work.
   completely. The human reviews the refined WHOLE, not fragments.
 - **Author != reviewer.** A non-trivial change gets a cross-family refutation before it lands; the
   refuter looks for the substrate rule the change violates. A bare "looks good" is not review.
-- **Receipt-verify coordination.** An addressed MC message has an observable delivery lifecycle
-  (unread/acked/stranded — `mc comms lifecycle <record_hash>`); an action-required message auto-wakes an
-  idle recipient. Check the lifecycle, not vibes; going quiet is not coordinating. Coordination FACTS
-  (presence, claims, channels) arrive level-triggered in your ambient cockpit header — read them there,
-  never re-poll what the ambient already shows.
+- **Receipt-verify coordination.** An addressed `helm chat` message has an observable delivery path
+  (the delivery lane's tool-boundary nudge; an idle recipient wakes only through its armed beacon —
+  `helm chat wait --follow` under a Monitor). Check delivery, not vibes; going quiet is not
+  coordinating. Coordination FACTS (roster presence, advisory claims) are reads — `helm chat seats` /
+  `helm chat claims` — never assumptions.
 - **Minimal-diff + loop-guard.** Smallest correct change; a failed fix pivots to a new cause category,
   never a re-tuned retry.
 - **Verify the verifier.** A tool's PASS/green/done is suspect until a second method confirms it saw the
@@ -65,7 +63,7 @@ work.
 
 Use `+task`, `+do`, `+fix`, `+clue`, and `+coach` as compact tactical prefixes at the start of a user
 prompt. They are not separate storage or command machinery; the reflex recognizer maps them onto
-existing mc primitives:
+existing helm primitives:
 
 - `+task`: file the payload as a task.
 - `+task+do` or `+do`: execute the payload this turn.
@@ -92,35 +90,33 @@ the full 19-heuristic audit (composition, identity, replay, evidence, refutation
 
 ## Reload triggers (automation beats hoping)
 
-Reload `/build` before a large/new task. Mechanical triggers in mc:
-- on plan-mode approval (ExitPlanMode);
-- on a fresh cell boot the SessionStart reground already carries the digest — reload the full skill
-  when the first non-trivial slice starts, not before.
+Reload `/build` before a large/new task:
+- on plan-mode approval (ExitPlanMode) — the plan is about to become implementation;
+- on a fresh seat the SessionStart join + per-turn inject already carry the digest — reload the full
+  skill when the first non-trivial slice starts, not before.
 
 ## R/H index (manage the system from here)
 
-- **Rules (R):** `rules/dev-process.md` - the always-on per-turn digest of this skill (the dev-domain
-  process; a team-skin pack can overlay its own `<domain>-process`). `rules/dev-process-light.md` for
-  the minimal tier.
-- **Hooks (H):** the deterministic guards - api-key block, git push/discard guards, commit hygiene,
-  time-word scan, subagent-budget surface, loop-guard, record-ops, plus the mc delivery seam
-  (message inbox check, claims digest, ambient render) wired by `hooks/inject-context.sh`.
-- **Skills (S):** `/refine` (converge pre-build), `/learn` (evolve the mc physics), `/lead` +
-  `/manage-teams` (scoped /build), `/xchk` (ground a claim/topic across all sources + flag red
-  herrings); deep skills `decision-spirit`, `ground-truth-cross-reference-loop`,
-  `reviewer-implements-own-findings`.
-- **Channel presets (the interaction grammar):** multi-agent phases run as cockpit CHANNELS over the
-  durable comms log - `mc cockpit dm|telepathy|mindmeld|whisper|council|open --sender <you> --conv <id>`
-  opens the scoped conversation; `mc comms send --conv <id>` carries the exchange; groupchat is the
-  human-joinable team channel. Pick the preset that matches the phase: telepathy = quick ask-the-knower,
-  mindmeld = fused co-design, council = judged panel, whisper = quiet 2-party message lane. An
-  action-required message auto-wakes an idle participant (F6) - handoffs never strand on a sleeping pane.
+- **Reflexes (R):** `helm reflex list` - the always-on (signal -> steer) layer, delivered per-turn
+  by `helm inject` through the wired harness hooks; the every-turn pack is the compressed digest of
+  this skill.
+- **Hooks (H):** the deterministic seam, wired by `helm hooks install|status|sync` - the per-turn
+  inject hook (reflex delivery + brief whisper), the tool-outcome recorder (`helm record`, whose
+  counters drive the counter/latch reflexes - the loop-guard analog), and the chat delivery lane
+  (SessionStart join, tool-boundary deliver nudge, stop-guard).
+- **Skills (S):** `/refine` (converge pre-build), `/learn` (evolve the helm physics), `/xchk`
+  (ground a claim/topic across all sources + flag red herrings); deep skills `decision-spirit`,
+  `ground-truth-cross-reference-loop`, `reviewer-implements-own-findings`.
+- **Chat surfaces (the interaction grammar):** multi-agent phases run over `helm chat` - the
+  human-included fleet room (`helm chat post|read`) carries the exchange; `helm chat dm <seat>` is
+  the true 1:1 lane; an addressed message reaches an idle seat through its armed beacon - handoffs
+  never strand on a sleeping seat.
 
 ## Cross-refs
 
 - `/refine` - the early gate of this loop.
 - `/x` - cross-family analysis (xrev before landing); the diversity primitive behind "author != reviewer".
-- `/learn` - when a learned behavior should become durable mc physics (rule/skill/hook).
+- `/learn` - when a learned behavior should become durable helm physics (store entry/reflex/skill/hook).
 - `ground-truth-cross-reference-loop` - when debugging is not converging.
 - `/xchk` - the user-invocable front door that runs one pass of the grounding loop across ALL sources
   (web/local/memory/code/git + a cross-family refute) to ground a claim/topic and flag red herrings.

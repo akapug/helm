@@ -286,6 +286,11 @@ def sync(canon=None, dirs=None, backup_root=None, apply=False):
 def cmd_sync(args):
     """skills sync [--apply] — merge strays into canonical + repoint every
     claude-code config dir (credhomes, ~/.claude, seats). Dry-run default."""
+    from .cli import guard_tail
+    rc = guard_tail("helm skills sync", args, flags=("--apply",),
+                    usage="skills sync [--apply]")
+    if rc is not None:
+        return rc
     apply = "--apply" in args
     r = sync(apply=apply)
     if "error" in r:

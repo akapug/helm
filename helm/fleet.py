@@ -389,6 +389,13 @@ def rows():
 
 def cmd_fleet(args):
     """fleet [--json] — every live claude process, composition truth."""
+    # flags-only membership reader — guard the tail before the census scan so
+    # `fleet --bogus` refuses rc 2 instead of silently printing the estate and
+    # exiting 0 (an unknown flag must never ride through as if it existed)
+    from .cli import guard_tail
+    rc = guard_tail("helm fleet", args, flags=("--json",), usage="fleet [--json]")
+    if rc is not None:
+        return rc
     table, daemons, flags = rows()
     probe_failed = [r for r in table if r["probe_failed"]]
     # EVERY completeness bit gates the exit code: a failed who scan, daemon

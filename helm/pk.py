@@ -15,6 +15,7 @@ Import-safe, side-effect-free at import.
 """
 import os
 import re
+import threading
 import time
 
 
@@ -58,7 +59,11 @@ def parse_simple_frontmatter(path, defaults, list_keys=()):
 
 def atomic_write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    # tmp name is unique PER WRITER (pid+thread): a shared path+'.tmp' loses
+    # one of two concurrent same-path writers — the first os.replace steals
+    # the other's tmp, whose own replace then dies FileNotFoundError and its
+    # write silently vanishes
+    tmp = "%s.%d.%x.tmp" % (path, os.getpid(), threading.get_ident())
     with open(tmp, "w", encoding="utf-8") as f:  # never the locale's guess —
         f.write(text)                            # readers open utf-8 explicitly
     os.replace(tmp, path)

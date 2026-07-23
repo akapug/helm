@@ -10,7 +10,7 @@ description: >
   fix session that skipped ground-truth + verify and burned hours).
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.2.0"
 ---
 
@@ -30,15 +30,16 @@ tissue.
    state. Quote the evidence. You cannot fix what you haven't seen fail.
 2. **READ THE HISTORY.** `git log --oneline -- <touched file>`, `git blame` the suspect lines, and
    `git log -S "<symbol>"` / grep planning commits + the durable comms log for the feature
-   (`mc comms poll --conv <conv> <endpoint>` / `mc cockpit get`). For ANY
+   (`helm chat` / `helm store events`). For ANY
    "changed / regressed / used to work" question this is the FASTEST answer and you do it FIRST — not
    after hours of grepping current code. Also: `git reflog`, `git stash list`, `git fsck --unreachable`
    for work that may be unmerged/squashed-away.
    - **a2a-comms symptom → REGRESSED-until-proven-novel** (owner canon 2026-07-13): an a2a bug OR
      optimization is presumed previously-solved until the history proves otherwise — so this step,
-     BEFORE step 3's hypothesis, is mandatory and has three named sources: (1) sweep BOTH repos —
-     `git log --all --grep=<capability>` in MC + buildr-private-beta — for the prior fix lineage;
-     (2) `cv` search for the owner's advice + buildr design docs on the capability; (3) DEPLOY-TIER
+     BEFORE step 3's hypothesis, is mandatory and has three named sources: (1) sweep the repo
+     history — `git log --all --grep=<capability>` — for the prior fix lineage;
+     (2) search the helm store (`helm store resolve` / `/recall`) for the owner's advice + design
+     docs on the capability; (3) DEPLOY-TIER
      check — a landed-but-not-live fix reads IDENTICAL to a regression (a BINARY fix on `main` whose
      daemon never swapped is not live; the "what stopped FIRING?" question applied to the deploy
      path). The answer is usually already in the log/corpus; skipping this re-invents a running
@@ -78,7 +79,7 @@ backfill in `dev-process.md`.)
    re-tune the same idea (N regex tweaks of one guess is the tell). Minimal correct diff at the right layer.
 4. **VERIFY against the REAL symptom** (verify-the-verifier). When the thing verified is a
    GUARD/HOOK, scrub its kill-switch env first — a CLEAN shell, e.g.
-   `env -i PATH="$PATH" HOME="$HOME" bash -c '<probe>'` (NOT `env -u MC_GUARD_*`:
+   `env -i PATH="$PATH" HOME="$HOME" bash -c '<probe>'` (NOT `env -u HELM_STOP_GUARD_*`:
    `-u` takes literal names, the glob expands against files — a literal copy unsets nothing):
    a leaked guard-disable var in your pane turns the probe into 0==0 — both sides off, a
    false PASS (env-leak class 7fd3373; struck the QC layer itself 2026-06-11). Run it; confirm with a SECOND method that
@@ -123,4 +124,4 @@ regression-guard added + fails-loud · old path retired · cross-family xrev cle
 - `/build` — forward-work sibling (same spine). `/refine` — converge an unclear fix shape first.
 - `decision-spirit` — the deep 19-heuristic audit. `systematic-debugging` /
   `ground-truth-cross-reference-loop` — when the diagnosis won't converge.
-- `/learn` — when the fix reveals a lesson worth making durable mc physics (rule/skill/hook).
+- `/learn` — when the fix reveals a lesson worth making durable helm physics (rule/skill/hook).

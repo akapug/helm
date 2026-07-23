@@ -138,6 +138,29 @@ class LaunchTest(unittest.TestCase):
             self.assertNotIn(v, env)
         self.assertEqual(env["PATH"], "/bin")  # everything else rides through
 
+    def test_cmd_launch_survives_a_deleted_cwd(self):
+        """MED (fable delta pair @2b4d496, probe A6): the seat DEFAULT called
+        stable_seat() — a bare os.getcwd() — BEFORE the safe_cwd resolver
+        line, so `helm launch` from a pruned worktree with neither --seat nor
+        HELM_CHAT_NAME died with FileNotFoundError instead of launching
+        un-homed as the adjacent comment promises. safe_cwd is hoisted above
+        the seat default; the seat falls to <host>-here, the room to main."""
+        saved = os.path.dirname(os.path.abspath(__file__))
+        self.addCleanup(os.chdir, saved)
+        d = tempfile.mkdtemp(dir=self.tmp)
+        os.chdir(d)
+        os.rmdir(d)
+        self.assertRaises(OSError, os.getcwd)   # the probe's precondition
+        with mock.patch.object(launch.seats, "join") as join, \
+                mock.patch.object(launch.os, "execvpe") as execvpe:
+            rc = launch.cmd_launch(["--no-install"])
+        self.assertIsNone(rc)                   # reached exec, no traceback
+        self.assertTrue(execvpe.called)
+        kw = join.call_args.kwargs
+        self.assertIsNone(kw["cwd"])            # un-homed, not crashed
+        self.assertEqual(kw["room"], "main")
+        self.assertTrue(kw["seat"].endswith("-here"))
+
     def test_stable_seat_sanitized(self):
         s = launch.stable_seat("/tmp/My Proj!x")
         self.assertNotIn(" ", s)

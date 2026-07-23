@@ -1,13 +1,13 @@
 ---
 name: dogfood
 description: >
-  Close the build loop by using what you just changed on real MC work and folding
+  Close the build loop by using what you just changed on real helm work and folding
   the friction back immediately. Use after landing a verb, rule, skill, hook,
   guard, script, or user-facing workflow; when the user asks whether it was
   actually used; and during autonomous runs after each shipped slice.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
@@ -30,31 +30,29 @@ it and the result is recorded.
 3. **Fold back immediately.** Bugs become fixes plus regression guards. Ergonomic
    issues become tasks or refinements. Durable lessons go through `/learn`.
 4. **Record the verdict.** Put a compact dogfood receipt where the work is being
-   coordinated: task, commit note, PRD, or `mc comms send` on the relevant conv.
+   coordinated: task, commit note, PRD, or `helm chat post` in the relevant room.
 
-## MC Receipt Shape
+## Receipt Shape
 
 ```text
 DOGFOOD <capability>: <clean|bit|fought|surprised>
 real task: <what used it>
-evidence: <command/output/file:line/comms seq/hash>
+evidence: <command/output/file:line/chat msg id>
 follow-up: <none|fix sha|task id|learned artifact>
 deploy tier: <source-only|next-session|hook-live|rebuild|daemon-restart|launch-loaded>
 ```
 
-If another cell must act on the follow-up, send it action-required:
+If another agent must act on the follow-up, send it directly:
 
 ```bash
-mc comms send --from pane:<you> --to pane:<owner> --conv <lane> \
-  --priority action-required \
-  --payload '<dogfood verdict + required action>'
+helm chat post '<dogfood verdict + required action>' --dm <owner-seat>
 ```
 
 Otherwise post it durably without waking anyone.
 
 ## Standing Posture
 
-MC agents are user zero for the MC RSH. Once a canonical path lands, use it
+Helm agents are user zero for helm. Once a canonical path lands, use it
 instead of the old habit. If you avoid the new path during real work, treat that
 as a fought-me signal and improve it or record the task.
 
@@ -70,8 +68,3 @@ as a fought-me signal and improve it or record the task.
 - `/build` for the full loop.
 - `/learn` for durable lessons.
 - `/x` for correctness review; dogfood covers real-use fitness.
-- `scripts/mc-feature-review.py submit …` — when dogfooding an ITERATING feature (v1→v2→v3),
-  record the review (rating + what-works + what-to-improve) to the trend ledger
-  (`~/.local/evals/mission-control/feature-reviews.jsonl`); `… trend --feature <f>` then answers
-  "is agent-rated quality actually improving across iterations, and did the recurring
-  'what to improve' themes get resolved?" — the trend, not any single 1-5 rating, is the signal.

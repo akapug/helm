@@ -215,6 +215,14 @@ def cmd_sweep(args):
     adopted store: propose superseding ancestor-era entries by their
     successor-era twins (lineage edge + same-slug/high-overlap required).
     Dry-run by default."""
+    # tail guard before propose() — membership reads ('--apply' in args)
+    # let `sweep --frobnicate --help` run the sweep and exit 0.
+    from .cli import guard_tail
+    rc = guard_tail("helm sweep", args, flags=("--apply",),
+                    valued=("--project",),
+                    usage="sweep [--apply] [--project P]")
+    if rc is not None:
+        return rc
     project = None
     if "--project" in args:
         i = args.index("--project")

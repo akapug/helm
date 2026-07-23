@@ -56,6 +56,15 @@ statement to the room the owner scans, tagged `owner-canon`, right after
 capture. Silence changes nothing; an inverted capture gets caught the same
 day instead of three incidents later.
 
+## The am-I-being-stupid gate (run BEFORE capturing)
+
+One question, every capture: **do we own the thing that misbehaved?** If the
+misbehaving code is ours (helm, our scripts, our hooks), this is a FIX LANE,
+not a rule — open it, and store at most a class pointer until the fix lands.
+Rules are for truths we cannot change. A store entry teaching agents to route
+around our own bug is self-bug-canonization (the --help incident, 2026-07-22:
+a 3-line cli.py fix lived as a fleet-wide behavioral prior instead).
+
 ## What does NOT go in the store
 
 Anything derivable from the repo (code structure, git history); anything only

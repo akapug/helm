@@ -9,6 +9,9 @@ Sections (headline-first; an empty section is omitted entirely):
   SINCE YOU LEFT  — sessions active in the window, bucketed by project
   KNOWLEDGE DELTA — store entries added/updated/retired + drain receipts,
                     plus inject-ledger turn stats (top-firing, silent-rate)
+  STORE REVIEW QUEUE — provisional entries (xrev-cleared, FIRING but awaiting
+                    the owner's ratify) newest-first + the raw-candidate count
+                    (the owner steer: the provisional queue comes to the owner)
   SEATS           — freshest cached quota observation per account
                     (no cache -> "quota: run `helm creds`", never a probe)
   WAITING ON YOU  — owner-gated items the estate already records
@@ -31,6 +34,7 @@ TOP_FIRING = 3   # inject entries named in the ledger line
 MAX_PROJECTS = 6  # session buckets shown (the ~40-line render cap)
 MAX_SEATS = 6
 MAX_WAITING = 6
+MAX_REVIEW = 6   # provisional entries listed before the "+N more" fold
 
 
 def _ts_epoch(s):
@@ -162,6 +166,26 @@ def _inject_stats(cutoff):
             "top": top, "starved": starved, "always_n": always_n}
 
 
+# --------------------------------------------------------- store review queue
+
+def _review_queue():
+    """The store's owner-review backlog, estate-wide (the same entry set as the
+    knowledge delta — never a project lens): provisional entries (xrev-cleared,
+    FIRING but awaiting the owner's ratify) newest-first, plus the raw-candidate
+    count. The owner steer 2026-07-23: this queue must ROUTINELY reach the owner,
+    so it rides the brief he already reads."""
+    from . import store
+    prov, cand = [], 0
+    for e in _store_entries():
+        st = e.get("status")
+        if st == store.STATUS_PROVISIONAL:
+            prov.append(e)
+        elif st == store.STATUS_CANDIDATE:
+            cand += 1
+    prov.sort(key=store._recency, reverse=True)  # freshest graduation first
+    return {"provisional": prov, "candidate": cand}
+
+
 # --------------------------------------------------------------- seat reality
 
 def _seats():
@@ -255,6 +279,7 @@ def compose(hours=12.0):
             "sessions": _sessions_delta(cutoff),
             "knowledge": _knowledge_delta(cutoff),
             "inject": _inject_stats(cutoff),
+            "review": _review_queue(),
             "seats": _seats(),
             "waiting": _waiting()}
 
@@ -309,6 +334,20 @@ def render(b):
                              "`helm store pinned --stats` (demote or reword)" % (
                                  len(inj["starved"]), inj["always_n"],
                                  ": " + ids + (" +%d" % more if more > 0 else "")))
+    rq = b["review"]
+    rq_active = bool(rq["provisional"] or rq["candidate"])
+    if rq_active:
+        head = ("STORE REVIEW QUEUE — %d provisional (firing, awaiting your ratify)"
+                % len(rq["provisional"]))
+        if rq["candidate"]:
+            head += " · %d candidate" % rq["candidate"]
+        lines += ["", head]
+        for e in rq["provisional"][:MAX_REVIEW]:
+            lines.append("  [%s] %s - %s" % (e["type"], str(e["id"]),
+                                             (e.get("statement") or "")[:80]))
+        more = len(rq["provisional"]) - MAX_REVIEW
+        if more > 0:
+            lines.append("  (+%d more provisional)" % more)
     lines += ["", "SEATS"]
     if b["seats"]:
         for r in b["seats"][:MAX_SEATS]:
@@ -320,7 +359,7 @@ def render(b):
     if b["waiting"]:
         lines += ["", "WAITING ON YOU"]
         lines += ["  - " + it for it in b["waiting"][:MAX_WAITING]]
-    if not (s["total"] or segs or live_inject or b["waiting"]):
+    if not (s["total"] or segs or live_inject or rq_active or b["waiting"]):
         lines.insert(1, "quiet — nothing new in the window.")
     return "\n".join(lines)
 
@@ -329,6 +368,14 @@ def cmd_brief(args):
     """brief [--hours N] [--json] — the operator's morning brief: session
     activity, knowledge delta, cached seat reality, owner gates. Read-only,
     never probes the network."""
+    # flags-only membership reader — guard the tail before compose():
+    # `brief --bogus` silently rendered the brief and exited 0.
+    from .cli import guard_tail
+    rc = guard_tail("helm brief", args, flags=("--json",),
+                    valued=("--hours",),
+                    usage="brief [--hours N] [--json]")
+    if rc is not None:
+        return rc
     hours = 12.0
     if "--hours" in args:
         try:

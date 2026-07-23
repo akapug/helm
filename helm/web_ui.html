@@ -394,6 +394,24 @@ mark{background:var(--accent);color:var(--bg);border-radius:2px;padding:0 1px}
 .cfgsec h4{font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 6px;border-bottom:1px solid var(--line);padding-bottom:4px}
 details.cfgsec>summary{cursor:pointer;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:6px;list-style:revert}
 details.cfgsec>summary:hover{color:var(--fg)}
+/* store review — the candidate + provisional owner queue (near configs) */
+#storerev{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:14px 0 16px}
+#storerevhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+#storerevlist{display:flex;flex-direction:column;gap:8px}
+.srevrow{border:1px solid var(--line);border-radius:9px;padding:9px 11px;background:var(--bg);transition:opacity .12s}
+.srevtop{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.srevbadge{font-size:var(--f0);border-radius:5px;padding:1px 6px;font-weight:700;letter-spacing:.03em;text-transform:uppercase}
+.srevbadge.candidate{color:#b58a2e;border:1px solid #b58a2e}
+.srevbadge.provisional{color:#3f7d54;border:1px solid #3f7d54}
+.srevtype{font-size:var(--f0);color:var(--mut);border:1px solid var(--line);border-radius:5px;padding:0 4px;font-weight:700}
+.srevid{font-weight:700}
+.srevstmt{margin:6px 0 4px;font-size:var(--f2);color:var(--fg);word-break:break-word}
+.srevmeta{font-size:var(--f1);color:var(--mut);display:flex;gap:12px;flex-wrap:wrap}
+.srevacts{display:flex;align-items:center;gap:6px;margin-top:8px;flex-wrap:wrap}
+.srevreason{flex:1;min-width:140px;padding:5px 9px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:var(--f1)}
+.srevreason:focus{border-color:var(--accent);outline:none}
+.chip.srevok{border-color:#3f7d54;color:#3f7d54}
+.chip.srevno{border-color:#b4442e;color:#b4442e}
 .cfgitem{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:7px;font-size:var(--f2)}
 .cfgitem:hover{background:var(--hl)}
 .cfgitem .src{font-size:var(--f0);color:var(--mut);margin-left:auto;white-space:nowrap}
@@ -645,6 +663,14 @@ details.cfgsec>summary:hover{color:var(--fg)}
 </div>
 
 <div class="view" id="view-configs">
+  <div id="storerev">
+    <div id="storerevhead">
+      <b>store review</b>
+      <span class="cfgmut" id="storerevmeta">auto-learned entries awaiting owner review</span>
+      <button class="chip" id="storerevReload" style="margin-left:auto">↻ reload</button>
+    </div>
+    <div id="storerevlist"><div class="empty">open the configs tab to load the review queue…</div></div>
+  </div>
   <div id="cfgbar">
     <input id="cfgFilter" placeholder="filter cwd / config…" autocomplete="off">
     <span class="chip on" data-ch="all">all</span>
@@ -800,7 +826,7 @@ function showView(v) {
   if (location.hash !== "#" + v) history.replaceState(null, "", "#" + v);
   if (v === "quota") initQuota();
   if (v === "sessions") initSessions();
-  if (v === "configs") cfgInit();
+  if (v === "configs") { cfgInit(); srevInit(); }
   if (v === "chat") initChat();
   if (v === "ledger") initLedger();
 }
@@ -2101,6 +2127,60 @@ renderPresets(); trayCount();
    TOKEN). helm addition beyond sesh: a physics-diff panel on home selection. */
 const CFG = {tree: null, homes: null, harness: "claude", home: null, ch: "all", loaded: false, openDirs: new Set(), sel: null};
 const cfgPost = (url, body) => post(url, body).catch(e => ({error: String(e.message || e)}));
+/* ---------- store review: candidate + provisional owner queue ----------
+   Owner canon: technical auto-learns may go PROVISIONALLY LIVE once a
+   cross-family /x review clears them; the owner still browses/approves/rejects
+   here in the web UI. Approve -> confirm, Reject -> reject — both route through
+   the SAME store functions the CLI calls (one writer path). */
+const SREV = {loaded: false};
+async function srevInit(force) {
+  if (SREV.loaded && !force) return;
+  $("#storerevlist").innerHTML = '<div class="empty">loading review queue…</div>';
+  try {
+    srevRender(await j("/api/store/review"));
+    SREV.loaded = true;
+  } catch (e) { $("#storerevlist").innerHTML = '<div class="empty">✗ review load failed: ' + esc(e.message) + '</div>'; }
+}
+function srevRender(d) {
+  const host = $("#storerevlist"), meta = $("#storerevmeta");
+  if (!d || d.unavailable) { host.innerHTML = '<div class="empty">store review unavailable</div>'; meta.textContent = "unavailable"; return; }
+  const rows = Array.isArray(d.entries) ? d.entries : [], c = d.counts || {};
+  meta.textContent = rows.length
+    ? `${c.candidate || 0} candidate (fires nothing) · ${c.provisional || 0} provisional (fires tagged) — approve to ratify, reject to retire`
+    : "queue clear — every entry is owner-ratified";
+  if (!rows.length) { host.innerHTML = '<div class="empty">nothing awaiting review — no candidate or provisional entries</div>'; return; }
+  host.innerHTML = rows.map(srevRow).join("");
+  host.querySelectorAll(".srevrow").forEach(el => {
+    const id = el.dataset.id, type = el.dataset.type;
+    el.querySelector(".srevok").onclick = () => srevAct("/api/store/confirm", {id, type}, el, "approved");
+    el.querySelector(".srevno").onclick = () => srevAct("/api/store/reject",
+      {id, type, reason: el.querySelector(".srevreason").value.trim()}, el, "rejected");
+  });
+}
+function srevRow(r) {
+  const day = s => s ? " · " + esc(String(s).slice(0, 10)) : "";
+  const xrev = r.xrev_by
+    ? `<span title="a cross-family review was attested">xrev ✓ ${esc(r.xrev_by)}${day(r.xrev_ts)}</span>`
+    : `<span title="no cross-family review yet — a candidate fires nothing until xrev-cleared">xrev ✗ not cleared</span>`;
+  return `<div class="srevrow" data-id="${esc(r.id)}" data-type="${esc(r.type)}">`
+    + `<div class="srevtop"><span class="srevbadge ${esc(r.status)}">${esc(r.status)}</span>`
+    + `<span class="srevtype">${esc(r.type)}</span><span class="srevid">${esc(r.id)}</span></div>`
+    + `<div class="srevstmt">${esc(r.statement)}</div>`
+    + `<div class="srevmeta"><span>captured-by ${esc(r.source || "?")}${day(r.captured_ts)}</span>`
+    + (r.scope ? `<span>${esc(r.scope)}</span>` : "") + xrev + `</div>`
+    + `<div class="srevacts"><button class="chip srevok">✓ approve</button>`
+    + `<input class="srevreason" placeholder="reject reason (optional)…" autocomplete="off">`
+    + `<button class="chip srevno">✕ reject</button></div></div>`;
+}
+async function srevAct(url, body, el, verb) {
+  el.style.opacity = ".5";
+  try {
+    await post(url, body);
+    toast(verb + " " + body.id);
+    srevInit(true);
+  } catch (e) { el.style.opacity = "1"; toast("✗ " + e.message, 4000); }
+}
+
 async function cfgInit(force) {
   if (CFG.loaded && !force) return;
   $("#cfgtree").innerHTML = '<div class="empty">scanning config tree…</div>';
@@ -2335,6 +2415,7 @@ $$("#cfgbar .chip[data-ch]").forEach(ch => ch.onclick = () => {
   if (CFG.loaded) cfgRenderTree();
 });
 $("#cfgReload").onclick = () => cfgInit(true);
+$("#storerevReload").onclick = () => srevInit(true);
 
 /* ================= chat view (the owner's surface — agents live on `helm chat`) =================
    Polls /api/chat every ~2s on EVERY tab — the poll is the owner's beacon
@@ -2674,6 +2755,24 @@ async function sendReact(div, e) {
 }
 
 /* ---- reply target: the composer's parent pointer (the row's stable id) ---- */
+let CHAT_REPLY_SEED = "";   // the auto-@ this panel prepended (swap/strip target)
+/* clicking reply seeds the composer with "@author " (slack/discord shape —
+   removable text, the visible face of the reply-wakes-parent delivery).
+   Never duplicates an @author the body already carries; retarget or cancel
+   swaps/strips ONLY the untouched seed, never the owner's own words. */
+function chatSeedMention(author) {
+  const el = $("#chattext");
+  if (CHAT_REPLY_SEED && el.value.startsWith(CHAT_REPLY_SEED))
+    el.value = el.value.slice(CHAT_REPLY_SEED.length);
+  CHAT_REPLY_SEED = "";
+  if (!author) return;
+  const re = new RegExp("(^|\\s)@" + author.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+                        "(?=\\s|$)", "i");
+  if (re.test(el.value)) return;   // already mentioned — never duplicate
+  CHAT_REPLY_SEED = "@" + author + " ";
+  el.value = CHAT_REPLY_SEED + el.value;
+  el.setSelectionRange(el.value.length, el.value.length);
+}
 function chatSetReply(div) {
   const id = div.dataset.id || "";
   if (!id) { toast("that message predates row ids — reply by posting normally"); return; }
@@ -2685,10 +2784,12 @@ function chatSetReply(div) {
     '</b><span class="rqt">' + esc(chatSnip(p.text)) +
     '</span><button id="chatreplyx" title="cancel (Esc)">✕</button>';
   $("#chatreplyx").onclick = chatClearReply;
+  chatSeedMention(String(p.from || div.dataset.from || "").trim());
   $("#chattext").focus();
 }
 function chatClearReply() {
   CHAT_REPLY_TO = null;
+  chatSeedMention("");            // cancel strips the untouched auto-@ too
   const strip = $("#chatreply");
   strip.hidden = true; strip.innerHTML = "";
 }

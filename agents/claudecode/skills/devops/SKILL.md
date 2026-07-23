@@ -7,7 +7,7 @@ description: >
   a feature slice yourself; that work feeds this role.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
@@ -19,14 +19,14 @@ verifies them, lands them, deploys them, and proves the live target changed.
 
 ## Invariants
 
-1. **Ordered intake.** Read `CODE_READY` and review messages from one ordered
-   view. Do not let contributors self-merge around the integrator.
+1. **Ordered intake.** Read ready-to-integrate and review messages from one
+   ordered view. Do not let contributors self-merge around the integrator.
 2. **Main stays green.** Integrate from current main, fast-forward or rebase as
    required by repo policy, and know the exact post-merge HEAD.
 3. **Author != verifier.** Non-trivial work gets independent review before land.
    Bounded findings can be fixed in-pass by the reviewer.
 4. **Merged != live.** State deploy tier and carry it through.
-5. **Live verification closes the loop.** Verify the target that users or cells
+5. **Live verification closes the loop.** Verify the target that users or seats
    actually run, not only the source tree.
 
 ## Deploy Tiers
@@ -35,7 +35,7 @@ verifies them, lands them, deploys them, and proves the live target changed.
   consumed directly by agents. Validate syntax and non-empty behavior.
 - **T1 binary/CLI**: requires build and binary swap before live behavior changes.
 - **T2 daemon/server**: requires controlled restart or bounce after build.
-- **T3 launch-loaded config**: requires new cells/sessions or operator-present
+- **T3 launch-loaded config**: requires new seats/sessions or operator-present
   restart.
 
 Use the repo's own release instructions when they define stricter tiers.
@@ -51,22 +51,20 @@ INTAKE -> VERIFY -> MERGE_GREEN -> DEPLOY_BY_TIER -> LIVE_VERIFY -> BACKFILL -> 
   review packet. Quote the green evidence.
 - **MERGE_GREEN**: land according to repo policy. Confirm exact HEAD.
 - **DEPLOY_BY_TIER**: execute the tier or record the human-only gate.
-- **LIVE_VERIFY**: exercise the real CLI/API/UI/cell path or inspect active
+- **LIVE_VERIFY**: exercise the real CLI/API/UI/seat path or inspect active
   deployed content.
 - **BACKFILL**: fix already-affected state when safe; surface destructive
   remediation as an owner call.
 - **CLOSE**: record `DONE` with sha, deploy tier, live proof, and residual risk.
 
-## MC Intake And Close
+## Helm Intake And Close
 
-Use MC messages for intake and receipts:
+Use helm chat for intake and receipts, and the integration board for ordered
+intake state:
 
 ```bash
-mc comms poll --conv <lane> pane:<you>
-mc comms lifecycle <hash>
-mc comms send --from pane:<you> --to pane:<owner> --conv <lane> \
-  --priority action-required \
-  --payload '<DONE/BLOCKED, sha, verify, deploy tier, live proof>'
+helm chat read --since 50   # ordered intake: ready-to-integrate and review posts
+helm chat post "DONE|BLOCKED: <sha>, verify, deploy tier, live proof" --reply-to <id>
 ```
 
 ## Human Gates

@@ -2,6 +2,64 @@
 
 ## Unreleased (0.2)
 
+- Homing review round (fable composition + adversarial lenses @ 8313d9f).
+  HIGH closed: the homing prologue's EAGER `os.getcwd()` crashed every
+  default chat verb and all three delivery hooks (join/deliver/stop-guard)
+  for a session whose cwd was deleted — a pruned lane worktree is routine;
+  main handled it, the lane regressed it. `seats.safe_cwd()` fails open to
+  None (un-homed -> #main) and every lane-introduced call site (`cmd_chat`'s
+  prologue, `helm launch`, `seat._resolve_homing`) plus the adjacent
+  same-class sites (`whoname`'s auto-name, the hook join's cwd fallback) now
+  resolve through it. LOW closed: the hook seam re-resolves a DERIVED
+  pre-resolution against the hook PAYLOAD's cwd (the session's ground
+  truth) instead of trusting the hook PROCESS's cwd. LOW closed (adversarial
+  B3): `_unlink_seat_state`/`_move_seat_state` match keyed state files at a
+  KEY BOUNDARY (`<marker><key>` then `.` or end) — the bare substring test
+  let pruning/renaming seat `foo` destroy the delivery ground of a live
+  seat literally named foo's key. Documented-accepted LOWs: the catalog's
+  glob-empty-root proof-of-absence bound (transcript proof is gc's LAST
+  tier behind fail-closed presence/process tiers; loss bounded to roster
+  row + cursors, rejoin self-heals) and the explicit-beats-explicit tier
+  gap (an operator rehome holds until a pane with a stale explicit
+  `HELM_CHAT_ROOM` env restarts — follow-up: rank operator above stale
+  explicit env or re-mint launch.sh on rehome).
+- Roster GC gets ONE evidence owner (codex-2's independent review, three
+  HIGHs closed). (1) Transcript truth is no longer a hand-rolled root list —
+  `seat gc` delegates to session's persistence census, which covers helm's
+  own seat homes (`~/.helm/_global/seats/**/claude/projects`); the old list
+  omitted them, so an inactive-but-fully-persisted proxy seat probed as
+  junk. The catalog now also scans `~/.claude-homes/*/projects` so the one
+  owner keeps the coverage the deleted list had. (2) The legacy auto-reap
+  that rode `roster_report` is DELETED, not fenced: it dropped any stale row
+  on presence alone, bypassing every transcript/process guard and the
+  dry-run gate — a report is a read; only `seat gc --apply` deletes.
+  (3) `--apply` re-runs the FULL keep-evidence probe fresh under the roster
+  lock before each deletion (a transcript flushing between scan and apply
+  wins); the process probe is same-uid scoped, counts a live
+  `HELM_CHAT_NAME=<seat>` environ for rows with no remembered session, and
+  any same-uid read failure keeps the row (only a pid proven exited
+  mid-scan — ENOENT/ESRCH — reads as absence, so gc never degenerates into
+  a fail-closed no-op).
+- Home-room scatter, as-prevented (owner mandate: "how they got scattered —
+  needs to be as-prevented"). A live roster held THREE `home_room` truths for
+  one team — `main` (the spawn mirror defaulted `room or "main"` and
+  `write_roster`'s unlabeled seam stamped it *explicit*), `<project>` (cwd
+  derivation), `<env room>` (the launch seam) — because four writers each
+  re-derived the precedence privately. Now `seats.resolve_homing()` is THE
+  one precedence (explicit CLI/operator room > `HELM_CHAT_ROOM` env, honoring
+  the seam's `derived` stamp > cwd git-project derivation) and every writer
+  (`seats.join`, `helm launch`, `helm seat add/launch/spawn`'s
+  `_resolve_homing`, the spawn-register roster mirror) resolves through it;
+  `write_roster` is the one enforcement gate and now tracks provenance on
+  every path: an UNLABELED `home_room` reads as *derived* (unknown provenance
+  takes the weakest tier), and a derived value can NEVER overwrite an
+  explicit/operator home — a re-join/resume/mirror never downgrades a
+  deliberate choice. The spawn record carries `room_source`, and a room-less
+  spawn writes NO home instead of inventing `main` (the SessionStart join
+  derives the real one). Plus `helm chat seat gc [--apply]` — the MANUAL
+  roster junk pruner (dry-run default, never automatic): prunes only rows
+  with no presence beat in the reap window, no transcript for any remembered
+  session, and no live process naming one; every probe fails CLOSED.
 - `helm todos` — the seat todo mirror: what every agent in the fleet is
   working on right now, without asking it. The recorder gains a todo leg
   that captures the CURRENT list off `TodoWrite` **and** the `Task*` family
@@ -37,10 +95,13 @@
   scope: self-consistency, not remote re-verification — the node still cannot
   disclose a turn's payload). Rendering is one level, builders.dev style — a
   compact parent quote, a `↩N` count, graceful orphans — in `helm chat read`,
-  the journal, and the web panel. Threading does NOT touch beacon-wake:
-  `seats.deliverable()` never reads the pointer, so a reply wakes exactly what
-  its text alone would have woken (asserted as a law over the full scope
-  matrix). The web chat surface also gains: per-channel unread/mention badges
+  the journal, and the web panel. Threading now REACHES beacon-wake — the
+  original "threading is invisible to the beacon" law was inverted 2026-07-22
+  (the owner's WHY: "I'm tired of typing agent names to mention"): a reply is
+  a direct address of the parent's author, mention-tier, any room, casefold —
+  and of NOBODY else; every other row wakes exactly what its text alone would
+  have woken (asserted over the full scope matrix). The web chat surface also
+  gains: per-channel unread/mention badges
   with last-activity age and dimmed quiet rooms, readable seat rows (age +
   legend, distinguishing-tail truncation), collapse for long agent posts,
   @mention completion from the live roster, an unread divider and

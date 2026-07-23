@@ -779,6 +779,12 @@ def cmd_env(args):
     if sub not in ("census",):
         print("usage: helm env census [--json]", file=sys.stderr)
         return 2
+    from .cli import guard_tail
+    rc = guard_tail("helm env census", args[1:] if args and args[0] == sub
+                    else args, flags=("--json",), valued=("--repo",),
+                    usage="env census [--json] [--repo PATH]")
+    if rc is not None:
+        return rc
     from . import seats
     r = census(root=seats._flag(args, "--repo"))
     if "--json" in args:
@@ -791,6 +797,11 @@ def cmd_env(args):
 def cmd_hooks_sync(args):
     """hooks sync [--apply] — reconcile every home's hooks to the canonical set
     (dry-run default; additive — strays preserved, backup-first, superset-refusal)."""
+    from .cli import guard_tail
+    rc = guard_tail("helm hooks sync", args or [], flags=("--apply",),
+                    usage="hooks sync [--apply]")
+    if rc is not None:
+        return rc
     apply = "--apply" in (args or [])
     r = hooks_sync(apply=apply)
     mode = "APPLIED" if apply else "dry-run (--apply to execute)"
@@ -818,6 +829,11 @@ def cmd_mcp(args):
     if not args or args[0] != "sync":
         print("usage: helm mcp sync [--apply]", file=sys.stderr)
         return 2
+    from .cli import guard_tail
+    rc = guard_tail("helm mcp sync", args[1:], flags=("--apply",),
+                    usage="mcp sync [--apply]")
+    if rc is not None:
+        return rc
     apply = "--apply" in args
     r = mcp_sync(apply=apply)
     mode = "APPLIED" if apply else "dry-run (--apply to execute)"
@@ -871,6 +887,11 @@ def cmd_worktree(args):
     if not args or args[0] != "gc":
         print("usage: helm worktree gc [--apply]", file=sys.stderr)
         return 2
+    from .cli import guard_tail
+    rc = guard_tail("helm worktree gc", args[1:], flags=("--apply",),
+                    valued=("--repo",), usage="worktree gc [--apply] [--repo PATH]")
+    if rc is not None:
+        return rc
     from . import seats
     r = worktree_gc(root=seats._flag(args, "--repo"), apply="--apply" in args)
     _print_worktree(r)
@@ -882,9 +903,17 @@ def cmd_tidy(args):
     gc, all dry-run by default. One consolidated 'here is everything that would
     change' report; --apply runs them all backup-first."""
     args = list(args or [])
-    from . import seats
+    # guard_tail owns the whole parse contract: unknown junk, a MISSING or
+    # flag-shaped --repo value (`tidy --repo --apply` once APPLIED against
+    # root='--apply'), and a duplicate --repo all refuse before any work.
+    from .cli import guard_tail
+    rc = guard_tail("helm tidy", args, flags=("--apply",), valued=("--repo",),
+                    usage="tidy [--apply] [--repo PATH]")
+    if rc is not None:
+        return rc
     apply = "--apply" in args
-    r = tidy(root=seats._flag(args, "--repo"), apply=apply)
+    root = args[args.index("--repo") + 1] if "--repo" in args else None
+    r = tidy(root=root, apply=apply)
     mode = "APPLY" if apply else "DRY-RUN — here is everything that would change"
     print("=" * 72)
     print("helm tidy [%s]" % mode)

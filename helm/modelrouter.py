@@ -495,18 +495,23 @@ def cmd_router(args):
         print(_USAGE, file=sys.stderr)
         return 2
     verb, rest = args[0], args[1:]
-    if verb == "run":
-        return _run(rest)
-    if verb == "up":
-        return _up(rest)
-    if verb == "down":
-        return _down(rest)
-    if verb == "status":
-        return _status(rest)
-    if verb == "line":
-        return _line(rest)
-    if verb == "probes":
-        return _probes(rest)
-    print("helm router: unknown verb '%s'" % verb, file=sys.stderr)
-    print(_USAGE, file=sys.stderr)
-    return 2
+    # (handler, plain flags, valued flags) — guard_tail refuses trailing junk
+    # BEFORE the handler runs: `router down --bogus --help` used to STOP the
+    # router and exit 0 as if --bogus existed.
+    table = {"run": (_run, (), ("--port", "--seat")),
+             "up": (_up, (), ("--port", "--seat")),
+             "down": (_down, (), ()),
+             "status": (_status, (), ()),
+             "line": (_line, (), ("--port",)),
+             "probes": (_probes, (), ("--dir",))}
+    if verb not in table:
+        print("helm router: unknown verb '%s'" % verb, file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
+        return 2
+    fn, flags, valued = table[verb]
+    from .cli import guard_tail
+    rc = guard_tail("helm router " + verb, rest, flags=flags, valued=valued,
+                    usage=_USAGE)
+    if rc is not None:
+        return rc
+    return fn(rest)

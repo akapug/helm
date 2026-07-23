@@ -63,12 +63,14 @@ Import-safe, stdlib-only.
 import base64
 import glob
 import json
+import math
 import os
 import re
 import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -90,6 +92,16 @@ CHILD_STAMP_VARS = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
                     "CLAUDE_CODE_BRIDGE_SESSION_ID")
 
 CODEX_HOMES = os.path.join(os.path.expanduser("~"), ".codex-homes")
+# The hermes CLI's OAuth artifact — the mint SOURCE for hermes-keyed families
+# (ds4pro). Read-only, never modified; tests point this at a fixture.
+HERMES_AUTH = os.path.join(os.path.expanduser("~"), ".hermes", "auth.json")
+# The opencode tool's auth store — the PREFERRED outbound-key source for pool
+# families (ds4pro), owner-maintained and fresher than the hermes mirror. A
+# JSON dict of provider -> {"type": "api"|"oauth", "key"/"access": <bearer>}.
+# Read-only, never modified; tests point this at a fixture. Only type=="api"
+# entries carry a static bearer we can bake.
+OPENCODE_AUTHSTORE = os.path.join(os.path.expanduser("~"), ".local", "share",
+                                  "opencode", "auth.json")
 PROXY_BIN_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin", "cli-proxy-api")
 DREGG_SIGNER_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin",
                                     "dregg-client-sign")
@@ -127,7 +139,68 @@ FAMILIES = {
              # one alias in the proxy config -> one probe; the mixed fan-out
              # leg needs two and SKIPs (loudly) for single-model families.
              "probe_models": ("kimi-k3",)},
+    # ds4pro = DeepSeek v4 Pro, served by whichever OpenAI-compatible gateway
+    # the owner holds a LIVE bearer for. OUTBOUND KEY SOURCE: when
+    # $DS4PRO_API_KEY / --key-from are absent the mint reads the bearer from
+    # the OPENCODE tool auth store (OPENCODE_AUTHSTORE,
+    # ~/.local/share/opencode/auth.json — owner-maintained, FRESH) by the
+    # provider's `authstore` name; only type=="api" entries carry a bakeable
+    # key. It FALLS BACK to the hermes credential_pool[<provider>]
+    # (HERMES_AUTH) when the authstore lacks a usable key. The reader picks the
+    # live one and it is baked 0600 into config.yaml at add time (value never
+    # printed/logged). The former nous-portal agent_key + the STALE 2026-05-18
+    # hermes pool mirror (both providers 401) are superseded by the authstore.
+    # MULTI-PROVIDER: each gateway serves v4-pro under its OWN model id and
+    # base_url — model ids probed live off <base_url>/models 2026-07-22:
+    # opencode-go = deepseek-v4-pro (LIVE, HTTP 200), deepseek (native) =
+    # deepseek-v4-pro (key valid but 402 Insufficient Balance — configured, not
+    # live), openrouter = deepseek/deepseek-v4-pro (authstore key dead). So the
+    # family carries a per-provider table and picks pool_default unless
+    # `helm seat add ds4pro --provider <name>` overrides. pool_default =
+    # opencode-go (the owner's long-term "open code go" route AND the one that
+    # answers a REAL completion live). The proxy's openai-compatibility block
+    # maps the claude-side alias "ds4-pro" to each provider's upstream id
+    # (slashes never reach claude's --model). Note opencode-go's gateway 403s
+    # (Cloudflare 1010) a request with NO User-Agent, but accepts any non-empty
+    # UA — CLIProxyAPI's Go http client sends "Go-http-client/1.1" by default,
+    # so the proxy leg passes. Port 8360: clear of codex 8317+N instance
+    # headroom and kimi 8318 (interleave discipline: families claim ports tens
+    # apart so instance ranges never collide). max_context mirrors codex's
+    # shave: 1M window less headroom for the 32k max_tokens request + CC's 20k
+    # reserve.
+    "ds4pro": {"port": 8360, "model": "ds4-pro", "mode": "proxy-key",
+               "key_env": "DS4PRO_API_KEY",
+               "pool_default": "opencode-go",
+               "pool_providers": {
+                   "opencode-go": {
+                       "base_url": "https://opencode.ai/zen/go/v1",
+                       "upstream_model": "deepseek-v4-pro",
+                       "authstore": "opencode-go"},
+                   "deepseek": {
+                       "base_url": "https://api.deepseek.com",
+                       "upstream_model": "deepseek-v4-pro",
+                       "authstore": "deepseek"},
+                   "openrouter": {
+                       "base_url": "https://openrouter.ai/api/v1",
+                       "upstream_model": "deepseek/deepseek-v4-pro",
+                       "authstore": "openrouter"},
+               },
+               "max_context": 1000000,
+               "probe_models": ("ds4-pro",)},
 }
+
+def _family_port_bases_are_unique():
+    """One collision-free owner for the port namespace: no two families share
+    a base port. The instance derivation (base+N) is per-family, so distinct
+    bases are the floor the whole scheme stands on; the interleave headroom
+    between a proxy family's base+N range and the next family's base is a
+    FAMILIES-table discipline (see `_instance_port`)."""
+    bases = [f["port"] for f in FAMILIES.values()]
+    return len(bases) == len(set(bases))
+
+
+assert _family_port_bases_are_unique(), \
+    "FAMILIES base ports must be distinct (the instance-port scheme's floor)"
 
 # CC's autocompact trigger = pct × (window − 20k). Against the CORRECT window it
 # otherwise fires with only a thin margin under a 32k-max_tokens turn; 78% lands
@@ -240,7 +313,9 @@ def _pid_alive(pid):
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, TypeError):
+    except (ProcessLookupError, TypeError, ValueError, OverflowError):
+        # no such pid, a non-int, or an int too large for C (a corrupt/hostile
+        # pidfile body) — all unparseable, all "not a live proxy we can prove".
         return False
     except PermissionError:
         return True
@@ -278,14 +353,145 @@ def _recorded_pid_alive(rec):
     return actual == expected
 
 
-def _running_pid(family):
-    """The live proxy pid from the seat's pidfile, else None."""
-    try:
-        with open(os.path.join(seat_dir(family), "proxy.pid")) as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
+def _proxy_home(family, seat=None):
+    """The dir that owns a seat's proxy fate (config.yaml/token/proxy.pid/
+    proxy.log). Instance 1 (seat == family) keeps the family dir — back-compat,
+    the live 8317 proxy is undisrupted. Instances N≥2 get instances/<seat>/ so
+    one instance's proxy restart/429-stall/log never touches a sibling's."""
+    seat = seat or family
+    return seat_dir(family) if seat == family else _instance_dir(family, seat)
+
+
+def _instance_port(family, seat=None):
+    """A seat's OWN proxy port. Instance 1 keeps fam["port"] (8317 for codex —
+    the port every minted launch.sh already points at). Instances N≥2 derive
+    deterministically from the numeric seat suffix (codex-2 -> port+2), so the
+    mapping needs no allocation state. COLLISION INVARIANT: only mode=proxy
+    families mint instances (the launch gate refuses proxy-key families), so
+    instance ports come from ONE family's block at a time; a new proxy family
+    MUST be assigned a base far enough from every existing proxy family's
+    block that base+N ranges never interleave (codex occupies 8317+N; leave
+    headroom). `_family_port_bases_are_unique` asserts the bases themselves
+    are distinct; the interleave headroom is a FAMILIES-table discipline."""
+    seat = seat or family
+    base = FAMILIES[family]["port"]
+    if seat == family:
+        return base
+    m = re.match(r"^%s-(\d+)$" % re.escape(family), seat)
+    if m:
+        return base + int(m.group(1))
+    return base  # a non-numeric seat name shares the family port (instance 1)
+
+
+import contextlib as _contextlib
+
+
+def _instance_gate(family, seat_name):
+    """The ONE per-instance admissibility predicate, shared by every verb that
+    can mint instance assets (spawn/resume — the fable MED was this gate
+    living on spawn alone, so resume minted the very seats spawn refuses).
+    Returns an error string to print, or None when the seat may proceed.
+    Per-instance proxies are a proxy-family (OAuth-pool) feature; and the
+    numeric suffix must be N>=2 — `-1` maps onto the family itself and base+1
+    collides with the adjacent family's base port (codex-1 -> 8318 = kimi's
+    base). The family seat itself is always admissible."""
+    if seat_name == family:
         return None
-    return pid if _pid_alive(pid) else None
+    fam = FAMILIES[family]
+    if fam["mode"] != "proxy":
+        return ("per-instance proxies need an OAuth-pool family "
+                "(mode=proxy); %s is mode=%s — only the family seat `%s` is "
+                "supported" % (family, fam["mode"], family))
+    m = re.match(r"^%s-(\d+)$" % re.escape(family), seat_name)
+    if m and m.group(1) != str(int(m.group(1))):
+        # a zero-padded suffix passes int()==N but names a DISTINCT proxy home
+        # whose derived port aliases the canonical instance's (codex-02 ->
+        # instances/codex-02 yet port base+2 = codex-2's) — two homes/tokens,
+        # one port, a confusing pre-bound-port failure. Refuse non-canonical
+        # up front (fable adversarial LOW).
+        return ("%s is not a canonical instance name — a zero-padded suffix "
+                "aliases `%s-%d`'s port with a separate proxy home; use "
+                "`%s-%d`" % (seat_name, family, int(m.group(1)),
+                             family, int(m.group(1))))
+    if m and int(m.group(1)) < 2:
+        return ("%s is not a distinct instance — instance 1 IS the family "
+                "seat `%s` (and base+1 would collide with a sibling family's "
+                "port); use `%s` or instance N>=2" % (seat_name, family, family))
+    return None
+
+
+@_contextlib.contextmanager
+def _proxy_lock(family, seat=None):
+    """Serialize _up/_down per proxy-home: an flock on <proxy_home>/.proxy.lock.
+    Without it two concurrent _up calls both pass the empty-pidfile check and
+    double-start, and a _down can delete a CONCURRENT replacement's fresh
+    pidfile (killing the old proxy, then unlinking the NEW record — leaving
+    the new proxy alive but unmanageable). The lock makes the check→spawn→
+    record and the verify→signal→unlink sequences each atomic."""
+    import fcntl
+    home = _proxy_home(family, seat)
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(home, ".proxy.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _proxy_pid_record(family, seat=None):
+    """The pidfile as an authenticated record: {pid, identity} or None. The
+    pidfile carries the process-BIRTH identity beside the pid (`<pid>
+    <identity>`) so a later signal goes to the SAME process, never a reused
+    pid — the proxy-lifecycle twin of the headless-seat `_pid_identity` guard.
+    Legacy bare-`<pid>` files parse with identity=None (treated unverifiable:
+    never signalled, reported stale)."""
+    try:
+        with open(os.path.join(_proxy_home(family, seat), "proxy.pid")) as f:
+            parts = f.read().split()
+        pid = int(parts[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    # pid < 2 can never be a spawned proxy: 0/1/negative are kernel-reserved
+    # or the process-group / whole-signal-set selectors for kill(2). Treat a
+    # corrupt file carrying one as stale (never signalled, reported down) so
+    # _down's remediation never echoes `kill -1`/`kill 0` into advice an agent
+    # would paste verbatim (fable adversarial MED — the signal path was already
+    # fail-closed, but the printed suggestion was not).
+    if pid < 2:
+        return None
+    return {"pid": pid, "identity": parts[1] if len(parts) > 1 else None}
+
+
+def _running_pid_rec(family, seat=None):
+    """The live proxy as an AUTHENTICATED RECORD {pid, identity}, or None —
+    `_running_pid`'s record-returning twin. ONE read of the pidfile produces
+    the owned snapshot the caller threads through its signal/unlink (the
+    atomic-ownership finding: re-reading the file after authenticating it lets
+    a transient failure/malformed replacement split the verify from the kill).
+    FAIL CLOSED identically: bare/'?' identity, dead pid, and birth-mismatch
+    all return None."""
+    rec = _proxy_pid_record(family, seat)
+    if not rec or not _pid_alive(rec["pid"]):
+        return None
+    ident = rec["identity"]
+    if not ident or ident == "?":
+        return None            # unauthenticated: refuse, never signal
+    return rec if _pid_identity(rec["pid"]) == ident else None
+
+
+def _running_pid(family, seat=None):
+    """The live proxy pid, ONLY when it is verifiably the SAME process the
+    pidfile recorded — a captured birth identity that still matches. FAIL
+    CLOSED: a record with no usable identity (legacy bare pid, or '?' from a
+    failed capture) is UNVERIFIABLE and returns None, so `_down` treats it as
+    stale and never signals the number — the reused-pid SIGTERM finding. A
+    live pid whose captured identity no longer matches is a REUSED pid and is
+    likewise refused. There is no alive-check-only fallback: trusting an
+    unauthenticated number is exactly the hazard this guard exists to close."""
+    rec = _running_pid_rec(family, seat)
+    return rec["pid"] if rec else None
 
 
 def _port_open(port, timeout=0.5):
@@ -296,12 +502,47 @@ def _port_open(port, timeout=0.5):
         return False
 
 
-def _read_token(family):
-    try:
-        with open(os.path.join(seat_dir(family), "token")) as f:
-            return f.read().strip()
-    except OSError:
-        return None
+def _read_token(family, seat=None):
+    """The seat's proxy token. Instances mint their own; an instance minted
+    before per-instance proxies (or mid-migration) falls back to the family
+    token so its launch line stays valid."""
+    for d in (_proxy_home(family, seat), seat_dir(family)):
+        try:
+            with open(os.path.join(d, "token")) as f:
+                tok = f.read().strip()
+            if tok:
+                return tok
+        except OSError:
+            continue
+    return None
+
+
+def _token_file(family, seat=None):
+    """The 0600 token file a launch line/script should READ AT EXEC TIME.
+    Resolves the bearer in the child shell, so the live token never transits
+    the script text, the printed stdout line, or any process argv (the
+    no-keys-in-argv gate). For an INSTANCE seat this is ALWAYS the instance's
+    own path (instances/<seat>/token) — never an existence-based fallback —
+    because launch.sh is written BEFORE `_mint_instance_proxy` runs; pointing
+    at the instance path means the script picks up the token the mint writes
+    a moment later, and stays correct across every later re-mint (the
+    first-mint stale-token finding). Instance 1 (seat == family) uses the
+    family file. An UNMINTED-instance launch line (printed for an operator
+    before `up`) resolves empty until the mint lands — a clean empty var, not
+    the wrong account."""
+    return os.path.join(_proxy_home(family, seat), "token")
+
+
+def _token_export(family, seat=None):
+    """The shell statement that puts the seat's bearer into the environ WITHOUT
+    it ever touching a process argv: read the 0600 token file into a var and
+    `export` it (both shell builtins — no external process, no argv). `env`'s
+    NAME=value form is deliberately NOT used: the external env binary would
+    carry the resolved secret in its own argv (/proc/pid/cmdline). The launch
+    line/script prepend this, then exec claude (which inherits the export).
+    2>/dev/null keeps an unminted seat's read a clean empty var."""
+    return ("ANTHROPIC_AUTH_TOKEN=$(cat %s 2>/dev/null); export ANTHROPIC_AUTH_TOKEN; "
+            % shlex.quote(_token_file(family, seat)))
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +625,14 @@ then re-run `helm seat add codex`."""
 # ---------------------------------------------------------------------------
 
 def _config_yaml(port, auth_dir, token):
-    """The proxy config that passed the live eval, verbatim shape."""
+    """The proxy config that passed the live eval, verbatim shape. The
+    nonstream-keepalive-interval is NOT optional: a long non-streaming pass
+    (compaction's ~360k summarize — the longest single request a session
+    makes) sits silent while the upstream thinks, the proxy reaps the idle
+    socket, and Claude Code gets an empty HTTP 200 ('proxy or gateway
+    intercepting') — owner-witnessed on a codex-2 /compact 2026-07-22. The
+    live family configs carry 15s by hand; the generator must emit it too or
+    every re-mint silently strips the fix (as-prevented)."""
     return ('host: "127.0.0.1"\n'
             "port: %d\n"
             'auth-dir: "%s"\n'
@@ -395,14 +643,30 @@ def _config_yaml(port, auth_dir, token):
             "remote-management:\n"
             "  allow-remote: false\n"
             '  secret-key: ""\n'
-            "  disable-control-panel: true\n") % (port, auth_dir, token)
+            "  disable-control-panel: true\n"
+            # heartbeat during long non-streaming thinking passes — see docstring.
+            "nonstream-keepalive-interval: 15\n"
+            # the STREAMING leg too (owner-witnessed 2026-07-22: with the
+            # nonstream keepalive already loaded, EVERY request at ~90% context
+            # still died empty-200 — the stream stalls before/during bytes at
+            # extreme payload sizes). keepalive-seconds emits SSE heartbeats so
+            # a long stream stays alive; bootstrap-retries retries a stream
+            # that stalls before its first byte. StreamingConfig has ONLY these
+            # two knobs — no upstream/read timeout field exists in the schema.
+            "streaming:\n"
+            "  keepalive-seconds: 15\n"
+            "  bootstrap-retries: 2\n") % (port, auth_dir, token)
 
 
-def _config_yaml_key(port, token, provider, base_url, model, api_key):
+def _config_yaml_key(port, token, provider, base_url, model, api_key,
+                     upstream=None):
     """The proxy-key config: same inbound head (the per-seat token claude
     presents), no auth-dir (no OAuth cred), plus the openai-compatibility
     provider block carrying the outbound API key (0600 via _write_private —
-    the same trust level as the seat token beside it)."""
+    the same trust level as the seat token beside it). `upstream` is the
+    provider-side model id when it differs from the claude-side alias
+    (ds4pro: alias ds4-pro -> deepseek/deepseek-v4-pro); default: same id
+    both sides (kimi)."""
     return ('host: "127.0.0.1"\n'
             "port: %d\n"
             "api-keys:\n"
@@ -421,7 +685,13 @@ def _config_yaml_key(port, token, provider, base_url, model, api_key):
             "    models:\n"
             '      - name: "%s"\n'
             '        alias: "%s"\n'
-            % (port, token, provider, base_url, api_key, model, model))
+            # same long-nonstream keepalive as _config_yaml (compaction survival)
+            "nonstream-keepalive-interval: 15\n"
+            "streaming:\n"
+            "  keepalive-seconds: 15\n"
+            "  bootstrap-retries: 2\n"
+            % (port, token, provider, base_url, api_key,
+               upstream or model, model))
 
 
 def _key_base_url(fam, api_key):
@@ -461,9 +731,13 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     that SAME seat identity; HELM_CELL_BIN selects the dregg-native client
     signer. A seat therefore never inherits the owner's ambient profile. `seat`
     (slice 6 — N-per-credhome) defaults to the family name; when set it swaps
-    the three identity vars + the config dir (instances/<seat>) so N instances
-    of one family share the proxy/port/token/pool but never config/session
-    state. `room` adds HELM_CHAT_ROOM=<room>; a project-derived default also
+    the three identity vars + the config dir (instances/<seat>). Instances
+    share ONLY the family OAuth cred pool (same account — no quota
+    multiplication); everything else is per-instance: config/session state AND,
+    since per-instance proxies, the proxy fate itself — each instance gets its
+    own port/config/token/log (`_mint_instance_proxy`), so one instance's
+    restart or 429-stall never takes a sibling down. `room` adds
+    HELM_CHAT_ROOM=<room>; a project-derived default also
     carries HELM_CHAT_ROOM_SOURCE=derived so later SessionStart joins cannot
     undo an operator rehome/clear. The command clears inherited room/source
     first, making explicit --room and project-less un-homed launches stable.
@@ -481,6 +755,7 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     fam = FAMILIES[family]
     model = model or fam["model"]
     seat = seat or family
+    port = _instance_port(family, seat)
     cfgdir = shlex.quote(os.path.join(_instance_dir(family, seat), "claude"))
     homing = (" HELM_CHAT_ROOM=%s" % shlex.quote(room)) if room else ""
     if room and room_source:
@@ -495,11 +770,19 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
         ctxenv += " CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d" % fam["max_context"]
     # --multi: no pin (frontmatter routes per-subagent); default: today's line.
     pin = "" if multi else " CLAUDE_CODE_SUBAGENT_MODEL=%s" % model
+    # NO-keys-in-argv (codex-2 re-review): the bearer is NEVER a NAME=value arg
+    # to the EXTERNAL `env` binary — `env TOKEN=$(cat f)` would put the
+    # resolved secret in env's OWN argv (/proc/pid/cmdline). Instead the token
+    # is exported into the seat's environ by `_token_export` (a shell builtin,
+    # no argv), and the `env` call below only UNSETS inherited vars and sets
+    # the non-secret ones. claude inherits the token from the export, so it
+    # never transits any process argv, the script text, or the printed line —
+    # and it resolves AT EXEC, so the line stays mint-order-immune (the
+    # first-mint finding).
     return ("env -u ANTHROPIC_API_KEY %s -u HELM_CHAT_ROOM"
             " -u MELD_CHAT_ROOM -u HELM_CHAT_ROOM_SOURCE"
             " -u MELD_CHAT_ROOM_SOURCE"
             " ANTHROPIC_BASE_URL=http://127.0.0.1:%d"
-            " ANTHROPIC_AUTH_TOKEN=%s"
             "%s"
             " CLAUDE_CONFIG_DIR=%s"
             " HELM_CHAT_NAME=%s%s"
@@ -508,7 +791,7 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
             " DREGG_PROFILE=%s%s"
             " claude --dangerously-skip-permissions --model %s"
             % (child_stamp_unsets(),
-               fam["port"], _read_token(family) or "<seat-token-missing>",
+               port,
                pin, cfgdir, shlex.quote(seat), homing,
                shlex.quote(DREGG_SIGNER_DEFAULT), shlex.quote(seat),
                shlex.quote(seat), ctxenv, model))
@@ -575,6 +858,84 @@ _ONBOARD_KEYS = ("hasCompletedOnboarding", "lastOnboardingVersion", "theme",
                  "numStartups", "tipsHistory", "bypassPermissionsModeAccepted",
                  "hasAcknowledgedCostThreshold")
 
+# Claude Code gates deferred tools (including Monitor) behind GrowthBook state.
+# Proxy seats cannot reliably refresh that state themselves, so a fresh instance
+# borrows ONLY these cache fields from a working same-family seat. Never widen
+# this tuple to identity, auth, project, session, or metric state.
+_FEATURE_CACHE_KEYS = ("cachedGrowthBookFeatures", "cachedExperimentFeatures",
+                       "cachedGrowthBookFeaturesAt")
+_FEATURE_CACHE_GATE = "tengu_deferred_stub_tool"
+_FEATURE_CACHE_MIN_FEATURES = 100
+_FEATURE_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+_FEATURE_CACHE_FUTURE_SKEW_MS = 5 * 60 * 1000
+
+
+def _feature_cache_complete(state, now_ms=None):
+    """Whether state can preserve the deferred-tool surface this seed exists for."""
+    if not isinstance(state, dict):
+        return False
+    features = state.get("cachedGrowthBookFeatures")
+    experiments = state.get("cachedExperimentFeatures")
+    fetched = state.get("cachedGrowthBookFeaturesAt")
+    if (not isinstance(features, dict)
+            or len(features) < _FEATURE_CACHE_MIN_FEATURES
+            or features.get(_FEATURE_CACHE_GATE) is not True
+            or not isinstance(experiments, list)
+            or isinstance(fetched, bool)
+            or not isinstance(fetched, (int, float))
+            or not math.isfinite(fetched)):
+        return False
+    now_ms = time.time() * 1000 if now_ms is None else now_ms
+    return (now_ms - _FEATURE_CACHE_MAX_AGE_MS <= fetched
+            <= now_ms + _FEATURE_CACHE_FUTURE_SKEW_MS)
+
+
+def _feature_cache_seed(family, dst):
+    """The freshest complete same-family regular-file cache, excluding dst.
+
+    Freshness is the cache's own millisecond timestamp; file mtime only breaks a
+    tie because Claude rewrites unrelated state independently. Resolved paths
+    must remain inside the family root, so a symlink cannot import another
+    account/family's GrowthBook state.
+    """
+    from . import pk
+    root = os.path.realpath(seat_dir(family))
+    refs = [os.path.join(root, "claude", ".claude.json")]
+    refs.extend(glob.glob(os.path.join(
+        root, "instances", "*", "claude", ".claude.json")))
+    dst = os.path.realpath(dst)
+    best = None
+    for ref in refs:
+        if os.path.islink(ref) or not os.path.isfile(ref):
+            continue
+        real = os.path.realpath(ref)
+        try:
+            inside = os.path.commonpath((root, real)) == root
+        except ValueError:
+            inside = False
+        if not inside or real == dst:
+            continue
+        state = pk.read_json(real, None)
+        if not _feature_cache_complete(state):
+            continue
+        try:
+            mtime = os.path.getmtime(real)
+        except OSError:
+            mtime = 0
+        rank = (state["cachedGrowthBookFeaturesAt"], mtime, real)
+        if best is None or rank > best[0]:
+            best = rank, state
+    if best is None:
+        return None
+    return {k: best[1][k] for k in _FEATURE_CACHE_KEYS}
+
+
+def _warn_feature_cache(cdir):
+    print("helm seat: WARNING — feature cache not seeded for %s; no recent "
+          "same-family seat has a complete %s cache. A launched seat may omit "
+          "deferred tools including Monitor until Claude refreshes it"
+          % (cdir, _FEATURE_CACHE_GATE), file=sys.stderr)
+
 
 def _onboarded_refs():
     """Config files to borrow onboarding flags from, best first: the minting
@@ -602,21 +963,43 @@ def _git_toplevel(path):
     return None
 
 
-def _seed_onboarding(cdir, workdir=None):
-    """A fresh seat config dir triggers CC's first-run wizard, which blocks the
-    seat at an interactive prompt (proven 2026-07-21: codex-2 stalled at the
-    theme picker, never joined chat). Seed <cdir>/.claude.json with the
-    onboarding-complete flags so a launched seat boots straight to work. Never
-    clobber a seat's own state; copy the flags from an onboarded sibling (version
-    match), else write a minimal complete marker. Also UNCONDITIONALLY trusts the
-    seat's intended workdir (+ its git root) — the folder-trust dialog is an
-    exact-match on the git-root realpath and no ref config carries helm-trust
-    (root cause of the codex-3 trust stall), so it must be synthesized, not
-    copied. Best-effort, non-fatal."""
+def _seed_onboarding(cdir, workdir=None, family=None):
+    """Seed a fresh seat's safe boot state without copying identity or sessions.
+
+    Onboarding/trust state skips two interactive wizards. Same-family feature
+    cache state preserves Claude Code's deferred tool surface (proven 2026-07-22:
+    cache-less codex-2 omitted Monitor while a cache-backed A/B launch exposed
+    it). Never clobber a seat's own state. Best-effort, non-fatal, but a missing
+    feature source is loud because the launched seat may be unwakeable.
+    """
     from . import pk
     dst = os.path.join(cdir, ".claude.json")
-    if os.path.exists(dst):
-        return                       # the seat owns its state once it exists
+    if os.path.lexists(dst):
+        if os.path.islink(dst) or not os.path.isfile(dst):
+            print("helm seat: WARNING — refusing non-regular seat state %s; "
+                  "feature cache cannot be repaired" % dst, file=sys.stderr)
+            return
+        state = pk.read_json(dst, None)
+        if not isinstance(state, dict):
+            print("helm seat: WARNING — unreadable seat state %s; refusing to "
+                  "overwrite it for feature-cache repair" % dst, file=sys.stderr)
+            return
+        if _feature_cache_complete(state):
+            return
+        cache = _feature_cache_seed(family, dst) if family else None
+        if cache is None:
+            _warn_feature_cache(cdir)
+            return
+        state.update(cache)          # preserve every seat-owned field; repair allowlist only
+        try:
+            mode = stat.S_IMODE(os.stat(dst).st_mode)
+            pk.write_json(dst, state)
+            os.chmod(dst, mode)       # atomic replace must not relax credential-adjacent state
+        except OSError as e:
+            print("helm seat: feature cache not repaired for %s (%s); a launched "
+                  "seat may omit deferred tools including Monitor" % (cdir, e),
+                  file=sys.stderr)
+        return
     seed = {"hasCompletedOnboarding": True, "theme": "dark"}
     for ref in _onboarded_refs():
         r = pk.read_json(ref, None)
@@ -637,6 +1020,11 @@ def _seed_onboarding(cdir, workdir=None):
             if trusted:
                 seed["projects"] = trusted
             break
+    cache = _feature_cache_seed(family, dst) if family else None
+    if cache is None:
+        _warn_feature_cache(cdir)
+    else:
+        seed.update(cache)
     # synthesize trust for the intended workdir (+ its git root) — exact-match
     # keys the dialog needs; helm already made the stronger bypass call.
     projects = seed.setdefault("projects", {})
@@ -712,6 +1100,44 @@ def _mint_probe_agents(cdir, family):
     return probes
 
 
+def _mint_instance_proxy(family, seat):
+    """Give an INSTANCE its own proxy fate: config.yaml + token under
+    instances/<seat>/, so `helm seat up <seat>` starts a proxy only this
+    instance uses. Idempotent (an existing instance token is kept so a live
+    launch line stays valid). The OAuth cred pool stays FAMILY-level — the
+    instance config's auth-dir points at the family's auth/, so per-instance
+    proxies add NO upstream quota (same account, N local listeners). Only
+    proxy (OAuth) families have a pool to point at; proxy-key families bake
+    their key into ONE family config and are out of scope here. -> the
+    instance proxy-home dir."""
+    home_dir = _proxy_home(family, seat)
+    os.makedirs(home_dir, mode=0o700, exist_ok=True)
+    os.chmod(home_dir, 0o700)
+    fam = FAMILIES[family]
+    token = _seat_token_per(home_dir)         # instance-scoped, stable
+    if fam["mode"] == "proxy":
+        auth_dir = os.path.join(seat_dir(family), "auth")   # the SHARED pool
+        _write_private(os.path.join(home_dir, "config.yaml"),
+                       _config_yaml(_instance_port(family, seat), auth_dir, token))
+    return home_dir
+
+
+def _seat_token_per(d):
+    """Read-or-mint a proxy token in an explicit dir (instance-scoped twin of
+    the family-level _seat_token)."""
+    try:
+        with open(os.path.join(d, "token")) as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    import secrets
+    tok = secrets.token_hex(32)
+    _write_private(os.path.join(d, "token"), tok + "\n")
+    return tok
+
+
 def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
                          room_source=None, multi=False):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
@@ -723,13 +1149,14 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
     merge-preserving write — a seat must never be born deaf. Install trouble
     is loud (stderr) but never fatal: the seat still mints and the message
     names the estate-wide repair. `seat` (slice 6) mints an INSTANCE's assets
-    (instances/<seat>/{claude,launch.sh}); the shared token/config.yaml stay
-    family-level and are NOT re-minted here."""
+    (instances/<seat>/{claude,launch.sh}). The instance's PROXY assets
+    (config.yaml/token) are minted separately by `_mint_instance_proxy` at
+    launch — this function stays proxy-agnostic."""
     seat = seat or family
     cdir = os.path.join(d, "claude")
     os.makedirs(cdir, exist_ok=True)
     _link_skills(cdir)       # seat agents get the host's /learn, /premise, /afk, …
-    _seed_onboarding(cdir, workdir)   # skip the onboarding/trust wizards
+    _seed_onboarding(cdir, workdir, family)  # onboarding/trust + feature cache
     from . import hooks
     action, detail = hooks.install_home(cdir, specs=hooks.DELIVERY_SPECS)
     if action == "fail":
@@ -749,8 +1176,14 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
                      "# child-stamp guard: inherited from a daemon born inside "
                      "a Claude session,\n# these mark the seat a subprocess "
                      "child (persistence silently OFF) — strip.\n"
-                     "unset %s\nexec %s \"$@\"\n"
+                     "unset %s\n"
+                     "# bearer: exported from the 0600 token file (builtin, no argv) —\n"
+                     "# never an env NAME=value arg (the external env binary's argv\n"
+                     "# would carry the resolved secret).\n"
+                     "%s"
+                     "exec %s \"$@\"\n"
                      % (seat, seat, " ".join(CHILD_STAMP_VARS),
+                        _token_export(family, seat),
                         launch_line(family, room=room, seat=seat,
                                     room_source=room_source, multi=multi)))
 
@@ -797,28 +1230,119 @@ def _env_file_value(path, key):
     return None
 
 
+def _hermes_pool_key(provider):
+    """(access_token, base_url, err) for a provider from the hermes CLI's
+    credential_pool (HERMES_AUTH). credential_pool[provider] is a LIST of
+    bearer entries; this selects the LIVE one — a real bearer (not an
+    empty/1-char placeholder), preferring last_status=='ok' then the lowest
+    priority — and returns its outbound base_url alongside so the caller wires
+    the endpoint the cred was minted for. READ-ONLY on the source; the token
+    value is secret and callers must never print or log it."""
+    try:
+        with open(HERMES_AUTH) as f:
+            a = json.load(f)
+    except (OSError, ValueError) as exc:
+        return None, None, "unreadable %s (%s)" % (HERMES_AUTH, exc)
+    pool = (a.get("credential_pool") or {}).get(provider)
+    if not isinstance(pool, list) or not pool:
+        return None, None, ("no credential_pool.%s entries in %s"
+                            % (provider, HERMES_AUTH))
+    # a real bearer is >= 20 chars — the junk placeholder entry (a 1-char
+    # token) never wins selection.
+    live = [e for e in pool if isinstance(e, dict)
+            and len(e.get("access_token") or "") >= 20]
+    if not live:
+        return None, None, ("no live bearer in credential_pool.%s of %s "
+                            "(entries present but tokens are empty/placeholder)"
+                            % (provider, HERMES_AUTH))
+    live.sort(key=lambda e: (
+        e.get("last_status") != "ok",
+        e.get("priority") if isinstance(e.get("priority"), int) else 1 << 30))
+    best = live[0]
+    return best.get("access_token"), best.get("base_url"), None
+
+
+def _opencode_authstore_key(provider):
+    """(api_key, err) for a provider from the opencode tool auth store
+    (OPENCODE_AUTHSTORE) — a JSON dict of provider -> {"type": "api",
+    "key": <bearer>}. Only type=="api" entries carry a static bearer we can
+    bake; oauth entries (access/refresh tokens that expire) are skipped here.
+    The store carries NO base_url, so the caller keeps the provider's
+    pool-table base_url. READ-ONLY on the source; the key value is secret and
+    callers must never print or log it."""
+    try:
+        with open(OPENCODE_AUTHSTORE) as f:
+            a = json.load(f)
+    except (OSError, ValueError) as exc:
+        return None, "unreadable %s (%s)" % (OPENCODE_AUTHSTORE, exc)
+    ent = a.get(provider)
+    if not isinstance(ent, dict):
+        return None, "no %s entry in %s" % (provider, OPENCODE_AUTHSTORE)
+    if ent.get("type") != "api":
+        return None, ("%s entry in %s is type '%s', not a static api key"
+                      % (provider, OPENCODE_AUTHSTORE, ent.get("type")))
+    key = ent.get("key")
+    # a real bearer is >= 20 chars — an empty/placeholder key never wins.
+    if not isinstance(key, str) or len(key) < 20:
+        return None, ("%s api entry in %s has no usable key"
+                      % (provider, OPENCODE_AUTHSTORE))
+    return key, None
+
+
 def _resolve_homing(explicit_room=None):
-    """(room, source) for seat add/launch. CLI wins, then the inherited
-    launch seam, then the current git project. Only a derived choice carries
-    the marker; explicit choices clear any inherited derived provenance."""
-    if explicit_room is not None:
-        return explicit_room, None
-    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
-    if env_room:
-        source = "derived" if env_source == "derived" else None
-        return env_room, source
+    """(room, source) for seat add/launch — seats.resolve_homing is THE one
+    precedence (CLI wins, then the inherited launch seam, then the current
+    git project; never a private re-derivation). Only a derived choice
+    carries the marker into launch assets; explicit choices clear any
+    inherited derived provenance."""
     from . import seats
-    room = seats.derive_home_room(os.getcwd())
-    return room, "derived" if room else None
+    # safe_cwd, never a bare os.getcwd(): `helm seat add --room X` from a
+    # deleted cwd must resolve (eager-getcwd class), not crash pre-resolver.
+    room, source = seats.resolve_homing(explicit_room, seats.safe_cwd())
+    return room, ("derived" if source == "derived" else None)
 
 
 def _add_proxy_key(family, fam, args, room=None, room_source=None):
     """mode "proxy-key": an API-key provider behind the same local proxy via
     its openai-compatibility block. No OAuth, no auth-dir. Key source order:
-    $<key_env>, then --key-from <.env-style file>. The key is baked into the
-    seat's 0600 config.yaml once, at add time — never printed, never logged."""
+    $<key_env>, then --key-from <.env-style file>, then — for POOL families
+    (pool_providers set, e.g. ds4pro) — the PREFERRED opencode tool auth store
+    (OPENCODE_AUTHSTORE) by the provider's `authstore` name, then the hermes
+    CLI's credential_pool[<provider>] (HERMES_AUTH) as fallback. Both read-only.
+    A pool family serves ONE selected provider per mint: `--provider <name>`
+    else pool_default; the provider's base_url + upstream model id come from
+    its pool table (the authstore carries no base_url, so the table's wins; on
+    the hermes fallback the credential_pool entry's own base_url wins when
+    present, so the seat rides exactly the endpoint the cred was minted for).
+    The key is baked into the seat's 0600 config.yaml once, at add time — never
+    printed, never logged."""
     key_env = fam["key_env"]
     api_key = os.environ.get(key_env)
+    # provider selection + outbound routing. Non-pool families (kimi) carry the
+    # provider/base_url/upstream on the family; pool families (ds4pro) resolve
+    # them from the selected provider's table.
+    provider = fam.get("provider")
+    base_url = fam.get("base_url")
+    upstream = fam.get("upstream_model")
+    pool_provider = None
+    if fam.get("pool_providers"):
+        pool_provider = fam.get("pool_default")
+        if "--provider" in args:
+            try:
+                pool_provider = args[args.index("--provider") + 1]
+            except IndexError:
+                print("helm seat: --provider wants a value", file=sys.stderr)
+                return 2
+        prov_cfg = fam["pool_providers"].get(pool_provider)
+        if prov_cfg is None:
+            print("helm seat: %s has no provider '%s' — choose one of: %s"
+                  % (family, pool_provider,
+                     ", ".join(sorted(fam["pool_providers"]))),
+                  file=sys.stderr)
+            return 2
+        provider = pool_provider
+        base_url = prov_cfg["base_url"]
+        upstream = prov_cfg["upstream_model"]
     if not api_key and "--key-from" in args:
         path = os.path.expanduser(args[args.index("--key-from") + 1])
         api_key = _env_file_value(path, key_env)
@@ -826,23 +1350,52 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
             print("helm seat: no %s= line found in %s" % (key_env, path),
                   file=sys.stderr)
             return 1
+    pool_err = None
+    as_err = None
+    if not api_key and pool_provider:
+        # PREFER the opencode auth store (fresh, owner-maintained); the
+        # authstore carries no base_url so the pool-table base_url (set above)
+        # stands. Fall back to the hermes credential_pool, whose entry base_url
+        # wins when present.
+        authstore_prov = prov_cfg.get("authstore")
+        if authstore_prov:
+            api_key, as_err = _opencode_authstore_key(authstore_prov)
+            if not api_key:
+                pool_err = as_err
+        if not api_key:
+            api_key, ent_base, hermes_err = _hermes_pool_key(pool_provider)
+            if api_key and ent_base:
+                base_url = ent_base   # the pool entry's own base_url wins
+            elif not api_key:
+                # both sources tried and failed: report BOTH reasons — the
+                # authstore is the PREFERRED path, so masking its error behind
+                # the hermes one hides the reason the operator most needs.
+                pool_err = "; ".join(e for e in (as_err, hermes_err) if e)
     if not api_key:
+        pool_hint = ""
+        if pool_provider:
+            pool_hint = (", or ensure %s or %s carries a live %s bearer (%s)"
+                         % (OPENCODE_AUTHSTORE, HERMES_AUTH, pool_provider,
+                            pool_err))
         print("helm seat: no outbound key — export %s=<key> or pass "
-              "--key-from <env-file> carrying a %s= line, then re-run "
-              "`helm seat add %s`" % (key_env, key_env, family), file=sys.stderr)
+              "--key-from <env-file> carrying a %s= line%s, then re-run "
+              "`helm seat add %s`" % (key_env, key_env, pool_hint, family),
+              file=sys.stderr)
         return 1
+    if pool_provider is None:
+        # non-pool proxy-key (kimi): dispatch the outbound endpoint by key shape
+        base_url = _key_base_url(fam, api_key)
     d = seat_dir(family)
     os.makedirs(d, mode=0o700, exist_ok=True)
     os.chmod(d, 0o700)
     token = _seat_token(family, d)
-    base_url = _key_base_url(fam, api_key)
     _write_private(os.path.join(d, "config.yaml"),
-                   _config_yaml_key(fam["port"], token, fam["provider"],
-                                    base_url, fam["model"], api_key))
+                   _config_yaml_key(fam["port"], token, provider,
+                                    base_url, fam["model"], api_key, upstream))
     _write_launch_assets(family, d, room, room_source=room_source)
     print("helm seat: %s seat minted at %s" % (family, d))
     print("  outbound %s key baked into config.yaml (0600 — value never "
-          "printed); provider %s -> %s" % (key_env, fam["provider"], base_url))
+          "printed); provider %s -> %s" % (key_env, provider, base_url))
     print("  proxy port %d; next: `helm seat up %s`, then `helm seat launch %s`"
           % (fam["port"], family, family))
     return 0
@@ -947,68 +1500,174 @@ def _require_seat(family):
     return FAMILIES[family]
 
 
-def _up(family, quiet=False):
+def _up(family, quiet=False, seat=None):
     fam = _require_seat(family)
     if fam is None:
         return 1
-    pid = _running_pid(family)
-    if pid:
-        print("helm seat: %s proxy already running (pid %d, port %d) — "
-              "`helm seat down %s` first" % (family, pid, fam["port"], family),
+    seat = seat or family
+    # an instance proxy must have its own minted config before it can come up
+    cfgd = _proxy_home(family, seat)
+    if seat != family and not os.path.exists(os.path.join(cfgd, "config.yaml")):
+        print("helm seat: no per-instance proxy for %s yet — `helm seat launch "
+              "%s -i %s` mints it" % (seat, family, seat.rsplit("-", 1)[-1]),
               file=sys.stderr)
         return 1
-    b = _proxy_bin()
-    if not b:
-        print("helm seat: cli-proxy-api binary not found (HELM_PROXY_BIN, %s, "
-              "PATH all empty) — run `helm seat doctor`" % PROXY_BIN_DEFAULT,
-              file=sys.stderr)
-        return 1
-    d = seat_dir(family)
-    log = open(os.path.join(d, "proxy.log"), "ab")
-    try:
-        p = subprocess.Popen([b, "-config", os.path.join(d, "config.yaml")],
-                             stdout=log, stderr=log, start_new_session=True)
-    except OSError as exc:
-        print("helm seat: proxy failed to launch: %s" % exc, file=sys.stderr)
-        return 1
-    finally:
-        log.close()
-    _write_private(os.path.join(d, "proxy.pid"), "%d\n" % p.pid)
-    for _ in range(30):  # up to ~6s for the port to open
-        if p.poll() is not None or _port_open(fam["port"]):
-            break
-        time.sleep(0.2)
-    if p.poll() is not None:
-        os.remove(os.path.join(d, "proxy.pid"))
-        print("helm seat: proxy exited rc %s — tail %s"
-              % (p.returncode, os.path.join(d, "proxy.log")), file=sys.stderr)
-        return 1
+    port = _instance_port(family, seat)
+    # Serialize check→spawn→record under the per-home lock: without it two
+    # concurrent _up calls both read an empty pidfile and double-start (the
+    # atomic-ownership finding). The whole critical section runs under the
+    # flock so the empty-check and the record-write are one atomic step.
+    with _proxy_lock(family, seat):
+        pid = _running_pid(family, seat)
+        if pid:
+            print("helm seat: %s proxy already running (pid %d, port %d) — "
+                  "`helm seat down %s` first" % (seat, pid, port, seat),
+                  file=sys.stderr)
+            return 1
+        b = _proxy_bin()
+        if not b:
+            print("helm seat: cli-proxy-api binary not found (HELM_PROXY_BIN, "
+                  "%s, PATH all empty) — run `helm seat doctor`"
+                  % PROXY_BIN_DEFAULT, file=sys.stderr)
+            return 1
+        # refuse a pre-bound target: an unrelated listener already on the port
+        # means a collision — spawning against it would either fight for the
+        # bind or, worse, _port_open would read the STRANGER as readiness (the
+        # codex MED: _up returned rc=0 + wrote proxy.pid against a foreign
+        # listener while its own child lost the bind). Family bases/comments
+        # prove no RUNTIME ownership.
+        if _port_open(port):
+            print("helm seat: port %d already has a listener that is not %s's "
+                  "proxy — refusing to spawn against someone else's socket "
+                  "(collision). Identify it (`ss -ltnp | grep :%d`) or `helm "
+                  "seat down %s` if it is a stale record."
+                  % (port, seat, port, seat), file=sys.stderr)
+            return 1
+        log = open(os.path.join(cfgd, "proxy.log"), "ab")
+        try:
+            p = subprocess.Popen([b, "-config",
+                                  os.path.join(cfgd, "config.yaml")],
+                                 stdout=log, stderr=log, start_new_session=True)
+        except OSError as exc:
+            print("helm seat: proxy failed to launch: %s" % exc, file=sys.stderr)
+            return 1
+        finally:
+            log.close()
+        # record pid + BIRTH identity so `_down`/`_running_pid` signal only THIS
+        # incarnation — a reused pid is never proxied-on or killed (the bare
+        # reusable-PID finding). Capture right after spawn; /proc can lag a tick,
+        # so retry briefly. If identity is STILL unverifiable the proxy would be
+        # unmanageable (fail-closed `_down` would refuse to ever signal it) — kill
+        # the orphan and fail loudly rather than leave a proxy we cannot stop.
+        ident = None
+        for _ in range(10):
+            ident = _pid_identity(p.pid)
+            if ident or p.poll() is not None:
+                break
+            time.sleep(0.1)
+        if not ident:
+            p.kill()
+            print("helm seat: proxy pid %d birth identity unverifiable — killed "
+                  "the orphan rather than leave an unstoppable proxy (no /proc?)"
+                  % p.pid, file=sys.stderr)
+            return 1
+        _write_private(os.path.join(cfgd, "proxy.pid"), "%d %s\n" % (p.pid, ident))
+        # readiness = OUR child alive AND the port open. Poll the child first:
+        # a dead child with the port held by a late foreign listener must NOT
+        # read as success (the other half of the codex MED). We already refused
+        # a pre-bound port above, so an open port with a live child is ours.
+        for _ in range(30):  # up to ~6s for the port to open
+            if p.poll() is not None or _port_open(port):
+                break
+            time.sleep(0.2)
+        if p.poll() is not None:
+            os.remove(os.path.join(cfgd, "proxy.pid"))
+            print("helm seat: proxy exited rc %s — tail %s"
+                  % (p.returncode, os.path.join(cfgd, "proxy.log")), file=sys.stderr)
+            return 1
+        if not _port_open(port):
+            # child alive but never bound (lost the race to a late listener, or
+            # wedged): not a proxy we can reach — kill it, don't leave an
+            # unmanageable record.
+            p.kill()
+            os.remove(os.path.join(cfgd, "proxy.pid"))
+            print("helm seat: proxy pid %d alive but port %d never opened — "
+                  "killed the orphan; tail %s"
+                  % (p.pid, port, os.path.join(cfgd, "proxy.log")), file=sys.stderr)
+            return 1
     if not quiet:
         print("helm seat: %s proxy up — 127.0.0.1:%d (pid %d)"
-              % (family, fam["port"], p.pid))
+              % (seat, port, p.pid))
     return 0
 
 
-def _down(family):
+def _down(family, seat=None):
     fam = _require_seat(family)
     if fam is None:
         return 1
-    pid = _running_pid(family)
-    pidfile = os.path.join(seat_dir(family), "proxy.pid")
-    if not pid:
-        if os.path.exists(pidfile):
-            os.remove(pidfile)  # stale
-        print("helm seat: %s proxy not running" % family)
-        return 0
-    os.kill(pid, signal.SIGTERM)
-    for _ in range(15):
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.2)
-    if _pid_alive(pid):
-        os.kill(pid, signal.SIGKILL)
-    os.remove(pidfile)
-    print("helm seat: %s proxy stopped (pid %d)" % (family, pid))
+    seat = seat or family
+    pidfile = os.path.join(_proxy_home(family, seat), "proxy.pid")
+    # Serialize verify→signal→unlink under the per-home lock (the atomic-
+    # ownership finding): without it a concurrent _up/replacement can write a
+    # FRESH pidfile after the old proxy exits, and an unconditional os.remove
+    # then deletes the NEW record — leaving the new proxy alive but
+    # unmanageable and eligible for a duplicate start.
+    with _proxy_lock(family, seat):
+        # ONE authenticated read, threaded through signal+unlink (the atomic-
+        # ownership advisory): the verify and the kill act on the SAME owned
+        # snapshot, so a transient re-read failure or malformed replacement
+        # mid-sequence can never split authentication from action (the 224e6b5
+        # None-subscript crash class) — the record is already in hand.
+        owned = _running_pid_rec(family, seat)
+        if not owned:
+            # Distinguish a merely-dead proxy from a REUSED/unauthenticated pid:
+            # a live process holding our recorded pid that we cannot prove is
+            # ours is NOT our proxy — never signal it. Reap the stale file.
+            rec = _proxy_pid_record(family, seat)
+            if rec and _pid_alive(rec["pid"]):
+                os.remove(pidfile)
+                print("helm seat: %s proxy pidfile stale — pid %d now belongs to "
+                      "an unrelated process (reused); NOT signalled, record "
+                      "reaped. NOTE: this includes LEGACY bare-pid records from "
+                      "pre-per-instance proxies (every proxy running at land). "
+                      "The old proxy may STILL hold the port — to load the new "
+                      "config, kill it by hand: `kill %d` (verify with "
+                      "`ss -ltnp | grep :%d`), then `helm seat up %s`."
+                      % (seat, rec["pid"], rec["pid"],
+                         _instance_port(family, seat), seat))
+                return 0
+            if os.path.exists(pidfile):
+                os.remove(pidfile)  # stale
+            print("helm seat: %s proxy not running" % seat)
+            return 0
+        pid, expected = owned["pid"], owned["identity"]
+        # TOCTOU guard: re-verify the birth identity IMMEDIATELY before each
+        # signal. `owned` authenticated at entry, but the proxy could die and
+        # its pid be recycled in the gap before a kill; a recycled pid has a
+        # different starttime, so the recheck refuses to signal it. (pidfd would
+        # close the window outright; /proc starttime narrows it to the
+        # check→kill instant, which is the portable floor here.)
+
+        def _still_ours():
+            return _pid_alive(pid) and _pid_identity(pid) == expected
+
+        if _still_ours():
+            os.kill(pid, signal.SIGTERM)
+        for _ in range(15):
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.2)
+        if _still_ours():
+            os.kill(pid, signal.SIGKILL)
+        # Unlink ONLY the exact record this operation killed: re-read under the
+        # lock and remove just if the pidfile still names THIS pid+birth. A
+        # concurrent replacement's fresh record (different pid or birth) is
+        # left intact.
+        cur = _proxy_pid_record(family, seat)
+        if cur and cur["pid"] == pid and cur["identity"] == expected \
+                and os.path.exists(pidfile):
+            os.remove(pidfile)
+    print("helm seat: %s proxy stopped (pid %d)" % (seat, pid))
     return 0
 
 
@@ -1031,7 +1690,7 @@ def _seat_env(family, config_dir, multi=False):
         env.pop(v, None)
     env.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
     env.update({
-        "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % fam["port"],
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % _instance_port(family),
         "ANTHROPIC_AUTH_TOKEN": _read_token(family) or "",
         "CLAUDE_CONFIG_DIR": config_dir,
         "HELM_CHAT_NAME": family,
@@ -1171,6 +1830,16 @@ def _seat_family(seat_name):
                   % (seat_name, ", ".join(sorted(FAMILIES))))
 
 
+def _split_seat(seat_name):
+    """'codex' -> ('codex', 'codex'), 'codex-3' -> ('codex', 'codex-3'): the
+    family (which FAMILIES entry / cred pool) beside the full seat identity
+    (whose proxy/config/session). Falls back to (seat_name, seat_name) so a
+    bare family name is instance 1."""
+    fam, _ = _seat_family(seat_name)
+    fam = fam or seat_name
+    return fam, seat_name
+
+
 _SESSION_JSONL = re.compile(r"^[0-9a-fA-F-]{36}\.jsonl$")
 
 
@@ -1240,42 +1909,6 @@ def _multi_from_launch(path):
         return False
 
 
-def _multi_from_launch(path):
-    """Recover the seat's mixed-model shape from launch.sh. --multi's durable
-    marker is the ABSENCE of the blunt CLAUDE_CODE_SUBAGENT_MODEL pin; every
-    single-model launch assigns it. Missing/unreadable assets default safely to
-    the normal pinned shape."""
-    try:
-        with open(path) as f:
-            return "CLAUDE_CODE_SUBAGENT_MODEL=" not in f.read()
-    except OSError:
-        return False
-
-
-def _multi_from_launch(path):
-    """Recover the seat's mixed-model shape from launch.sh. --multi's durable
-    marker is the ABSENCE of the blunt CLAUDE_CODE_SUBAGENT_MODEL pin; every
-    single-model launch assigns it. Missing/unreadable assets default safely to
-    the normal pinned shape."""
-    try:
-        with open(path) as f:
-            return "CLAUDE_CODE_SUBAGENT_MODEL=" not in f.read()
-    except OSError:
-        return False
-
-
-def _multi_from_launch(path):
-    """Recover the seat's mixed-model shape from launch.sh. --multi's durable
-    marker is the ABSENCE of the blunt CLAUDE_CODE_SUBAGENT_MODEL pin; every
-    single-model launch assigns it. Missing/unreadable assets default safely to
-    the normal pinned shape."""
-    try:
-        with open(path) as f:
-            return "CLAUDE_CODE_SUBAGENT_MODEL=" not in f.read()
-    except OSError:
-        return False
-
-
 def _resume(seat_name, rest):
     """seat resume <seat> — relaunch the seat's pane at its drain point via
     the detected metaharness: the pane runs the seat's freshly re-minted
@@ -1287,6 +1920,13 @@ def _resume(seat_name, rest):
     family, err = _seat_family(seat_name)
     if err:
         print("helm seat: " + err, file=sys.stderr)
+        return 2
+    # Same admissibility gate as `_spawn`, BEFORE anything is minted (the
+    # fable MED: resume bypassed it, so `resume kimi-2`/`resume codex-1` minted
+    # instance assets spawn would have refused).
+    gate = _instance_gate(family, seat_name)
+    if gate:
+        print("helm seat: " + gate, file=sys.stderr)
         return 2
     d = _instance_dir(family, seat_name)
     launch_sh = os.path.join(d, "launch.sh")
@@ -1320,8 +1960,22 @@ def _resume(seat_name, rest):
         # assets (identity vars, delivery hooks, context env), room preserved.
         _write_launch_assets(
             family, d, room, seat_name, room_source=room_source, multi=multi)
-        handle = ad.spawn(command, title=seat_name,
-                          cwd=sess_cwd or os.getcwd())
+        from . import seats
+        # resume must not strand the seat on a dead proxy either (the same
+        # silent-dead-seat class the fable HIGH named in _spawn): mint the
+        # instance proxy (idempotent) and start it if down, so the relaunched
+        # seat's 8319 line has a live proxy behind it.
+        fam = FAMILIES[family]
+        if seat_name != family and fam["mode"] == "proxy":
+            _mint_instance_proxy(family, seat_name)
+        if os.path.exists(os.path.join(_proxy_home(family, seat_name),
+                                       "config.yaml")) \
+                and not _running_pid(family, seat_name):
+            if _up(family, quiet=True, seat=seat_name) == 0:
+                print("  (proxy was down — auto-started)")
+        handle = ad.spawn(command, title=seat_name,   # safe_cwd: a deleted
+                          cwd=sess_cwd or seats.safe_cwd())  # cwd must not
+        # crash the resume (eager-getcwd class); spawn treats None as inherit.
     except harness.HarnessError as e:
         print("helm seat: %s resume via %s failed: %s"
               % (seat_name, ad.name, e), file=sys.stderr)
@@ -1366,9 +2020,11 @@ def onboarding_prompt(seat_name, room=None):
     spawn paths (only the delivery differs). One line, no newlines (it rides
     `terminal send`/`pane run` as a single keystroke burst) and no secrets
     (it crosses the adapter seam). Content law: arm the beacon FIRST (the only
-    idle wake), read the home room, announce, take @<seat> work."""
-    r = room or "main"
-    flag = "" if r == "main" else " --room %s" % shlex.quote(r)
+    idle wake), read the home room, announce, take @<seat> work. room=None is
+    NOT 'main': the home derives at SessionStart join (seats.resolve_homing)
+    — the prompt says so instead of inventing a room the roster never wrote."""
+    r = room or "derived at join — `helm chat seats` shows it"
+    flag = "" if not room or room == "main" else " --room %s" % shlex.quote(room)
     return ("You are helm fleet seat '%(s)s' (home room %(r)s). Self-onboard "
             "now, in order: (1) ARM YOUR INBOX BEACON before anything else — "
             "Monitor(command: \"helm chat wait --seat %(s)s --follow\", "
@@ -1384,7 +2040,12 @@ def onboarding_prompt(seat_name, room=None):
             "ANNOUNCE: `helm chat post%(f)s \"%(s)s online — beacon armed, "
             "taking @%(s)s work\"`. (4) TAKE WORK: rows addressed @%(s)s and "
             "owner posts are yours — do the work, reply in the room, and when "
-            "idle again stay parked on the beacon."
+            "idle again stay parked on the beacon. (5) END YOUR TURNS: at "
+            "every bounded milestone post progress and STOP — the beacon "
+            "re-wakes you; that is what it is for. A turn held open blocks "
+            "queued messages and /compact, inflates context toward the "
+            "100%% cliff, and is indistinguishable from a hang. A routine "
+            "event = process, post, END."
             % {"s": seat_name, "r": r, "f": flag})
 
 
@@ -1496,8 +2157,14 @@ def _register_spawn(seat_name, d, rec):
         return False
     try:
         from . import seats as _seats
-        _seats.write_roster(seat_name, cwd=rec.get("worktree"),
-                            home_room=rec.get("room"))
+        # Provenance rides into the mirror: a derived room stays derived (it
+        # may NEVER overwrite an explicit/operator home — write_roster's law);
+        # no room writes NO home (join derives the real one at SessionStart).
+        _seats.write_roster(
+            seat_name, cwd=rec.get("worktree"), home_room=rec.get("room"),
+            home_room_source=None if not rec.get("room")
+            else "derived" if rec.get("room_source") == "derived"
+            else "explicit")
     except Exception as e:
         print("helm seat: chat-roster mirror skipped (%s) — spawn.json is "
               "still authoritative for `helm seat where`" % e, file=sys.stderr)
@@ -1545,15 +2212,18 @@ def _spawn_plan(seat_name, d, launch_sh, room, cwd, onboard, ad):
               % ad.name)
     print("  register: %s {harness, %s, worktree=%s, room=%s}"
           % (_spawn_path(d), "pid" if ad is None else "handle", cwd,
-             room or "main"))
+             room or "(derived at join)"))
     print("  onboarding first-prompt:\n    " + onboard)
     return 0
 
 
 def _spawn_args(rest):
     """Parse spawn's small option surface without letting a missing value raise
-    IndexError or an unknown flag silently change the launch."""
-    room, cwd, dry_run = None, os.getcwd(), False
+    IndexError or an unknown flag silently change the launch. The default cwd
+    is safe_cwd, not a bare os.getcwd() — a deleted cwd must not crash spawn
+    (eager-getcwd class); downstream tolerates None (harness inherits)."""
+    from . import seats
+    room, cwd, dry_run = None, seats.safe_cwd(), False
     i = 0
     while i < len(rest):
         arg = rest[i]
@@ -1583,6 +2253,14 @@ def _spawn(seat_name, rest, _locked=False):
     if err:
         print("helm seat: " + err, file=sys.stderr)
         return 2
+    # Instance-spawn gate (the fable MED — it lived only on `launch`, so
+    # `spawn kimi-2` / `spawn codex-1` minted launch lines pointed at a SIBLING
+    # family's port range). ONE shared predicate with `_resume` (the second
+    # fable MED: the gate on spawn alone let resume mint the refused seats).
+    gate = _instance_gate(family, seat_name)
+    if gate:
+        print("helm seat: " + gate, file=sys.stderr)
+        return 2
     d = _instance_dir(family, seat_name)
     launch_sh = os.path.join(d, "launch.sh")
     if not os.path.exists(launch_sh) and \
@@ -1597,7 +2275,15 @@ def _spawn(seat_name, rest, _locked=False):
               "[--cwd DIR] [--print]" % arg_err, file=sys.stderr)
         return 2
     room, cwd, dry_run = parsed
-    room = room if room is not None else _room_from_launch(launch_sh)
+    # Room provenance rides with the room (roster-scatter class): an explicit
+    # --room / launch.sh HELM_CHAT_ROOM is explicit; a launch.sh room the
+    # seam stamped derived stays derived; NO room stays None — the roster
+    # mirror must not invent a 'main' home the SessionStart join would never
+    # have written (seats.resolve_homing derives the real one from cwd).
+    room_source = "explicit" if room is not None else None
+    if room is None:
+        room, room_source = _homing_from_launch(launch_sh)
+        room_source = room_source or ("explicit" if room else None)
     multi = _multi_from_launch(launch_sh)
     onboard = onboarding_prompt(seat_name, room)
     from . import harness
@@ -1622,18 +2308,34 @@ def _spawn(seat_name, rest, _locked=False):
     # mint hygiene AFTER the reap (a stale pane's sh may still be reading the
     # old launch.sh — the resume-verb ordering law), workdir=cwd so the trust
     # seed covers where the seat will actually run.
-    _write_launch_assets(family, d, room, seat_name, workdir=cwd, multi=multi)
-    if os.path.exists(os.path.join(seat_dir(family), "config.yaml")) \
-            and not _running_pid(family):
-        if _up(family, quiet=True) == 0:
+    # room_source rides INTO the re-minted script (HELM_CHAT_ROOM_SOURCE):
+    # dropping it here laundered a derived room to explicit — the child's
+    # SessionStart join then outranked (and overwrote) an operator-set home.
+    _write_launch_assets(family, d, room, seat_name, workdir=cwd,
+                         room_source=room_source, multi=multi)
+    # per-instance proxy fate: an INSTANCE seat owns its OWN proxy
+    # (instances/<seat>/), so spawn mints + starts THAT seat's proxy — never
+    # the family's. MINT FIRST (the fable HIGH): a never-launched instance has
+    # no config yet, and gating on its existence silently skipped BOTH the
+    # auto-start AND the WARN — a spawn-first codex-2 launched DEAD (launch.sh
+    # pointed at 8319, empty token, no proxy) where pre-lane it WORKED on the
+    # shared family proxy. `_mint_instance_proxy` is idempotent, so minting
+    # here mirrors `launch` and is a no-op for an already-minted instance.
+    fam = FAMILIES[family]
+    if seat_name != family and fam["mode"] == "proxy":
+        _mint_instance_proxy(family, seat_name)
+    seat_cfg = os.path.join(_proxy_home(family, seat_name), "config.yaml")
+    if os.path.exists(seat_cfg) and not _running_pid(family, seat_name):
+        if _up(family, quiet=True, seat=seat_name) == 0:
             print("  (proxy was down — auto-started)")
         else:
             print("helm seat: WARN — %s proxy not running and auto-start "
                   "failed; the seat errors until `helm seat up %s`"
-                  % (family, family), file=sys.stderr)
+                  % (seat_name, seat_name), file=sys.stderr)
     from . import pk
-    rec = {"v": 1, "seat": seat_name, "worktree": cwd, "room": room or "main",
-           "launch_sh": launch_sh, "ts": pk.now_ts()}
+    rec = {"v": 1, "seat": seat_name, "worktree": cwd, "room": room,
+           "room_source": room_source, "launch_sh": launch_sh,
+           "ts": pk.now_ts()}
     if ad is None:
         try:
             pid = _headless_spawn(launch_sh, onboard, cwd,
@@ -1735,13 +2437,28 @@ def _where(seat_name, rest):
                               "detected here)" % rec.get("harness"))
     print("%s: %s %s — %s; worktree %s, room %s, spawned %s"
           % (seat_name, rec.get("harness"), ref, state, rec.get("worktree"),
-             rec.get("room"), rec.get("ts")))
+             rec.get("room") or "(derived at join)", rec.get("ts")))
     return 0
 
 
 # ---------------------------------------------------------------------------
 # list / status / doctor
 # ---------------------------------------------------------------------------
+
+def _minted_instances(family):
+    """[seat] every instance with its OWN minted proxy (config.yaml under
+    instances/<seat>/) — the per-instance-proxy fleet, sorted numerically so
+    codex-2 precedes codex-10."""
+    root = os.path.join(seat_dir(family), "instances")
+    out = []
+    for name in (os.listdir(root) if os.path.isdir(root) else []):
+        if os.path.exists(os.path.join(root, name, "config.yaml")):
+            out.append(name)
+    def _key(s):
+        m = re.match(r"^%s-(\d+)$" % re.escape(family), s)
+        return (0, int(m.group(1))) if m else (1, s)
+    return sorted(out, key=_key)
+
 
 def _seat_row(family):
     d = seat_dir(family)
@@ -1765,11 +2482,19 @@ def _seat_row(family):
         if len(creds) > 1:
             cred += " (+%d more pooled)" % (len(creds) - 1)
     pid = _running_pid(family)
-    port = fam.get("port")
+    port = _instance_port(family)
     live = "proxy UP pid %d port %d%s" % (pid, port, "" if _port_open(port) else
                                           " (port not answering!)") if pid \
         else "proxy down"
     row = "%-8s %-38s %s" % (family, live, cred)
+    # per-instance proxies: each minted instance reports its OWN proxy fate
+    for inst in _minted_instances(family):
+        ipid = _running_pid(family, inst)
+        iport = _instance_port(family, inst)
+        ilive = "proxy UP pid %d port %d%s" % (
+            ipid, iport, "" if _port_open(iport) else " (port not answering!)") \
+            if ipid else "proxy down"
+        row += "\n  %-6s %-38s" % (inst, ilive)
     if family == "codex":   # slice 6: live-instance / pooled-capacity suffix
         try:
             from . import codexhomes, seats as _seats
@@ -1843,9 +2568,16 @@ def cmd_seat(args):
         print(_USAGE, file=sys.stderr)
         return 2
     verb, rest = args[0], args[1:]
+    from .cli import guard_tail
     if verb in ("list", "status"):
+        rc = guard_tail("helm seat " + verb, rest, usage=_USAGE)
+        if rc is not None:
+            return rc
         return _status(rest)
     if verb == "doctor":
+        rc = guard_tail("helm seat doctor", rest, usage=_USAGE)
+        if rc is not None:
+            return rc
         return _doctor(rest)
     if verb == "autocompact":
         from . import autocompact
@@ -1865,12 +2597,31 @@ def cmd_seat(args):
         if not rest:
             print("usage: helm seat resume <seat>", file=sys.stderr)
             return 2
+        # resume RELAUNCHES the pane — trailing junk refuses before it fires.
+        rc = guard_tail("helm seat resume", rest[1:],
+                        usage="seat resume <seat>")
+        if rc is not None:
+            return rc
         return _resume(rest[0], rest[1:])
     if verb in ("add", "up", "down", "launch", "smoke"):
         if not rest:
             print("usage: helm seat %s <family>" % verb, file=sys.stderr)
             return 2
         family = rest[0]
+        # per-verb tail contract — refuse trailing junk BEFORE anything runs:
+        # `seat down codex --bogus --help` used to STOP the seat and exit 0.
+        tails = {"add": ((), ("--room", "--auth-from", "--key-from",
+                              "--provider")),
+                 "up": ((), ()),
+                 "down": ((), ()),
+                 "smoke": (("--multi",), ()),
+                 "launch": (("--multi",),
+                            ("--room", "--model", "-i", "--instance"))}
+        tflags, tvalued = tails[verb]
+        rc = guard_tail("helm seat " + verb, rest[1:], flags=tflags,
+                        valued=tvalued, usage=_USAGE)
+        if rc is not None:
+            return rc
         # --multi (launch/smoke): the mixed-model fleet shape — no subagent
         # pin, probe agents minted, smoke grows the fan-out leg.
         multi = "--multi" in rest
@@ -1889,18 +2640,21 @@ def cmd_seat(args):
         if verb == "add":
             return _add(
                 family, rest[1:], room=room, room_source=room_source)
-        if verb == "up":
-            return _up(family)
-        if verb == "down":
-            return _down(family)
+        if verb in ("up", "down"):
+            # `helm seat up codex-3` targets instance codex-3's OWN proxy;
+            # `helm seat up codex` targets the family (instance-1) proxy.
+            fam_name, seat_name = _split_seat(family)
+            fn = _up if verb == "up" else _down
+            return fn(fam_name, seat=seat_name)
         if verb == "smoke":
             return _smoke(family, multi=multi)
         fam = _require_seat(family)
         if fam is None:
             return 1
         model = rest[rest.index("--model") + 1] if "--model" in rest else None
-        # slice 6 — N instances of one family share the proxy/port/token/pool:
-        # -i/--instance N -> seat codex-N (default 1 = today's exact line).
+        # slice 6 — N instances of one family share the OAuth cred POOL but each
+        # gets its own proxy fate: -i/--instance N -> seat codex-N on its own
+        # port (default 1 = the family proxy, today's exact line).
         inst = 1
         for flag in ("-i", "--instance"):
             if flag in rest:
@@ -1910,6 +2664,20 @@ def cmd_seat(args):
                     print("helm seat: %s wants an integer" % flag, file=sys.stderr)
                     return 2
         seat = family if inst <= 1 else "%s-%d" % (family, inst)
+        # Per-instance proxies are a PROXY-family (OAuth-pool) feature only.
+        # proxy-key families (kimi) bake ONE key into the family config — there
+        # is no pool to point an instance config at, so `_mint_instance_proxy`
+        # skips config generation and `up <instance>` must refuse. Accepting
+        # `launch kimi -i 2` would print an instance line whose proxy can never
+        # come up (and its derived port can collide with a sibling family's
+        # block). Refuse up front: this is an unsupported-family gate, not a
+        # warn — the launch cannot produce a working instance.
+        if inst > 1 and fam["mode"] != "proxy":
+            print("helm seat: per-instance proxies need an OAuth-pool family "
+                  "(mode=proxy); %s is mode=%s — only `helm seat launch %s` "
+                  "(instance 1) is supported"
+                  % (family, fam["mode"], family), file=sys.stderr)
+            return 2
         # guards ride stderr (stdout stays the bare pasteable line), warn
         # never refuse: over-capacity burns one pool faster (fall-through
         # masks it) and a live same-named seat is a relaunch-vs-collision the
@@ -1935,7 +2703,18 @@ def cmd_seat(args):
         _write_launch_assets(
             family, _instance_dir(family, seat), room, seat,
             room_source=room_source, multi=multi)
-        print(launch_line(
+        if seat != family:
+            # per-instance proxies: this instance gets its OWN port/config/
+            # token/log, so one instance's restart/429-stall never takes a
+            # sibling down (the shared-8317 blast-radius). OAuth pool stays
+            # family-level — no quota multiplication.
+            _mint_instance_proxy(family, seat)
+            print("helm seat: %s gets its own proxy — `helm seat up %s` "
+                  "(127.0.0.1:%d) before launching"
+                  % (seat, seat, _instance_port(family, seat)), file=sys.stderr)
+        # the pasteable line: export the bearer from its 0600 file (builtin, no
+        # argv), then the env/claude command — the token never transits argv.
+        print(_token_export(family, seat) + launch_line(
             family, model, room, seat, room_source=room_source, multi=multi))
         from . import hooks
         hooks.surface_uncovered(out=sys.stderr)  # a running joined-late pane
