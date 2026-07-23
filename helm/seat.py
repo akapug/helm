@@ -1959,6 +1959,16 @@ def _resume(seat_name, rest, _locked=False):
     room, room_source = _homing_from_launch(launch_sh)
     multi = _multi_from_launch(launch_sh)
     sid, sess_cwd = _newest_seat_session(d)
+    if room is None:
+        # launch.sh carries no explicit room stamp (minted room-less). Resume
+        # must still preserve the seat's DERIVABLE home — re-minting with
+        # room=None would stamp the relaunch HELM_CHAT_ROOM-less and the
+        # SessionStart join would fall back to #main, silently dropping the
+        # seat out of its project room (the kimi room-drop regression,
+        # 2026-07-23). Fall back to the one precedence (explicit env >
+        # cwd-derived project room); a project-less seat stays un-homed.
+        from . import seats as _seats
+        room, room_source = _seats.resolve_homing(cwd=sess_cwd)
     command = "%s %s" % (shlex.quote(launch_sh),
                          ("--resume " + shlex.quote(sid)) if sid else "--continue")
     from . import harness

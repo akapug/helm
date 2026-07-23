@@ -1357,6 +1357,43 @@ class SeatMultiTest(unittest.TestCase):
             self.assertEqual(seat.cmd_seat(["launch", "codex"]), 0)
         self.assertFalse(seat._multi_from_launch(launch_sh))
 
+    def test_resume_roomless_launch_falls_back_to_project_room(self):
+        """The kimi room-drop regression (2026-07-23): a launch.sh minted
+        WITHOUT a room stamp (HELM_CHAT_ROOM-less) made _resume recover
+        (None, None) and re-mint room=None — the SessionStart join then
+        defaulted the seat to #main, silently dropping it out of its project
+        room. The resume seam now falls back to seats.resolve_homing(cwd), so
+        the cwd-derived project room is preserved. Pin the two halves: (1)
+        _homing_from_launch really is empty on a room-less launch.sh (the
+        precondition), and (2) resolve_homing recovers the project room for
+        the seat's cwd — the value _resume now re-mints."""
+        from helm import seats
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        d = seat.seat_dir("codex")
+        launch_sh = os.path.join(d, "launch.sh")
+        # mint a launch, then strip its room stamp: the regression's
+        # precondition (a launch.sh carrying NO HELM_CHAT_ROOM= line)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(seat.cmd_seat(["launch", "codex"]), 0)
+        with open(launch_sh) as f:
+            txt = f.read()
+        import re as _re
+        txt = _re.sub(r"\s*HELM_CHAT_ROOM(_SOURCE)?=\S+", "", txt)
+        with open(launch_sh, "w") as f:
+            f.write(txt)
+        room, room_source = seat._homing_from_launch(launch_sh)
+        self.assertIsNone(room)
+        self.assertIsNone(room_source)
+        # the resume fallback recovers the cwd-derived project room, not None
+        # (use the real helm repo — _git_project needs a true git root)
+        fb_room, fb_source = seats.resolve_homing(cwd="/home/owner/dev/akapug/helm")
+        self.assertIsNotNone(fb_room)
+        self.assertEqual(fb_source, "derived")
+        # and that room mints HELM_CHAT_ROOM into the relaunch line (not #main)
+        line = seat.launch_line("codex", room=fb_room, room_source=fb_source)
+        self.assertIn("HELM_CHAT_ROOM=%s" % fb_room, line)
+
     def test_seat_env_multi_no_pin_and_no_inherited_pin(self):
         self._plant("home-a")
         self.assertEqual(self._add()[0], 0)
