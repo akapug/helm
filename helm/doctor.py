@@ -312,7 +312,8 @@ def check_chat_node():
                 if transport.get("mode") == "degraded" else [])
     if signer["configured"] and not signer["usable"] \
             and transport.get("code") != "signer_unavailable":
-        degraded.append((WARN, "chat signer UNAVAILABLE — %s" % signer["reason"]))
+        degraded.append((WARN, "chat signer UNAVAILABLE — %s" %
+                         chat._safe_reason(signer["reason"])))
     if not url:
         return degraded + [(OK, "chat: signed transport disabled "
                                 "(HELM_CHAT_NODE_URL empty) — v1 RAM room only")]

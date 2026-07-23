@@ -1048,6 +1048,8 @@ _TRANSPORT_PROJECTION_CONSUMERS = {
     ("chat.py", "_stamp_sign_failure"): "reason-only row projection routes its transport copy through _public_transport",
     ("chat.py", "_transport_tag"): "CLI, follow, and journal row renderer launders legacy/pre-fix nested fields at the sink",
     ("chat.py", "transport_failure_summary"): "CLI/node/doctor summary launders both nested fields at the sink",
+    ("chat.py", "transport_status"): "status owner consumes already-public incidents and routes signer reason through _transient_failure",
+    ("doctor.py", "check_chat_node"): "doctor routes direct signer reason through chat._safe_reason and transport summaries through their public owner",
     ("human.py", "status_line"): "TUI renderer launders both nested fields at the sink",
 }
 
