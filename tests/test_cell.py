@@ -192,6 +192,31 @@ class BinPathTest(CellBase):
     def test_no_auto_resolution_returns_none(self):
         # never a PATH probe, never a sibling-build guess — unset => None
         self.assertIsNone(cell.bin_path())
+        self.assertEqual(cell.bin_status()["state"], "unset")
+
+    def test_bin_status_distinguishes_missing_and_non_executable(self):
+        missing = os.path.join(self.tmp, "deleted-signer\x1b[2J")
+        os.environ["HELM_CELL_BIN"] = missing
+        status = cell.bin_status()
+        self.assertEqual((status["configured"], status["usable"], status["state"]),
+                         (True, False, "missing"))
+        self.assertIn("path does not exist", status["reason"])
+        self.assertNotIn(missing, status["reason"])
+
+        directory = os.path.join(self.tmp, "signer-dir")
+        os.mkdir(directory)
+        os.environ["HELM_CELL_BIN"] = directory
+        self.assertEqual(cell.bin_status()["state"], "not_file")
+
+        os.environ["HELM_CELL_BIN"] = missing
+        with open(missing, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(missing, 0o600)
+        status = cell.bin_status()
+        self.assertEqual(status["state"], "not_executable")
+        self.assertIn("not executable", status["reason"])
+        os.chmod(missing, 0o700)
+        self.assertEqual(cell.bin_status()["state"], "ready")
 
     def test_run_bin_degrades_without_binary(self):
         rc, out, err = cell.run_bin(["roster"])
@@ -285,6 +310,16 @@ class StatusTest(CellBase):
         self.assertEqual(rc, 0)
         self.assertIn("node LIVE", out)
         self.assertIn("chain head 5", out)
+
+    def test_live_node_with_configured_missing_signer_is_unavailable(self):
+        os.environ["HELM_CELL_BIN"] = os.path.join(self.tmp, "deleted-signer")
+        with mock.patch.object(cell, "get_json", return_value=[
+                {"chain_index": 5, "finality": "tentative"}]):
+            rc, out, _ = self.run_cli(["status"])
+        self.assertEqual(rc, 1)
+        self.assertIn("signer UNAVAILABLE", out)
+        self.assertIn("path does not exist", out)
+        self.assertNotIn("transport OFF", out)
 
 
 if __name__ == "__main__":

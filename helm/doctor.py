@@ -303,11 +303,16 @@ def check_chat_node():
     joined-cell balances (the never-die-on-computrons watch). Read-only —
     repairs live with `helm chat node up`."""
     from . import chat, pk as _pk
+    from . import cell as _cell
     url = chat.node_url()
     transport = chat.transport_status()
+    signer = _cell.bin_status()
     degraded = ([(WARN, "chat signing " +
                   chat.transport_failure_summary(transport))]
                 if transport.get("mode") == "degraded" else [])
+    if signer["configured"] and not signer["usable"] \
+            and transport.get("code") != "signer_unavailable":
+        degraded.append((WARN, "chat signer UNAVAILABLE — %s" % signer["reason"]))
     if not url:
         return degraded + [(OK, "chat: signed transport disabled "
                                 "(HELM_CHAT_NODE_URL empty) — v1 RAM room only")]
@@ -317,8 +322,7 @@ def check_chat_node():
                                   "back to [unsigned]; `helm chat node up`" % url)]
     out = [(OK, "chat room node LIVE at %s — chain head %s" % (
         url, head.get("chain_index") if head else "(no receipts yet)"))] + degraded
-    from . import cell as _cell
-    if not _cell.bin_ready():
+    if not signer["configured"]:
         out.append((WARN, "chat signer OFF (HELM_CELL_BIN unset) — the node "
                           "answers but every post rides [unsigned]; set "
                           "HELM_CELL_BIN or accept unsigned-by-default"))

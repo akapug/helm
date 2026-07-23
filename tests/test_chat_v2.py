@@ -17,7 +17,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import cell as cellmod  # noqa: E402
-from helm import chat, chatnode, home, pk  # noqa: E402
+from helm import chat, chatnode, home, human, pk  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -29,6 +29,8 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
 
 SENT = {"sent": True, "turn_hash": "a" * 64, "receipt_hash": "b" * 64,
         "chain_index": 7}
+READY_SIGNER = {"configured": True, "usable": True, "state": "ready",
+                "reason": "signer ready"}
 
 
 class V2Base(unittest.TestCase):
@@ -62,7 +64,7 @@ class TransportTest(V2Base):
         self.assertIsNone(chat.node_url())
         self.assertEqual(chat.transport_status(),
                          {"mode": "unsigned", "url": None, "head": None,
-                          "signer": False})
+                          "signer": False, "signer_configured": False})
         self.assertFalse(os.path.exists(os.environ["HELM_CHAT_DIR"]))
 
     def test_node_url_env_wins_and_strips(self):
@@ -142,7 +144,7 @@ class TransportTest(V2Base):
             return outs.pop(0)
 
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
-        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(cellmod, "run_bin", side_effect=fake_run), \
              mock.patch.object(chat, "_revive", return_value=("tok2", None)) as rv, \
              mock.patch.object(chat, "_faucet",
@@ -164,7 +166,7 @@ class TransportTest(V2Base):
         outs = [(1, "", "insufficient computrons token=" + secret),
                 (1, "", "still insufficient")]
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
-        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "_room_cell",
                                return_value=("c" * 64, None, True)), \
              mock.patch.object(chat, "_balance", return_value=0), \
@@ -218,7 +220,7 @@ class TransportTest(V2Base):
         chat._record_sign_failure("p1", chat._diag("send_failed", "existing"))
         malformed = dict(SENT, sent="false", chain_index=False)
         result = (0, json.dumps(malformed), "")
-        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "_room_cell",
                                return_value=("c" * 64, None, True)), \
              mock.patch.object(chat, "_balance", return_value=None), \
@@ -237,7 +239,7 @@ class TransportTest(V2Base):
                               "_last_epoch": "bad", "failure_count": "many"},
                        "junk": [1, 2, 3]}, f)
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
-        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "node_head", return_value={"chain_index": 1}):
             st = chat.transport_status()
         self.assertEqual((st["mode"], st["profile"], st["code"],
@@ -309,7 +311,7 @@ class TransportTest(V2Base):
             out = io.StringIO()
             with mock.patch.object(chat.time, "time", return_value=200), \
                  mock.patch.object(pk, "now_ts", return_value="unreadable"), \
-                 mock.patch.object(cellmod, "bin_ready", return_value=True), \
+                 mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
                  mock.patch.object(chat, "node_head",
                                    return_value={"chain_index": 8}), \
                  contextlib.redirect_stdout(out):
@@ -330,7 +332,7 @@ class TransportTest(V2Base):
         self.assertEqual(chat.sign_failures()[0]["reason"], "real incident")
         self.assertTrue(chat._clear_sign_failure(raw, succeeded_at=300))
         self.assertEqual(chat.sign_failures(), [])
-        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "node_head", return_value={"chain_index": 9}):
             self.assertEqual(chat.transport_status()["mode"], "signed")
 
@@ -359,7 +361,7 @@ class TransportTest(V2Base):
                          [chat._dsan(raw), other])
         self.assertEqual((rows[0]["reason"], rows[0]["failure_count"]),
                          ("latest", 2))
-        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "node_head", return_value={"chain_index": 10}):
             st = chat.transport_status()
         self.assertEqual((st["mode"], st["code"], st["failure_count"]),
@@ -413,7 +415,7 @@ class TransportTest(V2Base):
         self.assertEqual((row["transport"]["profile"],
                           row["transport"]["failure_count"]), (raw, 1))
         self.assertEqual(chat.sign_failures()[0]["reason"], "cannot lock owner")
-        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "node_head", return_value={"chain_index": 11}):
             self.assertEqual(chat.transport_status()["mode"], "degraded")
         self.assertTrue(chat._clear_sign_failure(raw))
@@ -426,13 +428,13 @@ class TransportTest(V2Base):
                 if outcome is None else mock.patch.object(
                     chat, "node_head", side_effect=outcome)
             with self.subTest(outcome=repr(outcome)), \
-                 mock.patch.object(cellmod, "bin_ready", return_value=True), patch:
+                 mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), patch:
                 st = chat.transport_status()
                 self.assertEqual((st["mode"], st["code"]),
                                  ("degraded", "node_unreachable"))
                 self.assertIn("configured chat node unreachable", st["reason"])
         out = io.StringIO()
-        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "node_head", return_value=None), \
              contextlib.redirect_stdout(out):
             self.assertEqual(chat.cmd_chat(["transport", "status"]), 1)
@@ -497,7 +499,7 @@ class TransportTest(V2Base):
         self.assertFalse(os.path.exists(chat.journal_dir()))  # log-after stays separate
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
         with mock.patch.object(chat.time, "time", return_value=220), \
-             mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "node_head",
                                return_value={"chain_index": 42}):
             st = chat.transport_status()
@@ -511,7 +513,7 @@ class TransportTest(V2Base):
         self.assertEqual(three["chain"], 7)
         self.assertEqual(chat.sign_failures(), [])
         self.assertTrue(os.path.exists(chat.sign_failures_path()))  # success watermark
-        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
              mock.patch.object(chat, "node_head",
                                return_value={"chain_index": 43}):
             self.assertEqual(chat.transport_status()["mode"], "signed")
@@ -566,7 +568,7 @@ class TransportTest(V2Base):
             info, err = chat._sign_send("payload", "p1")
         self.assertIsNone(info)
         self.assertEqual(err["code"], "signer_unavailable")
-        self.assertIn("no signer", err["reason"])
+        self.assertIn("HELM_CELL_BIN is unset", err["reason"])
         rb.assert_not_called()
         rv.assert_not_called()
         with mock.patch.object(chat, "node_head") as nh, \
@@ -576,37 +578,102 @@ class TransportTest(V2Base):
         rv.assert_not_called()
         self.assertNotIn("chain", m)
         self.assertIn("[unsigned]", chat._fmt(m))
+        self.assertEqual(chat.sign_failures(), [])
 
-    def test_unusable_signer_is_not_ready(self):
-        """Codex day-review #1: bin_ready must reject a non-executable file AND
-        a directory (os.path.exists would wrongly say yes) — a bogus
-        HELM_CELL_BIN can NEVER read 'signed' or fire the unlock lap."""
-        import tempfile
-        d = tempfile.mkdtemp()
-        try:
-            plain = os.path.join(d, "notabin")
-            with open(plain, "w") as f:
-                f.write("x")
-            os.chmod(plain, 0o600)                 # regular file, NOT executable
-            os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
-            for bogus in (plain, d, os.path.join(d, "absent")):
-                os.environ["HELM_CELL_BIN"] = bogus
-                self.assertFalse(cellmod.bin_ready(), bogus)
-                # node UP + bogus signer must read "(no signer)", never "signed"
-                with mock.patch.object(chat, "node_head", return_value={"chain_index": 15}):
-                    self.assertEqual(chat.transport_status()["mode"],
-                                     "unsigned (no signer)")
-                with mock.patch.object(cellmod, "run_bin") as rb, \
-                     mock.patch.object(chat, "_revive") as rv, \
-                     mock.patch.object(chat, "node_head", return_value={"chain_index": 15}) as nh:
-                    info, err = chat._sign_send("payload", "p1")
-                self.assertIsNone(info)            # never signs
-                rb.assert_not_called()             # never launches the binary
-                rv.assert_not_called()             # never revives/unlocks
-        finally:
-            os.environ.pop("HELM_CELL_BIN", None)
-            import shutil
-            shutil.rmtree(d, ignore_errors=True)
+    def _write_signer(self, path, executable=True):
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n"
+                    "case \"$1\" in\n"
+                    "join) echo '%s' ;;\n"
+                    "send) echo '%s' ;;\n"
+                    "esac\n" % (
+                        json.dumps({"joined": True, "cell": "c" * 64}),
+                        json.dumps(SENT)))
+        os.chmod(path, 0o700 if executable else 0o600)
+
+    def _assert_broken_to_fixed(self, path, reason, repair):
+        os.environ["HELM_CELL_BIN"] = path
+        os.environ["HELM_CELL_PROFILE"] = "p1"
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with mock.patch.object(chat, "node_head") as nh:
+            status = chat.transport_status()
+        nh.assert_not_called()
+        self.assertEqual((status["mode"], status["code"], status["signer"],
+                          status["signer_configured"]),
+                         ("degraded", "signer_unavailable", False, True))
+        self.assertIn(reason, status["reason"])
+        self.assertEqual(chat.sign_failures(), [])  # status alone does not invent history
+
+        with mock.patch.object(chat, "node_head") as nh, \
+             mock.patch.object(chat, "_revive") as rv:
+            first = chat.post("broken one", who="a1")
+            second = chat.post("broken two", who="a1")
+        nh.assert_not_called()
+        rv.assert_not_called()
+        self.assertEqual(first["transport"]["code"], "signer_unavailable")
+        self.assertEqual(second["transport"]["failure_count"], 2)
+        self.assertEqual(chat.sign_failures()[0]["failure_count"], 2)
+        self.assertEqual(chat.read()[1], 2)  # RAM delivery remains service-preserving
+
+        repair()
+        with mock.patch.object(chat, "node_head",
+                               return_value={"chain_index": 15}), \
+             mock.patch.object(cellmod, "get_json", return_value=None):
+            recovered = chat.post("fixed", who="a1")
+        self.assertEqual(recovered["chain"], 7)
+        self.assertEqual(chat.sign_failures(), [])
+        with mock.patch.object(chat, "node_head",
+                               return_value={"chain_index": 16}):
+            self.assertEqual(chat.transport_status()["mode"], "signed")
+
+    def test_configured_nonexistent_signer_fails_loud_then_recovers(self):
+        path = os.path.join(self.tmp, "deleted-signer")
+        self._assert_broken_to_fixed(
+            path, "path does not exist", lambda: self._write_signer(path))
+
+    def test_configured_non_executable_signer_fails_loud_then_recovers(self):
+        path = os.path.join(self.tmp, "non-executable-signer")
+        self._write_signer(path, executable=False)
+        self._assert_broken_to_fixed(
+            path, "not executable", lambda: os.chmod(path, 0o700))
+
+    def test_executable_that_cannot_launch_is_signer_unavailable(self):
+        path = os.path.join(self.tmp, "bad-exec-format")
+        with open(path, "w") as f:
+            f.write("not an executable format\n")
+        os.chmod(path, 0o700)
+        os.environ["HELM_CELL_BIN"] = path
+        with mock.patch.object(chat, "_revive") as rv:
+            info, failure = chat._sign_send("payload", "p1")
+        self.assertIsNone(info)
+        self.assertEqual(failure["code"], "signer_unavailable")
+        self.assertIn("could not execute", failure["reason"])
+        rv.assert_not_called()
+
+    def test_unusable_signer_projects_as_degraded_not_off(self):
+        os.environ["HELM_CELL_BIN"] = os.path.join(self.tmp, "deleted-signer")
+        os.environ["HELM_CELL_PROFILE"] = "p1"
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        status = chat.transport_status()
+        self.assertEqual((status["mode"], status["code"]),
+                         ("degraded", "signer_unavailable"))
+        self.assertIn("DEGRADED", human.status_line(
+            dict(human.model_new(), status=status), 160))
+
+        chat_out = io.StringIO()
+        with contextlib.redirect_stdout(chat_out):
+            self.assertEqual(chat.cmd_chat(["transport", "status"]), 1)
+        self.assertIn("signer path does not exist", chat_out.getvalue())
+        self.assertNotIn("UNSIGNED", chat_out.getvalue())
+
+        node_out, node_err = io.StringIO(), io.StringIO()
+        with mock.patch.object(chatnode, "_systemctl", return_value=(0, "active")), \
+             mock.patch.object(cellmod, "get_json", return_value=[]), \
+             contextlib.redirect_stdout(node_out), \
+             contextlib.redirect_stderr(node_err):
+            self.assertEqual(chatnode._status([]), 1)
+        self.assertIn("signer path does not exist", node_err.getvalue())
+        self.assertNotIn("no signer", node_err.getvalue())
 
     def test_transport_status_reports_the_signer(self):
         """A reachable node without a signer must never read "signed" —
@@ -616,9 +683,10 @@ class TransportTest(V2Base):
         with mock.patch.object(chat, "node_head",
                                return_value={"chain_index": 15}):
             st = chat.transport_status()
-            self.assertEqual((st["mode"], st["signer"], st["head"]),
-                             ("unsigned (no signer)", False, 15))
-            with mock.patch.object(cellmod, "bin_ready", return_value=True):
+            self.assertEqual((st["mode"], st["signer"],
+                              st["signer_configured"], st["head"]),
+                             ("unsigned (no signer)", False, False, 15))
+            with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER):
                 self.assertEqual(chat.transport_status()["mode"], "signed")
 
     def test_room_cell_cache_hits_without_binary(self):

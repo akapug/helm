@@ -25,7 +25,8 @@ keeps every status surface DEGRADED until that profile completes a signed turn
 (`/dev/shm/helm-chat-failures/<room-key>` when CHAT_DIR is not itself tmpfs).
 SIGNING IS OPT-IN: it needs the explicit cell binary
 (HELM_CELL_BIN — unset => off, no PATH probe; the de-meld law), so configured-
-off chat is UNSIGNED BY DEFAULT, not a failure. Join/token caches follow
+off chat is UNSIGNED BY DEFAULT, not a failure. A set-but-unusable signer is
+configured-on and stamps `signer_unavailable`. Join/token caches follow
 HELM_CHAT_DIR (RAM at the production default; an override owns their storage
 location), while failure state is always forced onto tmpfs. Transport is
 NODE-AGNOSTIC (HELM_CHAT_NODE_URL, else node-state url, else :8898) — the node
@@ -723,25 +724,37 @@ def transport_status():
     """The ONE transport truth for CLI/TUI/web/doctor. A reachable node plus an
     executable signer is only *ready*; any profile whose attempted signed turn
     fell back remains DEGRADED until that SAME profile completes a signed turn.
+    An unset signer is configured-off; a set-but-unusable signer is unavailable.
     The persistent incident fields come from RAM, never disk coordination."""
     from . import cell
     u = node_url()
-    signer = cell.bin_ready()
+    signer = cell.bin_status()
     failures = sign_failures()
+    out = {"mode": "unsigned", "url": u, "head": None,
+           "signer": signer["usable"],
+           "signer_configured": signer["configured"]}
+    if signer["configured"] and not signer["usable"]:
+        current = next((f for f in failures
+                        if f.get("profile") == _dsan(cell.profile_name())
+                        and f.get("code") == "signer_unavailable"), None)
+        current = current or _transient_failure(
+            cell.profile_name(), "signer_unavailable", signer["reason"])
+        rows = [current] + [f for f in failures if f is not current]
+        out.update(current, mode="degraded", state="DEGRADED",
+                   failed_profiles=rows)
+        return out
     probe_error = None
     try:
         h = node_head(u) if u else None
     except Exception as exc:
         h = None
         probe_error = "%s: %s" % (exc.__class__.__name__, exc)
-    out = {"mode": "unsigned", "url": u,
-           "head": h.get("chain_index") if isinstance(h, dict) and h else None,
-           "signer": signer}
+    out["head"] = h.get("chain_index") if isinstance(h, dict) and h else None
     if failures:
         out.update(failures[0], mode="degraded", state="DEGRADED",
                    failed_profiles=failures)
         return out
-    if u and signer and h is None:
+    if u and signer["usable"] and h is None:
         reason = "configured chat node unreachable at %s" % u
         if probe_error:
             reason += " (%s)" % probe_error
@@ -751,7 +764,7 @@ def transport_status():
                    failed_profiles=[f])
         return out
     if h is not None:
-        out["mode"] = "signed" if signer else "unsigned (no signer)"
+        out["mode"] = "signed" if signer["usable"] else "unsigned (no signer)"
     return out
 
 
@@ -1006,15 +1019,14 @@ def _sign_send(payload, profile):
     (None, structured diagnostic). One recovery lap; both send attempts and
     every revive/faucet refusal survive into the final operator reason."""
     from . import cell
-    if not cell.bin_ready():
-        return None, _diag(
-            "signer_unavailable",
-            "no signer — HELM_CELL_BIN is unset or not executable")
+    signer = cell.bin_status()
+    if not signer["usable"]:
+        return None, _diag("signer_unavailable", signer["reason"])
     token = _node_token()
     hexid, err, launched = _room_cell(profile, token)
     if err:
         if not launched:
-            return None, _diag("signer_launch_failed", err)
+            return None, _diag("signer_unavailable", err)
         revived, revive_err = _revive()
         if revive_err is None:
             token = revived if revived is not None else token
@@ -1036,7 +1048,7 @@ def _sign_send(payload, profile):
              "--topic", CHAT_TOPIC, payload],
             timeout=30, env_extra=_env_extra(token))
         if rc is None:
-            return None, _diag("signer_launch_failed", err)
+            return None, _diag("signer_unavailable", err)
         info = cell._last_json(out)
         complete = _complete_send(info)
         if rc == 0 and complete:
@@ -1066,7 +1078,8 @@ def _signed_row(row, payload_text, profile, sign):
     """Common signing owner for posts/reactions. The RAM row ALWAYS lands.
     A failed attempted signature is stamped + retained per profile; only an
     observed signed send clears that profile's incident. On the production
-    `sign=None` path, no signer/node URL is configured-off v1, not an alarm.
+    `sign=None` path, an unset signer/node URL is configured-off v1, while a
+    configured-but-unusable signer is a `signer_unavailable` incident.
     `sign=True` is the explicit force/test seam and therefore records inability
     to honor that forced attempt; `sign=False` always skips."""
     p = profile
@@ -1074,7 +1087,11 @@ def _signed_row(row, payload_text, profile, sign):
         from . import cell
         p = p or cell.profile_name()
         if sign is None:
-            if not cell.bin_ready() or not node_url():
+            signer = cell.bin_status()
+            if signer["configured"] and not signer["usable"]:
+                return _stamp_sign_failure(
+                    row, p, _diag("signer_unavailable", signer["reason"]))
+            if not signer["configured"] or not node_url():
                 return row
             try:
                 live = node_head()

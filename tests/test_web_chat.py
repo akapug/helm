@@ -24,7 +24,8 @@ from helm import chat, web  # noqa: E402
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
             "HELM_CHAT_ROOM", "MELD_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
-            "MELD_CHAT_ROOM_SOURCE", "HELM_CELL_BIN", "MELD_CELL_BIN")
+            "MELD_CHAT_ROOM_SOURCE", "HELM_CELL_BIN", "MELD_CELL_BIN",
+            "HELM_CELL_PROFILE", "MELD_AGENT_PROFILE")
 
 
 class TestWebChat(unittest.TestCase):
@@ -92,7 +93,29 @@ class TestWebChat(unittest.TestCase):
         # the transport truth rides every poll: disabled env -> unsigned, no url
         self.assertEqual(d["transport"],
                          {"mode": "unsigned", "url": None, "head": None,
-                          "signer": False})
+                          "signer": False, "signer_configured": False})
+
+    def test_web_post_with_configured_missing_signer_is_persistently_degraded(self):
+        missing = os.path.join(self.tmp, "deleted\x1b[2J-token=secret-signer")
+        env = {"HELM_CELL_BIN": missing, "HELM_CELL_PROFILE": "web-seat",
+               "HELM_CHAT_NODE_URL": "http://127.0.0.1:1"}
+        with mock.patch.dict(os.environ, env):
+            status, posted = self.req("/api/chat", {"text": "still delivered"})
+            self.assertEqual(status, 200)
+            status, polled = self.req("/api/chat?since=0")
+            self.assertEqual(status, 200)
+        row = posted["msg"]
+        transport = polled["transport"]
+        self.assertEqual((row["transport"]["code"], transport["mode"],
+                          transport["code"], transport["signer_configured"]),
+                         ("signer_unavailable", "degraded",
+                          "signer_unavailable", True))
+        self.assertEqual(chat.sign_failures()[0]["profile"], "web-seat")
+        public = json.dumps({"posted": posted, "polled": polled},
+                            ensure_ascii=False)
+        self.assertNotIn(missing, public)
+        self.assertNotIn("secret", public)
+        self.assertNotIn("\x1b", public)
 
     def test_web_poll_and_served_ui_show_precise_degraded_transport(self):
         failure = chat._diag("send_failed", "second send failed")

@@ -196,7 +196,9 @@ class TestChecks(DoctorBase):
              mock.patch.object(chat, "transport_status", return_value=st), \
              mock.patch.object(chat, "cells_path",
                                return_value=os.path.join(self.tmp.name, "none")), \
-             mock.patch.object(cell, "bin_ready", return_value=True):
+             mock.patch.object(cell, "bin_status", return_value={
+                 "configured": True, "usable": True, "state": "ready",
+                 "reason": "signer ready"}):
             results = doctor.check_chat_node()
         warning = "\n".join(levels(results, doctor.WARN))
         self.assertIn("DEGRADED profile 'seat-a': send failed", warning)
@@ -217,6 +219,22 @@ class TestChecks(DoctorBase):
                             for lvl, msg in disabled))
         self.assertTrue(any(lvl == doctor.OK and "disabled" in msg
                             for lvl, msg in disabled))
+
+    def test_configured_missing_signer_is_unavailable_not_unset(self):
+        missing = os.path.join(self.tmp.name, "deleted-signer")
+        with mock.patch.dict(os.environ, {
+                "HELM_CELL_BIN": missing,
+                "HELM_CHAT_NODE_URL": "http://node"}), \
+             mock.patch.object(chat, "node_head",
+                               return_value={"chain_index": 7}), \
+             mock.patch.object(chat, "cells_path",
+                               return_value=os.path.join(self.tmp.name, "none")):
+            results = doctor.check_chat_node()
+        warning = "\n".join(levels(results, doctor.WARN))
+        self.assertIn("DEGRADED profile", warning)
+        self.assertIn("signer path does not exist", warning)
+        self.assertNotIn("HELM_CELL_BIN unset", warning)
+        self.assertNotIn(missing, warning)
 
 
 class TestProjectionRegistry(DoctorBase):
