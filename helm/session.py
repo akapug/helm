@@ -70,7 +70,7 @@ def _cv(*argv, timeout=120, env=None):
     up when the mechanics layer is absent."""
     try:
         p = subprocess.run([CV] + list(argv), capture_output=True, text=True,
-                           timeout=timeout, env=env)
+                           timeout=timeout, env=home.cv_env(env))
         return p.returncode, p.stdout, p.stderr
     except FileNotFoundError:
         return 127, "", "cv not installed — clustervision must be on PATH"
@@ -123,7 +123,7 @@ def _cv_launch(sid):
     timeout: the interactive harness owns the TTY until it exits."""
     try:
         return subprocess.call([CV, "resume", sid, "--launch"],
-                               env=_launch_env()), ""
+                               env=home.cv_env(_launch_env())), ""
     except FileNotFoundError:
         return 127, "cv not installed — clustervision must be on PATH"
     except OSError as e:

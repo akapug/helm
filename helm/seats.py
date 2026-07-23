@@ -1429,7 +1429,7 @@ def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None,
 # ---------------------------------------------------------------------------
 
 def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
-         room_source=None):
+         room_source=None, session_source=None):
     """The autojoin: roster row + cursor initialized HERE + the identity line
     the hook injects as session context. The line DIRECTS the agent to arm its
     idle-wake beacon as a mandatory FIRST action — a self-armed Monitor is the
@@ -1454,6 +1454,19 @@ def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
         home_room = pk.slug(home_room) if home_room else None
     row = write_roster(seat, session=session, cwd=cwd, home_room=home_room,
                        home_room_source=source)
+    if session:
+        try:
+            from . import seat as _seat
+            if _seat._seat_family(seat)[1] is None:
+                bound = _seat._bind_spawn_session(
+                    seat, session, source=session_source)
+                if bound is False:
+                    print("helm chat join: WARN — could not bind session %s to "
+                          "spawn register for %s; autocompact stays fail-closed"
+                          % (session, seat), file=sys.stderr)
+        except Exception as e:
+            print("helm chat join: WARN — spawn-session bind failed for %s (%s); "
+                  "autocompact stays fail-closed" % (seat, e), file=sys.stderr)
     effective_home = row.get("home_room")
     lane = dm_lane(seat)
     for r in _scan_rooms(
@@ -3030,15 +3043,17 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
     args = list(args or [])
     if verb == "join":
         try:
-            session = cwd = None
+            session = cwd = session_source = None
             if "--hook-json" in args:
                 d = _hook_stdin()
                 session, cwd = d.get("session_id"), d.get("cwd")
+                session_source = d.get("source")
                 room, room_source = _payload_homing(cwd, room, room_source)
             seat, line = join(session=session, cwd=cwd or safe_cwd(),
                               seat=_flag(args, "--seat"), room=room,
                               room_explicit=room_explicit,
-                              room_source=room_source)
+                              room_source=room_source,
+                              session_source=session_source)
             if "--hook-json" in args:
                 _hook_emit("SessionStart")(line)
             else:

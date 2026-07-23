@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 
-from . import catalog
+from . import catalog, home
 from .providers import ProviderError
 
 HOME = os.path.expanduser("~")
@@ -230,7 +230,8 @@ def deep_search(query, limit=40, scope=None, include_synthetic=False):
         # flags first, then `--`, then the user-controlled query — a query
         # beginning with `-` must reach cv as a positional, never a flag
         p = _sp.run(["cv", "search", "--json", "--limit", str(limit), "--", query],
-                    capture_output=True, text=True, timeout=45)
+                    capture_output=True, text=True, timeout=45,
+                    env=home.cv_env())
         if p.returncode == 0 and p.stdout.strip().startswith("["):
             hits = [{"harness": h.get("harness", "?"), "id8": (h.get("id") or "")[:8],
                      "date": (h.get("updatedAt") or "")[:10], "title": (h.get("title") or "")[:120],
@@ -250,7 +251,8 @@ def deep_search(query, limit=40, scope=None, include_synthetic=False):
         pass  # fall through to the table parse
     try:
         p = _sp.run(["cv", "search", "--limit", str(limit), "--", query],
-                    capture_output=True, text=True, timeout=60)
+                    capture_output=True, text=True, timeout=60,
+                    env=home.cv_env())
     except _sp.TimeoutExpired:
         return {"error": "cv search timed out"}
     if p.returncode != 0:
@@ -290,7 +292,8 @@ def _cv_show(sid, rng=None, harness=None):
         raise ProviderError(f"invalid harness {harness!r}")
     args = ["cv", "show", "--json"] + (["--range", rng] if rng else []) \
         + (["--harness", harness] if harness else []) + ["--", sid]
-    p = _sp.run(args, capture_output=True, text=True, timeout=60)
+    p = _sp.run(args, capture_output=True, text=True, timeout=60,
+                env=home.cv_env())
     if p.returncode != 0:
         raise ProviderError(f"cv show failed: {(p.stderr or '').strip()[:200]}")
     return json.loads(p.stdout)
@@ -618,7 +621,8 @@ def _cv_prune_help():
     import subprocess as _sp
     def build():
         try:
-            p = _sp.run(["cv", "prune", "--help"], capture_output=True, text=True, timeout=15)
+            p = _sp.run(["cv", "prune", "--help"], capture_output=True,
+                        text=True, timeout=15, env=home.cv_env())
             return (p.stdout or "") + (p.stderr or "")
         except Exception:
             return ""
@@ -661,7 +665,8 @@ def prune_session(sid, preset="lean", dry=False, tokens=None):
     except OSError:
         before = row["z"]
     try:
-        p = _sp.run(cmd, capture_output=True, text=True, timeout=300)
+        p = _sp.run(cmd, capture_output=True, text=True, timeout=300,
+                    env=home.cv_env())
     except FileNotFoundError:
         return {"error": "cv not installed — prune needs clustervision on PATH"}
     except _sp.TimeoutExpired:

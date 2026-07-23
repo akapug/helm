@@ -2,6 +2,25 @@
 
 ## Unreleased (0.2)
 
+- Proxy-seat autocompaction is now operational rather than alert-only. The
+  actuator resolves the authoritative `spawn.json` pane identity; mutable Claude
+  Code titles, copied launch text, and visible content never authorize input.
+  Orca handle remints recover through the exact registered session's live
+  pid/procStart -> `ORCA_PANE_KEY` -> `terminal.resolvePane` chain, require one
+  connected+writable handle+PTY+worktree inventory match, then atomically repair
+  `spawn.json` under its lifecycle lock. One resolver owns injection,
+  duplicate-seat reap, dry-run, and `seat where`. Queued `/compact` blocks a
+  duplicate, and the flock-serialized latch re-arms only after context drops or
+  the session changes, never from elapsed time alone. Repeated terminal 400
+  context-overflow loops queue `/clear` once; the SessionStart-bound session
+  transition proves completion before the empty session receives its onboarding
+  brief. Every launch/spawn/resume refreshes the external 60-second systemd
+  cadence through the installed `helm` binary, never an ephemeral worktree.
+  Missing, headless, session-unbound, stale, or ambiguous identity fails loudly.
+  The CV seam is fleet-complete too: Helm appends all family and instance seat
+  transcript roots through `CLUSTERVISION_CLAUDE_ROOTS` on every CV subprocess,
+  and the corresponding CV-core multi-root discovery change preserves the one
+  recall index across custom `CLAUDE_CONFIG_DIR` homes.
 - Homing review round (fable composition + adversarial lenses @ 8313d9f).
   HIGH closed: the homing prologue's EAGER `os.getcwd()` crashed every
   default chat verb and all three delivery hooks (join/deliver/stop-guard)
