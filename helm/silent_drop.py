@@ -1,4 +1,4 @@
-"""helm.silent_swallow — the empty-completion loud-fail rung.
+"""helm.silent_drop — the empty-completion loud-fail rung.
 
 THE BUG CLASS (owner hypothesis, kimi investigation 2026-07-23): the codex
 cc-proxy (router-for-me/CLIProxyAPI) translates an upstream codex completion
@@ -20,7 +20,7 @@ tokens):
 READ-ONLY by design: this rung NEVER injects into a pane (unlike autocompact,
 which owns pane actuation). It posts a loud a2a alert naming the seat, the
 output_tokens that were lost, and the transcript line — so the seat and the
-integrator SEE the swallow instead of the pane silently idling. Distinct from
+integrator SEE the drop instead of the pane silently idling. Distinct from
 the codex-cc-never-ends-turns quirk (that = turn never terminates; this = turn
 terminates EMPTY).
 
@@ -29,7 +29,7 @@ autocompact's bounded transcript tail (_tail_lines), newest-transcript walk
 (_newest_transcript), proxy-seat discovery (proxy_seats), the fcntl state
 latch, and chat.post's alert idiom. It is a SIBLING rung, not an autocompact
 extension, because autocompact's check() is a fire-into-pane path keyed on the
-gauge pct — the swallow detector is a read-only recent-turn scan with its own
+gauge pct — the drop detector is a read-only recent-turn scan with its own
 per-line dedup latch. One timer cadence can run both.
 """
 import fcntl
@@ -40,13 +40,13 @@ import time
 
 from . import autocompact, home
 
-LATCH_TTL_S = 15 * 60     # one alert per seat per swallow episode
+LATCH_TTL_S = 15 * 60     # one alert per seat per drop episode
 RECENT_LINES = 400        # bounded scan of the transcript tail
-_STATE = "silent_swallow.json"
+_STATE = "silent_drop.json"
 
-_USAGE = """usage: helm seat silent-swallow [--seat S] [--once] [--dry-run] [--quiet] [--json]
+_USAGE = """usage: helm seat silent-drop [--seat S] [--once] [--dry-run] [--quiet] [--json]
   One read-only pass over every proxy seat: scan the recent transcript tail
-  for the empty-completion swallow (end_turn + no text/tool + output_tokens>0)
+  for the empty-completion drop (end_turn + no text/tool + output_tokens>0)
   and post a LOUD a2a alert naming the lost tokens. Latched: one alert per
   seat per episode. --dry-run reports without posting; --quiet skips the chat
   post; --once accepted for interface stability.
@@ -57,7 +57,7 @@ _USAGE = """usage: helm seat silent-swallow [--seat S] [--once] [--dry-run] [--q
 # the detector
 # ---------------------------------------------------------------------------
 
-def _is_swallow(record):
+def _is_drop(record):
     """True for the drop-after-generate signature: an end_turn assistant turn
     that produced output_tokens yet delivered no visible content."""
     if record.get("type") != "assistant" or record.get("isSidechain"):
@@ -84,7 +84,7 @@ def _is_swallow(record):
 
 def scan_seat(seat_name):
     """Read-only scan of one seat's newest transcript tail. Returns a finding
-    dict on the most recent swallow, else None. Never injects, never writes."""
+    dict on the most recent drop, else None. Never injects, never writes."""
     from . import seat
     family, err = seat._seat_family(seat_name)
     if err:
@@ -99,7 +99,7 @@ def scan_seat(seat_name):
             r = json.loads(ln)
         except ValueError:
             continue
-        if _is_swallow(r):
+        if _is_drop(r):
             usage = (r.get("message") or {}).get("usage") or {}
             newest = {
                 "seat": seat_name,
@@ -126,12 +126,12 @@ def _state_path():
 
 
 def _alert_text(f):
-    return ("@%(seat)s @opus-integrator SILENT-SWALLOW detected: codex "
+    return ("@%(seat)s @opus-integrator SILENT-DROP detected: codex "
             "produced %(output_tokens)s output_tokens but the completion "
             "arrived EMPTY (proxy drop-after-generate, not a refusal). The "
             "turn ended silently — nothing surfaced. transcript %(session)s "
             "at %(ts)s. If this was security/crypto work, the answer was "
-            "generated then lost — consider re-asking. [silent-swallow "
+            "generated then lost — consider re-asking. [silent-drop "
             "watchdog]" % {
                 "seat": f["seat"],
                 "output_tokens": f.get("output_tokens"),
@@ -155,7 +155,7 @@ def check(seats=None, post=True, quiet=False):
         alerted = []
         for f in findings:
             entry = st.get(f["seat"])
-            # re-alert only after the latch TTL (a recurring swallow stays loud)
+            # re-alert only after the latch TTL (a recurring drop stays loud)
             if entry and now - (entry.get("alerted_at") or 0) < LATCH_TTL_S \
                     and entry.get("ts") == f.get("ts"):
                 f["latched"] = True
@@ -169,9 +169,9 @@ def check(seats=None, post=True, quiet=False):
         for f in alerted:
             try:
                 from . import chat
-                chat.post(_alert_text(f), who="silent-swallow")
+                chat.post(_alert_text(f), who="silent-drop")
             except Exception as e:   # a down chat node never blocks detection
-                print("helm silent-swallow: chat post failed (%s): %s"
+                print("helm silent-drop: chat post failed (%s): %s"
                       % (f["seat"], e), file=sys.stderr)
     return {"findings": findings, "alerted": alerted}
 
@@ -180,7 +180,7 @@ def check(seats=None, post=True, quiet=False):
 # CLI
 # ---------------------------------------------------------------------------
 
-def cmd_silent_swallow(argv=None):
+def cmd_silent_drop(argv=None):
     args = list(argv if argv is not None else sys.argv[1:])
     if "-h" in args or "--help" in args:
         print(_USAGE)
@@ -196,13 +196,13 @@ def cmd_silent_swallow(argv=None):
         print(json.dumps(res))
     else:
         for f in res["findings"]:
-            print("%s: swallow output_tokens=%s ts=%s%s"
+            print("%s: drop output_tokens=%s ts=%s%s"
                   % (f["seat"], f.get("output_tokens"), f.get("ts"),
                      " (latched)" if f.get("latched") else " ALERTED"))
         if not res["findings"]:
-            print("no swallows detected")
+            print("no drops detected")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(cmd_silent_swallow())
+    raise SystemExit(cmd_silent_drop())

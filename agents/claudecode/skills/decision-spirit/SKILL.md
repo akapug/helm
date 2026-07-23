@@ -226,6 +226,30 @@ while continuing with the best reversible probe path.
     into - hot state was correct in RAM but agents still read disk rows every turn; the keel of
     the RAM-first re-architecture. 2026-06-21.)
 
+25. **EXISTENCE SWEEP before net-new — the dual of #18** (owner canon 2026-07-23:
+    "you don't tend to notice when they've already mostly built something that
+    nevertheless needs improving / implementing elsewhere / refactoring / moving").
+    #18 guards the premise you build ON; this guards the thing you are about to
+    CREATE. Before speccing / dispatching / building ANYTHING net-new — a tab, panel,
+    function, endpoint, lane, feature, ESPECIALLY on an owner feature request — FIRST
+    sweep what already exists: grep the surfaces that render/handle this, read the
+    siblings, check recent lands + the fleet task list for overlapping work. THEN
+    decide build / extend / move / refactor / consolidate with an explicit
+    "prior-art: X@file:line -> decision because…" line. Why a NEW reflex when the
+    values already say reuse>invent (#4): every VERIFICATION reflex (#18 premise,
+    verify-before-done, #15 trace-pipeline) fires AFTER the decision, to check that
+    what you are doing is true; NONE asks "should I be building this at all, or
+    extending what's there?" — so this class needs a trigger UPSTREAM of the decision,
+    not another downstream check. Make it a gate-ARTIFACT, not a vibe: a build-spec /
+    dispatch carries a prior-art-scan field (as a land carries feasibility-evidence
+    #13), and the integrator REJECTS a net-new dispatch that lacks it — same as a
+    "done" with no proof. Turns #4 from a passive value into a triggered procedure.
+    Bug class: `built-new-when-extend-existed` / `prior-art-unswept`. Live: speced a
+    from-scratch roster tab; the owner had to point out the ledger already rendered
+    SEAT-ACTIVITY + FLEET-TODOS off the same data — every reflex I ran fired AFTER I'd
+    already decided to build. The fix dogfooded itself: it EXTENDS this skill instead
+    of inventing a new one.
+
 ## Audit Shape
 
 For substantial choices, write a compact table or bullets:
