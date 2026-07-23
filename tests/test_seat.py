@@ -25,6 +25,14 @@ def _jwt(claims):
     return _b64seg({"alg": "RS256", "typ": "JWT"}) + "." + _b64seg(claims) + ".fake-sig"
 
 
+def _warm_features(**extra):
+    """Obviously synthetic GrowthBook-sized map; no live feature state in tests."""
+    features = {"synthetic-feature-%03d" % i: False for i in range(100)}
+    features["tengu_deferred_stub_tool"] = True
+    features.update(extra)
+    return features
+
+
 class SeatTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-seat-")
@@ -916,10 +924,9 @@ class SeatTest(unittest.TestCase):
         partial = os.path.join(seat._instance_dir("codex", "codex-4"),
                                "claude", ".claude.json")
         rows = (
-            (parent, {"tengu_deferred_stub_tool": True, "parent": True},
-             [], now - 2000,
+            (parent, _warm_features(parent=True), [], now - 2000,
              {"oauthAccount": {"email": "must-not-cross@example.com"}}),
-            (sibling, {"tengu_deferred_stub_tool": True, "winner": True},
+            (sibling, _warm_features(winner=True),
              ["exp-a"], now - 1000,
              {"lastSessionId": "must-not-cross"}),
             (partial, {"unrelated": True}, [], now, {}),
@@ -943,8 +950,9 @@ class SeatTest(unittest.TestCase):
         with open(os.path.join(target, "claude", ".claude.json")) as f:
             seeded = json.load(f)
         self.assertEqual(seat._FEATURE_CACHE_GATE, "tengu_deferred_stub_tool")
-        self.assertEqual(seeded["cachedGrowthBookFeatures"],
-                         {"tengu_deferred_stub_tool": True, "winner": True})
+        self.assertGreaterEqual(len(seeded["cachedGrowthBookFeatures"]), 100)
+        self.assertTrue(seeded["cachedGrowthBookFeatures"]["winner"])
+        self.assertNotIn("parent", seeded["cachedGrowthBookFeatures"])
         self.assertEqual(seeded["cachedExperimentFeatures"], ["exp-a"])
         self.assertEqual(seeded["cachedGrowthBookFeaturesAt"], now - 1000)
         self.assertNotIn("oauthAccount", seeded)
@@ -971,14 +979,14 @@ class SeatTest(unittest.TestCase):
         state.update({"mine": True, "lastSessionId": "seat-owned"})
         with open(state_path, "w") as f:
             json.dump(state, f)
+        os.chmod(state_path, 0o600)
         self.assertIn("feature cache not seeded", first.getvalue())
 
         source = os.path.join(seat.seat_dir("codex"), "claude", ".claude.json")
         os.makedirs(os.path.dirname(source), exist_ok=True)
         now = int(time.time() * 1000)
         with open(source, "w") as f:
-            json.dump({"cachedGrowthBookFeatures":
-                           {seat._FEATURE_CACHE_GATE: True},
+            json.dump({"cachedGrowthBookFeatures": _warm_features(),
                        "cachedExperimentFeatures": [],
                        "cachedGrowthBookFeaturesAt": now,
                        "oauthAccount": {"email": "must-not-cross@example.com"}}, f)
@@ -993,6 +1001,7 @@ class SeatTest(unittest.TestCase):
         self.assertTrue(repaired["cachedGrowthBookFeatures"]
                         [seat._FEATURE_CACHE_GATE])
         self.assertEqual(repaired["cachedGrowthBookFeaturesAt"], now)
+        self.assertEqual(stat.S_IMODE(os.stat(state_path).st_mode), 0o600)
         self.assertNotIn("oauthAccount", repaired)
         self.assertNotIn("feature cache not seeded", second.getvalue())
 
@@ -1006,11 +1015,11 @@ class SeatTest(unittest.TestCase):
         now = int(time.time() * 1000)
         bad = (
             ({"unrelated": True}, now),
-            ({seat._FEATURE_CACHE_GATE: True},
-             now - seat._FEATURE_CACHE_MAX_AGE_MS - 1),
-            ({seat._FEATURE_CACHE_GATE: True},
+            ({seat._FEATURE_CACHE_GATE: True}, now),  # shallow sticky stub
+            (_warm_features(), now - seat._FEATURE_CACHE_MAX_AGE_MS - 1),
+            (_warm_features(),
              now + seat._FEATURE_CACHE_FUTURE_SKEW_MS + 60_000),
-            ({seat._FEATURE_CACHE_GATE: True}, float("nan")),
+            (_warm_features(), float("nan")),
         )
         for i, (features, fetched) in enumerate(bad, 3):
             p = os.path.join(seat._instance_dir("codex", "codex-%d" % i),
@@ -1024,11 +1033,10 @@ class SeatTest(unittest.TestCase):
         foreign = os.path.join(seat.seat_dir("kimi"), "claude", ".claude.json")
         os.makedirs(os.path.dirname(foreign), exist_ok=True)
         with open(foreign, "w") as f:
-            json.dump({"cachedGrowthBookFeatures":
-                           {seat._FEATURE_CACHE_GATE: True, "foreign": True},
+            json.dump({"cachedGrowthBookFeatures": _warm_features(foreign=True),
                        "cachedExperimentFeatures": [],
                        "cachedGrowthBookFeaturesAt": now}, f)
-        escaped = os.path.join(seat._instance_dir("codex", "codex-7"),
+        escaped = os.path.join(seat._instance_dir("codex", "codex-8"),
                                "claude", ".claude.json")
         os.makedirs(os.path.dirname(escaped), exist_ok=True)
         os.symlink(foreign, escaped)

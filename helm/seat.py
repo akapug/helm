@@ -70,6 +70,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -864,6 +865,7 @@ _ONBOARD_KEYS = ("hasCompletedOnboarding", "lastOnboardingVersion", "theme",
 _FEATURE_CACHE_KEYS = ("cachedGrowthBookFeatures", "cachedExperimentFeatures",
                        "cachedGrowthBookFeaturesAt")
 _FEATURE_CACHE_GATE = "tengu_deferred_stub_tool"
+_FEATURE_CACHE_MIN_FEATURES = 100
 _FEATURE_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 _FEATURE_CACHE_FUTURE_SKEW_MS = 5 * 60 * 1000
 
@@ -876,6 +878,7 @@ def _feature_cache_complete(state, now_ms=None):
     experiments = state.get("cachedExperimentFeatures")
     fetched = state.get("cachedGrowthBookFeaturesAt")
     if (not isinstance(features, dict)
+            or len(features) < _FEATURE_CACHE_MIN_FEATURES
             or features.get(_FEATURE_CACHE_GATE) is not True
             or not isinstance(experiments, list)
             or isinstance(fetched, bool)
@@ -989,7 +992,9 @@ def _seed_onboarding(cdir, workdir=None, family=None):
             return
         state.update(cache)          # preserve every seat-owned field; repair allowlist only
         try:
+            mode = stat.S_IMODE(os.stat(dst).st_mode)
             pk.write_json(dst, state)
+            os.chmod(dst, mode)       # atomic replace must not relax credential-adjacent state
         except OSError as e:
             print("helm seat: feature cache not repaired for %s (%s); a launched "
                   "seat may omit deferred tools including Monitor" % (cdir, e),
