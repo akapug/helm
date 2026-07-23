@@ -1132,15 +1132,17 @@ class SaWhisperTest(InjectBase):
         with open(inject._ledger_path(), encoding="utf-8") as f:
             return [json.loads(l) for l in f.read().splitlines()]
 
-    def test_codex_seat_gets_the_line_last_in_pinned(self):
+    def test_codex_seat_gets_the_lines_last_in_pinned(self):
         self.plant_pinned("pin-a", "always truth")
         self.seat("codex")
         got = inject.gather("anything at all")["pinned"]
-        self.assertEqual(got[-1], inject.SA_WHISPER,
-                         "the nudge rides LAST — premises lead")
+        self.assertEqual(got[-2:], [inject.SA_WHISPER, inject.CLAIM_WHISPER],
+                         "the nudges ride LAST in SA_LINES order — premises lead")
         self.assertIn("PREMISE pin-a: always truth", got[0])
         r = self.rows()[-1]
-        self.assertEqual(r["fired"]["pinned"][-1], inject.SA_WHISPER_ID)
+        self.assertEqual(r["fired"]["pinned"][-2:],
+                         [inject.SA_WHISPER_ID, inject.CLAIM_WHISPER_ID],
+                         "ledger honesty: each fired nudge under its own id")
 
     def test_line_is_terse_and_justification_free(self):
         self.assertIn("subagents", inject.SA_WHISPER)
@@ -1160,12 +1162,16 @@ class SaWhisperTest(InjectBase):
             got = inject.gather("anything")["pinned"]
             self.assertNotIn(inject.SA_WHISPER, got,
                              "claude-family seat %r must never see the nudge" % name)
+            self.assertNotIn(inject.CLAIM_WHISPER, got,
+                             "claude-family seat %r must never see claim-start" % name)
 
     def test_codexes_only_kimi_excluded(self):
         self.seat("kimi")  # a real seat family, but the ask is codexes-only
-        self.assertNotIn(inject.SA_WHISPER, inject.gather("hi")["pinned"])
+        got = inject.gather("hi")["pinned"]
+        self.assertNotIn(inject.SA_WHISPER, got)
+        self.assertNotIn(inject.CLAIM_WHISPER, got)
 
-    def test_full_budget_drops_the_nudge_never_a_premise(self):
+    def test_full_budget_drops_the_nudges_never_a_premise(self):
         for i in range(4):  # 3 x 395B lines fill the 1200B budget
             self.plant_pinned("big-%d" % i, "x" * 380)
         self.seat(None)
@@ -1173,8 +1179,9 @@ class SaWhisperTest(InjectBase):
         self.seat("codex")
         got = inject.gather("anything")["pinned"]
         self.assertEqual(got, baseline,
-                         "a full budget drops the nudge and nothing else")
+                         "a full budget drops the nudges and nothing else")
         self.assertNotIn(inject.SA_WHISPER, got)
+        self.assertNotIn(inject.CLAIM_WHISPER, got)
         self.assertLessEqual(sum(len(l) for l in got), inject.PINNED_BUDGET)
 
     def test_family_derivation_is_the_existing_resolver(self):
@@ -1196,14 +1203,97 @@ class SaWhisperTest(InjectBase):
         self.assertEqual((rc, out, err), (0, "", ""),
                          "resolver trouble -> no nudge, never a blocked turn")
 
-    def test_explain_renders_the_nudge(self):
+    def test_explain_renders_the_nudges(self):
         self.seat("codex")
         rc, out, _ = self.run_inject(["--explain"], stdin_text="anything")
         self.assertEqual(rc, 0)
         self.assertIn(inject.SA_WHISPER, out)
         self.assertIn(inject.SA_WHISPER_ID, out)
+        self.assertIn(inject.CLAIM_WHISPER, out)
+        self.assertIn(inject.CLAIM_WHISPER_ID, out)
         self.assertFalse(os.path.exists(inject._ledger_path()),
                          "--explain must never write the ledger")
+
+
+class ClaimWhisperTest(InjectBase):
+    """The codex-only claim-start whisper (owner ask 2026-07-23): a codex
+    claimed two lanes then STOPPED without starting the writers — law-5's
+    'end turns at bounded milestones' read as 'posted my claim'. The second
+    SA_LINES line teaches claim-is-a-start-not-a-stop, terse, justification
+    left out; it rides the SAME budget walk AFTER the SA-delegation line
+    (pressure drops it first, never a premise), ledgered under its own id.
+    Claude-family + kimi seats never see it (SaWhisperTest covers those)."""
+
+    def seat(self, name):
+        if name is None:
+            os.environ.pop("HELM_CHAT_NAME", None)
+        else:
+            os.environ["HELM_CHAT_NAME"] = name
+
+    def rows(self):
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            return [json.loads(l) for l in f.read().splitlines()]
+
+    def test_line_is_terse_and_justification_free(self):
+        self.assertEqual(inject.CLAIM_WHISPER,
+                         "Claiming a lane is a START, not a milestone — "
+                         "launch the writer this same turn; end your turn "
+                         "only when work is visibly moving.")
+        self.assertLessEqual(len(inject.CLAIM_WHISPER), inject.LINE_CAP)
+        for word in ("because", "law-5", "milestone-discipline", "justif"):
+            self.assertNotIn(word, inject.CLAIM_WHISPER.lower(),
+                             "the justification is deliberately left out")
+
+    def test_codex_seat_gets_both_lines_delegation_first(self):
+        self.seat("codex-3")  # instance names ride the one resolver too
+        got = inject.gather("anything at all")["pinned"]
+        self.assertIn(inject.SA_WHISPER, got)
+        self.assertIn(inject.CLAIM_WHISPER, got)
+        self.assertLess(got.index(inject.SA_WHISPER),
+                        got.index(inject.CLAIM_WHISPER),
+                        "SA-delegation leads, claim-start follows")
+
+    def test_pressure_drops_claim_start_first_never_a_premise(self):
+        for i in range(3):  # 3 x 350B lines leave 150B: SA (84B) fits,
+            self.plant_pinned("big-%d" % i, "x" * 335)  # claim (127B) drops
+        self.seat("codex")
+        got = inject.gather("anything")["pinned"]
+        for i in range(3):
+            self.assertTrue(any(("big-%d" % i) in l for l in got),
+                            "a nudge never evicts a premise")
+        self.assertIn(inject.SA_WHISPER, got,
+                      "the earlier SA_LINES line survives the squeeze")
+        self.assertNotIn(inject.CLAIM_WHISPER, got,
+                         "the later SA_LINES line degrades first")
+        self.assertLessEqual(sum(len(l) for l in got), inject.PINNED_BUDGET)
+
+    def test_ledger_honesty_for_both_ids(self):
+        self.seat("codex")
+        inject.gather("anything at all")
+        r = self.rows()[-1]
+        self.assertEqual(r["fired"]["pinned"],
+                         [inject.SA_WHISPER_ID, inject.CLAIM_WHISPER_ID])
+        self.assertEqual(r["candidates"], 2,
+                         "each nudge counts as its own candidate")
+
+    def test_explain_parity_under_pressure(self):
+        for i in range(3):  # gather's exact squeeze: SA fires, claim drops
+            self.plant_pinned("big-%d" % i, "x" * 335)
+        self.seat("codex")
+        rc, out, _ = self.run_inject(["--explain"], stdin_text="anything")
+        self.assertEqual(rc, 0)
+        self.assertIn("+ %s" % inject.SA_WHISPER, out)
+        self.assertIn("- %s (over budget)" % inject.CLAIM_WHISPER_ID, out)
+        self.assertFalse(os.path.exists(inject._ledger_path()),
+                         "--explain must never write the ledger")
+
+    def test_resolver_trouble_fails_open(self):
+        self.seat("codex")
+        with mock.patch("helm.seat._seat_family",
+                        side_effect=RuntimeError("seat exploded")):
+            rc, out, err = self.run_inject([], stdin_text="unmatched words")
+        self.assertEqual((rc, out, err), (0, "", ""),
+                         "resolver trouble -> no nudges, never a blocked turn")
 
 
 class _FakeBackend:
