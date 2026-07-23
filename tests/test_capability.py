@@ -80,6 +80,54 @@ class SurfacingTest(CapBase):
         self.assertIn("wired via", blob)
         self.assertIn("live)", blob)
 
+    def test_natural_converge_vocabulary_surfaces_meld(self):
+        # The #1-feature discoverability owner-canon (reach for meld WITHOUT
+        # being told): an agent must surface the meld lever at a converge moment
+        # in the WORDS it actually uses, not only literal "converge/a2a". All
+        # four MISSED before the keyword enrichment (verified on baseline).
+        for text in ("reach consensus with another agent",
+                     "we disagree, how do we resolve this",
+                     "get on the same page with the other seat",
+                     "bounce this off another agent"):
+            self.assertIn("meld", self.jit_ids(text), text)
+
+    def test_did_they_see_it_surfaces_the_pending_ladder(self):
+        # substrate-awareness: reasoning about whether a message was SEEN /
+        # ACTED / stranded must surface the ack-ladder pending view — a silent
+        # reply must never be mistaken for a lost one. The lever did not exist
+        # in the catalog before this lane.
+        for text in ("did they see my message or act on it",
+                     "is my dispatch stranded with no reply"):
+            self.assertIn("pending", self.jit_ids(text), text)
+
+    def test_ordinary_work_prompts_do_not_surface_meld(self):
+        # No over-fire: solo-work vocabulary must NOT drag in the meld lever —
+        # the enriched keywords stay specific, the specificity gate still holds.
+        for text in ("fix the failing test in seats.py",
+                     "refactor this function to be cleaner"):
+            self.assertNotIn("meld", self.jit_ids(text), text)
+
+    def test_dregg_protocol_vocab_does_not_false_fire_a2a_levers(self):
+        # Cross-family gate catch (2026-07-23): this fleet debugs dregg CONSTANTLY
+        # ("consensus root", "converge with the finalized root"), so bare
+        # "consensus"/"converge" in the meld+deliver keywords was a relevance
+        # regression in the index whose whole job is relevance. Scoped to a2a.
+        for text in ("debug the Lean consensus root disagreement",
+                     "make the faucet turn converge with the finalized root",
+                     "the full-consensus node smoke fails on the faucet turn"):
+            ids = self.jit_ids(text)
+            self.assertNotIn("meld", ids, text)
+            self.assertNotIn("chat-deliver", ids, text)
+
+    def test_a_common_word_cap_id_does_not_broad_fire(self):
+        # The SYSTEMIC fix (_probes): a capability id is a short verb-slug, and
+        # 'pending' is everywhere in dev work — the id must NOT be a match probe
+        # or the lever broad-fires on any "pending" turn. It fires on its curated
+        # SEEN/ACTED keywords only. Protects every present + future cap.
+        for text in ("is the deploy pending", "the PR is pending review",
+                     "pending migrations to run"):
+            self.assertNotIn("pending", self.jit_ids(text), text)
+
     def test_per_toolcall_whisper_meld_reaches_chat_deliver(self):
         # the ORIGINAL failure: reasoning about the per-toolcall whisper meld
         # and NOT reaching for helm chat deliver. It must now surface.

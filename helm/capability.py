@@ -48,7 +48,10 @@ CAPABILITIES = (
         # chat deliver" — so whisper/meld/converge ARE this verb's trigger
         # context, and it co-fires with `meld` on the a2a-converge moment.
         "keywords": "a2a,whisper,per-toolcall,per toolcall,whisper meld,meld,"
-                    "converge,deliver,broadcast,tell the fleet,push to the fleet,"
+                    # NO bare "converge" — it collides with dregg protocol vocab
+                    # ("converge with the finalized root"); a2a/whisper/meld
+                    # already carry the real a2a-converge moment.
+                    "deliver,broadcast,tell the fleet,push to the fleet,"
                     "nudge the fleet,agent-to-agent,steer another agent,"
                     "inject into another",
         "tier": TIER_CORE,
@@ -61,8 +64,20 @@ CAPABILITIES = (
         "what": "converge with another model/seat in-turn — independent drafts, "
                 "you synthesize the final answer",
         "wired_via": "helm chat meld + the /com council skill",
-        "keywords": "meld,converge,a2a,second opinion,another seat,another model,"
-                    "second seat,another take,pair with,two models,cross-family",
+        "keywords": "meld,a2a,second opinion,another seat,another model,"
+                    "second seat,another take,pair with,two models,cross-family,"
+                    # the converge MOMENT in the words agents actually use (owner
+                    # canon: reach for meld WITHOUT being told). Every token is a
+                    # multi-word A2A-SCOPED phrase — NO bare "converge"/"consensus"
+                    # (they collide with dregg protocol vocab this fleet debugs
+                    # constantly: "consensus root", "converge with the finalized
+                    # root" — a relevance regression the cross-family gate caught).
+                    "reach consensus,reach agreement,can we agree,"
+                    "agree on this,get on the same page,same page,hash this out,"
+                    "hash it out,sync up,another perspective,another agent,"
+                    "bounce this off,bounce it off,we disagree,resolve the "
+                    "disagreement,converge with a peer,converge with another,"
+                    "align with a peer",
         "tier": TIER_CORE,
         "visibility": VIS_PUBLIC,
     },
@@ -88,6 +103,22 @@ CAPABILITIES = (
         "keywords": "dispatch,delegate,hand off,handoff,land request,"
                     "land-request,farm out,assign to,another seat do,"
                     "review loop,track to done",
+        "tier": TIER_CORE,
+        "visibility": VIS_PUBLIC,
+    },
+    {
+        "id": "pending",
+        "verb": "helm chat pending",
+        "tool": "helm chat pending",
+        "what": "see whether your @mention/DM was SEEN or ACTED on and which "
+                "addressees STRANDED (no seat answers) — the SENT/SEEN/ACTED "
+                "consume ladder, so a silent reply is never mistaken for lost",
+        "wired_via": "helm chat pending + the ack-ladder consume ladder",
+        "keywords": "did they see,did they see it,was it seen,did they act,"
+                    "did they ack,did they read it,did my message land,did it "
+                    "reach,no reply,no response,unanswered,who has not "
+                    "responded,waiting on a reply,message stranded,stranded,"
+                    "did it get delivered,ghosted",
         "tier": TIER_CORE,
         "visibility": VIS_PUBLIC,
     },
