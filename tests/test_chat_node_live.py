@@ -175,9 +175,11 @@ class LiveNodeTest(unittest.TestCase):
         self.assertTrue(any("LIVE" in msg for _lvl, msg in results))
         self.assertTrue(any("helm-chat-test" in msg for _lvl, msg in results))
 
-    def test_07_transport_status_signed(self):
+    def test_07_transport_status_ready_until_this_profile_commits(self):
         st = chat.transport_status()
-        self.assertEqual(st["mode"], "signed")
+        self.assertEqual(st["mode"], "ready")
+        self.assertEqual(st["label"], "ready (unproven)")
+        self.assertIn("no committed signing receipt", st["detail"])
         self.assertEqual(st["url"], self.url)
         self.assertIsInstance(st["head"], int)
 
