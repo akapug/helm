@@ -33,7 +33,10 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
             "HELM_CACHE_DIR", "MELD_CACHE_DIR",
             # the comparison backend's activation env — popped so the WHOLE suite
             # is hermetic (a stray HELM_CF_ENDPOINT must never let a test reach out)
-            "HELM_CF_ENDPOINT", "MELD_CF_ENDPOINT", "HELM_CF_TOKEN", "MELD_CF_TOKEN")
+            "HELM_CF_ENDPOINT", "MELD_CF_ENDPOINT", "HELM_CF_TOKEN", "MELD_CF_TOKEN",
+            # the seat identity env — popped so a suite run INSIDE a codex seat
+            # never smuggles the SA whisper into every budget/shape assertion
+            "HELM_CHAT_NAME", "MELD_CHAT_NAME")
 
 
 class InjectBase(unittest.TestCase):
@@ -1107,6 +1110,98 @@ class WhisperTest(InjectBase):
         self.assertIn("BRIEF: helm morning", out)
         self.assertFalse(inject._greeted_today(),
                          "--explain must never stamp the greeted latch")
+        self.assertFalse(os.path.exists(inject._ledger_path()),
+                         "--explain must never write the ledger")
+
+
+class SaWhisperTest(InjectBase):
+    """The codex-only SA whisper (owner ask 2026-07-21): a codex-family seat
+    gets ONE terse delegate-to-subagents pinned line, justification left out;
+    claude-family seats NEVER see it. Family rides the ONE existing resolver
+    (HELM_CHAT_NAME -> seat._seat_family), the line walks LAST in
+    PINNED_BUDGET (a full budget drops the nudge, never a premise), and the
+    gate fails open."""
+
+    def seat(self, name):
+        if name is None:
+            os.environ.pop("HELM_CHAT_NAME", None)
+        else:
+            os.environ["HELM_CHAT_NAME"] = name
+
+    def rows(self):
+        with open(inject._ledger_path(), encoding="utf-8") as f:
+            return [json.loads(l) for l in f.read().splitlines()]
+
+    def test_codex_seat_gets_the_line_last_in_pinned(self):
+        self.plant_pinned("pin-a", "always truth")
+        self.seat("codex")
+        got = inject.gather("anything at all")["pinned"]
+        self.assertEqual(got[-1], inject.SA_WHISPER,
+                         "the nudge rides LAST — premises lead")
+        self.assertIn("PREMISE pin-a: always truth", got[0])
+        r = self.rows()[-1]
+        self.assertEqual(r["fired"]["pinned"][-1], inject.SA_WHISPER_ID)
+
+    def test_line_is_terse_and_justification_free(self):
+        self.assertIn("subagents", inject.SA_WHISPER)
+        self.assertLessEqual(len(inject.SA_WHISPER), inject.LINE_CAP)
+        for word in ("because", "compaction", "context window", "justif"):
+            self.assertNotIn(word, inject.SA_WHISPER.lower(),
+                             "the justification is deliberately left out")
+
+    def test_codex_instance_seat_resolves_through_the_one_resolver(self):
+        self.seat("codex-3")  # slice-6 instance: _seat_family's law, not ours
+        self.assertIn(inject.SA_WHISPER, inject.gather("hi")["pinned"])
+
+    def test_claude_family_seats_never_get_it(self):
+        self.plant_pinned("pin-a", "always truth")
+        for name in (None, "helm-fable", "claude", "opus-integrator", "fable-2"):
+            self.seat(name)
+            got = inject.gather("anything")["pinned"]
+            self.assertNotIn(inject.SA_WHISPER, got,
+                             "claude-family seat %r must never see the nudge" % name)
+
+    def test_codexes_only_kimi_excluded(self):
+        self.seat("kimi")  # a real seat family, but the ask is codexes-only
+        self.assertNotIn(inject.SA_WHISPER, inject.gather("hi")["pinned"])
+
+    def test_full_budget_drops_the_nudge_never_a_premise(self):
+        for i in range(4):  # 3 x 395B lines fill the 1200B budget
+            self.plant_pinned("big-%d" % i, "x" * 380)
+        self.seat(None)
+        baseline = inject.gather("anything")["pinned"]
+        self.seat("codex")
+        got = inject.gather("anything")["pinned"]
+        self.assertEqual(got, baseline,
+                         "a full budget drops the nudge and nothing else")
+        self.assertNotIn(inject.SA_WHISPER, got)
+        self.assertLessEqual(sum(len(l) for l in got), inject.PINNED_BUDGET)
+
+    def test_family_derivation_is_the_existing_resolver(self):
+        # the resolver is the AUTHORITY: its verdict, not the raw name, gates
+        with mock.patch("helm.seat._seat_family",
+                        return_value=("codex", None)) as m:
+            self.seat("anything-at-all")
+            self.assertIn(inject.SA_WHISPER, inject.gather("hi")["pinned"])
+            m.assert_called_with("anything-at-all")
+        with mock.patch("helm.seat._seat_family", return_value=(None, "nope")):
+            self.seat("codex")
+            self.assertNotIn(inject.SA_WHISPER, inject.gather("hi")["pinned"])
+
+    def test_resolver_trouble_fails_open(self):
+        self.seat("codex")
+        with mock.patch("helm.seat._seat_family",
+                        side_effect=RuntimeError("seat exploded")):
+            rc, out, err = self.run_inject([], stdin_text="unmatched words")
+        self.assertEqual((rc, out, err), (0, "", ""),
+                         "resolver trouble -> no nudge, never a blocked turn")
+
+    def test_explain_renders_the_nudge(self):
+        self.seat("codex")
+        rc, out, _ = self.run_inject(["--explain"], stdin_text="anything")
+        self.assertEqual(rc, 0)
+        self.assertIn(inject.SA_WHISPER, out)
+        self.assertIn(inject.SA_WHISPER_ID, out)
         self.assertFalse(os.path.exists(inject._ledger_path()),
                          "--explain must never write the ledger")
 
