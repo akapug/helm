@@ -1364,8 +1364,9 @@ waiters — each owning agent gets its Monitor-exit notification and re-arms on
 the new code at its OWN turn boundary (this is the OWNED version of the
 beacon-killer incident class); **(3)** restarts the web unit **iff** it is active
 AND stale; **(4)** NEVER touches proxies/daemons/seats — they print as advisory
-only. Idempotent: staleness is recomputed from live state each run, so a second
-`--apply` right after finds nothing stale.
+only. Idempotent by convergence: staleness is recomputed from live state each
+run, so once the signaled waiters exit a second `--apply` finds nothing stale (a
+re-signal of a still-dying pid is a harmless no-op).
 
 **Safety — failed-probe-is-not-absence.** Only a process whose cmdline argv
 EXACTLY matches the waiter shape (a `helm` executable token immediately followed
@@ -1373,8 +1374,11 @@ by `chat wait`) is ever signaled; the bash Monitor wrapper carries the same
 string inside a single `-c` argument, has no standalone `helm` token, and is
 excluded by construction. Ownership is the `--seat` token; a stale waiter with
 no readable seat, an unreadable start, or an unreachable HEAD (staleness
-unprovable) is SKIPPED and reported, NEVER signaled. Reads `/proc` cmdline +
-stat only.
+unprovable) is SKIPPED and reported, NEVER signaled. The argv shape and stat
+starttime are re-checked immediately before each SIGTERM, so a waiter that
+exited into a recycled pid during the announce round-trip is never hit; and if
+the announce itself fails to land, the pass is **fail-closed** — nothing is
+signaled or restarted. Reads `/proc` cmdline + stat only.
 
 **The ANNOUNCE row carries the re-arm incantation.** An idle owner is *woken*
 by the Monitor-exit event and re-arms at that turn; a busy owner keeps its

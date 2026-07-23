@@ -20,8 +20,9 @@ minutes after a land batch (premise land-to-live-compression-owner-directive).
     and re-arms on new code at its own turn boundary (the OWNED version of the
     unowned mass-SIGTERM beacon-killer incident class); (3) restart the web
     unit iff it is active AND stale; (4) NEVER touch proxies/daemons/seats —
-    advisory only. Idempotent: recomputed from live state each run, so a
-    second --apply right after finds nothing stale.
+    advisory only. Idempotent by convergence: staleness is recomputed from live
+    state each run, so once the signaled waiters exit a second --apply finds
+    nothing stale (a re-signal of a still-dying pid is a harmless no-op).
 
 SAFETY — failed-probe-is-not-absence: only a process whose cmdline argv EXACTLY
 matches the waiter shape (a `helm` executable token immediately followed by
@@ -29,8 +30,10 @@ matches the waiter shape (a `helm` executable token immediately followed by
 string INSIDE a single `-c` argument, never as a standalone `helm` token) is
 excluded by construction. Ownership is the `--seat` token; a stale waiter with
 no readable seat, an unreadable start, or an unreachable HEAD (staleness
-unprovable) is SKIPPED and reported, NEVER signaled. Reads /proc cmdline +
-stat only.
+unprovable) is SKIPPED and reported, NEVER signaled. The argv shape AND stat
+starttime are re-checked immediately before each SIGTERM (who.py's anti-reuse
+bracket), so a waiter that exited into a recycled pid during the announce
+round-trip is never hit. Reads /proc cmdline + stat only.
 """
 import glob
 import json
@@ -46,6 +49,11 @@ PROC = "/proc"          # module-level so tests point it at a fixture tree
 WEB_UNIT = "helm-web"   # the systemd --user web-service unit (docs/WEB.md)
 ANNOUNCE_ROOM = "main"
 ANNOUNCE_NAME = "helm-rearm"
+SKEW_S = 2              # whole-second flooring on BOTH /proc/stat btime and git
+                        # %ct underestimates a proc's start by up to ~1s, so a
+                        # freshly-spawned post-land waiter can compute just under
+                        # HEAD. Class STALE only when older than HEAD by this
+                        # band => a fresh waiter is never mis-killed (fail-safe).
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +254,20 @@ def _web_state(head):
 # scan (read-only) + apply (the owned mutation)
 # ---------------------------------------------------------------------------
 
+def _still_waiter(pid, starttime):
+    """Re-validate a scan-time waiter immediately before signaling (who.py's
+    anti-reuse bracket): the pid must still carry the SAME stat starttime — the
+    canonical anti-recycle key, since a reused pid has a different one — AND the
+    exact `chat wait` argv shape. Any mismatch (exited, recycled, or reshaped)
+    means it is no longer our waiter, so it is skipped, never signaled. Closes
+    the pid-reuse TOCTOU across the announce round-trip: the scan-time guarantee
+    that only the waiter shape is ever signaled is re-asserted AT kill time."""
+    if starttime_of(pid) != starttime:
+        return False
+    sub = _helm_subargv(_cmdline(pid) or [])
+    return sub is not None and sub[:2] == ["chat", "wait"]
+
+
 def scan():
     """One read-only pass -> the plan dict: HEAD identity, every waiter
     (status STALE|current|UNKNOWN + signalable), the web unit, and pre-HEAD
@@ -272,15 +294,16 @@ def scan():
         start = proc_start_epoch(pid)
         if sub[:2] == ["chat", "wait"]:
             seat = _flag(sub, "--seat")
+            st_ticks = starttime_of(pid)     # raw ticks: the kill-time re-check key
             if start is None or head is None:
                 status = "UNKNOWN"       # cannot classify -> never signal
-            elif start < head:
+            elif start < head - SKEW_S:
                 status = "STALE"
             else:
                 status = "current"
             waiters.append({
                 "pid": pid, "seat": seat, "start": start,
-                "follow": "--follow" in sub, "status": status,
+                "starttime": st_ticks, "status": status,
                 "signalable": status == "STALE" and bool(seat),
                 "cmdline": " ".join(argv)})
         else:
@@ -320,11 +343,17 @@ def apply(plan):
     """Execute the owned pass over `plan`. ORDER IS LOAD-BEARING: announce
     FIRST (ambient — wakes nobody), THEN SIGTERM only signalable-stale waiters,
     THEN restart the web unit iff active+stale. Advisory/web-nonstale/uncertain
-    are never touched. No stale target => no-op (nothing announced, idempotent)."""
+    are never touched. No stale target => no-op (nothing announced, idempotent).
+    Two fail-safes at the kill boundary: (a) fail-CLOSED — if the announce did
+    NOT land, the disruptive re-arm is exactly the unexplained mass-SIGTERM this
+    verb exists to replace, so signal/restart NOTHING and surface the reason
+    loudly; (b) each pid is re-validated (starttime + argv shape) right before
+    os.kill, so a waiter that exited into a recycled pid during the announce
+    round-trip is skipped, not killed."""
     stale_waiters = [w for w in plan["waiters"] if w["signalable"]]
     web = plan.get("web")
     web_restart = bool(web and web["stale"])
-    actions = {"announced": False, "signaled": [], "failed": [],
+    actions = {"announced": False, "signaled": [], "failed": [], "skipped": [],
                "web_restarted": False, "web_msg": None}
     if not stale_waiters and not web_restart:
         return actions
@@ -334,8 +363,17 @@ def apply(plan):
         chat.post(txt, room=ANNOUNCE_ROOM, who=ANNOUNCE_NAME, ambient=True)
         actions["announced"] = True
     except Exception as exc:
+        # fail-CLOSED: announce-first is load-bearing. A chat-node hiccup must
+        # not degrade into the unexplained mass-SIGTERM the verb replaces — so
+        # signal and restart nothing this pass; the owners still re-arm via the
+        # independent Monitor-exit path, and the next --apply retries the announce.
         actions["announce_error"] = str(exc)
+        pk.event("rearm", "waiters", "ABORTED: announce failed (%s)" % exc)
+        return actions
     for w in stale_waiters:
+        if not _still_waiter(w["pid"], w["starttime"]):
+            actions["skipped"].append(w["pid"])   # exited/recycled since scan
+            continue
         try:
             os.kill(w["pid"], signal.SIGTERM)
             actions["signaled"].append(w["pid"])
@@ -344,8 +382,10 @@ def apply(plan):
     if web_restart:
         ok, msg = _systemctl_restart(web["unit"])
         actions["web_restarted"], actions["web_msg"] = ok, msg
-    summary = "signaled %d stale waiter%s%s" % (
+    summary = "signaled %d stale waiter%s%s%s" % (
         len(actions["signaled"]), "s"[:len(actions["signaled"]) != 1],
+        "; %d skipped (pid reuse/exit)" % len(actions["skipped"])
+        if actions["skipped"] else "",
         "; web restarted" if actions["web_restarted"] else "")
     pk.event("rearm", "waiters", summary)
     return actions
@@ -389,6 +429,8 @@ def _print_report(plan, actions, applying):
               "stale; nothing is signaled")
     waiters = plan["waiters"]
     signaled = set(actions["signaled"]) if actions else set()
+    skipped = set(actions.get("skipped", [])) if actions else set()
+    aborted = bool(actions and actions.get("announce_error"))
     print("  waiters (helm chat wait): %s"
           % ("" if waiters else "none live"))
     for w in waiters:
@@ -399,6 +441,10 @@ def _print_report(plan, actions, applying):
             note = "  (start/HEAD unreadable — SKIPPED)"
         elif w["pid"] in signaled:
             note = "  -> SIGTERM sent (re-arms at its owner's next turn)"
+        elif w["pid"] in skipped:
+            note = "  -> skipped (exited/recycled before signal — fail-safe)"
+        elif applying and aborted and w["signalable"]:
+            note = "  -> NOT signaled (announce failed — fail-closed)"
         elif applying and w["signalable"]:
             note = "  -> signal FAILED"
         print("    %-7s pid %-8d seat %-22s started %s%s" % (
@@ -435,6 +481,9 @@ def _print_report(plan, actions, applying):
     if applying and actions:
         if actions["announced"]:
             print("  announced to #%s (ambient — woke nobody)" % ANNOUNCE_ROOM)
+        elif actions.get("announce_error"):
+            print("  ANNOUNCE FAILED (%s) — fail-closed: nothing signaled or "
+                  "restarted this pass" % actions["announce_error"])
         print("helm rearm: %s" % tail)
     else:
         print("helm rearm: %s" % tail)

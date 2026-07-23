@@ -127,6 +127,16 @@ class StaleTest(RearmBase):
         self.assertEqual(w["status"], "UNKNOWN")
         self.assertFalse(w["signalable"])   # git down => the fail-safe: no signal
 
+    def test_fresh_waiter_within_skew_band_is_not_stale(self):
+        # whole-second flooring of btime/%ct can push a genuinely-fresh post-land
+        # start just under HEAD; the SKEW_S band keeps it classed current so a
+        # fresh waiter (already on new code) is never mis-killed.
+        self.plant(220, self.waiter("codex-3"),
+                   start_after_boot=500 - 1)   # HEAD is BTIME+500; 1s under HEAD
+        w = rearm.scan()["waiters"][0]
+        self.assertEqual(w["status"], "current")
+        self.assertFalse(w["signalable"])
+
 
 # ---------------------------------------------------------------------------
 # exact-shape match + skip-on-uncertain
@@ -280,6 +290,49 @@ class ApplyTest(RearmBase):
         self.assertFalse(actions["announced"])
         self.post.assert_not_called()
         self.assertEqual(self.killed, [])
+
+    def test_apply_fails_closed_when_announce_raises(self):
+        # a chat-node hiccup: the announce raises. Fail-closed — no waiter is
+        # SIGTERMed and no web unit restarted (the disruption never lands
+        # unexplained), and the error is recorded loudly, not swallowed.
+        self.post.side_effect = RuntimeError("room node unreachable")
+        self.plant(621, self.waiter("codex-3"), start_after_boot=100)  # stale+seat
+        self._patch(rearm, "_systemctl_show",
+                    self.web_show(active=True, since_after_boot=100))   # web stale
+        actions = rearm.apply(rearm.scan())
+        self.assertFalse(actions["announced"])
+        self.assertEqual(actions["announce_error"], "room node unreachable")
+        self.assertEqual(self.killed, [])
+        self.assertEqual(actions["signaled"], [])
+        self.restart.assert_not_called()
+        self.assertFalse(actions["web_restarted"])
+
+    def test_recycled_pid_is_revalidated_and_skipped(self):
+        # a classified stale waiter exits and its pid is recycled to an unrelated
+        # process during the announce round-trip: the starttime changes, so the
+        # kill-time re-check spares the innocent recycled pid.
+        self.plant(631, self.waiter("codex-3"), start_after_boot=100)  # stale+seat
+        plan = rearm.scan()
+        self.assertEqual([w["pid"] for w in plan["waiters"] if w["signalable"]],
+                         [631])
+        with open(os.path.join(self.proc, "631", "stat"), "w") as f:   # new proc
+            f.write("631 (python3) S 1 %s %d 0"
+                    % ("0 " * 17, 777 * rearm._clk_tck()))
+        actions = rearm.apply(plan)
+        self.assertEqual(self.killed, [])
+        self.assertEqual(actions["signaled"], [])
+        self.assertEqual(actions["skipped"], [631])
+
+    def test_reshaped_pid_is_revalidated_and_skipped(self):
+        # same pid + starttime (an exec preserves both) but the cmdline no longer
+        # reads as `chat wait`: the shape half of the re-check skips it.
+        self.plant(632, self.waiter("kimi"), start_after_boot=100)     # stale+seat
+        plan = rearm.scan()
+        with open(os.path.join(self.proc, "632", "cmdline"), "wb") as f:
+            f.write(b"\0".join([b"vim", b"/etc/hosts"]) + b"\0")
+        actions = rearm.apply(plan)
+        self.assertEqual(self.killed, [])
+        self.assertEqual(actions["skipped"], [632])
 
     def test_second_apply_is_idempotent_noop(self):
         d = self.plant(801, self.waiter("codex-3"), start_after_boot=100)  # stale
