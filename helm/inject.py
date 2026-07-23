@@ -81,16 +81,20 @@ read. Budget-capped (WHISPER_CAP) and fully FAIL-OPEN: brief unavailable -> no
 whisper, never a blocked hook. `--explain` renders it read-only (stamps nothing);
 a quiet window (no sessions/knowledge/gates) whispers nothing but still latches.
 
-CODEX SA-WHISPER (the delegation nudge — owner ask 2026-07-21): a turn fired
-inside a codex-family seat appends ONE terse pinned-lane line nudging the seat
-to orchestrate its subagents for reviews/reads/research (context stays lean,
-compaction stays rare); the justification is deliberately left out. Family
-comes from the ONE existing derivation — the launch seam's HELM_CHAT_NAME
-(seat.py exports it) resolved through seat._seat_family ('codex-3' -> codex)
-— never a second resolver. Claude-family seats carry names outside
-seat.FAMILIES, resolve to None, and NEVER receive the line (attention
-budget). The whisper walks LAST in PINNED_BUDGET, so a full budget drops it
-(it is a nudge, not an obligation); ledgered as whisper:codex-sa. Fail-open.
+CODEX WHISPERS (the codex-only nudges — owner asks 2026-07-21/23): a turn
+fired inside a codex-family seat appends terse pinned-lane lines, each
+justification-free (owner-spec style). Two today: the SA-delegation nudge
+(orchestrate your subagents for reviews/reads/research; whisper:codex-sa) and
+the claim-start nudge (claiming a lane is a START, not a milestone — a codex
+claimed two lanes then idled on turn-discipline law-5, reading 'posted my
+claim' as the bounded milestone; whisper:codex-claim-start). Family comes
+from the ONE existing derivation — the launch seam's HELM_CHAT_NAME (seat.py
+exports it) resolved through seat._seat_family ('codex-3' -> codex) — never
+a second resolver. Claude-family seats carry names outside seat.FAMILIES,
+resolve to None, and NEVER receive the lines (attention budget). The
+whispers walk LAST in PINNED_BUDGET in SA_LINES order (delegation, then
+claim-start): budget pressure drops the tail nudges, NEVER a premise; each
+fired line is ledgered under its own id. Fail-open.
 
 LANE-REPORT (the lane-split eval's instrument): `helm inject --lane-report` is
 a READ-ONLY analyzer over the whole fire-ledger — every fired id classified
@@ -155,7 +159,13 @@ WHISPER_CAP = 240     # the one-line brief digest's byte cap (attention budget)
 SA_WHISPER_ID = "whisper:codex-sa"  # the codex delegation nudge's ledger id
 SA_WHISPER = ("Delegate reviews, reads, and research to your subagents; "
               "keep your own context lean.")
-SA_FAMILIES = frozenset(("codex",))  # codexes-only (owner ask 2026-07-21)
+CLAIM_WHISPER_ID = "whisper:codex-claim-start"  # the claim-is-a-start nudge's ledger id
+CLAIM_WHISPER = ("Claiming a lane is a START, not a milestone — launch the "
+                 "writer this same turn; end your turn only when work is "
+                 "visibly moving.")
+SA_FAMILIES = frozenset(("codex",))  # codexes-only (owner asks 2026-07-21/23)
+SA_LINES = ((SA_WHISPER, SA_WHISPER_ID),  # the budget-tail walk order: the
+            (CLAIM_WHISPER, CLAIM_WHISPER_ID))  # later line degrades first
 
 _CACHE_VERSION = 1    # bump when store parsing/derivation changes entry shape
 
@@ -194,21 +204,22 @@ def _who_lines():
 
 
 def _sa_whisper():
-    """The codex-only delegation nudge, or None. Family is derived through the
-    ONE existing resolver: the launch seam's HELM_CHAT_NAME (seat.py exports
-    it; the same leg seats.derive_seat reads first) fed to seat._seat_family
-    ('codex'/'codex-3' -> codex; anything outside seat.FAMILIES -> None) —
-    never a second derivation. No seat name / non-codex family / any trouble
-    -> None (fail-open, never a blocked turn)."""
+    """The codex-only nudge lines — SA_LINES ((line, ledger-id) pairs, walk
+    order) or (). Family is derived through the ONE existing resolver: the
+    launch seam's HELM_CHAT_NAME (seat.py exports it; the same leg
+    seats.derive_seat reads first) fed to seat._seat_family ('codex'/'codex-3'
+    -> codex; anything outside seat.FAMILIES -> None) — never a second
+    derivation. No seat name / non-codex family / any trouble -> () (fail-open,
+    never a blocked turn)."""
     try:
         name = home.env("CHAT_NAME")
         if not name:
-            return None
+            return ()
         from . import seat
         family, _err = seat._seat_family(str(name))
-        return SA_WHISPER if family in SA_FAMILIES else None
+        return SA_LINES if family in SA_FAMILIES else ()
     except Exception:
-        return None
+        return ()
 
 
 def _entry_line_full(e):
@@ -626,8 +637,9 @@ def gather(text, project=None, session=None, compare=None):
     The pinned lane leads with the WHO digest (_who_lines) as its FIRST entry
     — atomic (fires whole or not at all against PINNED_BUDGET), ledgered as
     who:operator with its bytes in the pinned lane, cooldown-exempt — and
-    closes with the codex-only SA whisper (_sa_whisper) LAST when the budget
-    still holds it (whisper:codex-sa; a full budget drops the nudge).
+    closes with the codex-only whispers (_sa_whisper, SA_LINES order) LAST
+    when the budget still holds them — each line drops alone under pressure
+    (whisper:codex-sa, then whisper:codex-claim-start), never a premise.
     Fail-open per lane: a raising store/reflex yields that lane empty. Every
     call appends one fire-ledger row (silent turns log {"silent": true});
     session (the hook's session_id) rides the row when supplied and switches
@@ -658,11 +670,13 @@ def gather(text, project=None, session=None, compare=None):
         pinned_lines.append(line)
         pinned_ids.append(str(e["id"]))
         used += len(line)
-    sa = _sa_whisper()  # codex-only delegation nudge — LAST in the budget,
-    if sa and used + len(sa) <= PINNED_BUDGET:  # a full budget drops it
-        pinned_lines.append(sa)
-        pinned_ids.append(SA_WHISPER_ID)
-        used += len(sa)
+    sa = _sa_whisper()  # codex-only nudges — LAST in the budget; pressure
+    for line, wid in sa:  # drops a nudge, never evicts a premise
+        if used + len(line) > PINNED_BUDGET:
+            continue
+        pinned_lines.append(line)
+        pinned_ids.append(wid)
+        used += len(line)
     n_jit = len(jit_all)      # pre-cap, pre-suppression candidate count
     seen = df = None
     suppressed = []
@@ -719,7 +733,7 @@ def gather(text, project=None, session=None, compare=None):
     if any(fired.values()):
         row.update({"fired": fired,
                     "bytes": {k: sum(len(l) for l in sections[k]) for k in sections},
-                    "candidates": bool(who) + bool(sa) + len(pinned_entries)
+                    "candidates": bool(who) + len(sa) + len(pinned_entries)
                     + n_jit + len(steers)})
     else:
         row["silent"] = True
@@ -770,7 +784,7 @@ def _explain(text, project=None, session=None):
     cut = False
     who = _who_lines()
     sa = _sa_whisper()
-    n_pin = bool(who) + len(pinned_entries) + bool(sa)
+    n_pin = bool(who) + len(pinned_entries) + len(sa)
     if n_pin:
         print("pinned (%d candidate%s, budget %dB):" % (
             n_pin, "s"[:n_pin != 1], PINNED_BUDGET))
@@ -793,11 +807,12 @@ def _explain(text, project=None, session=None):
         else:
             used += len(line)
             print("  + %s ← %s" % (line, e.get("root") or "?"))
-    if sa:  # gather's exact tail walk: LAST in the budget or dropped
-        if used + len(sa) <= PINNED_BUDGET:
-            print("  + %s ← %s" % (sa, SA_WHISPER_ID))
+    for line, wid in sa:  # gather's exact tail walk: each nudge fits or drops
+        if used + len(line) <= PINNED_BUDGET:
+            used += len(line)
+            print("  + %s ← %s" % (line, wid))
         else:
-            print("  - %s (over budget) ← codex-only nudge" % SA_WHISPER_ID)
+            print("  - %s (over budget) ← codex-only nudge" % wid)
     if jit_all:
         print("jit (%d hit%s, cap %d):" % (len(jit_all), "s"[:len(jit_all) != 1], JIT_CAP))
     rank = 0
