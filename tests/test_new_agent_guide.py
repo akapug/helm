@@ -283,8 +283,19 @@ class NewAgentGuideTest(unittest.TestCase):
             "bare post from a project cwd landed in `main` — the homing "
             "default regressed (resolve_homing no longer owns the bare-post "
             "room); guide section 2 and this pin flip together")
+        # The derived room is FINGERPRINTED (proj-<16hex>), never the dir
+        # basename — discover it from the chat dir instead of guessing.
+        chat_dir = os.environ["HELM_CHAT_DIR"]
+        rooms = [f[:-6] for f in os.listdir(chat_dir) if f.endswith(".jsonl")]
+        derived = [r for r in rooms if r != "main"]
+        self.assertEqual(
+            len(derived), 1,
+            "expected exactly one derived room beside main, got %r" % rooms)
+        self.assertRegex(
+            derived[0], r"^canary-proj-[0-9a-f]{16}$",
+            "derived room is not <project>-<fingerprint> shaped")
         in_derived = subprocess.run(
-            [sys.executable, HELM, "chat", "read", "--room", "canary-proj",
+            [sys.executable, HELM, "chat", "read", "--room", derived[0],
              "--since", "0"], cwd=proj, capture_output=True, text=True,
             timeout=60)
         self.assertIn(
