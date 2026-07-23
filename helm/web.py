@@ -766,8 +766,12 @@ def _room_seats(room, rows, roster):
     seen, out = set(), []
 
     def _row(seat):
+        # the seat KEY rides the sidebar JSON raw — launder the emitted label
+        # (the raw key still indexes roster[]/last_seen above) so a hostile
+        # HELM_CHAT_NAME cannot spoof the channel roster or a non-browser reader.
         ls = _s.last_seen(seat, roster[seat])
-        return {"seat": seat, "presence": _s.presence_of(ls), "last_seen": ls}
+        return {"seat": _s._seat_label(seat),
+                "presence": _s.presence_of(ls), "last_seen": ls}
 
     for m in reversed(rows[-64:]):           # recent activity, newest first
         frm = str(m.get("from") or "")
@@ -848,9 +852,15 @@ def _api_chat(qs):
             presence = _s.presence_report()
         except Exception:
             presence = []
+        # `roster` feeds the composer's @mention list — the seat KEYS ride
+        # the JSON wire raw (ensure_ascii=False), so launder each label so a
+        # hostile HELM_CHAT_NAME (ESC/bidi) cannot reach a non-browser consumer
+        # or spoof the dropdown. The panel still matches on the exact stored
+        # key when the owner sends; only this published copy is laundered.
         out = {"room": room, "lines": rows[since if 0 <= since <= total else 0:],
                "total": total, "transport": chat.transport_status(),
-               "rooms": _rooms_summary(roster), "roster": sorted(roster),
+               "rooms": _rooms_summary(roster),
+               "roster": sorted(_s._seat_label(s) for s in roster),
                "presence": presence}
         out.update(_owner_signal(room, rows))
         return out, 200

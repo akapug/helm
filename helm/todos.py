@@ -164,6 +164,29 @@ def _scrub(s):
                    or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
 
 
+def _clip(s, cap):
+    """Byte-budget clip on a codepoint boundary (seats._clip's law, local
+    copy — importing seats here would cycle)."""
+    enc = s.encode("utf-8")
+    if len(enc) <= cap:
+        return s
+    end = cap
+    while end > 0 and (enc[end] & 0xC0) == 0x80:
+        end -= 1
+    return enc[:end].decode("utf-8", errors="ignore") + "…"
+
+
+def _lbl(s, cap=80):
+    """Launder a roster-borne KEY for a DISPLAY sink: the seat name and the
+    project ride the fleet table's first columns AND the /api/todos JSON, and
+    the seat key is the unvalidated HELM_CHAT_NAME join seam — a hostile one
+    (\\x1b[2J screen-clear, bidi override) must not reshape the operator's
+    terminal or the panel. Mirrors _scrub's law for the todo TEXT, extended to
+    the key/project (the two roster-borne strings _row emits raw before this).
+    None/empty pass through untouched."""
+    return _clip(_scrub(str(s)).strip(), cap) if s else s
+
+
 def digest(items):
     """The pull surface's one-line summary of a list:
     {"active","done","total","fp"}. `fp` is the MATERIAL fingerprint — the
@@ -345,10 +368,22 @@ ORPHAN_CAP = 25         # unclaimed sessions shown, freshest first
 
 def _row(name, project, st, items):
     d = digest(st.get("items"))
-    r = {"seat": name, "project": project, "active": d["active"],
+    # the seat KEY and project are roster-borne DISPLAY strings — laundered
+    # at this emit boundary so neither the fleet table nor /api/todos JSON
+    # carries raw ESC/bidi (digest already scrubs the todo TEXT; this is the
+    # same law extended to the key/project). The raw key still drove the
+    # roster read upstream; only the emitted copy is laundered.
+    r = {"seat": _lbl(name), "project": _lbl(project), "active": d["active"],
          "done": d["done"], "total": d["total"], "ts": _ts(st)}
     if items:
-        r["items"] = [i for i in (st.get("items") or []) if isinstance(i, dict)]
+        # `helm todos --all --json` ships the FULL item list — a display sink
+        # like every other. Launder EVERY string field of each item (the `text`
+        # line renders in the panel/CLI) so a hostile todo cannot ride the JSON
+        # wire raw. Field-agnostic: a new string field is laundered the moment
+        # it appears, not a hand-maintained per-key list.
+        r["items"] = [{k: (_lbl(v, 200) if isinstance(v, str) and v else v)
+                       for k, v in i.items()}
+                      for i in (st.get("items") or []) if isinstance(i, dict)]
     return r
 
 
