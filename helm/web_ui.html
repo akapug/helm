@@ -3111,16 +3111,20 @@ function initChat() {
    function declarations referenced only inside closures, so their later
    definition is fine. */
 let ES = null, ES_LIVE = false, ES_TICKS = 0;
+function esCatchUp() {
+  pollChat();                                      // instant cursor catch-up
+  pollDregg();                                     // a signed post = a turn
+  if ($("#view-roster").classList.contains("on")) pollRoster();
+}
 function esConnect() {
   if (!window.EventSource) return;                 // no ES -> timers carry it
   try { ES = new EventSource("/api/events"); } catch (e) { return; }
-  ES.onopen = () => { ES_LIVE = true; };
+  // onopen catches up EVERY connect — initial AND each auto-reconnect: any
+  // doorbell that rang while disconnected is covered by one cursor read
+  // (the server also rings immediately on a stale Last-Event-ID; belt+braces)
+  ES.onopen = () => { ES_LIVE = true; esCatchUp(); };
   ES.onerror = () => { ES_LIVE = false; };         // ES reconnects by itself
-  ES.addEventListener("chat", () => {
-    pollChat();                                    // instant cursor catch-up
-    pollDregg();                                   // a signed post = a turn
-    if ($("#view-roster").classList.contains("on")) pollRoster();
-  });
+  ES.addEventListener("chat", esCatchUp);
 }
 // while the doorbell is live, a 2s timer only ACTS every 5th tick (10s
 // heartbeat); the moment the stream drops it acts every tick again

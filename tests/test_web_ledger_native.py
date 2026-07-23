@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 import urllib.error
@@ -329,37 +330,187 @@ class TestRoomsSummarySingleFlightCache(unittest.TestCase):
             self.assertEqual(self.calls["n"], 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestSseDoorbellWatcher(unittest.TestCase):
-    """The push leg's ground truth (REARCH leg 2): the fingerprint MUST move
-    when any room file changes (a doorbell that can't ring is a dead guard —
-    guard-needs-fires-on-violation), stay still when nothing changed, and the
-    watcher must arm exactly once."""
+    """The push leg's ground truth (REARCH leg 2), rebuilt to codex-3's xrev:
+    the fingerprint scopes to the CANONICAL logs (room *.jsonl + dm/*.jsonl —
+    the chat dir holds ~9k cursor/lock noise files that must NOT ring, and DM
+    appends in the subdir MUST), a ring invalidates the rooms-summary cache
+    FIRST, a dead watcher is detectable, and a crashed watcher drops its
+    arm-flag so the next client re-arms (never a wedged stream)."""
 
-    def test_fingerprint_moves_on_room_append_and_holds_still(self):
-        import tempfile, os as _os
-        with tempfile.TemporaryDirectory() as d:
-            with mock.patch("helm.chat.chat_dir", return_value=d):
-                fp0 = web._chat_fingerprint()
-                self.assertEqual(fp0, web._chat_fingerprint())  # still = still
-                with open(_os.path.join(d, "main"), "a") as f:
-                    f.write('{"from":"x","text":"row"}\n')
-                fp1 = web._chat_fingerprint()
-                self.assertNotEqual(fp0, fp1)                   # append rings
-                self.assertEqual(fp1, web._chat_fingerprint())  # then still
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.d, "dm"), exist_ok=True)
+        self._p = mock.patch("helm.chat.chat_dir", return_value=self.d)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        self.addCleanup(lambda: shutil.rmtree(self.d, ignore_errors=True))
+        # pristine watcher state per test; never leak an armed flag
+        self._state = dict(web._SSE_STATE)
+        web._SSE_STATE.update(
+            {"chat_fp": None, "seq": 0, "watcher": False, "beat": 0.0})
+        self.addCleanup(lambda: web._SSE_STATE.update(self._state))
+        web._ROOMS_SUM_CACHE.clear()
+        self.addCleanup(web._ROOMS_SUM_CACHE.clear)
+
+    def _append(self, rel, row='{"from":"x","text":"r"}\n'):
+        with open(os.path.join(self.d, rel), "a") as f:
+            f.write(row)
+
+    def test_fingerprint_scopes_to_canonical_logs_only(self):
+        self._append("main.jsonl")
+        fp0 = web._chat_fingerprint()
+        self.assertEqual(fp0, web._chat_fingerprint())      # still = still
+        # cursor/lock/stopwhisper noise must NOT move it (7/8 doorbells were
+        # this class of noise before the scope fix)
+        self._append("main.cursor.agent-abc123")
+        self._append("main.cursor.agent-abc123.lock", "x")
+        self._append("main.stopwhisper.tmp-claude-1", "x")
+        self.assertEqual(fp0, web._chat_fingerprint())
+        # a room append RINGS
+        self._append("main.jsonl")
+        fp1 = web._chat_fingerprint()
+        self.assertNotEqual(fp0, fp1)
+        # a DM append in the dm/ SUBDIR rings too (the flat-listdir miss)
+        self._append(os.path.join("dm", "alice.jsonl"))
+        self.assertNotEqual(fp1, web._chat_fingerprint())
 
     def test_fingerprint_fails_open_on_missing_dir(self):
         with mock.patch("helm.chat.chat_dir", return_value="/nonexistent-x"):
-            self.assertIsNone(web._chat_fingerprint())          # never raises
+            self.assertIsNone(web._chat_fingerprint())      # never raises
 
-    def test_watcher_arms_exactly_once(self):
-        before = web._SSE_STATE["watcher"]
-        web._sse_ensure_watcher()
-        web._sse_ensure_watcher()                               # idempotent
-        self.assertTrue(web._SSE_STATE["watcher"])
-        alive = [t.name for t in threading.enumerate()
-                 if t.name == "helm-sse-watcher"]
-        self.assertEqual(len(alive), 1 if not before else len(alive))
+    def test_tick_invalidates_summary_before_ring(self):
+        # a doorbell's whole point is that the poll it triggers reads FRESH
+        # state — the tick must pop the summary cache for this chat root
+        web._ROOMS_SUM_CACHE[self.d] = (time.time(), [{"room": "stale"}])
+        self._append("main.jsonl")
+        rang = web._sse_tick()
+        self.assertTrue(rang)
+        self.assertNotIn(self.d, web._ROOMS_SUM_CACHE)      # invalidated
+        self.assertEqual(web._SSE_STATE["seq"], 1)
+        self.assertFalse(web._sse_tick())                   # quiet = no ring
+
+    def test_watcher_dead_predicate(self):
+        web._SSE_STATE.update({"watcher": True, "beat": time.time()})
+        self.assertFalse(web._sse_watcher_dead())           # armed + fresh
+        web._SSE_STATE["beat"] = time.time() - (web._SSE_DEAD_S + 1)
+        self.assertTrue(web._sse_watcher_dead())            # armed + silent
+        web._SSE_STATE.update({"watcher": False, "beat": time.time()})
+        self.assertTrue(web._sse_watcher_dead())            # unarmed
+
+    def test_crashed_watcher_drops_arm_flag_for_rearm(self):
+        # containment: however the loop dies, the NEXT client can re-arm —
+        # a permanently-set flag with no thread = the wedged-UI class
+        web._SSE_STATE.update({"watcher": True, "beat": time.time()})
+        with mock.patch.object(web, "_sse_tick", side_effect=RuntimeError):
+            with mock.patch.object(web, "_SSE_WATCH_S", 0.01):
+                t = threading.Thread(target=web._sse_watcher, daemon=True)
+                t.start()
+                t.join(timeout=3)
+        self.assertFalse(t.is_alive())
+        self.assertFalse(web._SSE_STATE["watcher"])          # flag dropped
+
+    def test_stop_flag_ends_the_watcher_loop(self):
+        web._SSE_STATE.update({"watcher": True, "beat": time.time()})
+        with mock.patch.object(web, "_SSE_WATCH_S", 0.01):
+            t = threading.Thread(target=web._sse_watcher, daemon=True)
+            t.start()
+            time.sleep(0.05)
+            web._SSE_STATE["watcher"] = False                # the stop switch
+            t.join(timeout=3)
+        self.assertFalse(t.is_alive())
+
+
+class TestSseDoorbellWire(unittest.TestCase):
+    """Non-vacuous WIRE controls (codex-3: no reconnect/death controls
+    existed): a real server, a raw socket, actual SSE frames."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        cls.d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(cls.d, "dm"), exist_ok=True)
+        cls.env_prior = os.environ.get("HELM_CHAT_DIR")
+        os.environ["HELM_CHAT_DIR"] = cls.d
+        cls.state_prior = dict(web._SSE_STATE)
+        web._SSE_STATE.update(
+            {"chat_fp": None, "seq": 0, "watcher": False, "beat": 0.0})
+        cls.srv = web.make_server(0)
+        cls.port = cls.srv.server_address[1]
+        cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        web._SSE_STATE["watcher"] = False    # stop the real watcher loop
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        cls.thread.join(timeout=5)
+        web._SSE_STATE.update(cls.state_prior)
+        if cls.env_prior is None:
+            os.environ.pop("HELM_CHAT_DIR", None)
+        else:
+            os.environ["HELM_CHAT_DIR"] = cls.env_prior
+        shutil.rmtree(cls.d, ignore_errors=True)
+
+    def _stream(self, extra_headers="", read_s=1.5):
+        import socket
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        s.settimeout(read_s)
+        req = ("GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n%s\r\n"
+               % (self.port, extra_headers))
+        s.sendall(req.encode())
+        buf = b""
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+        except socket.timeout:
+            pass
+        finally:
+            s.close()
+        return buf.decode("utf-8", "replace")
+
+    def test_stale_last_event_id_gets_immediate_catchup_ring(self):
+        # reconnect semantics: doorbells are contentless, so ONE immediate
+        # ring + the client's cursor read replays any gap
+        got = self._stream("Last-Event-ID: 999\r\n")
+        self.assertIn(": helm sse doorbell", got)
+        self.assertIn("event: chat", got)                    # the catch-up
+
+    def test_fresh_connect_gets_handshake_not_phantom_ring(self):
+        got = self._stream()
+        self.assertIn(": helm sse doorbell", got)
+        self.assertNotIn("event: chat", got)                 # quiet = quiet
+
+    def test_dead_watcher_ends_the_stream(self):
+        # the wedge class: a watcherless server must END streams (a client
+        # whose ES dies falls back to 2s polls) — never keepalive forever
+        import socket
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        s.settimeout(8)
+        s.sendall(("GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n"
+                   % self.port).encode())
+        time.sleep(0.3)                       # stream is up
+        with web._SSE_COND:                   # kill the watcher, wake streams
+            web._SSE_STATE["watcher"] = False
+            web._SSE_STATE["beat"] = 0.0
+            web._SSE_COND.notify_all()
+        ended = False
+        try:
+            while True:
+                if not s.recv(4096):
+                    ended = True               # server closed the stream
+                    break
+        except socket.timeout:
+            ended = False
+        finally:
+            s.close()
+        self.assertTrue(ended)
+
+
+if __name__ == "__main__":
+    unittest.main()

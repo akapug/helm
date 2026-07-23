@@ -1752,37 +1752,85 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 # every 20s + no-cache/no-transform (the glue anti-proxy-buffering pair);
 # EventSource gives the client auto-reconnect for free.
 _SSE_COND = threading.Condition()
-_SSE_STATE = {"chat_fp": None, "seq": 0, "watcher": False}
+_SSE_STATE = {"chat_fp": None, "seq": 0, "watcher": False, "beat": 0.0}
 _SSE_WATCH_S = 0.25
+_SSE_DEAD_S = 5.0    # a beat older than this = the watcher died
 
 
 def _chat_fingerprint():
-    """One cheap stat sweep over the room files — order-independent combine
-    of (mtime_ns, size), so ANY room's append/rotation moves the value."""
+    """Order-independent combine over ONLY the canonical message logs:
+    <room>.jsonl at the dir top + dm/<seat>.jsonl one level down. The chat
+    dir also holds THOUSANDS of cursor/lock/stopwhisper state files (9,085
+    measured live) — statting them made 7/8 doorbells noise, and because DMs
+    live in the dm/ SUBDIR a flat listdir MISSED real DM appends entirely
+    (codex-3 xrev, both E2E-reproduced). The file NAME is folded into each
+    term so two logs swapping identical (mtime,size) cannot cancel
+    (collision-safe generation)."""
     from . import chat
     try:
         d = chat.chat_dir()
-        fp = 0
-        for name in os.listdir(d):
-            try:
-                st = os.stat(os.path.join(d, name))
-                fp ^= st.st_mtime_ns ^ (st.st_size << 1)
-            except OSError:
-                continue
-        return fp
     except OSError:
         return None
+    fp, seen = 0, False
+    for base in (d, os.path.join(d, "dm")):
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        seen = True
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                st = os.stat(os.path.join(base, name))
+            except OSError:
+                continue
+            fp ^= hash((base, name, st.st_mtime_ns, st.st_size))
+    return fp if seen else None
+
+
+def _sse_tick():
+    """One watcher heartbeat: refresh the beat, and on a fingerprint change
+    invalidate the rooms-summary cache BEFORE ringing — so the poll a
+    doorbell triggers reads FRESH state, never the <=3s-stale summary
+    (codex-3: a new room's doorbell still omitted it until TTL expiry).
+    Returns True when it rang (the unit tests pin this contract)."""
+    fp = _chat_fingerprint()
+    with _SSE_COND:
+        _SSE_STATE["beat"] = time.time()
+        if fp == _SSE_STATE["chat_fp"]:
+            return False
+        _SSE_STATE["chat_fp"] = fp
+        _rooms_summary_invalidate()
+        _SSE_STATE["seq"] += 1
+        _SSE_COND.notify_all()
+        return True
+
+
+def _sse_watcher_dead():
+    """The stream loop's health predicate: armed-but-silent past _SSE_DEAD_S
+    means the watcher thread died. A dead watcher must END the streams —
+    otherwise keepalives keep ES_LIVE true and every client sits on the
+    stretched 10s poll forever (codex-3: an injected crash WEDGED the UI)."""
+    return (not _SSE_STATE["watcher"]) or \
+        (time.time() - _SSE_STATE["beat"] > _SSE_DEAD_S)
 
 
 def _sse_watcher():
-    while True:
-        time.sleep(_SSE_WATCH_S)
-        fp = _chat_fingerprint()
+    try:
+        # the arm-flag doubles as the STOP condition: clearing it ends the
+        # loop within one tick (tests + server teardown get a real lifecycle)
+        while _SSE_STATE["watcher"]:
+            time.sleep(_SSE_WATCH_S)
+            _sse_tick()
+    finally:
+        # containment: however this thread dies, drop the arm-flag so the
+        # NEXT /api/events client arms a fresh watcher, and wake every
+        # stream so its health check runs NOW instead of at keepalive time
         with _SSE_COND:
-            if fp != _SSE_STATE["chat_fp"]:
-                _SSE_STATE["chat_fp"] = fp
-                _SSE_STATE["seq"] += 1
-                _SSE_COND.notify_all()
+            _SSE_STATE["watcher"] = False
+            _SSE_STATE["beat"] = 0.0
+            _SSE_COND.notify_all()
 
 
 def _sse_ensure_watcher():
@@ -1790,6 +1838,7 @@ def _sse_ensure_watcher():
         if _SSE_STATE["watcher"]:
             return
         _SSE_STATE["watcher"] = True
+        _SSE_STATE["beat"] = time.time()
         _SSE_STATE["chat_fp"] = _chat_fingerprint()   # baseline, no boot storm
     threading.Thread(target=_sse_watcher, daemon=True,
                      name="helm-sse-watcher").start()
@@ -1875,24 +1924,61 @@ class Handler(BaseHTTPRequestHandler):
     def _sse(self):
         """text/event-stream: block on the watcher's Condition; emit a `chat`
         doorbell per state change (id = the watcher seq) and a keepalive
-        comment on 20s of quiet. The client's EventSource reconnects itself;
-        a vanished client just raises into the quiet except below."""
+        comment on 5s of quiet (the short tick doubles as the health/teardown
+        cadence). The client's EventSource reconnects itself; a vanished
+        client just raises into the quiet except below. Three exits beyond
+        client-gone (codex-3 xrev, all E2E-reproduced): a RECONNECT with a
+        stale Last-Event-ID gets an IMMEDIATE catch-up doorbell (events are
+        contentless, so one ring replays any gap — the cursor read carries
+        the payload); a DEAD WATCHER ends the stream (keepalives from a
+        watcherless server would pin ES_LIVE and wedge every client on the
+        stretched poll); a CLOSED SERVER socket ends it (streams must not
+        outlive server_close)."""
         _sse_ensure_watcher()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache, no-transform")
-        self.send_header("Connection", "keep-alive")
         self.end_headers()
+        # a stream is never keep-alive-reusable: when this handler returns
+        # (dead watcher / server close / client gone) the SOCKET must close so
+        # the client's EventSource sees the end — without this the base
+        # handler's keep-alive loop just waits for a next request and the
+        # "ended" stream looks alive forever (caught by the wire test). Set
+        # AFTER the headers: send_header("Connection", "keep-alive") silently
+        # RESETS close_connection to False inside the base handler, which is
+        # why that header is gone (HTTP/1.1 keeps the connection by default;
+        # the stream stays open exactly as long as this loop runs).
+        self.close_connection = True
         with _SSE_COND:
             seq = _SSE_STATE["seq"]
+        # Last-Event-ID = the reconnect cursor EventSource sends by itself:
+        # a mismatch means doorbells rang while this client was away
+        catch_up = False
+        last_id = self.headers.get("Last-Event-ID")
+        if last_id is not None:
+            try:
+                catch_up = int(last_id) != seq
+            except ValueError:
+                catch_up = True
         try:
             self.wfile.write(b": helm sse doorbell\n\n")
+            if catch_up:
+                self.wfile.write(
+                    ("event: chat\nid: %d\ndata: {}\n\n" % seq).encode())
             self.wfile.flush()
             while True:
                 with _SSE_COND:
                     fired = _SSE_COND.wait_for(
-                        lambda: _SSE_STATE["seq"] != seq, timeout=20.0)
+                        lambda: _SSE_STATE["seq"] != seq, timeout=5.0)
                     seq = _SSE_STATE["seq"]
+                    dead = _sse_watcher_dead()
+                if dead:
+                    return   # end the stream -> client ES errors -> 2s polls
+                try:
+                    if self.server.socket.fileno() == -1:
+                        return   # server_close ran — do not outlive it
+                except (OSError, AttributeError):
+                    return
                 self.wfile.write(
                     ("event: chat\nid: %d\ndata: {}\n\n" % seq).encode()
                     if fired else b": keepalive\n\n")
