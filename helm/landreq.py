@@ -34,11 +34,23 @@ import time
 
 from . import dispatches
 
-# Land-side stall thresholds (seconds). The review-side stages (OPEN,
-# AWAITING_REVIEW) instead honor the dispatch row's own advisory deadline_s —
-# the author already stated how long the review should take. Terminal LANDED
-# never stalls.
-LAND_STALL_S = {"READY": 3600, "MERGED_LOCAL": 1800}
+# Land-side stall thresholds (seconds), measured — like every LR dwell — from
+# the VERDICT stamp, because git records no moment for the local merge or the
+# push: MERGED_LOCAL/LANDED are OBSERVED, so their timeline ts is None and the
+# only clock a land-side loop has is its verdict. The thresholds are therefore
+# CUMULATIVE from the verdict and MONOTONIC in stage order — land within the
+# land budget of the verdict, reach upstream within a further push budget of
+# it. Because MERGED_LOCAL >= READY, forward progress (READY -> MERGED_LOCAL)
+# can never manufacture a stall on a loop that was healthy in READY: the merge
+# CLEARS the land-side wait and re-arms the push budget rather than flipping a
+# one-second-old push loop to STALLED. (A future revision could date the merge
+# from the trunk commit's committer date; v1 is observe-only, never gating.)
+# The review-side stages (OPEN, AWAITING_REVIEW) instead honor the dispatch
+# row's own advisory deadline_s. Terminal LANDED never stalls.
+_LAND_BUDGET_S = 3600      # land within 1h of the verdict
+_PUSH_BUDGET_S = 1800      # reach upstream within a further 30m
+LAND_STALL_S = {"READY": _LAND_BUDGET_S,
+                "MERGED_LOCAL": _LAND_BUDGET_S + _PUSH_BUDGET_S}
 TERMINAL = ("LANDED",)
 STAGE_ORDER = {"OPEN": 0, "AWAITING_REVIEW": 1, "READY": 2,
                "MERGED_LOCAL": 3, "LANDED": 4}
@@ -103,12 +115,14 @@ def _observe(gitdir, tip, cache):
             "has_upstream": bool(upstream)}
 
 
-def _transitions(rid):
-    """(open_ts, delivered_ts, verdict_ts) read from the raw ledger events —
+def _transitions(events):
+    """(open_ts, delivered_ts, verdict_ts) read from a row's raw ledger events —
     the existing per-event timestamps, no new clock. Legacy snapshot rows that
-    carry a verdict without a discrete event fall back to the opening stamp."""
+    carry a verdict without a discrete event fall back to the opening stamp.
+    Events are the row's already-grouped slice, so project() reads the ledger
+    once, not once per row (that per-row history() reparse was O(N^2))."""
     open_ts = delivered_ts = verdict_ts = None
-    for ev in dispatches.history(rid):
+    for ev in events:
         event, ts = ev.get("event"), ev.get("ts")
         if event in ("dispatch", "add", "posting", None) and open_ts is None:
             open_ts = ts
@@ -141,10 +155,10 @@ def _timeline(state, open_ts, delivered_ts, verdict_ts):
     return tl
 
 
-def _lr(row, cache, now):
+def _lr(row, events, cache, now):
     rid = row["id"]
     tip = row.get("tip")
-    open_ts, delivered_ts, verdict_ts = _transitions(rid)
+    open_ts, delivered_ts, verdict_ts = _transitions(events)
     closed = row.get("status") == "verdict"
     # Landing arms only at READY, so git is only consulted for a verdict'd row.
     obs = (_observe(row.get("repo_id"), tip, cache) if closed
@@ -193,12 +207,13 @@ def project(now=None):
     current, unavailable = dispatches.snapshot()
     if unavailable:
         return {}, unavailable
+    by_id = dispatches.events_by_id()   # one grouped ledger read, not N reparses
     cache, out = {}, {}
     for rid, row in current.items():
         if row.get("migration") or not row.get("tip"):
             continue
         try:
-            out[rid] = _lr(row, cache, now)
+            out[rid] = _lr(row, by_id.get(rid, ()), cache, now)
         except Exception:
             continue
     return out, None

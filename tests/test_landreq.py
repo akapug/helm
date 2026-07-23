@@ -177,12 +177,53 @@ class StallTest(LandReqBase):
         self.assertEqual(stalled[0]["state"], "AWAITING_REVIEW")
         self.assertTrue(stalled[0]["stalled"])
 
+    def test_open_stalls_at_the_dispatch_deadline(self):
+        # Never delivered -> stays OPEN; OPEN honors the row's own advisory
+        # deadline and is assertable without any git observation.
+        row = self.dispatch(deadline_s=60)
+        self.age(row["id"], 3600)                   # far past the 60s deadline
+        stalled = landreq.stalls()[0]
+        self.assertEqual([(lr["id"], lr["state"]) for lr in stalled],
+                         [(row["id"], "OPEN")])
+        self.assertTrue(stalled[0]["stalled"])
+
     def test_ready_stalls_past_the_land_threshold(self):
         row = self.dispatch()
         dispatches.mark_verdict(row["id"], self.side, "ok")
         self.age(row["id"], landreq.LAND_STALL_S["READY"] + 60)
         stalled = landreq.stalls()[0]
         self.assertEqual([lr["state"] for lr in stalled], ["READY"])
+
+    def test_merged_local_stalls_past_its_cumulative_push_threshold(self):
+        # A push loop sitting since its verdict past the MERGED_LOCAL threshold
+        # IS a workflow gap — the local merge landed but the push never did.
+        self.add_origin()                          # origin lacks the reviewed tip
+        row = self.dispatch(ref=self.side)
+        dispatches.mark_verdict(row["id"], self.side, "ok")
+        self.git("merge", "--no-edit", "-q", "side")   # local trunk only
+        self.age(row["id"], landreq.LAND_STALL_S["MERGED_LOCAL"] + 60)
+        stalled = landreq.stalls()[0]
+        self.assertEqual([(lr["id"], lr["state"]) for lr in stalled],
+                         [(row["id"], "MERGED_LOCAL")])
+        self.assertTrue(stalled[0]["stalled"])
+
+    def test_forward_progress_never_manufactures_a_stall(self):
+        # A loop healthy in READY (dwell inside the land budget) must NOT flip
+        # to STALLED the instant the integrator merges it locally. Thresholds
+        # are cumulative from the verdict and MERGED_LOCAL >= READY, so the
+        # merge clears the land-side wait, it does not invent a push stall.
+        self.add_origin()
+        row = self.dispatch(ref=self.side)
+        dispatches.mark_verdict(row["id"], self.side, "ok")
+        self.age(row["id"], landreq.LAND_STALL_S["READY"] - 60)   # inside READY
+        before = landreq.get(row["id"])[0]
+        self.assertEqual(before["state"], "READY")
+        self.assertFalse(before["stalled"])
+        self.git("merge", "--no-edit", "-q", "side")             # forward progress
+        after = landreq.get(row["id"])[0]
+        self.assertEqual(after["state"], "MERGED_LOCAL")
+        self.assertFalse(after["stalled"])                       # not a false alarm
+        self.assertEqual(landreq.stalls()[0], [])
 
     def test_landed_and_young_loops_never_show_as_stalled(self):
         landed = self.dispatch(ref=self.side)
