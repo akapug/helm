@@ -127,6 +127,16 @@ FRESH_S, QUIET_S = 120, 900
 DEFAULT_TTL = 900        # claims lease default
 SCAN_CAP = 512 * 1024    # deliver never reads more than this per room
 ROOM_SCAN_CAP = 16       # rooms per boundary/beacon pass — the multi-room bound
+BEACON_DRAIN_CAP = 4     # emitted wakes per --follow drain pass. An idle beacon
+                         # arming to a large backlog must NOT replay it as one
+                         # burst: each emit is a Monitor event, and >~10 events
+                         # in a burst trips Monitor's firehose auto-stop → SIGTERM
+                         # (exit 143), and the seat goes DEAF (live 2026-07-23:
+                         # a seat with a ~36-row backlog died <8s every arm). Cap
+                         # the pass; the remainder delivers next poll, and the
+                         # agent's own catch-up `helm chat read` advances the
+                         # cursor to drain the rest. Single-shot mode is unbounded
+                         # (it returns on the first match — no burst possible).
 OWNER_RAILS = ("web", "tui")  # server-side owner surfaces stamp these origins
 # the join banner's onboarding pointer — resolved against THIS checkout so a
 # seat in any cwd can open it; tests pin banner ↔ file together (moving the
@@ -1511,8 +1521,9 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
                     stream(chat._fmt(m))
             since = total
         else:
-            while True:                     # drain all currently-matching rows
-                try:                        # across EVERY room (multi-room)
+            drained = 0
+            while True:                     # drain currently-matching rows,
+                try:                        # bounded so a backlog can't firehose
                     line = deliver_any(session=session, seat=seat,
                                        emit=stream, room=room)
                 except Exception:
@@ -1521,6 +1532,14 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
                     break
                 if not follow:
                     return line             # single-shot: first match wins
+                drained += 1
+                if drained >= BEACON_DRAIN_CAP:
+                    # Backlog exceeds one pass — stop replaying it as individual
+                    # wakes (the burst that trips Monitor's auto-stop → SIGTERM,
+                    # the seat goes deaf). One catch-up nudge; the agent's read
+                    # advances the cursor, and any residue delivers next poll.
+                    stream("[helm chat] more pending — helm chat read to catch up")
+                    break
         if deadline and time.time() >= deadline:
             return None
         time.sleep(poll)
