@@ -1107,7 +1107,14 @@ HELP = {
     "release": "usage: helm chat release <resource> --lease ID [--seat S]",
     "claims": "usage: helm chat claims [--room R]  (the live leases)",
     "post": "usage: helm chat post <text...> [--room R] [--seat S] "
-            "[--dm SEAT] [--reply-to <id|n>]",
+            "[--dm SEAT] [--reply-to <id|n>]\n"
+            "  Leading option positions are policed, the body is never "
+            "scanned: prose ABOUT\n"
+            "  --help past the leading position sends fine. Bare `post "
+            "--help` = this usage\n"
+            "  (rc 0); `post --help <body>` refuses loudly (rc 2, nothing "
+            "sent); `post --\n"
+            "  <body>` sends a body that STARTS with a flag-shaped token.",
     "reply": "usage: helm chat reply <id|n> <text...> [--room R] [--seat S]  "
              "(id = the parent row's id, n = its 1-based number, -1 = latest)",
     "read": "usage: helm chat read [--room R] [--since N] [--follow] [--dm "
@@ -1127,10 +1134,26 @@ HELP = {
     "meld": "usage: helm chat meld invite <peer> <topic...> | join <room> | "
             "recv <room> [--timeout S] | say <room> --marker "
             "YIELD|HOLD|DONE|ABORT <text...> | status",
+    # verdict/reveal EXIST as dispatchable verbs but are deferred to 0.3
+    # (council — design doc §11): --help answers honestly with the deferral
+    # instead of the bare rc-2 message the verb itself returns.
+    "verdict": "usage: helm chat verdict — DEFERRED to 0.3 (council, design "
+               "doc §11); until it lands the verb answers with the deferral: "
+               "use the room + /premise",
+    "reveal": "usage: helm chat reveal — DEFERRED to 0.3 (council, design "
+              "doc §11); until it lands the verb answers with the deferral: "
+              "use the room + /premise",
 }
 # Free-text verbs scan only the LEADING position for a help ask — prose
 # ABOUT --help stays sendable (the same scope law as post's flag refusal:
 # leading option positions are policed, the body is never scanned).
+#
+# The CONTRACT (judged at review, 2026-07-22): bare leading --help/-h is a
+# help ask -> usage on stdout, rc 0. Leading --help WITH a body refuses
+# LOUDLY (rc 2, usage on stderr, nothing sent) — the parent refused that
+# shape too, and rc 0 here would SUCCESS-CODE a silently dropped message on
+# a comms substrate. `-- ` before the body sends it literally. Repo swept
+# for consumers of the parent's rc-2-on-bare---help shape: none exist.
 _TEXT_VERBS = ("post", "reply", "dm", "meld")
 
 
@@ -1186,20 +1209,47 @@ def cmd_chat(args):
         if not room_given and env_source == "derived" else None
     if room_given:
         i = args.index("--room")
-        if i + 1 >= len(args):
-            print("helm chat: --room wants a name", file=sys.stderr)
+        val = args[i + 1] if i + 1 < len(args) else None
+        if not val or val.startswith("-"):
+            # guard_tail law: a flag-shaped value is never a room name.
+            # Consuming it here ATE `--help` before the help gate below, so
+            # `wait --room --help` blocked forever — the lane's own bug, one
+            # token over — and `post --room --help x` posted into a room
+            # literally named "--help". Refuse fast, name the problem.
+            print("helm chat: --room wants a room name%s"
+                  % (" — got %r" % val if val else ""), file=sys.stderr)
             return 2
-        room = args[i + 1]
+        room = val
         del args[i:i + 2]
     verb = args[0] if args else "read"
     if verb == "roster":            # roster: a friendlier alias for `seats`
         verb = "seats"
     # --help answered HERE, before ANY verb runs: wait/read --follow must
     # never enter their loops on a help ask, join/deliver/claim/log-flush
-    # must never do work under one. rc 0 — an honest existence probe.
-    if verb in HELP and _help_ask(verb, args[1:]):
+    # must never do work under one. rc 0 — an honest existence probe. On a
+    # text verb, leading --help WITH a body is the loud rc-2 shape instead
+    # (contract above _TEXT_VERBS): nothing is ever silently dropped.
+    tail = args[1:]
+    if verb in HELP and _help_ask(verb, tail):
+        if verb in _TEXT_VERBS and len(tail) > 1:
+            print(HELP[verb], file=sys.stderr)
+            print("helm chat: NOTHING was sent — bare `helm chat %s --help` "
+                  "asks usage; to send a body that STARTS with --help, put "
+                  "`--` before it." % verb, file=sys.stderr)
+            return 2
         print(HELP[verb])
         return 0
+    # guard_tail law for the one flag every leg shares: a flag-shaped value
+    # is never a seat name — refuse FAST instead of letting a later pop
+    # swallow `--help` as an identity (`post --seat --help hi` posted as a
+    # seat literally named "--help"; same class as the --room guard above).
+    if "--seat" in args:
+        i = args.index("--seat")
+        v = args[i + 1] if i + 1 < len(args) else None
+        if not v or v.startswith("-"):
+            print("helm chat: --seat wants a seat name%s"
+                  % (" — got %r" % v if v else ""), file=sys.stderr)
+            return 2
     if verb == "node":
         from . import chatnode
         return chatnode.cmd_node(args[1:])
@@ -1236,8 +1286,9 @@ def cmd_chat(args):
             i = args.index("--dm")
             to = args[i + 1] if i + 1 < len(args) else None
             del args[i:i + 2]
-            if not to:
-                print("helm chat: --dm wants a seat name", file=sys.stderr)
+            if not to or to.startswith("-"):
+                print("helm chat: --dm wants a seat name%s"
+                      % (" — got %r" % to if to else ""), file=sys.stderr)
                 return 2
         # REFUSE an unrecognised LEADING flag instead of POSTING it.
         #
@@ -1275,6 +1326,8 @@ def cmd_chat(args):
             elif a in ("--help", "-h"):
                 print("  usage: helm chat post <text...> [--room R] [--seat S] "
                       "[--dm SEAT] [--reply-to <id|n>]", file=sys.stderr)
+                print("  nothing was sent — bare `helm chat post --help` asks "
+                      "usage; `--` before the body sends it.", file=sys.stderr)
             else:
                 print("  to send a message that STARTS with a flag-shaped "
                       "token, put `--` before it.", file=sys.stderr)

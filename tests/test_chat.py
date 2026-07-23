@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -348,13 +349,16 @@ class HelpBeforeWorkTest(ChatBase):
 
     def _no_dispatch(self, args):
         """cmd_chat(args) with every downstream leg booby-trapped: reaching
-        one means the help gate did not fire."""
+        one means the help gate did not fire. chat._follow is trapped too —
+        the read --follow leg dispatches inline in cmd_chat, and without the
+        trap a gate regression HANGS the suite instead of failing fast."""
         from helm import seats, chatnode, meld
         boom = mock.Mock(side_effect=AssertionError(
             "dispatched past the --help gate"))
         with mock.patch.object(seats, "cmd", boom), \
                 mock.patch.object(chatnode, "cmd_node", boom), \
-                mock.patch.object(meld, "cmd", boom):
+                mock.patch.object(meld, "cmd", boom), \
+                mock.patch.object(chat, "_follow", boom):
             return self.run_cmd(args)
 
     def test_wait_help_answers_before_the_loop(self):
@@ -383,10 +387,89 @@ class HelpBeforeWorkTest(ChatBase):
             self.assertIn("usage: helm chat %s" % verb, out)
 
     def test_read_follow_help_returns(self):
-        # read --follow --help blocked forever too (same class, chat-local)
-        rc, out, _ = self.run_cmd(["read", "--follow", "--help"])
+        # read --follow --help blocked forever too (same class, chat-local);
+        # _no_dispatch traps _follow so a regression fails, never hangs
+        rc, out, _ = self._no_dispatch(["read", "--follow", "--help"])
         self.assertEqual(rc, 0)
         self.assertIn("usage: helm chat read", out)
+
+    def test_verdict_and_reveal_answer_help_with_the_deferral(self):
+        # the only dispatchable chat verbs deferred to 0.3: --help answers
+        # honestly (rc 0 + the deferral) instead of the verb's bare rc 2
+        for verb in ("verdict", "reveal"):
+            rc, out, _ = self._no_dispatch([verb, "--help"])
+            self.assertEqual(rc, 0, verb)
+            self.assertIn("usage: helm chat %s" % verb, out)
+            self.assertIn("0.3", out)
+
+    def test_room_flag_refuses_a_flag_shaped_value(self):
+        # THE residual: the --room pop ran BEFORE the help gate and consumed
+        # '--help' as the room name — `wait --room --help` blocked forever
+        # (rc 124, zero output) and `post --room --help x` posted into a
+        # room literally named "--help". A flag-shaped value is never a
+        # room name: refuse fast, before any dispatch.
+        for argv in (["wait", "--room", "--help"],
+                     ["read", "--room", "--help", "--follow"],
+                     ["post", "--room", "--help", "hello"],
+                     ["read", "--room"]):
+            rc, _, err = self._no_dispatch(argv)
+            self.assertEqual(rc, 2, argv)
+            self.assertIn("--room wants a room name", err, argv)
+        self.assertEqual(chat.read("--help")[1], 0)   # no room "--help"
+
+    def test_seat_flag_refuses_a_flag_shaped_value(self):
+        # same class, the identity flag: `post --seat --help hi` posted AS a
+        # seat named "--help". Non-text verbs never get here — the gate's
+        # whole-tail scan answers `wait --seat --help` as help first.
+        for argv in (["post", "--seat", "--help", "hi"],
+                     ["dm", "--seat", "--help", "codex", "hi"],
+                     ["post", "--seat"]):
+            rc, _, err = self._no_dispatch(argv)
+            self.assertEqual(rc, 2, argv)
+            self.assertIn("--seat wants a seat name", err, argv)
+        self.assertEqual(chat.read()[1], 0)
+        rc, out, _ = self._no_dispatch(["wait", "--seat", "--help"])
+        self.assertEqual(rc, 0)                       # help wins at the gate
+        self.assertIn("usage: helm chat wait", out)
+
+    def test_dm_flag_refuses_a_flag_shaped_value(self):
+        rc, _, err = self._no_dispatch(["post", "--dm", "--help", "hi"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--dm wants a seat name", err)
+        self.assertEqual(chat.read()[1], 0)
+
+    def test_leading_help_with_a_body_refuses_loudly(self):
+        # the judged contract: bare leading --help = usage rc 0 (pinned in
+        # test_inert_verbs...); leading --help WITH a body = rc 2, usage on
+        # stderr, NOTHING sent — never success-code a dropped message
+        for argv in (["post", "--help", "me", "with", "this"],
+                     ["reply", "--help", "1", "still", "broken"],
+                     ["dm", "--help", "codex", "hi"]):
+            rc, out, err = self._no_dispatch(argv)
+            self.assertEqual(rc, 2, argv)
+            self.assertEqual(out, "", argv)
+            self.assertIn("usage: helm chat %s" % argv[0], err, argv)
+            self.assertIn("NOTHING was sent", err, argv)
+        self.assertEqual(chat.read()[1], 0)
+
+    def test_dashdash_sends_a_body_that_starts_with_help(self):
+        # the deliberate path the refusal points at stays open
+        rc, _, _ = self.run_cmd(["post", "--seat", "t", "--",
+                                 "--help", "me", "with", "this"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(chat.read()[0][-1]["text"], "--help me with this")
+
+    def test_help_asks_never_block_end_to_end(self):
+        # the class's live symptom was rc 124 under harness timeout: pin the
+        # never-blocks property through the real entrypoint, hard timeout
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for argv, want in ((["wait", "--help"], 0),
+                           (["wait", "--room", "--help"], 2),
+                           (["read", "--room", "--help", "--follow"], 2)):
+            p = subprocess.run(
+                [sys.executable, "-m", "helm", "chat"] + argv, cwd=root,
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(p.returncode, want, (argv, p.stderr))
 
     def test_inert_verbs_answer_help_without_side_effects(self):
         for verb in ("react", "rooms", "verify", "log-flush", "post",
