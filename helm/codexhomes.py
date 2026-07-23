@@ -526,7 +526,10 @@ def _print_capacity():
             c["email"] or "-", c["tier"], c["seats"], "s"[:c["seats"] != 1]))
     live = sorted(s for s in _s.roster() if s == "codex" or s.startswith("codex-"))
     if live:
-        print("  live codex seats: %s" % ", ".join(live))
+        # the seat KEY is the unvalidated HELM_CHAT_NAME join seam — launder
+        # the emitted label so a hostile codex-<ESC/bidi> seat cannot reshape
+        # this readout's terminal (matching still rode the raw key above).
+        print("  live codex seats: %s" % ", ".join(_s._seat_label(s) for s in live))
     return 0
 
 

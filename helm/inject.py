@@ -212,7 +212,7 @@ def _sa_whisper():
     derivation. No seat name / non-codex family / any trouble -> () (fail-open,
     never a blocked turn)."""
     try:
-        name = home.env("CHAT_NAME")
+        name = home.chat_name()
         if not name:
             return ()
         from . import seat
