@@ -219,11 +219,26 @@ class TestSay(MeldBase):
             meld.say(room, "MAYBE", "x", seat="seat-a")
 
     def test_done_status_transitions(self):
+        """After your own DONE, recv is the COUNTERSIGN WATCH (live-fire
+        2026-07-23: the closer went blind — recv refused, so the convener
+        could never confirm the peer's close through the meld surface)."""
         room, _ = self.open_meld()
-        meld.say(room, "DONE", "closing", seat="seat-a")
+        out = "\n".join(meld.say(room, "DONE", "closing", seat="seat-a"))
+        self.assertIn("countersign", out)             # the closer is told how
         self.assertEqual(meld.state(room, "seat-a")["status"], "done")
+        code, lines = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
+        self.assertEqual(code, meld.EXIT_BOUND)       # watch, not refusal
+        self.assertIn("no countersign", "\n".join(lines))
+        meld.say(room, "DONE", "ack", seat="seat-b")
+        before = meld.state(room, "seat-a")["exchanges"]
+        code, lines = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
+        self.assertEqual(code, 0)                     # the countersign lands
+        self.assertIn("done-mutual", "\n".join(lines))
+        st = meld.state(room, "seat-a")
+        self.assertEqual(st["status"], "done-mutual")
+        self.assertEqual(st["exchanges"], before + 1)  # countersign COUNTED
         code, _ = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
-        self.assertEqual(code, 2)                     # left seats don't recv
+        self.assertEqual(code, 2)                     # sealed is sealed
 
 
 class TestConvergenceLoop(MeldBase):
@@ -264,6 +279,75 @@ class TestConvergenceLoop(MeldBase):
         self.assertIn("role=convener", out)
 
 
+class TestPinnedPair(MeldBase):
+    """Live-fire 2026-07-23: recv accepted READY + chunks from ANY non-self
+    seat — a meld convened for one seat was consummated by another, and a
+    third seat could kill any meld with a forged DONE/ABORT."""
+
+    def test_forged_ready_from_third_seat_never_goes(self):
+        room, _ = meld.invite("seat-b", "topic x", seat="seat-a")
+        epoch = meld.state(room, "seat-a")["epoch"]
+        chat.post("[MELD e:%d] READY:%d (seat-c joined %s)" % (epoch, epoch, room),
+                  room=room, who="seat-c", sign=False)
+        code, lines = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
+        self.assertEqual(code, meld.EXIT_BOUND)       # no GO from a stranger
+        self.assertEqual(meld.state(room, "seat-a")["status"], "invited")
+        self.assertIn("non-peer", "\n".join(lines))   # noted, never silent
+        meld.join(room, seat="seat-b")                # the real peer
+        code, lines = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
+        self.assertEqual(code, 0)
+        self.assertIn("READY", lines[0])
+
+    def test_forged_abort_from_third_seat_cannot_kill(self):
+        room, epoch = self.open_meld()
+        meld.recv(room, timeout=0, seat="seat-a", poll=0.01)   # consume READY
+        chat.post("[MELD e:%d] die [ABORT]" % epoch, room=room, who="seat-c",
+                  sign=False)
+        code, _ = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)
+        self.assertEqual(code, meld.EXIT_BOUND)       # bound, NOT abort
+        self.assertNotEqual(meld.state(room, "seat-a")["status"], "aborted")
+
+    def test_join_refuses_uninvited_seat(self):
+        room, _ = meld.invite("seat-b", "topic x", seat="seat-a")
+        with self.assertRaises(SystemExit) as cm:
+            meld.join(room, seat="seat-c")
+        self.assertIn("seat-b", str(cm.exception))    # names the invited seat
+
+    def test_pre_pin_seed_grandfathers_unpinned(self):
+        """A seed without invited= (pre-fix meld) still joins."""
+        chat.post("[MELD e:7] PROBLEM: old | convener=seat-a cap=5 "
+                  "recv-timeout=90s | MELD DISCIPLINE: ... [HOLD]",
+                  room="meld-7-old", who="seat-a", sign=False)
+        out = "\n".join(meld.join("meld-7-old", seat="seat-c"))
+        self.assertIn("MELD-JOINED", out)
+
+
+class TestIdentity(MeldBase):
+    def test_self_seat_is_env_first_like_whoname(self):
+        """Live-fire 2026-07-23 identity trap: roster-first _self_seat
+        silently overrode HELM_CHAT_NAME for any roster-known session."""
+        seats.join(session="sid-x", cwd=self.tmp, seat="roster-name")
+        os.environ["CLAUDE_SESSION_ID"] = "sid-x"
+        self.assertEqual(meld._self_seat(), "roster-name")  # roster floor holds
+        os.environ["HELM_CHAT_NAME"] = "env-name"
+        self.assertEqual(meld._self_seat(), "env-name")     # env WINS now
+
+    def test_invite_warns_when_peer_untracked(self):
+        _room, lines = meld.invite("seat-b", "topic x", seat="seat-a")
+        self.assertIn("NOT on the chat roster", "\n".join(lines))
+
+    def test_invite_no_warning_for_tracked_peer(self):
+        seats.join(session="sid-b", cwd=self.tmp, seat="seat-b")
+        _room, lines = meld.invite("seat-b", "topic x", seat="seat-a")
+        out = "\n".join(lines)
+        self.assertNotIn("NOT on the chat roster", out)
+        self.assertIn("never lost, only delayed", out)
+
+    def test_invite_rejects_hostile_peer_name(self):
+        with self.assertRaises(SystemExit):
+            meld.invite("evil\x1b[2Jseat", "topic x", seat="seat-a")
+
+
 class TestCLI(MeldBase):
     def test_chat_routes_meld(self):
         rc = chat.cmd_chat(["meld", "invite", "seat-b", "wire", "format"])
@@ -274,6 +358,24 @@ class TestCLI(MeldBase):
     def test_usage_on_garbage(self):
         self.assertEqual(chat.cmd_chat(["meld", "bogus"]), 2)
         self.assertEqual(chat.cmd_chat(["meld", "recv"]), 2)
+
+    def test_seat_flag_names_the_actor(self):
+        rc = meld.cmd(["invite", "seat-b", "wire", "--seat", "seat-a"])
+        self.assertEqual(rc, 0)
+        room = next(r for r in chat.list_rooms() if r.startswith("meld-"))
+        self.assertEqual(meld.state(room, "seat-a")["role"], "convener")
+        self.assertEqual(meld.cmd(["invite", "seat-b", "x", "--seat"]), 2)
+        self.assertEqual(
+            meld.cmd(["invite", "seat-b", "x", "--seat", "e\x1bvil"]), 2)
+
+    def test_invite_wait_collapses_invite_and_first_recv(self):
+        """--wait = invite + recv in one call (every convener's literal next
+        command, live-fire want)."""
+        os.environ["HELM_MELD_RECV_TIMEOUT_S"] = "0"
+        rc = meld.cmd(["invite", "seat-b", "wire", "--wait", "--seat", "seat-a"])
+        self.assertEqual(rc, meld.EXIT_BOUND)         # blocked, bounded out
+        room = next(r for r in chat.list_rooms() if r.startswith("meld-"))
+        self.assertEqual(meld.state(room, "seat-a")["status"], "invited")
 
 
 class TestSelfSeat(MeldBase):

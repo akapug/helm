@@ -47,8 +47,20 @@ Floor markers (the lineage vocabulary, verbatim): [YIELD] hands the floor,
 [HOLD] more coming from the same speaker, [DONE] leaving the meld,
 [ABORT] kills it fail-loud (exit 4).
 
-v1 is 2-party (mc-meld precedent); 3+ minds use a plain room + discipline,
-or council when independence is the point (a council is never a meld).
+v1 is 2-party (mc-meld precedent); 3+ minds use a plain room + discipline.
+NAMING (premise council-is-the-number-one-feature, owner canon 2026-07-23):
+MELD is the GENUS — `meld` stays the primary verb; `standup` (informal 2+
+convergence, includes this 2-party mindmeld) and `council` (the big FORMAL
+convergence — agenda/quorum/recorded verdict, the 0.3 N-of-M machinery) are
+SPECIES spellings routed to this same preset, never replacements. Every
+spelling echoes itself back in the printed next-commands (`via`).
+
+PINNED PAIR (live-fire 2026-07-23): a meld is its invited pair. The seed
+carries `invited=<peer>`; join REFUSES any other seat; recv accepts READY
+and chunks ONLY from state["peer"] — a third seat can no longer GO, hijack,
+or kill a meld with a forged DONE/ABORT. Identity is env-first
+(home.chat_name), aligned with chat.whoname — the roster-first order here
+silently overrode HELM_CHAT_NAME for any roster-known session.
 """
 import os
 import re
@@ -66,6 +78,10 @@ EXIT_BOUND, EXIT_ABORT = 3, 4
 _MARKER_RE = re.compile(r"\[(YIELD|HOLD|DONE|ABORT)\]\s*$")
 _EPOCH_RE = re.compile(r"\[MELD(?:-INVITE)? e:(\d+)\]")
 _READY_RE = re.compile(r"\bREADY:(\d+)\b")
+# the seed's pinned-pair fields — findall[-1] so a topic that EMBEDS a fake
+# `convener=… invited=…` run can never outrank the real fields (they are
+# appended AFTER the topic, so the last match is always the seed's own)
+_INVITED_RE = re.compile(r"convener=[\w.-]+ invited=([\w.-]+) cap=\d")
 
 
 def _cap():
@@ -84,6 +100,14 @@ def _recv_timeout():
 
 def _self_seat():
     from . import seats
+    # ENV-FIRST, aligned with chat.whoname (live-fire 2026-07-23 identity
+    # trap): the roster-first order here silently ignored HELM_CHAT_NAME for
+    # any session already in the roster — the invite fired AND the peer
+    # joined under the roster seat instead of the exported one, zero warning.
+    # home.chat_name is THE validated seam (hostile names rejected at source).
+    name = home.chat_name()
+    if name:
+        return name
     sid = home.session_id()
     # safe_cwd, not os.getcwd(): a bare getcwd here crashed ALL five meld
     # verbs from a deleted cwd (eager-getcwd class); derive_seat handles None.
@@ -118,66 +142,95 @@ def _post(text, room, seat):
     return chat.post(text, room=room, who=seat, sign=False)
 
 
-def invite(peer, topic, seat=None):
+def invite(peer, topic, seat=None, via="meld"):
     """(room, lines) — open a meld: seed the problem ([HOLD], discipline
     included so the joiner needs no skill file), then the @peer invite with
-    the protocol HEAD-first (clip-proof). State: convener/invited."""
+    the protocol HEAD-first (clip-proof). State: convener/invited. The seed
+    carries `invited=<peer>` — the pinned pair's durable half (join refuses
+    any other seat; recv accepts only this one). An untracked peer gets a
+    LOUD warning instead of the unconditional 'wakes at its next boundary'
+    line (live-fire: the invite asserted delivery to a seat with no lane)."""
     seat = seat or _self_seat()
     peer = (peer or "").lstrip("@")
     if not peer:
-        raise SystemExit("helm meld: invite wants a peer seat name")
+        raise SystemExit("helm %s: invite wants a peer seat name" % via)
+    try:  # THE arg-side ingestion seam — a hostile/garbled peer name never
+        peer = home.validate_seat_arg(peer)  # becomes a seed field or mention
+    except home.SeatNameError as e:
+        raise SystemExit("helm %s: %s" % (via, e))
     epoch = int(time.time())
     room = room_name(topic, epoch)
     if state(room, seat):
-        raise SystemExit("helm meld: state already exists for room %s" % room)
-    seed = ("[MELD e:%d] PROBLEM: %s | convener=%s cap=%d recv-timeout=%ds | "
-            "MELD DISCIPLINE: reply FAST with what you already know; a fork "
-            "that needs research is NOT a meld — close [DONE] with the async "
-            "continuation. [HOLD]"
-            % (epoch, topic, seat, _cap(), int(_recv_timeout())))
+        raise SystemExit("helm %s: state already exists for room %s" % (via, room))
+    seed = ("[MELD e:%d] PROBLEM: %s | convener=%s invited=%s cap=%d "
+            "recv-timeout=%ds | MELD DISCIPLINE: reply FAST with what you "
+            "already know; a fork that needs research is NOT a meld — close "
+            "[DONE] with the async continuation. [HOLD]"
+            % (epoch, topic, seat, peer, _cap(), int(_recv_timeout())))
     _post(seed, room, seat)
-    # peer is an operator-supplied seat name that enters the @mention posted
-    # TEXT (rendered raw by chat._fmt on every reader's terminal) and the
-    # convener's own display lines — launder the EMITTED copies; the RAW peer
-    # stays in state for say()'s DONE/ABORT mention. topic is CONTENT, left
-    # full-fidelity by the class rule (only identity is laundered).
+    # peer is validated above; laundering the EMITTED copies stays as
+    # defense-in-depth beneath the seam. topic is CONTENT, left full-fidelity
+    # by the class rule (only identity is laundered).
     d_peer = chat._dsan(peer)
-    inv = ("@%s [MELD-INVITE e:%d] room=%s JOIN: helm chat meld join %s "
-           "THEN: helm chat meld recv %s || topic: %s"
-           % (d_peer, epoch, room, room, room, topic))
+    inv = ("@%s [MELD-INVITE e:%d] room=%s JOIN: helm chat %s join %s "
+           "THEN: helm chat %s recv %s || topic: %s"
+           % (d_peer, epoch, room, via, room, via, room, topic))
     _post(inv, room, seat)
     _write_state(room, seat, {
         "room": room, "epoch": epoch, "role": "convener", "self": seat,
         "peer": peer, "idx": 0, "exchanges": 0, "cap": _cap(),
         "status": "invited", "created": pk.now_ts()})
+    from . import seats
+    try:  # the wake-truth line: honest per the peer's ACTUAL delivery lane
+        tracked = seats.seat_scope(peer)["tracked"]
+    except Exception:
+        tracked = False
+    wake = ("the invite is a durable row — %s wakes at its next tool "
+            "boundary or beacon (never lost, only delayed)" % d_peer
+            if tracked else
+            "WARNING: %s is NOT on the chat roster — no delivery lane "
+            "exists; nothing wakes it until it joins (`helm chat join`) or "
+            "reads %s itself" % (d_peer, room))
     return room, [
         "MELD-INVITED room=%s epoch=%d peer=%s" % (room, epoch, d_peer),
-        "the invite is a durable row — %s wakes at its next tool boundary "
-        "or beacon (never lost, only delayed)" % d_peer,
-        "next: helm chat meld recv %s   (returns on READY; then speak the "
-        "first chunk: helm chat meld say %s --marker YIELD \"...\")"
-        % (room, room)]
+        wake,
+        "next: helm chat %s recv %s   (returns on READY; then speak the "
+        "first chunk: helm chat %s say %s --marker YIELD \"...\")"
+        % (via, room, via, room)]
 
 
-def join(room, seat=None):
-    """(lines) — join a meld: parse epoch + convener from the seed, post the
-    control-only READY (@convener — the wake-back; a READY that lands
-    silently strands GO forever, buildr live-incident), state joiner/active
-    with idx=0 so the seeded problem is the first recv chunk."""
+def join(room, seat=None, via="meld"):
+    """(lines) — join a meld: parse epoch + convener + invited from the seed,
+    post the control-only READY (@convener — the wake-back; a READY that
+    lands silently strands GO forever, buildr live-incident), state
+    joiner/active with idx=0 so the seeded problem is the first recv chunk.
+    REFUSES a seat the seed did not invite (live-fire 2026-07-23: a meld
+    convened for one seat was consummated by another with zero warning —
+    downstream, the convener's DONE @mentioned a ghost). Pre-pin seeds
+    (no invited= field) grandfather in unpinned."""
     seat = seat or _self_seat()
     rows, _total = chat.read(room)
-    epoch = convener = None
+    epoch = convener = seedtext = None
     for m in rows:
         em = _EPOCH_RE.search(m.get("text") or "")
         if em and m.get("from"):
-            epoch, convener = int(em.group(1)), m["from"]
+            epoch, convener, seedtext = int(em.group(1)), m["from"], m["text"]
             break
     if epoch is None:
-        raise SystemExit("helm meld: no meld seed in room %s — was it "
-                         "invited? (helm chat read --room %s)" % (room, room))
+        raise SystemExit("helm %s: no meld seed in room %s — was it "
+                         "invited? (helm chat read --room %s)" % (via, room, room))
     if convener == seat:
-        raise SystemExit("helm meld: %s convened this meld — recv, don't "
-                         "join" % seat)
+        raise SystemExit("helm %s: %s convened this meld — recv, don't "
+                         "join" % (via, seat))
+    fm = _INVITED_RE.findall(seedtext or "")
+    invited = fm[-1] if fm else None
+    if invited and invited != seat:
+        raise SystemExit(
+            "helm %s: room %s was convened for %s, not %s — join under the "
+            "invited name (HELM_CHAT_NAME=%s or --seat %s). A different-seat "
+            "join is how melds got hijacked/mis-consummated (live-fire "
+            "2026-07-23)." % (via, room, invited, chat._dsan(seat),
+                              invited, invited))
     # convener is a SEED ROW's from-field — planted/foreign (a pre-fix or
     # foreign-node seed) it may carry ESC/bidi. Launder it before it enters
     # BOTH the MELD-JOINED display line AND the posted READY text (chat._fmt
@@ -192,42 +245,64 @@ def join(room, seat=None):
         "peer": convener, "idx": 0, "exchanges": 0, "cap": _cap(),
         "status": "active", "created": pk.now_ts()})
     return ["MELD-JOINED room=%s epoch=%d convener=%s" % (room, epoch, d_convener),
-            "next: helm chat meld recv %s   (the seeded problem statement "
-            "is your first chunk)" % room]
+            "next: helm chat %s recv %s   (the seeded problem statement "
+            "is your first chunk)" % (via, room)]
 
 
-def _fall_lines(room, reason, st):
+def _fall_lines(room, reason, st, via="meld"):
     return ["MELD-BOUND room=%s reason=%s exchanges=%d/%d"
             % (room, reason, st.get("exchanges", 0), st.get("cap", _cap())),
             "the synchronous window is over — fall to async NOW: post your "
             "current state + the required next action as the closing chunk "
             "(it @mentions the peer; the durable row guarantees it lands):",
-            "  helm chat meld say %s --marker DONE \"<state + next action>\""
-            % room]
+            "  helm chat %s say %s --marker DONE \"<state + next action>\""
+            % (via, room)]
 
 
-def recv(room, timeout=None, seat=None, poll=MELD_POLL):
+def _ignored_note(ignored, peer):
+    """One terse line when the loop skipped floor-shaped rows from non-peer
+    seats — silence here is how the unpinned-peer hijack went unnoticed."""
+    if not ignored:
+        return []
+    who = ", ".join(sorted({chat._dsan(x) for x in ignored}))
+    return ["(pinned pair: ignored %d floor/READY row(s) from non-peer "
+            "seat(s) %s — this meld speaks only with %s)"
+            % (len(ignored), who, chat._dsan(peer))]
+
+
+def recv(room, timeout=None, seat=None, poll=MELD_POLL, via="meld"):
     """(code, lines) — the blocking marker-aware read: return the next PEER
     chunk carrying a real floor marker; skip own/unattributable rows (F2),
-    stale epochs (the fence), control echoes (F1), markerless chatter and
-    reactions. Bounds are behavior: cap/timeout → (EXIT_BOUND, fall-to-async
+    stale epochs (the fence), control echoes (F1), markerless chatter,
+    reactions, and — the pinned-pair law — EVERY row from a seat that is not
+    state["peer"] (live-fire 2026-07-23: recv accepted READY and chunks from
+    ANY non-self sender; a meld convened for one seat was consummated by
+    another, and a third seat could kill any meld with a forged DONE/ABORT).
+    Bounds are behavior: cap/timeout → (EXIT_BOUND, fall-to-async
     instruction); [ABORT] → (EXIT_ABORT, loud). READY returns exactly once —
-    to the invited convener, flipping it active (the GO moment)."""
+    to the invited convener, flipping it active (the GO moment). After your
+    own [DONE] recv becomes the COUNTERSIGN WATCH (closer-went-blind,
+    live-fire): it returns the peer's closing DONE/ABORT — flipping
+    done-mutual and counting the exchange — instead of refusing."""
     seat = seat or _self_seat()
     st = state(room, seat)
     if st is None:
-        return 2, ["helm meld: no meld state for %s — invite or join first"
-                   % room]
+        return 2, ["helm %s: no meld state for %s — invite or join first"
+                   % (via, room)]
     if st["status"] == "aborted":
-        return 2, ["helm meld: room %s is ABORTED — the meld is dead" % room]
-    if st["status"] in ("done", "done-mutual"):
-        return 2, ["helm meld: you already left room %s ([DONE])" % room]
+        return 2, ["helm %s: room %s is ABORTED — the meld is dead" % (via, room)]
+    if st["status"] == "done-mutual":
+        return 2, ["helm %s: room %s is sealed (done-mutual) — both sides "
+                   "closed" % (via, room)]
+    closing = st["status"] == "done"      # countersign watch, not a refusal
     if st["status"] == "peer-done":
-        return 2, ["helm meld: peer already left room %s — nothing further "
-                   "arrives; close: helm chat meld say %s --marker DONE "
-                   "\"<closing state>\"" % (room, room)]
-    if st["exchanges"] >= st.get("cap", _cap()):
-        return EXIT_BOUND, _fall_lines(room, "cap", st)
+        return 2, ["helm %s: peer already left room %s — nothing further "
+                   "arrives; close: helm chat %s say %s --marker DONE "
+                   "\"<closing state>\"" % (via, room, via, room)]
+    if not closing and st["exchanges"] >= st.get("cap", _cap()):
+        return EXIT_BOUND, _fall_lines(room, "cap", st, via)
+    peer = str(st.get("peer") or "")
+    ignored, late = [], 0
     deadline = time.time() + (_recv_timeout() if timeout is None else timeout)
     while True:
         rows, total = chat.read(room, since=st["idx"])
@@ -242,51 +317,73 @@ def recv(room, timeout=None, seat=None, poll=MELD_POLL):
             if em and int(em.group(1)) != st["epoch"]:
                 st["idx"] = here          # stale epoch: a dead meld's row
                 continue                  # can never replay (the fence)
+            if peer and frm != peer:      # the pinned pair — noted, never obeyed
+                if _READY_RE.search(text) or _MARKER_RE.search(text):
+                    ignored.append(frm)
+                st["idx"] = here
+                continue
             if _READY_RE.search(text) and not _MARKER_RE.search(text):
                 st["idx"] = here
                 if st["role"] == "convener" and st["status"] == "invited":
                     st["status"] = "active"
                     _write_state(room, seat, st)
                     return 0, ["[meld %s e:%d] READY — %s is in. You have "
-                               "the floor: helm chat meld say %s --marker "
+                               "the floor: helm chat %s say %s --marker "
                                "YIELD \"<first chunk>\""
-                               % (room, st["epoch"], chat._dsan(frm), room)]
+                               % (room, st["epoch"], chat._dsan(frm), via, room)] \
+                        + _ignored_note(ignored, peer)
                 continue                  # control echo elsewhere (F1)
             mk = _MARKER_RE.search(text)
             if not mk:
                 st["idx"] = here          # markerless chatter is not a chunk
                 continue
             marker = mk.group(1)
+            if closing and marker in ("YIELD", "HOLD"):
+                st["idx"] = here          # late chunk after your DONE — the
+                late += 1                 # watch wants only the countersign
+                continue
             st["idx"], st["exchanges"] = here, st["exchanges"] + 1
             if marker == "ABORT":
                 st["status"] = "aborted"
                 _write_state(room, seat, st)
                 return EXIT_ABORT, ["[meld %s e:%d] ABORT from %s — the meld "
                                     "is dead, fail-loud:" % (room, st["epoch"], chat._dsan(frm)),
-                                    "  %s" % text]
+                                    "  %s" % text] + _ignored_note(ignored, peer)
             if marker == "DONE":
-                st["status"] = "peer-done"
+                st["status"] = "done-mutual" if closing else "peer-done"
                 _write_state(room, seat, st)
+                tail = ("done-mutual — the meld is sealed; the room is the "
+                        "durable record (log-flush out-of-band)" if closing
+                        else "peer left — close your side: helm chat %s say "
+                        "%s --marker DONE \"<closing state>\"" % (via, room))
                 return 0, ["[meld %s e:%d] %s: %s"
                            % (room, st["epoch"], chat._dsan(frm), text),
-                           "peer left — close your side: helm chat meld say "
-                           "%s --marker DONE \"<closing state>\"" % room]
+                           tail] + _ignored_note(ignored, peer)
             _write_state(room, seat, st)
             floor = ("floor: YOURS — reply fast with what you already know: "
-                     "helm chat meld say %s --marker YIELD|HOLD|DONE \"...\""
-                     % room) if marker == "YIELD" else \
+                     "helm chat %s say %s --marker YIELD|HOLD|DONE \"...\""
+                     % (via, room)) if marker == "YIELD" else \
                     "floor: PEER'S — more coming; recv again"
             return 0, ["[meld %s e:%d] %s: %s" % (room, st["epoch"], chat._dsan(frm), text),
-                       floor]
+                       floor] + _ignored_note(ignored, peer)
         if st["idx"] != total:
             st["idx"] = total
         _write_state(room, seat, st)      # consumed ground survives a re-run
         if time.time() >= deadline:
-            return EXIT_BOUND, _fall_lines(room, "timeout", st)
+            if closing:
+                return EXIT_BOUND, [
+                    "MELD-CLOSING room=%s — no countersign from %s yet; "
+                    "your side stays closed, the room stays readable "
+                    "(helm chat read --room %s)"
+                    % (room, chat._dsan(peer or "?"), room)] \
+                    + (["(%d late chunk(s) after your DONE skipped)" % late]
+                       if late else []) + _ignored_note(ignored, peer)
+            return EXIT_BOUND, _fall_lines(room, "timeout", st, via) \
+                + _ignored_note(ignored, peer)
         time.sleep(poll)
 
 
-def say(room, marker, text, seat=None):
+def say(room, marker, text, seat=None, via="meld"):
     """(lines) — append one bounded chunk: content + floor marker in the one
     text field (text-or-it-didn't-happen). DONE/ABORT @mention the peer (the
     act-moments — a closing that lands silently strands the peer's bound);
@@ -294,17 +391,17 @@ def say(room, marker, text, seat=None):
     seat = seat or _self_seat()
     marker = (marker or "").upper()
     if marker not in MARKERS:
-        raise SystemExit("helm meld: --marker wants one of %s" % "|".join(MARKERS))
+        raise SystemExit("helm %s: --marker wants one of %s" % (via, "|".join(MARKERS)))
     st = state(room, seat)
     if st is None:
-        raise SystemExit("helm meld: no meld state for %s — invite or join "
-                         "first" % room)
+        raise SystemExit("helm %s: no meld state for %s — invite or join "
+                         "first" % (via, room))
     if st["status"] == "aborted":
-        raise SystemExit("helm meld: room %s is ABORTED" % room)
+        raise SystemExit("helm %s: room %s is ABORTED" % (via, room))
     text = (text or "").strip()
     if not text:
-        raise SystemExit("helm meld: say wants text — a bare marker is not "
-                         "a chunk (text-or-it-didn't-happen)")
+        raise SystemExit("helm %s: say wants text — a bare marker is not "
+                         "a chunk (text-or-it-didn't-happen)" % via)
     # st["peer"] is the RELOCATED convener/invitee from-field (join stored the
     # seed row's raw `from` here; invite stored the raw arg). Launder it before
     # it enters the DONE/ABORT posted text — chat._fmt renders posted text raw
@@ -324,6 +421,9 @@ def say(room, marker, text, seat=None):
     if marker == "DONE":
         out.append("you left the meld — /premise anything durable; the room "
                    "log-flushes out-of-band like any room")
+        if st["status"] == "done":  # peer not closed yet — the closer is not
+            out.append("confirm the countersign: helm chat %s recv %s "
+                       "(returns the peer's DONE → done-mutual)" % (via, room))
     return out
 
 
@@ -358,35 +458,65 @@ def _flag(args, name, default=None):
     return default
 
 
-def cmd(args):
-    """helm chat meld invite <peer> <topic...> | join <room> |
-    recv <room> [--timeout S] | say <room> --marker M <text...> | status"""
+def usage(via="meld"):
+    return ("usage: helm chat %s invite <peer> <topic...> [--wait] | "
+            "join <room> | recv <room> [--timeout S] | say <room> --marker "
+            "YIELD|HOLD|DONE|ABORT <text...> | status   [--seat S on any] "
+            "(one preset, three spellings: meld = the genus, council/standup "
+            "= species)" % via)
+
+
+def cmd(args, via="meld"):
+    """helm chat meld|council|standup invite <peer> <topic...> [--wait] |
+    join <room> | recv <room> [--timeout S] | say <room> --marker M
+    <text...> | status — every verb takes --seat S (explicit per-command
+    identity; live-fire: ambient-only identity forced env -u gymnastics for
+    one-off council seats). `via` is the spelling the operator typed — it
+    echoes back in every printed next-command."""
     args = list(args or [])
+    seat = None
+    if "--seat" in args:
+        v = _flag(args, "--seat")
+        try:
+            seat = home.validate_seat_arg(v)
+        except home.SeatNameError as e:
+            print("helm %s: %s" % (via, e), file=sys.stderr)
+            return 2
+        if not seat:
+            print("helm %s: --seat wants a seat name" % via, file=sys.stderr)
+            return 2
+    wait = "--wait" in args               # invite --wait = invite + first recv
+    if wait:                              # (every convener's literal next call)
+        args.remove("--wait")
     verb = args[0] if args else "status"
     try:
         if verb == "invite" and len(args) >= 3:
-            _room, lines = invite(args[1], " ".join(args[2:]))
+            room, lines = invite(args[1], " ".join(args[2:]), seat=seat, via=via)
             print("\n".join(lines))
-            return 0
+            if not wait:
+                return 0
+            code, lines = recv(room, seat=seat, via=via)
+            print("\n".join(lines), file=sys.stderr if code else sys.stdout)
+            return code
         if verb == "join" and len(args) >= 2:
-            print("\n".join(join(args[1])))
+            print("\n".join(join(args[1], seat=seat, via=via)))
             return 0
         if verb == "recv" and len(args) >= 2:
             t = _flag(args, "--timeout")
-            code, lines = recv(args[1], timeout=float(t) if t else None)
+            code, lines = recv(args[1], timeout=float(t) if t else None,
+                               seat=seat, via=via)
             print("\n".join(lines), file=sys.stderr if code else sys.stdout)
             return code
         if verb == "say" and len(args) >= 2:
             marker = _flag(args, "--marker")
-            print("\n".join(say(args[1], marker, " ".join(args[2:]))))
+            print("\n".join(say(args[1], marker, " ".join(args[2:]),
+                                seat=seat, via=via)))
             return 0
         if verb == "status":
-            print("\n".join(status()))
+            print("\n".join(status(seat=seat)))
             return 0
     except SystemExit as e:
         print(str(e), file=sys.stderr)
         return 2
-    print("usage: helm chat meld invite <peer> <topic...> | join <room> | "
-          "recv <room> [--timeout S] | say <room> --marker "
-          "YIELD|HOLD|DONE|ABORT <text...> | status", file=sys.stderr)
+    print(usage(via), file=sys.stderr)
     return 2
