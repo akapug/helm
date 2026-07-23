@@ -112,6 +112,40 @@ FIELD_SEP = "\x1e"          # ASCII RS: fields cannot be slid into one another
 QUOTE_CHARS = 72            # the quoted parent's snippet budget (one line)
 
 
+_ID_FIELDS = ("from", "tfrom", "rfrom", "dm")   # the NAME-carrying row fields
+
+
+def _dsan(s):
+    """DISPLAY-launder an IDENTITY string (a from/tfrom/rfrom/dm name) for a
+    text OR JSON sink: strip C0/C1 controls, Unicode format chars (bidi
+    overrides included), and line/paragraph separators, so a row's name column
+    can never reshape a terminal or reorder a rendered line. Defense-in-depth
+    BENEATH the validated join seam (home.chat_name already rejects a hostile
+    HELM_CHAT_NAME at the source) — a legit name is unchanged; this catches any
+    row whose name was planted OUTSIDE the seam (a foreign/pre-fix jsonl row).
+    Message TEXT is deliberately NOT touched — it legitimately carries unicode
+    (voice pastes, emoji, U+2028); only names are laundered."""
+    if not isinstance(s, str):
+        return s
+    return "".join(ch for ch in s if ch == "\t"
+                   or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
+
+
+def public_rows(rows):
+    """Copies of `rows` with every NAME field display-laundered — the shape the
+    web /api/chat wire and any JSON sink emits. The stored rows keep their raw
+    identity (reaction/reply matching indexes them); only the emitted copy is
+    laundered, one owner, mirroring seats._pub_row for the roster."""
+    out = []
+    for m in rows:
+        c = dict(m)
+        for k in _ID_FIELDS:
+            if isinstance(c.get(k), str):
+                c[k] = _dsan(c[k])
+        out.append(c)
+    return out
+
+
 def chat_dir():
     """HELM_CHAT_DIR else the RAM room dir — env read through home.env."""
     return home.env("CHAT_DIR") or DEFAULT_DIR
@@ -168,8 +202,8 @@ def whoname():
     deliveries speak one name — the rename verb rebinds both); an unknown
     session gets seats.auto_name's meaningful project+family name, and the
     opaque agent-<sid8> hex survives only as the fail-open floor."""
-    name = home.env("CHAT_NAME")
-    if name:
+    name = home.chat_name()   # THE validated seam: a hostile name is REJECTED
+    if name:                  # here (home.SeatNameError), never posted as `from`
         return name
     sid = home.session_id()
     if sid:
@@ -897,22 +931,24 @@ def _fmt(m, hhmm=True, idx=None):
     ts = str(m.get("ts") or "")
     stamp = (ts[11:16] or "--:--") if hhmm else (ts or "?")
     tag = "" if m.get("chain") is not None else " [unsigned]"
+    # identity fields are display-laundered (_dsan) so a name column can never
+    # reshape the terminal — defense-in-depth beneath the validated join seam.
     if m.get("react"):
         return "%s %s %s %s -> %s@%s%s" % (
-            stamp, m.get("from") or "?",
+            stamp, _dsan(m.get("from") or "?"),
             "un-reacted" if m.get("un") else "reacted",
-            m["react"], m.get("tfrom") or "?",
+            m["react"], _dsan(m.get("tfrom") or "?"),
             str(m.get("tts") or "")[11:16] or "--:--", tag)
     q = quote_of(m, idx) if idx else None
-    quote = ' ↳%s "%s"' % q if q else ""
+    quote = ' ↳%s "%s"' % (_dsan(q[0]), q[1]) if q else ""
     n = (idx or {}).get("replies", {}).get(tkey(m), 0)
     thread_tail = " ↩%d" % n if n else ""
     if m.get("dm"):     # a DM row is a DM everywhere it renders — never a
-        return "%s %s%s -> @%s (dm): %s%s%s" % (stamp, m.get("from") or "?",
-                                                quote, m["dm"],
+        return "%s %s%s -> @%s (dm): %s%s%s" % (stamp, _dsan(m.get("from") or "?"),
+                                                quote, _dsan(m["dm"]),
                                                 m.get("text") or "",
                                                 thread_tail, tag)
-    return "%s %s%s: %s%s%s" % (stamp, m.get("from") or "?", quote,
+    return "%s %s%s: %s%s%s" % (stamp, _dsan(m.get("from") or "?"), quote,
                                 m.get("text") or "", thread_tail, tag)
 
 

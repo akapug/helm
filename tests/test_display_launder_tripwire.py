@@ -40,7 +40,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import codexhomes, hooks, seats, todos, web  # noqa: E402
+from helm import chat, codexhomes, home, hooks, human, seats, todos, web  # noqa: E402,E501
 
 # the two payload markers every sink must strip: a screen-clear CSI (Cc) and a
 # right-to-left override (Cf, reorders the whole rendered line).
@@ -85,6 +85,20 @@ _ROSTER_CONSUMERS = {
         "emits a stored roster KEY to a raw sink."),
 }
 
+# COUNT-PIN per module: module-granularity alone let a NEW roster() call site
+# slip into an ALREADY-allowlisted module unreviewed (r6 was module-only). Pin
+# the exact number of call sites per module so a new one — even in an
+# allowlisted module — trips the wire until a human re-counts AND confirms the
+# new site launders. Regenerate deliberately with _roster_call_sites() below.
+_ROSTER_CALL_COUNTS = {
+    "codexhomes.py": 1,
+    "hooks.py": 1,
+    "seat.py": 2,
+    "seats.py": 15,
+    "todos.py": 1,
+    "web.py": 2,
+}
+
 # matches seats.roster() / _s.roster() / _seats.roster() / bare roster(), but
 # NOT the `def roster()` definition, nor write_roster()/gc_roster()/
 # roster_report()/roster_path() (\b keeps the underscore-joined names out, and
@@ -127,6 +141,22 @@ class RosterConsumerAllowlistTest(unittest.TestCase):
             "_seat_label, or INTERNAL-MATCHING-ONLY) AND, if it emits, wire it "
             "into the runtime sweep below.\n  sites: %s"
             % (offenders, [s for s in sites if s[0] in offenders]))
+
+    def test_roster_call_site_counts_are_pinned(self):
+        """COUNT-PIN, not just module-membership: a NEW roster() call site in an
+        ALREADY-allowlisted module (the exact gap r6 left — module-granular
+        guards can't see a fresh call site in a module already trusted) trips
+        this until a human re-counts and confirms the new site launders."""
+        from collections import Counter
+        counts = Counter(m for m, _, _ in _roster_call_sites())
+        actual = dict(counts)
+        self.assertEqual(
+            actual, _ROSTER_CALL_COUNTS,
+            "roster() call-site counts drifted from the pin. A new call site "
+            "(even in an allowlisted module) can reach a sink unreviewed — "
+            "verify each site launders its emitted key, then update "
+            "_ROSTER_CALL_COUNTS.\n  actual: %s\n  pinned: %s"
+            % (actual, _ROSTER_CALL_COUNTS))
 
     def test_allowlist_has_no_stale_entries(self):
         """The allowlist cannot rot: every allowlisted module must still call
@@ -284,6 +314,166 @@ class RosterSinkSweepTest(unittest.TestCase):
         self.assertIn(ESC, raw["project"])       # the stored key stays raw…
         # …and _seat_label is what makes the EMITTED copy inert.
         self._assert_inert("_seat_label", seats._seat_label(self.SEAT))
+
+
+# ── C. the SOURCE seam: every HELM_CHAT_NAME env read routes the accessor ────
+#
+# The r1..r6 rounds laundered SINKS; this closes the SOURCE. HELM_CHAT_NAME is
+# validated once, in home.chat_name (home.py) — a legit name is [A-Za-z0-9._-],
+# a control/bidi name is REJECTED at the seam. This grep enforces that NO other
+# module reads the var raw: a new `os.environ["HELM_CHAT_NAME"]` /
+# getenv / home.env("CHAT_NAME") anywhere but the accessor FAILS here, so a new
+# sink can never be fed an unvalidated name again.
+_RAW_ENV_READ = re.compile(
+    r"""(?:os\.)?(?:environ(?:\.get)?\s*[\[(]|getenv\s*\()\s*"""
+    r"""['"](?:HELM|MELD)_CHAT_NAME""")
+_HOME_ENV_READ = re.compile(r"""\benv\(\s*['"]CHAT_NAME['"]""")
+# ONLY this module may read the var — it is the accessor's home.
+_ACCESSOR_MODULE = "home.py"
+
+
+def _chat_name_read_sites():
+    """[(module, lineno, text)] for every helm/*.py line that reads the
+    HELM_CHAT_NAME env var — directly (os.environ/getenv) or via home.env's
+    'CHAT_NAME' indirection. Source-driven: a new reader shows up here with no
+    edit to this test, then fails unless it is the accessor module."""
+    sites = []
+    for fn in sorted(os.listdir(PKG)):
+        if not fn.endswith(".py"):
+            continue
+        with open(os.path.join(PKG, fn), encoding="utf-8") as fh:
+            for i, line in enumerate(fh, 1):
+                if _RAW_ENV_READ.search(line) or _HOME_ENV_READ.search(line):
+                    sites.append((fn, i, line.strip()))
+    return sites
+
+
+class SeatNameSourceSeamTest(unittest.TestCase):
+    def test_only_the_accessor_reads_helm_chat_name(self):
+        """Every HELM_CHAT_NAME ingestion routes home.chat_name — the ONE
+        validating seam. A raw read in any other module (a new sink fed an
+        unvalidated name) fails until it is routed through the accessor."""
+        sites = _chat_name_read_sites()
+        self.assertTrue(sites, "found no HELM_CHAT_NAME read — regex rotted")
+        offenders = sorted({(m, ln, t) for m, ln, t in sites
+                            if m != _ACCESSOR_MODULE})
+        self.assertFalse(
+            offenders,
+            "HELM_CHAT_NAME is read RAW outside the accessor (%s) — route it "
+            "through home.chat_name so the name is validated at the source.\n"
+            "  offenders: %s" % (_ACCESSOR_MODULE, offenders))
+
+    def test_the_accessor_actually_reads_it(self):
+        """The seam cannot rot to a no-op: home.py must still read the var, so
+        the allowlist-of-one names a real reader, not a stale entry."""
+        live = {m for m, _, _ in _chat_name_read_sites()}
+        self.assertIn(_ACCESSOR_MODULE, live,
+                      "the accessor module no longer reads HELM_CHAT_NAME — the "
+                      "seam moved; update _ACCESSOR_MODULE")
+
+
+# ── D. the chat.py runtime sweep: hostile name REJECTED at the seam ──────────
+#
+# r6 found chat.py's from-field (reaching `helm chat read`/`rooms`/--follow +
+# /api/chat raw) — the surface the roster()-scoped tripwire is structurally
+# blind to. The SOURCE fix closes it: a seat can NEVER post under a hostile
+# HELM_CHAT_NAME because home.chat_name rejects it before whoname/derive_seat
+# return. This class proves (1) the reject fires across every name reader, (2)
+# a legit name (codex-2/opus-integrator/ds4pro) still joins+posts+reads clean,
+# and (3) a name planted OUTSIDE the seam (a foreign jsonl row) is still
+# display-laundered on read AND /api/chat — belt (source) and suspenders (sink).
+class ChatHostileNameSweepTest(unittest.TestCase):
+    HOSTILE = "lane" + ESC + "[2J" + BIDI + "pwn"
+    LEGIT = ("codex-2", "opus-integrator", "ds4pro")
+
+    _ENV = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
+            "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
+            "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_ROOM",
+            "MELD_CHAT_ROOM", "HELM_CELL_BIN", "MELD_CELL_BIN")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-chatseam-")
+        self.prior = {k: os.environ.get(k) for k in self._ENV}
+        for k in self._ENV:
+            os.environ.pop(k, None)
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
+        os.environ["HELM_CHAT_NODE_URL"] = ""   # transport off — hermetic
+        self.cwd_prior = os.getcwd()
+        os.chdir(self.tmp)                       # default room stays 'main'
+
+    def tearDown(self):
+        os.chdir(self.cwd_prior)
+        for k, v in self.prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _assert_inert(self, label, text):
+        self.assertNotIn(ESC, text, "%s leaked ESC" % label)
+        self.assertNotIn(BIDI, text, "%s leaked bidi" % label)
+
+    # (1) the reject fires at the source, across EVERY name reader ------------
+    def test_hostile_helm_chat_name_is_rejected_at_the_seam(self):
+        os.environ["HELM_CHAT_NAME"] = self.HOSTILE
+        for label, fn in (("home.chat_name", home.chat_name),
+                          ("chat.whoname", chat.whoname),
+                          ("seats.derive_seat", seats.derive_seat),
+                          ("human.operator_name", human.operator_name)):
+            with self.assertRaises(home.SeatNameError, msg=label):
+                fn()
+
+    def test_hostile_name_cannot_post_and_the_error_is_safe(self):
+        os.environ["HELM_CHAT_NAME"] = self.HOSTILE
+        with self.assertRaises(home.SeatNameError) as cm:
+            chat.post("payload")
+        # the room never received the hostile row — the post was refused
+        _rows, total = chat.read("main")
+        self.assertEqual(total, 0, "a hostile name entered the room")
+        # the error names the offender SAFELY — no raw ESC/bidi in the message
+        self._assert_inert("SeatNameError message", str(cm.exception))
+        self.assertIn("\\x1b", str(cm.exception))   # hex-escaped, not raw
+
+    # (2) a LEGIT name still joins + posts + reads cleanly, pinned ------------
+    def test_legit_names_join_post_and_read_clean(self):
+        for name in self.LEGIT:
+            os.environ["HELM_CHAT_NAME"] = name
+            self.assertEqual(home.chat_name(), name)
+            self.assertEqual(chat.whoname(), name)
+            row = chat.post("hi from %s" % name, room=name)
+            self.assertEqual(row["from"], name)
+            rows, total = chat.read(name)
+            self.assertEqual(total, 1)
+            self.assertEqual(rows[0]["from"], name)
+            self._assert_inert(name, chat._fmt(rows[0]))
+            self.assertIn(name, chat._fmt(rows[0]))
+
+    # (3) a name planted OUTSIDE the seam is still laundered on the sinks -----
+    def test_planted_hostile_from_field_is_laundered_on_read_and_api(self):
+        # bypass the seam: write a raw jsonl row with a hostile `from`
+        os.makedirs(chat.chat_dir(), mode=0o700, exist_ok=True)
+        import json
+        with open(chat.room_path("main"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "2026-07-22T00:00:00", "from": self.HOSTILE,
+                                "text": "planted"}, ensure_ascii=False) + "\n")
+        rows, total = chat.read("main")
+        self.assertEqual(total, 1)
+        # CLI/journal render sink: laundered, but the visible name survives
+        line = chat._fmt(rows[0])
+        self._assert_inert("chat._fmt", line)
+        self.assertIn("lane", line)
+        self.assertIn("pwn", line)
+        # web /api/chat JSON sink: no raw ESC/bidi in any string or the wire
+        body, _ = web._api_chat({})
+        import json as _json
+        for s in _walk_strings(body):
+            self._assert_inert("/api/chat (walk)", s)
+        self._assert_inert("/api/chat (serialized)",
+                           _json.dumps(body, ensure_ascii=False))
+        # the laundered name still rode the wire (not vanished)
+        self.assertIn("lane", _json.dumps(body, ensure_ascii=False))
 
 
 if __name__ == "__main__":

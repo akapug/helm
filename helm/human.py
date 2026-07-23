@@ -32,7 +32,7 @@ _LOOPS = None         # test seam: cap the shell loop
 
 def operator_name():
     """The human at the helm: HELM_CHAT_NAME else david (the web default)."""
-    return home.env("CHAT_NAME") or "david"
+    return home.chat_name() or "david"   # THE validated seam (home.chat_name)
 
 
 def model_new(room="main"):

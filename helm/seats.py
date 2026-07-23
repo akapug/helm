@@ -193,8 +193,8 @@ def derive_seat(session=None, cwd=None):
     stable auto-name for the session (auto_name — project+family, deduped),
     else chat.whoname's law: a bare agent never gets the operator's
     identity."""
-    name = home.env("CHAT_NAME")
-    if name:
+    name = home.chat_name()   # THE validated seam (home.chat_name): a hostile
+    if name:                  # HELM_CHAT_NAME is rejected, never becomes a seat
         return name
     if session:
         return auto_name(session, cwd)

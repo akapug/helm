@@ -8,6 +8,57 @@ env2 new-with-old-fallback pattern). ~/.helm is the durable USER knowledge
 corpus; engine runtime state (any tool's ~/.config/<tool>) stays out of it.
 """
 import os
+import re
+
+# A legitimate seat name is an IDENTIFIER: codex-2, opus-integrator, ds4pro —
+# [A-Za-z0-9._-], bounded. HELM_CHAT_NAME is the one unvalidated join seam every
+# chat surface trusts (roster keys, chat from/tfrom/rfrom, hook pane names,
+# todos, codex capacity, …); it is validated HERE, at the source, exactly once,
+# so a control-char name never enters the system rather than being laundered at
+# each of a dozen sinks forever (the ESC/bidi display-launder class, closed at
+# the owner layer — decision-spirit #15).
+_SEAT_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
+
+
+class SeatNameError(ValueError):
+    """A hostile HELM_CHAT_NAME reached the join seam. The message names the
+    offending bytes SAFELY (ASCII-escaped via _safe_name) — the raw ESC/bidi
+    payload never rides the error onward into a terminal or log."""
+
+
+def _safe_name(raw):
+    """The offending name rendered as pure printable ASCII — ESC becomes \\x1b,
+    a bidi override U+202E becomes \\u202e — so the rejection message itself
+    can never carry the control/format payload it is reporting on. Bounded, so
+    a pathologically long name cannot flood the error."""
+    return str(raw)[:80].encode("unicode_escape").decode("ascii")
+
+
+def chat_name():
+    """The seat identity from HELM_CHAT_NAME (legacy MELD_CHAT_NAME) — THE one
+    validated ingestion seam for the seat name. Every os.environ read of this
+    var routes here (chat.whoname, seats.derive_seat, human.operator_name,
+    launch); no other module reads it raw (tests/test_display_launder_tripwire
+    enforces that with a source grep).
+
+    Returns the name when it is a legitimate seat identifier ([A-Za-z0-9._-],
+    like codex-2 / opus-integrator / ds4pro); None when unset OR empty (callers
+    fall through to their auto-name floor, preserving the old `if name:` /
+    `or "david"` semantics); and RAISES SeatNameError when the name carries ESC
+    / C0-C1 controls / Unicode bidi overrides (U+202A-E, U+2066-9) / any other
+    format-Cf. A control-char seat name is never legitimate, so it is REJECTED
+    at the source — it never becomes a roster key, a chat from-field, a hook
+    pane name, a todo row, or any future sink."""
+    raw = env("CHAT_NAME")
+    if not raw:                     # unset or explicitly empty -> fall through
+        return None
+    if not _SEAT_NAME_RE.match(raw):
+        raise SeatNameError(
+            "HELM_CHAT_NAME is not a legitimate seat name: '%s' "
+            "(a seat name is [A-Za-z0-9._-], like codex-2) — refusing to join "
+            "or post under it" % _safe_name(raw))
+    return raw
+
 
 # Per-project concept-category chain (the buildr .local family, lifted to a
 # user-level product-namespace home). Order is the organic dev cycle:

@@ -857,7 +857,14 @@ def _api_chat(qs):
         # hostile HELM_CHAT_NAME (ESC/bidi) cannot reach a non-browser consumer
         # or spoof the dropdown. The panel still matches on the exact stored
         # key when the owner sends; only this published copy is laundered.
-        out = {"room": room, "lines": rows[since if 0 <= since <= total else 0:],
+        # the rows carry raw NAME fields (from/tfrom/rfrom/dm) — a hostile one
+        # can only exist OUTSIDE the validated join seam (home.chat_name), but
+        # launder the EMITTED copy so no such name reaches a non-browser reader
+        # of the /api/chat JSON (chat.public_rows; the stored rows stay raw for
+        # reaction/reply matching, mirroring the roster's _pub_row owner).
+        out = {"room": room,
+               "lines": chat.public_rows(
+                   rows[since if 0 <= since <= total else 0:]),
                "total": total, "transport": chat.transport_status(),
                "rooms": _rooms_summary(roster),
                "roster": sorted(_s._seat_label(s) for s in roster),

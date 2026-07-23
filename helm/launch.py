@@ -19,7 +19,7 @@ import re
 import socket
 import sys
 
-from . import homes, hooks, seats
+from . import home, homes, hooks, seats
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -113,7 +113,9 @@ def cmd_launch(args):
     # class), it just launches un-homed — hoisted above the seat default
     # because stable_seat() derives from cwd too.
     cwd = seats.safe_cwd()
-    seat = (opts["seat"] or os.environ.get("HELM_CHAT_NAME")
+    # home.chat_name is THE validated seam: a hostile HELM_CHAT_NAME is rejected
+    # (home.SeatNameError) here rather than exported to the child as its identity.
+    seat = (opts["seat"] or home.chat_name()
             or stable_seat(cwd or "here"))
     room, source = seats.resolve_homing(opts["room"], cwd)
     room_source = "derived" if source == "derived" else None
