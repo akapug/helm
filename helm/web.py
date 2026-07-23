@@ -737,10 +737,13 @@ def _owner_signal(room, rows):
                 out["owner_mentions"] += 1
                 last = m
         if last is not None:
+            # _dsan the identity: a foreign/pre-fix row's from-field is not
+            # covered by the join seam and rides this owner-polled JSON raw.
+            from . import chat
             out["owner_mention_last"] = "%s|%s" % (last.get("ts") or "",
-                                                   last.get("from") or "")
+                                                   chat._dsan(last.get("from") or ""))
             out["owner_mention_preview"] = "%s: %s" % (
-                last.get("from") or "?", (last.get("text") or "")[:120])
+                chat._dsan(last.get("from") or "?"), (last.get("text") or "")[:120])
         return out
     except Exception:
         return {"owner_read": 0, "owner_unread": 0, "owner_mentions": 0}
@@ -1036,7 +1039,8 @@ def _turn_about():
             for m in rows:
                 t = m.get("turn")
                 if t:
-                    out[t] = {"kind": "chat", "from": m.get("from"), "room": room,
+                    out[t] = {"kind": "chat", "from": chat._dsan(m.get("from")),
+                              "room": room,
                               "text": str(m.get("text") or m.get("react") or "")[:80]}
     except Exception:
         pass
@@ -1144,8 +1148,10 @@ def _native_chat_pulse():
             out["msgs"] += sum(1 for m in rows if not m.get("react"))
             last = rows[-1]
             if (last.get("ts") or "") > out["last_ts"]:
+                from . import chat
                 out.update(last_ts=last.get("ts") or "",
-                           last_from=last.get("from") or "", last_room=room)
+                           last_from=chat._dsan(last.get("from") or ""),
+                           last_room=room)
     except Exception:
         pass  # a torn room reads as a quieter pulse, never an error
     return out

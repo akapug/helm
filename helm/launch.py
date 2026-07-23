@@ -113,9 +113,11 @@ def cmd_launch(args):
     # class), it just launches un-homed — hoisted above the seat default
     # because stable_seat() derives from cwd too.
     cwd = seats.safe_cwd()
-    # home.chat_name is THE validated seam: a hostile HELM_CHAT_NAME is rejected
-    # (home.SeatNameError) here rather than exported to the child as its identity.
-    seat = (opts["seat"] or home.chat_name()
+    # home.chat_name / home.validate_seat_arg are THE two validated seams: a
+    # hostile name from EITHER the --seat CLI arg or the HELM_CHAT_NAME env is
+    # rejected (home.SeatNameError) here rather than exported to the child as
+    # its identity or written as a roster key.
+    seat = (home.validate_seat_arg(opts["seat"]) or home.chat_name()
             or stable_seat(cwd or "here"))
     room, source = seats.resolve_homing(opts["room"], cwd)
     room_source = "derived" if source == "derived" else None

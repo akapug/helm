@@ -452,12 +452,15 @@ class ChatHostileNameSweepTest(unittest.TestCase):
 
     # (3) a name planted OUTSIDE the seam is still laundered on the sinks -----
     def test_planted_hostile_from_field_is_laundered_on_read_and_api(self):
-        # bypass the seam: write a raw jsonl row with a hostile `from`
+        # bypass the seam: write a raw jsonl row with a hostile `from`. The text
+        # carries an @owner mention + a turn id so the owner_mention_* AND ledger
+        # sinks (the reviewer's blind spots) are exercised, not only `lines`.
         os.makedirs(chat.chat_dir(), mode=0o700, exist_ok=True)
         import json
         with open(chat.room_path("main"), "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": "2026-07-22T00:00:00", "from": self.HOSTILE,
-                                "text": "planted"}, ensure_ascii=False) + "\n")
+                                "text": "@david look here", "turn": "t1"},
+                               ensure_ascii=False) + "\n")
         rows, total = chat.read("main")
         self.assertEqual(total, 1)
         # CLI/journal render sink: laundered, but the visible name survives
@@ -465,15 +468,30 @@ class ChatHostileNameSweepTest(unittest.TestCase):
         self._assert_inert("chat._fmt", line)
         self.assertIn("lane", line)
         self.assertIn("pwn", line)
-        # web /api/chat JSON sink: no raw ESC/bidi in any string or the wire
-        body, _ = web._api_chat({})
         import json as _json
-        for s in _walk_strings(body):
-            self._assert_inert("/api/chat (walk)", s)
-        self._assert_inert("/api/chat (serialized)",
-                           _json.dumps(body, ensure_ascii=False))
+        # every browser-polled JSON sink that carries a from-field: /api/chat
+        # (incl. owner_mention_last/preview) + the ledger endpoints.
+        for label, body in (("/api/chat", web._api_chat({})[0]),
+                            ("/api/ledger/native", web._api_ledger_native({})[0]),
+                            ("/api/ledger", web._api_ledger({})[0])):
+            for s in _walk_strings(body):
+                self._assert_inert(label + " (walk)", s)
+            self._assert_inert(label + " (serialized)",
+                               _json.dumps(body, ensure_ascii=False))
         # the laundered name still rode the wire (not vanished)
-        self.assertIn("lane", _json.dumps(body, ensure_ascii=False))
+        self.assertIn("lane", _json.dumps(web._api_chat({})[0], ensure_ascii=False))
+
+    def test_seat_arg_rejects_hostile_name_second_ingestion(self):
+        # the --seat CLI arg is the SECOND seat-name ingestion beside the env
+        # seam; home.validate_seat_arg rejects a hostile name so `helm launch
+        # --seat <hostile>` can never export it as HELM_CHAT_NAME or key a roster
+        # row (the source-grep tripwire covers env reads only).
+        from helm import home
+        with self.assertRaises(home.SeatNameError) as cm:
+            home.validate_seat_arg(self.HOSTILE)
+        self._assert_inert("SeatNameError(--seat)", str(cm.exception))
+        self.assertEqual(home.validate_seat_arg("codex-2"), "codex-2")
+        self.assertIsNone(home.validate_seat_arg(""))
 
 
 if __name__ == "__main__":

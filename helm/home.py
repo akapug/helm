@@ -60,6 +60,23 @@ def chat_name():
     return raw
 
 
+def validate_seat_arg(raw):
+    """The SECOND seat-name ingestion beside the env seam: a name supplied as a
+    CLI arg (helm launch/spawn --seat). Same rule as chat_name — None when empty
+    (caller falls through), the name when a legit identifier, SeatNameError on
+    ESC/control/bidi — so a hostile --seat can never be exported as the child's
+    HELM_CHAT_NAME or written as a roster key (the source-grep tripwire guards
+    env reads only; this closes the arg path)."""
+    if not raw:
+        return None
+    if not _SEAT_NAME_RE.match(raw):
+        raise SeatNameError(
+            "--seat is not a legitimate seat name: '%s' "
+            "(a seat name is [A-Za-z0-9._-], like codex-2) — refusing to "
+            "launch under it" % _safe_name(raw))
+    return raw
+
+
 # Per-project concept-category chain (the buildr .local family, lifted to a
 # user-level product-namespace home). Order is the organic dev cycle:
 # priors art feeds prd, build happens in the repo, evals then journal then archive.
