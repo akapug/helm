@@ -405,7 +405,13 @@ def send(recipient, lane, message, ref, note=None, deadline_s=DEFAULT_DEADLINE_S
         if err:
             return None, err, False
     from . import seats
-    sender = seats.derive_seat(home.session_id())
+    try:
+        sender = seats.derive_seat(home.session_id())
+    except home.SeatNameError:
+        # A hostile HELM_CHAT_NAME is rejected at the validated source
+        # (home.chat_name raises); surface it as the same graceful sender
+        # refusal the exact-token check gives, never an uncaught raise.
+        return None, "sender must be an exact 1-64 character seat token", False
     probe, err = _base(recipient, lane, ref, note, deadline_s, repo,
                        sender=sender, message_hash=hashlib.blake2b(
                            message.encode("utf-8"), digest_size=16).hexdigest())

@@ -809,10 +809,13 @@ def _owner_signal(room, rows):
                 out["owner_mentions"] += 1
                 last = m
         if last is not None:
+            # _dsan the identity: a foreign/pre-fix row's from-field is not
+            # covered by the join seam and rides this owner-polled JSON raw.
+            from . import chat
             out["owner_mention_last"] = "%s|%s" % (last.get("ts") or "",
-                                                   last.get("from") or "")
+                                                   chat._dsan(last.get("from") or ""))
             out["owner_mention_preview"] = "%s: %s" % (
-                last.get("from") or "?", (last.get("text") or "")[:120])
+                chat._dsan(last.get("from") or "?"), (last.get("text") or "")[:120])
         return out
     except Exception:
         return {"owner_read": 0, "owner_unread": 0, "owner_mentions": 0}
@@ -838,8 +841,12 @@ def _room_seats(room, rows, roster):
     seen, out = set(), []
 
     def _row(seat):
+        # the seat KEY rides the sidebar JSON raw — launder the emitted label
+        # (the raw key still indexes roster[]/last_seen above) so a hostile
+        # HELM_CHAT_NAME cannot spoof the channel roster or a non-browser reader.
         ls = _s.last_seen(seat, roster[seat])
-        return {"seat": seat, "presence": _s.presence_of(ls), "last_seen": ls}
+        return {"seat": _s._seat_label(seat),
+                "presence": _s.presence_of(ls), "last_seen": ls}
 
     for m in reversed(rows[-64:]):           # recent activity, newest first
         frm = str(m.get("from") or "")
@@ -914,9 +921,29 @@ def _api_chat(qs):
         except Exception:
             roster = {}
         rows, total = chat.read(room)   # one read serves the slice AND the signal
-        out = {"room": room, "lines": rows[since if 0 <= since <= total else 0:],
+        try:
+            # the fleet-wide presence bar (dot + one status line per seat) —
+            # rides the poll the panel already runs; light (no cursor scans)
+            presence = _s.presence_report()
+        except Exception:
+            presence = []
+        # `roster` feeds the composer's @mention list — the seat KEYS ride
+        # the JSON wire raw (ensure_ascii=False), so launder each label so a
+        # hostile HELM_CHAT_NAME (ESC/bidi) cannot reach a non-browser consumer
+        # or spoof the dropdown. The panel still matches on the exact stored
+        # key when the owner sends; only this published copy is laundered.
+        # the rows carry raw NAME fields (from/tfrom/rfrom/dm) — a hostile one
+        # can only exist OUTSIDE the validated join seam (home.chat_name), but
+        # launder the EMITTED copy so no such name reaches a non-browser reader
+        # of the /api/chat JSON (chat.public_rows; the stored rows stay raw for
+        # reaction/reply matching, mirroring the roster's _pub_row owner).
+        out = {"room": room,
+               "lines": chat.public_rows(
+                   rows[since if 0 <= since <= total else 0:]),
                "total": total, "transport": chat.transport_status(),
-               "rooms": _rooms_summary(roster), "roster": sorted(roster)}
+               "rooms": _rooms_summary(roster),
+               "roster": sorted(_s._seat_label(s) for s in roster),
+               "presence": presence}
         out.update(_owner_signal(room, rows))
         return out, 200
     except Exception:
@@ -1084,7 +1111,8 @@ def _turn_about():
             for m in rows:
                 t = m.get("turn")
                 if t:
-                    out[t] = {"kind": "chat", "from": m.get("from"), "room": room,
+                    out[t] = {"kind": "chat", "from": chat._dsan(m.get("from")),
+                              "room": room,
                               "text": str(m.get("text") or m.get("react") or "")[:80]}
     except Exception:
         pass
@@ -1192,8 +1220,10 @@ def _native_chat_pulse():
             out["msgs"] += sum(1 for m in rows if not m.get("react"))
             last = rows[-1]
             if (last.get("ts") or "") > out["last_ts"]:
+                from . import chat
                 out.update(last_ts=last.get("ts") or "",
-                           last_from=last.get("from") or "", last_room=room)
+                           last_from=chat._dsan(last.get("from") or ""),
+                           last_room=room)
     except Exception:
         pass  # a torn room reads as a quieter pulse, never an error
     return out

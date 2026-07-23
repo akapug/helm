@@ -1736,6 +1736,35 @@ frames; this lane is called *delivery*.)
   rode it dropped stale-but-persisted seats on presence alone; retired).
   Junk rows leave only via `helm chat seat gc`, the one cleanup owner. The
   web twin is the **seats** panel in the ledger tab (`GET /api/chat/roster`).
+- **`helm chat status [<one-line> | --clear] [--seat S]`** — the seat's
+  ICQ-style away message: ONE glanceable line of "what am I on", written on
+  the seat's roster row (through the roster writer's flock — no second
+  writer path; scrubbed + clipped to 160 bytes). Bare `status` shows the
+  seat's current line. Every surface composes the same line with the same
+  precedence — **fresh explicit status > live claim** (`working lane/<x>,
+  <ttl> left`) **> stale explicit status > home room** — so the web chat's
+  fleet **presence bar** (dot 🟢 fresh / 🟡 quiet / ⚫ gone + seat + line,
+  one row per seat, visible from every room, riding the existing `/api/chat`
+  poll), `helm chat seats`, and the ledger seats panel all glance
+  identically. An explicit line always shows its AGE (`▸ line (2d)`; the web
+  bar dims a stale one) and DECAYS: past `STATUS_FRESH_S` (4h) it yields to
+  a live claim — a holding lease is fresher evidence than an hours-old
+  announcement, so a 3-day-old away message can never mask a seat verifiably
+  working a lane. With no claim the stale line still shows, aged. The line
+  persists until overwritten or `--clear`ed; setting your own is also a
+  presence beat. Cross-seat writes (`--seat` ≠ self) stay allowed — a
+  coordinator annotating a wedged seat is the point — but record the writer
+  (`status_by`, post-attribution parity), rendered as `(by X)`; the beat
+  lands on the writer, never the annotated target. Reader-side, whatever
+  tier wins is scrubbed + clipped in `status_line` itself, `claims_list`
+  launders resource/holder for EVERY claim surface (the seats footer,
+  `helm chat claims`, the web ledger), and the roster report launders the
+  display columns (home room, project, todo cell) — a planted claim
+  resource or junk roster field cannot reshape a terminal anywhere the
+  fleet is glanced. A corrupt row fails open to `?` instead of blanking
+  the bar, and a junk `status_ts` — missing, non-numeric, OR dated into
+  the future past a small skew allowance — counts as stale: an unknown
+  (or unfalsifiably "fresh") age must never outrank a live lease.
 - **`helm chat seat rename <sid|oldname> <newname>`** — bind a live agent to
   a memorable @name (`old` = seat name or an 8+-char session-id prefix). The
   roster row AND every keyed state file move together, so tracked delivery

@@ -42,6 +42,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 
 from . import home, pk
 
@@ -152,6 +153,40 @@ def _apply_task(items, tool, tin, resp):
 
 # ── digest ──────────────────────────────────────────────────────────────────
 
+def _scrub(s):
+    """seats._scrub's reader-side label defense, local copy (importing seats
+    here would cycle): strip C0/C1 controls, format chars (incl. bidi
+    overrides), line/paragraph separators — a todo whose text carries
+    \\x1b[2J must not reshape the terminal `helm chat seats` prints its
+    task cell into. Capture's whitespace-collapse does NOT strip these
+    (str.split() only splits on whitespace), so the read seam must."""
+    return "".join(ch for ch in s if ch == "\t"
+                   or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
+
+
+def _clip(s, cap):
+    """Byte-budget clip on a codepoint boundary (seats._clip's law, local
+    copy — importing seats here would cycle)."""
+    enc = s.encode("utf-8")
+    if len(enc) <= cap:
+        return s
+    end = cap
+    while end > 0 and (enc[end] & 0xC0) == 0x80:
+        end -= 1
+    return enc[:end].decode("utf-8", errors="ignore") + "…"
+
+
+def _lbl(s, cap=80):
+    """Launder a roster-borne KEY for a DISPLAY sink: the seat name and the
+    project ride the fleet table's first columns AND the /api/todos JSON, and
+    the seat key is the unvalidated HELM_CHAT_NAME join seam — a hostile one
+    (\\x1b[2J screen-clear, bidi override) must not reshape the operator's
+    terminal or the panel. Mirrors _scrub's law for the todo TEXT, extended to
+    the key/project (the two roster-borne strings _row emits raw before this).
+    None/empty pass through untouched."""
+    return _clip(_scrub(str(s)).strip(), cap) if s else s
+
+
 def digest(items):
     """The pull surface's one-line summary of a list:
     {"active","done","total","fp"}. `fp` is the MATERIAL fingerprint — the
@@ -161,10 +196,12 @@ def digest(items):
 
     Rows that are not well-formed dicts are DROPPED, not trusted: this reads
     a file a hand-edit or a truncated write can reach, and every consumer of
-    the digest (CLI, roster, web) has to survive it."""
+    the digest (CLI, roster, web) has to survive it. `active` leaves here
+    SCRUBBED for the same reason — every surface (CLI task cell, fleet
+    table, web panel) renders it as a one-line label."""
     items = [i for i in (items or []) if isinstance(i, dict)] \
         if isinstance(items, list) else []
-    active = next((str(i.get("text") or "") for i in items
+    active = next((_scrub(str(i.get("text") or "")) for i in items
                    if i.get("status") == ACTIVE), None)
     done = sum(1 for i in items if i.get("status") == DONE)
     return {"active": active, "done": done, "total": len(items),
@@ -331,10 +368,22 @@ ORPHAN_CAP = 25         # unclaimed sessions shown, freshest first
 
 def _row(name, project, st, items):
     d = digest(st.get("items"))
-    r = {"seat": name, "project": project, "active": d["active"],
+    # the seat KEY and project are roster-borne DISPLAY strings — laundered
+    # at this emit boundary so neither the fleet table nor /api/todos JSON
+    # carries raw ESC/bidi (digest already scrubs the todo TEXT; this is the
+    # same law extended to the key/project). The raw key still drove the
+    # roster read upstream; only the emitted copy is laundered.
+    r = {"seat": _lbl(name), "project": _lbl(project), "active": d["active"],
          "done": d["done"], "total": d["total"], "ts": _ts(st)}
     if items:
-        r["items"] = [i for i in (st.get("items") or []) if isinstance(i, dict)]
+        # `helm todos --all --json` ships the FULL item list — a display sink
+        # like every other. Launder EVERY string field of each item (the `text`
+        # line renders in the panel/CLI) so a hostile todo cannot ride the JSON
+        # wire raw. Field-agnostic: a new string field is laundered the moment
+        # it appears, not a hand-maintained per-key list.
+        r["items"] = [{k: (_lbl(v, 200) if isinstance(v, str) and v else v)
+                       for k, v in i.items()}
+                      for i in (st.get("items") or []) if isinstance(i, dict)]
     return r
 
 

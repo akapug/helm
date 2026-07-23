@@ -496,9 +496,13 @@ def uncovered_panes(proc=None, quiet_s=900):
             ls = seats.last_seen(name, row) if row else None
             if row and ls and now - ls < quiet_s:
                 continue
-            p["reason"] = ("no roster row for '%s' — never joined" % name
+            # the seat name is a raw HELM_CHAT_NAME (from /proc environ, the
+            # unvalidated join seam) — launder it INTO the reason so the
+            # printed line cannot reshape the operator's terminal.
+            lbl = seats._seat_label(name)
+            p["reason"] = ("no roster row for '%s' — never joined" % lbl
                            if not row else "roster row for '%s' is stale "
-                           "(%.0fm quiet)" % (name, (now - (ls or 0)) / 60))
+                           "(%.0fm quiet)" % (lbl, (now - (ls or 0)) / 60))
             out.append(p)
         return out
     except Exception:
@@ -537,6 +541,7 @@ def surface_uncovered(out=None):
     Same law for signing: a pane launched before the signing trio landed in
     launch_line posts [unsigned] forever (a process cannot retrofit its own
     environment) — name those too (no-silent-break)."""
+    from . import seats
     out = out or sys.stdout
     rows = uncovered_panes()
     if rows:
@@ -544,15 +549,19 @@ def surface_uncovered(out=None):
               "them (an idle pane cannot self-heal into delivery):" % len(rows),
               file=out)
         for p in rows:
-            print("  pid %-7d %-14s %s" % (p["pid"], p["seat"] or p["family"] or "?",
-                                           p["reason"]), file=out)
+            # launder the printed name column — a hostile HELM_CHAT_NAME rides
+            # p["seat"]/p["family"] raw from the /proc scan.
+            print("  pid %-7d %-14s %s" % (
+                p["pid"], seats._seat_label(p["seat"] or p["family"] or "?"),
+                p["reason"]), file=out)
     sign = unsigned_panes()
     if sign:
         print("helm hooks: %d running pane(s) posting UNSIGNED (no signing env) — "
               "relaunch from their minted launch.sh to sign:" % len(sign), file=out)
         for p in sign:
-            print("  pid %-7d %-14s %s" % (p["pid"], p["seat"] or p["family"] or "?",
-                                           p["sign_reason"]), file=out)
+            print("  pid %-7d %-14s %s" % (
+                p["pid"], seats._seat_label(p["seat"] or p["family"] or "?"),
+                p["sign_reason"]), file=out)
 
 
 _CODEX_PENDING = ("codex: recipe pending — docs/HOOKS.md carries no mechanical "

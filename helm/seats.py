@@ -122,6 +122,7 @@ from . import chat, home, pk
 
 MAX_BYTES = 200          # the delivery clip — meld's whisper frame budget
 PREVIEW_CHARS = 80       # roster panel preview
+SEAT_BYTES = 80          # the seat label clip — a name is a glance, not a payload
 FRESH_S, QUIET_S = 120, 900
 DEFAULT_TTL = 900        # claims lease default
 SCAN_CAP = 512 * 1024    # deliver never reads more than this per room
@@ -198,8 +199,8 @@ def derive_seat(session=None, cwd=None):
     stable auto-name for the session (auto_name — project+family, deduped),
     else chat.whoname's law: a bare agent never gets the operator's
     identity."""
-    name = home.env("CHAT_NAME")
-    if name:
+    name = home.chat_name()   # THE validated seam (home.chat_name): a hostile
+    if name:                  # HELM_CHAT_NAME is rejected, never becomes a seat
         return name
     if session:
         return auto_name(session, cwd)
@@ -766,14 +767,15 @@ def rename_seat(old, new):
         r[new] = r.pop(seat)
         pk.write_json(roster_path(), r)
         _move_seat_state(seat, new)
-    return True, ("seat %s -> %s: @%s now delivers to it. If it armed a "
-                  "beacon on the old name, re-arm: Monitor(command: \"helm "
+    old_lbl = _seat_label(seat)   # raw key drove r[new]=r.pop(seat); echoed
+    return True, ("seat %s -> %s: @%s now delivers to it. If it armed a "  # old
+                  "beacon on the old name, re-arm: Monitor(command: \"helm "  # name
                   "chat wait --seat %s --follow\", persistent: true) — if Monitor "
                   "is not in your surface it is DEFERRED: ToolSearch(query: "
-                  "\"select:Monitor\") first. A seat "
-                  "launched with HELM_CHAT_NAME=%s re-registers the old name "
+                  "\"select:Monitor\") first. A seat "  # laundered (new is validated
+                  "launched with HELM_CHAT_NAME=%s re-registers the old name "  # safe)
                   "on its next session — relaunch to make the rename stick "
-                  "there." % (seat, new, new, new, seat))
+                  "there." % (old_lbl, new, new, new, old_lbl))
 
 
 def set_mute(seat, room, on=True):
@@ -793,11 +795,12 @@ def set_mute(seat, room, on=True):
         row["mute"] = sorted(mute)
         r[seat] = row
         pk.write_json(roster_path(), r)
-    if on:
+    lbl = _seat_label(seat)   # raw key drove the dict write above; the echoed
+    if on:                    # label is laundered (a hostile HELM_CHAT_NAME
         return True, ("%s muted for %s — @%s mentions and DMs still surface "
-                      "(unmute: helm chat seat unmute %s)"
-                      % (room, seat, seat, room))
-    return True, "%s unmuted for %s" % (room, seat)
+                      "(unmute: helm chat seat unmute %s)"  # must not reshape
+                      % (room, lbl, lbl, room))             # the CLI terminal)
+    return True, "%s unmuted for %s" % (room, lbl)
 
 
 def mutes(seat):
@@ -865,11 +868,15 @@ def rehome_seat(token, room):
                            % token)
         row = r.get(seat) or {}
         old = row.get("home_room")
+        # raw seat key drove _resolve_seat + the dict write; the echoed seat
+        # label AND the roster-borne old home_room are laundered so neither a
+        # hostile HELM_CHAT_NAME nor a planted home_room reshapes the terminal.
+        lbl, old_lbl = _seat_label(seat), _seat_label(old) if old else old
         if clear and not old and row.get("home_room_source") == "operator":
-            return True, "seat %s is already un-homed (all rooms)" % seat
+            return True, "seat %s is already un-homed (all rooms)" % lbl
         if not clear and home_room == old \
                 and row.get("home_room_source") == "operator":
-            return True, "seat %s is already homed to #%s" % (seat, home_room)
+            return True, "seat %s is already homed to #%s" % (lbl, home_room)
         new_home = None if clear else home_room
         newly_admitted = _rooms_to_baseline(old, new_home)
         _baseline_rooms(seat, row, newly_admitted)
@@ -883,10 +890,10 @@ def rehome_seat(token, room):
         if clear:
             return True, ("seat %s re-homed %s -> un-homed (all rooms); "
                           "takes effect on its next delivery scan"
-                          % (seat, old or "un-homed"))
+                          % (lbl, old_lbl or "un-homed"))
     return True, ("seat %s re-homed %s -> #%s; delivery is now { #%s, #main } "
                   "— takes effect on its next delivery scan (no relaunch)"
-                  % (seat, old or "un-homed", home_room, home_room))
+                  % (lbl, old_lbl or "un-homed", home_room, home_room))
 
 
 # ---------------------------------------------------------------------------
@@ -1271,8 +1278,8 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
         where = (" dm" if is_dm                           # every surface —
                  else "" if room == "main" else " #%s" % room)  # never a room
         line = "[helm chat%s → %s] %s: %s" % (            # the reply must land
-            where, seat, row.get("from") or "?",          # where the word came
-            _clip(_scrub(row.get("text") or "")))
+            where, seat, chat._dsan(row.get("from") or "?"),  # identity laundered
+            _clip(_scrub(row.get("text") or "")))          # (text carries unicode)
         if waiting:
             line += " (+%d waiting — helm chat read%s)" % (
                 waiting, " --dm" if is_dm
@@ -1941,7 +1948,7 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
                 lines = ["  %s%s: %s" % (
                     "[dm] " if rm.startswith(chat.DM_PREFIX)
                     else "" if rm == room else "[#%s] " % rm,
-                    r.get("from") or "?",
+                    chat._dsan(r.get("from") or "?"),  # identity laundered
                     _clip(_scrub(r.get("text") or ""), 120))
                          for rm, r in pending[:5]]
                 if len(pending) > 5:
@@ -2085,7 +2092,15 @@ def claims_list():
     (tmp + os.replace) so a lockless read never sees a torn file. Only
     when a row actually expired does the GC leg take the flock, re-read,
     and persist the sweep — a watched roster (web polls every 3s) must
-    never churn .claims.json or contend with real claim/release traffic."""
+    never churn .claims.json or contend with real claim/release traffic.
+
+    Reader-side law (same as status_line): resource + holder leave here
+    scrubbed (Cc/Cf incl. bidi, Zl/Zp) + clipped — this is the ONE publish
+    boundary every claim surface reads (the seats footer, `helm chat
+    claims`, the web ledger), so a hostile claim("evil\\x1b[2J…") cannot
+    clear/retitle the operator's terminal through any of them. The stored
+    file keeps the raw key: release/extend match on the dict itself, never
+    on this table."""
     raw = pk.read_json(claims_path(), {}) or {}
     c = _sweep(raw)
     if len(c) != len(raw):  # sweep only ever drops rows
@@ -2095,7 +2110,10 @@ def claims_list():
             if len(c) != len(raw):
                 pk.write_json(claims_path(), c)
     now = _now_mono()
-    return [{"resource": r, "holder": v.get("holder"), "fence": v.get("fence"),
+    return [{"resource": _clip(_scrub(str(r)).strip(), STATUS_BYTES),
+             "holder": _clip(_scrub(str(v.get("holder") or "")).strip(), 40)
+             or None,
+             "fence": v.get("fence"),
              "remaining": int(v.get("exp_mono", now) - now)}
             for r, v in sorted(c.items()) if r != "_fence"]
 
@@ -2109,6 +2127,192 @@ def presence_of(ls):
         return "absent"
     age = time.time() - ls
     return "fresh" if age < FRESH_S else "quiet" if age < QUIET_S else "absent"
+
+
+# the ICQ-style glance: one dot + one line per seat, on every surface (the
+# web presence bar, `helm chat seats`, the roster payload) — same truth
+PRESENCE_DOTS = {"fresh": "\U0001f7e2",    # 🟢 active at a tool boundary
+                 "quiet": "\U0001f7e1",    # 🟡 seated, idle a while
+                 "absent": "⚫"}       # ⚫ gone (no recent beat)
+
+STATUS_BYTES = 160   # the explicit one-liner stays a glance, never a post
+
+
+def presence_dot(p):
+    return PRESENCE_DOTS.get(p, PRESENCE_DOTS["absent"])
+
+
+def set_status(seat, text, by=None):
+    """(ok, message). The seat's explicit one-line status ('what am I on') —
+    `helm chat status <line>` / `--clear`. Rides THE roster writer's flock
+    (a sibling of write_roster, mutating only the status fields — never a
+    second writer path; the homing lane unified writers for a reason).
+    Scrubbed + byte-clipped like every roster-borne label. Cross-seat writes
+    stay allowed (a coordinator annotating a wedged seat is the point), but
+    a writer that isn't the target is RECORDED as status_by — the same
+    attribution parity posts have; a self-set carries no by field. The
+    presence beat lands on the WRITER (the seat evidently alive is the one
+    announcing, not a wedged target being annotated)."""
+    if not seat:
+        return False, "no seat to set a status on (join first, or --seat S)"
+    line = _clip(_scrub(str(text or "")).strip(), STATUS_BYTES) or None
+    by = _clip(_scrub(str(by or "")).strip(), 40) or None
+    chat._ensure_dir()
+    with _flocked(roster_path() + ".lock"):
+        r = roster()
+        row = r.get(seat)
+        if row is None:
+            return False, ("no roster row for %r — sessions join on start "
+                           "(helm hooks install wires it); `helm chat status "
+                           "--seat <live-seat>` targets an existing one" % seat)
+        if line:
+            row["status"] = line
+            row["status_ts"] = time.time()
+            if by and by != seat:
+                row["status_by"] = by
+            else:
+                row.pop("status_by", None)
+        else:
+            row.pop("status", None)
+            row.pop("status_ts", None)
+            row.pop("status_by", None)
+        r[seat] = row
+        pk.write_json(roster_path(), r)
+    touch_seen(by or seat)
+    lbl = _seat_label(seat)   # raw key drove the write; echoed label laundered
+    return True, ("%s ▸ %s" % (lbl, line) if line
+                  else "%s status cleared" % lbl)
+
+
+def _fmt_left(sec):
+    sec = max(0, int(sec or 0))
+    if sec >= 3600:
+        return "%dh%02dm" % (sec // 3600, sec % 3600 // 60)
+    return "%dm" % (sec // 60) if sec >= 60 else "<1m"
+
+
+_WORKTREE_RES = re.compile(r"^worktree:([^:]+):(.+)$")
+
+STATUS_FRESH_S = 4 * 3600   # how long an explicit status outranks LIVE truth:
+# past this age it yields to a live claim — a holding lease is fresher
+# evidence of what the seat is on than an hours-old announcement. A fresh
+# status still beats a claim; a stale status with NO claim still shows (with
+# its age on every surface). A missing/junk status_ts counts as stale:
+# unknown age must never outrank a live lease.
+
+STATUS_SKEW_S = 300   # clock-skew allowance on status_ts: a ts slightly in
+# the future (NTP drift between writers) still reads age 0; FURTHER in the
+# future is a plant — clamping it to 0 forever would invert the decay law
+# (perpetually 'fresh', outranking every live lease), so it counts as junk,
+# same bucket as a missing ts.
+
+
+def _status_age(row):
+    """Seconds since the explicit status was set, or None (no status, or a
+    planted row without a sane status_ts — missing, non-numeric, or dated
+    beyond STATUS_SKEW_S into the future)."""
+    ts = row.get("status_ts")
+    if row.get("status") and isinstance(ts, (int, float)):
+        d = time.time() - ts
+        if d >= -STATUS_SKEW_S:
+            return max(0, int(d))
+    return None
+
+
+def _status_by(row):
+    """The recorded cross-seat writer for '(by X)', scrubbed reader-side."""
+    b = row.get("status_by")
+    return (_clip(_scrub(str(b)).strip(), 40) or None) if b else None
+
+
+def _fmt_age(sec):
+    sec = max(0, int(sec or 0))
+    if sec >= 86400:
+        return "%dd" % (sec // 86400)
+    if sec >= 3600:
+        return "%dh" % (sec // 3600)
+    return "%dm" % (sec // 60) if sec >= 60 else "<1m"
+
+
+def status_line(row, claim=None):
+    """(line, source) — the ONE status line every surface shows, composed
+    from what already exists. Precedence: a FRESH explicit status (the seat
+    said so, within STATUS_FRESH_S) > a live claim (the lease says what it
+    holds) > a stale explicit status > the home room (where it lives).
+    source ∈ status|claim|home names the winning tier. Reader-side law:
+    WHICHEVER tier wins, the line leaves here scrubbed (Cc/Cf incl. bidi,
+    Zl/Zp) + clipped — a planted claim resource or roster field must not
+    reshape a terminal or reorder the seats table. Never raises: a junk row
+    reads '?' (one corrupt row must not blank the whole fleet bar)."""
+    try:
+        s = str(row.get("status") or "").strip()
+        age = _status_age(row)
+        fresh = age is not None and age <= STATUS_FRESH_S
+        if s and (fresh or not claim):
+            line, source = s, "status"
+        elif claim:
+            left = _fmt_left(claim.get("remaining"))
+            m = _WORKTREE_RES.match(str(claim.get("resource") or ""))
+            line, source = (("working lane/%s (%s), %s left"
+                             % (m.group(2), m.group(1), left)) if m else
+                            "holds %s, %s left"
+                            % (claim.get("resource"), left)), "claim"
+        elif row.get("home_room"):
+            line, source = "in #%s" % row["home_room"], "home"
+        else:
+            line, source = ("in %s" % row["project"]
+                            if row.get("project") else ""), "home"
+        return _clip(_scrub(str(line)).strip(), STATUS_BYTES), source
+    except Exception:
+        return "?", "home"
+
+
+def _claims_by_holder(cl=None):
+    """holder -> its longest-lived live claim (the most work-shaped one)."""
+    by = {}
+    for c in (claims_list() if cl is None else cl):
+        h = c.get("holder")
+        if h and (h not in by
+                  or (c.get("remaining") or 0) > (by[h].get("remaining") or 0)):
+            by[h] = c
+    return by
+
+
+def presence_report():
+    """The fleet-wide glance bar: one LIGHT row per roster seat — presence
+    dot + the one status line — with zero cursor scans (roster_report walks
+    pending; this must stay cheap enough to ride every ~2s web poll).
+    [{seat, presence, dot, last_seen, status, line, source}], fresh first."""
+    try:
+        by = _claims_by_holder()
+    except Exception:
+        by = {}
+    rank = {"fresh": 0, "quiet": 1, "absent": 2}
+    out = []
+    for seat, row in sorted(roster().items()):
+        try:
+            ls = last_seen(seat, row)
+            p = presence_of(ls)
+            line, source = status_line(row, by.get(seat))
+            # the fleet bar is a roster-consuming SURFACE too: every string it
+            # ships (seat KEY, status, status_by, line, source) rides the SAME
+            # publish boundary as roster_report — presence_report escaping this
+            # choke point is exactly how the 5th ESC surface was born (r4). One
+            # owner, not a scrub scattered per surface.
+            out.append(_pub_row({
+                        "seat": seat, "presence": p, "dot": presence_dot(p),
+                        "last_seen": ls, "status": row.get("status"),
+                        "status_age": _status_age(row),
+                        "status_by": _status_by(row),
+                        "line": line, "source": source}))
+        except Exception:   # per-row fail-open: one junk roster row renders
+            out.append(_pub_row({    # '?', it never blanks the whole fleet bar
+                "seat": seat, "presence": "absent",
+                "dot": presence_dot("absent"), "last_seen": None,
+                "status": None, "status_age": None, "status_by": None,
+                "line": "?", "source": "home"}))
+    out.sort(key=lambda s: (rank.get(s["presence"], 3), s["seat"]))
+    return out
 
 
 REAP_S = 3600   # presence window: a beat this recent is live evidence on its
@@ -2308,6 +2512,52 @@ def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
     return rows, pruned
 
 
+def _seat_label(s):
+    """Launder a seat KEY for terminal display (the `seat gc` listing and
+    `status` bare-show read the roster dict directly, not roster_report).
+    A legit seat — [A-Za-z0-9._-], a slug, or auto_name — is unchanged; a
+    hostile HELM_CHAT_NAME (the seat key is unvalidated at the join seam)
+    loses its ESC/bidi so the most prominent, first-printed column cannot
+    reshape the operator's terminal. The report path routes through
+    _pub_row; this is the same law for the two direct-read surfaces."""
+    return _clip(_scrub(str(s)).strip(), SEAT_BYTES)
+
+
+# per-field byte caps for a roster row's DISPLAY strings; unlisted string
+# fields ride the default. seat + session are here too so NO roster-borne
+# string — the seat KEY included — reaches an operator terminal unlaundered.
+_ROW_CAPS = {"seat": SEAT_BYTES, "session": MAX_BYTES, "project": 80,
+             "cwd": 160, "home_room": 40, "home_room_source": 40,
+             "status": STATUS_BYTES, "status_by": 40, "line": STATUS_BYTES,
+             "source": 40, "preview": PREVIEW_CHARS, "active": STATUS_BYTES}
+
+
+def _pub_row(d):
+    """The ONE publish boundary for a roster row: scrub+clip EVERY string
+    field (Cc/Cf incl. bidi, Zl/Zp) at its per-field cap, so no roster-borne
+    string — seat KEY, project, cwd, status, status_by, line, source,
+    preview, and any FUTURE string field — can reshape an operator terminal
+    or reorder the fleet table. RECURSES into nested dicts and lists so a
+    nested cell (the todo mirror's `active` text, or any future nested
+    surface) is laundered by the same enumeration — not a hand-maintained
+    special case that the next nested field would silently escape. Non-string
+    values (last_seen, pending, dot, status_age) and falsy strings pass
+    through. The stored roster keeps its raw keys (rename/claim match the dict
+    itself); only this report copy is laundered — one owner, not a scrub
+    scattered across every print site."""
+    for k, v in list(d.items()):
+        if isinstance(v, str) and v:
+            d[k] = _clip(_scrub(v).strip(), _ROW_CAPS.get(k, 80))
+        elif isinstance(v, dict):
+            _pub_row(v)
+        elif isinstance(v, list):
+            d[k] = [_pub_row(x) if isinstance(x, dict)
+                    else _clip(_scrub(x).strip(), _ROW_CAPS.get(k, 80))
+                    if isinstance(x, str) and x else x
+                    for x in v]
+    return d
+
+
 def roster_report(room="main"):
     """{"seats": [...], "claims": [...]} — fail-open by caller. Pending is
     computed from each seat's cursor WITHOUT moving it. A report is a READ:
@@ -2317,31 +2567,55 @@ def roster_report(room="main"):
     kept it. Cleanup has ONE owner now: gc_roster, a verb someone runs.
     Absent rows merely hide behind --all in the surfaces.)"""
     seats = []
+    try:
+        cl = claims_list()
+    except Exception:
+        cl = []
+    by_holder = _claims_by_holder(cl)
     for seat, row in sorted(roster().items()):
-        # pending is the MULTI-ROOM truth (the owner's panel must show a
-        # helm-dogfood mention, not just main), read off the row's newest
-        # session cursor (hook joins are session-keyed) with the seat-level
-        # fallback — cursors never move here.
-        hits = _pending_all(
-            room, seat, session=row.get("session"), scan_lane="report")
-        pending, preview = len(hits), None
-        if hits:
-            preview = _scrub(hits[-1][1].get("text") or "")[:PREVIEW_CHARS]
-        ls = last_seen(seat, row)
-        # the seat's CURRENT task, pulled (never pushed) off the todo mirror
-        # — this is what turns "who is here" into "who is working on what".
         try:
-            from . import todos as _todos
-            todo = _todos.seat_digest(row)
-        except Exception:
-            todo = None                  # fail-open: a roster read never 500s
-        seats.append({"seat": seat, "session": row.get("session"),
-                      "project": row.get("project"), "cwd": row.get("cwd"),
-                      "home_room": row.get("home_room"),
-                      "home_room_source": row.get("home_room_source"),
-                      "last_seen": ls, "presence": presence_of(ls),
-                      "pending": pending, "preview": preview, "todo": todo})
-    return {"room": room, "seats": seats, "claims": claims_list()}
+            # pending is the MULTI-ROOM truth (the owner's panel must show a
+            # helm-dogfood mention, not just main), read off the row's newest
+            # session cursor (hook joins are session-keyed) with the
+            # seat-level fallback — cursors never move here.
+            hits = _pending_all(
+                room, seat, session=row.get("session"), scan_lane="report")
+            pending, preview = len(hits), None
+            if hits:
+                preview = _scrub(hits[-1][1].get("text") or "")[:PREVIEW_CHARS]
+            ls = last_seen(seat, row)
+            # the seat's CURRENT task, pulled (never pushed) off the todo
+            # mirror — what turns "who is here" into "who is working on what".
+            try:
+                from . import todos as _todos
+                todo = _todos.seat_digest(row)
+            except Exception:
+                todo = None              # fail-open: a roster read never 500s
+            line, source = status_line(row, by_holder.get(seat))
+            p = presence_of(ls)
+            seats.append(_pub_row({
+                          "seat": seat, "session": row.get("session"),
+                          "project": row.get("project"),
+                          "cwd": row.get("cwd"),
+                          "home_room": row.get("home_room"),
+                          "home_room_source": row.get("home_room_source"),
+                          "last_seen": ls, "presence": p,
+                          "dot": presence_dot(p), "status": row.get("status"),
+                          "status_age": _status_age(row),
+                          "status_by": _status_by(row),
+                          "line": line, "source": source,
+                          "pending": pending, "preview": preview,
+                          "todo": todo}))
+        except Exception:   # per-row fail-open (the same law as the bar): a
+            seats.append(_pub_row({  # junk row reads '?', never kills the report
+                "seat": seat, "session": None, "project": None, "cwd": None,
+                "home_room": None, "home_room_source": None,
+                "last_seen": None, "presence": "absent",
+                "dot": presence_dot("absent"), "status": None,
+                "status_age": None, "status_by": None,
+                "line": "?", "source": "home",
+                "pending": 0, "preview": None, "todo": None}))
+    return {"room": room, "seats": seats, "claims": cl}
 
 
 # ---------------------------------------------------------------------------
@@ -2460,7 +2734,9 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             if sub == "mutes":
                 got = mutes(who)
                 print("helm chat: %s mutes %s" % (
-                    who, ", ".join(got) if got else "nothing"))
+                    _seat_label(who),
+                    ", ".join(_seat_label(g) for g in got)
+                    if got else "nothing"))
                 return 0
             if not args:
                 print("usage: helm chat seat %s <room> [--seat S]" % sub,
@@ -2485,10 +2761,14 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             if not rows:
                 print("helm chat: roster empty — nothing to gc")
                 return 0
-            w = max(len(r["seat"]) for r in rows)
+            # launder BOTH columns: the seat KEY (a hostile HELM_CHAT_NAME) and
+            # the why (it interpolates that same key — "carries HELM_CHAT_NAME=%s")
+            labels = {id(r): _seat_label(r["seat"]) for r in rows}
+            w = max(len(labels[id(r)]) for r in rows)
             for r in rows:
                 print("  %-5s %-*s  %s"
-                      % (r["verdict"].upper(), w, r["seat"], r["why"]))
+                      % (r["verdict"].upper(), w, labels[id(r)],
+                         _clip(_scrub(str(r["why"])).strip(), STATUS_BYTES)))
             n = sum(r["verdict"] == "prune" for r in rows)
             if "--apply" in rest:
                 print("helm chat: pruned %d roster row%s (+ derived seat "
@@ -2567,9 +2847,23 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             task = (" · %s (%d/%d)" % (t["active"][:44], t["done"], t["total"])
                     if t.get("active") else
                     " · %d/%d done" % (t["done"], t["total"]) if t else "")
-            print("  %-*s  %-6s  pending %-3d %s · home %s%s%s" % (
+            # the same one-line status the web presence bar shows (fresh
+            # explicit status > live claim > stale status > home) — home-tier
+            # is already the row. An explicit line carries its age (a 2-day-
+            # old away message must READ as 2 days old) + the cross-seat
+            # writer where one was recorded.
+            extra = ""
+            if s.get("source") == "status":
+                if s.get("status_age") is not None:
+                    extra = " (%s)" % _fmt_age(s["status_age"])
+                if s.get("status_by"):
+                    extra += " (by %s)" % s["status_by"]
+            line = (" ▸ %s%s" % (s["line"], extra)
+                    if s.get("line") and s.get("source") != "home" else "")
+            print("  %s %-*s  %-6s  pending %-3d %s · home %s%s%s%s" % (
+                s.get("dot") or presence_dot(s["presence"]),
                 w, s["seat"], s["presence"], s["pending"],
-                (s.get("project") or ""), scope, source, task))
+                (s.get("project") or ""), scope, source, line, task))
         if hidden:
             print("  (%d absent seat%s hidden — --all shows them; `helm chat "
                   "seat gc` prunes evidence-free rows)"
@@ -2578,6 +2872,42 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             print("  claim: %s -> %s (%ds left, fence %s)" % (
                 c["resource"], c["holder"], c["remaining"], c["fence"]))
         return 0
+    if verb == "status":
+        # `helm chat status <one-line>` sets, `--clear` clears, bare shows —
+        # the ICQ away-message: one glanceable line on the seat's roster row
+        clear = "--clear" in args
+        if clear:
+            args = [a for a in args if a != "--clear"]
+        who = chat._seat_flag(args) or derive_seat(_env_session())
+        text = " ".join(args).strip()
+        if text and clear:
+            print("usage: helm chat status [<one-line> | --clear] [--seat S]",
+                  file=sys.stderr)
+            return 2
+        if not text and not clear:            # bare: show the current line
+            row = roster().get(who)
+            if row is None:
+                print("helm chat: no roster row for %r yet" % who,
+                      file=sys.stderr)
+                return 1
+            line, source = status_line(row, _claims_by_holder().get(who))
+            extra = ""
+            if source == "status":
+                age, sb = _status_age(row), _status_by(row)
+                if age is not None:
+                    extra = " (%s)" % _fmt_age(age)
+                if sb:
+                    extra += " (by %s)" % sb
+            print("helm chat: %s %s ▸ %s (%s)%s" % (
+                presence_dot(presence_of(last_seen(who, row))),
+                _seat_label(who), line or "—", source, extra))
+            return 0
+        # the WRITER is always the ambient identity — a cross-seat write
+        # (--seat != self) is allowed but recorded (status_by, post parity)
+        ok, msg = set_status(who, None if clear else text,
+                             by=derive_seat(_env_session()))
+        print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
     if verb == "claim":
         if not args:
             print("usage: helm chat claim <resource> [--ttl SECONDS] [--seat S] "
