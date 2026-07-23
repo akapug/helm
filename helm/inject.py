@@ -649,9 +649,12 @@ def _council_reach(session, cwd):
     ONE other seat in its home room — async back-and-forth that a bounded
     synchronous meld collapses. One bounded room-tail read (chat rooms are
     tmpfs; the delivery lanes already pay this every boundary). Fires ONCE
-    per streak: fingerprint = room|peer|streak-start-ts, latched in
-    _global/.state/council-reach.json (a NEW streak re-arms; more rounds of
-    the SAME streak stay silent — no wallpaper). Skips meld/dm rooms, owner
+    per streak: fingerprint = room|peer|streak-start (the start OFFSET in
+    attributed rows — reactions/ambient rows/tail-cap growth never drift it;
+    a suffix saturating COUNCIL_TAIL hides the start and latches the pair
+    itself), latched in _global/.state/council-reach.json (a NEW streak
+    re-arms; more rounds of the SAME streak stay silent — no wallpaper).
+    Skips meld/dm rooms, owner
     back-and-forth (a human conversation is not a meld candidate), and
     pairs already mid-meld (the verb was reached; the rung's job is done).
     Fail-open to None everywhere (reflex law: a whisper that can crash or
@@ -664,10 +667,11 @@ def _council_reach(session, cwd):
     room = room or "main"
     if room.startswith("meld-") or room.startswith(chat.DM_PREFIX):
         return None
-    rows, total = chat.read(room)
-    tail = [m for m in rows
+    rows, _total = chat.read(room)
+    kept = [m for m in rows
             if m.get("from") and (m.get("text") or "").strip()
-            and not m.get("react") and not m.get("ambient")][-COUNCIL_TAIL:]
+            and not m.get("react") and not m.get("ambient")]
+    tail = kept[-COUNCIL_TAIL:]
     owners = seats.owner_names()
     peer = None
     suffix = []                     # newest-first two-party run
@@ -700,15 +704,24 @@ def _council_reach(session, cwd):
                 return None
     except OSError:
         pass
-    # fingerprint = the streak's START offset: stable while the same streak
-    # grows (every new streak row bumps total and suffix together), fresh for
-    # a new streak; a second-resolution ts would collide across two streaks
-    # posted inside one second
-    fp = "%s|%s|%d" % (room, peer, total - len(suffix))
+    # fingerprint = the streak's START offset in KEPT (attributed) coordinates
+    # — react/ambient rows and the COUNCIL_TAIL cap must never drift it (the
+    # shipped total-based offset re-fired every turn once a streak outgrew the
+    # cap and on any reaction row: wallpaper on exactly the agents deepest in
+    # ping-pong; live-probed 2026-07-23). A saturated suffix (len ==
+    # COUNCIL_TAIL) hides the true start — "deep" latches the PAIR: silent
+    # while any latched fp names it, one fire when none does; a NEW streak
+    # re-arms through its exact fp the turn it shows short of the cap (the
+    # break row shifts every later offset). Offset, not first-row ts: the
+    # second-resolution ts collides across two streaks inside one second.
+    pair = "%s|%s" % (room, peer)
+    deep = len(suffix) >= COUNCIL_TAIL
+    fp = pair + "|deep" if deep else "%s|%d" % (pair, len(kept) - len(suffix))
     d = pk.read_json(_council_path())
     offered = [str(x) for x in (d.get("offered") or ())] \
         if isinstance(d, dict) else []
-    if fp in offered:
+    if fp in offered \
+            or (deep and any(x.startswith(pair + "|") for x in offered)):
         return None
     pk.write_json(_council_path(), {
         "v": 1, "ts": pk.now_ts(),

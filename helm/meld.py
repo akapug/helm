@@ -427,7 +427,7 @@ def say(room, marker, text, seat=None, via="meld"):
     return out
 
 
-def status(seat=None):
+def status(seat=None, via="meld"):
     """[lines] — this actor's live melds off its state files + room truth."""
     from . import seats
     seat = seat or _self_seat()
@@ -445,7 +445,7 @@ def status(seat=None):
                    % (room, st.get("role"), st.get("status"),
                       st.get("exchanges"), st.get("cap"),
                       chat._dsan(st.get("peer") or "?")))  # identity laundered
-    return out or ["helm meld: no live melds for seat %s" % seat]
+    return out or ["helm %s: no live melds for seat %s" % (via, seat)]
 
 
 def _flag(args, name, default=None):
@@ -513,7 +513,7 @@ def cmd(args, via="meld"):
                                 seat=seat, via=via)))
             return 0
         if verb == "status":
-            print("\n".join(status(seat=seat)))
+            print("\n".join(status(seat=seat, via=via)))
             return 0
     except SystemExit as e:
         print(str(e), file=sys.stderr)

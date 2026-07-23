@@ -5,6 +5,8 @@ ambient session ids scrubbed (test_seats.py's exact envelope). Lineage pins:
 mc-meld.sh scars (epoch fence, F1 control echoes, F2 fail-closed self-skip,
 room×actor state, clip-proof invite head) + the helm-native laws (act-moment
 mentions only, latency-pure sign=False, bounds as behavior)."""
+import contextlib
+import io
 import os
 import shutil
 import sys
@@ -380,8 +382,14 @@ class TestCLI(MeldBase):
         self.assertIn("helm chat council join %s" % room, inv)  # joiner side
         head = seats._clip(seats._scrub(inv))                   # still clip-proof
         self.assertIn("helm chat council join %s" % room, head)
-        rc = chat.cmd_chat(["standup", "status"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = chat.cmd_chat(["standup", "status", "--seat", "seat-z"])
         self.assertEqual(rc, 0)
+        # the empty slate answers in the TYPED voice too (the one meld
+        # surface that used to hardcode "helm meld:")
+        self.assertIn("helm standup: no live melds for seat seat-z",
+                      out.getvalue())
 
     def test_invite_wait_collapses_invite_and_first_recv(self):
         """--wait = invite + recv in one call (every convener's literal next

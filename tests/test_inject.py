@@ -1490,6 +1490,44 @@ class CouncilReachTest(InjectBase):
         self._pingpong(3)                                      # NEW streak
         self.assertIsNotNone(inject._council_reach(None, None))
 
+    def test_latch_holds_past_the_tail_cap_and_over_reactions(self):
+        """Live-probed 2026-07-23: fp = room|peer|(total-len(suffix)) mixed
+        coordinate systems — total counted ALL rows while suffix capped at
+        COUNCIL_TAIL attributed rows — so the rung RE-FIRED every turn once
+        a streak outgrew the cap, and re-fired on any reaction row: wallpaper
+        on exactly the agents deepest in ping-pong."""
+        from helm import chat
+        self._pingpong(3)
+        self.assertIsNotNone(inject._council_reach(None, None))   # latches
+        self._pingpong(6)      # 18 attributed rows — past COUNCIL_TAIL=16
+        self.assertIsNone(inject._council_reach(None, None))
+        self._pingpong(1)      # deeper still: every extra round re-fired
+        self.assertIsNone(inject._council_reach(None, None))
+        _row, err = chat.react(-1, "👍", room="workroom", who="seat-c")
+        self.assertIsNone(err)
+        self.assertIsNone(inject._council_reach(None, None))      # no drift
+        chat.post("break", room="workroom", who="seat-c")
+        self._pingpong(3)                                         # NEW streak
+        self.assertIsNotNone(inject._council_reach(None, None))   # re-arms
+
+    def test_reaction_mid_streak_before_the_cap_keeps_the_latch(self):
+        from helm import chat
+        self._pingpong(3)
+        self.assertIsNotNone(inject._council_reach(None, None))
+        _row, err = chat.react(-1, "👍", room="workroom", who="seat-c")
+        self.assertIsNone(err)
+        self._pingpong(1)                                         # SAME streak
+        self.assertIsNone(inject._council_reach(None, None))
+
+    def test_deep_streak_with_unknown_start_latches_the_pair(self):
+        """First observed already past the cap (start hidden by the window):
+        one fire, then the pair itself stays latched — no wallpaper even
+        when the streak's start offset is unknowable."""
+        self._pingpong(9)      # 18 rows: suffix saturates on first look
+        self.assertIsNotNone(inject._council_reach(None, None))
+        self._pingpong(1)
+        self.assertIsNone(inject._council_reach(None, None))
+
     def test_under_threshold_owner_and_monologue_stay_silent(self):
         from helm import chat
         self._pingpong(2)
