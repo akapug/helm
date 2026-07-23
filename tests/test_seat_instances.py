@@ -400,10 +400,12 @@ class ProxyFixRoundTest(Slice6Base):
         calls = {"n": 0}
 
         def swapping(family, seat=None):
-            # 1st call = _running_pid's read, 2nd = expected-identity read,
-            # 3rd = the ownership re-read before unlink -> the REPLACEMENT.
+            # 1st call = the ONE authentication read (real, so pid verifies);
+            # 2nd = the unlink guard's re-check -> the REPLACEMENT record.
+            # (Post-atomicity refactor there is no third ownership read — the
+            # authenticated snapshot is threaded through signal+unlink.)
             calls["n"] += 1
-            if calls["n"] >= 3:
+            if calls["n"] >= 2:
                 return {"pid": live + 99999, "identity": "proc:replacement"}
             return real(family, seat)
 
@@ -421,45 +423,54 @@ class ProxyFixRoundTest(Slice6Base):
         # the replacement record was NOT unlinked (the pidfile still exists)
         self.assertTrue(os.path.exists(os.path.join(home, "proxy.pid")))
 
-    def test_down_fails_closed_when_ownership_reread_vanishes(self):
-        # codex-2 advisory on 224e6b5: after `_running_pid` succeeds, the
-        # ownership re-read under the lock can return None (transient read
-        # failure / manual pidfile removal / malformed replacement). _down must
-        # FAIL CLOSED (rc 1, no signal, no crash) — never TypeError on a None
-        # subscript. Pin both the None and the wrong-pid cases.
+    def test_down_survives_a_vanishing_unlink_guard_reread(self):
+        # codex-2 advisory on 224e6b5, SUPERSEDED shape: pre-refactor _down
+        # re-read the pidfile for ownership AFTER verifying it, and a None/
+        # wrong-pid re-read had to refuse (rc 1). The atomicity fix threads ONE
+        # authenticated snapshot through signal+unlink, so the ONLY remaining
+        # re-read is the unlink guard's re-check — a hostile None/wrong-pid
+        # there now just declines the unlink (fail-closed), the down itself
+        # completes rc 0, and the signal decisions were already made from the
+        # OWNED record (never the hostile value). Pin: no crash, no refuse, no
+        # signal from a hostile value, pidfile left in place.
         home = seat._proxy_home("codex", "codex-2")
         os.makedirs(home, exist_ok=True)
         live = os.getpid()      # alive, NOT a proxy
         old_ident = seat._pid_identity(live)
-        seat._write_private(os.path.join(home, "proxy.pid"),
-                            "%d %s\n" % (live, old_ident), mode=0o600)
-        real = seat._proxy_pid_record
+        pidfile = os.path.join(home, "proxy.pid")
         for bad in (None, {"pid": live + 99999, "identity": "proc:other"}):
+            seat._write_private(pidfile, "%d %s\n" % (live, old_ident),
+                                mode=0o600)
+            real = seat._proxy_pid_record
             calls = {"n": 0}
 
             def vanishing(family, seat=None, _bad=bad):
                 calls["n"] += 1
-                # 1st call = _running_pid's read (real, so pid verifies);
-                # 2nd = the ownership re-read -> the BAD value.
+                # 1st call = the ONE authentication read (real, so pid
+                # verifies); 2nd = the unlink guard's re-check -> BAD value.
                 return real(family, seat) if calls["n"] == 1 else _bad
 
-            def no_real_signal(pid, sig=0, *a, **k):
-                # kill(pid, 0) is the liveness probe — allowed. Any REAL signal
-                # (SIGTERM/SIGKILL) means _down failed to refuse.
-                if sig not in (0,):
-                    raise AssertionError("must never signal, got %r" % sig)
+            real_kill = os.kill
+            signals = []
+
+            def recording_kill(pid, sig=0, *a, **k):
+                signals.append(sig)
+                if sig == 0:
+                    return real_kill(pid, sig)   # real liveness probe
+                # swallow SIGTERM/SIGKILL (would kill the test runner)
 
             with mock.patch.object(seat, "_proxy_pid_record", vanishing), \
-                    mock.patch.object(seat.os, "kill", no_real_signal):
+                    mock.patch.object(seat.os, "kill", recording_kill):
                 out, err = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(out), \
                         contextlib.redirect_stderr(err):
                     rc = seat._down("codex", seat="codex-2")
-            self.assertEqual(rc, 1, "must fail closed on %r" % (bad,))
-            self.assertIn("changed/vanished", err.getvalue())
-            # the live pid was never signalled (we are still running) and the
-            # pidfile was NOT unlinked (down refused, not reaped).
-            self.assertTrue(os.path.exists(os.path.join(home, "proxy.pid")))
+            self.assertEqual(rc, 0, "hostile re-read must not crash: %r" % (bad,))
+            # signals (if any) were decided from the OWNED record, before the
+            # hostile read — and our own live pid was never really signalled.
+            self.assertNotIn(None, signals)
+            # the unlink guard declined: the pidfile survives.
+            self.assertTrue(os.path.exists(pidfile))
 
     def test_up_serializes_concurrent_starts(self):
         # atomic-ownership finding: the check→spawn critical section is under
@@ -553,6 +564,75 @@ class FableRoundTest(Slice6Base):
         self.assertEqual(rc, 2)
         self.assertIn("not a distinct instance", err.getvalue())
 
+    def test_resume_applies_the_same_instance_gate(self):
+        # MED (fable-comp on 2a93541): the spawn-seam gate lived ONLY on
+        # _spawn — `_resume` minted instance assets for the very seats spawn
+        # refuses (kimi-2 proxy-key, codex-1 not-distinct). ONE shared
+        # predicate now serves both verbs; resume refuses rc 2 BEFORE minting.
+        for args, marker in ((["resume", "kimi-2"], "mode=proxy"),
+                             (["resume", "codex-1"], "not a distinct instance")):
+            # Mint the family/instance dirs so the gate — not the
+            # missing-launch.sh refusal — is the branch under test.
+            d = seat._instance_dir(args[1].rsplit("-", 1)[0], args[1])
+            os.makedirs(d, exist_ok=True)
+            seat._write_private(os.path.join(d, "launch.sh"),
+                                "#!/bin/sh\n", mode=0o700)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                rc = seat.cmd_seat(args)
+            self.assertEqual(rc, 2, "%s must be refused" % args)
+            self.assertIn(marker, err.getvalue())
+
+    def test_down_threads_one_authenticated_record(self):
+        # HIGH (codex-2 advisory carried forward): _down authenticates from ONE
+        # owned snapshot read under the lock, and threads THAT record through
+        # signal+unlink — a hostile later re-read can never split the verify
+        # from the kill (the 224e6b5 None-subscript crash class). Probe: the
+        # FIRST (authentication) read returns a valid owned record; any LATER
+        # read (the unlink guard's re-check) returns None. _down must still
+        # complete rc 0 without crashing — the only effect of the hostile
+        # re-read is that the unlink guard declines to unlink (fail-closed).
+        home = seat._proxy_home("codex", "codex-2")
+        os.makedirs(home, exist_ok=True)
+        live = os.getpid()
+        ident = seat._pid_identity(live)
+        pidfile = os.path.join(home, "proxy.pid")
+        seat._write_private(pidfile, "%d %s\n" % (live, ident), mode=0o600)
+        reads = []
+
+        real_record = seat._proxy_pid_record
+
+        def counting_record(family, s=None):
+            reads.append(1)
+            if len(reads) == 1:
+                return real_record(family, s)
+            return None          # hostile: vanish on any re-read
+
+        real_kill = os.kill
+
+        def no_real_signal(pid, sig=0):
+            if sig not in (0,):
+                return           # swallow SIGTERM/SIGKILL aimed at ourselves
+            return real_kill(pid, sig)
+
+        with mock.patch.object(seat, "_proxy_pid_record", counting_record), \
+                mock.patch.object(seat.os, "kill", no_real_signal):
+            # capture stdout: _down's print is buffered on sys.stdout, and an
+            # un-flushed buffer leaks into a LATER test's fd-1 capture (the
+            # test_seats deliver-hook JSON probe) — cross-test pollution.
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                rc = seat._down("codex", "codex-2")
+        self.assertEqual(rc, 0, "hostile re-read must not crash the down")
+        self.assertEqual(len(reads), 2,
+                         "expected ONE authentication read + ONE unlink-guard "
+                         "re-check, got %d" % len(reads))
+        self.assertTrue(os.path.exists(pidfile),
+                        "unlink guard fails closed: record left in place when "
+                        "the re-read vanished")
+
     def test_hostile_pidfile_corpus_fails_closed(self):
         # LOW: every hostile pidfile shape must fail CLOSED (no signal, no
         # crash) — including an overflow-sized pid (was an uncaught
@@ -569,6 +649,8 @@ class FableRoundTest(Slice6Base):
             seat._write_private(os.path.join(home, "proxy.pid"), body, mode=0o600)
             self.assertIsNone(seat._running_pid("codex", "codex-2"),
                               "hostile pidfile must fail closed: %r" % body)
+            self.assertIsNone(seat._running_pid_rec("codex", "codex-2"),
+                              "hostile pidfile must fail closed (rec): %r" % body)
 
 
 if __name__ == "__main__":

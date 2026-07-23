@@ -326,6 +326,30 @@ def _instance_port(family, seat=None):
 import contextlib as _contextlib
 
 
+def _instance_gate(family, seat_name):
+    """The ONE per-instance admissibility predicate, shared by every verb that
+    can mint instance assets (spawn/resume — the fable MED was this gate
+    living on spawn alone, so resume minted the very seats spawn refuses).
+    Returns an error string to print, or None when the seat may proceed.
+    Per-instance proxies are a proxy-family (OAuth-pool) feature; and the
+    numeric suffix must be N>=2 — `-1` maps onto the family itself and base+1
+    collides with the adjacent family's base port (codex-1 -> 8318 = kimi's
+    base). The family seat itself is always admissible."""
+    if seat_name == family:
+        return None
+    fam = FAMILIES[family]
+    if fam["mode"] != "proxy":
+        return ("per-instance proxies need an OAuth-pool family "
+                "(mode=proxy); %s is mode=%s — only the family seat `%s` is "
+                "supported" % (family, fam["mode"], family))
+    m = re.match(r"^%s-(\d+)$" % re.escape(family), seat_name)
+    if m and int(m.group(1)) < 2:
+        return ("%s is not a distinct instance — instance 1 IS the family "
+                "seat `%s` (and base+1 would collide with a sibling family's "
+                "port); use `%s` or instance N>=2" % (seat_name, family, family))
+    return None
+
+
 @_contextlib.contextmanager
 def _proxy_lock(family, seat=None):
     """Serialize _up/_down per proxy-home: an flock on <proxy_home>/.proxy.lock.
@@ -362,6 +386,23 @@ def _proxy_pid_record(family, seat=None):
     return {"pid": pid, "identity": parts[1] if len(parts) > 1 else None}
 
 
+def _running_pid_rec(family, seat=None):
+    """The live proxy as an AUTHENTICATED RECORD {pid, identity}, or None —
+    `_running_pid`'s record-returning twin. ONE read of the pidfile produces
+    the owned snapshot the caller threads through its signal/unlink (the
+    atomic-ownership finding: re-reading the file after authenticating it lets
+    a transient failure/malformed replacement split the verify from the kill).
+    FAIL CLOSED identically: bare/'?' identity, dead pid, and birth-mismatch
+    all return None."""
+    rec = _proxy_pid_record(family, seat)
+    if not rec or not _pid_alive(rec["pid"]):
+        return None
+    ident = rec["identity"]
+    if not ident or ident == "?":
+        return None            # unauthenticated: refuse, never signal
+    return rec if _pid_identity(rec["pid"]) == ident else None
+
+
 def _running_pid(family, seat=None):
     """The live proxy pid, ONLY when it is verifiably the SAME process the
     pidfile recorded — a captured birth identity that still matches. FAIL
@@ -371,13 +412,8 @@ def _running_pid(family, seat=None):
     live pid whose captured identity no longer matches is a REUSED pid and is
     likewise refused. There is no alive-check-only fallback: trusting an
     unauthenticated number is exactly the hazard this guard exists to close."""
-    rec = _proxy_pid_record(family, seat)
-    if not rec or not _pid_alive(rec["pid"]):
-        return None
-    ident = rec["identity"]
-    if not ident or ident == "?":
-        return None            # unauthenticated: refuse, never signal
-    return rec["pid"] if _pid_identity(rec["pid"]) == ident else None
+    rec = _running_pid_rec(family, seat)
+    return rec["pid"] if rec else None
 
 
 def _port_open(port, timeout=0.5):
@@ -1269,8 +1305,13 @@ def _down(family, seat=None):
     # then deletes the NEW record — leaving the new proxy alive but
     # unmanageable and eligible for a duplicate start.
     with _proxy_lock(family, seat):
-        pid = _running_pid(family, seat)
-        if not pid:
+        # ONE authenticated read, threaded through signal+unlink (the atomic-
+        # ownership advisory): the verify and the kill act on the SAME owned
+        # snapshot, so a transient re-read failure or malformed replacement
+        # mid-sequence can never split authentication from action (the 224e6b5
+        # None-subscript crash class) — the record is already in hand.
+        owned = _running_pid_rec(family, seat)
+        if not owned:
             # Distinguish a merely-dead proxy from a REUSED/unauthenticated pid:
             # a live process holding our recorded pid that we cannot prove is
             # ours is NOT our proxy — never signal it. Reap the stale file.
@@ -1291,24 +1332,13 @@ def _down(family, seat=None):
                 os.remove(pidfile)  # stale
             print("helm seat: %s proxy not running" % seat)
             return 0
+        pid, expected = owned["pid"], owned["identity"]
         # TOCTOU guard: re-verify the birth identity IMMEDIATELY before each
-        # signal. `_running_pid` verified at entry, but the proxy could die and
+        # signal. `owned` authenticated at entry, but the proxy could die and
         # its pid be recycled in the gap before a kill; a recycled pid has a
         # different starttime, so the recheck refuses to signal it. (pidfd would
         # close the window outright; /proc starttime narrows it to the
         # check→kill instant, which is the portable floor here.)
-        # Re-read the record under the lock and FAIL CLOSED if it vanished or
-        # changed out from under the verified pid (a transient read failure,
-        # manual pidfile removal, or a malformed replacement must never crash
-        # the lifecycle on a None subscript — codex-2 advisory on 224e6b5).
-        owned = _proxy_pid_record(family, seat)
-        if not owned or owned["pid"] != pid or not owned["identity"] \
-                or owned["identity"] == "?":
-            print("helm seat: %s proxy record changed/vanished mid-down — "
-                  "refusing to signal an unowned pid %d" % (seat, pid),
-                  file=sys.stderr)
-            return 1
-        expected = owned["identity"]
 
         def _still_ours():
             return _pid_alive(pid) and _pid_identity(pid) == expected
@@ -1619,6 +1649,13 @@ def _resume(seat_name, rest):
     if err:
         print("helm seat: " + err, file=sys.stderr)
         return 2
+    # Same admissibility gate as `_spawn`, BEFORE anything is minted (the
+    # fable MED: resume bypassed it, so `resume kimi-2`/`resume codex-1` minted
+    # instance assets spawn would have refused).
+    gate = _instance_gate(family, seat_name)
+    if gate:
+        print("helm seat: " + gate, file=sys.stderr)
+        return 2
     d = _instance_dir(family, seat_name)
     launch_sh = os.path.join(d, "launch.sh")
     if not os.path.exists(launch_sh):
@@ -1928,24 +1965,12 @@ def _spawn(seat_name, rest, _locked=False):
         return 2
     # Instance-spawn gate (the fable MED — it lived only on `launch`, so
     # `spawn kimi-2` / `spawn codex-1` minted launch lines pointed at a SIBLING
-    # family's port range). Per-instance proxies are a proxy-family feature;
-    # and the numeric suffix must be N>=2 — `-1` maps onto the family itself
-    # and base+1 collides with the adjacent family's base port (codex-1 -> 8318
-    # = kimi's base). Refuse both before any asset is minted.
-    if seat_name != family:
-        fam = FAMILIES[family]
-        m = re.match(r"^%s-(\d+)$" % re.escape(family), seat_name)
-        if fam["mode"] != "proxy":
-            print("helm seat: per-instance proxies need an OAuth-pool family "
-                  "(mode=proxy); %s is mode=%s — only the family seat `%s` is "
-                  "supported" % (family, fam["mode"], family), file=sys.stderr)
-            return 2
-        if m and int(m.group(1)) < 2:
-            print("helm seat: %s is not a distinct instance — instance 1 IS the "
-                  "family seat `%s` (and base+1 would collide with a sibling "
-                  "family's port); use `%s` or instance N>=2"
-                  % (seat_name, family, family), file=sys.stderr)
-            return 2
+    # family's port range). ONE shared predicate with `_resume` (the second
+    # fable MED: the gate on spawn alone let resume mint the refused seats).
+    gate = _instance_gate(family, seat_name)
+    if gate:
+        print("helm seat: " + gate, file=sys.stderr)
+        return 2
     d = _instance_dir(family, seat_name)
     launch_sh = os.path.join(d, "launch.sh")
     if not os.path.exists(launch_sh) and \
