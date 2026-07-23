@@ -40,7 +40,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import chat, codexhomes, home, hooks, human, seats, todos, web  # noqa: E402,E501
+from helm import chat, codexhomes, home, hooks, human, meld, pk, seats, todos, web  # noqa: E402,E501
 
 # the two payload markers every sink must strip: a screen-clear CSI (Cc) and a
 # right-to-left override (Cf, reorders the whole rendered line).
@@ -492,6 +492,123 @@ class ChatHostileNameSweepTest(unittest.TestCase):
         self._assert_inert("SeatNameError(--seat)", str(cm.exception))
         self.assertEqual(home.validate_seat_arg("codex-2"), "codex-2")
         self.assertIsNone(home.validate_seat_arg(""))
+
+
+# ── E. the chat-ROW from-field sinks: deliver / stop_guard / meld.recv ───────
+#
+# Rounds A–D covered roster() consumers, the four web endpoints, and the
+# HELM_CHAT_NAME env seam. But three terminal-facing sinks read a from-field
+# off a CHAT ROW — not from roster() and not from the env — so BOTH the
+# roster-grep tripwire (A) and the env-seam grep (C) are structurally BLIND to
+# them, and the round-D chat sweep only drives chat._fmt / the JSON endpoints:
+#
+#   1. seats.deliver()   — the tool-boundary nudge "[helm chat → seat] <FROM>:
+#                          <text>" (the most-rendered agent-facing line, every
+#                          PostToolUse + beacon).
+#   2. seats.stop_guard() — the undelivered-message block line.
+#   3. meld.recv()       — the YIELD/HOLD/DONE/ABORT/READY line to the peer.
+#
+# A hostile from-field reaches these via a PLANTED/FOREIGN jsonl row (written
+# outside the validating join seam — a pre-fix row, a foreign node's row). The
+# TEXT legitimately carries unicode and is left as-is (the class rule); only
+# the identity field is laundered through chat._dsan. THIS SWEEP now covers the
+# chat-ROW from-field sinks, not just roster()/env readers — a 12th surface in
+# any of these three verbs trips here.
+class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
+    HOSTILE = "lane" + ESC + "[2J" + BIDI + "pwn"
+
+    _ENV = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
+            "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
+            "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_ROOM",
+            "MELD_CHAT_ROOM", "HELM_CELL_BIN", "MELD_CELL_BIN")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-rowsink-")
+        self.prior = {k: os.environ.get(k) for k in self._ENV}
+        for k in self._ENV:
+            os.environ.pop(k, None)
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
+        os.environ["HELM_CHAT_NODE_URL"] = ""    # transport off — hermetic
+        self.cwd_prior = os.getcwd()
+        os.chdir(self.tmp)                        # default room stays 'main'
+        os.makedirs(chat.chat_dir(), mode=0o700, exist_ok=True)
+
+    def tearDown(self):
+        os.chdir(self.cwd_prior)
+        for k, v in self.prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _assert_inert(self, label, text):
+        self.assertNotIn(ESC, text, "%s leaked ESC" % label)
+        self.assertNotIn(BIDI, text, "%s leaked bidi" % label)
+
+    def _plant(self, room, rid, text):
+        """Append ONE raw jsonl row with a hostile from-field — bypassing the
+        join seam, as a foreign/pre-fix node row does."""
+        import json
+        with open(chat.room_path(room), "a", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"ts": "2026-07-22T00:00:00", "id": rid, "from": self.HOSTILE,
+                 "text": text}, ensure_ascii=False) + "\n")
+
+    # -- 1. seats.deliver(): the tool-boundary nudge ---------------------------
+    def test_deliver_boundary_nudge_is_inert(self):
+        self._plant("main", "aa" * 6, "@recvr ping here")
+        collected = []
+        seats.deliver(session="s" * 32, room="main", seat="recvr",
+                      emit=collected.append, backfill=True)
+        line = "\n".join(collected)
+        self._assert_inert("seats.deliver", line)
+        # the from-field actually EMITTED (laundered, not vanished): the sweep
+        # would pass vacuously if deliver never rendered the row's from.
+        self.assertIn("lane", line)
+        self.assertIn("pwn", line)
+
+    # -- 2. seats.stop_guard(): the undelivered-message block ------------------
+    def test_stop_guard_inbox_block_is_inert(self):
+        sid = "t" * 32
+        seats.write_roster("stopr", session=sid, cwd=self.tmp)
+        seats.deliver(session=sid, room="main", seat="stopr",
+                      emit=lambda s: None)         # establish the EOF cursor
+        self._plant("main", "bb" * 6, "@stopr ping here")
+        blocks, warns = seats.stop_guard(session=sid, room="main", seat="stopr")
+        text = "\n".join(blocks + warns)
+        self._assert_inert("seats.stop_guard", text)
+        self.assertIn("undelivered", text)         # the block fired…
+        self.assertIn("lane", text)                # …and rendered the from
+        self.assertIn("pwn", text)
+
+    # -- 3. meld.recv(): the peer-facing chunk line ---------------------------
+    def test_meld_recv_chunk_line_is_inert(self):
+        room = "meld-sink-test"
+        meld._write_state(room, "recvr2", {
+            "room": room, "epoch": 123, "role": "joiner", "self": "recvr2",
+            "peer": self.HOSTILE, "idx": 0, "exchanges": 0, "cap": 8,
+            "status": "active", "created": pk.now_ts()})
+        self._plant(room, "cc" * 6, "my chunk [YIELD]")
+        code, lines = meld.recv(room, timeout=0.2, seat="recvr2")
+        text = "\n".join(lines)
+        self._assert_inert("meld.recv", text)
+        self.assertEqual(code, 0)                  # a real chunk was returned…
+        self.assertIn("lane", text)                # …with the from laundered
+        self.assertIn("pwn", text)
+
+    # -- proof the sweep BITES: the planted from-field is genuinely hostile ----
+    def test_planted_from_field_is_actually_hostile(self):
+        """Guards the guard: if the plant stopped carrying ESC/bidi the three
+        assertions above would pass vacuously. The stored from stays RAW; only
+        the EMITTED copy (chat._dsan) is inert."""
+        self.assertIn(ESC, self.HOSTILE)
+        self.assertIn(BIDI, self.HOSTILE)
+        self._plant("main", "dd" * 6, "@x hi")
+        rows, _total = chat.read("main")
+        self.assertIn(ESC, rows[0]["from"])        # stored key stays raw…
+        self._assert_inert("chat._dsan", chat._dsan(self.HOSTILE))  # …emit inert
 
 
 if __name__ == "__main__":

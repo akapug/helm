@@ -1257,8 +1257,8 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
         where = (" dm" if is_dm                           # every surface —
                  else "" if room == "main" else " #%s" % room)  # never a room
         line = "[helm chat%s → %s] %s: %s" % (            # the reply must land
-            where, seat, row.get("from") or "?",          # where the word came
-            _clip(_scrub(row.get("text") or "")))
+            where, seat, chat._dsan(row.get("from") or "?"),  # identity laundered
+            _clip(_scrub(row.get("text") or "")))          # (text carries unicode)
         if waiting:
             line += " (+%d waiting — helm chat read%s)" % (
                 waiting, " --dm" if is_dm
@@ -1927,7 +1927,7 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
                 lines = ["  %s%s: %s" % (
                     "[dm] " if rm.startswith(chat.DM_PREFIX)
                     else "" if rm == room else "[#%s] " % rm,
-                    r.get("from") or "?",
+                    chat._dsan(r.get("from") or "?"),  # identity laundered
                     _clip(_scrub(r.get("text") or ""), 120))
                          for rm, r in pending[:5]]
                 if len(pending) > 5:

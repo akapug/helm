@@ -237,7 +237,7 @@ def recv(room, timeout=None, seat=None, poll=MELD_POLL):
                     return 0, ["[meld %s e:%d] READY — %s is in. You have "
                                "the floor: helm chat meld say %s --marker "
                                "YIELD \"<first chunk>\""
-                               % (room, st["epoch"], frm, room)]
+                               % (room, st["epoch"], chat._dsan(frm), room)]
                 continue                  # control echo elsewhere (F1)
             mk = _MARKER_RE.search(text)
             if not mk:
@@ -249,13 +249,13 @@ def recv(room, timeout=None, seat=None, poll=MELD_POLL):
                 st["status"] = "aborted"
                 _write_state(room, seat, st)
                 return EXIT_ABORT, ["[meld %s e:%d] ABORT from %s — the meld "
-                                    "is dead, fail-loud:" % (room, st["epoch"], frm),
+                                    "is dead, fail-loud:" % (room, st["epoch"], chat._dsan(frm)),
                                     "  %s" % text]
             if marker == "DONE":
                 st["status"] = "peer-done"
                 _write_state(room, seat, st)
                 return 0, ["[meld %s e:%d] %s: %s"
-                           % (room, st["epoch"], frm, text),
+                           % (room, st["epoch"], chat._dsan(frm), text),
                            "peer left — close your side: helm chat meld say "
                            "%s --marker DONE \"<closing state>\"" % room]
             _write_state(room, seat, st)
@@ -263,7 +263,7 @@ def recv(room, timeout=None, seat=None, poll=MELD_POLL):
                      "helm chat meld say %s --marker YIELD|HOLD|DONE \"...\""
                      % room) if marker == "YIELD" else \
                     "floor: PEER'S — more coming; recv again"
-            return 0, ["[meld %s e:%d] %s: %s" % (room, st["epoch"], frm, text),
+            return 0, ["[meld %s e:%d] %s: %s" % (room, st["epoch"], chat._dsan(frm), text),
                        floor]
         if st["idx"] != total:
             st["idx"] = total
