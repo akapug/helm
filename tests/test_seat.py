@@ -47,6 +47,11 @@ class SeatTest(unittest.TestCase):
         # hermetic: the real ~/.hermes/auth.json must never feed a test mint
         self._hermes_auth = seat.HERMES_AUTH
         seat.HERMES_AUTH = os.path.join(self.tmp, "hermes-auth.json")
+        # hermetic: the real opencode auth store must never feed a test mint.
+        # Point it at a non-existent tmp path — tests that exercise the
+        # authstore plant it explicitly; the rest fall through to hermes.
+        self._opencode_authstore = seat.OPENCODE_AUTHSTORE
+        seat.OPENCODE_AUTHSTORE = os.path.join(self.tmp, "opencode-auth.json")
         for key in ("HELM_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
                     "MELD_CHAT_ROOM", "MELD_CHAT_ROOM_SOURCE"):
             os.environ.pop(key, None)
@@ -60,6 +65,7 @@ class SeatTest(unittest.TestCase):
     def tearDown(self):
         seat.CODEX_HOMES = self._codex_homes
         seat.HERMES_AUTH = self._hermes_auth
+        seat.OPENCODE_AUTHSTORE = self._opencode_authstore
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -413,6 +419,25 @@ class SeatTest(unittest.TestCase):
     # constant so the secret-hygiene assertions (assertNotIn) can never drift
     # out of sync with what was planted.
     _LIVE = "sk-live-ds4pro-bearer-3f9c2a1e6b7d8049aa11bb22cc33dd44"
+    # the opencode-authstore fake bearers — distinct per provider and distinct
+    # from _LIVE so a test can prove WHICH source (authstore vs hermes) won.
+    _AS_OC = "sk-authstore-opencode-go-1122334455667788990011223344ff"
+    _AS_DS = "sk-authstore-deepseek-9a8b7c6d5e4f3021ffeeddccbbaa9988ee"
+
+    def _plant_authstore(self, opencode=True, deepseek=True, oauth_ds=False):
+        """A fake ~/.local/share/opencode/auth.json shaped like the real one:
+        a dict of provider -> {type, key}. `oauth_ds` swaps deepseek to an
+        oauth entry (no bakeable static key) to exercise the type filter."""
+        store = {}
+        if opencode:
+            store["opencode-go"] = {"type": "api", "key": self._AS_OC}
+        if deepseek and not oauth_ds:
+            store["deepseek"] = {"type": "api", "key": self._AS_DS}
+        if oauth_ds:
+            store["deepseek"] = {"type": "oauth", "access": "a" * 60,
+                                 "refresh": "r" * 60, "expires": 9999999999999}
+        with open(seat.OPENCODE_AUTHSTORE, "w") as f:
+            json.dump(store, f)
 
     def _plant_pool(self, opencode=None, openrouter=None, extra=None):
         """A fake ~/.hermes/auth.json shaped like the real one: a
@@ -463,10 +488,19 @@ class SeatTest(unittest.TestCase):
         self.assertEqual(fam["pool_default"], "opencode-go")
         self.assertEqual(fam["pool_providers"]["opencode-go"],
                          {"base_url": "https://opencode.ai/zen/go/v1",
-                          "upstream_model": "deepseek-v4-pro"})
+                          "upstream_model": "deepseek-v4-pro",
+                          "authstore": "opencode-go"})
+        # native DeepSeek: real model id deepseek-v4-pro (probed 2026-07-22),
+        # base api.deepseek.com; key valid but 402 (no balance) so configured
+        # not live-default.
+        self.assertEqual(fam["pool_providers"]["deepseek"],
+                         {"base_url": "https://api.deepseek.com",
+                          "upstream_model": "deepseek-v4-pro",
+                          "authstore": "deepseek"})
         self.assertEqual(fam["pool_providers"]["openrouter"],
                          {"base_url": "https://openrouter.ai/api/v1",
-                          "upstream_model": "deepseek/deepseek-v4-pro"})
+                          "upstream_model": "deepseek/deepseek-v4-pro",
+                          "authstore": "openrouter"})
         # the retired nous portal shape is gone
         self.assertNotIn("hermes_provider", fam)
         self.assertNotIn("provider", fam)
@@ -507,6 +541,75 @@ class SeatTest(unittest.TestCase):
         tok, _, err = seat._hermes_pool_key("nope")
         self.assertIsNone(tok)
         self.assertIn("no credential_pool.nope", err)
+
+    # -- the opencode auth store reader -------------------------------------
+    def test_authstore_reader_picks_api_key(self):
+        self._plant_authstore()
+        key, err = seat._opencode_authstore_key("opencode-go")
+        self.assertIsNone(err)
+        self.assertEqual(key, self._AS_OC)
+        key, err = seat._opencode_authstore_key("deepseek")
+        self.assertIsNone(err)
+        self.assertEqual(key, self._AS_DS)
+
+    def test_authstore_reader_skips_oauth_entry(self):
+        """An oauth entry carries no static bakeable key — the reader reports
+        it, never returns the access token as a key."""
+        self._plant_authstore(oauth_ds=True)
+        key, err = seat._opencode_authstore_key("deepseek")
+        self.assertIsNone(key)
+        self.assertIn("not a static api key", err)
+
+    def test_authstore_reader_missing_provider_and_file(self):
+        self._plant_authstore()
+        key, err = seat._opencode_authstore_key("nope")
+        self.assertIsNone(key)
+        self.assertIn("no nope entry", err)
+        os.remove(seat.OPENCODE_AUTHSTORE)
+        key, err = seat._opencode_authstore_key("opencode-go")
+        self.assertIsNone(key)
+        self.assertIn("unreadable", err)
+
+    def test_add_ds4pro_prefers_authstore_over_hermes(self):
+        """Both sources present: the authstore bearer is baked, the hermes
+        _LIVE bearer is NOT — and neither raw value is ever printed."""
+        self._plant_authstore()
+        self._plant_pool()          # hermes _LIVE also present
+        rc, out, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(self._AS_OC, out + err)   # secret: never printed
+        self.assertNotIn(self._LIVE, out + err)
+        d = seat.seat_dir("ds4pro")
+        with open(os.path.join(d, "config.yaml")) as f:
+            cfg = f.read()
+        self.assertIn('api-key: "%s"' % self._AS_OC, cfg)   # authstore won
+        self.assertNotIn(self._LIVE, cfg)                   # not hermes
+        self.assertIn('base-url: "https://opencode.ai/zen/go/v1"', cfg)
+        with open(os.path.join(d, "launch.sh")) as f:
+            self.assertNotIn(self._AS_OC, f.read())         # never in launch.sh
+
+    def test_add_ds4pro_deepseek_provider_from_authstore(self):
+        """--provider deepseek bakes the native DeepSeek key + real model id
+        deepseek-v4-pro at api.deepseek.com."""
+        self._plant_authstore()
+        rc, out, err = self._add(("add", "ds4pro", "--provider", "deepseek"))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("provider deepseek", out)
+        self.assertNotIn(self._AS_DS, out + err)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
+            cfg = f.read()
+        self.assertIn('api-key: "%s"' % self._AS_DS, cfg)
+        self.assertIn('name: "deepseek"', cfg)
+        self.assertIn('base-url: "https://api.deepseek.com"', cfg)
+        self.assertIn('- name: "deepseek-v4-pro"', cfg)
+
+    def test_add_ds4pro_falls_back_to_hermes_when_authstore_absent(self):
+        """No authstore file -> the hermes credential_pool bearer is used."""
+        self._plant_pool()          # authstore path does not exist
+        rc, _, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
+            self.assertIn('api-key: "%s"' % self._LIVE, f.read())
 
     def test_add_ds4pro_default_provider_is_opencode_go(self):
         self._plant_pool()

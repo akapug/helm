@@ -93,6 +93,13 @@ CODEX_HOMES = os.path.join(os.path.expanduser("~"), ".codex-homes")
 # The hermes CLI's OAuth artifact — the mint SOURCE for hermes-keyed families
 # (ds4pro). Read-only, never modified; tests point this at a fixture.
 HERMES_AUTH = os.path.join(os.path.expanduser("~"), ".hermes", "auth.json")
+# The opencode tool's auth store — the PREFERRED outbound-key source for pool
+# families (ds4pro), owner-maintained and fresher than the hermes mirror. A
+# JSON dict of provider -> {"type": "api"|"oauth", "key"/"access": <bearer>}.
+# Read-only, never modified; tests point this at a fixture. Only type=="api"
+# entries carry a static bearer we can bake.
+OPENCODE_AUTHSTORE = os.path.join(os.path.expanduser("~"), ".local", "share",
+                                  "opencode", "auth.json")
 PROXY_BIN_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin", "cli-proxy-api")
 DREGG_SIGNER_DEFAULT = os.path.join(os.path.expanduser("~"), ".local", "bin",
                                     "dregg-client-sign")
@@ -131,40 +138,50 @@ FAMILIES = {
              # leg needs two and SKIPs (loudly) for single-model families.
              "probe_models": ("kimi-k3",)},
     # ds4pro = DeepSeek v4 Pro, served by whichever OpenAI-compatible gateway
-    # the owner holds a LIVE bearer for. OUTBOUND KEY SOURCE (the hermes-auth
-    # dependency): when $DS4PRO_API_KEY / --key-from are absent the mint reads
-    # the live bearer from credential_pool[<provider>] in HERMES_AUTH
-    # (~/.hermes/auth.json, the hermes CLI's OAuth/key artifact) — a LIST of
-    # bearer entries per provider; the reader picks the live one (a real
-    # bearer, last_status ok, lowest priority) and bakes it 0600 into
-    # config.yaml at add time. The former nous-portal agent_key path is RETIRED
-    # (providers.nous.agent_key expired 2026-05-18 and its refresh is not
-    # self-serve). MULTI-PROVIDER: each gateway serves v4-pro under its OWN
-    # model id and base_url — model ids probed live off <base_url>/models
-    # 2026-07-22: openrouter = deepseek/deepseek-v4-pro, opencode-go =
-    # deepseek-v4-pro — so the family carries a per-provider table and picks
-    # pool_default unless `helm seat add ds4pro --provider <name>` overrides.
-    # pool_default = opencode-go (the owner's long-term "open code go" route);
-    # openrouter is the credit-bearing test route. The proxy's openai-
-    # compatibility block maps the claude-side alias "ds4-pro" to each
-    # provider's upstream id (slashes never reach claude's --model). Note
-    # opencode-go's gateway 403s (Cloudflare 1010) a request with NO
-    # User-Agent, but accepts any non-empty UA — CLIProxyAPI's Go http client
-    # sends "Go-http-client/1.1" by default, so the proxy leg passes. Port
-    # 8360: clear of codex 8317+N instance headroom and kimi 8318 (interleave
-    # discipline: families claim ports tens apart so instance ranges never
-    # collide). max_context mirrors codex's shave: 1M window less headroom for
-    # the 32k max_tokens request + CC's 20k reserve.
+    # the owner holds a LIVE bearer for. OUTBOUND KEY SOURCE: when
+    # $DS4PRO_API_KEY / --key-from are absent the mint reads the bearer from
+    # the OPENCODE tool auth store (OPENCODE_AUTHSTORE,
+    # ~/.local/share/opencode/auth.json — owner-maintained, FRESH) by the
+    # provider's `authstore` name; only type=="api" entries carry a bakeable
+    # key. It FALLS BACK to the hermes credential_pool[<provider>]
+    # (HERMES_AUTH) when the authstore lacks a usable key. The reader picks the
+    # live one and it is baked 0600 into config.yaml at add time (value never
+    # printed/logged). The former nous-portal agent_key + the STALE 2026-05-18
+    # hermes pool mirror (both providers 401) are superseded by the authstore.
+    # MULTI-PROVIDER: each gateway serves v4-pro under its OWN model id and
+    # base_url — model ids probed live off <base_url>/models 2026-07-22:
+    # opencode-go = deepseek-v4-pro (LIVE, HTTP 200), deepseek (native) =
+    # deepseek-v4-pro (key valid but 402 Insufficient Balance — configured, not
+    # live), openrouter = deepseek/deepseek-v4-pro (authstore key dead). So the
+    # family carries a per-provider table and picks pool_default unless
+    # `helm seat add ds4pro --provider <name>` overrides. pool_default =
+    # opencode-go (the owner's long-term "open code go" route AND the one that
+    # answers a REAL completion live). The proxy's openai-compatibility block
+    # maps the claude-side alias "ds4-pro" to each provider's upstream id
+    # (slashes never reach claude's --model). Note opencode-go's gateway 403s
+    # (Cloudflare 1010) a request with NO User-Agent, but accepts any non-empty
+    # UA — CLIProxyAPI's Go http client sends "Go-http-client/1.1" by default,
+    # so the proxy leg passes. Port 8360: clear of codex 8317+N instance
+    # headroom and kimi 8318 (interleave discipline: families claim ports tens
+    # apart so instance ranges never collide). max_context mirrors codex's
+    # shave: 1M window less headroom for the 32k max_tokens request + CC's 20k
+    # reserve.
     "ds4pro": {"port": 8360, "model": "ds4-pro", "mode": "proxy-key",
                "key_env": "DS4PRO_API_KEY",
                "pool_default": "opencode-go",
                "pool_providers": {
                    "opencode-go": {
                        "base_url": "https://opencode.ai/zen/go/v1",
-                       "upstream_model": "deepseek-v4-pro"},
+                       "upstream_model": "deepseek-v4-pro",
+                       "authstore": "opencode-go"},
+                   "deepseek": {
+                       "base_url": "https://api.deepseek.com",
+                       "upstream_model": "deepseek-v4-pro",
+                       "authstore": "deepseek"},
                    "openrouter": {
                        "base_url": "https://openrouter.ai/api/v1",
-                       "upstream_model": "deepseek/deepseek-v4-pro"},
+                       "upstream_model": "deepseek/deepseek-v4-pro",
+                       "authstore": "openrouter"},
                },
                "max_context": 1000000,
                "probe_models": ("ds4-pro",)},
@@ -887,6 +904,33 @@ def _hermes_pool_key(provider):
     return best.get("access_token"), best.get("base_url"), None
 
 
+def _opencode_authstore_key(provider):
+    """(api_key, err) for a provider from the opencode tool auth store
+    (OPENCODE_AUTHSTORE) — a JSON dict of provider -> {"type": "api",
+    "key": <bearer>}. Only type=="api" entries carry a static bearer we can
+    bake; oauth entries (access/refresh tokens that expire) are skipped here.
+    The store carries NO base_url, so the caller keeps the provider's
+    pool-table base_url. READ-ONLY on the source; the key value is secret and
+    callers must never print or log it."""
+    try:
+        with open(OPENCODE_AUTHSTORE) as f:
+            a = json.load(f)
+    except (OSError, ValueError) as exc:
+        return None, "unreadable %s (%s)" % (OPENCODE_AUTHSTORE, exc)
+    ent = a.get(provider)
+    if not isinstance(ent, dict):
+        return None, "no %s entry in %s" % (provider, OPENCODE_AUTHSTORE)
+    if ent.get("type") != "api":
+        return None, ("%s entry in %s is type '%s', not a static api key"
+                      % (provider, OPENCODE_AUTHSTORE, ent.get("type")))
+    key = ent.get("key")
+    # a real bearer is >= 20 chars — an empty/placeholder key never wins.
+    if not isinstance(key, str) or len(key) < 20:
+        return None, ("%s api entry in %s has no usable key"
+                      % (provider, OPENCODE_AUTHSTORE))
+    return key, None
+
+
 def _resolve_homing(explicit_room=None):
     """(room, source) for seat add/launch — seats.resolve_homing is THE one
     precedence (CLI wins, then the inherited launch seam, then the current
@@ -904,13 +948,16 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
     """mode "proxy-key": an API-key provider behind the same local proxy via
     its openai-compatibility block. No OAuth, no auth-dir. Key source order:
     $<key_env>, then --key-from <.env-style file>, then — for POOL families
-    (pool_providers set, e.g. ds4pro) — the live bearer in the hermes CLI's
-    credential_pool[<provider>] (HERMES_AUTH, read-only). A pool family serves
-    ONE selected provider per mint: `--provider <name>` else pool_default; the
-    provider's base_url + upstream model id come from its pool table (and the
-    credential_pool entry's own base_url wins when present, so the seat rides
-    exactly the endpoint the cred was minted for). The key is baked into the
-    seat's 0600 config.yaml once, at add time — never printed, never logged."""
+    (pool_providers set, e.g. ds4pro) — the PREFERRED opencode tool auth store
+    (OPENCODE_AUTHSTORE) by the provider's `authstore` name, then the hermes
+    CLI's credential_pool[<provider>] (HERMES_AUTH) as fallback. Both read-only.
+    A pool family serves ONE selected provider per mint: `--provider <name>`
+    else pool_default; the provider's base_url + upstream model id come from
+    its pool table (the authstore carries no base_url, so the table's wins; on
+    the hermes fallback the credential_pool entry's own base_url wins when
+    present, so the seat rides exactly the endpoint the cred was minted for).
+    The key is baked into the seat's 0600 config.yaml once, at add time — never
+    printed, never logged."""
     key_env = fam["key_env"]
     api_key = os.environ.get(key_env)
     # provider selection + outbound routing. Non-pool families (kimi) carry the
@@ -947,15 +994,27 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
             return 1
     pool_err = None
     if not api_key and pool_provider:
-        api_key, ent_base, pool_err = _hermes_pool_key(pool_provider)
-        if api_key and ent_base:
-            base_url = ent_base   # the pool entry's own base_url is authoritative
+        # PREFER the opencode auth store (fresh, owner-maintained); the
+        # authstore carries no base_url so the pool-table base_url (set above)
+        # stands. Fall back to the hermes credential_pool, whose entry base_url
+        # wins when present.
+        authstore_prov = prov_cfg.get("authstore")
+        if authstore_prov:
+            api_key, as_err = _opencode_authstore_key(authstore_prov)
+            if not api_key:
+                pool_err = as_err
+        if not api_key:
+            api_key, ent_base, hermes_err = _hermes_pool_key(pool_provider)
+            if api_key and ent_base:
+                base_url = ent_base   # the pool entry's own base_url wins
+            elif not api_key:
+                pool_err = hermes_err or pool_err
     if not api_key:
         pool_hint = ""
         if pool_provider:
-            pool_hint = (", or log the hermes CLI in so %s carries a live "
-                         "credential_pool.%s bearer (%s)"
-                         % (HERMES_AUTH, pool_provider, pool_err))
+            pool_hint = (", or ensure %s or %s carries a live %s bearer (%s)"
+                         % (OPENCODE_AUTHSTORE, HERMES_AUTH, pool_provider,
+                            pool_err))
         print("helm seat: no outbound key — export %s=<key> or pass "
               "--key-from <env-file> carrying a %s= line%s, then re-run "
               "`helm seat add %s`" % (key_env, key_env, pool_hint, family),
