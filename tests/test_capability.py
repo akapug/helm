@@ -91,6 +91,15 @@ class SurfacingTest(CapBase):
                      "bounce this off another agent"):
             self.assertIn("meld", self.jit_ids(text), text)
 
+    def test_did_they_see_it_surfaces_the_pending_ladder(self):
+        # substrate-awareness: reasoning about whether a message was SEEN /
+        # ACTED / stranded must surface the ack-ladder pending view — a silent
+        # reply must never be mistaken for a lost one. The lever did not exist
+        # in the catalog before this lane.
+        for text in ("did they see my message or act on it",
+                     "is my dispatch stranded with no reply"):
+            self.assertIn("pending", self.jit_ids(text), text)
+
     def test_ordinary_work_prompts_do_not_surface_meld(self):
         # No over-fire: solo-work vocabulary must NOT drag in the meld lever —
         # the enriched keywords stay specific, the specificity gate still holds.

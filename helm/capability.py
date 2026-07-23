@@ -100,6 +100,22 @@ CAPABILITIES = (
         "visibility": VIS_PUBLIC,
     },
     {
+        "id": "pending",
+        "verb": "helm chat pending",
+        "tool": "helm chat pending",
+        "what": "see whether your @mention/DM was SEEN or ACTED on and which "
+                "addressees STRANDED (no seat answers) — the SENT/SEEN/ACTED "
+                "consume ladder, so a silent reply is never mistaken for lost",
+        "wired_via": "helm chat pending + the ack-ladder consume ladder",
+        "keywords": "did they see,did they see it,was it seen,did they act,"
+                    "did they ack,did they read it,did my message land,did it "
+                    "reach,no reply,no response,unanswered,who has not "
+                    "responded,waiting on a reply,message stranded,stranded,"
+                    "did it get delivered,ghosted",
+        "tier": TIER_CORE,
+        "visibility": VIS_PUBLIC,
+    },
+    {
         "id": "work-claims",
         "verb": "helm work claim",
         "tool": "helm work claim",
