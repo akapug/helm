@@ -1022,7 +1022,7 @@ def _chat_win(qs):
 # truth (that is recomputed live on the poll path only, never here). Single-
 # flight TTL, keyed by the chat root like _ROOMS_SUM so isolated test worlds
 # can never read each other's slice.
-_CHAT_OLDER_CACHE = {}          # (chat-root, room, before, win, stat) -> (at, body)
+_CHAT_OLDER_CACHE = {}          # (chat-root, room, before, win) -> (at, body, stat)
 _CHAT_OLDER_TTL = 30.0
 _CHAT_OLDER_LOCK = threading.Lock()
 
@@ -1062,25 +1062,38 @@ def _api_chat_older(qs):
         root = str(chat.chat_dir())
     except Exception:
         root = "?"
-    # `stat` in the key is what makes this cache rotation-aware: a rotate (or any
-    # append) changes (size, mtime_ns), so the stale entry can never be served —
-    # we never hand back dropped rows or a stale total.
-    key = (root, room, before, win, _room_stat(room))
+    # The stat is VALIDATED, not keyed. Baking a pre-sampled stat into the key
+    # was a TOCTOU: an append between that sample and the serve left the sampled
+    # stat matching the OLD entry, so a stale total got served (codex-3: cached
+    # total 10 while the file already held 11). It also NEVER evicted — every
+    # append minted a fresh stat -> a fresh key -> unbounded growth (12 appends,
+    # 12 entries). Now the key is version-free (root, room, before, win) and the
+    # room's live stat is compared to the stat STORED WITH the body: a mismatch is
+    # a MISS (rotation/append can never serve a stale slice or total), and a fresh
+    # read OVERWRITES the one entry per (room, page) — the cache stays bounded.
+    key = (root, room, before, win)
     now = time.time()
     hit = _CHAT_OLDER_CACHE.get(key)
-    if hit and now - hit[0] < _CHAT_OLDER_TTL:
+    if hit and now - hit[0] < _CHAT_OLDER_TTL and hit[2] == _room_stat(room):
         return dict(hit[1]), 200
     with _CHAT_OLDER_LOCK:
         hit = _CHAT_OLDER_CACHE.get(key)   # re-check under the single-flight lock
-        if hit and now - hit[0] < _CHAT_OLDER_TTL:
+        if hit and now - hit[0] < _CHAT_OLDER_TTL and hit[2] == _room_stat(room):
             return dict(hit[1]), 200
         rows, total = chat.read(room)
+        st = _room_stat(room)              # sampled AFTER the read: the stat the body reflects
         end = before if 0 <= before <= total else total
         start = max(0, end - win)
         body = {"room": room,
                 "lines": chat.public_rows(rows[start:end]),
                 "base": start, "total": total, "gen": _chat_gen(rows)}
-        _CHAT_OLDER_CACHE[key] = (now, body)
+        # evict every OTHER version of this room (any before/win at a different
+        # stat) so a rotated/appended room cannot accumulate entries — the cache
+        # holds only current-version pages, bounded per room.
+        for k in [k for k, v in _CHAT_OLDER_CACHE.items()
+                  if k[0] == root and k[1] == room and v[2] != st]:
+            del _CHAT_OLDER_CACHE[k]
+        _CHAT_OLDER_CACHE[key] = (now, body, st)
         return dict(body), 200
 
 
