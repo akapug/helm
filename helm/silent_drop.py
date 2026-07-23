@@ -42,6 +42,9 @@ from . import autocompact, home
 
 LATCH_TTL_S = 15 * 60     # one alert per seat per drop episode
 RECENT_LINES = 400        # bounded scan of the transcript tail
+RECENT_ALERT_WINDOW_S = 20 * 60   # only alert on a drop recent enough to ACT on;
+                          # a stale drop on a frozen/idle seat must never re-cry —
+                          # the newest-drop-in-tail otherwise re-alerts forever
 _STATE = "silent_drop.json"
 
 _USAGE = """usage: helm seat silent-drop [--seat S] [--once] [--dry-run] [--quiet] [--json]
@@ -82,9 +85,25 @@ def _is_drop(record):
         return False
 
 
+def _recent(ts):
+    """True if a drop's timestamp is within the alert window (or unparseable —
+    fail-OPEN so a clock/format surprise never suppresses a real drop)."""
+    if not ts:
+        return True
+    try:
+        import datetime
+        t = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (now - t).total_seconds() <= RECENT_ALERT_WINDOW_S
+    except (ValueError, TypeError):
+        return True
+
+
 def scan_seat(seat_name):
     """Read-only scan of one seat's newest transcript tail. Returns a finding
-    dict on the most recent drop, else None. Never injects, never writes."""
+    dict on the most RECENT drop (within the alert window), else None. A stale
+    drop on a frozen/idle seat is NOT a finding — it already happened and the
+    seat is producing no turns to rescue. Never injects, never writes."""
     from . import seat
     family, err = seat._seat_family(seat_name)
     if err:
@@ -108,6 +127,8 @@ def scan_seat(seat_name):
                 "output_tokens": usage.get("output_tokens"),
                 "session": os.path.basename(tp)[:-len(".jsonl")],
             }
+    if newest and not _recent(newest.get("ts")):
+        return None   # stale drop (older than the window) — don't cry wolf
     return newest
 
 

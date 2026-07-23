@@ -15,10 +15,19 @@ from helm import seat, silent_drop
 SID = "11111111-1111-1111-1111-111111111111"
 
 
-def asst(content, stop="end_turn", ot=50, ts="2026-07-23T10:00:00Z",
-         sidechain=False):
+def _rts(mins_ago=0):
+    """A RECENT iso timestamp — drops model 'just happened', so they must fall
+    inside silent_drop.RECENT_ALERT_WINDOW_S or the recency guard suppresses them."""
+    import datetime
+    t = (datetime.datetime.now(datetime.timezone.utc)
+         - datetime.timedelta(minutes=mins_ago))
+    return t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def asst(content, stop="end_turn", ot=50, ts=None, sidechain=False):
     return json.dumps({
-        "type": "assistant", "isSidechain": sidechain, "timestamp": ts,
+        "type": "assistant", "isSidechain": sidechain,
+        "timestamp": ts if ts is not None else _rts(),
         "message": {"role": "assistant", "stop_reason": stop,
                     "content": content, "usage": {"output_tokens": ot}}})
 
@@ -95,17 +104,18 @@ class SilentDropTest(unittest.TestCase):
         self.assertIsNone(silent_drop.scan_seat("codex"))
 
     def test_reports_the_newest_drop(self):
-        self.plant([asst([], ot=10, ts="2026-07-23T10:00:00Z"),
+        old_ts, new_ts = _rts(10), _rts(2)
+        self.plant([asst([], ot=10, ts=old_ts),
                     asst([{"type": "text", "text": "healthy"}], ot=200),
-                    asst([], ot=77, ts="2026-07-23T11:00:00Z")])
+                    asst([], ot=77, ts=new_ts)])
         f = silent_drop.scan_seat("codex")
         self.assertEqual(f["output_tokens"], 77)
-        self.assertEqual(f["ts"], "2026-07-23T11:00:00Z")
+        self.assertEqual(f["ts"], new_ts)
 
     # -- the latch ----------------------------------------------------------
 
     def test_latch_suppresses_repeat_same_ts(self):
-        self.plant([asst([], ot=50, ts="2026-07-23T10:00:00Z")])
+        self.plant([asst([], ot=50, ts=_rts(1))])
         r1 = silent_drop.check(seats=["codex"], post=False)
         self.assertEqual(len(r1["alerted"]), 1)
         r2 = silent_drop.check(seats=["codex"], post=False)
