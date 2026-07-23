@@ -1072,6 +1072,33 @@ def reject(eid, ts, why="", project=None, ctype=None):
     return e, None
 
 
+def _notify_graduation(etype, eid):
+    """Fire ONE optional push when a candidate graduates to provisional — the
+    owner steer: the provisional queue must ROUTINELY reach the owner, never
+    wait silently. HELM_NTFY_TOPIC (a full URL, else a bare topic ->
+    https://ntfy.sh/<name>) opts in; UNSET -> no network call at all. stdlib
+    urllib POST, 3s per-op timeout (bounds each socket op, not total
+    wall-clock), a one-line body + a Title header. ALWAYS fail-open:
+    any error (down notifier, DNS, timeout) is journaled as a one-line receipt
+    and the graduation still succeeds — a notifier NEVER breaks the verb."""
+    topic = (home.env("NTFY_TOPIC") or "").strip()
+    if not topic:
+        return  # opted out — never touch the network
+    url = topic if topic.startswith(("http://", "https://")) \
+        else "https://ntfy.sh/" + topic
+    msg = "helm: %s %s now provisionally live - review when convenient" % (etype, eid)
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            url, data=msg.encode("utf-8"), method="POST",
+            headers={"Title": "helm store review queue"})
+        with urllib.request.urlopen(req, timeout=3):
+            pass
+    except Exception as ex:
+        pk.event("store.notify_failed", str(eid),
+                 "ntfy graduation push failed: " + str(ex)[:120])
+
+
 def xrev_clear(eid, ts, by, project=None, ctype=None):
     """The graduation gate: a candidate -> provisional after a cross-family /x
     review clears it (owner canon: xrev is the gate, not the owner). The
@@ -1080,7 +1107,9 @@ def xrev_clear(eid, ts, by, project=None, ctype=None):
     the resolver like live but renders with a visible [provisional] tag until the
     owner ratifies (confirm) or rejects (reject) it in the web review panel. The
     receipt lands in xrev_by/xrev_ts on the file (all types) + the events
-    journal, and a prior also logs it to its own evidence_log. Refuses a missing
+    journal, and a prior also logs it to its own evidence_log. On graduation it
+    fires ONE optional push (HELM_NTFY_TOPIC) so the provisional queue reaches
+    the owner — fail-open, never blocks the graduation. Refuses a missing
     reviewer, a non-candidate, and cross-type slug ambiguity (same law as
     confirm/reject)."""
     if not str(by or "").strip():
@@ -1101,6 +1130,7 @@ def xrev_clear(eid, ts, by, project=None, ctype=None):
             {"ts": ts, "type": "xrev-cleared", "delta": 0, "reason": note, "by": by}]
     _WRITERS[e["type"]](e, path=e["path"])
     pk.event("store.xrev_clear", str(e["id"]), note)
+    _notify_graduation(e["type"], str(e["id"]))
     return e, None
 
 
