@@ -771,7 +771,8 @@ class SeatTest(unittest.TestCase):
         """ctx-window fix: proxy seats mint CLAUDE_CODE_MAX_CONTEXT_TOKENS
         (per-family real window, teaching CC past its hardcoded 200k) +
         CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, so a non-claude seat compacts before
-        the unrecoverable 400. kimi (1M real) omits the max; signing env intact."""
+        the unrecoverable 400. Every proxy family mints its real window (kimi
+        included — k3 is 1M); signing env intact."""
         self._plant("home-a")
         self.assertEqual(self._add()[0], 0)
         line = seat.launch_line("codex")
@@ -779,10 +780,12 @@ class SeatTest(unittest.TestCase):
         self.assertIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=78", line)
         # ctxenv appends AFTER the signing env, which stays byte-identical
         self.assertIn("DREGG_PROFILE=codex CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=78", line)
-        # kimi is a 1M-window model — CC's 200k default is safe, so no max minted
+        # kimi's k3 is a 1M-window model — mint the real max so CC's gauge and
+        # autocompact stop tracking the hardcoded 200k (kimi was compacting 5x
+        # too early).
         kline = seat.launch_line("kimi")
         self.assertIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=78", kline)
-        self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", kline)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000", kline)
 
     # -- the child-stamp guard (child-stamp-kills-seat-persistence) ---------
     def test_launch_line_strips_child_stamp(self):

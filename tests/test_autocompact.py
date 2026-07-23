@@ -135,23 +135,42 @@ class AutocompactTest(unittest.TestCase):
         self.assertEqual(autocompact.read("codex-2")["status"], "ok")
 
     def test_window_unset_is_noop_when_assume_off(self):
+        # a synthetic family with NO max_context exercises the unset path
         os.environ["HELM_AUTOCOMPACT_ASSUME_WINDOW"] = "0"
-        os.makedirs(seat.seat_dir("kimi"), exist_ok=True)
-        row = autocompact.read("kimi")
-        self.assertEqual(row["status"], "window-unset")
-        res = autocompact.check(seats=["kimi"], post=False,
-                                adapter=FakeAdapter())
-        self.assertEqual(res["fired"], [])
+        with mock.patch.dict(seat.FAMILIES,
+                             {"nowin": {"port": 8399, "model": "nowin-m",
+                                        "mode": "proxy-key"}}):
+            os.makedirs(seat.seat_dir("nowin"), exist_ok=True)
+            row = autocompact.read("nowin")
+            self.assertEqual(row["status"], "window-unset")
+            res = autocompact.check(seats=["nowin"], post=False,
+                                    adapter=FakeAdapter())
+            self.assertEqual(res["fired"], [])
 
     def test_window_unset_mirrors_cc_default(self):
-        # no FAMILIES max_context for kimi -> CC's assumed 200k is the gauge
+        # a family with no FAMILIES max_context -> CC's assumed 200k is the gauge
+        with mock.patch.dict(seat.FAMILIES,
+                             {"nowin": {"port": 8399, "model": "nowin-m",
+                                        "mode": "proxy-key"}}):
+            proj = os.path.join(seat.seat_dir("nowin"), "claude", "projects", "-p")
+            os.makedirs(proj, exist_ok=True)
+            with open(os.path.join(proj, SID + ".jsonl"), "w") as f:
+                f.write(usage_line(100000, model="nowin-m") + "\n")
+            row = autocompact.read("nowin")
+            self.assertEqual(row["window"], 200000)
+            self.assertEqual(row["window_src"], "cc-assumed-default")
+            self.assertAlmostEqual(row["pct"], 50.0)
+
+    def test_window_pinned_from_family_max_context(self):
+        # kimi now declares max_context (k3 = 1M) -> the pinned window is the
+        # gauge, NOT CC's 200k default. 500k of a 1M window reads 50%.
         proj = os.path.join(seat.seat_dir("kimi"), "claude", "projects", "-p")
         os.makedirs(proj, exist_ok=True)
         with open(os.path.join(proj, SID + ".jsonl"), "w") as f:
-            f.write(usage_line(100000, model="kimi-k3") + "\n")
+            f.write(usage_line(500000, model="kimi-k3") + "\n")
         row = autocompact.read("kimi")
-        self.assertEqual(row["window"], 200000)
-        self.assertEqual(row["window_src"], "cc-assumed-default")
+        self.assertEqual(row["window"], 1000000)
+        self.assertEqual(row["window_src"], "FAMILIES.max_context")
         self.assertAlmostEqual(row["pct"], 50.0)
 
     # -- the trigger -------------------------------------------------------
