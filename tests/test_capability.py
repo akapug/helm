@@ -80,6 +80,24 @@ class SurfacingTest(CapBase):
         self.assertIn("wired via", blob)
         self.assertIn("live)", blob)
 
+    def test_natural_converge_vocabulary_surfaces_meld(self):
+        # The #1-feature discoverability owner-canon (reach for meld WITHOUT
+        # being told): an agent must surface the meld lever at a converge moment
+        # in the WORDS it actually uses, not only literal "converge/a2a". All
+        # four MISSED before the keyword enrichment (verified on baseline).
+        for text in ("reach consensus with another agent",
+                     "we disagree, how do we resolve this",
+                     "get on the same page with the other seat",
+                     "bounce this off another agent"):
+            self.assertIn("meld", self.jit_ids(text), text)
+
+    def test_ordinary_work_prompts_do_not_surface_meld(self):
+        # No over-fire: solo-work vocabulary must NOT drag in the meld lever —
+        # the enriched keywords stay specific, the specificity gate still holds.
+        for text in ("fix the failing test in seats.py",
+                     "refactor this function to be cleaner"):
+            self.assertNotIn("meld", self.jit_ids(text), text)
+
     def test_per_toolcall_whisper_meld_reaches_chat_deliver(self):
         # the ORIGINAL failure: reasoning about the per-toolcall whisper meld
         # and NOT reaching for helm chat deliver. It must now surface.

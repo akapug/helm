@@ -62,7 +62,15 @@ CAPABILITIES = (
                 "you synthesize the final answer",
         "wired_via": "helm chat meld + the /com council skill",
         "keywords": "meld,converge,a2a,second opinion,another seat,another model,"
-                    "second seat,another take,pair with,two models,cross-family",
+                    "second seat,another take,pair with,two models,cross-family,"
+                    # the converge MOMENT in the words agents actually use (owner
+                    # canon: reach for meld WITHOUT being told). Specific phrases,
+                    # not bare generics, so the specificity gate still holds.
+                    "reach consensus,consensus,reach agreement,can we agree,"
+                    "agree on this,get on the same page,same page,hash this out,"
+                    "hash it out,sync up,another perspective,another agent,"
+                    "bounce this off,bounce it off,we disagree,resolve the "
+                    "disagreement,converge with,align with a peer",
         "tier": TIER_CORE,
         "visibility": VIS_PUBLIC,
     },
