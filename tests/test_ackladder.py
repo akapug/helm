@@ -148,6 +148,39 @@ class SentSeenTests(LadderBase):
                       emit=lambda ln: None)
         self.assertEqual(self.states(), [("recipT", "sent")])
 
+    def test_rotation_voids_join_baseline_no_false_SENT(self):
+        """A room-file ROTATION (replacement → new inode) must VOID the join
+        baseline: it indexes the now-gone old file. recipT joins main at a high
+        EOF (base = that offset); main is then replaced by a fresh, SMALLER file
+        whose @recipT mention deliver actually surfaces. Its end offset sits
+        BELOW the stale old-file base, so a carried-forward base would gate the
+        cursor-SEEN off and false-SENT a just-delivered row. deliver re-baselines
+        base to 0 on the new inode, so the delivered row reads SEEN. Fail-safe
+        (over-reports SENT, never a false clear) — but still a wart it closes."""
+        for i in range(12):
+            chat.post("filler %d — push main EOF well past one row" % i,
+                      room="main", who="senderS")
+        self.join("recipT")                     # base = high pre-rotation EOF
+        old_ino = seats._recipient_cursor("main", "recipT")["ino"]
+
+        # Replace main with a fresh, smaller file (new inode) carrying a fresh
+        # mention. os.replace GUARANTEES a distinct inode — a bare remove+create
+        # can REUSE the freed inode (ext4), which would dodge the dev,ino branch.
+        row = chat.post("@recipT after the rotation", room="rotsrc",
+                        who="senderS")
+        os.replace(chat.room_path("rotsrc"), chat.room_path("main"))
+        self.assertNotEqual(os.stat(chat.room_path("main")).st_ino, old_ino)
+
+        surfaced = []                           # the new-file mention delivers
+        seats.deliver(session="sess-recipT", room="main", seat="recipT",
+                      emit=lambda ln: surfaced.append(ln))
+        self.assertTrue(surfaced)
+        self.assertEqual(seats._recipient_cursor("main", "recipT")["base"], 0)
+
+        self.mask_old("recipT")                 # SEEN must come from the CURSOR
+        st, _a = seats.consume_state(row, "main", "recipT")
+        self.assertEqual(st, "seen")            # not false-SENT off a stale base
+
     def test_never_joined_seat_mention_stays_visible(self):
         """A ROOM @mention of a seat that never joined has no cursor ground
         and is not even in the roster — it must NOT vanish from pending (the

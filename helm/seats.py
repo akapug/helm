@@ -1239,6 +1239,12 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
         if got is None:
             return None
         dev, ino, base, entries, last_rid, skip = got
+        # A rotation/replacement (_tail restarts at 0 on a new dev,ino) voids
+        # the join baseline: it indexes the now-gone old file, so carrying it
+        # forward would false-SENT the new file's genuinely-delivered rows. The
+        # pre-join backlog died with the old inode — re-baseline the gate at 0.
+        cbase = cur.get("base") \
+            if (dev, ino) == (cur.get("dev"), cur.get("ino")) else 0
         hit = None
         last_end = base
         for i, (row, end) in enumerate(entries):
@@ -1250,7 +1256,7 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
             _write_cursor(
                 room, seat, dev, ino, last_end, last_rid, session=session,
                 active=cur.get("active") or bool(entries), skip=skip,
-                base=cur.get("base"))          # advance never moves the base
+                base=cbase)          # advance never moves the base (0 on rot.)
             return None
         i, row, end = hit
         waiting = sum(1 for r, _e in entries[i + 1:]
@@ -1269,7 +1275,7 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
             emit(line)                  # output FIRST …
         _write_cursor(room, seat, dev, ino, end, row.get("id"),
                       session=session, active=True,   # … commit after
-                      base=cur.get("base"))           # base carried forward
+                      base=cbase)             # carried forward (0 on rotation)
         return line
 
 
@@ -2747,10 +2753,12 @@ def consume_state(m, room, recipient, dev=None, ino=None, end_off=None,
     # The join baseline: rows at/below the offset the seat baselined this room
     # at (a room @mention posted BEFORE the join sits below EOF) were NEVER
     # surfaced by deliver and never will be — neither cursor- nor touch_seen-
-    # SEEN can fire on them. base is carried forward unchanged as the cursor
-    # advances; it defaults to 0 (legacy cursors / DM lanes baseline at 0, so
-    # every row above 0 stays eligible — no regression). It is a valid offset
-    # only against the SAME lane file the cursor baselined against.
+    # SEEN can fire on them. base carries forward unchanged as the cursor
+    # advances but RESETS to 0 on a rotation (deliver re-baselines when dev,ino
+    # changes — the old-file offset would else false-SENT the new file's rows);
+    # it defaults to 0 (legacy cursors / DM lanes baseline at 0, so every row
+    # above 0 stays eligible — no regression). It is a valid offset only against
+    # the SAME lane file the cursor baselined against — the `same` guard below.
     same = bool(cur) and (dev, ino) == (cur.get("dev"), cur.get("ino"))
     base = cur.get("base", 0) if same else 0
     below_base = end_off is not None and end_off <= base
