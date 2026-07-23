@@ -50,8 +50,15 @@ class KeepaliveTest(unittest.TestCase):
         keepalive.CODEX_HOMES_ROOT = j("codex-homes")
         keepalive._live_holder_pid = lambda p: None
         keepalive._predecessor_pids = lambda: []
+        # refresh_home's pre-image rides cred.backup — point it at tmp for
+        # EVERY test, or fake-token snapshots land in the real ~/.cred-backups
+        # (they did; cred's foreign-family coherence check caught the leak)
+        self._envp = mock.patch.dict(os.environ, {
+            "HELM_CRED_BACKUP_ROOT": j("cred-backups")})
+        self._envp.start()
 
     def tearDown(self):
+        self._envp.stop()
         for k, v in self._orig.items():
             setattr(keepalive, k, v)
         shutil.rmtree(self.tmp, ignore_errors=True)
