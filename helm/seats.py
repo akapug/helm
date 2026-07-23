@@ -392,8 +392,8 @@ def deliverable(m, seat, room="main", scope=None):
         outside home): never (noise law).
     scope=None computes seat_scope here — hot paths pass it precomputed."""
     text = m.get("text")
-    if not text or m.get("react") or m.get("ambient"):
-        return False
+    if not text or m.get("react") or m.get("ambient") or m.get("ack"):
+        return False        # an ack marker is state the SENDER pulls, not a wake
     frm = str(m.get("from") or "")
     if frm.casefold() == str(seat or "").casefold():
         # Own-post suppression casefolds like EVERY seat-identity match here
@@ -2598,6 +2598,240 @@ def roster_report(room="main"):
 
 
 # ---------------------------------------------------------------------------
+# ACK / CONSUME LADDER (AX primitive #3): SENT != SEEN != ACTED.
+# An addressed word has a per-(recipient, row) state the SENDER can OBSERVE,
+# derived READ-ONLY off the EXISTING delivery cursor + touch_seen — never a
+# second ledger. SENT (row written) -> SEEN (the recipient's cursor passed the
+# row, or it was active in a later second) -> ACTED (an explicit ack row on
+# the same one-writer chat path). `pending` is the sender's view of everything
+# not yet ACTED, so a message sent to a dead / wedged / away recipient is a
+# VISIBLE object, not silent loss (owner-flagged: the notify-me gap).
+# ---------------------------------------------------------------------------
+
+_MENTION_TOKEN = re.compile(r"(?<![A-Za-z0-9._-])@([A-Za-z0-9._-]{1,64})")
+
+
+def _ts_epoch(ts):
+    """An ISO chat ts -> epoch seconds (None on garbage). last_seen is a float
+    mtime and a row ts is second-floored, so the SEEN fallback compares
+    int(last_seen) against this."""
+    import calendar
+    try:
+        return calendar.timegm(time.strptime(str(ts), "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _dm_lanes():
+    """Every private DM lane as its reserved room name. list_rooms() hides
+    them (no fanout), but a sender's outbound DMs live in the RECIPIENTS'
+    lanes — `pending` must enumerate them to find its own stranded words."""
+    try:
+        names = os.listdir(os.path.join(chat.chat_dir(), "dm"))
+    except OSError:
+        return []
+    return [chat.DM_PREFIX + n[:-6] for n in names if n.endswith(".jsonl")]
+
+
+def _all_lanes():
+    return list(chat.list_rooms()) + _dm_lanes()
+
+
+def _recipients(m, r=None):
+    """The seats a row DIRECTLY ADDRESSES — whose consume state the sender
+    tracks. A DM names exactly one; otherwise the roster seats @mentioned plus
+    a reply's parent author (rfrom), the same set deliverable() would wake.
+    ack / react / ambient rows address nobody. Roster-resolved (casefold),
+    broadcast tokens dropped: only a seat with a cursor can be SEEN or ACTED."""
+    if not isinstance(m, dict) or m.get("ack") or m.get("react") \
+            or m.get("ambient"):
+        return []
+    if m.get("dm"):
+        return [str(m["dm"])]
+    text = m.get("text") or ""
+    r = roster() if r is None else r
+    keys = {k.casefold(): k for k in r}
+    out, seen = [], set()
+    for tok in _MENTION_TOKEN.findall(text):
+        if _BROADCAST.search("@" + tok):
+            continue
+        k = keys.get(tok.casefold())
+        if k and k.casefold() not in seen:
+            out.append(k)
+            seen.add(k.casefold())
+    rf = str(m.get("rfrom") or "").casefold()
+    if rf and rf in keys and rf not in seen:
+        out.append(keys[rf])
+    return out
+
+
+def _row_offsets(room):
+    """(dev, ino, [(row, end_off)]) for one lane — every complete row and the
+    byte offset PAST it, the same identity the delivery cursor commits (codex
+    H5). Lets a row be tested against a recipient's cursor.off without moving
+    it. Every chat row ends in a newline (chat._append), so there is no
+    partial tail to mis-measure."""
+    try:
+        with open(chat.room_path(room), "rb") as f:
+            st = os.fstat(f.fileno())
+            data = f.read()
+    except OSError:
+        return None, None, []
+    out, pos = [], 0
+    for chunk in data.split(b"\n"):
+        end = pos + len(chunk) + 1
+        if chunk:
+            row = chat._msg(chunk.decode("utf-8", errors="replace"))
+            if row is not None:
+                out.append((row, end))
+        pos = end
+    return st.st_dev, st.st_ino, out
+
+
+def _recipient_cursor(room, seat):
+    """The recipient's delivery cursor for one lane — its newest session's,
+    seat-level fallback (roster_report's read pattern). None when the seat has
+    no ground here (never joined / not tracked): then it has NOT seen the row."""
+    row = roster().get(seat) or {}
+    return _cursor(room, seat, row.get("session")) or _cursor(room, seat)
+
+
+def consume_state(m, room, recipient, dev=None, ino=None, end_off=None,
+                  acks=None):
+    """(state, ackstate) for ONE (recipient, row): 'acted' | 'seen' | 'sent'.
+    READ-ONLY over the existing plumbing — no cursor moves, no second ledger:
+      acted  an ack row (this recipient, this row id) exists in the lane
+      seen   the recipient's cursor passed the row's end offset, OR the seat
+             was active in a strictly-later second than the row (touch_seen)
+      sent   the row was written and neither holds — the stranded state
+    `acks` = {(target_id, from_cf): ackstate} for the lane; dev/ino/end_off
+    are that same lane read (all recomputed when a caller omits them)."""
+    tid = m.get("id")
+    rcf = str(recipient or "").casefold()
+    if acks is None or dev is None:
+        dev, ino, rows = _row_offsets(room)
+        acks, end_off = {}, None
+        for x, e in rows:
+            if x.get("ack"):
+                acks[(x["ack"], str(x.get("from") or "").casefold())] = \
+                    x.get("ackstate") or "done"
+            if x.get("id") == tid:
+                end_off = e
+    if tid and (tid, rcf) in acks:
+        return "acted", acks[(tid, rcf)]
+    cur = _recipient_cursor(room, recipient)
+    if cur and end_off is not None \
+            and (dev, ino) == (cur.get("dev"), cur.get("ino")) \
+            and end_off <= cur.get("off", 0):
+        return "seen", None
+    ls = last_seen(recipient)
+    mts = _ts_epoch(m.get("ts"))
+    if ls is not None and mts is not None and int(ls) > mts:
+        return "seen", None       # touch_seen fallback (a later second)
+    return "sent", None
+
+
+def _locate_row(target_id):
+    """(row, room, err): the one chat row a bare id names, across every live
+    lane. Exact id wins; an unambiguous >=4-char prefix resolves too (ids are
+    12 hex — nobody types them whole). Ambiguous or unknown => a refusal
+    string, never a guess."""
+    tid = str(target_id or "").strip()
+    if not tid:
+        return None, None, "ack needs a message id (helm chat read shows ids)"
+    hits = []
+    for room in _all_lanes():
+        for m in chat.read(room)[0]:
+            rid = str(m.get("id") or "")
+            if rid and (rid == tid or (len(tid) >= 4 and rid.startswith(tid))):
+                hits.append((m, room, rid == tid))
+    exact = [h for h in hits if h[2]]
+    hits = exact or hits
+    if not hits:
+        return None, None, "no message matches id %r (helm chat read)" % tid
+    if len({h[0].get("id") for h in hits}) > 1:
+        return None, None, "id %r is ambiguous — use more of it" % tid
+    return hits[0][0], hits[0][1], None
+
+
+def ack(target_id, state="done", note=None, who=None, session=None):
+    """(result, err). The RECIPIENT marks a row ACTED. One append-only ack row
+    on the SAME lane as the target (the one-writer chat.post path, signed like
+    any row), stamped {ack: <target id>, ackstate: done|blocked}; the note is
+    its text. REFUSED unless the acker is an actual recipient of the row —
+    a foreign or unknown id never writes. Idempotent: a repeat with the same
+    acker + state + note appends nothing (append-only, but no duplicate row)."""
+    state = str(state or "done").lower()
+    if state not in ("done", "blocked"):
+        return None, "ack state must be 'done' or 'blocked' (got %r)" % state
+    note = (note or "").strip() or None
+    seat = who or seat_for_session(session) or derive_seat(session)
+    m, room, err = _locate_row(target_id)
+    if err:
+        return None, err
+    tid = m.get("id")
+    recips = _recipients(m)
+    scf = str(seat).casefold()
+    if not any(scf == str(x).casefold() for x in recips):
+        # the refusal reaches a terminal (cmd prints err to stderr): launder
+        # every roster/identity-borne token via _seat_label, the seats.py
+        # publish-owner law — a planted seat name must not reshape the refusal.
+        if not recips:
+            return None, ("%s is not an addressed message — nothing to ack "
+                          "(from %s)" % (str(tid)[:8],
+                                         _seat_label(m.get("from") or "?")))
+        return None, ("%s is addressed to %s, not you (%s) — only its "
+                      "recipient can ack"
+                      % (str(tid)[:8],
+                         "/".join(_seat_label(x) for x in recips),
+                         _seat_label(seat)))
+    prior = [x for x in chat.read(room)[0] if x.get("ack") == tid
+             and str(x.get("from") or "").casefold() == scf]
+    prev = prior[-1] if prior else None
+    if prev and prev.get("ackstate") == state \
+            and (prev.get("text") or "") == (note or ""):
+        return {"target": m, "room": room, "state": state, "row": prev,
+                "dup": True}, None
+    row = chat.post(note or "", room=room, who=seat, profile=seat,
+                    ack=tid, ackstate=state)
+    return {"target": m, "room": room, "state": state, "row": row,
+            "dup": False}, None
+
+
+def pending(seat=None, session=None, cap=50):
+    """(items, total): the sender's outbound ADDRESSED rows not yet ACTED, one
+    entry per (recipient, row) — SENT-not-SEEN or SEEN-not-ACTED. Derived
+    read-only off the recipients' cursors + touch_seen; an acked pair drops off
+    (consumed). Ordered oldest-first (longest-stranded on top), bounded."""
+    seat = seat or seat_for_session(session) or derive_seat(session)
+    scf = str(seat).casefold()
+    r = roster()
+    items = []
+    for room in _all_lanes():
+        dev, ino, rows = _row_offsets(room)
+        acks = {}
+        for m, _e in rows:
+            if m.get("ack"):
+                acks[(m["ack"], str(m.get("from") or "").casefold())] = \
+                    m.get("ackstate") or "done"
+        for m, end_off in rows:
+            if str(m.get("from") or "").casefold() != scf:
+                continue
+            for rc in _recipients(m, r):
+                if str(rc).casefold() == scf:
+                    continue
+                st, _a = consume_state(m, room, rc, dev, ino, end_off, acks)
+                if st == "acted":
+                    continue
+                items.append({"id": m.get("id"), "room": room, "to": rc,
+                              "state": st, "ts": m.get("ts"),
+                              "dm": bool(m.get("dm")),
+                              "text": m.get("text") or ""})
+    items.sort(key=lambda x: str(x.get("ts") or ""))
+    return items[:cap], len(items)
+
+
+# ---------------------------------------------------------------------------
 # CLI (dispatched from chat.cmd_chat) + the hook legs
 # ---------------------------------------------------------------------------
 
@@ -2701,6 +2935,61 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             print("helm chat: " + err, file=sys.stderr)
             return 1
         print("helm chat [dm] %s" % chat._fmt(row))
+        return 0
+    if verb == "ack":
+        seat = chat._seat_flag(args) or derive_seat(_env_session())
+        note = None
+        if "--note" in args:
+            i = args.index("--note")
+            note = " ".join(args[i + 1:]).strip() or None
+            del args[i:]                 # --note eats the rest of the line
+        tid = args[0] if args else None
+        if not tid:
+            print("usage: helm chat ack <id> [done|blocked] [--note ...] "
+                  "[--seat S]", file=sys.stderr)
+            return 2
+        state = args[1] if len(args) > 1 else "done"
+        res, err = ack(tid, state, note=note, who=seat,
+                       session=_env_session())
+        if err:
+            print("helm chat: " + err, file=sys.stderr)
+            return 1
+        tgt = str(res["target"].get("id") or "")[:8]
+        lbl = res["state"].upper()
+        sender = chat._dsan(str(res["target"].get("from") or "?"))
+        if res["dup"]:
+            print("helm chat: %s already acked %s by %s — no new row "
+                  "(idempotent)" % (tgt, lbl, _seat_label(seat)))
+            return 0
+        tail = (': "%s"' % _clip(_scrub(note), 80)) if note else ""
+        print("helm chat: acked %s %s%s — @%s watches it leave `helm chat "
+              "pending`" % (tgt, lbl, tail, sender))
+        return 0
+    if verb == "pending":
+        seat = chat._seat_flag(args) or derive_seat(_env_session())
+        items, total = pending(seat=seat, session=_env_session())
+        if not items:
+            print("helm chat: nothing outbound is waiting — every addressed "
+                  "message you sent is consumed (acted) ✓")
+            return 0
+        now = time.time()
+        n_sent = sum(1 for it in items if it["state"] == "sent")
+        print("helm chat pending (as %s) — %d addressed row%s awaiting consume "
+              "(%d SENT-not-SEEN, %d SEEN-not-ACTED):"
+              % (_seat_label(seat), total, "s"[:total != 1], n_sent,
+                 total - n_sent))
+        for it in items:
+            glyph, st = (("○", "SENT") if it["state"] == "sent"
+                         else ("◐", "SEEN"))
+            where = ("dm" if it["dm"] else "main" if it["room"] == "main"
+                     else "#" + it["room"])
+            age = _fmt_age(now - (_ts_epoch(it["ts"]) or now))
+            print("  %s %-4s %-8s → %-14s %-7s %4s  %s"
+                  % (glyph, st, str(it["id"] or "")[:8], _seat_label(it["to"]),
+                     where, age, _clip(_scrub(it["text"]), 60)))
+        print("  ○ SENT = never surfaced (recipient dead / away / wedged?)   "
+              "◐ SEEN = surfaced, not acted   ·   they close it: helm chat "
+              "ack <id> done|blocked")
         return 0
     if verb == "seat":
         if args[:1] == ["rename"] and len(args) >= 3:
