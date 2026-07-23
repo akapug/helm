@@ -343,6 +343,16 @@ def _instance_gate(family, seat_name):
                 "(mode=proxy); %s is mode=%s — only the family seat `%s` is "
                 "supported" % (family, fam["mode"], family))
     m = re.match(r"^%s-(\d+)$" % re.escape(family), seat_name)
+    if m and m.group(1) != str(int(m.group(1))):
+        # a zero-padded suffix passes int()==N but names a DISTINCT proxy home
+        # whose derived port aliases the canonical instance's (codex-02 ->
+        # instances/codex-02 yet port base+2 = codex-2's) — two homes/tokens,
+        # one port, a confusing pre-bound-port failure. Refuse non-canonical
+        # up front (fable adversarial LOW).
+        return ("%s is not a canonical instance name — a zero-padded suffix "
+                "aliases `%s-%d`'s port with a separate proxy home; use "
+                "`%s-%d`" % (seat_name, family, int(m.group(1)),
+                             family, int(m.group(1))))
     if m and int(m.group(1)) < 2:
         return ("%s is not a distinct instance — instance 1 IS the family "
                 "seat `%s` (and base+1 would collide with a sibling family's "
@@ -382,6 +392,14 @@ def _proxy_pid_record(family, seat=None):
             parts = f.read().split()
         pid = int(parts[0])
     except (OSError, ValueError, IndexError):
+        return None
+    # pid < 2 can never be a spawned proxy: 0/1/negative are kernel-reserved
+    # or the process-group / whole-signal-set selectors for kill(2). Treat a
+    # corrupt file carrying one as stale (never signalled, reported down) so
+    # _down's remediation never echoes `kill -1`/`kill 0` into advice an agent
+    # would paste verbatim (fable adversarial MED — the signal path was already
+    # fail-closed, but the printed suggestion was not).
+    if pid < 2:
         return None
     return {"pid": pid, "identity": parts[1] if len(parts) > 1 else None}
 

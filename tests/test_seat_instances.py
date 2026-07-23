@@ -184,6 +184,16 @@ class GuardTest(Slice6Base):
         self.assertEqual(rc, 2)
         self.assertIn("integer", err)
 
+    def test_instance_gate_refuses_zero_padded_alias(self):
+        # fable adversarial LOW: codex-02 parses int()==2 but names a DISTINCT
+        # proxy home aliasing codex-2's port. The gate refuses non-canonical
+        # names up front, while the canonical N>=2 stays admissible.
+        self.assertIsNone(seat._instance_gate("codex", "codex-2"))
+        for padded in ("codex-02", "codex-002", "codex-01", "codex-00"):
+            g = seat._instance_gate("codex", padded)
+            self.assertIsNotNone(g, "%s must be refused" % padded)
+            self.assertIn("canonical", g)
+
 
 class AtomicPoolWriteTest(Slice6Base):
     def test_pool_write_is_atomic_0600(self):
@@ -651,6 +661,26 @@ class FableRoundTest(Slice6Base):
                               "hostile pidfile must fail closed: %r" % body)
             self.assertIsNone(seat._running_pid_rec("codex", "codex-2"),
                               "hostile pidfile must fail closed (rec): %r" % body)
+
+    def test_sub2_pid_reaps_without_kill_advice(self):
+        # fable adversarial MED: a corrupt proxy.pid carrying 0/1/-1 must never
+        # surface `kill -1`/`kill 0` in _down's remediation — agents paste that
+        # advice verbatim and kill -1 SIGTERMs the whole signal set. The record
+        # parse itself rejects pid < 2, so _down takes the stale-reap path.
+        home = seat._proxy_home("codex", "codex-2")
+        os.makedirs(home, exist_ok=True)
+        pidpath = os.path.join(home, "proxy.pid")
+        for bad in ("-1 proc:x\n", "0 proc:x\n", "1 proc:x\n", "-1\n", "0\n"):
+            seat._write_private(pidpath, bad, mode=0o600)
+            self.assertIsNone(seat._proxy_pid_record("codex", "codex-2"),
+                              "pid<2 must parse as no-record: %r" % bad)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                seat._down("codex", seat="codex-2")
+            blob = out.getvalue() + err.getvalue()
+            self.assertNotIn("kill -1", blob, "leaked kill -1 for %r" % bad)
+            self.assertNotIn("kill 0", blob, "leaked kill 0 for %r" % bad)
 
 
 if __name__ == "__main__":
