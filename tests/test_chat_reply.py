@@ -23,7 +23,7 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "MELD_CHAT_NODE_URL", "HELM_CHAT_ROOM", "MELD_CHAT_ROOM",
             "HELM_CHAT_LOG", "MELD_CHAT_LOG", "HELM_CELL_BIN", "MELD_CELL_BIN")
 
-SENT = {"sent": True, "turn_hash": "t" * 64, "receipt_hash": "r" * 64,
+SENT = {"sent": True, "turn_hash": "a" * 64, "receipt_hash": "b" * 64,
         "chain_index": 7}
 
 

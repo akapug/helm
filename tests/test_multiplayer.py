@@ -214,6 +214,67 @@ class MultiplayerTest(unittest.TestCase):
                          [("david", "opaque-a"), ("codex", "opaque-b")])
         self.assertEqual(self._run(["peers", "--cave", "demo", "--json"])[0], 0)
 
+    def test_cli_set_and_status_drive_the_lww_demo_board(self):
+        # a monotonic clock so "later write wins" is deterministic (real ts are
+        # monotonic across sequential publishes; pinning them removes any doubt)
+        counter = [100.0]
+
+        def clock():
+            counter[0] += 1.0
+            return counter[0]
+
+        with mock.patch.object(multiplayer.time, "time", clock):
+            for args in (["set", "board", "greeting", "hello", "--cave", "demo",
+                          "--actor", "david"],
+                         ["set", "board", "greeting", "hi", "there", "--cave",
+                          "demo", "--actor", "codex"],  # later + multi-word value
+                         ["set", "board", "status", "building", "--cave", "demo",
+                          "--actor", "codex"]):
+                self.assertEqual(self._run(args)[0], 0, args)
+            rc, out, _ = self._run(["status", "board", "--cave", "demo", "--json"])
+        self.assertEqual(rc, 0)
+        got = json.loads(out)
+        board = {c["key"]: c for c in got["board"]}
+        self.assertEqual(board["greeting"]["value"], "hi there")  # LWW: codex later
+        self.assertEqual(board["greeting"]["actor"], "codex")
+        self.assertEqual(board["status"]["value"], "building")
+        self.assertEqual(got["foreign"], 0)
+        # the human render materializes the same board (and launders — see below)
+        rc, out, _ = self._run(["status", "board", "--cave", "demo"])
+        self.assertEqual(rc, 0)
+        self.assertIn("greeting = hi there", out)
+        self.assertIn("status = building", out)
+
+    def test_cli_status_launders_relay_supplied_values(self):
+        # cell values ride the BLIND relay from any actor — a hostile ESC/bidi
+        # payload must never reach the terminal through the status view.
+        from helm import multiplayer_demo
+        self.relay.publish("demo", "board", "attacker",
+                           multiplayer_demo.encode("k", chr(0x9b) + "31mred",
+                                                   "attacker"))
+        rc, out, _ = self._run(["status", "board", "--cave", "demo"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn(chr(0x9b), out)
+        self.assertIn("\\u009b31mred", out)
+
+    def test_cli_json_launders_relay_supplied_values(self):
+        # the --json sinks are ALSO a terminal seam (TESTDRIVE points the owner
+        # at --json). The presence API guards actor/connection via _identity, so
+        # the real unguarded surface is the BLIND relay: a planted cell value +
+        # envelope actor carry C1 (U+009B) / bidi RLO (U+202E) undecoded, and
+        # they must escape in --json, never reach the terminal raw.
+        from helm import multiplayer_demo
+        payload = chr(0x9b) + "31m" + chr(0x202e) + "evil"
+        self.relay.publish("demo", "board", chr(0x202e) + "attacker",
+                           multiplayer_demo.encode("k", payload, "attacker"))
+        for args in (["status", "board", "--cave", "demo", "--json"],
+                     ["read", "board", "--cave", "demo", "--json"]):
+            rc, out, _ = self._run(args)
+            self.assertEqual(rc, 0, args)
+            self.assertNotIn(chr(0x9b), out, args)     # C1 CSI never raw
+            self.assertNotIn(chr(0x202e), out, args)   # bidi RLO never raw
+            self.assertIn("\\u009b", out, args)        # escaped instead
+
     def test_cli_stdin_only_and_safe_human_output(self):
         self.assertEqual(self._run(["publish", "doc", "--stdin"], stdin="--cave")[0], 0)
         self.assertEqual(self._run(["publish", "doc", "raw-argv"])[0], 2)

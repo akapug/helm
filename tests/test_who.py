@@ -123,10 +123,11 @@ class ScanTest(WhoBase):
         self.plant_proc(250, "node", ppid=100)
         self.plant_proc(300, "claude", ppid=250, start=20,
                         env=b"CLAUDE_CONFIG_DIR=" + home.encode() + b"\0", cwd=cwd)
-        self.plant_proc(400, "codex", ppid=1, start=30)  # no env -> default home
+        self.plant_proc(400, "codex", ppid=1, start=30)  # no process HOME
         self.plant_proc(500, "vim", ppid=1)              # never an agent row
         accounts = [{"name": "seat@x.com", "provider": "anthropic", "home": home}]
-        rows = {r["pid"]: r for r in who.scan(accounts)}
+        status = {}
+        rows = {r["pid"]: r for r in who.scan(accounts, status=status)}
         self.assertEqual(set(rows), {100, 300, 400})
         top = rows[100]
         self.assertEqual((top["provider"], top["account"], top["child"]),
@@ -135,19 +136,53 @@ class ScanTest(WhoBase):
         self.assertEqual(top["cwd"], cwd)
         self.assertTrue(rows[300]["child"])  # found through the ancestor chain
         cx = rows[400]
-        self.assertEqual(cx["home"], os.path.expanduser("~/.codex"))
-        self.assertIsNone(cx["account"])     # default home unmapped -> never guessed
-        self.assertEqual(cx["attribution"], "default")  # environ READ, key absent
+        self.assertIsNone(cx["home"])  # inspector ~/.codex is not process evidence
+        self.assertIsNone(cx["account"])
+        self.assertEqual(cx["attribution"], "home-unproven")
+        self.assertIn(400, status["failed_pids"])
         self.assertEqual(top["attribution"], "env")
 
     def test_unreadable_environ_is_visible_but_never_default_attributed(self):
         d = self.plant_proc(600, "codex", start=40)
-        os.unlink(os.path.join(d, "environ"))  # pid died / permissions / race
-        rows = {r["pid"]: r for r in who.scan([])}
+        os.unlink(os.path.join(d, "environ"))  # pid persists; probe failed
+        status = {}
+        rows = {r["pid"]: r for r in who.scan([], status=status)}
         r = rows[600]
         self.assertIsNone(r["home"])     # NOT ~/.codex — no evidence is no home
         self.assertIsNone(r["account"])
         self.assertEqual(r["attribution"], "environ-unreadable")
+        self.assertIn(600, status["failed_pids"])
+
+    def test_default_home_belongs_to_the_process_not_the_inspector(self):
+        alt = os.path.join(self.tmp, "alternate-home")
+        self.plant_proc(610, "claude", start=41,
+                        env=("HOME=" + alt).encode() + b"\0", cwd=self.tmp)
+        rows = {r["pid"]: r for r in who.scan([])}
+        self.assertEqual(rows[610]["home"], os.path.join(alt, ".claude"))
+
+    def test_missing_process_home_is_unproven_not_inspector_default(self):
+        self.plant_proc(611, "claude", start=42, env=b"A=1\0", cwd=self.tmp)
+        status = {}
+        rows = {r["pid"]: r for r in who.scan([], status=status)}
+        self.assertIsNone(rows[611]["home"])
+        self.assertEqual(rows[611]["attribution"], "home-unproven")
+        self.assertIn(611, status["failed_pids"])
+
+    def test_unreadable_cwd_reaches_the_completeness_channel(self):
+        self.plant_proc(612, "claude", start=43,
+                        env=b"HOME=/tmp/process-home\0", cwd=None)
+        status = {}
+        rows = {r["pid"]: r for r in who.scan([], status=status)}
+        self.assertIsNone(rows[612]["cwd"])
+        self.assertIn(612, status["failed_pids"])
+
+    def test_unreadable_live_stat_reaches_the_completeness_channel(self):
+        d = self.plant_proc(620, "claude", start=42)
+        os.unlink(os.path.join(d, "stat"))
+        status = {}
+        self.assertEqual(who.scan([], status=status), [])
+        self.assertIn(620, status["failed_pids"])
+        self.assertFalse(status["listing_failed"])
 
     def test_pid_gone_between_comm_and_environ_is_skipped(self):
         d = self.plant_proc(700, "claude", start=50)

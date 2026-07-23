@@ -28,6 +28,7 @@ Two tripwires, deliberately BOTH — one proves today, one guards tomorrow:
      ESC/bidi reaches any stdout/stderr or JSON body. Proves the surfaces are
      clean at HEAD; the grep tripwire keeps them that way.
 """
+import ast
 import contextlib
 import io
 import os
@@ -63,10 +64,15 @@ _ROSTER_CONSUMERS = {
         "PUBLISH OWNER: every roster-borne string emits through "
         "_pub_row / _seat_label (roster_report, presence_report, the CLI "
         "glance verbs, the mutation-helper echoes); field-complete guard is "
-        "tests/test_presence.py::RosterLaunderCompletenessTest. The "
-        "work-offer rung's _live_seats() is INTERNAL-MATCHING-ONLY — it reads "
-        "keys into a casefolded set for the poaching filter and never emits "
-        "one (the offer line carries a dispatch id + lane, no roster key)."),
+        "tests/test_presence.py::RosterLaunderCompletenessTest. Two "
+        "INTERNAL-MATCHING-ONLY reader sets: (a) the work-offer rung's "
+        "_live_seats() reads keys into a casefolded set for the poaching filter "
+        "and never emits one (the offer line carries a dispatch id + lane, no "
+        "roster key); (b) the consume-ladder readers (_recipients resolves "
+        "@mention/rfrom tokens to roster KEYS, _recipient_cursor matches a "
+        "cursor row internally, pending resolves recipients) emit only through "
+        "the `pending` CLI's _seat_label / the `ack` refusal's _seat_label — "
+        "same publish owner."),
     "todos.py": (
         "LAUNDERED: fleet()/_row run the seat KEY + project through _lbl "
         "(_scrub + _clip) before the fleet table AND the /api/todos JSON; "
@@ -97,7 +103,9 @@ _ROSTER_CALL_COUNTS = {
     "codexhomes.py": 1,
     "hooks.py": 1,
     "seat.py": 2,
-    "seats.py": 16,
+    "seats.py": 20,        # main's 19 (+3 ack-ladder _recipients/_recipient_
+                           # cursor/pending, +1 _is_seat) + work-offer's
+                           # _live_seats() poaching-filter read (internal-only)
     "todos.py": 1,
     "web.py": 2,
 }
@@ -763,6 +771,30 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
         self.assertIn("pwn", body)
         self.assertIn("hi there", body)            # the text rode through intact
 
+    # -- 10. nested transport profile/reason projections -----------------------
+    def test_nested_transport_identity_and_reason_sinks_are_inert(self):
+        transport = {"state": "DEGRADED", "profile": self.HOSTILE,
+                     "code": "send_failed",
+                     "reason": "node " + self.HOSTILE + " refused",
+                     "first_failure": "then", "last_failure": "now",
+                     "last_age_s": 1, "failure_count": 1,
+                     "remediation": "retry"}
+        row = {"ts": "2026-07-23T00:00:00Z", "from": "agent",
+               "text": "fallback", "transport": transport}
+        public = chat.public_rows([row])[0]["transport"]
+        self._assert_inert("public transport.profile", public["profile"])
+        self._assert_inert("public transport.reason", public["reason"])
+        for label, text in (
+                ("chat._fmt transport", chat._fmt(row)),
+                ("chat._fmt_body transport", chat._fmt_body(row)),
+                ("transport summary", chat.transport_failure_summary(
+                    dict(transport, mode="degraded")))):
+            self._assert_inert(label, text)
+        model = human.model_new()
+        model["status"] = dict(transport, mode="degraded", head=None)
+        self._assert_inert("human status transport",
+                           human.status_line(model, 300))
+
     # -- proof the sweep BITES: the planted from-field is genuinely hostile ----
     def test_planted_from_field_is_actually_hostile(self):
         """Guards the guard: if the plant stopped carrying ESC/bidi the three
@@ -904,11 +936,15 @@ _FROM_FIELD_CONSUMERS = {
         "matching (never emitted raw). Verified by ChatRowFromFieldSinkSweep's "
         "join/invite/say/status/recv-all-markers tests."),
     "seats.py": (
-        "LAUNDERED+INTERNAL: the two EMIT sites — deliver()'s boundary nudge and "
-        "stop_guard()'s undelivered block — launder via chat._dsan; the "
-        "deliverable-matching reads (frm/dm/rfrom in deliverable()) are "
-        "INTERNAL-MATCHING-ONLY, never emitted. Verified by "
-        "ChatRowFromFieldSinkSweep's deliver/stop_guard tests."),
+        "LAUNDERED+INTERNAL: the EMIT sites — deliver()'s boundary nudge, "
+        "stop_guard()'s undelivered block, the `ack` refusal string and the "
+        "`pending`/`ack` CLI success lines — launder via chat._dsan / "
+        "_seat_label; the deliverable-matching reads (frm/dm/rfrom in "
+        "deliverable()) and the consume-ladder matching reads (from/dm/rfrom "
+        "casefolded into dict keys + branch tests in _recipients / "
+        "consume_state / pending / ack) are INTERNAL-MATCHING-ONLY, never "
+        "emitted raw. Verified by ChatRowFromFieldSinkSweep's deliver/"
+        "stop_guard tests + test_ackladder's hostile-name sink test."),
     "web.py": (
         "LAUNDERED+INTERNAL: the owner-mention preview + ledger + channel-row "
         "emits launder via chat._dsan (and the /api/chat body via "
@@ -928,10 +964,12 @@ _FROM_FIELD_CONSUMERS = {
 # trips until a human re-counts AND confirms the new site launders (or is
 # internal). Regenerate deliberately from _from_field_read_sites().
 _FROM_FIELD_READ_COUNTS = {
-    "chat.py": 29,
+    "chat.py": 30,         # +1: _fmt's ack-marker render (laundered via _dsan)
     "homes.py": 1,
     "meld.py": 9,
-    "seats.py": 6,
+    "seats.py": 18,        # +11: the ack/consume-ladder reads (matching +
+                           # laundered emits); +1: consume_state's dm-vs-room
+                           # branch reads .get("dm") for control flow only
     "web.py": 7,
 }
 
@@ -972,6 +1010,92 @@ class ChatRowFromFieldConsumerAllowlistTest(unittest.TestCase):
         stale = sorted(set(_FROM_FIELD_CONSUMERS) - live)
         self.assertFalse(stale, "from-field allowlist entries no longer read an "
                          "identity field: %r" % stale)
+
+
+# ── G. source-driven nested transport profile/reason sink tripwire ────────────
+# A transport projection may expose either nested identity (`profile`) OR network
+# diagnostic (`reason`) independently. Enumerate every such key reader across
+# helm/*.py: a new renderer/status/JSON adapter becomes a new site and fails
+# until its laundering boundary is explicitly justified.
+
+
+def _transport_projection_functions(source):
+    functions = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        keys = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call) \
+                    and isinstance(child.func, ast.Attribute) \
+                    and child.func.attr in ("get", "pop", "setdefault") \
+                    and child.args and isinstance(child.args[0], ast.Constant):
+                keys.add(child.args[0].value)
+            elif isinstance(child, ast.Subscript) \
+                    and isinstance(child.slice, ast.Constant):
+                keys.add(child.slice.value)
+        projection = {"profile", "reason"} & keys
+        transport = "transport" in node.name or any(
+            isinstance(child, ast.Constant) and child.value == "transport"
+            or isinstance(child, ast.Name) and "transport" in child.id
+            or isinstance(child, ast.Attribute) and "transport" in child.attr
+            for child in ast.walk(node))
+        # `reason` is generic across unrelated domains. The old both-key pair is
+        # unambiguous; a single-key projection must carry transport context.
+        if projection and (len(projection) == 2 or transport):
+            functions.add(node.name)
+    return functions
+
+
+def _transport_projection_sites():
+    sites = set()
+    for fn in sorted(os.listdir(PKG)):
+        if not fn.endswith(".py"):
+            continue
+        with open(os.path.join(PKG, fn), encoding="utf-8") as f:
+            sites.update((fn, name)
+                         for name in _transport_projection_functions(f.read()))
+    return sites
+
+
+_TRANSPORT_PROJECTION_CONSUMERS = {
+    ("chat.py", "_public_transport"): "publish owner launders profile via _dsan and reason via _safe_reason",
+    ("chat.py", "_failure_public"): "incident status owner launders profile and reason before every status/JSON consumer",
+    ("chat.py", "_stamp_sign_failure"): "reason-only row projection routes its transport copy through _public_transport",
+    ("chat.py", "_transport_tag"): "CLI, follow, and journal row renderer launders legacy/pre-fix nested fields at the sink",
+    ("chat.py", "transport_failure_summary"): "CLI/node/doctor summary launders both nested fields at the sink",
+    ("chat.py", "transport_status"): "status owner consumes already-public incidents and routes signer reason through _transient_failure",
+    ("doctor.py", "check_chat_node"): "doctor routes direct signer reason through chat._safe_reason and transport summaries through their public owner",
+    ("human.py", "status_line"): "TUI renderer launders both nested fields at the sink",
+}
+
+
+class TransportProjectionConsumerAllowlistTest(unittest.TestCase):
+    def test_reason_only_and_profile_only_sinks_trip(self):
+        functions = _transport_projection_functions("""
+def reason_only(row):
+    return row["transport"].get("reason")
+
+def profile_only(row):
+    return row["transport"]["profile"]
+
+def unrelated(row):
+    return row.get("code")
+""")
+        self.assertEqual(functions, {"reason_only", "profile_only"})
+
+        live = _transport_projection_sites()
+        for boundary in _TRANSPORT_PROJECTION_CONSUMERS:
+            self.assertIn(boundary, live,
+                          "central laundering boundary stopped being detected")
+
+    def test_every_nested_transport_projection_is_allowlisted(self):
+        self.assertEqual(
+            _transport_projection_sites(),
+            set(_TRANSPORT_PROJECTION_CONSUMERS),
+            "nested transport profile/reason consumer drifted: every new public "
+            "projection must pass chat._dsan/_safe_reason before rendering or "
+            "JSON emission and be registered with its laundering reason")
 
 
 if __name__ == "__main__":

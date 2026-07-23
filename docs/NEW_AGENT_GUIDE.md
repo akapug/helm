@@ -118,10 +118,11 @@ so an account swap in one pane is an account swap in all of them.
 ## 7. Composition truth
 
 - Composition questions — who is running, which pid/seat/sid/home/pane — are
-  answered by running the CLI, never from memory. Today's table is `helm who`
-  (pid → cred home, account, session, cwd; shared sessions flagged). The full
-  live-probed census `helm fleet` (lane/fleet-truth-verb) supersedes it once
-  landed — probe with the `helm <verb> --help` existence law and prefer it
-  when it answers. Quote the output, including to the owner.
+  answered by running the CLI, never from memory. `helm who` is the
+  pid → cred home/account/session/cwd table (shared sessions flagged); the full
+  live-probed composition census is `helm fleet` (pid → seat/sid/home/daemon/
+  pane/stamps/deck, every column a live probe, a failed probe rendered UNKNOWN
+  and gating the exit code). Prefer `helm fleet` when it answers. Quote the
+  output, including to the owner.
 - `helm session ls` is tri-state: **persisted / MEMORY-ONLY / UNKNOWN**.
   UNKNOWN is never PASS — a failed probe is not an absence fact.

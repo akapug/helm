@@ -17,15 +17,20 @@ there: the turn payload carries the message digest ("chat:b2b:<blake2b-256>",
 73 B inside the whisper frame budget), the RAM room carries the text — thin
 claim, fat corroboration, exactly the premise-attestation pattern. The
 message row gains {turn, receipt, chain}; renderers show signed rows clean
-and tag everything else "[unsigned]". Node down -> the v1 path automatically
-(fallback law: drop the signature, never the RAM property). SIGNING IS
-OPT-IN: it needs the explicit cell binary (HELM_CELL_BIN — unset => off, no
-PATH probe; the de-meld law), so out of the box chat is UNSIGNED BY DEFAULT
-even with a live node — transport_status says "unsigned (no signer)" and no
-signing leg (probe/revive/unlock) ever fires without the binary. NO transport
-path writes disk, ever; RAM-side caches (join cells, node token) live in the
-room dir itself. Transport is NODE-AGNOSTIC (HELM_CHAT_NODE_URL, else the
-node-state url, else :8898) — the node migration just repoints it.
+and tag everything else "[unsigned]". Node/sign/faucet failure -> the v1 path
+automatically (fallback law: drop the signature, never the RAM property), BUT
+NEVER QUIETLY: the fallback row carries structured `transport:{state,profile,
+code,reason,first_failure,last_failure,...}` and a per-profile tmpfs incident
+keeps every status surface DEGRADED until that profile completes a signed turn
+(`/dev/shm/helm-chat-failures/<room-key>` when CHAT_DIR is not itself tmpfs).
+SIGNING IS OPT-IN: it needs the explicit cell binary
+(HELM_CELL_BIN — unset => off, no PATH probe; the de-meld law), so configured-
+off chat is UNSIGNED BY DEFAULT, not a failure. A set-but-unusable signer is
+configured-on and stamps `signer_unavailable`. Join/token caches follow
+HELM_CHAT_DIR (RAM at the production default; an override owns their storage
+location), while failure state is always forced onto tmpfs. Transport is
+NODE-AGNOSTIC (HELM_CHAT_NODE_URL, else node-state url, else :8898) — the node
+migration just repoints it.
 
 The log-after leg — the ONLY disk writer here (the canon's durable-record
 layer): `helm chat log-flush` appends delivered history OUT-OF-BAND to
@@ -89,9 +94,12 @@ The owner's orca pane sidecar is exactly: helm chat read --follow
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
+import stat
 import sys
+import threading
 import time
 import unicodedata
 
@@ -110,6 +118,38 @@ CHAT_TOPIC = "helm.chat"    # the signed turn's event topic on the room node
 DM_PREFIX = "dm-"           # reserved room-name namespace: the private lanes
 FIELD_SEP = "\x1e"          # ASCII RS: fields cannot be slid into one another
 QUOTE_CHARS = 72            # the quoted parent's snippet budget (one line)
+SIGN_FAILURES_FILE = ".sign-failures.json"  # RAM-only per-profile owner truth
+SIGN_FAILURES_ROOT = "/dev/shm/helm-chat-failures"
+_SIGN_FAILURE_FALLBACK = {}  # owner path -> exact raw profile -> private state
+_SIGN_FAILURE_FALLBACK_LOCK = threading.RLock()
+_QUOTED_VALUE = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
+_UNCLOSED_QUOTED_VALUE = r'''(?:"[^\r\n;}]*|'[^\r\n;}]*')'''
+_AUTH_VALUE = re.compile(
+    r'''(?ix)["']?authorization["']?\s*[:=]\s*(?:''' +
+    _QUOTED_VALUE + r'''|''' + _UNCLOSED_QUOTED_VALUE + r'''|[^\r\n;}]+)''')
+_SECRET_VALUE = re.compile(
+    r'''(?ix)(?:["']?)(bearer[_-]?token|access[_-]?token|refresh[_-]?token|'''
+    r'''id[_-]?token|api[_-]?key|client[_-]?secret|token|passphrase|password|'''
+    r'''secret|credentials?)(?:["']?)(?:\s*[:=]\s*|\s+)(?:''' +
+    _QUOTED_VALUE + r'''|''' + _UNCLOSED_QUOTED_VALUE +
+    r'''|[^\s,;}\]]+)''')
+_AUTH_SCHEME = re.compile(
+    r'''(?ix)\b(?:bearer|basic)\s+(?:''' + _QUOTED_VALUE + r'''|''' +
+    _UNCLOSED_QUOTED_VALUE + r'''|[^\r\n,;}]+)''')
+_URL_USERINFO = re.compile(r"(https?://)[^/@\s]+@", re.I)
+_ACK_REMEDIATION = ("if this profile was retired or renamed: "
+                    "helm chat transport ack --profile <name>")
+
+_REMEDIATION = {
+    "node_unreachable": "restore the chat node, then send one signed turn as this profile",
+    "node_probe_failed": "inspect `helm chat node status`, restore the probe, then retry",
+    "signer_unavailable": "restore HELM_CELL_BIN to an executable signer, then retry",
+    "signer_launch_failed": "repair the configured signer executable, then retry",
+    "join_failed": "repair this profile's room-node join, then retry",
+    "send_failed": "inspect `helm chat node status` and this profile's balance, then retry",
+    "signing_exception": "inspect `helm doctor` and the named exception, then retry",
+    "incident_state_unreadable": "repair incident-state ownership/permissions/space, then retry; transport ack cannot retire an unreadable owner",
+}
 
 
 _ID_FIELDS = ("from", "tfrom", "rfrom", "dm")   # the NAME-carrying row fields
@@ -131,17 +171,36 @@ def _dsan(s):
                    or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
 
 
+def _public_transport(value):
+    """Copy one transport projection with signer identities display-laundered.
+    The incident map remains keyed by the exact raw profile; only emitted row,
+    status, and JSON copies pass through this boundary."""
+    if not isinstance(value, dict):
+        return value
+    out = dict(value)
+    if isinstance(out.get("profile"), str):
+        out["profile"] = _dsan(out["profile"])
+    if isinstance(out.get("reason"), str):
+        out["reason"] = _safe_reason(out["reason"])
+    if isinstance(out.get("failed_profiles"), list):
+        out["failed_profiles"] = [_public_transport(v)
+                                  for v in out["failed_profiles"]]
+    return out
+
+
 def public_rows(rows):
-    """Copies of `rows` with every NAME field display-laundered — the shape the
-    web /api/chat wire and any JSON sink emits. The stored rows keep their raw
-    identity (reaction/reply matching indexes them); only the emitted copy is
-    laundered, one owner, mirroring seats._pub_row for the roster."""
+    """Copies of `rows` with every identity display-laundered — the shape the
+    web /api/chat wire and any JSON sink emits. The stored rows keep raw NAME
+    fields for reaction/reply matching; transport.profile is an emitted signer
+    identity and is laundered too."""
     out = []
     for m in rows:
         c = dict(m)
         for k in _ID_FIELDS:
             if isinstance(c.get(k), str):
                 c[k] = _dsan(c[k])
+        if "transport" in c:
+            c["transport"] = _public_transport(c["transport"])
         out.append(c)
     return out
 
@@ -242,6 +301,424 @@ def _token_path():
     return os.path.join(chat_dir(), ".node-token")
 
 
+def sign_failures_dir():
+    """A RAM-backed coordination dir even when HELM_CHAT_DIR is overridden to
+    durable storage. The production default already lives under /dev/shm; a
+    custom room gets an isolated tmpfs key, so status never writes disk."""
+    d = os.path.realpath(chat_dir())
+    shm = os.path.realpath("/dev/shm")
+    if d == shm or d.startswith(shm + os.sep):
+        return chat_dir()
+    key = hashlib.blake2b(os.path.abspath(chat_dir()).encode("utf-8"),
+                          digest_size=8).hexdigest()
+    return os.path.join(SIGN_FAILURES_ROOT, key)
+
+
+def sign_failures_path():
+    return os.path.join(sign_failures_dir(), SIGN_FAILURES_FILE)
+
+
+def _sign_failures_lock_path():
+    return os.path.join(sign_failures_dir(), ".sign-failures.lock")
+
+
+def _epoch(value, default=0.0):
+    """Finite non-negative event time; bool/string are never timestamps."""
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        return default
+    return float(value)
+
+
+def _count(value, default=0):
+    return value if type(value) is int and value >= 0 else default
+
+
+def _active_failure(rec):
+    """Conservative activity test for current and older incident rows. A valid
+    reason without a usable failure clock remains loud until an exact profile
+    success writes a valid watermark; malformed clocks never reach comparisons."""
+    if not isinstance(rec, dict) or not isinstance(rec.get("reason"), str) \
+            or not rec["reason"]:
+        return False
+    last = _epoch(rec.get("_last_epoch"), None)
+    success = _epoch(rec.get("_success_epoch"), None)
+    if last is None:
+        return success is None or success == 0
+    return last > (success or 0)
+
+
+def _profile(profile):
+    """Exact signer identity. Never truncate: prefix collisions cross-clear."""
+    p = str(profile or "helm-agent")
+    return p or "helm-agent"
+
+
+def _safe_reason(reason):
+    """Bounded operator diagnostic. Redact BEFORE whitespace folding so an
+    auth assignment can consume its full multiword value without eating the
+    next diagnostic clause."""
+    s = str(reason or "unknown signing failure")
+    s = _URL_USERINFO.sub(r"\1[redacted]@", s)
+    s = _AUTH_VALUE.sub("authorization=[redacted]", s)
+    s = _SECRET_VALUE.sub(lambda m: "%s=[redacted]" % m.group(1), s)
+    s = _AUTH_SCHEME.sub("auth=[redacted]", s)
+    return _dsan(" ".join(s.split()))[:360]
+
+
+def _diag(code, reason, remediation=None, event_epoch=None, event_ts=None):
+    """Structured, secret-safe failure captured at the failure boundary. The
+    private event clock is sampled FIRST, so scheduling during redaction or
+    before the RAM lock cannot reorder it behind a newer success."""
+    event_epoch = _epoch(event_epoch, time.time())
+    event_ts = event_ts if isinstance(event_ts, str) and event_ts else pk.now_ts()
+    fix = remediation or _REMEDIATION.get(
+        code, "repair the named signing failure, then retry")
+    if "transport ack" not in fix:
+        fix += "; " + _ACK_REMEDIATION
+    return {"code": str(code or "signing_exception"),
+            "reason": _safe_reason(reason), "remediation": fix,
+            "_event_epoch": event_epoch, "_event_ts": event_ts}
+
+
+def _normal_diag(value, code="signing_exception"):
+    if isinstance(value, dict):
+        return _diag(value.get("code") or code, value.get("reason"),
+                     value.get("remediation"), value.get("_event_epoch"),
+                     value.get("_event_ts"))
+    return _diag(code, value)
+
+
+def _validate_sign_failure_owner():
+    """Reject deterministic tmpfs-key squats before trusting or mutating them."""
+    uid = os.geteuid()
+    d = sign_failures_dir()
+    if os.path.lexists(d):
+        s = os.stat(d, follow_symlinks=False)
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != uid:
+            raise PermissionError("incident-state directory is not owned by this uid")
+        if not os.access(d, os.R_OK | os.W_OK | os.X_OK):
+            raise PermissionError("incident-state directory is not accessible")
+    for p in (_sign_failures_lock_path(), sign_failures_path()):
+        if not os.path.lexists(p):
+            continue
+        s = os.stat(p, follow_symlinks=False)
+        if not stat.S_ISREG(s.st_mode) or s.st_uid != uid:
+            raise PermissionError("incident-state file is not owned by this uid")
+
+
+@contextlib.contextmanager
+def _sign_failure_lock():
+    """Serialize the shared RAM map across fleet poster processes."""
+    import fcntl
+    d = sign_failures_dir()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    _validate_sign_failure_owner()
+    os.chmod(d, 0o700)
+    with open(_sign_failures_lock_path(), "a") as f:
+        if os.fstat(f.fileno()).st_uid != os.geteuid():
+            raise PermissionError("incident-state lock is not owned by this uid")
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _read_sign_failure_state():
+    """Strict owner read: unlike pk.read_json, I/O and JSON errors stay loud."""
+    p = sign_failures_path()
+    if not os.path.exists(p):
+        return {}
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _fallback_sign_failure_state():
+    return _SIGN_FAILURE_FALLBACK.setdefault(
+        os.path.abspath(sign_failures_path()), {})
+
+
+def _combined_sign_failure_state(*records):
+    """One exact-profile private state from persisted and process-local views."""
+    records = [r for r in records if isinstance(r, dict)]
+    if not records:
+        return {}
+    success = max(_epoch(r.get("_success_epoch")) for r in records)
+    active = [r for r in records if _active_failure(r)]
+    if not active:
+        out = dict(max(records, key=lambda r: _epoch(r.get("_success_epoch"))))
+        out.pop("reason", None)
+        out["_success_epoch"] = success
+        return out
+    out = dict(max(active, key=lambda r: _epoch(r.get("_last_epoch"))))
+    first = min(active, key=lambda r: _epoch(
+        r.get("_first_epoch"), float("inf")))
+    out["first_failure"] = first.get("first_failure", out.get("first_failure"))
+    out["_first_epoch"] = min(_epoch(r.get("_first_epoch"),
+                                    _epoch(out.get("_last_epoch")))
+                              for r in active)
+    out["failure_count"] = max(_count(r.get("failure_count"), 1)
+                               for r in active)
+    out["_success_epoch"] = success
+    return out
+
+
+def _next_sign_failure(old, profile, diag):
+    """Apply one event-clock-ordered failure to one exact profile state."""
+    now, stamp = diag["_event_epoch"], diag["_event_ts"]
+    candidate = {"profile": profile, "code": diag["code"],
+                 "reason": diag["reason"], "first_failure": stamp,
+                 "last_failure": stamp, "failure_count": 1,
+                 "remediation": diag["remediation"],
+                 "_first_epoch": now, "_last_epoch": now}
+    old = old if isinstance(old, dict) else {}
+    success = _epoch(old.get("_success_epoch"))
+    last = _epoch(old.get("_last_epoch"))
+    if success >= now:
+        return old, candidate, False
+    active = _active_failure(old)
+    if last > now:
+        if not active:
+            return old, candidate, False
+        out = dict(old)
+        out["failure_count"] = _count(out.get("failure_count")) + 1
+        first = _epoch(out.get("_first_epoch"), last)
+        if now < first:
+            out.update(first_failure=stamp, _first_epoch=now)
+        return out, out, True
+    candidate.update(
+        first_failure=old.get("first_failure")
+        if active and isinstance(old.get("first_failure"), str) else stamp,
+        failure_count=(_count(old.get("failure_count")) if active else 0) + 1,
+        _first_epoch=_epoch(old.get("_first_epoch"), now) if active else now,
+        _success_epoch=success)
+    return candidate, candidate, True
+
+
+def _failure_public(rec, now=None):
+    """Validate one persisted incident before it reaches any status surface."""
+    if not isinstance(rec, dict) or not isinstance(rec.get("reason"), str) \
+            or not rec["reason"]:
+        return None
+    now = _epoch(now, time.time())
+    first = _epoch(rec.get("_first_epoch"), now)
+    last = _epoch(rec.get("_last_epoch"), first)
+    return {"profile": _dsan(rec.get("profile"))
+            if isinstance(rec.get("profile"), str) else "?",
+            "code": rec.get("code") if isinstance(rec.get("code"), str)
+            else "incident_state_corrupt",
+            "reason": _safe_reason(rec["reason"]),
+            "first_failure": rec.get("first_failure")
+            if isinstance(rec.get("first_failure"), str) else "?",
+            "last_failure": rec.get("last_failure")
+            if isinstance(rec.get("last_failure"), str) else "?",
+            "failure_count": max(1, _count(rec.get("failure_count"), 1)),
+            "remediation": rec.get("remediation")
+            if isinstance(rec.get("remediation"), str) else _ACK_REMEDIATION,
+            "age_s": max(0, int(now - first)),
+            "last_age_s": max(0, int(now - last))}
+
+
+def _sign_failure_rows(state, now=None):
+    now, rows = _epoch(now, time.time()), []
+    if not isinstance(state, dict):
+        return rows
+    for p, rec in state.items():
+        if not _active_failure(rec):
+            continue
+        normalized = dict(rec)
+        if isinstance(p, str):
+            normalized["profile"] = p
+        row = _failure_public(normalized, now)
+        if row:
+            rows.append(row)
+    return sorted(rows, key=lambda r: r.get("last_failure") or "", reverse=True)
+
+
+def _incident_state_unreadable(exc, now=None):
+    from . import cell
+    reason = "incident state unreadable (%s: %s)" % (
+        exc.__class__.__name__, exc)
+    d = _diag("incident_state_unreadable", reason, event_epoch=now)
+    rec = {"profile": _profile(cell.profile_name()), "code": d["code"],
+           "reason": d["reason"], "first_failure": d["_event_ts"],
+           "last_failure": d["_event_ts"], "failure_count": 1,
+           "remediation": d["remediation"],
+           "_first_epoch": d["_event_epoch"],
+           "_last_epoch": d["_event_epoch"]}
+    return _failure_public(rec, d["_event_epoch"])
+
+
+def sign_failures():
+    """Every uncleared profile failure, newest first, projected without the
+    internal epoch fields. Persisted and process-local owner views are merged;
+    an unreadable owner is itself a public degradation, never healthy/empty."""
+    now = time.time()
+    with _SIGN_FAILURE_FALLBACK_LOCK:
+        fallback = {p: dict(r) for p, r in
+                    _fallback_sign_failure_state().items()
+                    if isinstance(r, dict)}
+        try:
+            _validate_sign_failure_owner()
+            if not os.path.exists(sign_failures_path()):
+                state = {}
+            else:
+                with _sign_failure_lock():
+                    state = _read_sign_failure_state()
+        except Exception as exc:
+            rows = [_incident_state_unreadable(exc, now)]
+            rows.extend(_sign_failure_rows(fallback, now))
+            return sorted(rows, key=lambda r: r.get("last_failure") or "",
+                          reverse=True)
+    if not isinstance(state, dict):
+        state = {}
+    merged = {}
+    profiles = list(state) + [p for p in fallback if p not in state]
+    for p in profiles:
+        if isinstance(p, str):
+            merged[p] = _combined_sign_failure_state(state.get(p),
+                                                     fallback.get(p))
+    return _sign_failure_rows(merged, now)
+
+
+def _record_sign_failure(profile, failure):
+    """Upsert one exact profile. The process fallback is updated before the
+    shared write, so lock/write failure cannot erase the incident."""
+    p = _profile(profile)
+    d = _normal_diag(failure)
+    remembered = False
+    with _SIGN_FAILURE_FALLBACK_LOCK:
+        fallback = _fallback_sign_failure_state()
+        try:
+            with _sign_failure_lock():
+                state = _read_sign_failure_state()
+                if not isinstance(state, dict):
+                    state = {}
+                old = _combined_sign_failure_state(state.get(p), fallback.get(p))
+                stored, shown, changed = _next_sign_failure(old, p, d)
+                if stored:
+                    fallback[p] = stored
+                remembered = True
+                if changed:
+                    state[p] = stored
+                    pk.write_json(sign_failures_path(), state)
+                return _failure_public(shown, d["_event_epoch"])
+        except Exception:
+            if not remembered:
+                stored, shown, changed = _next_sign_failure(fallback.get(p), p, d)
+                if changed:
+                    fallback[p] = stored
+            raise
+
+
+def _clear_sign_failure(profile, succeeded_at=None):
+    """Record a per-profile committed-signing watermark in both owner views.
+    The real receipt-confirmed signing path is the sole production caller; the
+    fallback changes only after the shared watermark write succeeds."""
+    p = _profile(profile)
+    succeeded_at = _epoch(succeeded_at, time.time())
+    try:
+        with _SIGN_FAILURE_FALLBACK_LOCK:
+            fallback = _fallback_sign_failure_state()
+            with _sign_failure_lock():
+                state = _read_sign_failure_state()
+                if not isinstance(state, dict):
+                    state = {}
+                old = _combined_sign_failure_state(state.get(p), fallback.get(p))
+                last = _epoch(old.get("_last_epoch"))
+                prior = _epoch(old.get("_success_epoch"))
+                active = _active_failure(old)
+                if last > succeeded_at:
+                    return False
+                cleared = {"profile": p,
+                           "_success_epoch": max(prior, succeeded_at)}
+                state[p] = cleared
+                pk.write_json(sign_failures_path(), state)
+                fallback[p] = cleared
+                return active
+    except Exception:
+        return False
+
+
+def _signed_success_epoch(profile):
+    """Exact-profile committed-signing evidence. ACK watermarks still retire
+    incidents but never claim that a signing receipt was observed."""
+    p = _profile(profile)
+    with _SIGN_FAILURE_FALLBACK_LOCK:
+        fallback = _fallback_sign_failure_state().get(p)
+        try:
+            _validate_sign_failure_owner()
+            if not os.path.exists(sign_failures_path()):
+                state = {}
+            else:
+                with _sign_failure_lock():
+                    state = _read_sign_failure_state()
+        except Exception:
+            return 0.0
+    rec = _combined_sign_failure_state(
+        state.get(p) if isinstance(state, dict) else None, fallback)
+    if rec.get("acknowledged_at"):
+        return 0.0
+    return _epoch(rec.get("_success_epoch"))
+
+
+def acknowledge_sign_failures(profile=None):
+    """Operator retirement for dead/renamed profiles. This is an explicit ACK,
+    not a recovery claim; its watermark prevents delayed pre-ack failures from
+    resurrecting the incident. Returns acknowledged exact profile names."""
+    now, stamp = time.time(), pk.now_ts()
+    try:
+        with _SIGN_FAILURE_FALLBACK_LOCK:
+            fallback = _fallback_sign_failure_state()
+            with _sign_failure_lock():
+                state = _read_sign_failure_state()
+                if not isinstance(state, dict):
+                    state = {}
+                profiles = list(state) + [p for p in fallback if p not in state]
+                targets = [_profile(profile)] if profile is not None else [
+                    p for p in profiles if isinstance(p, str) and _active_failure(
+                        _combined_sign_failure_state(state.get(p), fallback.get(p)))]
+                done, cleared = [], {}
+                for p in targets:
+                    rec = _combined_sign_failure_state(state.get(p), fallback.get(p))
+                    if not _active_failure(rec):
+                        continue
+                    cleared[p] = {"profile": p, "_success_epoch": now,
+                                  "acknowledged_at": stamp}
+                    state[p] = cleared[p]
+                    done.append(p)
+                if done:
+                    pk.write_json(sign_failures_path(), state)
+                    fallback.update(cleared)
+                return done
+    except Exception:
+        return []
+
+
+def _stamp_sign_failure(row, profile, failure):
+    """Preserve RAM-pure fail-open delivery, but make the fallback self-
+    describing on the row and persistent in the shared transport status. Even
+    a failed RAM-state write cannot kill the chat row."""
+    try:
+        rec = _record_sign_failure(profile, failure)
+    except Exception as exc:
+        p = _profile(profile)
+        with _SIGN_FAILURE_FALLBACK_LOCK:
+            private = _fallback_sign_failure_state().get(p)
+            rec = _failure_public(private) if private else None
+        d = _normal_diag(failure)
+        stamp = d["_event_ts"]
+        rec = rec or {"profile": p, "code": d["code"], "reason": d["reason"],
+                      "first_failure": stamp, "last_failure": stamp,
+                      "failure_count": 1, "age_s": 0, "last_age_s": 0,
+                      "remediation": d["remediation"]}
+        rec["remediation"] = "%s; shared incident retention failed: %s; process-local fallback active" % (
+            rec["remediation"], _safe_reason(
+                "%s: %s" % (exc.__class__.__name__, exc)))
+    row["transport"] = _public_transport(dict(rec, state="DEGRADED"))
+    return row
+
+
 def node_head(url=None, timeout=1.5):
     """The chain head receipt: dict, {} for a live-but-empty chain, None when
     the node is down — post()'s cheap reachability probe doubles as data."""
@@ -251,26 +728,124 @@ def node_head(url=None, timeout=1.5):
         return None
     rs = cell.get_json(u + "/api/receipts", timeout=timeout)
     if isinstance(rs, list):
-        return rs[0] if rs else {}
+        return rs[0] if rs and isinstance(rs[0], dict) else {} if not rs else None
     return None
 
 
+def _transient_failure(profile, code, reason):
+    d = _diag(code, reason)
+    rec = {"profile": _profile(profile), "code": d["code"],
+           "reason": d["reason"], "first_failure": d["_event_ts"],
+           "last_failure": d["_event_ts"], "failure_count": 1,
+           "remediation": d["remediation"],
+           "_first_epoch": d["_event_epoch"],
+           "_last_epoch": d["_event_epoch"]}
+    return _failure_public(rec, d["_event_epoch"])
+
+
 def transport_status():
-    """One probe -> {"mode", "url", "head", "signer"} — the status strip in
-    `helm --human`, the web panel and doctor all read this. mode reports the
-    SIGNER's truth, not just node reachability: "signed" needs the explicit
-    cell binary AND a live node; a reachable node with no signer is
-    "unsigned (no signer)" — the exact state where every post falls to
-    [unsigned] while the node still answers (day-review #1)."""
+    """The ONE transport truth for CLI/TUI/web/doctor. A reachable node plus an
+    executable signer is only *ready*; any profile whose attempted signed turn
+    fell back remains DEGRADED until that SAME profile completes a signed turn.
+    An unset signer is configured-off; a set-but-unusable signer is unavailable.
+    The persistent incident fields come from RAM, never disk coordination."""
     from . import cell
     u = node_url()
-    signer = cell.bin_ready()
-    h = node_head(u) if u else None
-    mode = "unsigned"
+    signer = cell.bin_status()
+    failures = sign_failures()
+    out = {"mode": "unsigned", "url": u, "head": None,
+           "signer": signer["usable"],
+           "signer_configured": signer["configured"]}
+    if signer["configured"] and not signer["usable"]:
+        current = next((f for f in failures
+                        if f.get("profile") == _dsan(cell.profile_name())
+                        and f.get("code") == "signer_unavailable"), None)
+        current = current or _transient_failure(
+            cell.profile_name(), "signer_unavailable", signer["reason"])
+        rows = [current] + [f for f in failures if f is not current]
+        out.update(current, mode="degraded", state="DEGRADED",
+                   failed_profiles=rows)
+        return out
+    probe_error = None
+    try:
+        h = node_head(u) if u else None
+    except Exception as exc:
+        h = None
+        probe_error = "%s: %s" % (exc.__class__.__name__, exc)
+    out["head"] = h.get("chain_index") if isinstance(h, dict) and h else None
+    if failures:
+        out.update(failures[0], mode="degraded", state="DEGRADED",
+                   failed_profiles=failures)
+        return out
+    if u and signer["usable"] and h is None:
+        reason = "configured chat node unreachable at %s" % u
+        if probe_error:
+            reason += " (%s)" % probe_error
+        f = _transient_failure(
+            cell.profile_name(), "node_unreachable", reason)
+        out.update(f, mode="degraded", state="DEGRADED",
+                   failed_profiles=[f])
+        return out
     if h is not None:
-        mode = "signed" if signer else "unsigned (no signer)"
-    return {"mode": mode, "url": u, "head": h.get("chain_index") if h else None,
-            "signer": signer}
+        if not signer["usable"]:
+            out["mode"] = "unsigned (no signer)"
+        elif _signed_success_epoch(cell.profile_name()):
+            out.update(mode="signed", state="SIGNED", label="signed")
+        else:
+            out.update(mode="ready", state="READY",
+                       label="ready (unproven)",
+                       detail="no committed signing receipt observed for this profile")
+    return out
+
+
+def transport_label(st):
+    """Public wording shared by every text renderer."""
+    if not isinstance(st, dict):
+        return "unknown"
+    return st.get("label") or st.get("mode", "unknown")
+
+
+def transport_failure_summary(st):
+    """One loud, bounded operator line from transport_status()."""
+    if not isinstance(st, dict) or st.get("mode") != "degraded":
+        return ""
+    st = _public_transport(st)
+    return ("DEGRADED profile '%s': %s — first %s, last %s (%ss ago), "
+            "%d failure%s; remediation: %s" % (
+                st.get("profile") or "?", st.get("reason") or "unknown",
+                st.get("first_failure") or "?", st.get("last_failure") or "?",
+                st.get("last_age_s") or 0, st.get("failure_count") or 1,
+                "s"[:(st.get("failure_count") or 1) != 1],
+                st.get("remediation") or "retry a signed turn"))
+
+
+def _cmd_transport(args):
+    verb = args[0] if args else "status"
+    if verb == "status" and len(args) == 1 or not args:
+        st = transport_status()
+        print("helm chat transport: " + (
+            transport_failure_summary(st) if st.get("mode") == "degraded"
+            else "%s%s" % (transport_label(st).upper(),
+                            " — chain #%s" % st["head"]
+                            if st.get("head") is not None else "")))
+        return 1 if st.get("mode") == "degraded" else 0
+    if verb != "ack":
+        print(HELP["transport"], file=sys.stderr)
+        return 2
+    profile = _pop_flag(args, "--profile")
+    all_profiles = "--all" in args
+    if all_profiles:
+        args.remove("--all")
+    if (profile is None) == (not all_profiles) or len(args) != 1:
+        print(HELP["transport"], file=sys.stderr)
+        return 2
+    done = acknowledge_sign_failures(None if all_profiles else profile)
+    if not done:
+        print("helm chat transport: no matching active incident", file=sys.stderr)
+        return 1
+    print("helm chat transport: ACKNOWLEDGED (not recovered): %s" %
+          ", ".join(repr(p) for p in done))
+    return 0
 
 
 def digest_payload(text):
@@ -395,37 +970,38 @@ def _env_extra(token):
 
 
 def _revive():
-    """The node lost its provisioned state (reboot wiped tmpfs; token stale;
-    chain empty): re-unlock with the STORED passphrase, re-bootstrap health,
-    cache the fresh token RAM-side. Returns the token or None. Chat turns
-    never die on provisioning state — the provisioning exhaustion lesson,
-    generalized."""
+    """Re-unlock + re-bootstrap a wiped/stale room node. Returns (token, None)
+    or (None, precise reason); unlock/faucet health failures never disappear."""
     from . import chatnode
     u = node_url()
     st = chatnode.state()
-    if not (u and st.get("passphrase")):
-        return None
+    if not u:
+        return None, "node revive unavailable: no chat node URL"
+    if not st.get("passphrase"):
+        return None, "node revive unavailable: no stored chat-node passphrase"
     token, err = chatnode.unlock(u, st["passphrase"])
     if err:
-        return None
-    chatnode.ensure_healthy(u)
+        return None, err
+    healthy, err = chatnode.ensure_healthy_result(u)
+    if not healthy:
+        return None, err
     _ensure_dir()
     pk.atomic_write(_token_path(), token or "")
     os.chmod(_token_path(), 0o600)
-    return token
+    return token, None
 
 
 LOW_WATER = 3000   # ~2 signed turns (measured: a 73B digest send costs ~1442)
 
 
 def _faucet(cell_hex):
-    """Top up one cell from the room node's faucet (balance must never kill a
-    chat turn). Fail-open — the node rate-limits faucets to 1/min/cell; a 429
-    just means the retry (or the unsigned fallback) tells the truth."""
-    from . import cell
+    """Top up one cell from the room node's faucet. Returns the validated
+    response or a precise refusal; success:false is never discarded."""
+    from . import chatnode
     u = node_url()
-    if u:
-        cell.post_json(u + "/api/faucet", {"recipient": cell_hex, "amount": 10000})
+    if not u:
+        return None, "faucet unavailable: no chat node URL"
+    return chatnode.faucet(u, cell_hex, 10000)
 
 
 def _balance(cell_hex):
@@ -453,8 +1029,7 @@ def _room_cell(profile, token):
         # node-state fault, so the caller must NOT revive/unlock over it.
         return None, err, False
     if rc != 0:
-        return None, ("join failed (rc %d): %s"
-                      % (rc, (err or out).strip()[-240:])), True
+        return None, "join failed (rc %d): %s" % (rc, (err or out).strip()), True
     info = cell._last_json(out)
     if not (info and info.get("cell")):
         return None, "join printed no cell id", True
@@ -464,76 +1039,125 @@ def _room_cell(profile, token):
     return info["cell"], None, True
 
 
+def _hex64(value):
+    return isinstance(value, str) and len(value) == 64 \
+        and all(c in "0123456789abcdefABCDEF" for c in value)
+
+
+def _complete_send(info):
+    return isinstance(info, dict) and info.get("sent") is True \
+        and _hex64(info.get("turn_hash")) \
+        and _hex64(info.get("receipt_hash")) \
+        and type(info.get("chain_index")) is int and info["chain_index"] >= 0
+
+
 def _sign_send(payload, profile):
-    """One signed self-write turn on the room node carrying `payload`.
-    (send-info, None) or (None, reason). One recovery lap (revive + faucet)
-    before giving up — then the caller falls back to unsigned, loudly tagged.
-    NO SIGNER => immediate, silent decline: without the explicit cell binary
-    a signed turn is impossible, so the recovery lap (a live unlock POST +
-    ensure_healthy against the node, burning its 5/60s unlock budget) must
-    never fire — a config fact is not a fault (day-review #1)."""
+    """One signed self-write turn. Returns (send-info, None) or
+    (None, structured diagnostic). One recovery lap; both send attempts and
+    every revive/faucet refusal survive into the final operator reason."""
     from . import cell
-    if not cell.bin_ready():
-        return None, ("no signer — HELM_CELL_BIN unset; posts ride the v1 "
-                      "room unsigned")
+    signer = cell.bin_status()
+    if not signer["usable"]:
+        return None, _diag("signer_unavailable", signer["reason"])
     token = _node_token()
     hexid, err, launched = _room_cell(profile, token)
     if err:
-        # A local signer-launch failure is not node state — decline unsigned,
-        # never fire the unlock/revive lap (day-review #1, codex B1 tail).
         if not launched:
-            return None, err
-        token = _revive() or token
+            return None, _diag("signer_unavailable", err)
+        revived, revive_err = _revive()
+        if revive_err is None:
+            token = revived if revived is not None else token
         hexid, err, launched = _room_cell(profile, token)
         if err:
-            return None, err
+            detail = err if not revive_err else "%s; revive failed: %s" % (
+                err, revive_err)
+            return None, _diag("join_failed", detail)
+    recovery = []
     b = _balance(hexid)
-    if b is not None and b < LOW_WATER:   # proactive top-up BEFORE the turn
-        _faucet(hexid)
-    rc = out = err2 = None
-    for attempt in (0, 1):
-        rc, out, err2 = cell.run_bin(
+    if b is not None and b < LOW_WATER:
+        _r, faucet_err = _faucet(hexid)
+        if faucet_err:
+            recovery.append("proactive %s" % faucet_err)
+    attempts = []
+    for attempt in (1, 2):
+        rc, out, err = cell.run_bin(
             ["send", "--profile", profile, "--to", hexid,
              "--topic", CHAT_TOPIC, payload],
             timeout=30, env_extra=_env_extra(token))
         if rc is None:
-            return None, err2
+            return None, _diag("signer_unavailable", err)
         info = cell._last_json(out)
-        if rc == 0 and info and info.get("sent"):
+        complete = _complete_send(info)
+        if rc == 0 and complete:
+            info = dict(info)
+            info["_helm_signed_at"] = time.time()
             return info, None
-        if attempt == 0:
-            token = _revive() or token   # locked node / stale token / no blocks
-            _faucet(hexid)               # computron exhaustion
-    return None, "send failed (rc %s): %s" % (rc, ((err2 or out) or "").strip()[-240:])
+        detail = (err or out) or "no complete sent receipt"
+        if rc == 0 and isinstance(info, dict) and info.get("sent") is True \
+                and not complete:
+            detail = "sent:true response has invalid turn_hash/receipt_hash/chain_index"
+        attempts.append("attempt %d rc %s: %s" % (
+            attempt, rc, detail.strip()))
+        if attempt == 1:
+            revived, revive_err = _revive()
+            if revive_err:
+                recovery.append("revive failed: %s" % revive_err)
+            elif revived is not None:
+                token = revived
+            _r, faucet_err = _faucet(hexid)
+            if faucet_err:
+                recovery.append("recovery %s" % faucet_err)
+    reason = "; ".join(attempts + recovery)
+    return None, _diag("send_failed", reason)
 
 
 def _signed_row(row, payload_text, profile, sign):
-    """Common signing leg for posts and reactions: attempt the turn when the
-    transport is up; annotate the row with its receipt on success. sign=None
-    probes; True forces the attempt; False skips (v1 path). FAIL-OPEN TOTAL:
-    any surprise in the signing leg (a raced cache write, a raising client)
-    degrades to the v1 unsigned row — the fallback law is drop the SIGNATURE,
-    never the message. The signer gate comes FIRST: no cell binary => no
-    node probe at all (the row is unsigned by configuration, not by
-    fault).
-
-    The payload is payload_for(row) — shape-dispatched, so the signer and
-    `helm chat verify` can never drift apart — and the signed row RECORDS it
-    ({payload}), making the parent binding re-derivable from the row alone."""
+    """Common signing owner for posts/reactions. The RAM row ALWAYS lands.
+    A failed attempted signature is stamped + retained per profile; only an
+    observed signed send clears that profile's incident. On the production
+    `sign=None` path, an unset signer/node URL is configured-off v1, while a
+    configured-but-unusable signer is a `signer_unavailable` incident.
+    `sign=True` is the explicit force/test seam and therefore records inability
+    to honor that forced attempt; `sign=False` always skips."""
+    p = profile
     try:
         from . import cell
+        p = p or cell.profile_name()
         if sign is None:
-            sign = cell.bin_ready() and bool(node_url()) \
-                and node_head() is not None
+            signer = cell.bin_status()
+            if signer["configured"] and not signer["usable"]:
+                return _stamp_sign_failure(
+                    row, p, _diag("signer_unavailable", signer["reason"]))
+            if not signer["configured"] or not node_url():
+                return row
+            try:
+                live = node_head()
+            except Exception as exc:
+                return _stamp_sign_failure(
+                    row, p, _diag("node_probe_failed", "%s: %s" % (
+                        exc.__class__.__name__, exc)))
+            if live is None:
+                return _stamp_sign_failure(
+                    row, p, _diag("node_unreachable",
+                                  "chat node unreachable at %s" % node_url()))
+            sign = True
         if not sign:
             return row
         payload = payload_for(row, payload_text)
-        info, _err = _sign_send(payload, profile or cell.profile_name())
-        if info:
-            row.update(turn=info.get("turn_hash"), receipt=info.get("receipt_hash"),
-                       chain=info.get("chain_index"), payload=payload)
-    except Exception:
-        pass
+        info, failure = _sign_send(payload, p)
+        if not info:
+            return _stamp_sign_failure(row, p, failure)
+        if not _complete_send(info):
+            return _stamp_sign_failure(row, p, _diag(
+                "send_failed", "signer returned no committed signing receipt"))
+        signed_at = info.pop("_helm_signed_at", time.time())
+        _clear_sign_failure(p, signed_at)
+        row.update(turn=info.get("turn_hash"), receipt=info.get("receipt_hash"),
+                   chain=info.get("chain_index"), payload=payload)
+    except Exception as exc:
+        return _stamp_sign_failure(
+            row, p or "helm-agent", _diag(
+                "signing_exception", "%s: %s" % (exc.__class__.__name__, exc)))
     return row
 
 
@@ -628,7 +1252,7 @@ def _parent_fields(room, ref):
 
 
 def post(text, room="main", who=None, profile=None, sign=None, origin=None,
-         dm=None, ambient=False, reply_to=None):
+         dm=None, ambient=False, reply_to=None, ack=None, ackstate=None):
     """Append one message; returns it. v2: shortcodes expand, and when the
     room node answers the digest rides a signed self-write turn FIRST — the
     row carries {turn, receipt, chain}. Node down -> plain v1 row (rendered
@@ -673,6 +1297,13 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
         row["origin"] = origin
     if ambient and not dm:
         row["ambient"] = 1
+    if ack:
+        # the ACK / CONSUME LADDER row (seats.ack): a NON-waking marker that
+        # names the target row it closes — seats.deliverable drops it like a
+        # reaction, and the SENDER reads it off `helm chat pending`. The note
+        # (if any) is the text; a blocked ack carries its reason there.
+        row["ack"] = ack
+        row["ackstate"] = ackstate or "done"
     if reply_to:
         row.update(_parent_fields(room, reply_to))
     _touch_poster_presence(row["from"])
@@ -920,9 +1551,23 @@ def consume(room="main", total=None):
     return True
 
 
+def _transport_tag(m):
+    """The row-local signing truth. Attempted fallbacks are loud and precise;
+    configured-off v1 rows keep the ordinary [unsigned] fact."""
+    if m.get("chain") is not None:
+        return ""
+    t = _public_transport(m.get("transport"))
+    if isinstance(t, dict) and t.get("state") == "DEGRADED":
+        return " [DEGRADED %s/%s: %s]" % (
+            t.get("profile") or "?", t.get("code") or "signing",
+            t.get("reason") or "unknown failure")
+    return " [unsigned]"
+
+
 def _fmt(m, hhmm=True, idx=None):
     """One row, rendered. Signed rows (a recorded chain receipt) print clean;
-    everything else carries the visible [unsigned] tag (fallback law).
+    configured-off rows carry [unsigned], attempted signing fallbacks carry the
+    precise DEGRADED diagnostic.
 
     With an `idx` (index_rows of the room) the one-level thread renders too: a
     reply carries a compact ↳author "quote" of its parent, and a parent carries
@@ -930,7 +1575,7 @@ def _fmt(m, hhmm=True, idx=None):
     line is byte-identical to before."""
     ts = str(m.get("ts") or "")
     stamp = (ts[11:16] or "--:--") if hhmm else (ts or "?")
-    tag = "" if m.get("chain") is not None else " [unsigned]"
+    tag = _transport_tag(m)
     # identity fields are display-laundered (_dsan) so a name column can never
     # reshape the terminal — defense-in-depth beneath the validated join seam.
     if m.get("react"):
@@ -939,6 +1584,12 @@ def _fmt(m, hhmm=True, idx=None):
             "un-reacted" if m.get("un") else "reacted",
             m["react"], _dsan(m.get("tfrom") or "?"),
             str(m.get("tts") or "")[11:16] or "--:--", tag)
+    if m.get("ack"):        # the consume-ladder ACTED marker (seats.ack)
+        note = (": " + (m.get("text") or "")) if m.get("text") else ""
+        return "%s %s ACK %s -> %s%s%s" % (
+            stamp, _dsan(m.get("from") or "?"),
+            str(m.get("ackstate") or "done").upper(),
+            str(m.get("ack") or "")[:8], note, tag)
     q = quote_of(m, idx) if idx else None
     quote = ' ↳%s "%s"' % (_dsan(q[0]), q[1]) if q else ""
     n = (idx or {}).get("replies", {}).get(tkey(m), 0)
@@ -1083,7 +1734,8 @@ def _fmt_body(m):
     """The log line's tail: sender + content + signature note, full fidelity —
     including a reply's parent pointer, so the durable journal never loses the
     thread the RAM room showed."""
-    tag = (" {chain %s}" % m["chain"]) if m.get("chain") is not None else " [unsigned]"
+    tag = (" {chain %s}" % m["chain"]) if m.get("chain") is not None \
+        else _transport_tag(m)
     # the journal is a terminal sink: `cat chat-<date>.log` renders these lines,
     # so the IDENTITY columns (from/tfrom/rfrom) are _dsan-laundered against a
     # planted/foreign row's ESC/bidi. The message TEXT is left full-fidelity by
@@ -1104,7 +1756,8 @@ def _fmt_body(m):
 # ---------------------------------------------------------------------------
 
 SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "seat", "dm",
-              "status", "claim", "release", "claims", "verdict", "reveal")
+              "ack", "pending", "status", "claim", "release", "claims",
+              "verdict", "reveal")
                                                # the delivery lane — seats.py
                                                # (verdict/reveal answer with
                                                # the 0.3 council deferral)
@@ -1148,6 +1801,22 @@ HELP = {
             "rehome <sid|name> <room|main|none>",
     "dm": "usage: helm chat dm <seat> <text...> [--seat S]  (one private "
           "recipient — never a room)",
+    "ack": "usage: helm chat ack <id> [done|blocked] [--note ...] [--seat S]\n"
+           "  Mark a message ADDRESSED TO YOU as acted — done (loop closed) or "
+           "blocked (--note the\n"
+           "  reason). One append-only ack row on the same lane; the sender "
+           "watches it leave their\n"
+           "  `helm chat pending`. <id> is the row's stable id (helm chat read "
+           "shows it). Only the\n"
+           "  recipient may ack; a foreign or unknown id is refused; an "
+           "identical repeat is a no-op.",
+    "pending": "usage: helm chat pending [--seat S]\n"
+               "  YOUR outbound addressed rows (DMs, @mentions) not yet "
+               "CONSUMED: SENT-not-SEEN (the\n"
+               "  recipient never surfaced it — dead / away / wedged?) or "
+               "SEEN-not-ACTED (surfaced, not\n"
+               "  yet acked). Acked rows drop off — a stranded word is a "
+               "visible object, not silent loss.",
     "claim": "usage: helm chat claim <resource> [--ttl SECONDS] [--seat S] "
              "[--lease ID to extend]  (keep the printed lease id — it is the "
              "release capability)",
@@ -1178,6 +1847,9 @@ HELP = {
                  "the disk journal)",
     "node": "usage: helm chat node up|down|status  (supervise the chat "
             "tmpfs node)",
+    "transport": "usage: helm chat transport status | ack --profile NAME | "
+                 "ack --all  (ACK retires dead/renamed incidents; it does not "
+                 "claim signing recovered)",
     "meld": "usage: helm chat meld invite <peer> <topic...> | join <room> | "
             "recv <room> [--timeout S] | say <room> --marker "
             "YIELD|HOLD|DONE|ABORT <text...> | status",
@@ -1310,6 +1982,8 @@ def cmd_chat(args):
             print("helm chat: --seat wants a seat name%s"
                   % (" — got %r" % v if v else ""), file=sys.stderr)
             return 2
+    if verb == "transport":
+        return _cmd_transport(args[1:])
     if verb == "node":
         from . import chatnode
         return chatnode.cmd_node(args[1:])
@@ -1501,6 +2175,7 @@ def cmd_chat(args):
             print("  %s  %d msg%s%s%s" % (n, total, "s"[:total != 1], unread, last))
         return 0
     print("helm chat: unknown subcommand '%s' (post|reply|read|rooms|react|"
-          "verify|log-flush|node|meld|roster|%s)" % (verb, "|".join(SEAT_VERBS)),
+          "verify|log-flush|node|transport|meld|roster|%s)" %
+          (verb, "|".join(SEAT_VERBS)),
           file=sys.stderr)
     return 2
