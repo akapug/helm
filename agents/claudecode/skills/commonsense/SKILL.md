@@ -39,7 +39,7 @@ let me just" OR a "the options are A or B" coming on.
    When context fills, you MANAGE it with tools and proceed: archive open work to the integration board,
    checkpoint to memory, dispatch subagents for big-LoC work, prune + re-triage the tasklist, /compact deliberately.
    A big task is never deferred for "fresh context" — it's decomposed + tooled. Capacity = real
-   resources remaining (with the builders.dev pack: live usage budget), not hours, not token-context.
+   resources remaining (`helm creds` is the live account scorecard), not hours, not token-context.
 2. **"This is big / a marathon → ship a smaller version now."** Size is never a gate. Decompose into a
    dependency graph and orchestrate (subagents, worktrees, waves) to do the FULL thing. "Smaller for now"
    is scope-invention, not prudence.

@@ -290,6 +290,72 @@ class WaitingOnYouTest(BriefBase):
         self.assertIn("WAITING ON YOU", text)
 
 
+class StoreReviewQueueTest(BriefBase):
+    """The owner steer 2026-07-23: the provisional queue must ROUTINELY reach
+    the owner. helm brief gains a store-review-queue section — provisional
+    (firing, awaiting ratify) listed newest-first as `[type] id - statement`
+    (clipped 80), candidate count only, omitted entirely when both are zero
+    (the empty-section law). Hermetic: entries seeded straight to disk with an
+    explicit status (no xrev-clear, so the ntfy path is never exercised here)."""
+
+    def _prov(self, pid, stmt, ts):
+        store.write_prior({"id": pid, "statement": stmt, "confidence": 0.7,
+                           "status": "provisional", "xrev_by": "codex-seat",
+                           "xrev_ts": ts, "stated_ts": ts, "last_updated": ts})
+
+    def test_provisional_listed_newest_first_candidate_counted(self):
+        older, newer = _iso(self.now - 7200), _iso(self.now - 600)
+        self._prov("prov-old", "the older cleared belief", older)
+        self._prov("prov-new", "the newer cleared belief", newer)
+        store.write_lexicon({"term": "cand-a", "definition": "a raw guess",
+                             "status": "candidate", "updated_ts": newer})
+        store.write_prior({"id": "cand-b", "statement": "another guess",
+                           "confidence": 0.6, "status": "candidate",
+                           "stated_ts": newer, "last_updated": newer})
+        b = self.compose()
+        rq = b["review"]
+        self.assertEqual([e["id"] for e in rq["provisional"]],
+                         ["prov-new", "prov-old"])   # newest graduation first
+        self.assertEqual(rq["candidate"], 2)          # count only, not listed
+        text = brief.render(b)
+        self.assertIn("STORE REVIEW QUEUE — 2 provisional (firing, awaiting your "
+                      "ratify) · 2 candidate", text)
+        self.assertIn("[prior] prov-new - the newer cleared belief", text)
+        self.assertLess(text.index("prov-new"), text.index("prov-old"))  # ordered
+        self.assertNotIn("cand-a", text)              # candidates are count-only
+
+    def test_statement_clipped_to_80(self):
+        self._prov("long-one", "y" * 200, _iso(self.now - 100))
+        line = [l for l in brief.render(self.compose()).splitlines()
+                if "[prior] long-one" in l][0]
+        self.assertIn("y" * 80, line)
+        self.assertNotIn("y" * 81, line)
+
+    def test_more_provisional_folds(self):
+        for i in range(8):
+            self._prov("prov-%02d" % i, "cleared belief %d" % i,
+                       _iso(self.now - i * 60))
+        text = brief.render(self.compose())
+        self.assertEqual(text.count("[prior] prov-"), brief.MAX_REVIEW)
+        self.assertIn("(+2 more provisional)", text)
+
+    def test_candidate_only_still_renders_section(self):
+        store.write_lexicon({"term": "cand-a", "definition": "a raw guess",
+                             "status": "candidate", "updated_ts": _iso(self.now)})
+        b = self.compose()
+        self.assertEqual(b["review"], {"provisional": [], "candidate": 1})
+        text = brief.render(b)
+        self.assertIn("STORE REVIEW QUEUE — 0 provisional", text)
+        self.assertIn("· 1 candidate", text)
+
+    def test_section_omitted_when_queue_empty(self):
+        store.write_prior({"id": "live-one", "statement": "confirmed truth",
+                           "stated_ts": "2026-06-01", "last_updated": "2026-06-02"})
+        b = self.compose()
+        self.assertEqual(b["review"], {"provisional": [], "candidate": 0})
+        self.assertNotIn("STORE REVIEW QUEUE", brief.render(b))
+
+
 class CmdBriefTest(BriefBase):
     def _run(self, args):
         out = io.StringIO()
@@ -305,7 +371,7 @@ class CmdBriefTest(BriefBase):
         self.assertEqual(rc, 0)
         b = json.loads(out)
         self.assertEqual(sorted(b), ["generated_at", "hours", "inject", "knowledge",
-                                     "seats", "sessions", "waiting"])
+                                     "review", "seats", "sessions", "waiting"])
         self.assertEqual(b["hours"], 12.0)
         self.assertEqual(b["sessions"]["total"], 1)
         self.assertIsNone(b["inject"])

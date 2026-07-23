@@ -276,5 +276,23 @@ class TestCLI(MeldBase):
         self.assertEqual(chat.cmd_chat(["meld", "recv"]), 2)
 
 
+class TestSelfSeat(MeldBase):
+    def test_self_seat_survives_a_deleted_cwd(self):
+        """LOW (fable adversarial @2b4d496, probe A7): _self_seat's bare
+        os.getcwd() crashed ALL five meld verbs (invite/join/recv/say/status
+        default their seat through it, with no fail-open wrapper) when the
+        process cwd was a pruned worktree. safe_cwd fails open to None and
+        derive_seat/auto_name handle cwd=None — the verb keeps its
+        family-derived auto-name instead of a FileNotFoundError."""
+        os.environ["CLAUDE_SESSION_ID"] = "sid-meld-gone-cwd"
+        saved = os.path.dirname(os.path.abspath(__file__))
+        self.addCleanup(os.chdir, saved)
+        d = tempfile.mkdtemp(dir=self.tmp)
+        os.chdir(d)
+        os.rmdir(d)
+        self.assertRaises(OSError, os.getcwd)   # the probe's precondition
+        self.assertTrue(meld._self_seat())      # named, not crashed
+
+
 if __name__ == "__main__":
     unittest.main()

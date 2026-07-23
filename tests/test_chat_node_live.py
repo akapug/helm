@@ -56,6 +56,10 @@ class LiveNodeTest(unittest.TestCase):
         cls.port = _free_port()
         cls.url = "http://127.0.0.1:%d" % cls.port
         os.environ["HELM_CHAT_NODE_URL"] = cls.url
+        # cwd hermeticity: the CLI default room derives from a git cwd
+        # (seats.resolve_homing) — run from tmp so defaults stay 'main'
+        cls.cwd_prior = os.getcwd()
+        os.chdir(cls.tmp)
         os.makedirs(os.path.join(cls.tmp, "data"))  # the node wants it present
         cls.log = open(os.path.join(cls.tmp, "node.log"), "w")
         cls.node = subprocess.Popen(
@@ -85,6 +89,7 @@ class LiveNodeTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls._teardown_node()
+        os.chdir(cls.cwd_prior)
         for k, v in cls.env_prior.items():
             if v is None:
                 os.environ.pop(k, None)

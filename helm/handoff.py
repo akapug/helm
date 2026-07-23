@@ -366,7 +366,9 @@ def cmd_handoff(args):
                 pass
             return 0
         sid = session or home.session_id()
-        path = check(sid, os.getcwd(), None)
+        from . import seats
+        path = check(sid, seats.safe_cwd(), None)  # deleted cwd: check runs
+        # project-less instead of tracebacking (eager-getcwd class)
         if path:
             print("helm handoff: contract satisfied — %s (%s old)"
                   % (path, _age(time.time() - os.stat(path).st_mtime)))

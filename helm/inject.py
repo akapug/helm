@@ -81,6 +81,21 @@ read. Budget-capped (WHISPER_CAP) and fully FAIL-OPEN: brief unavailable -> no
 whisper, never a blocked hook. `--explain` renders it read-only (stamps nothing);
 a quiet window (no sessions/knowledge/gates) whispers nothing but still latches.
 
+CODEX WHISPERS (the codex-only nudges — owner asks 2026-07-21/23): a turn
+fired inside a codex-family seat appends terse pinned-lane lines, each
+justification-free (owner-spec style). Two today: the SA-delegation nudge
+(orchestrate your subagents for reviews/reads/research; whisper:codex-sa) and
+the claim-start nudge (claiming a lane is a START, not a milestone — a codex
+claimed two lanes then idled on turn-discipline law-5, reading 'posted my
+claim' as the bounded milestone; whisper:codex-claim-start). Family comes
+from the ONE existing derivation — the launch seam's HELM_CHAT_NAME (seat.py
+exports it) resolved through seat._seat_family ('codex-3' -> codex) — never
+a second resolver. Claude-family seats carry names outside seat.FAMILIES,
+resolve to None, and NEVER receive the lines (attention budget). The
+whispers walk LAST in PINNED_BUDGET in SA_LINES order (delegation, then
+claim-start): budget pressure drops the tail nudges, NEVER a premise; each
+fired line is ledgered under its own id. Fail-open.
+
 LANE-REPORT (the lane-split eval's instrument): `helm inject --lane-report` is
 a READ-ONLY analyzer over the whole fire-ledger — every fired id classified
 against the current store into the facts cohort (lexicon / certain
@@ -141,6 +156,17 @@ COINAGE_CAP = 400     # tracked unoffered terms — oldest evicted past this
 WHISPER_ID = "whisper:brief"  # the first-turn digest's ledger id
 WHISPER_CAP = 240     # the one-line brief digest's byte cap (attention budget)
 
+SA_WHISPER_ID = "whisper:codex-sa"  # the codex delegation nudge's ledger id
+SA_WHISPER = ("Delegate reviews, reads, and research to your subagents; "
+              "keep your own context lean.")
+CLAIM_WHISPER_ID = "whisper:codex-claim-start"  # the claim-is-a-start nudge's ledger id
+CLAIM_WHISPER = ("Claiming a lane is a START, not a milestone — launch the "
+                 "writer this same turn; end your turn only when work is "
+                 "visibly moving.")
+SA_FAMILIES = frozenset(("codex",))  # codexes-only (owner asks 2026-07-21/23)
+SA_LINES = ((SA_WHISPER, SA_WHISPER_ID),  # the budget-tail walk order: the
+            (CLAIM_WHISPER, CLAIM_WHISPER_ID))  # later line degrades first
+
 _CACHE_VERSION = 1    # bump when store parsing/derivation changes entry shape
 
 
@@ -177,18 +203,42 @@ def _who_lines():
     return lines
 
 
+def _sa_whisper():
+    """The codex-only nudge lines — SA_LINES ((line, ledger-id) pairs, walk
+    order) or (). Family is derived through the ONE existing resolver: the
+    launch seam's HELM_CHAT_NAME (seat.py exports it; the same leg
+    seats.derive_seat reads first) fed to seat._seat_family ('codex'/'codex-3'
+    -> codex; anything outside seat.FAMILIES -> None) — never a second
+    derivation. No seat name / non-codex family / any trouble -> () (fail-open,
+    never a blocked turn)."""
+    try:
+        name = home.env("CHAT_NAME")
+        if not name:
+            return ()
+        from . import seat
+        family, _err = seat._seat_family(str(name))
+        return SA_LINES if family in SA_FAMILIES else ()
+    except Exception:
+        return ()
+
+
 def _entry_line_full(e):
+    # a provisional (xrev-cleared) entry FIRES like live but carries a visible
+    # [provisional] PREFIX so the agent can weight it as not-yet-owner-ratified.
+    # The prefix (not a suffix) survives LINE_CAP truncation — the tag can't be
+    # the part that gets cut. candidates never reach here (load_all excludes them).
+    pv = "[provisional] " if e.get("status") == "provisional" else ""
     t = e.get("type")
     if t == "prior":
         tag = "PREMISE" if e.get("class") == "certain" else "PRIOR %.2f" % e["confidence"]
-        return "%s %s: %s" % (tag, e["id"], e.get("statement") or "")
+        return "%s%s %s: %s" % (pv, tag, e["id"], e.get("statement") or "")
     if t == "lexicon":
-        return "TERM %s: %s" % (e.get("term") or e["id"], e.get("definition") or e.get("statement") or "")
+        return "%sTERM %s: %s" % (pv, e.get("term") or e["id"], e.get("definition") or e.get("statement") or "")
     if t == "heuristic":
-        return "MOVE %s: %s" % (e["id"], e.get("statement") or "")
+        return "%sMOVE %s: %s" % (pv, e["id"], e.get("statement") or "")
     if t == "reference":
-        return "REF %s: %s" % (e["id"], e.get("statement") or "")
-    return "%s: %s" % (e["id"], e.get("statement") or "")
+        return "%sREF %s: %s" % (pv, e["id"], e.get("statement") or "")
+    return "%s%s: %s" % (pv, e["id"], e.get("statement") or "")
 
 
 def _cache_file(project=None):
@@ -586,7 +636,10 @@ def gather(text, project=None, session=None, compare=None):
     (each may be empty).
     The pinned lane leads with the WHO digest (_who_lines) as its FIRST entry
     — atomic (fires whole or not at all against PINNED_BUDGET), ledgered as
-    who:operator with its bytes in the pinned lane, cooldown-exempt.
+    who:operator with its bytes in the pinned lane, cooldown-exempt — and
+    closes with the codex-only whispers (_sa_whisper, SA_LINES order) LAST
+    when the budget still holds them — each line drops alone under pressure
+    (whisper:codex-sa, then whisper:codex-claim-start), never a premise.
     Fail-open per lane: a raising store/reflex yields that lane empty. Every
     call appends one fire-ledger row (silent turns log {"silent": true});
     session (the hook's session_id) rides the row when supplied and switches
@@ -616,6 +669,13 @@ def gather(text, project=None, session=None, compare=None):
             break
         pinned_lines.append(line)
         pinned_ids.append(str(e["id"]))
+        used += len(line)
+    sa = _sa_whisper()  # codex-only nudges — LAST in the budget; pressure
+    for line, wid in sa:  # drops a nudge, never evicts a premise
+        if used + len(line) > PINNED_BUDGET:
+            continue
+        pinned_lines.append(line)
+        pinned_ids.append(wid)
         used += len(line)
     n_jit = len(jit_all)      # pre-cap, pre-suppression candidate count
     seen = df = None
@@ -673,7 +733,8 @@ def gather(text, project=None, session=None, compare=None):
     if any(fired.values()):
         row.update({"fired": fired,
                     "bytes": {k: sum(len(l) for l in sections[k]) for k in sections},
-                    "candidates": bool(who) + len(pinned_entries) + n_jit + len(steers)})
+                    "candidates": bool(who) + len(sa) + len(pinned_entries)
+                    + n_jit + len(steers)})
     else:
         row["silent"] = True
     _ledger_append(row)
@@ -722,7 +783,8 @@ def _explain(text, project=None, session=None):
     used = 0
     cut = False
     who = _who_lines()
-    n_pin = bool(who) + len(pinned_entries)
+    sa = _sa_whisper()
+    n_pin = bool(who) + len(pinned_entries) + len(sa)
     if n_pin:
         print("pinned (%d candidate%s, budget %dB):" % (
             n_pin, "s"[:n_pin != 1], PINNED_BUDGET))
@@ -745,6 +807,12 @@ def _explain(text, project=None, session=None):
         else:
             used += len(line)
             print("  + %s ← %s" % (line, e.get("root") or "?"))
+    for line, wid in sa:  # gather's exact tail walk: each nudge fits or drops
+        if used + len(line) <= PINNED_BUDGET:
+            used += len(line)
+            print("  + %s ← %s" % (line, wid))
+        else:
+            print("  - %s (over budget) ← codex-only nudge" % wid)
     if jit_all:
         print("jit (%d hit%s, cap %d):" % (len(jit_all), "s"[:len(jit_all) != 1], JIT_CAP))
     rank = 0
@@ -771,7 +839,7 @@ def _explain(text, project=None, session=None):
             else "helm-global"
         print("  + %s [%s] ← %s: %s" % (e["id"], e.get("signal") or "prompt",
                                         origin, e["steer"]))
-    if not (wd or who or pinned_entries or jit_all or fired_reflex):
+    if not (wd or who or sa or pinned_entries or jit_all or fired_reflex):
         print("silent turn — nothing fires (salience law)")
     cb = _active_compare()  # read-only status; nothing is queried in a dry look
     if cb is not None:

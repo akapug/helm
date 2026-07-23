@@ -185,6 +185,7 @@ VERBS = {
     "human": _lazy("human", "cmd_human"),
     "premise": _lazy("premise", "cmd_premise"),
     "asks": _lazy("ownerasks", "cmd_asks"),
+    "dispatch": _lazy("dispatches", "cmd_dispatch"),
     "coach": _lazy("coach", "cmd_coach"),
     "premise-check": _lazy("premise", "cmd_premise_check"),
     "seat": _lazy("seat", "cmd_seat"),
@@ -211,6 +212,7 @@ VERBS = {
     "mcp": _lazy("envtidy", "cmd_mcp"),
     "worktree": _lazy("envtidy", "cmd_worktree"),
     "tidy": _lazy("envtidy", "cmd_tidy"),
+    "rearm": _lazy("rearm", "cmd_rearm"),
 }
 
 # Verbs whose handlers read NO arguments at all: nothing below main() will
@@ -248,12 +250,14 @@ _VERB_HELP = {
     "configs": "configs [list|show|cascade <cwd>] — every config across every home, read-only",
     "hooks": "hooks [install [--dry]|status|sync [--apply]] — self-wire the per-turn inject hook into every claude home; sync reconciles every home to the NAMED canonical hook set (dry-run default)",
     "cell": "cell join|send|recv|heartbeat|roster|status — the a2a substrate, helm-named",
-    "chat": "chat post|read [--since N|--follow]|rooms|react <n> <emoji>|log-flush|node up|down|status|join|deliver|wait|seats|claim|release|claims [--room R] — the human-included groupchat (RAM room + signed dregg transport; web panel = the owner's surface) + the delivery lane (tool-boundary nudge, roster presence, advisory session-bound claims)",
+    "chat": "chat post|read [--since N|--follow]|rooms|react <n> <emoji>|log-flush|node up|down|status|join|deliver|wait|seats|seat gc [--apply]|claim|release|claims [--room R] — the human-included groupchat (RAM room + signed dregg transport; web panel = the owner's surface) + the delivery lane (tool-boundary nudge, roster presence, advisory session-bound claims)",
     "multiplayer": "multiplayer publish|read|presence|peers|leave — metaharness-agnostic local multiplayer: blind opaque-update relay + decoupled TTL presence",
     "launch": "launch [--seat S] [--home H] [--room R] [--no-install] [--] [claude args…] — the metaharness seam: wire hooks, seat the roster, exec claude under a stable addressable name",
     "human": "human (or helm --human) — the operator's curses TUI: chat room + status strip, posts as you",
     "premise": "premise <id> | <statement> — capture a certain truth, attested on the ledger; --supersede <old-id> <new-id> | <statement> evolves the chain (one signed linking turn)",
     "asks": "asks add <text>|done <id> <evidence>|report <id> <chat-post-id>|list [--open] [--json] — the durable OWNER-ASK ledger (agents self-add); 'done' stays OPEN until 'report' names the chat post that told the OWNER (owner-surface-is-the-bar); unreported asks ride the stop-whisper's top rung",
+    "dispatch": "dispatch send <recipient> <lane> <message...> --ref TIP [--key K]|add <recipient> <lane> --ref TIP|verdict <id> <full-reviewed-tip> <evidence>|list [--open|--overdue] [--json] — durable DISPATCH ledger, three events only. A dispatch persists before delivery; one operation sends AT MOST ONCE (a retry never re-DMs — confirm at the recipient); ambiguous delivery stays open NEEDS CONFIRMATION; only a matching exact-tip verdict closes. Historical ref-less rows read NEEDS REDISPATCH (redispatch with --ref; no bind/retarget/ack verbs exist). Unavailable storage means obligations UNKNOWN",
+
     "coach": "coach <lesson...> [--apply] [--as L] [--id ID] [--project P] [--supersede OLD] [--json] — the capture front door with the 4-step GATE (reframe->place->search-first->simplify); propose-only unless --apply (low-confidence -> drain intake, lossless)",
     "premise-check": "premise-check <id> [--chain] — verify digest + quote the finality tier; --chain walks the supersession chain (attested biography)",
     "seat": "seat add|up|down|launch|spawn|where|resume|smoke|autocompact|list|status — multimodel seats (codex family via local proxy); spawn <seat> = harness-agnostic SELF-ONBOARDING spawn (reaps a stale same-name seat; orca/herdr pane + onboarding injection, or detached HEADLESS with the onboarding as boot first-prompt when no metaharness; --print dry-runs the exact calls); where <seat> resolves the spawn register (harness/handle/pid/worktree/room/liveness); launch/smoke --multi = mixed-model fleet (no subagent pin, per-agent frontmatter routes, conductor-log-verified fan-out); resume <seat> relaunches the pane via the detected metaharness (orca/herdr), freshest launch.sh + claude --resume/--continue; autocompact = proxy-seat context watchdog (inject /compact at ~90% before the 100% hang)",
@@ -280,6 +284,7 @@ _VERB_HELP = {
     "mcp": "mcp sync [--apply] — reconcile canonical MCP servers into every home (dry-run default; additive + fail-closed; backup-first, superset-refusal)",
     "worktree": "worktree gc [--apply] — prune orphan worktree-* branches + landed worktrees (dry-run default; rescue-dirty-first, locked/occupied-immune, unmerged-blocked; composes `helm work gc` for lane rooms)",
     "tidy": "tidy [--apply] — the umbrella: census + hooks sync + mcp sync + worktree gc, all dry-run; one consolidated report (--apply runs them all backup-first)",
+    "rearm": "rearm [--apply] [--json] — land-to-live: report (dry-run default) which long-lived processes still hold pre-HEAD code (helm chat wait waiters, the web unit, advisory proxies/daemons); --apply announces (ambient), SIGTERMs ONLY the stale waiters so each owner re-arms on new code at its own turn boundary (the OWNED beacon-cycle), and restarts a stale web unit — proxies/daemons/seats never signaled",
 }
 
 

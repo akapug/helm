@@ -35,6 +35,10 @@ class TestWebChat(unittest.TestCase):
         os.environ["HELM_HOME"] = os.path.join(cls.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(cls.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""  # transport off — hermetic v1
+        # cwd hermeticity: the CLI default room derives from a git cwd
+        # (seats.resolve_homing) — run from tmp so defaults stay 'main'
+        cls.cwd_prior = os.getcwd()
+        os.chdir(cls.tmp)
         cls.srv = web.make_server(0)  # ephemeral port
         cls.port = cls.srv.server_address[1]
         cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
@@ -45,6 +49,7 @@ class TestWebChat(unittest.TestCase):
         cls.srv.shutdown()
         cls.srv.server_close()
         cls.thread.join(timeout=5)
+        os.chdir(cls.cwd_prior)
         for k, v in cls.env_prior.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -226,20 +231,54 @@ class TestWebChat(unittest.TestCase):
         self.assertEqual(d["msg"]["reply_to"], "beef99")
         self.assertNotIn("rts", d["msg"])
 
-    def test_a_reply_never_changes_who_the_row_wakes(self):
-        """The beacon law, asserted at the ENDPOINT: the row the web writes
-        decides identically with and without its parent pointer."""
+    def test_a_web_reply_wakes_the_parent_rows_author(self):
+        """The beacon law, asserted at the ENDPOINT (inverted 2026-07-22 —
+        replying replaces typing the @mention): the reply row the web writes
+        carries the parent's identity and wakes EXACTLY the parent's author —
+        the text alone would have woken nobody, and a bystander seat decides
+        identically with and without the pointer."""
         from helm import seats
         seats.write_roster("codex", session="s-codex")
-        self.req("/api/chat", {"text": "seed"})
+        seats.write_roster("kimi", session="s-kimi")
+        self.req("/api/chat", {"text": "seed", "name": "codex"})
         p = self.req("/api/chat?since=0")[1]["lines"][0]
         self.req("/api/chat", {"text": "no mention here", "reply_to": p["id"]})
         row = self.req("/api/chat?since=0")[1]["lines"][1]
         plain = {k: v for k, v in row.items()
                  if k not in ("reply_to", "rts", "rfrom")}
-        self.assertFalse(seats.deliverable(row, "codex", "main"))
-        self.assertEqual(seats.deliverable(row, "codex", "main"),
-                         seats.deliverable(plain, "codex", "main"))
+        self.assertTrue(seats.deliverable(row, "codex", "main"))
+        self.assertFalse(seats.deliverable(plain, "codex", "main"))
+        self.assertFalse(seats.deliverable(row, "kimi", "main"))
+        self.assertEqual(seats.deliverable(row, "kimi", "main"),
+                         seats.deliverable(plain, "kimi", "main"))
+
+    def test_reply_click_seeds_the_composer_with_the_authors_at(self):
+        """The reply affordance's visible face (owner ask 2026-07-22): the
+        endpoint half threads the payload's reply_to, and the SERVED page
+        carries the seed-@ mechanism — chatSetReply feeds the parent's author
+        into chatSeedMention, which prepends "@author " to the composer and
+        refuses a duplicate. Asserted against the mechanism's own statements,
+        not a comment."""
+        # endpoint half: the payload the seeded composer sends threads
+        self.req("/api/chat", {"text": "parent", "name": "codex"})
+        p = self.req("/api/chat?since=0")[1]["lines"][0]
+        d = self.req("/api/chat", {"text": "@codex on it",
+                                   "reply_to": p["id"]})[1]
+        self.assertEqual(d["msg"]["reply_to"], p["id"])
+        # template half: GET / (served fresh, token templated) — the click
+        # handler seeds with the PARENT'S author...
+        url = "http://127.0.0.1:%d/" % self.port
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            html = resp.read().decode("utf-8")
+        self.assertIn('chatSeedMention(String(p.from || '
+                      'div.dataset.from || "").trim())', html)
+        # ...the seed is the @-prefixed author PREPENDED to the composer...
+        self.assertIn('CHAT_REPLY_SEED = "@" + author + " "', html)
+        self.assertIn("el.value = CHAT_REPLY_SEED + el.value", html)
+        # ...an already-typed @author is never doubled (the dedupe regex)...
+        self.assertIn(r'new RegExp("(^|\\s)@" + author.replace', html)
+        # ...and cancel strips only the untouched seed (removable, not sticky)
+        self.assertIn("el.value.startsWith(CHAT_REPLY_SEED)", html)
 
     def test_poll_carries_the_live_roster_for_mention_completion(self):
         from helm import seats

@@ -19,7 +19,7 @@ import re
 import socket
 import sys
 
-from . import home, homes, hooks, seats
+from . import homes, hooks, seats
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -107,12 +107,17 @@ def cmd_launch(args):
             return 1
         home_path = targets[0][1]
         home_note(home_path, opts["home"])
-    seat = opts["seat"] or os.environ.get("HELM_CHAT_NAME") or stable_seat()
-    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
-    room = opts["room"] or env_room or seats.derive_home_room(os.getcwd())
-    room_source = ("derived" if room and opts["room"] is None
-                   and (not env_room or env_source == "derived") else None)
-    room_explicit = opts["room"] is not None or bool(env_room and not room_source)
+    # seats.resolve_homing is THE one precedence (CLI --room > env seam >
+    # project derivation) — launch never re-derives its own copy. safe_cwd:
+    # a deleted process cwd must not crash the launch seam (eager-getcwd
+    # class), it just launches un-homed — hoisted above the seat default
+    # because stable_seat() derives from cwd too.
+    cwd = seats.safe_cwd()
+    seat = (opts["seat"] or os.environ.get("HELM_CHAT_NAME")
+            or stable_seat(cwd or "here"))
+    room, source = seats.resolve_homing(opts["room"], cwd)
+    room_source = "derived" if source == "derived" else None
+    room_explicit = source == "explicit"
     if opts["install"]:
         for name, path in ([(opts["home"], home_path)] if home_path
                            else hooks.claude_homes()):
@@ -120,7 +125,7 @@ def cmd_launch(args):
             if action == "fail":
                 print("helm launch: hook install failed in %s: %s"
                       % (name, detail), file=sys.stderr)
-    seats.join(cwd=os.getcwd(), seat=seat, room=room or "main",
+    seats.join(cwd=cwd, seat=seat, room=room or "main",
                room_explicit=room_explicit, room_source=room_source)
     env = build_env(os.environ, seat, home_path, room, room_source)
     print("[helm launch] seat '%s'%s — exec claude" % (

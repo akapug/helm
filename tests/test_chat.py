@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -36,8 +37,14 @@ class ChatBase(unittest.TestCase):
         # SET-BUT-EMPTY disables the signed transport — v1 behavior, hermetic
         # even when a real room node is live on this machine
         os.environ["HELM_CHAT_NODE_URL"] = ""
+        # cwd hermeticity: the default room resolves through seats.
+        # resolve_homing, which derives a project room from a git cwd — run
+        # from tmp (not the helm checkout) so defaults stay 'main'
+        self.cwd_prior = os.getcwd()
+        os.chdir(self.tmp)
 
     def tearDown(self):
+        os.chdir(self.cwd_prior)
         for k, v in self.env_prior.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -184,6 +191,33 @@ class CmdTest(ChatBase):
         rc, out, _ = self.run_cmd(["read", "--room", "ops"])
         self.assertIn("sidebar", out)
 
+    def test_default_io_consumes_the_one_homing_resolver(self):
+        """The roster-scatter hole codex probed: the SessionStart join homed
+        the seat to its project room (seats.resolve_homing, cwd-derived), but
+        a no---room `helm chat post` privately defaulted to env-or-'main' and
+        wrote ZERO rows to that home. Default chat I/O now consumes the SAME
+        resolver: post and read land in the derived project room; --room
+        still wins; a project-less cwd (the base-class chdir) keeps main."""
+        import subprocess
+        from helm import seats
+        repo = os.path.join(self.tmp, "proj-a")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True,
+                       capture_output=True)
+        home_room = seats.derive_home_room(repo)
+        self.assertIsNotNone(home_room)         # the join's answer, one truth
+        os.chdir(repo)
+        rc, out, _ = self.run_cmd(["post", "to", "my", "home"])
+        self.assertEqual(rc, 0)
+        self.assertIn("[%s]" % home_room, out)
+        self.assertEqual(chat.read("main"), ([], 0))    # zero rows to main
+        self.assertEqual(chat.read(home_room)[1], 1)    # the home room got it
+        rc, out, _ = self.run_cmd(["read"])             # default read: home too
+        self.assertIn("to my home", out)
+        self.assertEqual(
+            self.run_cmd(["post", "aside", "--room", "main"])[0], 0)
+        self.assertEqual(chat.read("main")[1], 1)       # --room still beats
+
     def test_env_room_homes_the_default(self):
         """Team-room homing (slice 3): HELM_CHAT_ROOM re-homes every no---room
         verb — exactly what the hooks call — while an explicit --room still
@@ -292,16 +326,21 @@ class PostUnknownFlagTest(ChatBase):
         self.assertEqual(self._rows(), [])
 
     def test_single_dash_flags_are_refused_too(self):
-        # xrev: startswith("--") left `-h` and `-x` broadcasting
-        for flag in ("-h", "-x"):
-            rc, _ = self._post(flag)
-            self.assertEqual(rc, 2, flag)
+        # xrev: startswith("--") left `-x` broadcasting (-h is now a help
+        # ask, answered rc 0 by the dispatcher gate — see HelpBeforeWorkTest)
+        rc, _ = self._post("-x")
+        self.assertEqual(rc, 2)
         self.assertEqual(self._rows(), [])
 
     def test_help_gets_usage_not_a_broadcast(self):
-        rc, err = self._post("--help")
-        self.assertEqual(rc, 2)
-        self.assertIn("usage:", err)
+        # upgraded from refusal (rc 2) to an ANSWER (rc 0, usage on stdout)
+        # by the dispatcher help gate; still never a broadcast
+        for flag in ("--help", "-h"):
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                rc = chat.cmd_chat(["post", flag])
+            self.assertEqual(rc, 0, flag)
+            self.assertIn("usage:", out.getvalue())
         self.assertEqual(self._rows(), [])
 
     def test_prose_about_flags_is_sendable(self):
@@ -330,6 +369,239 @@ class PostUnknownFlagTest(ChatBase):
         rc, _ = self._post("--seat", "tester", "an ordinary message")
         self.assertEqual(rc, 0)
         self.assertEqual(len(self._rows()), 1)
+
+
+class DeletedCwdTest(ChatBase):
+    """A session whose process cwd was DELETED (a pruned lane worktree — a
+    ROUTINE lifecycle state here) must keep chatting. The homing prologue's
+    eager os.getcwd() crashed every default chat verb AND all three delivery
+    hooks BEFORE their fail-open guards could catch it (fable composition
+    HIGH @ 8313d9f; main handled this, the lane regressed it). seats.safe_cwd
+    fails open to None -> un-homed -> #main; the session lives."""
+
+    def _delete_cwd(self):
+        d = tempfile.mkdtemp(dir=self.tmp)
+        os.chdir(d)
+        os.rmdir(d)
+        self.assertRaises(OSError, os.getcwd)   # the probe's precondition
+
+    def _hook(self, args, payload=b"{}"):
+        """chat.cmd_chat with hook-JSON stdin + FD-1 capture (the hook emit
+        writes fd 1 directly — invisible to redirect_stdout)."""
+        import types
+        fake = types.SimpleNamespace(buffer=io.BytesIO(payload))
+        r, w = os.pipe()
+        saved = os.dup(1)
+        os.dup2(w, 1)
+        os.close(w)
+        try:
+            with mock.patch.object(sys, "stdin", fake), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = chat.cmd_chat(list(args))
+            sys.stdout.flush()
+        finally:
+            os.dup2(saved, 1)
+            os.close(saved)
+        chunks = []
+        while True:
+            b = os.read(r, 65536)
+            if not b:
+                break
+            chunks.append(b)
+        os.close(r)
+        return rc, b"".join(chunks).decode("utf-8")
+
+    def test_default_chat_io_survives_a_deleted_cwd(self):
+        self._delete_cwd()
+        rc, _, err = self.run_cmd(["post", "still", "alive"])
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.run_cmd(["read"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("still alive", out)
+
+    def test_all_three_delivery_hooks_survive_a_deleted_cwd(self):
+        payload = json.dumps({"session_id": "s-del-cwd"}).encode("utf-8")
+        self._delete_cwd()
+        rc, out = self._hook(["join", "--hook-json"], payload)
+        self.assertEqual(rc, 0)
+        # the join RAN and emitted its identity line — a crash swallowed by
+        # a fail-open guard would also rc 0, but emit nothing
+        self.assertIn("SessionStart", out)
+        rc, _ = self._hook(["deliver", "--hook-json"], payload)
+        self.assertEqual(rc, 0)
+        rc, _ = self._hook(["stop-guard", "--hook-json"], payload)
+        self.assertEqual(rc, 0)
+
+    def test_seat_add_homing_resolves_from_a_deleted_cwd(self):
+        """The same eager-getcwd class at seat.py's _resolve_homing: `helm
+        seat add --room X` from a deleted cwd must resolve, not crash."""
+        from helm import seat as seat_mod
+        from helm import seats
+        self._delete_cwd()
+        self.assertIsNone(seats.safe_cwd())
+        self.assertEqual(seat_mod._resolve_homing("ops"), ("ops", None))
+        self.assertEqual(seat_mod._resolve_homing(None), (None, None))
+
+class HelpBeforeWorkTest(ChatBase):
+    """--help is answered at the dispatcher, BEFORE any verb runs (the
+    block-before-help class, live-probed 2026-07-22): `wait --help` entered
+    the wait loop and blocked forever — the mandatory-first-action verb every
+    new seat probes — and join/deliver/claim/log-flush DID WORK under --help
+    (`claim --help` leased a resource named "--help"). The seats/node/meld
+    legs are patched to raise, so a regression fails FAST instead of hanging
+    the suite."""
+
+    def _no_dispatch(self, args):
+        """cmd_chat(args) with every downstream leg booby-trapped: reaching
+        one means the help gate did not fire. chat._follow is trapped too —
+        the read --follow leg dispatches inline in cmd_chat, and without the
+        trap a gate regression HANGS the suite instead of failing fast."""
+        from helm import seats, chatnode, meld
+        boom = mock.Mock(side_effect=AssertionError(
+            "dispatched past the --help gate"))
+        with mock.patch.object(seats, "cmd", boom), \
+                mock.patch.object(chatnode, "cmd_node", boom), \
+                mock.patch.object(meld, "cmd", boom), \
+                mock.patch.object(chat, "_follow", boom):
+            return self.run_cmd(args)
+
+    def test_wait_help_answers_before_the_loop(self):
+        # THE bug: rc 124/143, zero output, harness timeout. Pin: rc 0 +
+        # usage naming every flag's semantics, loop never entered.
+        for argv in (["wait", "--help"], ["wait", "-h"],
+                     ["wait", "--seat", "s", "--help"]):
+            rc, out, err = self._no_dispatch(argv)
+            self.assertEqual(rc, 0, argv)
+            for token in ("--seat", "--room", "--follow", "--timeout",
+                          "--any", "timeout"):
+                self.assertIn(token, out, argv)
+            self.assertEqual(err, "")
+
+    def test_every_seat_verb_answers_help_without_running(self):
+        for verb in ("join", "deliver", "stop-guard", "seats", "seat", "dm",
+                     "claim", "release", "claims"):
+            rc, out, _ = self._no_dispatch([verb, "--help"])
+            self.assertEqual(rc, 0, verb)
+            self.assertIn("usage: helm chat %s" % verb, out)
+
+    def test_node_and_meld_answer_help_without_dispatch(self):
+        for verb in ("node", "meld"):
+            rc, out, _ = self._no_dispatch([verb, "--help"])
+            self.assertEqual(rc, 0, verb)
+            self.assertIn("usage: helm chat %s" % verb, out)
+
+    def test_read_follow_help_returns(self):
+        # read --follow --help blocked forever too (same class, chat-local);
+        # _no_dispatch traps _follow so a regression fails, never hangs
+        rc, out, _ = self._no_dispatch(["read", "--follow", "--help"])
+        self.assertEqual(rc, 0)
+        self.assertIn("usage: helm chat read", out)
+
+    def test_verdict_and_reveal_answer_help_with_the_deferral(self):
+        # the only dispatchable chat verbs deferred to 0.3: --help answers
+        # honestly (rc 0 + the deferral) instead of the verb's bare rc 2
+        for verb in ("verdict", "reveal"):
+            rc, out, _ = self._no_dispatch([verb, "--help"])
+            self.assertEqual(rc, 0, verb)
+            self.assertIn("usage: helm chat %s" % verb, out)
+            self.assertIn("0.3", out)
+
+    def test_room_flag_refuses_a_flag_shaped_value(self):
+        # THE residual: the --room pop ran BEFORE the help gate and consumed
+        # '--help' as the room name — `wait --room --help` blocked forever
+        # (rc 124, zero output) and `post --room --help x` posted into a
+        # room literally named "--help". A flag-shaped value is never a
+        # room name: refuse fast, before any dispatch.
+        for argv in (["wait", "--room", "--help"],
+                     ["read", "--room", "--help", "--follow"],
+                     ["post", "--room", "--help", "hello"],
+                     ["read", "--room"]):
+            rc, _, err = self._no_dispatch(argv)
+            self.assertEqual(rc, 2, argv)
+            self.assertIn("--room wants a room name", err, argv)
+        self.assertEqual(chat.read("--help")[1], 0)   # no room "--help"
+
+    def test_seat_flag_refuses_a_flag_shaped_value(self):
+        # same class, the identity flag: `post --seat --help hi` posted AS a
+        # seat named "--help". Non-text verbs never get here — the gate's
+        # whole-tail scan answers `wait --seat --help` as help first.
+        for argv in (["post", "--seat", "--help", "hi"],
+                     ["dm", "--seat", "--help", "codex", "hi"],
+                     ["post", "--seat"]):
+            rc, _, err = self._no_dispatch(argv)
+            self.assertEqual(rc, 2, argv)
+            self.assertIn("--seat wants a seat name", err, argv)
+        self.assertEqual(chat.read()[1], 0)
+        rc, out, _ = self._no_dispatch(["wait", "--seat", "--help"])
+        self.assertEqual(rc, 0)                       # help wins at the gate
+        self.assertIn("usage: helm chat wait", out)
+
+    def test_dm_flag_refuses_a_flag_shaped_value(self):
+        rc, _, err = self._no_dispatch(["post", "--dm", "--help", "hi"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--dm wants a seat name", err)
+        self.assertEqual(chat.read()[1], 0)
+
+    def test_leading_help_with_a_body_refuses_loudly(self):
+        # the judged contract: bare leading --help = usage rc 0 (pinned in
+        # test_inert_verbs...); leading --help WITH a body = rc 2, usage on
+        # stderr, NOTHING sent — never success-code a dropped message
+        for argv in (["post", "--help", "me", "with", "this"],
+                     ["reply", "--help", "1", "still", "broken"],
+                     ["dm", "--help", "codex", "hi"]):
+            rc, out, err = self._no_dispatch(argv)
+            self.assertEqual(rc, 2, argv)
+            self.assertEqual(out, "", argv)
+            self.assertIn("usage: helm chat %s" % argv[0], err, argv)
+            self.assertIn("NOTHING was sent", err, argv)
+        self.assertEqual(chat.read()[1], 0)
+
+    def test_dashdash_sends_a_body_that_starts_with_help(self):
+        # the deliberate path the refusal points at stays open
+        rc, _, _ = self.run_cmd(["post", "--seat", "t", "--",
+                                 "--help", "me", "with", "this"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(chat.read()[0][-1]["text"], "--help me with this")
+
+    def test_help_asks_never_block_end_to_end(self):
+        # the class's live symptom was rc 124 under harness timeout: pin the
+        # never-blocks property through the real entrypoint, hard timeout
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for argv, want in ((["wait", "--help"], 0),
+                           (["wait", "--room", "--help"], 2),
+                           (["read", "--room", "--help", "--follow"], 2)):
+            p = subprocess.run(
+                [sys.executable, "-m", "helm", "chat"] + argv, cwd=root,
+                capture_output=True, text=True, timeout=15)
+            self.assertEqual(p.returncode, want, (argv, p.stderr))
+
+    def test_inert_verbs_answer_help_without_side_effects(self):
+        for verb in ("react", "rooms", "verify", "log-flush", "post",
+                     "reply"):
+            rc, out, _ = self.run_cmd([verb, "--help"])
+            self.assertEqual(rc, 0, verb)
+            self.assertIn("usage: helm chat %s" % verb, out)
+        self.assertEqual(chat.read()[1], 0)   # nothing posted, nothing leased
+
+    def test_claim_help_creates_no_lease(self):
+        rc, out, _ = self._no_dispatch(["claim", "--help"])
+        self.assertEqual(rc, 0)
+        from helm import seats
+        self.assertEqual(seats.claims_list(), [])
+
+    def test_prose_about_help_still_sends(self):
+        # free-text verbs scan only the LEADING position: a body ABOUT
+        # --help must stay sendable (post's flag-refusal scope law)
+        rc, out, _ = self.run_cmd(["post", "--seat", "t", "run", "it",
+                                   "with", "--help", "first"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(chat.read()[0][-1]["text"],
+                         "run it with --help first")
+
+    def test_roster_alias_shares_the_seats_help(self):
+        rc, out, _ = self._no_dispatch(["roster", "--help"])
+        self.assertEqual(rc, 0)
+        self.assertIn("usage: helm chat seats", out)
 
 
 if __name__ == "__main__":
