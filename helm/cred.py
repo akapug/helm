@@ -379,6 +379,33 @@ def _lineage_accounts(fam):
     return {a for a in (_email_or_none(x) for x in accts) if a}
 
 
+def _census_pair(real):
+    """(family, account_email) for a live home, read under a stat bracket over
+    BOTH credential files — or None when a concurrent write straddles the two
+    reads. The lineage census pairs a home's token FAMILY (.credentials.json)
+    with the ACCOUNT it is live under (.claude.json); read on opposite sides of
+    a /login those two files disagree — the family is still the evicted
+    account's, the identity already the arriving one's — and the union-only,
+    never-pruned accounts column would then record a (family, account) pairing
+    that never existed on disk, thereafter auto-heal-refusing the evicted
+    account's OWN legitimate snapshots as a torn pair. /login is precisely the
+    event that precedes drift, so this ms-scale window is aligned with the very
+    incident the lineage exists to auto-heal. Mirrors _capture_home's bracket:
+    a home mid-/login-write is not a trustworthy lineage input, and dropping
+    one census cycle's row is safe — the next stable census records it
+    correctly. Only a family DIGEST and an email ever leave this function;
+    no token byte does."""
+    auth = os.path.join(real, AUTH_JSON)      # the token family lives here
+    cfg = os.path.join(real, ACCOUNT_JSON)    # the identity lives here
+    for _ in range(2):
+        before = (_stat_key(auth), _stat_key(cfg))
+        fam = homes._token_family("claude", real)
+        acct = account_of(real)
+        if before == (_stat_key(auth), _stat_key(cfg)):
+            return fam, (acct["email"] if acct["ok"] else None)
+    return None
+
+
 def _snapshot_families_on_disk():
     """Every family a surviving snapshot's meta still claims — the set the
     lineage prune must never evict: the snapshot outlives any count of newer
@@ -1135,7 +1162,22 @@ def _family_elsewhere(snapshot, target, estate):
     one a borrower ever REFRESHED (rotating, i.e. consuming, the snapshot's
     copy) trips server-side reuse detection, which revokes the whole family
     and bricks the live borrower. The live-bytes compare goes blind one
-    borrower rotation later; the lineage does not."""
+    borrower rotation later; the lineage does not.
+
+    KNOWN CORNER (eviction-clean over-refusal, documented not yet closed):
+    when heal ITSELF evicts a family from a foreign home — snapshotting the
+    occupant as a pre-image, then overwriting with the named account — that
+    family is no longer live anywhere and was never REFRESHED (heal does not
+    run the credential, so nothing consumed the snapshot's copy). Yet the
+    lineage still records it "ever live" in that foreign home, so a later heal
+    of the evicted account's OWN home from its own snapshot trips the
+    live=False lineage clash and is refused as a revocation-risk. The refusal
+    is conservative-safe (a fresh login always recovers), merely stricter than
+    necessary for this one clean-eviction shape. Closing it needs an
+    evicted-clean marker distinguishing a heal-performed eviction from a
+    borrower rotation, or a fall-back to the newest non-refused snapshot;
+    deliberately deferred here to avoid weakening the revocation-bomb refusal
+    on the highest-stakes path."""
     fam = snapshot.get("family") or _snapshot_family(snapshot["path"])
     if not fam:
         return None, False
@@ -1199,8 +1241,20 @@ def heal_plan(name=None, record=False):
     plans = []
     estate = rows()
     if record:
-        _lineage_record([(r.get("family"), os.path.basename(r["real"]),
-                          r["account"]) for r in estate])
+        # Re-read each home's (family, account) under a stat bracket rather than
+        # trusting the estate row, whose family (from homes_list) and account
+        # (from a later verdict_for) were read at DIFFERENT times: a /login
+        # landing between them would file the evicted family under the arriving
+        # account. A home whose two files move mid-read is dropped this cycle
+        # (the next stable census records it) — never recorded as a torn pair.
+        seen = []
+        for r in estate:
+            pair = _census_pair(r["real"])
+            if pair is None:
+                continue
+            fam, email = pair
+            seen.append((fam, os.path.basename(r["real"]), email))
+        _lineage_record(seen)
     for r in estate:
         if r["verdict"] != "DRIFT":
             continue

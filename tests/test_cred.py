@@ -1329,6 +1329,54 @@ class LineageTest(CredBase):
         st = os.stat(cred._lineage_path() + ".lock")
         self.assertEqual(stat.S_IMODE(st.st_mode), 0o600)
 
+    def test_a_login_mid_census_never_records_a_cross_account_pairing(self):
+        """The census/login race, pinned dead. The estate census reads a home's
+        token FAMILY (.credentials.json, via homes_list) and its ACCOUNT
+        (.claude.json, via verdict_for) with a window between the two. A /login
+        completing inside that window makes the census pair the EVICTED
+        account's family with the ARRIVING account's identity — a pairing that
+        never existed on disk. Because the lineage accounts column is union-only
+        and never pruned, that phantom pairing would thereafter auto-heal-refuse
+        cto's own legitimate snapshots as torn. The stat-bracketed re-read drops
+        the mid-write home this cycle instead of recording the tear."""
+        home = self.plant("cto-example-com", "cto@example.invalid", token="FAKE-CTO")
+        cto_real = os.path.realpath(home)
+        fam_cto = hashlib.sha256(b"FAKE-CTO").hexdigest()[:10]
+        fam_david = hashlib.sha256(b"FAKE-DAVID").hexdigest()[:10]
+        orig = homes._token_family
+        fired = []
+
+        def teared(provider, h):
+            # Fire once, on the census's FIRST family read of cto's home: return
+            # cto's real (old) family, THEN let david's /login land in the same
+            # home — so the account read that follows sees david, not cto.
+            if provider == "claude" and os.path.realpath(h) == cto_real and not fired:
+                fired.append(1)
+                fam = orig(provider, h)
+                with open(os.path.join(cto_real, ".claude.json"), "w") as f:
+                    json.dump({"oauthAccount": {"emailAddress": "owner@example.invalid",
+                                                "accountUuid": "u-d",
+                                                "organizationName": "O"}}, f)
+                with open(os.path.join(cto_real, ".credentials.json"), "w") as f:
+                    json.dump({"claudeAiOauth": {
+                        "refreshToken": "FAKE-DAVID",
+                        "accessToken": "FAKE-DAVID-A",
+                        "expiresAt": int((time.time() + 3600) * 1000)}}, f)
+                cred.cache_clear()
+                return fam
+            return orig(provider, h)
+
+        with mock.patch.object(homes, "_token_family", teared):
+            cred.heal(apply=True)                 # the apply-path census (record=True)
+        self.assertTrue(fired)                    # the race was actually exercised
+        # cto's family must NOT have been filed under david — the phantom pair
+        # that would brick cto's own snapshots on every later heal.
+        self.assertNotIn("owner@example.invalid", cred._lineage_accounts(fam_cto))
+        self.assertEqual(cred._lineage_accounts(fam_cto), set())   # dropped this cycle
+        # and the true, coherent state that landed IS recorded — the census still
+        # works, it only refuses the torn read.
+        self.assertEqual(cred._lineage_accounts(fam_david), {"owner@example.invalid"})
+
 
 class TornPairTest(CredBase):
     """A backup that fires mid-/login can pair one account's freshly-landed
