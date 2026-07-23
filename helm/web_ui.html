@@ -551,6 +551,15 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .spv{color:var(--fg);font-size:var(--f1);word-break:break-word}
 .spjump{margin-top:10px;width:100%;text-align:left;font-size:var(--f1);padding:6px 10px;border-radius:7px;background:color-mix(in srgb,var(--accent) 14%,transparent);border:1px solid var(--accent);color:var(--accent);cursor:pointer}
 .spjump:hover{background:color-mix(in srgb,var(--accent) 24%,transparent)}
+/* the dregg ticker: ONE glance line under the nav on EVERY view — the owner's
+   "is the fleet signing, what landed last" pulse (owner ask 2026-07-23: "get
+   that back at the top of the UI"). Click anywhere -> the full ledger tab. */
+#dreggstrip{padding:5px 18px;border-bottom:1px solid var(--line);font-size:var(--f1);color:var(--mut);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#dreggstrip:hover{background:var(--hover)}
+#dreggstrip .dsok{color:var(--ok);font-weight:var(--w-med)}
+#dreggstrip .dsbad{color:var(--warn);font-weight:var(--w-med)}
+#dreggstrip .dsturn{color:var(--fg)}
+#dreggstrip .dslink{color:var(--accent)}
 /* ---------- roster tab: one dense Tuftian table for the whole fleet ---------- */
 table.roster{width:100%;border-collapse:collapse;font-size:var(--f2);table-layout:auto}
 table.roster th{text-align:left;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);padding:6px 9px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none;white-space:nowrap}
@@ -625,6 +634,8 @@ table.roster tr.eph td{opacity:.5;font-style:italic}
   <button class="icon" id="themetog" title="toggle light / dark">◐</button>
   <button class="icon" id="trayBtn" title="team tray — collect seats">⊞</button>
 </nav>
+
+<div id="dreggstrip" hidden title="the dregg signed-turn feed — click for the full ledger"></div>
 
 <div class="wrap">
 
@@ -3781,6 +3792,47 @@ function initLedger() {
   pollLedger();
 }
 
+/* ---------- dregg ticker: the signed-turn pulse on every view ----------
+   Owner ask 2026-07-23 ("get that back at the top of the UI"): the dregg
+   signing / cave-turn activity, prominent + global. Reuses /api/ledger (the
+   ledger tab's own read); its OWN slow timer (8s — a pulse, not a poll storm)
+   and a DECISION-keyed dedup: the strip re-renders only when the signing MODE
+   or the NEWEST TURN changes, never on cosmetic churn. Fail-quiet: an errored
+   poll keeps the last strip. Click anywhere -> the full ledger tab. */
+let DREGG_POLLING = false, DREGG_SIG = "";
+async function pollDregg() {
+  if (document.hidden || DREGG_POLLING) return;
+  DREGG_POLLING = true;
+  try {
+    let d;
+    try { d = await j("/api/ledger"); } catch (e) { return; } // keep the last strip
+    const el = $("#dreggstrip");
+    if (!el) return;
+    const tp = d.transport, t = (d.turns || [])[0];
+    const sig = ((tp && tp.mode) || "?") + ":" + ((t && t.turn_hash) || "") + ":" + (d.offline ? "off" : "on");
+    if (sig === DREGG_SIG) return;
+    DREGG_SIG = sig;
+    el.hidden = false;
+    const turnBit = !t ? "" :
+      ' <span class="dsturn">#' + (t.chain_index ?? "?") +
+      (t.about && t.about.kind === "chat"
+        ? " chat by " + esc(t.about.from || "?") + (t.about.text ? " · “" + esc(String(t.about.text).slice(0, 60)) + "”" : "")
+        : t.about ? " attest " + esc(t.about.id || "") : "") +
+      (t.executor_signed ? ' · exec-signed' : '') + '</span> · ' + esc(lago(t.timestamp));
+    el.innerHTML = d.offline
+      ? '⛓ <span class="dsbad">node unreachable</span> — retrying quietly · <span class="dslink">ledger →</span>'
+      : tp && tp.mode === "signed"
+        ? '⛓ <span class="dsok">signing live</span> ·' + turnBit + ' · <span class="dslink">ledger →</span>'
+        : '⛓ <span class="dsbad">signing ' + esc((tp && (tp.label || tp.mode)) || "?") + '</span>' +
+          // the glance strip carries the CAUSE, not the raw signer transcript:
+          // take the tail after the last "error:" and clamp — the full reason
+          // lives one click away in the ledger tab (attention budget)
+          (tp && tp.reason ? ' · ' + esc(String(tp.reason).split("error:").pop().trim().slice(0, 90)) : '') +
+          (turnBit ? ' · last' + turnBit : '') +
+          ' · <span class="dslink">ledger →</span>';
+  } finally { DREGG_POLLING = false; }
+}
+
 /* ================= boot ================= */
 {
   const v = location.hash.slice(1);
@@ -3795,5 +3847,9 @@ function initLedger() {
   }
   const o = new URLSearchParams(location.search).get("open");
   if (o) { showView("sessions"); openSession(o); }
+  const strip = $("#dreggstrip");
+  if (strip) strip.onclick = () => showView("ledger");
+  setInterval(pollDregg, 8000);
+  pollDregg();
 }
 </script>
