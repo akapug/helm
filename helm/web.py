@@ -1024,17 +1024,45 @@ def _seat_ephemeral(s):
         s.get("seat"), s.get("home_room"), s.get("cwd"))
 
 
+# roster_report is the ONE heavy read on the poll path (~2.4s at 200 seats: it
+# walks pending per seat). Uncached, N clients x 2s polls ran N CONCURRENT
+# 2.4s computes on the threaded server -> CPU pegged -> 25s responses ->
+# BrokenPipeError -> the owner's UI went blank (live incident 2026-07-23).
+# Single-flight TTL cache: ONE compute per freshness window; every other
+# poller is served from memory (decision-spirit #22 — memory is the
+# coordination read-path; the recompute is the write-behind). The TTL sits
+# just past the 2s poll cadence so each window recomputes at most once, and
+# the ephemeral tag is baked in so the cached rep is fully publish-ready.
+_ROSTER_REP_CACHE = {}          # room -> (computed_at, rep)
+_ROSTER_REP_TTL = 2.5
+_ROSTER_REP_LOCK = threading.Lock()
+
+
+def _roster_cached(room):
+    hit = _ROSTER_REP_CACHE.get(room)
+    if hit and time.time() - hit[0] < _ROSTER_REP_TTL:
+        return hit[1]
+    with _ROSTER_REP_LOCK:
+        hit = _ROSTER_REP_CACHE.get(room)   # re-check under the lock: the
+        if hit and time.time() - hit[0] < _ROSTER_REP_TTL:  # single-flight gate
+            return hit[1]
+        from . import seats
+        rep = seats.roster_report(room)
+        for s in rep.get("seats", []):
+            s["ephemeral"] = _seat_ephemeral(s)
+        _ROSTER_REP_CACHE[room] = (time.time(), rep)
+        return rep
+
+
 def _api_chat_roster(qs):
     """The seats panel's read: roster presence + per-seat pending deliveries
     + live claims (seats.py — the meld-half's M3 parity surface). Read-only,
     fail-open: any surprise answers empty, never a 500. Each seat is tagged
-    `ephemeral` so the live picker can hide done review-SAs (kept queryable)."""
+    `ephemeral` so the live picker can hide done review-SAs (kept queryable).
+    Served from the single-flight roster cache — poll fan-in never stacks
+    concurrent heavy computes again."""
     try:
-        from . import seats
-        rep = seats.roster_report(_q1(qs, "room", "main"))
-        for s in rep.get("seats", []):
-            s["ephemeral"] = _seat_ephemeral(s)
-        return rep, 200
+        return _roster_cached(_q1(qs, "room", "main")), 200
     except Exception:
         return {"seats": [], "claims": [], "unavailable": True}, 200
 
@@ -1086,8 +1114,9 @@ def _api_roster_git(qs):
     the 60s cache + the tab's 60s poll keep git off the 2s presence hot path."""
     now = time.time()
     try:
-        from . import seats
-        rows = seats.roster_report(_q1(qs, "room", "main")).get("seats", [])
+        # rides the same single-flight roster cache as the panel read — this
+        # endpoint no longer triggers its own heavy roster_report walk.
+        rows = _roster_cached(_q1(qs, "room", "main")).get("seats", [])
     except Exception:
         rows = []
     seen, out = set(), {}
