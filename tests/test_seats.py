@@ -2433,6 +2433,20 @@ class RosterReportTest(SeatsBase):
         # the report never moves the cursor — both rows still deliver
         self.assertIn("one", seats.deliver(seat="alice"))
 
+    def test_presence_report_carries_the_shared_ephemeral_tag(self):
+        # ONE criterion for every surface that hides review-SAs (the web picker
+        # + the fleet-presence 'online' list, owner feature 2026-07-23):
+        # agent-<hex> + no home + /tmp -> ephemeral; a real seat never is.
+        self.assertTrue(seats._is_ephemeral_sa("agent-047d53ef", None, "/tmp/x"))
+        self.assertFalse(seats._is_ephemeral_sa("console-design", None, "/tmp/x"))
+        self.assertFalse(seats._is_ephemeral_sa("agent-047d53ef", "main", "/tmp/x"))
+        self.assertFalse(seats._is_ephemeral_sa("agent-047d53ef", None, "/home/p"))
+        self.assertFalse(seats._is_ephemeral_sa(None, None, None))  # fail-safe
+        seats.join(seat="realseat", cwd="/home/p/proj", session="s-r")
+        row = next(s for s in seats.presence_report() if s["seat"] == "realseat")
+        self.assertIn("ephemeral", row)   # the 'online' list can drop SAs
+        self.assertFalse(row["ephemeral"])
+
     def test_presence_tiers_from_seen_file(self):
         seats.write_roster("old-seat")
         old = time.time() - 1000        # absent (>QUIET_S) but under REAP_S

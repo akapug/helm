@@ -1012,19 +1012,15 @@ def _api_chat_dm(payload):
 
 
 def _seat_ephemeral(s):
-    """An EPHEMERAL review-subagent: auto-named `agent-<hex>`, no home room, a
-    /tmp cwd — a transient fan-out SA (tonight's fable/ds4pro/opus review SAs),
-    not a conversational seat you would ever message. Tagged so the live
-    'message a seat' picker can hide it while it stays QUERYABLE elsewhere
-    (owner steer 2026-07-23: declutter the picker, do not delete). Fail-safe:
-    any surprise reads False (a real seat is never mis-hidden)."""
-    try:
-        name = str(s.get("seat") or "")
-        rest = name[6:] if name.startswith("agent-") else ""
-        auto = bool(rest) and all(c in "0123456789abcdef" for c in rest)
-        return auto and not s.get("home_room") and "/tmp" in str(s.get("cwd") or "")
-    except Exception:
-        return False
+    """An EPHEMERAL review-subagent (auto-named agent-<hex>, no home room, /tmp
+    cwd) — a transient fan-out SA, not a conversational seat you would message.
+    Tagged so the live 'message a seat' picker can hide it while it stays
+    QUERYABLE elsewhere (owner steer 2026-07-23: declutter, do not delete).
+    Delegates to seats._is_ephemeral_sa — ONE criterion for every surface that
+    hides them (picker + the fleet-presence 'online' list)."""
+    from . import seats
+    return seats._is_ephemeral_sa(
+        s.get("seat"), s.get("home_room"), s.get("cwd"))
 
 
 def _api_chat_roster(qs):
