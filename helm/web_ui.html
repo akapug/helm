@@ -2813,7 +2813,12 @@ function chatRooms(rooms) {
 function chatPresence(list) {
   const bar = $("#chatpresence");
   if (!bar) return;
-  const rows = Array.isArray(list) ? list.filter(s => s && s.seat) : [];
+  // "Online Friends" (owner feature 2026-07-23): the bar shows who is ACTUALLY
+  // ON right now — ACTIVE (🟢 <2m) + IDLE (🟡 <15m) real agents only. Drop the
+  // absent (⚫ gone) rows and the ephemeral review-SAs (agent-<hex>, done), so
+  // a glance answers "who's here" instead of scrolling the whole roster.
+  const rows = (Array.isArray(list) ? list : [])
+    .filter(s => s && s.seat && s.presence !== "absent" && !s.ephemeral);
   bar.hidden = !rows.length;
   if (!rows.length) { bar.innerHTML = ""; return; }
   bar.innerHTML = rows.map(s => {

@@ -2499,11 +2499,28 @@ def _claims_by_holder(cl=None):
     return by
 
 
+def _is_ephemeral_sa(name, home_room, cwd):
+    """An EPHEMERAL review-subagent: auto-named agent-<hex>, no home room, a
+    /tmp cwd — a transient fan-out SA (a review/scan SA), not a conversational
+    seat. The ONE criterion every surface that hides them shares (the web
+    'message a seat' picker AND the fleet-presence 'online' list). Fail-safe:
+    any surprise reads False, so a real seat is never mis-hidden."""
+    try:
+        n = str(name or "")
+        rest = n[6:] if n.startswith("agent-") else ""
+        auto = bool(rest) and all(c in "0123456789abcdef" for c in rest)
+        return auto and not home_room and "/tmp" in str(cwd or "")
+    except Exception:
+        return False
+
+
 def presence_report():
     """The fleet-wide glance bar: one LIGHT row per roster seat — presence
     dot + the one status line — with zero cursor scans (roster_report walks
-    pending; this must stay cheap enough to ride every ~2s web poll).
-    [{seat, presence, dot, last_seen, status, line, source}], fresh first."""
+    pending; this must stay cheap enough to ride every ~2s web poll). Each row
+    carries `ephemeral` so the 'online' list can drop done review-SAs.
+    [{seat, presence, dot, last_seen, status, line, source, ephemeral}],
+    fresh first."""
     try:
         by = _claims_by_holder()
     except Exception:
@@ -2525,7 +2542,9 @@ def presence_report():
                         "last_seen": ls, "status": row.get("status"),
                         "status_age": _status_age(row),
                         "status_by": _status_by(row),
-                        "line": line, "source": source}))
+                        "line": line, "source": source,
+                        "ephemeral": _is_ephemeral_sa(
+                            seat, row.get("home_room"), row.get("cwd"))}))
         except Exception:   # per-row fail-open: one junk roster row renders
             out.append(_pub_row({    # '?', it never blanks the whole fleet bar
                 "seat": seat, "presence": "absent",
