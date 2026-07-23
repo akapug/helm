@@ -278,19 +278,20 @@ class NewAgentGuideTest(unittest.TestCase):
             [sys.executable, HELM, "chat", "read", "--room", "main",
              "--since", "0"], cwd=proj, capture_output=True, text=True,
             timeout=60)
-        self.assertIn(
+        self.assertNotIn(
             token, in_main.stdout,
-            "bare post from a project cwd no longer lands in `main` — if "
-            "lane/homing-as-prevented just merged this is the CANARY: flip "
-            "guide section 2 and this pin together (see comment above)")
+            "bare post from a project cwd landed in `main` — the homing "
+            "default regressed (resolve_homing no longer owns the bare-post "
+            "room); guide section 2 and this pin flip together")
         in_derived = subprocess.run(
             [sys.executable, HELM, "chat", "read", "--room", "canary-proj",
              "--since", "0"], cwd=proj, capture_output=True, text=True,
             timeout=60)
-        self.assertNotIn(
+        self.assertIn(
             token, in_derived.stdout,
-            "bare post reached the derived home room — homing landed; flip "
-            "guide section 2 and this pin together (see comment above)")
+            "bare post missed the derived home room — homing landed and the "
+            "default must resolve there; guide section 2 and this pin flip "
+            "together")
 
     def test_canary_launch_line_shared_port_and_inline_token(self):
         # ============================ MERGE-TIME CANARY =====================

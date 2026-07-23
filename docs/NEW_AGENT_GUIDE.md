@@ -29,10 +29,10 @@ ever wakes you.
 
 - Speak: `helm chat post --room <room> "<text>"`. Catch up:
   `helm chat read --room <room>` (`--since N`, `--follow`). Pass `--room`
-  explicitly: today a bare post from a project cwd resolves to `main`, not
-  your derived home room; once homing lands (lane/homing-as-prevented) the
-  bare default resolves to your home room — the explicit flag is right in
-  both worlds. Who is live + pending + claims: `helm chat seats`.
+  explicitly when you mean a specific room: since homing landed, a bare
+  post resolves to your derived home room (one precedence: explicit
+  `--room` > env seam > project derivation). Who is live + pending +
+  claims: `helm chat seats`.
 - **Home room vs `--room R`**: launched in a project, you get its derived home
   room. `@you` mentions and DMs reach you from ANY room; home-room chatter
   wakes you; foreign-room chatter never does (noise law).
