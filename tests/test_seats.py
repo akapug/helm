@@ -550,6 +550,46 @@ class WaitTest(SeatsBase):
         # still WAKES the agent and points it at the backlog to catch up
         self.assertTrue(any("more pending" in c for c in captured))
 
+    def test_wait_any_follow_bounds_a_burst_and_streams_the_residue(self):
+        """The --any --follow watcher is the SAME firehose class as the seat
+        drain: >BEACON_DRAIN_CAP new rows in one poll must NOT emit as one
+        Monitor burst (auto-stop -> SIGTERM -> deaf). Each pass emits <=CAP + one
+        nudge and advances the watermark only PAST what it emitted, so the residue
+        streams the NEXT poll — never a since=total skip that drops rows."""
+        class _PassDone(Exception):
+            pass
+        cap = seats.BEACON_DRAIN_CAP
+        n = cap * 2 + 1                         # two full over-cap passes + a tail
+        rows = [{"id": "r%d" % i, "from": "bob", "text": "burst %d" % i}
+                for i in range(n)]
+        reads = {"n": 0}
+        loop_since = []
+        def fake_read(room="main", since=0):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return [], 0                   # the arm baseline -> since=0
+            loop_since.append(since)           # every loop read's watermark
+            return rows[since:], len(rows)
+        sleeps = {"n": 0}
+        def fake_sleep(*_a):
+            sleeps["n"] += 1
+            if sleeps["n"] >= 2:               # stop after exactly two poll passes
+                raise _PassDone
+        emitted = []
+        with mock.patch.object(seats.chat, "read", side_effect=fake_read):
+            with mock.patch("time.sleep", side_effect=fake_sleep):
+                with self.assertRaises(_PassDone):
+                    seats.wait(any_row=True, follow=True, poll=0.01,
+                               emit=emitted.append)
+        # residue preserved: pass 2 read from the ADVANCED watermark (cap), never
+        # from total — a since=total skip would have dropped rows[cap:] silently.
+        self.assertEqual(loop_since, [0, cap])
+        content = [c for c in emitted if "more pending" not in c]
+        nudges = [c for c in emitted if "more pending" in c]
+        self.assertEqual(len(nudges), 2)               # both passes were over-cap
+        self.assertEqual(len(content), 2 * cap)        # cap per pass, none dropped
+        self.assertLess(len(content), n)               # never the whole burst
+
     def test_wait_any_sees_only_rows_after_arming(self):
         import threading
         chat.post("pre-existing", who="bob")
