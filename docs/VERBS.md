@@ -103,12 +103,19 @@ helm store list [--type T] [--all] [--candidates]
 helm store get <id>                        one entry, full record
 helm store resolve <text>                  JIT lookup — what fires for this prompt
                                            (or pipe the prompt on stdin)
+helm store xrev-clear <id> --by <who> [--type T]
+                                           candidate -> PROVISIONAL: a cross-family
+                                           /x review cleared it (the reviewer
+                                           attests; the verb never runs the review).
+                                           Provisional FIRES with a [provisional]
+                                           tag, awaiting owner ratify
 helm store confirm <id> [--type T] [--edit <stmt...>]
-                                           promote a candidate -> live
-helm store reject <id> [--type T] [why...] reject a candidate — retired in
-                                           place (file kept as the record)
-                                           (--type on either: disambiguate a
-                                           slug shared across candidate types)
+                                           owner ratify -> live (candidate OR
+                                           provisional)
+helm store reject <id> [--type T] [why...] reject a candidate/provisional —
+                                           retired in place (file kept as record)
+                                           (--type on any: disambiguate a slug
+                                           shared across reviewable types)
 helm store pinned [--stats]                the always-on lane (--stats: budget
                                            walk + ledger made-it/starved counts)
 helm store add <type> <id> | <statement> [| ...]
@@ -160,19 +167,39 @@ as a prior belief instead). A candidate is a *non-live* status, so the
 resolver's live-filter already EXCLUDES it from resolve / pinned / inject —
 the hard law: nothing inferred is ever silently authoritative. `list
 --candidates` surfaces them (and coach's dup-search reads
-`store.candidates()`). Three exits, all receipted, none silent: `helm store
-confirm <id> [--edit <stmt...>]` promotes candidate → live (`source:explicit`;
-a prior keeps its captured confidence — confirming ratifies the capture, never
-inflates the belief — and carries the who/when receipt in its own
-evidence_log); `helm store reject <id> [why...]` retires the wrong inference
-IN PLACE (file kept as the record, never deleted). Both resolve against the
-candidate set first, and a slug shared across candidate types is refused
-without `--type T` (never ratify/retire the wrong entry — the `list
---candidates` hints print the qualifier when needed). Decay is
-operator-visible, never a silent job: `helm drain --expire-candidates
-[--days N] [--apply]` archives-then-prunes unconfirmed candidates of every
+`store.candidates()`).
+
+**Provisional tier (xrev-cleared → provisionally live).** Owner canon: a lot of
+the technical auto-learns will be Greek to the owner, so they may go
+*provisionally live* — but ONLY after a cross-family `/x` review clears them
+(xrev is the gate, not the owner). `helm store xrev-clear <id> --by <reviewer>`
+graduates candidate → `status:provisional`, recording the who/when in
+`xrev_by`/`xrev_ts` (all types) + the prior's own evidence_log + the events
+journal. The reviewer **attests** a cross-family review happened — the verb
+never runs the review itself. A provisional entry FIRES through resolve / inject
+like live (it is usable knowledge) but renders with a visible `[provisional]`
+tag everywhere (CLI `list`, `resolve`, the inject line, the web panel) so an
+agent can weight it as not-yet-owner-ratified. An un-cleared candidate still
+fires NOTHING.
+
+Exits (all receipted, none silent): `helm store confirm <id> [--edit <stmt...>]`
+is the owner ratify — it works on BOTH a candidate and a provisional, promoting
+→ live (`source:explicit`; a prior keeps its captured confidence — confirming
+ratifies the capture, never inflates the belief — and carries the who/when
+receipt in its own evidence_log; the xrev provenance survives). `helm store
+reject <id> [why...]` retires the wrong inference (candidate OR provisional) IN
+PLACE (file kept as the record, never deleted). `xrev-clear`/`confirm`/`reject`
+resolve against the reviewable set (candidate + provisional) first, and a slug
+shared across types is refused without `--type T` (never act on the wrong
+entry). The **owner's review surface is the web UI**: near the configs view, a
+*store review* panel lists candidate + provisional entries with Approve
+(confirm), Reject (reason box), and the per-row xrev-clear display — the owner
+actions route through the SAME store functions as the CLI (one writer path).
+Decay is operator-visible, never a silent job: `helm drain --expire-candidates
+[--days N] [--apply]` archives-then-prunes unconfirmed **candidates** of every
 type older than N days (14 default; a no-timestamp candidate never expires;
-dry-run default; net + receipt).
+a provisional is never age-expired — xrev cleared it; dry-run default; net +
+receipt).
 
 **Adopted project roots.** With `--project P`, the store also reads P's OWN
 claude memory dir(s) as `adopted-project` roots (canonical cwd + observed

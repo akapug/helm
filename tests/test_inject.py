@@ -112,6 +112,40 @@ class BudgetTest(InjectBase):
         self.assertEqual(short, "PREMISE short-one: small truth")
 
 
+class ProvisionalTagTest(InjectBase):
+    """The resolver renders a provisional (xrev-cleared) entry WITH a visible
+    [provisional] prefix so an agent can weight it; a candidate fires NOTHING;
+    a live entry is untagged (unchanged byte-shape). All three pinned here."""
+
+    def plant_provisional(self, pid, statement, keywords):
+        store.write_prior({"id": pid, "statement": statement, "confidence": "0.8",
+                           "keywords": keywords, "status": "provisional",
+                           "xrev_by": "codex-seat", "xrev_ts": "2026-07-20"})
+
+    def plant_candidate(self, pid, statement, keywords):
+        store.write_prior({"id": pid, "statement": statement, "confidence": "0.8",
+                           "keywords": keywords, "status": "candidate"})
+
+    def test_three_states_in_the_jit_lane(self):
+        self.plant_jit("live-a", "a flux fact", "fluxcap")
+        self.plant_provisional("prov-a", "a cleared flux fact", "fluxcap")
+        self.plant_candidate("cand-a", "a raw flux guess", "fluxcap")
+        jit = inject.gather("tune the fluxcap")["jit"]
+        self.assertIn("PRIOR 0.80 live-a: a flux fact", jit)
+        self.assertIn("[provisional] PRIOR 0.80 prov-a: a cleared flux fact", jit)
+        self.assertFalse(any("cand-a" in l for l in jit),
+                         "a candidate must fire NOTHING through inject")
+
+    def test_provisional_prefix_survives_line_truncation(self):
+        # the tag is a PREFIX so the LINE_CAP cut can never eat it
+        self.plant_provisional("long-one", "z" * 600, "fluxcap")
+        line = next(l for l in inject.gather("tune the fluxcap")["jit"]
+                    if "long-one" in l)
+        self.assertEqual(len(line), inject.LINE_CAP)
+        self.assertTrue(line.startswith("[provisional] "))
+        self.assertTrue(line.endswith("…"))
+
+
 class SalienceTest(InjectBase):
     def test_no_match_empty_stdout_rc0(self):
         # JIT-only store (empty pinned lane), prompt matches nothing

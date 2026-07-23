@@ -1388,5 +1388,181 @@ class CandidateTierTest(StoreBase):
             self.assertNotIn("retired", raw, typ)
 
 
+class ProvisionalTierTest(StoreBase):
+    """Provisional tier (owner canon 2026-07-22): a candidate a cross-family /x
+    review has cleared goes PROVISIONALLY LIVE — it FIRES through the resolver
+    like live but stays visibly [provisional]-tagged until the owner ratifies
+    (confirm) or rejects it. xrev-clear is the graduation gate; an un-cleared
+    candidate still fires NOTHING (the hard law never weakens)."""
+
+    def add(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(["add", *args])
+        return rc, out.getvalue(), err.getvalue()
+
+    def run_cli(self, args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_three_state_resolver_law(self):
+        # the whole point pinned in one place: live fires, provisional fires
+        # (usable knowledge), candidate fires NOTHING.
+        self.seed_prior("live-law", "the confirmed truth", keywords="glorpwork")
+        self.add("prior", "prov-law | the cleared belief | 0.7 | glorpwork", "--candidate")
+        self.add("prior", "cand-law | the raw guess | 0.7 | glorpwork", "--candidate")
+        store.xrev_clear("prov-law", TS, by="codex-seat")
+        got = [e["id"] for e in store.resolve_prompt("glorpwork now")]
+        self.assertIn("live-law", got)
+        self.assertIn("prov-law", got, "provisional must fire like live")
+        self.assertNotIn("cand-law", got, "candidate must stay fully excluded")
+        # load_all default surfaces live + provisional, never the candidate
+        ids = {e["id"]: e["status"] for e in store.load_all()}
+        self.assertEqual(ids, {"live-law": "live", "prov-law": "provisional"})
+
+    def test_xrev_clear_records_reviewer_and_persists(self):
+        self.add("prior", "x-law | inferred belief | 0.7 | glorpwork", "--candidate")
+        e, err = store.xrev_clear("x-law", TS, by="codex-seat")
+        self.assertIsNone(err)
+        self.assertEqual((e["status"], e["xrev_by"], e["xrev_ts"]),
+                         ("provisional", "codex-seat", TS))
+        # reload from disk: status + who/when receipt persisted in the file
+        e = self.one(store.load_all(), "x-law")
+        self.assertEqual((e["status"], e["xrev_by"]), ("provisional", "codex-seat"))
+        with open(e["path"]) as f:
+            raw = f.read()
+        self.assertIn("  status: provisional", raw)
+        self.assertIn("  xrev_by: codex-seat", raw)
+        # a prior logs the clearance to its own evidence_log (who/when)
+        r = e["evidence_log"][-1]
+        self.assertEqual((r["type"], r["by"]), ("xrev-cleared", "codex-seat"))
+        # the events journal carries the mutation receipt
+        self.assertTrue(any(row.get("verb") == "store.xrev_clear"
+                            and row.get("target") == "x-law"
+                            for row in pk.read_events(50)))
+
+    def test_xrev_clear_all_types_carry_the_file_receipt(self):
+        # the non-prior types have no evidence_log, so the durable receipt is the
+        # xrev_by/xrev_ts file fields (what the web panel/CLI display reads)
+        for args in (("lexicon", "glorpterm | a cleared coinage"),
+                     ("heuristic", "x-move | try glorp first | glorpwork"),
+                     ("reference", "x-ref | the glorp paper | https://x.example")):
+            self.add(*args, "--candidate")
+        for eid in ("glorpterm", "x-move", "x-ref"):
+            e, err = store.xrev_clear(eid, TS, by="opus-seat")
+            self.assertIsNone(err, eid)
+            self.assertEqual(e["status"], "provisional", eid)
+            e = self.one(store.load_all(), eid)
+            self.assertEqual(e["xrev_by"], "opus-seat", eid)
+            with open(e["path"]) as f:
+                self.assertIn("xrev_by: opus-seat", f.read(), eid)
+
+    def test_xrev_clear_guards(self):
+        self.add("prior", "x-law | guess | 0.6", "--candidate")
+        # a reviewer is mandatory — the verb attests a review happened
+        e, err = store.xrev_clear("x-law", TS, by="")
+        self.assertIsNone(e)
+        self.assertIn("--by", err)
+        # not found
+        e, err = store.xrev_clear("ghost", TS, by="r")
+        self.assertIsNone(e)
+        self.assertIn("not found", err)
+        # a live entry is not a candidate
+        self.add("lexicon", "liveterm | a live one")
+        e, err = store.xrev_clear("liveterm", TS, by="r")
+        self.assertIsNone(e)
+        self.assertIn("not a candidate", err)
+        # already provisional -> refused (graduate candidates only, once)
+        store.xrev_clear("x-law", TS, by="r1")
+        e, err = store.xrev_clear("x-law", TS, by="r2")
+        self.assertIsNone(e)
+        self.assertIn("not a candidate", err)
+        self.assertIn("provisional", err)
+
+    def test_xrev_clear_ambiguous_cross_type_refused(self):
+        self.add("prior", "dupx | belief guess | 0.6", "--candidate")
+        self.add("lexicon", "dupx | a term guess", "--candidate")
+        e, err = store.xrev_clear("dupx", TS, by="r")
+        self.assertIsNone(e)
+        self.assertIn("ambiguous", err)
+        e, err = store.xrev_clear("dupx", TS, by="r", ctype="lexicon")
+        self.assertIsNone(err)
+        self.assertEqual((e["type"], e["status"]), ("lexicon", "provisional"))
+        # the prior sibling is untouched — still a candidate
+        self.assertEqual(self.one(store.candidates(), "dupx")["type"], "prior")
+
+    def test_confirm_ratifies_a_provisional(self):
+        self.add("prior", "x-law | cleared belief | 0.7 | glorpwork", "--candidate")
+        store.xrev_clear("x-law", TS, by="codex-seat")
+        self.assertEqual([e["id"] for e in store.resolve_prompt("glorpwork")], ["x-law"])
+        e, err = store.confirm("x-law", TS)
+        self.assertIsNone(err)
+        self.assertEqual((e["status"], e["source"]), ("live", "explicit"))
+        e = self.one(store.load_all(), "x-law")
+        self.assertEqual(e["status"], "live")
+        # the promotion receipt names the prior state; xrev provenance survives
+        r = e["evidence_log"][-1]
+        self.assertEqual(r["type"], "confirmed")
+        self.assertIn("provisional -> live", r["reason"])
+        self.assertEqual(e["xrev_by"], "codex-seat")
+        # and it now fires UNtagged (the [provisional] mark is gone)
+        rc, out, _ = self.run_cli(["resolve", "glorpwork"])
+        self.assertIn("x-law", out)
+        self.assertNotIn("[provisional]", out)
+
+    def test_reject_retires_a_provisional_in_place(self):
+        self.add("lexicon", "glorpterm | a cleared coinage", "--candidate")
+        store.xrev_clear("glorpterm", TS, by="r")
+        path = self.one(store.load_all(), "glorpterm")["path"]
+        e, err = store.reject("glorpterm", TS, why="wrong after all")
+        self.assertIsNone(err)
+        self.assertEqual(e["status"], "retired")
+        self.assertTrue(os.path.isfile(path), "the record law: the file stays")
+        # gone from every injecting surface
+        self.assertEqual(store.load_all(), [])
+        self.assertEqual(store.resolve_prompt("is glorpterm here"), [])
+        e = self.one(store.load_all(include_retired=True), "glorpterm")
+        self.assertEqual((e["status"], e["retired_why"]), ("retired", "wrong after all"))
+
+    def test_provisional_marked_in_cli_list_and_resolve(self):
+        self.add("prior", "x-law | cleared | 0.7 | glorpwork", "--candidate")
+        store.xrev_clear("x-law", TS, by="r")
+        rc, out, _ = self.run_cli(["list"])
+        self.assertIn("x-law", out)
+        self.assertIn("[provisional]", out)
+        rc, out, _ = self.run_cli(["resolve", "glorpwork here"])
+        self.assertIn("[provisional]", out)
+        self.assertIn("x-law", out)
+
+    def test_xrev_clear_cli(self):
+        self.add("prior", "x-law | guess | 0.7 | glorpwork", "--candidate")
+        rc, out, _ = self.run_cli(["xrev-clear", "x-law", "--by", "codex-seat"])
+        self.assertEqual(rc, 0)
+        self.assertIn("XREV-CLEARED 'x-law'", out)
+        self.assertIn("provisional", out)
+        self.assertEqual(self.one(store.load_all(), "x-law")["status"], "provisional")
+        # missing --by is a usage error (rc 2), not a silent clear
+        self.add("prior", "y-law | guess | 0.7", "--candidate")
+        rc, _, err = self.run_cli(["xrev-clear", "y-law"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--by", err)
+        self.assertEqual(self.one(store.candidates(), "y-law")["status"], "candidate")
+
+    def test_readd_scrubs_stale_xrev_receipt(self):
+        # cleared -> rejected -> re-added: the fresh candidate must NOT carry the
+        # prior xrev clearance ("provisional receipt on a raw candidate" corrupts
+        # provenance — same law as the retire-receipt scrub)
+        self.add("prior", "x-law | first | 0.7 | glorpwork", "--candidate")
+        store.xrev_clear("x-law", TS, by="r")
+        store.reject("x-law", TS, why="wrong")
+        self.add("prior", "x-law | second guess | 0.7 | glorpwork", "--candidate")
+        e = self.one(store.candidates(), "x-law")
+        self.assertEqual((e["status"], e["xrev_by"]), ("candidate", ""))
+        with open(e["path"]) as f:
+            self.assertNotIn("xrev_by", f.read())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -178,17 +178,22 @@ def _who_lines():
 
 
 def _entry_line_full(e):
+    # a provisional (xrev-cleared) entry FIRES like live but carries a visible
+    # [provisional] PREFIX so the agent can weight it as not-yet-owner-ratified.
+    # The prefix (not a suffix) survives LINE_CAP truncation — the tag can't be
+    # the part that gets cut. candidates never reach here (load_all excludes them).
+    pv = "[provisional] " if e.get("status") == "provisional" else ""
     t = e.get("type")
     if t == "prior":
         tag = "PREMISE" if e.get("class") == "certain" else "PRIOR %.2f" % e["confidence"]
-        return "%s %s: %s" % (tag, e["id"], e.get("statement") or "")
+        return "%s%s %s: %s" % (pv, tag, e["id"], e.get("statement") or "")
     if t == "lexicon":
-        return "TERM %s: %s" % (e.get("term") or e["id"], e.get("definition") or e.get("statement") or "")
+        return "%sTERM %s: %s" % (pv, e.get("term") or e["id"], e.get("definition") or e.get("statement") or "")
     if t == "heuristic":
-        return "MOVE %s: %s" % (e["id"], e.get("statement") or "")
+        return "%sMOVE %s: %s" % (pv, e["id"], e.get("statement") or "")
     if t == "reference":
-        return "REF %s: %s" % (e["id"], e.get("statement") or "")
-    return "%s: %s" % (e["id"], e.get("statement") or "")
+        return "%sREF %s: %s" % (pv, e["id"], e.get("statement") or "")
+    return "%s%s: %s" % (pv, e["id"], e.get("statement") or "")
 
 
 def _cache_file(project=None):

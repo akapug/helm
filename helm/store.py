@@ -70,6 +70,21 @@ STATUS_DELETE_ELIGIBLE = "delete_eligible"
 # `helm store confirm` promotes, `reject` retires-in-place, drain
 # --expire-candidates is the age leg. source: inferred|asked-once|explicit.
 STATUS_CANDIDATE = "candidate"
+# PROVISIONAL (xrev-cleared candidate): a candidate a cross-family /x review has
+# cleared (owner canon 2026-07-22: the technical ones may go PROVISIONALLY LIVE
+# once xrev clears them — xrev is the gate, not the owner). A provisional entry
+# FIRES through the resolver like live (it is usable knowledge) but renders with
+# a visible [provisional] tag everywhere (CLI list + inject line + web) until the
+# owner ratifies it (confirm -> live) or rejects it (reject -> retired). The
+# graduation verb is `helm store xrev-clear <id> --by <reviewer>` (candidate ->
+# provisional; the reviewer ATTESTS the review happened, the verb never runs it).
+STATUS_PROVISIONAL = "provisional"
+
+# The statuses that FIRE through the injecting lanes (resolve/pinned/inject):
+# live = human-canon, provisional = xrev-cleared-but-not-yet-owner-ratified.
+# candidate/retired/delete_eligible stay OUT (the hard law: never silently
+# authoritative — an un-reviewed candidate fires NOTHING).
+INJECTABLE_STATUSES = (STATUS_LIVE, STATUS_PROVISIONAL)
 
 # PINNED priors inject EVERY turn (load_class always). Pin = a `pin: true`
 # flag OR membership here (belt-and-suspenders, same tuple as mc so the live
@@ -265,6 +280,9 @@ _PRIOR_DEFAULTS = {
     "evidence_log": "", "confidence_history": "",
     "supersedes": "", "replaced_by": "", "source_prior": "",
     "retired_ts": "", "retired_why": "",
+    # xrev-clear receipt (candidate -> provisional): who attested the
+    # cross-family review + when. Carries through parse/rewrite for display.
+    "xrev_by": "", "xrev_ts": "",
     # attestation pointer (premise.py annotates; parse + rewrite carry through).
     # attest_record is the NATIVE hash-chain record (the primary proof);
     # attest_anchor* is the OPTIONAL dregg anchor; attest_turn/attest_receipt/
@@ -277,14 +295,15 @@ _PRIOR_DEFAULTS = {
 
 _LEX_DEFAULTS = {"term": "", "scope": "global", "definition": "", "kind": "",
                  "source": "", "examples": [], "updated_ts": "", "hits": "0",
-                 "status": "live", "retired_ts": "", "retired_why": ""}
+                 "status": "live", "retired_ts": "", "retired_why": "",
+                 "xrev_by": "", "xrev_ts": ""}
 
 _HEUR_DEFAULTS = {
     "id": "", "move": "", "statement": "", "trigger": "", "keywords": "",
     "domain": "", "status": "live", "load_class": "jit",
     "stated_ts": "", "last_updated": "", "source": "",
     "supersedes": "", "replaced_by": "", "retired_ts": "", "retired_why": "",
-    "name": "", "description": "",
+    "xrev_by": "", "xrev_ts": "", "name": "", "description": "",
 }
 
 _REF_DEFAULTS = {
@@ -292,6 +311,7 @@ _REF_DEFAULTS = {
     "domain": "", "status": "live", "load_class": "", "source": "",
     "stated_ts": "", "last_updated": "", "name": "", "description": "",
     "supersedes": "", "replaced_by": "", "retired_ts": "", "retired_why": "",
+    "xrev_by": "", "xrev_ts": "",
 }
 
 _EPISODIC_DEFAULTS = {"name": "", "description": "", "type": "", "load_class": ""}
@@ -458,8 +478,9 @@ def load_all(project=None, include_retired=False, include_dormant=True, types=No
     for e in merged.values():
         # status filter AFTER the merge: a retired shadow-WINNER
         # drops out entirely — it must not un-bury the wider-scope entry it
-        # shadowed (the record law survives scope precedence).
-        if not include_retired and e.get("status") != STATUS_LIVE:
+        # shadowed (the record law survives scope precedence). live AND
+        # provisional (xrev-cleared) both inject; candidate/retired stay out.
+        if not include_retired and e.get("status") not in INJECTABLE_STATUSES:
             continue
         if not include_dormant and e.get("load_class") == "dormant":
             continue
@@ -480,6 +501,18 @@ def candidates(project=None, types=None):
     surface `list --candidates` and coach's dup-search read here."""
     return [e for e in load_all(project=project, include_retired=True, types=types)
             if e.get("status") == STATUS_CANDIDATE]
+
+
+def reviewable(project=None, types=None):
+    """The owner review queue: candidate (fires NOTHING) + provisional (fires
+    WITH a [provisional] tag) — the two non-ratified states the owner browses,
+    approves (confirm -> live), or rejects (reject -> retired) in the web review
+    panel. xrev-clear graduates candidate -> provisional between them. Newest
+    capture first so the freshest inference is reviewed first."""
+    rows = [e for e in load_all(project=project, include_retired=True, types=types)
+            if e.get("status") in (STATUS_CANDIDATE, STATUS_PROVISIONAL)]
+    rows.sort(key=_recency, reverse=True)
+    return rows
 
 
 def counts(project=None):
@@ -692,7 +725,7 @@ def write_prior(e, root_dir=None, path=None):
                 "attest_turn", "attest_receipt", "attest_supersedes_turn"):
         if e.get(opt) not in (None, ""):
             body.append("  " + opt + ": " + str(e[opt]))
-    for opt in ("supersedes", "replaced_by", "source_prior"):
+    for opt in ("supersedes", "replaced_by", "source_prior", "xrev_by", "xrev_ts"):
         if e.get(opt):
             body.append("  " + opt + ": " + str(e[opt]))
     if e.get("retired_ts"):
@@ -740,6 +773,9 @@ def write_lexicon(e, root_dir=None, path=None):
     status = str(e.get("status") or STATUS_LIVE)
     if status != STATUS_LIVE:
         body.insert(6, "  status: " + status)
+    for opt in ("xrev_by", "xrev_ts"):  # the provisional-graduation receipt
+        if e.get(opt):
+            body.append("  " + opt + ": " + str(e[opt]))
     if e.get("retired_ts"):  # a rejected candidate keeps its receipt in-file
         body += ["  retired_ts: " + str(e["retired_ts"]),
                  "  retired_why: " + (e.get("retired_why") or "")]
@@ -781,7 +817,7 @@ def write_heuristic(e, root_dir=None, path=None):
         "  last_updated: " + str(e.get("last_updated") or e.get("stated_ts") or ""),
         "  source: " + (e.get("source") or "human"),
     ]
-    for opt in ("supersedes", "replaced_by"):
+    for opt in ("supersedes", "replaced_by", "xrev_by", "xrev_ts"):
         if e.get(opt):
             body.append("  " + opt + ": " + str(e[opt]))
     if e.get("retired_ts"):
@@ -833,7 +869,7 @@ def write_reference(e, root_dir=None, path=None):
         "  last_updated: " + str(e.get("last_updated") or e.get("stated_ts") or ""),
         "  source: " + (e.get("source") or "harvest"),
     ]
-    for opt in ("supersedes", "replaced_by"):
+    for opt in ("supersedes", "replaced_by", "xrev_by", "xrev_ts"):
         if e.get(opt):
             body.append("  " + opt + ": " + str(e[opt]))
     if e.get("retired_ts"):
@@ -948,13 +984,13 @@ _CANDIDATE_TYPES = ("prior", "lexicon", "heuristic", "reference")
 
 
 def _pick_candidate(eid, project=None, ctype=None):
-    """Resolve a confirm/reject id against the CANDIDATE set first — bare
-    _find is typed-first (prior > heuristic > reference > lexicon), and with
-    candidates mintable in all four types a slug shared across types would
-    silently ratify/retire the WRONG entry. >1 same-slug candidate without a
-    type qualifier is REFUSED with the exact disambiguation; zero candidate
-    hits falls back to _find so the not-found / not-a-candidate errors keep
-    their precision."""
+    """Resolve a confirm/reject/xrev-clear id against the REVIEWABLE set first
+    (candidate + provisional) — bare _find is typed-first (prior > heuristic >
+    reference > lexicon), and with entries mintable in all four types a slug
+    shared across types would silently ratify/retire the WRONG entry. >1
+    same-slug reviewable without a type qualifier is REFUSED with the exact
+    disambiguation; zero reviewable hits falls back to _find so the not-found /
+    not-a-candidate errors keep their precision."""
     if ctype:
         ctype = "prior" if ctype == "premise" else ctype
         if ctype not in _CANDIDATE_TYPES:
@@ -962,7 +998,7 @@ def _pick_candidate(eid, project=None, ctype=None):
                 % (ctype, ", ".join(_CANDIDATE_TYPES))
     types = (ctype,) if ctype else None
     want = _slug(str(eid or ""))
-    hits = [e for e in candidates(project=project, types=types)
+    hits = [e for e in reviewable(project=project, types=types)
             if _slug(str(e["id"])) == want]
     if len(hits) > 1:
         return None, "'%s' is ambiguous — %d candidates share the id (%s); " \
@@ -977,20 +1013,25 @@ def _pick_candidate(eid, project=None, ctype=None):
 
 
 def confirm(eid, ts, new_statement=None, project=None, ctype=None):
-    """Promote a candidate -> live (the owner/confirm gate that makes inferred
-    capture safe to leave on) — v2: every capturable type (autolearn widened
-    it from lexicon-only; capture everything, canonize nothing automatically).
-    --edit swaps the statement in the same turn. source flips to 'explicit' —
-    the knowledge is now human-confirmed. A prior carries the who/when receipt
-    in its own evidence_log (confidence untouched — confirming ratifies the
-    capture, never inflates the belief); the other types' receipt is the
-    events journal row. ctype disambiguates a slug shared across candidate
-    types (ambiguity without it is refused — never ratify the wrong entry)."""
+    """Owner ratify -> live (the owner/confirm gate that makes inferred capture
+    safe to leave on) — works on BOTH a candidate (fires nothing) AND a
+    provisional (xrev-cleared, already firing tagged): either way the owner's
+    ratification makes it human-canon. v2: every capturable type (autolearn
+    widened it from lexicon-only; capture everything, canonize nothing
+    automatically). --edit swaps the statement in the same turn. source flips to
+    'explicit' — the knowledge is now human-confirmed. A prior carries the
+    who/when receipt in its own evidence_log (confidence untouched — confirming
+    ratifies the capture, never inflates the belief); the other types' receipt
+    is the events journal row. ctype disambiguates a slug shared across
+    reviewable types (ambiguity without it is refused — never ratify the wrong
+    entry)."""
     e, err = _pick_candidate(eid, project=project, ctype=ctype)
     if err:
         return None, err
-    if e.get("status") != STATUS_CANDIDATE:
-        return None, "'%s' is not a candidate (status=%s)" % (eid, e.get("status"))
+    prev = e.get("status")
+    if prev not in (STATUS_CANDIDATE, STATUS_PROVISIONAL):
+        return None, "'%s' is not a candidate or provisional entry (status=%s)" \
+            % (eid, prev)
     edited = bool(str(new_statement or "").strip())
     if edited:
         s = new_statement.strip()
@@ -998,7 +1039,7 @@ def confirm(eid, ts, new_statement=None, project=None, ctype=None):
         alias = _STMT_ALIAS.get(e["type"])
         if alias:
             e[alias] = s
-    note = "candidate -> live" + (" (edited)" if edited else "")
+    note = prev + " -> live" + (" (edited)" if edited else "")
     e.update({"status": STATUS_LIVE, "source": "explicit",
               "updated_ts": ts, "last_updated": ts})
     if e["type"] == "prior":
@@ -1010,21 +1051,56 @@ def confirm(eid, ts, new_statement=None, project=None, ctype=None):
 
 
 def reject(eid, ts, why="", project=None, ctype=None):
-    """The wrong-inference exit: candidate -> retired IN PLACE (the record law:
-    the file STAYS, never deleted — a rejected inference is itself knowledge).
-    Refuses non-candidates (retire is the live-entry verb) and cross-type
-    slug ambiguity without a ctype qualifier (same law as confirm); drain
-    --expire-candidates remains the age leg for the never-reviewed."""
+    """The wrong-inference exit: a candidate OR a provisional -> retired IN PLACE
+    (the record law: the file STAYS, never deleted — a rejected inference is
+    itself knowledge). Works on both non-ratified states (the owner may reject a
+    provisional that xrev cleared but is wrong). Refuses live entries (retire is
+    the live-entry verb) and cross-type slug ambiguity without a ctype qualifier
+    (same law as confirm); drain --expire-candidates remains the age leg for the
+    never-reviewed."""
+    e, err = _pick_candidate(eid, project=project, ctype=ctype)
+    if err:
+        return None, err
+    prev = e.get("status")
+    if prev not in (STATUS_CANDIDATE, STATUS_PROVISIONAL):
+        return None, "'%s' is not a candidate or provisional entry (status=%s) " \
+            "— retire handles live entries" % (eid, prev)
+    e.update({"status": STATUS_RETIRED, "retired_ts": ts,
+              "retired_why": why or "rejected", "updated_ts": ts, "last_updated": ts})
+    _WRITERS[e["type"]](e, path=e["path"])
+    pk.event("store.reject", str(e["id"]), (prev + " rejected") + ((" — " + why) if why else ""))
+    return e, None
+
+
+def xrev_clear(eid, ts, by, project=None, ctype=None):
+    """The graduation gate: a candidate -> provisional after a cross-family /x
+    review clears it (owner canon: xrev is the gate, not the owner). The
+    reviewer ATTESTS a cross-family review happened — this verb records the
+    who/when, it NEVER runs the review itself. A provisional entry FIRES through
+    the resolver like live but renders with a visible [provisional] tag until the
+    owner ratifies (confirm) or rejects (reject) it in the web review panel. The
+    receipt lands in xrev_by/xrev_ts on the file (all types) + the events
+    journal, and a prior also logs it to its own evidence_log. Refuses a missing
+    reviewer, a non-candidate, and cross-type slug ambiguity (same law as
+    confirm/reject)."""
+    if not str(by or "").strip():
+        return None, "xrev-clear requires --by <reviewer> " \
+            "(who attests the cross-family review cleared it)"
     e, err = _pick_candidate(eid, project=project, ctype=ctype)
     if err:
         return None, err
     if e.get("status") != STATUS_CANDIDATE:
-        return None, "'%s' is not a candidate (status=%s) — retire handles live entries" \
-            % (eid, e.get("status"))
-    e.update({"status": STATUS_RETIRED, "retired_ts": ts,
-              "retired_why": why or "rejected", "updated_ts": ts, "last_updated": ts})
+        return None, "'%s' is not a candidate (status=%s) — xrev-clear graduates " \
+            "candidates only" % (eid, e.get("status"))
+    by = str(by).strip()
+    note = "candidate -> provisional (xrev-cleared by %s)" % by
+    e.update({"status": STATUS_PROVISIONAL, "xrev_by": by, "xrev_ts": ts,
+              "updated_ts": ts, "last_updated": ts})
+    if e["type"] == "prior":
+        e["evidence_log"] = list(e.get("evidence_log") or []) + [
+            {"ts": ts, "type": "xrev-cleared", "delta": 0, "reason": note, "by": by}]
     _WRITERS[e["type"]](e, path=e["path"])
-    pk.event("store.reject", str(e["id"]), why or "candidate rejected")
+    pk.event("store.xrev_clear", str(e["id"]), note)
     return e, None
 
 
@@ -1282,7 +1358,8 @@ _GUARD_TYPE = {"prior": "prior", "premise": "prior",
 # replaced_by X" / "live but retired_ts Y" corrupts provenance — codex-seat
 # review). Every parse-then-update add branch scrubs these; reject makes
 # rejected -> re-add a routine agent lane, so the scrub is load-bearing.
-_STALE_ON_REMINT = ("replaced_by", "supersedes", "retired_ts", "retired_why")
+_STALE_ON_REMINT = ("replaced_by", "supersedes", "retired_ts", "retired_why",
+                    "xrev_by", "xrev_ts")
 
 
 def _tokens(s):
@@ -1328,11 +1405,18 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
       a LIVE same-id add is REFUSED (supersede/evidence instead, printed);
       a near-identical statement warns and proceeds (lexicon redefines freely
       EXCEPT --candidate over a live term — capture never de-canonizes)
-  confirm <id> [--type T] [--edit <stmt...>]  promote a candidate -> live
-  reject <id> [--type T] [why...]             reject a candidate — retired in
-                                              place (file kept as the record)
-      --type on either: disambiguate when candidates share an id across types
-      (ambiguous bare id is refused — never ratify/retire the wrong entry)
+  xrev-clear <id> --by <who> [--type T]       candidate -> PROVISIONAL: a
+                                              cross-family /x review cleared it
+                                              (the reviewer attests; the verb
+                                              never runs the review). Provisional
+                                              FIRES with a [provisional] tag,
+                                              awaiting owner ratify
+  confirm <id> [--type T] [--edit <stmt...>]  owner ratify -> live (candidate OR
+                                              provisional)
+  reject <id> [--type T] [why...]             reject a candidate/provisional —
+                                              retired in place (file kept)
+      --type on any: disambiguate when reviewable entries share an id across
+      types (ambiguous bare id is refused — never ratify/retire the wrong entry)
   evidence <ts> <id> <delta> <reason...>      move a belief (logged + clamped)
   supersede <ts> <old-id> <new-id> [reason]   TOMBSTONE old (file kept)
   retire <ts> <id> [why...]                   retire (file kept as the record)
@@ -1342,26 +1426,29 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
 
 
 def _fmt(e):
+    # provisional (xrev-cleared) fires but stays visibly tagged everywhere it
+    # renders — the CLI resolve/pinned view, alongside the inject line + web.
+    pv = "[provisional] " if e.get("status") == STATUS_PROVISIONAL else ""
     t = e["type"]
     if t == "prior":
         tag = "PREMISE" if e["class"] == "certain" else "PRIOR"
-        return tag + " " + str(e["id"]) + " [" + ("%.2f" % e["confidence"]) + "]: " \
+        return pv + tag + " " + str(e["id"]) + " [" + ("%.2f" % e["confidence"]) + "]: " \
             + (e.get("statement") or "")
     if t == "heuristic":
-        return "HEURISTIC " + str(e["id"]) + ": " + (e.get("statement") or "")
+        return pv + "HEURISTIC " + str(e["id"]) + ": " + (e.get("statement") or "")
     if t == "lexicon":
         kind = e.get("kind") or ""
-        return "TERM " + str(e["id"]) + ((" (" + kind + ")") if kind else "") + ": " \
+        return pv + "TERM " + str(e["id"]) + ((" (" + kind + ")") if kind else "") + ": " \
             + (e.get("definition") or "")
     if t == "reference":
         url = e.get("url") or ""
-        return "REF " + str(e["id"]) + ": " + (e.get("statement") or "") \
+        return pv + "REF " + str(e["id"]) + ": " + (e.get("statement") or "") \
             + ((" <" + url + ">") if url else "")
-    return str(e["id"]) + ": " + (e.get("statement") or "")
+    return pv + str(e["id"]) + ": " + (e.get("statement") or "")
 
 
 def cmd_store(args):
-    """store <list|get|add|resolve|pinned|confirm|reject|evidence|supersede|retire|demote|events|counts> — the ONE typed personal-knowledge store."""
+    """store <list|get|add|resolve|pinned|xrev-clear|confirm|reject|evidence|supersede|retire|demote|events|counts> — the ONE typed personal-knowledge store."""
     args = list(args)
     project = None
     if "--project" in args:
@@ -1428,10 +1515,41 @@ def cmd_store(args):
               + ("%.2f" % e["confidence"]) + "/" + e["load_class"] + " "
               + e["status"] + " " + e["root"] + "]: " + (e.get("statement") or ""))
         for k in ("keywords", "domain", "url", "supersedes", "replaced_by",
-                  "retired_why"):
+                  "xrev_by", "xrev_ts", "retired_why"):
             if e.get(k):
                 print("  " + k + ": " + str(e[k]))
         print("  path: " + e["path"])
+        return 0
+
+    if cmd == "xrev-clear":
+        by = None
+        ctype = None
+        if "--by" in rest:
+            i = rest.index("--by")
+            if i + 1 >= len(rest):
+                print("helm store xrev-clear: --by needs a reviewer", file=sys.stderr)
+                return 2
+            by = rest[i + 1]
+            del rest[i:i + 2]
+        if "--type" in rest:
+            i = rest.index("--type")
+            if i + 1 >= len(rest):
+                print("helm store xrev-clear: --type needs a type", file=sys.stderr)
+                return 2
+            ctype = rest[i + 1]
+            del rest[i:i + 2]
+        eid = " ".join(a for a in rest if not a.startswith("--")).strip()
+        if not eid or not by:
+            print("usage: helm store xrev-clear <id> --by <reviewer> [--type T]",
+                  file=sys.stderr)
+            return 2
+        e, err = xrev_clear(eid, pk.now_ts(), by, project=project, ctype=ctype)
+        if err:
+            print("helm store xrev-clear: " + err, file=sys.stderr)
+            return 1
+        print("helm store: XREV-CLEARED '" + eid + "' candidate -> provisional "
+              "(cleared by " + by + ") — now FIRES with a [provisional] tag; "
+              "owner ratifies via: helm store confirm " + eid)
         return 0
 
     if cmd == "confirm":
@@ -1459,9 +1577,9 @@ def cmd_store(args):
         if err:
             print("helm store confirm: " + err, file=sys.stderr)
             return 1
-        print("helm store: CONFIRMED '" + eid + "' candidate -> live"
+        print("helm store: CONFIRMED '" + eid + "' -> live (owner-ratified)"
               + (" (definition edited)" if new_stmt else "")
-              + " - now fires in the JIT lane")
+              + " - now fires in the JIT lane untagged")
         return 0
 
     if cmd == "reject":
@@ -1481,7 +1599,7 @@ def cmd_store(args):
         if err:
             print("helm store reject: " + err, file=sys.stderr)
             return 1
-        print("helm store: REJECTED '" + rest[0] + "' candidate -> retired "
+        print("helm store: REJECTED '" + rest[0] + "' -> retired "
               "(file kept as the record)")
         return 0
 
