@@ -30,7 +30,8 @@ class SeatTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-seat-")
         self._env = {k: os.environ.get(k) for k in
                      ("HELM_HOME", "MELD_HOME", "HELM_PROXY_BIN",
-                      "MELD_PROXY_BIN", "KIMI_API_KEY", "HELM_PROC",
+                      "MELD_PROXY_BIN", "KIMI_API_KEY", "DS4PRO_API_KEY",
+                      "HELM_PROC",
                       "HELM_CHAT_DIR", "HELM_CHAT_ROOM",
                       "HELM_CHAT_ROOM_SOURCE", "MELD_CHAT_ROOM",
                       "MELD_CHAT_ROOM_SOURCE", "HELM_CODEX_HOMES_DIR",
@@ -42,6 +43,15 @@ class SeatTest(unittest.TestCase):
         os.environ.pop("HELM_PROXY_BIN", None)
         os.environ.pop("MELD_PROXY_BIN", None)
         os.environ.pop("KIMI_API_KEY", None)  # hermetic: never the real key
+        os.environ.pop("DS4PRO_API_KEY", None)
+        # hermetic: the real ~/.hermes/auth.json must never feed a test mint
+        self._hermes_auth = seat.HERMES_AUTH
+        seat.HERMES_AUTH = os.path.join(self.tmp, "hermes-auth.json")
+        # hermetic: the real opencode auth store must never feed a test mint.
+        # Point it at a non-existent tmp path — tests that exercise the
+        # authstore plant it explicitly; the rest fall through to hermes.
+        self._opencode_authstore = seat.OPENCODE_AUTHSTORE
+        seat.OPENCODE_AUTHSTORE = os.path.join(self.tmp, "opencode-auth.json")
         for key in ("HELM_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
                     "MELD_CHAT_ROOM", "MELD_CHAT_ROOM_SOURCE"):
             os.environ.pop(key, None)
@@ -54,6 +64,8 @@ class SeatTest(unittest.TestCase):
 
     def tearDown(self):
         seat.CODEX_HOMES = self._codex_homes
+        seat.HERMES_AUTH = self._hermes_auth
+        seat.OPENCODE_AUTHSTORE = self._opencode_authstore
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -407,6 +419,302 @@ class SeatTest(unittest.TestCase):
         self.assertTrue(line.endswith(
             "claude --dangerously-skip-permissions --model kimi-k3"))
         self.assertNotIn("fake-kimi-key-for-tests", line)  # key never rides
+
+    # -- ds4pro (pool-keyed proxy-key family, credential_pool bearer) --------
+    # The literal bearer token every test bakes/asserts-absent. A single
+    # constant so the secret-hygiene assertions (assertNotIn) can never drift
+    # out of sync with what was planted.
+    _LIVE = "sk-live-ds4pro-bearer-3f9c2a1e6b7d8049aa11bb22cc33dd44"
+    # the opencode-authstore fake bearers — distinct per provider and distinct
+    # from _LIVE so a test can prove WHICH source (authstore vs hermes) won.
+    _AS_OC = "sk-authstore-opencode-go-1122334455667788990011223344ff"
+    _AS_DS = "sk-authstore-deepseek-9a8b7c6d5e4f3021ffeeddccbbaa9988ee"
+
+    def _plant_authstore(self, opencode=True, deepseek=True, oauth_ds=False):
+        """A fake ~/.local/share/opencode/auth.json shaped like the real one:
+        a dict of provider -> {type, key}. `oauth_ds` swaps deepseek to an
+        oauth entry (no bakeable static key) to exercise the type filter."""
+        store = {}
+        if opencode:
+            store["opencode-go"] = {"type": "api", "key": self._AS_OC}
+        if deepseek and not oauth_ds:
+            store["deepseek"] = {"type": "api", "key": self._AS_DS}
+        if oauth_ds:
+            store["deepseek"] = {"type": "oauth", "access": "a" * 60,
+                                 "refresh": "r" * 60, "expires": 9999999999999}
+        with open(seat.OPENCODE_AUTHSTORE, "w") as f:
+            json.dump(store, f)
+
+    def _plant_pool(self, opencode=None, openrouter=None, extra=None):
+        """A fake ~/.hermes/auth.json shaped like the real one: a
+        credential_pool of provider -> LIST of bearer entries. Defaults plant
+        BOTH ds4pro providers with the live bearer at priority 0 (last_status
+        ok). `extra` injects additional entries per provider to exercise
+        selection (junk placeholders, expired/non-ok)."""
+        pool = {
+            "opencode-go": [{"access_token": opencode or self._LIVE,
+                             "base_url": "https://opencode.ai/zen/go/v1",
+                             "label": "OPENCODE_GO_API_KEY",
+                             "last_status": "ok", "priority": 0,
+                             "auth_type": "api_key"}],
+            "openrouter": [{"access_token": openrouter or self._LIVE,
+                            "base_url": "https://openrouter.ai/api/v1",
+                            "label": "OPENROUTER_API_KEY",
+                            "last_status": "ok", "priority": 0,
+                            "auth_type": "api_key"}],
+        }
+        for prov, entries in (extra or {}).items():
+            pool.setdefault(prov, []).extend(entries)
+        with open(seat.HERMES_AUTH, "w") as f:
+            json.dump({"version": 1, "providers": {},
+                       "credential_pool": pool}, f)
+
+    def test_family_ports_unique_with_interleave_headroom(self):
+        """The port invariant, extended for ds4pro: every family owns a
+        distinct port, ds4pro sits at 8360 — clear of the codex 8317+N
+        instance range and kimi's 8318 (no OTHER family within 8350-8370)."""
+        ports = {f: fam["port"] for f, fam in seat.FAMILIES.items()}
+        self.assertEqual(len(set(ports.values())), len(ports), ports)
+        self.assertEqual(ports["ds4pro"], 8360)
+        for f, p in ports.items():
+            if f != "ds4pro":
+                self.assertFalse(8350 <= p <= 8370,
+                                 "%s port %d crowds ds4pro's headroom" % (f, p))
+
+    def test_ds4pro_family_shape(self):
+        fam = seat.FAMILIES["ds4pro"]
+        self.assertEqual(fam["mode"], "proxy-key")
+        self.assertEqual(fam["model"], "ds4-pro")           # claude-side alias
+        self.assertEqual(fam["key_env"], "DS4PRO_API_KEY")
+        self.assertEqual(fam["probe_models"], ("ds4-pro",))
+        self.assertIn("max_context", fam)
+        # multi-provider: opencode-go is the owner's long-term default;
+        # openrouter is the credit-bearing test route. Each carries the REAL
+        # model id that provider's /models advertises (probed 2026-07-22).
+        self.assertEqual(fam["pool_default"], "opencode-go")
+        self.assertEqual(fam["pool_providers"]["opencode-go"],
+                         {"base_url": "https://opencode.ai/zen/go/v1",
+                          "upstream_model": "deepseek-v4-pro",
+                          "authstore": "opencode-go"})
+        # native DeepSeek: real model id deepseek-v4-pro (probed 2026-07-22),
+        # base api.deepseek.com; key valid but 402 (no balance) so configured
+        # not live-default.
+        self.assertEqual(fam["pool_providers"]["deepseek"],
+                         {"base_url": "https://api.deepseek.com",
+                          "upstream_model": "deepseek-v4-pro",
+                          "authstore": "deepseek"})
+        self.assertEqual(fam["pool_providers"]["openrouter"],
+                         {"base_url": "https://openrouter.ai/api/v1",
+                          "upstream_model": "deepseek/deepseek-v4-pro",
+                          "authstore": "openrouter"})
+        # the retired nous portal shape is gone
+        self.assertNotIn("hermes_provider", fam)
+        self.assertNotIn("provider", fam)
+
+    def test_config_yaml_key_upstream_alias_mapping(self):
+        cfg = seat._config_yaml_key(8360, "tok", "openrouter",
+                                    "https://openrouter.ai/api/v1",
+                                    "ds4-pro", "fake-key",
+                                    "deepseek/deepseek-v4-pro")
+        self.assertIn('- name: "deepseek/deepseek-v4-pro"\n'
+                      '        alias: "ds4-pro"', cfg)
+
+    # -- the auth reader: live-entry selection ------------------------------
+    def test_pool_reader_picks_live_bearer_over_junk_and_non_ok(self):
+        """_hermes_pool_key selects the real bearer, never the 1-char junk
+        placeholder (opencode-go's real [1] entry), and prefers last_status
+        ok / lowest priority."""
+        self._plant_pool(extra={"opencode-go": [
+            {"access_token": "\x1b", "last_status": None, "priority": 1},
+            {"access_token": "sk-stale-not-ok", "last_status": "exhausted",
+             "priority": 0},
+        ]})
+        tok, base, err = seat._hermes_pool_key("opencode-go")
+        self.assertIsNone(err)
+        self.assertEqual(tok, self._LIVE)     # the ok/priority-0 real bearer
+        self.assertEqual(base, "https://opencode.ai/zen/go/v1")
+
+    def test_pool_reader_all_junk_reports_no_live_bearer(self):
+        with open(seat.HERMES_AUTH, "w") as f:
+            json.dump({"credential_pool": {"opencode-go": [
+                {"access_token": "\x1b", "priority": 1}]}}, f)
+        tok, base, err = seat._hermes_pool_key("opencode-go")
+        self.assertIsNone(tok)
+        self.assertIn("no live bearer", err)
+
+    def test_pool_reader_missing_provider(self):
+        self._plant_pool()
+        tok, _, err = seat._hermes_pool_key("nope")
+        self.assertIsNone(tok)
+        self.assertIn("no credential_pool.nope", err)
+
+    # -- the opencode auth store reader -------------------------------------
+    def test_authstore_reader_picks_api_key(self):
+        self._plant_authstore()
+        key, err = seat._opencode_authstore_key("opencode-go")
+        self.assertIsNone(err)
+        self.assertEqual(key, self._AS_OC)
+        key, err = seat._opencode_authstore_key("deepseek")
+        self.assertIsNone(err)
+        self.assertEqual(key, self._AS_DS)
+
+    def test_authstore_reader_skips_oauth_entry(self):
+        """An oauth entry carries no static bakeable key — the reader reports
+        it, never returns the access token as a key."""
+        self._plant_authstore(oauth_ds=True)
+        key, err = seat._opencode_authstore_key("deepseek")
+        self.assertIsNone(key)
+        self.assertIn("not a static api key", err)
+
+    def test_authstore_reader_missing_provider_and_file(self):
+        self._plant_authstore()
+        key, err = seat._opencode_authstore_key("nope")
+        self.assertIsNone(key)
+        self.assertIn("no nope entry", err)
+        os.remove(seat.OPENCODE_AUTHSTORE)
+        key, err = seat._opencode_authstore_key("opencode-go")
+        self.assertIsNone(key)
+        self.assertIn("unreadable", err)
+
+    def test_add_ds4pro_prefers_authstore_over_hermes(self):
+        """Both sources present: the authstore bearer is baked, the hermes
+        _LIVE bearer is NOT — and neither raw value is ever printed."""
+        self._plant_authstore()
+        self._plant_pool()          # hermes _LIVE also present
+        rc, out, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(self._AS_OC, out + err)   # secret: never printed
+        self.assertNotIn(self._LIVE, out + err)
+        d = seat.seat_dir("ds4pro")
+        with open(os.path.join(d, "config.yaml")) as f:
+            cfg = f.read()
+        self.assertIn('api-key: "%s"' % self._AS_OC, cfg)   # authstore won
+        self.assertNotIn(self._LIVE, cfg)                   # not hermes
+        self.assertIn('base-url: "https://opencode.ai/zen/go/v1"', cfg)
+        with open(os.path.join(d, "launch.sh")) as f:
+            self.assertNotIn(self._AS_OC, f.read())         # never in launch.sh
+
+    def test_add_ds4pro_deepseek_provider_from_authstore(self):
+        """--provider deepseek bakes the native DeepSeek key + real model id
+        deepseek-v4-pro at api.deepseek.com."""
+        self._plant_authstore()
+        rc, out, err = self._add(("add", "ds4pro", "--provider", "deepseek"))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("provider deepseek", out)
+        self.assertNotIn(self._AS_DS, out + err)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
+            cfg = f.read()
+        self.assertIn('api-key: "%s"' % self._AS_DS, cfg)
+        self.assertIn('name: "deepseek"', cfg)
+        self.assertIn('base-url: "https://api.deepseek.com"', cfg)
+        self.assertIn('- name: "deepseek-v4-pro"', cfg)
+
+    def test_add_ds4pro_falls_back_to_hermes_when_authstore_absent(self):
+        """No authstore file -> the hermes credential_pool bearer is used."""
+        self._plant_pool()          # authstore path does not exist
+        rc, _, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
+            self.assertIn('api-key: "%s"' % self._LIVE, f.read())
+
+    def test_add_ds4pro_default_provider_is_opencode_go(self):
+        self._plant_pool()
+        rc, out, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(self._LIVE, out + err)   # secret: never printed
+        self.assertIn("provider opencode-go", out)
+        d = seat.seat_dir("ds4pro")
+        for p, want in ((os.path.join(d, "token"), 0o600),
+                        (os.path.join(d, "config.yaml"), 0o600),
+                        (os.path.join(d, "launch.sh"), 0o700)):
+            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), want, p)
+        with open(os.path.join(d, "config.yaml")) as f:
+            cfg = f.read()
+        self.assertIn('api-key: "%s"' % self._LIVE, cfg)     # baked 0600
+        self.assertIn('name: "opencode-go"', cfg)
+        self.assertIn('base-url: "https://opencode.ai/zen/go/v1"', cfg)
+        self.assertIn('- name: "deepseek-v4-pro"', cfg)      # opencode's id
+        self.assertIn('alias: "ds4-pro"', cfg)
+        self.assertIn("port: 8360", cfg)
+        self.assertNotIn("auth-dir", cfg)     # no OAuth dir for proxy-key
+
+    def test_add_ds4pro_provider_openrouter_route(self):
+        self._plant_pool()
+        rc, out, err = self._add(("add", "ds4pro", "--provider", "openrouter"))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("provider openrouter", out)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
+            cfg = f.read()
+        self.assertIn('name: "openrouter"', cfg)
+        self.assertIn('base-url: "https://openrouter.ai/api/v1"', cfg)
+        self.assertIn('- name: "deepseek/deepseek-v4-pro"', cfg)  # openrouter id
+        self.assertNotIn(self._LIVE, out + err)
+
+    def test_add_ds4pro_unknown_provider_refused(self):
+        self._plant_pool()
+        rc, _, err = self._add(("add", "ds4pro", "--provider", "bogus"))
+        self.assertEqual(rc, 2)
+        self.assertIn("no provider 'bogus'", err)
+        self.assertIn("opencode-go", err)     # names the valid choices
+
+    def test_add_ds4pro_pool_entry_base_url_wins(self):
+        """The credential_pool entry's own base_url overrides the family
+        default, so the seat rides exactly the endpoint the cred was minted
+        for (owner moves a gateway without a code change)."""
+        self._plant_pool(opencode=self._LIVE)
+        with open(seat.HERMES_AUTH) as f:
+            data = json.load(f)
+        data["credential_pool"]["opencode-go"][0]["base_url"] = \
+            "https://opencode.ai/zen/go/v2"
+        with open(seat.HERMES_AUTH, "w") as f:
+            json.dump(data, f)
+        rc, _, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
+            self.assertIn('base-url: "https://opencode.ai/zen/go/v2"', f.read())
+
+    def test_add_ds4pro_env_var_beats_pool(self):
+        self._plant_pool()
+        os.environ["DS4PRO_API_KEY"] = "sk-env-wins-over-pool"
+        rc, _, err = self._add(("add", "ds4pro"))
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:
+            self.assertIn('api-key: "sk-env-wins-over-pool"', f.read())
+
+    def test_add_ds4pro_missing_everything_names_all_sources(self):
+        rc, out, err = self._add(("add", "ds4pro"))   # no env/file/pool
+        self.assertEqual(rc, 1)
+        self.assertIn("DS4PRO_API_KEY", err)
+        self.assertIn("--key-from", err)
+        self.assertIn(seat.HERMES_AUTH, err)  # names the credential_pool source
+        self.assertIn("opencode-go", err)     # names the selected provider
+        self.assertFalse(os.path.exists(os.path.join(seat.seat_dir("ds4pro"),
+                                                     "config.yaml")))
+
+    def test_ds4pro_launch_line_shape_and_never_leaks_token(self):
+        self._plant_pool()
+        self.assertEqual(self._add(("add", "ds4pro"))[0], 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = seat.cmd_seat(["launch", "ds4pro"])
+        self.assertEqual(rc, 0)
+        line = out.getvalue().strip()
+        self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8360", line)
+        self.assertIn("HELM_CHAT_NAME=ds4pro", line)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000", line)
+        self.assertTrue(line.endswith(
+            "claude --dangerously-skip-permissions --model ds4-pro"))
+        self.assertNotIn("deepseek", line)    # alias on the wire, not the id
+        self.assertNotIn(self._LIVE, line)     # the outbound bearer never rides
+
+    def test_ds4pro_launch_sh_never_contains_the_bearer(self):
+        """The 0700 launch.sh is the real launch artifact — the outbound
+        bearer lives only in the 0600 config.yaml the proxy reads, never in
+        the launch line/argv/script."""
+        self._plant_pool()
+        self.assertEqual(self._add(("add", "ds4pro"))[0], 0)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "launch.sh")) as f:
+            self.assertNotIn(self._LIVE, f.read())
 
     # -- launch line shape --------------------------------------------------
     def test_launch_line_shape(self):
