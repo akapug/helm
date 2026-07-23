@@ -612,7 +612,8 @@ def _record_sign_failure(profile, failure):
 
 
 def _clear_sign_failure(profile, succeeded_at=None):
-    """Record a per-profile signed-success watermark in both owner views. The
+    """Record a per-profile committed-signing watermark in both owner views.
+    The real receipt-confirmed signing path is the sole production caller; the
     fallback changes only after the shared watermark write succeeds."""
     p = _profile(profile)
     succeeded_at = _epoch(succeeded_at, time.time())
@@ -637,6 +638,28 @@ def _clear_sign_failure(profile, succeeded_at=None):
                 return active
     except Exception:
         return False
+
+
+def _signed_success_epoch(profile):
+    """Exact-profile committed-signing evidence. ACK watermarks still retire
+    incidents but never claim that a signing receipt was observed."""
+    p = _profile(profile)
+    with _SIGN_FAILURE_FALLBACK_LOCK:
+        fallback = _fallback_sign_failure_state().get(p)
+        try:
+            _validate_sign_failure_owner()
+            if not os.path.exists(sign_failures_path()):
+                state = {}
+            else:
+                with _sign_failure_lock():
+                    state = _read_sign_failure_state()
+        except Exception:
+            return 0.0
+    rec = _combined_sign_failure_state(
+        state.get(p) if isinstance(state, dict) else None, fallback)
+    if rec.get("acknowledged_at"):
+        return 0.0
+    return _epoch(rec.get("_success_epoch"))
 
 
 def acknowledge_sign_failures(profile=None):
@@ -764,8 +787,22 @@ def transport_status():
                    failed_profiles=[f])
         return out
     if h is not None:
-        out["mode"] = "signed" if signer["usable"] else "unsigned (no signer)"
+        if not signer["usable"]:
+            out["mode"] = "unsigned (no signer)"
+        elif _signed_success_epoch(cell.profile_name()):
+            out.update(mode="signed", state="SIGNED", label="signed")
+        else:
+            out.update(mode="ready", state="READY",
+                       label="ready (unproven)",
+                       detail="no committed signing receipt observed for this profile")
     return out
+
+
+def transport_label(st):
+    """Public wording shared by every text renderer."""
+    if not isinstance(st, dict):
+        return "unknown"
+    return st.get("label") or st.get("mode", "unknown")
 
 
 def transport_failure_summary(st):
@@ -788,7 +825,7 @@ def _cmd_transport(args):
         st = transport_status()
         print("helm chat transport: " + (
             transport_failure_summary(st) if st.get("mode") == "degraded"
-            else "%s%s" % (st.get("mode", "unknown").upper(),
+            else "%s%s" % (transport_label(st).upper(),
                             " — chain #%s" % st["head"]
                             if st.get("head") is not None else "")))
         return 1 if st.get("mode") == "degraded" else 0
@@ -1110,6 +1147,9 @@ def _signed_row(row, payload_text, profile, sign):
         info, failure = _sign_send(payload, p)
         if not info:
             return _stamp_sign_failure(row, p, failure)
+        if not _complete_send(info):
+            return _stamp_sign_failure(row, p, _diag(
+                "send_failed", "signer returned no committed signing receipt"))
         signed_at = info.pop("_helm_signed_at", time.time())
         _clear_sign_failure(p, signed_at)
         row.update(turn=info.get("turn_hash"), receipt=info.get("receipt_hash"),

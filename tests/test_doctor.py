@@ -220,6 +220,23 @@ class TestChecks(DoctorBase):
         self.assertTrue(any(lvl == doctor.OK and "disabled" in msg
                             for lvl, msg in disabled))
 
+    def test_ready_unproven_signing_is_explicit(self):
+        st = {"mode": "ready", "state": "READY",
+              "label": "ready (unproven)",
+              "detail": "no committed signing receipt observed for this profile"}
+        from helm import cell
+        with mock.patch.object(chat, "node_url", return_value="http://node"), \
+             mock.patch.object(chat, "node_head", return_value={"chain_index": 7}), \
+             mock.patch.object(chat, "transport_status", return_value=st), \
+             mock.patch.object(chat, "cells_path",
+                               return_value=os.path.join(self.tmp.name, "none")), \
+             mock.patch.object(cell, "bin_status", return_value={
+                 "configured": True, "usable": True, "state": "ready",
+                 "reason": "signer ready"}):
+            warning = "\n".join(levels(doctor.check_chat_node(), doctor.WARN))
+        self.assertIn("ready (unproven)", warning)
+        self.assertIn("no committed signing receipt", warning)
+
     def test_configured_missing_signer_is_unavailable_not_unset(self):
         missing = os.path.join(self.tmp.name, "deleted-signer")
         with mock.patch.dict(os.environ, {

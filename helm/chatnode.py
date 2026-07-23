@@ -265,6 +265,8 @@ def _status(args):
     if transport.get("mode") == "degraded":
         print("helm chat node: " + chat.transport_failure_summary(transport),
               file=sys.stderr)
+    elif transport.get("mode") == "ready":
+        print("helm chat node: signing " + chat.transport_label(transport))
     head = cell.get_json(url + "/api/receipts", timeout=3)
     if head is None:
         print("helm chat node: API UNREACHABLE at %s — chat posts fall back "

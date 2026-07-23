@@ -322,6 +322,10 @@ def check_chat_node():
                                   "back to [unsigned]; `helm chat node up`" % url)]
     out = [(OK, "chat room node LIVE at %s — chain head %s" % (
         url, head.get("chain_index") if head else "(no receipts yet)"))] + degraded
+    if transport.get("mode") == "ready":
+        out.append((WARN, "chat signing %s — %s" % (
+            chat.transport_label(transport), transport.get("detail") or
+            "no committed signing receipt observed for this profile")))
     if not signer["configured"]:
         out.append((WARN, "chat signer OFF (HELM_CELL_BIN unset) — the node "
                           "answers but every post rides [unsigned]; set "

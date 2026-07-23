@@ -135,6 +135,8 @@ class TestWebChat(unittest.TestCase):
                                     timeout=10) as resp:
             html = resp.read().decode("utf-8")
         self.assertIn('t.mode === "degraded"', html)
+        self.assertIn('t.label || t.mode || "unsigned"', html)
+        self.assertIn('tp.label || tp.mode', html)
         self.assertIn('"DEGRADED · " + (t.profile', html)
         self.assertIn("t.first_failure", html)
         self.assertIn("t.last_failure", html)

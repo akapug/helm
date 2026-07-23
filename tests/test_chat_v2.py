@@ -687,7 +687,82 @@ class TransportTest(V2Base):
                               st["signer_configured"], st["head"]),
                              ("unsigned (no signer)", False, False, 15))
             with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER):
-                self.assertEqual(chat.transport_status()["mode"], "signed")
+                ready = chat.transport_status()
+            self.assertEqual((ready["mode"], ready["state"], ready["label"]),
+                             ("ready", "READY", "ready (unproven)"))
+            self.assertIn("no committed signing receipt", ready["detail"])
+            self.assertIn("READY (UNPROVEN)", human.status_line(
+                dict(human.model_new(), status=ready), 160))
+            chat_out = io.StringIO()
+            with mock.patch.object(chat, "transport_status", return_value=ready), \
+                 contextlib.redirect_stdout(chat_out):
+                self.assertEqual(chat.cmd_chat(["transport", "status"]), 0)
+            self.assertIn("READY (UNPROVEN)", chat_out.getvalue())
+            node_out = io.StringIO()
+            with mock.patch.object(chat, "transport_status", return_value=ready), \
+                 mock.patch.object(chatnode, "_systemctl", return_value=(0, "active")), \
+                 mock.patch.object(cellmod, "get_json", return_value=[]), \
+                 contextlib.redirect_stdout(node_out):
+                self.assertEqual(chatnode._status([]), 0)
+            self.assertIn("signing ready (unproven)", node_out.getvalue())
+
+    def test_committed_send_is_the_exact_profile_persisted_signing_witness(self):
+        path = os.path.join(self.tmp, "signer")
+        self._write_signer(path)
+        os.environ.update(HELM_CELL_BIN=path, HELM_CELL_PROFILE="profile-a",
+                          HELM_CHAT_NODE_URL="http://127.0.0.1:1")
+        with mock.patch.object(chat, "node_head",
+                               return_value={"chain_index": 15}), \
+             mock.patch.object(cellmod, "get_json", return_value=None):
+            before = chat.transport_status()
+            row = chat.post("commit witness", who="a1", profile="profile-a")
+            after = chat.transport_status()
+        self.assertEqual((before["mode"], before["label"]),
+                         ("ready", "ready (unproven)"))
+        self.assertEqual((row["chain"], after["mode"]), (7, "signed"))
+        self.assertGreater(chat._signed_success_epoch("profile-a"), 0)
+
+        os.environ["HELM_CELL_PROFILE"] = "profile-b"
+        with mock.patch.object(chat, "node_head",
+                               return_value={"chain_index": 16}):
+            isolated = chat.transport_status()
+        self.assertEqual((isolated["mode"], isolated["label"]),
+                         ("ready", "ready (unproven)"))
+
+        # Simulate a normal process reload: discard the process-local owner view;
+        # the persisted exact-profile watermark still proves A and never B.
+        chat._SIGN_FAILURE_FALLBACK.pop(
+            os.path.abspath(chat.sign_failures_path()), None)
+        os.environ["HELM_CELL_PROFILE"] = "profile-a"
+        with mock.patch.object(chat, "node_head",
+                               return_value={"chain_index": 17}):
+            self.assertEqual(chat.transport_status()["mode"], "signed")
+
+    def test_uncommitted_send_never_proves_signing(self):
+        os.environ.update(HELM_CELL_PROFILE="profile-a",
+                          HELM_CHAT_NODE_URL="http://127.0.0.1:1")
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
+             mock.patch.object(chat, "node_head",
+                               return_value={"chain_index": 15}), \
+             mock.patch.object(chat, "_sign_send", return_value=(
+                 None, chat._diag("send_failed", "receipt not committed"))):
+            self.assertEqual(chat.transport_status()["mode"], "ready")
+            row = chat.post("failed witness", who="a1", profile="profile-a",
+                            sign=True)
+            status = chat.transport_status()
+        self.assertNotIn("chain", row)
+        self.assertEqual((status["mode"], status["code"]),
+                         ("degraded", "send_failed"))
+        self.assertEqual(chat._signed_success_epoch("profile-a"), 0)
+
+        chat.acknowledge_sign_failures("profile-a")
+        malformed = dict(SENT, receipt_hash="not-a-receipt")
+        with mock.patch.object(chat, "_sign_send", return_value=(malformed, None)):
+            row = chat.post("malformed witness", who="a1", profile="profile-b",
+                            sign=True)
+        self.assertNotIn("chain", row)
+        self.assertEqual(row["transport"]["state"], "DEGRADED")
+        self.assertEqual(chat._signed_success_epoch("profile-b"), 0)
 
     def test_room_cell_cache_hits_without_binary(self):
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"

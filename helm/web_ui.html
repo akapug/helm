@@ -2680,7 +2680,7 @@ function chatTransport(t) {
   }
   el.textContent = t.mode === "signed"
     ? "signed ⛓" + (t.head == null ? "" : "#" + t.head)
-    : (t.mode || "unsigned"); // honest label, e.g. "unsigned (no signer)"
+    : (t.label || t.mode || "unsigned"); // honest owner wording
   el.title = "chat transport: " + (t.url || "v1 RAM room only");
 }
 
@@ -3315,7 +3315,7 @@ function ledgerStrip(d) {
       ? '<span title="chat transport truth (helm chat status): posts + attestations sign as cave turns">signing <span class="lbadge final">live · dregg-primary</span></span>'
       : tp.mode === "degraded"
         ? '<span title="RAM chat still delivers unsigned rows. Remediation: ' + esc(tp.remediation || "repair signing and retry") + '">signing <span class="lbadge tent">DEGRADED</span> · <b>' + esc(tp.profile || "?") + '</b> · ' + esc(tp.reason || "signing failed") + ' · first ' + esc(tp.first_failure || "?") + ' · last ' + esc(tp.last_failure || "?") + ' (' + esc(String(tp.last_age_s || 0)) + 's ago)</span>'
-        : '<span title="chat transport truth (helm chat status)">signing <span class="lbadge tent">' + esc(tp.mode) + '</span></span>';
+        : '<span title="chat transport truth (helm chat status)">signing <span class="lbadge tent">' + esc(tp.label || tp.mode) + '</span></span>';
   el.innerHTML =
     '<span><b>' + (s.healthy === true ? "healthy" : "degraded") + '</b></span>' + sig +
     '<span title="turns accepted at ingress">ingress <b>' + esc(String(s.dag_height ?? "?")) + '</b></span>' +

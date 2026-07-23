@@ -287,9 +287,10 @@ class TestWebLedgerSigned(LedgerBase):
         self.assertEqual(status, 200)
         return d, {t["turn_hash"]: t for t in d["turns"]}
 
-    def test_transport_reports_signed(self):
+    def test_transport_reports_ready_until_this_profile_commits(self):
         d, _ = self._turns_by_hash()
-        self.assertEqual(d["transport"]["mode"], "signed")
+        self.assertEqual((d["transport"]["mode"], d["transport"]["label"]),
+                         ("ready", "ready (unproven)"))
         self.assertTrue(d["transport"]["signer"])
 
     def test_chat_turn_carries_its_about_label(self):
