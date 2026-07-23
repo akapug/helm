@@ -3274,6 +3274,9 @@ def cmd_seat(args):
     if verb == "autocompact":
         from . import autocompact
         return autocompact.cmd_autocompact(rest)
+    if verb == "silent-swallow":
+        from . import silent_swallow
+        return silent_swallow.cmd_silent_swallow(rest)
     if verb == "spawn":
         if not rest:
             print("usage: helm seat spawn <seat> [--room R] [--cwd DIR] "
