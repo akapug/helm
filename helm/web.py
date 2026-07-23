@@ -1403,6 +1403,19 @@ def _mp_caves():
     return sorted(caves)
 
 
+def _mp_pub(row, fields):
+    """A copy of `row` with each identity/display field in `fields` display-
+    laundered through chat._dsan — the cave web wire's analog of chat.public_rows.
+    A peer actor/connection/state or an envelope actor rides the BLIND relay from
+    any client, so a bidi/control-char payload must never reach the cave panel."""
+    from . import chat
+    c = dict(row)
+    for k in fields:
+        if isinstance(c.get(k), str):
+            c[k] = chat._dsan(c[k])
+    return c
+
+
 def _api_mp_state(qs):
     """The cave tab's poll (open on loopback, like every GET): the blind relay's
     opaque update log after ?after=CURSOR + the live TTL peers + the discoverable
@@ -1434,11 +1447,22 @@ def _api_mp_state(qs):
         peers = presence.peers(cave)
     except ValueError:
         peers = []
-    updates = [{"id": u.get("id"), "actor": u.get("actor"), "ts": u.get("ts"),
-                "bytes": len(str(u.get("update", "")).encode("utf-8")),
-                "update": u.get("update")} for u in state["updates"]]
+    # DISPLAY-launder every identity/display field the SERVER emits, mirroring the
+    # chat wire (public_rows/_dsan): peer actor/connection/state, the demo cell's
+    # envelope actor, and the discoverable cave names all ride the BLIND relay
+    # from any client. The opaque `update` stays RAW — the relay never decodes it,
+    # and the browser folds the CRDT and launders the decoded cell at its render
+    # seam (the server cannot, without breaking the blind-relay contract).
+    from . import chat
+    peers = [_mp_pub(p, ("actor", "connection", "state")) for p in peers]
+    updates = [_mp_pub({"id": u.get("id"), "actor": u.get("actor"),
+                        "ts": u.get("ts"),
+                        "bytes": len(str(u.get("update", "")).encode("utf-8")),
+                        "update": u.get("update")}, ("actor",))
+               for u in state["updates"]]
+    caves = [chat._dsan(c) for c in _mp_caves()]
     return {"cave": cave, "doc": doc, "cursor": state["cursor"], "reset": reset,
-            "updates": updates, "peers": peers, "caves": _mp_caves()}, 200
+            "updates": updates, "peers": peers, "caves": caves}, 200
 
 
 def _api_mp_publish(payload):

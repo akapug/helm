@@ -145,6 +145,52 @@ class TestWebMultiplayer(unittest.TestCase):
         self.assertTrue(d["reset"])
         self.assertEqual(len(d["updates"]), 1)  # replayed from the head
 
+    def test_state_launders_relay_supplied_identity_fields(self):
+        # bidi (U+202E, category Cf) passes the source-side _identity validator
+        # (it rejects only Cc), so a relay client CAN plant it in actor/
+        # connection/state/cave. The web sink must launder every identity/display
+        # field it emits — the analog of the CLI's launder + the chat wire's
+        # public_rows — while the opaque `update` rides through RAW: the browser
+        # folds the CRDT and launders the decoded cell at its own render seam.
+        BIDI = "‮"
+        relay, presence = multiplayer.adapters()
+        relay.publish("demo", "board", "code" + BIDI + "x",
+                      multiplayer_demo.encode("greeting", "he" + BIDI + "llo",
+                                              "code" + BIDI + "x"))
+        presence.heartbeat("demo", "ag" + BIDI + "ent", "bu" + BIDI + "ild",
+                           connection="ta" + BIDI + "b1")
+        relay.publish("ca" + BIDI + "ve9", "board", "x",
+                      multiplayer_demo.encode("k", "v", "x"))
+        s, d = self.req("/api/multiplayer/state?cave=demo&doc=board")
+        self.assertEqual(s, 200)
+        p = d["peers"][0]
+        # peer identity/display columns laundered; the visible name still survives
+        self.assertEqual((p["actor"], p["connection"], p["state"]),
+                         ("agent", "tab1", "build"))
+        self.assertEqual(d["updates"][0]["actor"], "codex")  # envelope actor
+        self.assertIn("cave9", d["caves"])                   # discoverable name
+        # NO server-emitted identity field carries the bidi override
+        for v in (p["actor"], p["connection"], p["state"],
+                  d["updates"][0]["actor"], *d["caves"]):
+            self.assertNotIn(BIDI, v)
+        # BUT the opaque update rides through RAW — the relay stays blind, and the
+        # browser launders the decoded cell at its render seam (see the page test).
+        self.assertIn(BIDI, d["updates"][0]["update"])
+
+    def test_served_page_launders_the_client_decoded_board(self):
+        # the board cell key/value/actor are decoded BROWSER-side from the opaque
+        # update (blind relay — the server cannot launder what it never decodes),
+        # so the shipped client must launder at its render seam. This pins the
+        # web-side equivalent of the CLI's launder test, closing that coverage gap.
+        with urllib.request.urlopen("http://127.0.0.1:%d/" % self.port,
+                                    timeout=10) as resp:
+            html = resp.read().decode("utf-8")
+        self.assertIn("const mpLaunder", html)
+        self.assertIn("\\p{Cf}", html)                       # strips bidi overrides
+        self.assertIn("esc(mpLaunder(c.value))", html)       # the board value sink
+        self.assertIn("esc(mpLaunder(c.actor))", html)       # the board actor sink
+        self.assertIn("esc(mpLaunder(p.actor))", html)       # the peer actor sink
+
     def test_served_page_carries_the_cave_tab_and_client_fold(self):
         with urllib.request.urlopen("http://127.0.0.1:%d/" % self.port,
                                     timeout=10) as resp:

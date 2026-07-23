@@ -872,6 +872,14 @@ details.cfgsec>summary:hover{color:var(--fg)}
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+/* the cave panel's identity/display launder — the BROWSER analog of chat._dsan
+   (helm/chat.py). The blind relay's opaque updates are folded HERE
+   (materializeCave), so a demo cell's key/value/actor is decoded client-side and
+   the server can never launder it. Strip bidi overrides (Cf) + C0/C1 controls
+   (Cc, tab kept) + line/paragraph separators (Zl/Zp) so a relayed payload cannot
+   reorder or reshape a rendered cell/peer. Applied BENEATH esc(), which entity-
+   escapes for XSS; this closes display/identity-spoofing, its orthogonal sibling. */
+const mpLaunder = s => String(s ?? "").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, c => c === "\t" ? c : "");
 const TOKEN = "__HELM_TOKEN__"; // per-process anti-CSRF bearer, templated in by the server — every POST carries it
 const KNOWN_H = ["claude", "codex", "opencode"];
 const STORE_ORDER = ["premise", "prior", "lexicon", "heuristic", "reference", "episodic"];
@@ -3127,18 +3135,18 @@ function renderPeers(peers) {
   el.innerHTML = peers.map(p => {
     const c = peerClass(p), age = Math.max(0, Date.now() / 1000 - (p.seen || 0));
     return '<div class="peer ' + c + '"><i class="pdot ' + c + '"></i>' +
-      '<span class="pactor">' + esc(p.actor) + '</span>' +
-      '<span class="pconn">' + esc(p.connection) + '</span>' +
-      '<span class="pstate">' + esc(p.state) + '</span>' +
+      '<span class="pactor">' + esc(mpLaunder(p.actor)) + '</span>' +
+      '<span class="pconn">' + esc(mpLaunder(p.connection)) + '</span>' +
+      '<span class="pstate">' + esc(mpLaunder(p.state)) + '</span>' +
       '<span class="page">' + Math.round(age) + 's</span></div>';
   }).join("");
 }
 function renderBoard(view) {
   const el = $("#boardRows");
   let html = view.board.map(c =>
-    '<div class="cell"><span class="ckey">' + esc(c.key) + '</span>' +
-    '<span class="cval">' + esc(c.value) + '</span>' +
-    '<span class="cwho">' + esc(c.actor) + '</span>' +
+    '<div class="cell"><span class="ckey">' + esc(mpLaunder(c.key)) + '</span>' +
+    '<span class="cval">' + esc(mpLaunder(c.value)) + '</span>' +
+    '<span class="cwho">' + esc(mpLaunder(c.actor)) + '</span>' +
     '<span class="cwhen">' + (c.ts ? Math.round(Math.max(0, Date.now() / 1000 - c.ts)) + 's' : '') +
     '</span></div>').join("");
   if (!view.board.length) html = '<div class="cempty">no cells yet — set one below</div>';
@@ -3151,14 +3159,14 @@ function renderLog(updates) {
   if (!updates.length) { el.innerHTML = '<div class="cempty">no updates yet</div>'; return; }
   el.innerHTML = updates.slice(-40).map(u =>
     '<div class="env"><span class="eid">' + esc(String(u.id || "").slice(0, 8)) + '</span>' +
-    '<span class="eactor">' + esc(u.actor) + '</span>' +
+    '<span class="eactor">' + esc(mpLaunder(u.actor)) + '</span>' +
     '<span class="ebytes">' + (u.bytes | 0) + ' B</span></div>').join("");
 }
 function renderCaves(caves) {
   const key = caves.join("\n");
   if (key === CAVE_CAVELIST) return;                     // no churn while typing
   CAVE_CAVELIST = key;
-  $("#caveList").innerHTML = caves.map(c => '<option value="' + esc(c) + '">').join("");
+  $("#caveList").innerHTML = caves.map(c => '<option value="' + esc(mpLaunder(c)) + '">').join("");
 }
 async function caveSet(ev) {
   ev.preventDefault();
