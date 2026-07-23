@@ -3298,7 +3298,15 @@ function nativeRows(d) {
 function ledgerStrip(d) {
   const el = $("#ledgerstrip");
   if (d.offline) {
-    el.innerHTML = '<span class="offline">substrate offline — node unreachable at <code>' + esc(d.node) + '</code>; retrying quietly…</span>';
+    const tp = d.transport, degraded = tp && tp.mode === "degraded";
+    el.innerHTML = '<span class="offline">substrate offline — node unreachable at <code>' +
+      esc(d.node) + '</code>; retrying quietly…</span>' + (degraded
+        ? '<span title="' + esc(tp.remediation || "repair signing and retry") +
+          '">chat signing <span class="lbadge tent">DEGRADED</span> · <b>' +
+          esc(tp.profile || "?") + '</b> · ' + esc(tp.reason || "signing failed") +
+          ' · first ' + esc(tp.first_failure || "?") + ' · last ' +
+          esc(tp.last_failure || "?") + ' (' + esc(String(tp.last_age_s || 0)) +
+          's ago)</span>' : '');
     return;
   }
   const s = d.status || {}, fin = s.latest_height ?? 0, tp = d.transport;

@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import web  # noqa: E402
+from helm import chat, web  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_NODE_URL", "MELD_NODE_URL",
             "HELM_CHAT_DIR", "MELD_CHAT_DIR",
@@ -119,6 +119,7 @@ class LedgerBase(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        failure_dir = chat.sign_failures_dir()
         cls.srv.shutdown()
         cls.srv.server_close()
         cls.thread.join(timeout=5)
@@ -127,6 +128,7 @@ class LedgerBase(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        shutil.rmtree(failure_dir, ignore_errors=True)
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def req(self, path, payload=None, token=True):
@@ -315,7 +317,23 @@ class TestWebLedgerOffline(LedgerBase):
     def test_ledger_fails_open(self):
         status, d = self.req("/api/ledger")
         self.assertEqual(status, 200)
-        self.assertEqual(d, {"offline": True, "node": self.node_url})
+        self.assertTrue(d["offline"])
+        self.assertEqual(d["node"], self.node_url)
+        self.assertEqual(d["transport"]["mode"], "unsigned")
+
+    def test_offline_ledger_keeps_persistent_chat_degradation(self):
+        chat._record_sign_failure(
+            "retired-seat", chat._diag("send_failed", "persistent failure"))
+        try:
+            status, d = self.req("/api/ledger")
+            self.assertEqual(status, 200)
+            self.assertTrue(d["offline"])
+            self.assertEqual((d["transport"]["mode"],
+                              d["transport"]["profile"],
+                              d["transport"]["reason"]),
+                             ("degraded", "retired-seat", "persistent failure"))
+        finally:
+            chat.acknowledge_sign_failures("retired-seat")
 
     def test_turn_status_fails_open(self):
         status, d = self.req("/api/ledger/turn?hash=" + "a" * 64)

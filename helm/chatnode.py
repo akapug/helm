@@ -132,9 +132,12 @@ def unlock(url, passphrase):
     r = cell.post_json(url + "/api/cipherclerk/unlock", {"passphrase": passphrase})
     if not isinstance(r, dict):
         return None, "unlock unreachable at %s" % url
-    if not r.get("success"):
-        return None, "unlock refused: %s" % (r.get("error") or r)
-    return r.get("bearer_token") or "", None
+    if r.get("success") is not True:
+        return None, "unlock refused: %s" % (r.get("error") or "success was not true")
+    token = r.get("bearer_token")
+    if not isinstance(token, str):
+        return None, "unlock accepted without a string bearer_token"
+    return token, None
 
 
 def bootstrap_cell_hex():
@@ -151,28 +154,30 @@ def faucet(url, recipient, amount):
                        {"recipient": recipient, "amount": amount})
     if not isinstance(r, dict):
         return None, "faucet unreachable or returned a non-object response at %s" % url
-    if not r.get("success"):
-        return None, "faucet refused: %s" % (r.get("error") or "success was false")
+    if r.get("success") is not True:
+        return None, "faucet refused: %s" % (r.get("error") or "success was not true")
     return r, None
 
 
-def ensure_healthy(url):
-    """The node's client-facing health gate demands one committed block; a
-    faucet turn to the throwaway bootstrap cell provides it. Returns
-    (True, None) or (False, precise reason) — the faucet response is never
-    discarded."""
+def ensure_healthy_result(url):
+    """Precise bootstrap result for callers that need attribution."""
     st = cell.get_json(url + "/status", timeout=3)
-    if isinstance(st, dict) and st.get("healthy"):
+    if isinstance(st, dict) and st.get("healthy") is True:
         return True, None
     _r, err = faucet(url, bootstrap_cell_hex(), 1)
     if err:
         return False, err
     for _ in range(20):
         st = cell.get_json(url + "/status", timeout=3)
-        if isinstance(st, dict) and st.get("healthy"):
+        if isinstance(st, dict) and st.get("healthy") is True:
             return True, None
         time.sleep(0.25)
     return False, "faucet accepted but the node never became healthy at %s" % url
+
+
+def ensure_healthy(url):
+    """Backward-compatible bool API; precise callers use ensure_healthy_result."""
+    return ensure_healthy_result(url)[0]
 
 
 def provision(url, passphrase=None):
@@ -185,7 +190,7 @@ def provision(url, passphrase=None):
     token, err = unlock(url, passphrase)
     if err:
         return None, err
-    healthy, err = ensure_healthy(url)
+    healthy, err = ensure_healthy_result(url)
     if not healthy:
         return None, "node reachable but never produced a block: %s" % err
     st.update({"url": url, "passphrase": passphrase, "token": token})

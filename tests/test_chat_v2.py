@@ -27,7 +27,7 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NODE_BIN", "MELD_CHAT_NODE_BIN",
             "HELM_CELL_BIN", "MELD_CELL_BIN")
 
-SENT = {"sent": True, "turn_hash": "t" * 64, "receipt_hash": "r" * 64,
+SENT = {"sent": True, "turn_hash": "a" * 64, "receipt_hash": "b" * 64,
         "chain_index": 7}
 
 
@@ -88,8 +88,8 @@ class TransportTest(V2Base):
         with mock.patch.object(chat, "_sign_send", return_value=(SENT, None)) as ss:
             m = chat.post("signed :fire:", who="a1", sign=True)
         self.assertEqual(m["chain"], 7)
-        self.assertEqual(m["turn"], "t" * 64)
-        self.assertEqual(m["receipt"], "r" * 64)
+        self.assertEqual(m["turn"], "a" * 64)
+        self.assertEqual(m["receipt"], "b" * 64)
         self.assertEqual(m["text"], "signed 🔥")  # expansion BEFORE signing
         ss.assert_called_once_with(chat.digest_payload("signed 🔥"),
                                    mock.ANY)
@@ -185,6 +185,125 @@ class TransportTest(V2Base):
         self.assertEqual(rb.call_count, 2)
         self.assertEqual(fc.call_count, 2)  # proactive + recovery grants
 
+    def test_diagnostics_scrub_auth_schemes_and_quoted_secret_keys(self):
+        cases = (
+            "Authorization: Basic dXNlcjpwYXNz",
+            'Authorization: Digest username="david", response="sekrit"',
+            "Authorization='Signature keyId=abc signature=sekrit'",
+            "{'bearer_token':'sekrit with spaces'}",
+            '{"refresh_token": "also-secret"}',
+            '{"token": "abc\\\"sekrit"}',
+            "token abc123",
+            "Basic abc123 extra",
+            "Bearer abc123",
+        )
+        for raw in cases:
+            clean = chat._safe_reason(raw)
+            self.assertNotIn("sekrit", clean, raw)
+            self.assertNotIn("dXNlcjpwYXNz", clean, raw)
+            self.assertNotIn("also-secret", clean, raw)
+            self.assertNotIn("abc123", clean, raw)
+            self.assertIn("redacted", clean, raw)
+
+    def test_send_acceptance_requires_exact_true_hex_hashes_and_int_chain(self):
+        good = dict(SENT)
+        self.assertTrue(chat._complete_send(good))
+        for patch in ({"sent": "false"}, {"sent": 1},
+                      {"turn_hash": "z" * 64}, {"receipt_hash": "r" * 64},
+                      {"chain_index": False}, {"chain_index": "7"}):
+            bad = dict(good, **patch)
+            self.assertFalse(chat._complete_send(bad), patch)
+
+    def test_malformed_send_receipt_cannot_clear_or_mark_the_row_signed(self):
+        chat._record_sign_failure("p1", chat._diag("send_failed", "existing"))
+        malformed = dict(SENT, sent="false", chain_index=False)
+        result = (0, json.dumps(malformed), "")
+        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(chat, "_room_cell",
+                               return_value=("c" * 64, None, True)), \
+             mock.patch.object(chat, "_balance", return_value=None), \
+             mock.patch.object(cellmod, "run_bin", return_value=result), \
+             mock.patch.object(chat, "_revive", return_value=(None, "refused")), \
+             mock.patch.object(chat, "_faucet", return_value=(None, "refused")):
+            row = chat.post("still degraded", who="a1", profile="p1", sign=True)
+        self.assertNotIn("chain", row)
+        self.assertEqual(row["transport"]["state"], "DEGRADED")
+        self.assertEqual(chat.sign_failures()[0]["profile"], "p1")
+
+    def test_malformed_incident_state_never_crashes_or_discards_valid_receipt(self):
+        os.makedirs(chat.sign_failures_dir(), exist_ok=True)
+        with open(chat.sign_failures_path(), "w") as f:
+            json.dump({"p1": {"profile": "stale-alias", "reason": "old",
+                              "_last_epoch": "bad", "failure_count": "many"},
+                       "junk": [1, 2, 3]}, f)
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(chat, "node_head", return_value={"chain_index": 1}):
+            st = chat.transport_status()
+        self.assertEqual((st["mode"], st["profile"], st["code"],
+                          st["reason"], st["failure_count"]),
+                         ("degraded", "p1", "incident_state_corrupt", "old", 1))
+        with mock.patch.object(chat, "_sign_send", return_value=(dict(SENT), None)):
+            row = chat.post("valid wins", who="a1", profile="p1", sign=True)
+        self.assertEqual(row["chain"], 7)
+        self.assertNotIn("transport", row)
+        self.assertEqual(chat.sign_failures(), [])
+
+    def test_full_profile_identity_prevents_prefix_cross_clear(self):
+        a = "p" * 120 + "-a"
+        b = "p" * 120 + "-b"
+        chat._record_sign_failure(a, chat._diag("send_failed", "a failed"))
+        chat._record_sign_failure(b, chat._diag("send_failed", "b failed"))
+        self.assertEqual({f["profile"] for f in chat.sign_failures()}, {a, b})
+        chat._clear_sign_failure(a)
+        self.assertEqual([f["profile"] for f in chat.sign_failures()], [b])
+
+    def test_configured_ready_signer_with_unreachable_node_is_degraded(self):
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        for outcome in (None, OSError("probe exploded")):
+            patch = mock.patch.object(chat, "node_head", return_value=outcome) \
+                if outcome is None else mock.patch.object(
+                    chat, "node_head", side_effect=outcome)
+            with self.subTest(outcome=repr(outcome)), \
+                 mock.patch.object(cellmod, "bin_ready", return_value=True), patch:
+                st = chat.transport_status()
+                self.assertEqual((st["mode"], st["code"]),
+                                 ("degraded", "node_unreachable"))
+                self.assertIn("configured chat node unreachable", st["reason"])
+        out = io.StringIO()
+        with mock.patch.object(cellmod, "bin_ready", return_value=True), \
+             mock.patch.object(chat, "node_head", return_value=None), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(chat.cmd_chat(["transport", "status"]), 1)
+        self.assertIn("DEGRADED", out.getvalue())
+        self.assertIn("configured chat node unreachable", out.getvalue())
+
+    def test_transport_ack_retires_exact_or_all_dead_profiles(self):
+        chat._record_sign_failure("dead-old", chat._diag("send_failed", "gone"))
+        chat._record_sign_failure("dead-two", chat._diag("join_failed", "gone"))
+        with mock.patch.object(chat.time, "time", return_value=10**12):
+            self.assertEqual(
+                {f["profile"] for f in chat.sign_failures()},
+                {"dead-old", "dead-two"})  # active incidents never age out
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(chat.cmd_chat(
+                ["transport", "ack", "--profile", "dead-old"]), 0)
+        self.assertIn("ACKNOWLEDGED (not recovered)", out.getvalue())
+        self.assertEqual([f["profile"] for f in chat.sign_failures()], ["dead-two"])
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(chat.cmd_chat(["transport", "ack", "--all"]), 0)
+        self.assertEqual(chat.sign_failures(), [])
+        # A delayed pre-ack process cannot resurrect the retired incident.
+        old = chat._diag("send_failed", "late", event_epoch=1, event_ts="old")
+        chat._record_sign_failure("dead-old", old)
+        self.assertEqual(chat.sign_failures(), [])
+        # ACK is not a permanent ignore: a genuinely later failure reopens it.
+        future = chat._diag("send_failed", "new failure",
+                            event_epoch=chat.time.time() + 1, event_ts="future")
+        chat._record_sign_failure("dead-old", future)
+        self.assertEqual(chat.sign_failures()[0]["reason"], "new failure")
+
     def test_failure_persists_in_ram_status_and_signed_success_clears_it(self):
         """Two unsigned fallbacks land, first/last/count/age persist, every
         surface reads DEGRADED, then the profile's signed turn is the clear
@@ -266,10 +385,13 @@ class TransportTest(V2Base):
         with mock.patch.object(chat.time, "time", return_value=300):
             chat._record_sign_failure("p1", chat._diag("join_failed", "newer"))
         with mock.patch.object(chat.time, "time", return_value=400):
-            chat._record_sign_failure("p1", delayed)
+            returned = chat._record_sign_failure("p1", delayed)
         state = chat.sign_failures()[0]
-        self.assertEqual((state["code"], state["reason"]),
-                         ("join_failed", "newer"))
+        self.assertEqual((state["code"], state["reason"], state["failure_count"]),
+                         ("join_failed", "newer", 2))
+        self.assertEqual((returned["code"], returned["reason"],
+                          returned["failure_count"]),
+                         ("join_failed", "newer", 2))
 
     def test_no_signer_short_circuits_the_signing_leg(self):
         """Day-review #1: with HELM_CELL_BIN unset a signed turn is
@@ -357,7 +479,7 @@ class DreggSignerBinTest(V2Base):
 
     JOIN = {"joined": True, "cell": "c" * 64, "public_key": "e" * 64,
             "profile": "p1", "materialized": True}
-    SEND = {"sent": True, "turn_hash": "t" * 64, "receipt_hash": "r" * 64,
+    SEND = {"sent": True, "turn_hash": "a" * 64, "receipt_hash": "b" * 64,
             "chain_index": 9, "agent_cell": "c" * 64, "topic": "helm.chat",
             "finality": "final", "consensus_final": True}
 
@@ -385,8 +507,8 @@ class DreggSignerBinTest(V2Base):
             f.write("tok-abc")           # the RAM-side node token cache
         m = chat.post("hello", who="a1", profile="p1", sign=True)
         # the receipt parsed into the row: {sent,turn_hash,receipt_hash,chain_index}
-        self.assertEqual(m["turn"], "t" * 64)
-        self.assertEqual(m["receipt"], "r" * 64)
+        self.assertEqual(m["turn"], "a" * 64)
+        self.assertEqual(m["receipt"], "b" * 64)
         self.assertEqual(m["chain"], 9)
         self.assertNotIn("[unsigned]", chat._fmt(m))
         with open(log) as f:
@@ -664,6 +786,27 @@ class NodeSupervisorTest(V2Base):
         self.assertEqual(err, "faucet refused: rate limited")
         post.assert_called_once_with(
             "http://node/api/faucet", {"recipient": "c" * 64, "amount": 10000})
+
+    def test_truthy_strings_are_not_faucet_unlock_or_health_success(self):
+        with mock.patch.object(cellmod, "post_json",
+                               return_value={"success": "false",
+                                             "bearer_token": "tok"}):
+            self.assertIsNotNone(chatnode.faucet("http://node", "c" * 64, 1)[1])
+            self.assertIsNotNone(chatnode.unlock("http://node", "pw")[1])
+        with mock.patch.object(cellmod, "get_json",
+                               return_value={"healthy": "false"}), \
+             mock.patch.object(chatnode, "faucet",
+                               return_value=(None, "refused")):
+            self.assertEqual(chatnode.ensure_healthy_result("http://node"),
+                             (False, "refused"))
+
+    def test_ensure_healthy_keeps_the_legacy_bool_contract(self):
+        with mock.patch.object(chatnode, "ensure_healthy_result",
+                               return_value=(True, None)):
+            self.assertIs(chatnode.ensure_healthy("http://node"), True)
+        with mock.patch.object(chatnode, "ensure_healthy_result",
+                               return_value=(False, "no")):
+            self.assertIs(chatnode.ensure_healthy("http://node"), False)
 
     def test_cmd_node_usage_and_missing_binary(self):
         err = io.StringIO()

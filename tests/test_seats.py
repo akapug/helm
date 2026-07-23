@@ -1016,7 +1016,7 @@ class DMTest(SeatsBase):
                       seats.deliver_any(session="s-p", seat="team.a"))
 
     def test_dm_signed_like_a_post_and_renders_as_dm(self):
-        sent = {"sent": True, "turn_hash": "t" * 64, "receipt_hash": "r" * 64,
+        sent = {"sent": True, "turn_hash": "a" * 64, "receipt_hash": "b" * 64,
                 "chain_index": 9}
         with mock.patch.object(chat, "_sign_send", return_value=(sent, None)) as ss:
             row, err = seats.dm("zoe", "signed word", who="ada", sign=True)

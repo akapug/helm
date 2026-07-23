@@ -1140,8 +1140,9 @@ def _api_ledger(qs):
     url = cell.node_url()
     status = cell.get_json(url + "/status", timeout=3)
     receipts = cell.get_json(url + "/api/receipts", timeout=3)
+    transport = _chat_transport()
     if status is None and receipts is None:
-        return {"offline": True, "node": url}, 200
+        return {"offline": True, "node": url, "transport": transport}, 200
     turns = sorted((r for r in (receipts or []) if isinstance(r, dict)),
                    key=lambda r: r.get("chain_index", 0),
                    reverse=True)[:LEDGER_TURNS]
@@ -1167,7 +1168,7 @@ def _api_ledger(qs):
                              -(c.get("last_turn_ts") or 0), c.get("id") or ""))
     return {"node": url,
             "status": {k: (status or {}).get(k) for k in LEDGER_STATUS_KEYS},
-            "transport": _chat_transport(),
+            "transport": transport,
             "turns": turns, "cells": rows}, 200
 
 
