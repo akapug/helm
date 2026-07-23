@@ -516,6 +516,29 @@ class DeliverTest(SeatsBase):
         self.assertNotIn("123", blob)              # the offender never rendered
         self.assertIsNone(seats.deliver_any(seat="alice"))  # drained, no strand
 
+    def test_unrenderable_main_row_does_not_strand_the_deliverable_scan(self):
+        """The COERCION half (deliverable() non-str text -> ''): a MAIN-ROOM row
+        with malformed non-string text would make deliverable()'s @mention regex
+        .search() raise DURING the backlog scan (not render) — stranding every
+        row behind it. The coercion makes it a clean non-match (undeliverable, no
+        crash), so a real @mention row AFTER it still delivers. Complements the
+        dm/render-raise strand test above; both halves (scan-coercion +
+        render-skip) are load-bearing (fable gate, 2026-07-23)."""
+        self.seat_up()
+        with open(chat.room_path("main"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "t", "from": "bob", "id": "badm",
+                                "text": 999}) + "\n")          # non-str, non-dm
+            f.write(json.dumps({"ts": "t", "from": "bob", "id": "gm",
+                                "text": "@alice after the bad main row"}) + "\n")
+        got = []
+        for _ in range(6):
+            line = seats.deliver(seat="alice")   # a skipped scan-row is None too
+            if line:
+                got.append(line)
+        blob = " ".join(got)
+        self.assertIn("after the bad main row", blob)  # scan got PAST the bad row
+        self.assertNotIn("999", blob)                  # offender: no mention, undelivered
+
 
 class WaitTest(SeatsBase):
     def test_wait_returns_pending_and_advances_cursor(self):

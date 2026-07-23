@@ -1324,9 +1324,13 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
             # (never a silent drop) and advance the cursor PAST the offender so
             # the rest drains. H7 holds — this wraps CONSTRUCTION only, never the
             # emit below (an emit that dies must still NOT commit).
-            os.write(2, ("[helm chat] skipped an unrenderable row %r in %s "
-                         "(%s) — advancing past it\n"
-                         % (row.get("id"), room, e)).encode("utf-8", "replace"))
+            try:
+                os.write(2, ("[helm chat] skipped an unrenderable row %r in %s "
+                             "(%s) — advancing past it\n"
+                             % (row.get("id"), room, e)).encode("utf-8", "replace"))
+            except OSError:
+                pass          # a dead/closed stderr (daemonized) must NOT re-raise
+                              # here — that would strand the backlog it's skipping
             _write_cursor(room, seat, dev, ino, end, row.get("id"),
                           session=session, active=True, base=cbase)
             return None
