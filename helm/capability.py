@@ -56,11 +56,11 @@ CAPABILITIES = (
     },
     {
         "id": "meld",
-        "verb": "helm meld",
-        "tool": "helm meld",
+        "verb": "helm chat meld",
+        "tool": "helm chat meld",
         "what": "converge with another model/seat in-turn — independent drafts, "
                 "you synthesize the final answer",
-        "wired_via": "helm meld + the /com council skill",
+        "wired_via": "helm chat meld + the /com council skill",
         "keywords": "meld,converge,a2a,second opinion,another seat,another model,"
                     "second seat,another take,pair with,two models,cross-family",
         "tier": TIER_CORE,

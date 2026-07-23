@@ -76,7 +76,7 @@ class SurfacingTest(CapBase):
         # and it renders the owner's exact "you have ... (wired via ..., live)".
         lines = self.jit("let's a2a converge with another seat on this")
         blob = "\n".join(lines)
-        self.assertIn("CAP you have helm meld:", blob)
+        self.assertIn("CAP you have helm chat meld:", blob)
         self.assertIn("wired via", blob)
         self.assertIn("live)", blob)
 
@@ -157,10 +157,10 @@ class BudgetAndCooldownTest(CapBase):
     def test_capability_cools_after_firing(self):
         sid = "cap-cooldown-sess"
         first = inject.gather("let's a2a converge with another seat", session=sid)
-        self.assertTrue(any("helm meld" in l for l in first["jit"]))
+        self.assertTrue(any("helm chat meld" in l for l in first["jit"]))
         second = inject.gather("let's a2a converge with another seat", session=sid)
         # same prompt, same session, next turn -> meld is cooled off (not re-fired)
-        self.assertFalse(any("helm meld" in l for l in second["jit"]),
+        self.assertFalse(any("helm chat meld" in l for l in second["jit"]),
                          "a fired capability must cool like any JIT entry")
 
 
@@ -211,7 +211,7 @@ class BrowseVerbTest(CapBase):
         rc, out, _ = self._run(["--public"])
         self.assertEqual(rc, 0)
         self.assertNotIn("polyana", out)
-        self.assertIn("helm meld", out)
+        self.assertIn("helm chat meld", out)
 
     def test_json_shape(self):
         import json
