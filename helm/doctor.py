@@ -190,6 +190,35 @@ def check_adopted_store(adopted_dir=None):
     return out
 
 
+def check_lexicon_dead_vocabulary():
+    """A multi-word kind: WITHOUT a comma and with no keywords: is a legacy
+    mis-filed keywords list the comma-gated fallback cannot rescue (it cannot
+    be told from a taxonomy slug) — that entry's symptom vocabulary is dead
+    until redefined with the 4-field form."""
+    from . import store
+    try:
+        # include_retired pulls the WHOLE record set (default load_all drops
+        # every non-injectable status — candidate/provisional included), so a
+        # mis-filed CANDIDATE's dead vocabulary is SEEN; only the tombstoned
+        # states (retired/delete_eligible) are genuinely gone and skipped.
+        entries = store.load_all(types=("lexicon",), include_retired=True)
+    except Exception as e:  # scan trouble is a WARN, never a crash
+        return [(WARN, "lexicon scan failed: %s" % e)]
+    out = []
+    for e in entries:
+        if e.get("status") in (store.STATUS_RETIRED, store.STATUS_DELETE_ELIGIBLE):
+            continue
+        kind = (e.get("kind") or "").strip()
+        if len(kind.split()) > 1 and "," not in kind and not e.get("keywords"):
+            out.append((WARN, "lexicon '%s': space-separated kind '%s' with no "
+                        "keywords — legacy mis-file, its symptom vocabulary is "
+                        "DEAD; migrate: helm store add lexicon \"%s | %s | "
+                        "phrase | %s\"" % (e["id"], kind, e["id"],
+                                           e.get("definition") or "<definition>",
+                                           ", ".join(kind.split()))))
+    return out
+
+
 def check_know_your_user():
     """The know-your-user leg: WARN while empty and un-interviewed."""
     p = whoami.load_profile()
@@ -419,7 +448,8 @@ def check_metaharness(detect=None, which=None):
 
 CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
           "check_projection_registry",
-          "check_adopted_store", "check_know_your_user", "check_cv",
+          "check_adopted_store", "check_lexicon_dead_vocabulary",
+          "check_know_your_user", "check_cv",
           "check_inject_coverage", "check_env", "check_physics_currency", "check_record",
           "check_chat_node", "check_cred_families", "check_cred_drift", "check_git",
           "check_metaharness")
