@@ -15,10 +15,17 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import seats  # noqa: E402
+from helm import seat, seats  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "HELM_CHAT_DIR", "HELM_CHAT_NAME", "HELM_CHAT_ROOM",
             "HELM_CHAT_ROOM_SOURCE", "HELM_CHAT_NODE_URL", "HELM_ADOPTED_DIR",
+            # the MELD_* legacy fallbacks too: home.env_pair falls back to
+            # them, so an ambient MELD_CHAT_ROOM redirects the canary's bare
+            # post to a foreign room and false-fires the homing message —
+            # and the hazard is realistic (launch_line itself unsets
+            # MELD_CHAT_ROOM because launchers leak it)
+            "MELD_CHAT_ROOM", "MELD_CHAT_ROOM_SOURCE", "MELD_CHAT_NAME",
+            "MELD_CHAT_DIR", "MELD_CHAT_NODE_URL",
             "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -143,25 +150,34 @@ class NewAgentGuideTest(unittest.TestCase):
 
     def test_lane_markers_expire_and_name_real_lanes(self):
         # the (lane/<lane>) marker is a dated promise, not a permanent skip:
-        # (a) the named lane must actually exist as a branch — a bogus marker
-        #     is a fabricated excuse and fails here;
-        # (b) once the verb --help-resolves rc0 from a neutral cwd the lane
-        #     LANDED — the marker is now a stale lie ("supersedes it once
-        #     landed" about a verb that IS landed) and fails here: drop the
-        #     marker and rewrite the claim in the present tense.
+        # (a) EVERY marker anywhere in the guide — helm-span-adjacent or
+        #     attached to prose (the per-instance-codex-proxies paragraphs) —
+        #     must name a lane that actually exists as a branch; a bogus
+        #     marker is a fabricated excuse and fails here;
+        # (b) once a span-adjacent marker's verb --help-resolves rc0 from a
+        #     neutral cwd the lane LANDED — the marker is now a stale lie
+        #     ("supersedes it once landed" about a verb that IS landed) and
+        #     fails here: drop the marker and rewrite the claim in the
+        #     present tense. Prose markers have no verb to probe; their
+        #     expiry is pinned by the launch-line canary below.
         text = open(GUIDE, encoding="utf-8").read()
         _verbs, marked = parse_guide_helm_spans(text)
+        all_lanes = {m.group(1) for m in LANE_MARKER.finditer(text)}
+        self.assertTrue(
+            set(lane for _v, lane in marked) <= all_lanes,
+            "span-adjacent markers escaped the all-marker scan")
         neutral = tempfile.mkdtemp(prefix="helm-guide-neutral-")
         try:
-            for verb, lane in marked:
+            for lane in sorted(all_lanes):
                 b = subprocess.run(
                     ["git", "-C", REPO, "branch", "--list", "--all",
                      "lane/%s" % lane, "*/lane/%s" % lane],
                     capture_output=True, text=True, timeout=60)
                 self.assertTrue(
                     b.stdout.strip(),
-                    "guide marks `helm %s` (lane/%s) but no such lane branch "
-                    "exists — a marker must name a real lane" % (verb, lane))
+                    "guide marks (lane/%s) but no such lane branch exists — "
+                    "a marker must name a real lane" % lane)
+            for verb, lane in marked:
                 p = subprocess.run(
                     [sys.executable, HELM, verb, "--help"], cwd=neutral,
                     capture_output=True, text=True, timeout=60)
@@ -173,14 +189,31 @@ class NewAgentGuideTest(unittest.TestCase):
         finally:
             shutil.rmtree(neutral, ignore_errors=True)
 
-    def _probe_sub(self, parent, sub, cwd):
-        """(rc, out, err) of `helm <parent> <sub> --help`, the probed token
-        normalized to @ so an unknown-subverb echo compares structurally."""
+    @staticmethod
+    def _norm(text, tokens):
+        """Collapse each token to @ at word boundaries ([A-Za-z0-9_-] runs):
+        boundary-aware so a 2-char sub (`ls`, `dm`) is never eaten out of an
+        unrelated word, and applied to a TOKEN SET, not just the probed one."""
+        for tok in tokens:
+            text = re.sub(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])"
+                          % re.escape(tok), "@", text)
+        return text
+
+    def _probe_sub(self, parent, probed, sub, cwd):
+        """(rc, out, err) of `helm <parent> <probed> --help`. BOTH the probed
+        token and the real sub are normalized to @ in the output — the real
+        sub in the BOGUS probe's output too, because a parent's unknown-
+        subcommand fallback (usage/choice text) may still NAME a dropped sub:
+        normalizing only each probe's own token left those byte-identical
+        outputs looking different, so a sloppy drop that forgot the usage
+        text false-passed the differential (proven with rename plants in
+        work/session/chat — 4 of 5 pinned pairs were vulnerable)."""
         p = subprocess.run(
-            [sys.executable, HELM, parent, sub, "--help"], cwd=cwd,
+            [sys.executable, HELM, parent, probed, "--help"], cwd=cwd,
             capture_output=True, text=True, timeout=60)
-        return (p.returncode, p.stdout.replace(sub, "@"),
-                p.stderr.replace(sub, "@"))
+        toks = (probed, sub)
+        return (p.returncode, self._norm(p.stdout, toks),
+                self._norm(p.stderr, toks))
 
     def test_guide_subverbs_resolve_differentially(self):
         # depth-2: rc alone cannot prove a SUBverb exists (most known subverbs
@@ -203,8 +236,8 @@ class NewAgentGuideTest(unittest.TestCase):
                     "GUIDE_SUBVERBS pins `helm %s %s` but the guide no longer "
                     "names it — drop the pair or restore the claim"
                     % (parent, sub))
-                real = self._probe_sub(parent, sub, scratch)
-                bogus = self._probe_sub(parent, "zzqx-no-such-subverb",
+                real = self._probe_sub(parent, sub, sub, scratch)
+                bogus = self._probe_sub(parent, "zzqx-no-such-subverb", sub,
                                         scratch)
                 self.assertNotEqual(
                     real, bogus,
@@ -258,6 +291,54 @@ class NewAgentGuideTest(unittest.TestCase):
             token, in_derived.stdout,
             "bare post reached the derived home room — homing landed; flip "
             "guide section 2 and this pin together (see comment above)")
+
+    def test_canary_launch_line_shared_port_and_inline_token(self):
+        # ============================ MERGE-TIME CANARY =====================
+        # This test pins TODAY'S launch-line FORM — the runtime truth behind
+        # BOTH dual-world paragraphs in guide section 6 (the two prose
+        # (lane/per-instance-codex-proxies) markers the span grammar cannot
+        # reach): the printed `helm seat launch codex -i 2` line carries the
+        # SHARED family port (not the instance's own base+N port) and embeds
+        # the bearer token INLINE (not a 0600-token-file read at exec time).
+        #
+        # WHEN THIS TEST FAILS AFTER lane/per-instance-codex-proxies MERGES,
+        # THAT IS THE CANARY FIRING, NOT A REGRESSION: flip ALL together —
+        #   1. guide section 6: rewrite both "Landed:/Not landed:" and
+        #      "Once ... lands ... until then" paragraphs in the present
+        #      tense and DROP both (lane/per-instance-codex-proxies) markers
+        #      ("run it, don't quote it" stays true in both worlds);
+        #   2. this test: assert the -i 2 line carries the instance's OWN
+        #      port (base+N, e.g. 8319 for codex-2) and NO inline token
+        #      (the line reads its 0600 token file at exec time).
+        # Do not delete the test and do not touch the paragraphs without the
+        # pin, or the guide silently goes stale (adversarial MED 2).
+        # ====================================================================
+        add = subprocess.run(
+            [sys.executable, HELM, "seat", "add", "codex"], cwd=self.tmp,
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(add.returncode, 0, add.stderr)
+        p = subprocess.run(
+            [sys.executable, HELM, "seat", "launch", "codex", "-i", "2"],
+            cwd=self.tmp, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        line = p.stdout.strip()
+        base = seat.FAMILIES["codex"]["port"]
+        self.assertIn(
+            "ANTHROPIC_BASE_URL=http://127.0.0.1:%d" % base, line,
+            "the -i 2 launch line no longer carries the shared family port "
+            "— if lane/per-instance-codex-proxies just merged this is the "
+            "CANARY: flip guide section 6 and this pin together (see "
+            "comment above)")
+        self.assertNotIn(
+            ":%d" % (base + 2), line,
+            "the -i 2 launch line carries an instance-own port — per-"
+            "instance proxies landed; flip guide section 6 and this pin "
+            "together (see comment above)")
+        self.assertRegex(
+            line, r"ANTHROPIC_AUTH_TOKEN=[0-9a-f]{16,}",
+            "the launch line no longer embeds the bearer inline (token-file "
+            "read landed?) — flip guide section 6 and this pin together "
+            "(see comment above)")
 
 
 if __name__ == "__main__":
