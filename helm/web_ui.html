@@ -580,6 +580,7 @@ details.cfgsec>summary:hover{color:var(--fg)}
   <button class="navtab" data-v="sessions">sessions</button>
   <button class="navtab" data-v="configs">configs</button>
   <button class="navtab" data-v="chat">chat</button>
+  <button class="navtab" data-v="cave">cave</button>
   <button class="navtab" data-v="ledger">ledger</button>
   <span class="spacer"></span>
   <div class="stats" id="navstats"></div>
@@ -780,6 +781,79 @@ details.cfgsec>summary:hover{color:var(--fg)}
   </div>
 </div>
 
+<style>
+/* ---------- cave: local multiplayer over the blind relay ---------- */
+#view-cave .cavebar{display:flex;align-items:center;flex-wrap:wrap;gap:10px 14px;padding:12px clamp(4px,2vw,18px) 14px;border-bottom:1px solid var(--line)}
+#view-cave .cavetitle{font-size:var(--f3);font-weight:var(--w-bold);letter-spacing:-.02em}
+#view-cave .cavebar label{display:flex;align-items:center;gap:6px;font-size:var(--f0);color:var(--sub);text-transform:uppercase;letter-spacing:.05em}
+#view-cave .cavebar input{width:9rem;padding:4px 8px;font-size:var(--f2);background:var(--card);border:1px solid var(--line);border-radius:var(--r-sm);color:var(--fg)}
+#view-cave .cavehint{font-size:var(--f1);color:var(--mut);flex:1 1 auto;min-width:12rem}
+#view-cave .cavecursor{font-size:var(--f0);color:var(--sub);font-variant-numeric:tabular-nums;white-space:nowrap}
+#caveGrid{display:grid;grid-template-columns:250px minmax(0,1fr) 250px;gap:14px;padding:14px clamp(4px,2vw,18px)}
+@media (max-width:900px){#caveGrid{grid-template-columns:1fr}}
+#view-cave .cavecol{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;min-height:0}
+#view-cave .cavecol h3{font-size:var(--f2);font-weight:var(--w-med);margin:0 0 8px;display:flex;flex-wrap:wrap;align-items:baseline;gap:6px}
+#view-cave .csub{font-size:var(--f0);color:var(--sub);font-weight:400}
+#view-cave .clegend{display:flex;gap:12px;flex-wrap:wrap;font-size:var(--f0);color:var(--sub);margin-bottom:8px}
+#view-cave .crows{display:flex;flex-direction:column;gap:4px;overflow:auto;max-height:56vh}
+#view-cave .cempty{color:var(--mut);font-size:var(--f1);padding:8px 2px}
+#view-cave .pdot,#view-cave .clegend i{width:8px;height:8px;border-radius:50%;background:var(--mut);flex:none;display:inline-block}
+#view-cave .pdot.fresh,#view-cave .clegend i.fresh{background:#35c26a}
+#view-cave .pdot.quiet,#view-cave .clegend i.quiet{background:#d9a227}
+#view-cave .peer{display:flex;align-items:center;gap:8px;font-size:var(--f1);padding:3px 4px;border-radius:6px}
+#view-cave .peer:not(.fresh):not(.quiet){opacity:.55}
+#view-cave .pactor{font-weight:var(--w-med);color:var(--fg)}
+#view-cave .pconn{color:var(--sub)}
+#view-cave .pstate{color:var(--mut);margin-left:auto}
+#view-cave .page{color:var(--sub);font-variant-numeric:tabular-nums;min-width:2.4rem;text-align:right}
+#view-cave .cell{display:grid;grid-template-columns:auto 1fr auto auto;gap:6px 10px;align-items:baseline;font-size:var(--f1);padding:5px 6px;border-radius:6px;background:color-mix(in srgb,var(--fg) 4%,transparent)}
+#view-cave .ckey{font-weight:var(--w-bold);color:var(--accent)}
+#view-cave .cval{color:var(--fg);word-break:break-word}
+#view-cave .cwho{color:var(--sub);font-size:var(--f0)}
+#view-cave .cwhen{color:var(--mut);font-size:var(--f0);font-variant-numeric:tabular-nums}
+#view-cave .cforeign{color:var(--mut);font-size:var(--f0);padding:6px 4px 0;font-style:italic}
+#caveForm{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+#caveForm input{flex:1 1 6rem;min-width:0;padding:6px 9px;font-size:var(--f2);background:var(--bg);border:1px solid var(--line);border-radius:var(--r-sm);color:var(--fg)}
+#caveForm #caveKey{flex:0 0 8rem}
+#caveMsg{font-size:var(--f0);color:var(--sub);margin-top:7px}
+#view-cave .env{display:flex;gap:10px;align-items:baseline;font-size:var(--f0);padding:3px 4px}
+#view-cave .eid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--sub)}
+#view-cave .eactor{color:var(--fg)}
+#view-cave .ebytes{color:var(--mut);margin-left:auto;font-variant-numeric:tabular-nums}
+</style>
+
+<div class="view" id="view-cave">
+  <div class="cavebar">
+    <span class="cavetitle">⎈ cave</span>
+    <label>cave <input id="caveName" list="caveList" value="main" spellcheck="false" autocomplete="off"></label>
+    <datalist id="caveList"></datalist>
+    <label>board <input id="caveDoc" value="board" spellcheck="false" autocomplete="off"></label>
+    <span class="cavehint" id="caveHint">a shared last-writer-wins board over helm’s blind relay — you and a terminal converge here</span>
+    <span class="cavecursor" id="caveCursor"></span>
+  </div>
+  <div id="caveGrid">
+    <section class="cavecol" id="cavePeers">
+      <h3>presence <span class="csub">who’s connected · TTL heartbeat</span></h3>
+      <div class="clegend"><span><i class="fresh"></i>fresh &lt;10s</span><span><i class="quiet"></i>quiet</span><span><i></i>fading out</span></div>
+      <div class="crows" id="peerRows"><div class="cempty">nobody connected yet</div></div>
+    </section>
+    <section class="cavecol" id="caveBoard">
+      <h3>board <span class="csub" id="boardSub">materialized client-side — the relay never decodes it</span></h3>
+      <div class="crows" id="boardRows"><div class="cempty">no cells yet — set one below</div></div>
+      <form id="caveForm" autocomplete="off">
+        <input id="caveKey" placeholder="key" maxlength="120" required aria-label="cell key">
+        <input id="caveVal" placeholder="value…" maxlength="400" required aria-label="cell value">
+        <button class="chip" id="caveSet" type="submit">set →</button>
+      </form>
+      <div id="caveMsg">you write as <b>david</b>; a terminal or agent writes as itself — set the same key from both and watch the later write win.</div>
+    </section>
+    <section class="cavecol" id="caveLog">
+      <h3>relay log <span class="csub">opaque envelopes · arrival order · helm never reads them</span></h3>
+      <div class="crows" id="logRows"><div class="cempty">no updates yet</div></div>
+    </section>
+  </div>
+</div>
+
 </div>
 
 <div id="tray"><h3>team tray — one seat per terminal<button id="trayClose" title="close">✕</button></h3>
@@ -798,6 +872,14 @@ details.cfgsec>summary:hover{color:var(--fg)}
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+/* the cave panel's identity/display launder — the BROWSER analog of chat._dsan
+   (helm/chat.py). The blind relay's opaque updates are folded HERE
+   (materializeCave), so a demo cell's key/value/actor is decoded client-side and
+   the server can never launder it. Strip bidi overrides (Cf) + C0/C1 controls
+   (Cc, tab kept) + line/paragraph separators (Zl/Zp) so a relayed payload cannot
+   reorder or reshape a rendered cell/peer. Applied BENEATH esc(), which entity-
+   escapes for XSS; this closes display/identity-spoofing, its orthogonal sibling. */
+const mpLaunder = s => String(s ?? "").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, c => c === "\t" ? c : "");
 const TOKEN = "__HELM_TOKEN__"; // per-process anti-CSRF bearer, templated in by the server — every POST carries it
 const KNOWN_H = ["claude", "codex", "opencode"];
 const STORE_ORDER = ["premise", "prior", "lexicon", "heuristic", "reference", "episodic"];
@@ -830,7 +912,7 @@ function toast(m, ms) {
 }
 
 /* ---------- nav (sesh navtab pattern; helm is the default view) ---------- */
-const VIEWS = ["helm", "quota", "sessions", "configs", "chat", "ledger"];
+const VIEWS = ["helm", "quota", "sessions", "configs", "chat", "cave", "ledger"];
 function showView(v) {
   $$(".navtab").forEach(t => t.classList.toggle("on", t.dataset.v === v));
   $$(".view").forEach(p => p.classList.toggle("on", p.id === "view-" + v));
@@ -840,6 +922,7 @@ function showView(v) {
   if (v === "sessions") initSessions();
   if (v === "configs") { cfgInit(); srevInit(); }
   if (v === "chat") initChat();
+  if (v === "cave") initCave();
   if (v === "ledger") initLedger();
 }
 $$(".navtab").forEach(t => t.onclick = () => showView(t.dataset.v));
@@ -2954,6 +3037,152 @@ function initChat() {
 // sessions tab must still see an @mention land).
 setInterval(pollChat, 2000);
 pollChat();
+
+/* ================= cave view — local multiplayer over the blind relay =================
+   Three panels off one 2s poll: presence (TTL heartbeat), the demo board
+   (a last-writer-wins map the CLIENT materializes), and the raw relay log
+   (opaque envelopes helm never decodes). The owner writes as `david`; a
+   terminal/agent writes as itself; the same log folds to the same board on
+   both — that convergence is the whole demo. The fold mirrors
+   helm/multiplayer_demo.materialize exactly. ============================= */
+let CAVE_POLLING = false, CAVE_STARTED = false, CAVE_CAVELIST = "";
+let CAVE_CAVE = "main", CAVE_DOC = "board", CAVE_CURSOR = "0";
+let CAVE_UPDATES = [];               // accumulated raw envelopes; the client folds them
+const CAVE_KIND = "helm.demo.lww";   // the demo type this client understands
+
+function initCave() {
+  if (CAVE_STARTED) { pollCave(); return; }
+  CAVE_STARTED = true;
+  const nameEl = $("#caveName"), docEl = $("#caveDoc");
+  const reset = () => {              // switching cave/doc drops the accumulated log
+    CAVE_CAVE = (nameEl.value || "main").trim() || "main";
+    CAVE_DOC = (docEl.value || "board").trim() || "board";
+    CAVE_CURSOR = "0"; CAVE_UPDATES = [];
+    $("#boardRows").innerHTML = '<div class="cempty">loading…</div>';
+    $("#logRows").innerHTML = '<div class="cempty">loading…</div>';
+    pollCave();
+  };
+  CAVE_CAVE = (nameEl.value || "main").trim() || "main";
+  CAVE_DOC = (docEl.value || "board").trim() || "board";
+  nameEl.addEventListener("change", reset);
+  docEl.addEventListener("change", reset);
+  $("#caveForm").addEventListener("submit", caveSet);
+  pollCave();
+}
+
+// the demo CRDT, mirroring helm/multiplayer_demo.materialize: per key the winner
+// is the update with the greatest (ts, id) — a total order every client computes
+// identically, so arrival order can't change the board. Non-demo updates are
+// counted, never decoded (the relay stays blind; so does this fold).
+function materializeCave(updates) {
+  const cells = {}; let foreign = 0;
+  for (const env of updates) {
+    let cell = null;
+    try {
+      const r = JSON.parse(env.update);
+      if (r && r.k === CAVE_KIND && typeof r.key === "string"
+          && typeof r.value === "string" && typeof r.actor === "string") cell = r;
+    } catch (e) {}
+    if (!cell) { foreign++; continue; }
+    const stamp = [env.ts || 0, env.id || ""];
+    const cur = cells[cell.key];
+    if (!cur || stamp[0] > cur.s[0] || (stamp[0] === cur.s[0] && stamp[1] >= cur.s[1]))
+      cells[cell.key] = {s: stamp, value: cell.value, actor: cell.actor, ts: env.ts};
+  }
+  const board = Object.keys(cells).sort()
+    .map(k => ({key: k, value: cells[k].value, actor: cells[k].actor, ts: cells[k].ts}));
+  return {board, foreign};
+}
+
+async function pollCave() {
+  if (CAVE_POLLING) return;
+  CAVE_POLLING = true;
+  try {
+    const cave = CAVE_CAVE, doc = CAVE_DOC;
+    // owner heartbeat — opening the tab makes ME a live peer (fire-and-forget)
+    post("/api/multiplayer/presence", {cave, state: "watching"}).catch(() => {});
+    let d;
+    try {
+      d = await j("/api/multiplayer/state?cave=" + encodeURIComponent(cave) +
+                  "&doc=" + encodeURIComponent(doc) +
+                  "&after=" + encodeURIComponent(CAVE_CURSOR));
+    } catch (e) { return; }          // fail-open: keep the page, keep quiet
+    if (d.unavailable) {
+      $("#caveHint").textContent = "multiplayer transport unavailable on this host";
+      return;
+    }
+    if (cave !== CAVE_CAVE || doc !== CAVE_DOC) return;   // switched mid-flight
+    if (d.reset) CAVE_UPDATES = [];  // the doc generation rolled — restart clean
+    if (Array.isArray(d.updates) && d.updates.length)
+      CAVE_UPDATES = CAVE_UPDATES.concat(d.updates);
+    CAVE_CURSOR = d.cursor || "0";
+    renderPeers(d.peers || []);
+    renderBoard(materializeCave(CAVE_UPDATES));
+    renderLog(CAVE_UPDATES);
+    renderCaves(d.caves || []);
+    const cur = String(d.cursor || "0");
+    $("#caveCursor").textContent = "cursor " + cur.slice(0, 20) + (cur.length > 20 ? "…" : "");
+  } finally { CAVE_POLLING = false; }
+}
+
+function peerClass(p) {
+  const age = Date.now() / 1000 - (p.seen || 0);
+  return age < 10 ? "fresh" : age < 30 ? "quiet" : "";
+}
+function renderPeers(peers) {
+  const el = $("#peerRows");
+  if (!peers.length) { el.innerHTML = '<div class="cempty">nobody connected yet</div>'; return; }
+  el.innerHTML = peers.map(p => {
+    const c = peerClass(p), age = Math.max(0, Date.now() / 1000 - (p.seen || 0));
+    return '<div class="peer ' + c + '"><i class="pdot ' + c + '"></i>' +
+      '<span class="pactor">' + esc(mpLaunder(p.actor)) + '</span>' +
+      '<span class="pconn">' + esc(mpLaunder(p.connection)) + '</span>' +
+      '<span class="pstate">' + esc(mpLaunder(p.state)) + '</span>' +
+      '<span class="page">' + Math.round(age) + 's</span></div>';
+  }).join("");
+}
+function renderBoard(view) {
+  const el = $("#boardRows");
+  let html = view.board.map(c =>
+    '<div class="cell"><span class="ckey">' + esc(mpLaunder(c.key)) + '</span>' +
+    '<span class="cval">' + esc(mpLaunder(c.value)) + '</span>' +
+    '<span class="cwho">' + esc(mpLaunder(c.actor)) + '</span>' +
+    '<span class="cwhen">' + (c.ts ? Math.round(Math.max(0, Date.now() / 1000 - c.ts)) + 's' : '') +
+    '</span></div>').join("");
+  if (!view.board.length) html = '<div class="cempty">no cells yet — set one below</div>';
+  if (view.foreign) html += '<div class="cforeign">+' + view.foreign + ' opaque update' +
+    (view.foreign === 1 ? '' : 's') + ' from other clients — relay stays blind</div>';
+  el.innerHTML = html;
+}
+function renderLog(updates) {
+  const el = $("#logRows");
+  if (!updates.length) { el.innerHTML = '<div class="cempty">no updates yet</div>'; return; }
+  el.innerHTML = updates.slice(-40).map(u =>
+    '<div class="env"><span class="eid">' + esc(String(u.id || "").slice(0, 8)) + '</span>' +
+    '<span class="eactor">' + esc(mpLaunder(u.actor)) + '</span>' +
+    '<span class="ebytes">' + (u.bytes | 0) + ' B</span></div>').join("");
+}
+function renderCaves(caves) {
+  const key = caves.join("\n");
+  if (key === CAVE_CAVELIST) return;                     // no churn while typing
+  CAVE_CAVELIST = key;
+  $("#caveList").innerHTML = caves.map(c => '<option value="' + esc(mpLaunder(c)) + '">').join("");
+}
+async function caveSet(ev) {
+  ev.preventDefault();
+  const key = $("#caveKey").value.trim(), value = $("#caveVal").value;
+  if (!key || !value.trim()) return;
+  try {
+    await post("/api/multiplayer/publish", {cave: CAVE_CAVE, doc: CAVE_DOC, key, value});
+    $("#caveVal").value = "";
+    $("#caveKey").focus();
+    pollCave();                                          // reflect immediately
+  } catch (e) { toast(e.message || "publish failed"); }
+}
+
+// poll ONLY while the cave tab is open — that is what makes the owner appear as
+// a peer on open and fade out ~TTL after he leaves it
+setInterval(() => { if ($("#view-cave").classList.contains("on")) pollCave(); }, 2000);
 
 /* ================= ledger view (read-only projection of the attestation node) =================
    Polls /api/ledger every ~3s while open. The node down is a NORMAL state:

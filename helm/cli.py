@@ -254,7 +254,7 @@ _VERB_HELP = {
     "hooks": "hooks [install [--dry]|status|sync [--apply]] — self-wire the per-turn inject hook into every claude home; sync reconciles every home to the NAMED canonical hook set (dry-run default)",
     "cell": "cell join|send|recv|heartbeat|roster|status — the a2a substrate, helm-named",
     "chat": "chat post|read [--since N|--follow]|rooms|react <n> <emoji>|log-flush|node up|down|status|join|deliver|wait|seats|status [<line>|--clear]|seat gc [--apply]|claim|release|claims [--room R] — the human-included groupchat (RAM room + signed dregg transport; web panel = the owner's surface) + the delivery lane (tool-boundary nudge, roster presence, advisory session-bound claims)",
-    "multiplayer": "multiplayer publish|read|presence|peers|leave — metaharness-agnostic local multiplayer: blind opaque-update relay + decoupled TTL presence",
+    "multiplayer": "multiplayer set|status|publish|read|presence|peers|leave — metaharness-agnostic local multiplayer: blind opaque-update relay + decoupled TTL presence (set/status drive the built-in LWW demo board)",
     "launch": "launch [--seat S] [--home H] [--room R] [--no-install] [--] [claude args…] — the metaharness seam: wire hooks, seat the roster, exec claude under a stable addressable name",
     "human": "human (or helm --human) — the operator's curses TUI: chat room + status strip, posts as you",
     "premise": "premise <id> | <statement> — capture a certain truth, attested on the ledger; --supersede <old-id> <new-id> | <statement> evolves the chain (one signed linking turn)",
