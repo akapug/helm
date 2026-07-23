@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import chat, seats  # noqa: E402
+from helm import chat, pk, seats  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -242,15 +242,21 @@ class PendingViewTests(LadderBase):
         self.assertEqual(self.states(), [("t3", "sent")])
 
     def test_pending_ordered_oldest_first(self):
-        a, _ = seats.dm("t1", "first", who="senderS")
-        # force a's ts strictly older so ordering is deterministic
-        rows = chat.read(seats.dm_lane("t1"))[0]
-        b, _ = seats.dm("t2", "second", who="senderS")
+        """Longest-stranded on top. Both rows land in ONE lane (main) so file
+        order is deterministic; the OLDER row is posted SECOND with a pinned
+        older ts (pk.now_ts is only second-resolution) — so ONLY the ts sort,
+        not append order, can float it to the top."""
+        self.join("t1")
+        self.join("t2")
+        with mock.patch.object(pk, "now_ts", return_value="2026-01-01T00:00:09Z"):
+            chat.post("@t1 newer", room="main", who="senderS")
+        with mock.patch.object(pk, "now_ts", return_value="2026-01-01T00:00:01Z"):
+            chat.post("@t2 older", room="main", who="senderS")
         items, total = seats.pending(seat="senderS")
         self.assertEqual(total, 2)
-        # oldest-first: whichever ts sorts first leads
         self.assertEqual([i["ts"] for i in items],
-                         sorted(i["ts"] for i in items))
+                         ["2026-01-01T00:00:01Z", "2026-01-01T00:00:09Z"])
+        self.assertEqual([i["to"] for i in items], ["t2", "t1"])
 
     def test_pending_empty_when_all_consumed(self):
         row, _ = seats.dm("t1", "solo", who="senderS")
