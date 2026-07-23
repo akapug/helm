@@ -544,6 +544,16 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .lhead .lidx{font-weight:700;font-variant-numeric:tabular-nums}
 .lhead .lage{margin-left:auto;color:var(--sub);font-size:var(--f1);white-space:nowrap;font-variant-numeric:tabular-nums}
 .seatrn{font-size:var(--f0);padding:1px 8px;border-radius:6px;background:none;border:1px solid var(--line);color:var(--mut);cursor:pointer}
+.seatjump{cursor:pointer;border-radius:5px;padding:0 3px;margin:0 -3px}
+.seatjump:hover{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
+.ephsa summary:hover{color:var(--fg)}
+.seatpop{position:fixed;z-index:60;min-width:230px;max-width:320px;background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.4);padding:12px 14px;font-size:var(--f2)}
+.spname{font-family:ui-monospace,monospace;font-weight:700;font-size:var(--f3);margin-bottom:8px;word-break:break-all}
+.spgrid{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;align-items:baseline}
+.spk{color:var(--sub);font-size:var(--f0);text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
+.spv{color:var(--fg);font-size:var(--f1);word-break:break-word}
+.spjump{margin-top:10px;width:100%;text-align:left;font-size:var(--f1);padding:6px 10px;border-radius:7px;background:color-mix(in srgb,var(--accent) 14%,transparent);border:1px solid var(--accent);color:var(--accent);cursor:pointer}
+.spjump:hover{background:color-mix(in srgb,var(--accent) 24%,transparent)}
 .seatrn:hover{border-color:var(--accent);color:var(--accent)}
 .lmeta{font-size:var(--f1);color:var(--mut);margin-top:2px;word-break:break-all}
 .lbadge{font-size:var(--f0);font-weight:700;padding:2px 7px;border-radius:5px;white-space:nowrap;background:color-mix(in srgb,var(--mut) 14%,transparent);color:var(--mut)}
@@ -3393,16 +3403,20 @@ const presenceLabel = p => p === "fresh" ? "active" : p;
 const seatHome = s => 'home ' + (s.home_room ? '#' + esc(s.home_room) : 'all rooms') +
   (s.home_room_source ? ' (' + esc(s.home_room_source) + ')' : '');
 
+let LAST_ROSTER = null;
 function rosterSeats(rep) {
-  const seats = (rep && rep.seats) || [], claims = (rep && rep.claims) || [];
-  if (!seats.length && !claims.length) {
+  LAST_ROSTER = rep;                                   // seatPop reads facts here
+  const allSeats = (rep && rep.seats) || [], claims = (rep && rep.claims) || [];
+  const seats = allSeats.filter(s => !s.ephemeral);   // live rows render as before
+  const ephSeats = allSeats.filter(s => s.ephemeral); // done review-SAs -> collapsed
+  if (!seats.length && !ephSeats.length && !claims.length) {
     $("#ledgerseats").innerHTML = '<div class="empty">no seats joined yet — a session joins on its next start (helm hooks install wires it)</div>';
     return;
   }
   const dot = p => p === "fresh" ? "active" : p === "quiet" ? "quiet" : "";
   let html = seats.map(s =>
     '<div class="lrow"><div class="lhead"><span class="ldot ' + dot(s.presence) + '"></span>' +
-    '<span class="mono copy" data-copy="' + esc(s.seat) + '" title="seat — click to copy">' + esc(s.seat) + '</span>' +
+    '<span class="mono seatjump" data-seat="' + esc(s.seat) + '" data-sess="' + esc(s.session || '') + '" title="open this agent’s sessions + transcript">' + esc(s.seat) + '</span>' +
     '<span class="lbadge' + (s.presence === "fresh" ? " final" : s.presence === "quiet" ? " tent" : "") + '">' + esc(presenceLabel(s.presence)) + '</span>' +
     (s.pending ? '<span class="lbadge tent">' + s.pending + ' pending</span>' : '') +
     '<button class="seatrn" data-seat="' + esc(s.seat) + '" data-rnkey="' + esc(s.session || s.seat) + '" title="rename this seat — @newname delivers to the same agent">rename</button>' +
@@ -3421,6 +3435,19 @@ function rosterSeats(rep) {
     html += '<div class="lmeta" style="margin-top:6px">claims: ' + claims.map(c =>
       esc(c.resource) + ' → <b>' + esc(c.holder || "?") + '</b> (' + c.remaining + 's left)').join(" · ") + '</div>';
   }
+  if (ephSeats.length) {
+    // Done ephemeral review-SAs (tonight's fan-out) collapse under a fold — the
+    // live list stays glanceable, they stay here + queryable (owner steer
+    // 2026-07-23). Each still deep-links to its own transcript.
+    const erows = ephSeats.map(s =>
+      '<div class="lrow"><div class="lhead"><span class="ldot"></span>' +
+      '<span class="mono seatjump" data-seat="' + esc(s.seat) + '" data-sess="' + esc(s.session || '') + '" title="open this agent’s sessions/transcript">' + esc(s.seat) + '</span>' +
+      '<span class="lbadge">' + esc(presenceLabel(s.presence)) + '</span>' +
+      '<span class="lage">' + (s.last_seen ? lago(s.last_seen) : "—") + '</span></div></div>').join("");
+    html += '<details class="ephsa" style="margin-top:8px"><summary style="cursor:pointer;color:var(--sub);font-size:var(--f2);padding:4px 0">' +
+      ephSeats.length + ' completed review SA' + (ephSeats.length === 1 ? '' : 's') +
+      ' — ephemeral fan-out (tmp home, done)</summary>' + erows + '</details>';
+  }
   $("#ledgerseats").innerHTML = html;
   // the one seats-panel mutation: bind a live agent to a memorable @name
   $("#ledgerseats").querySelectorAll(".seatrn").forEach(b => b.onclick = async () => {
@@ -3438,6 +3465,57 @@ function rosterSeats(rep) {
       pollLedger();
     } catch (e) { toast("rename refused: " + e.message); }
   });
+  // click a seat name -> a small Tuftian popup that deep-links to THAT agent's
+  // sessions/transcript (owner feature 2026-07-23: "cool and tuftian").
+  $("#ledgerseats").querySelectorAll(".seatjump").forEach(el =>
+    el.onclick = ev => { ev.stopPropagation(); seatPop(el, el.dataset.seat, el.dataset.sess); });
+}
+
+// A small anchored, data-dense card for one seat: its live facts + one deep
+// link into the sessions tab (its transcript). Minimal chrome — one card reused,
+// dismissed on any outside click / Escape. No network: reads the row already in
+// hand from the roster poll.
+function seatPop(anchor, seat, sess) {
+  closeSeatPop();
+  const s = ((LAST_ROSTER && LAST_ROSTER.seats) || []).find(x => x.seat === seat) || {seat: seat, session: sess};
+  const fact = (k, v) => v ? '<div class="spk">' + esc(k) + '</div><div class="spv">' + esc(v) + '</div>' : '';
+  const pop = document.createElement("div");
+  pop.className = "seatpop";
+  pop.id = "seatpop";
+  pop.innerHTML =
+    '<div class="spname">' + esc(s.seat) + '</div>' +
+    '<div class="spgrid">' +
+      fact("presence", presenceLabel(s.presence)) +
+      fact("last seen", s.last_seen ? lago(s.last_seen) : "—") +
+      fact("home", (s.home_room || "—")) +
+      fact("project", s.project) +
+      fact("pending", s.pending ? (s.pending + " undelivered") : "") +
+      fact("task", s.todo && s.todo.active) +
+      fact("session", (s.session || sess || "").slice(0, 8)) +
+    '</div>' +
+    '<button type="button" class="spjump">→ open sessions + transcript</button>';
+  document.body.appendChild(pop);
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = Math.min(r.left, window.innerWidth - pop.offsetWidth - 12) + "px";
+  pop.style.top = (r.bottom + 6) + "px";
+  pop.querySelector(".spjump").onclick = () => { seatToSessions(seat, s.session || sess); closeSeatPop(); };
+  setTimeout(() => document.addEventListener("mousedown", _seatPopAway), 0);
+  document.addEventListener("keydown", _seatPopEsc);
+}
+function _seatPopAway(ev) { const p = $("#seatpop"); if (p && !p.contains(ev.target)) closeSeatPop(); }
+function _seatPopEsc(ev) { if (ev.key === "Escape") closeSeatPop(); }
+function closeSeatPop() {
+  const p = $("#seatpop"); if (p) p.remove();
+  document.removeEventListener("mousedown", _seatPopAway);
+  document.removeEventListener("keydown", _seatPopEsc);
+}
+function seatToSessions(seat, sess) {
+  // deep-link (reuses the day->sessions jump pattern): filter the sessions tab
+  // to this agent by its session id, name fallback, then focus the tab.
+  const q = sess || seat;
+  state.q = q; const box = $("#sq"); if (box) box.value = q;
+  CONTENT = null; showView("sessions"); renderSessions();
+  toast("sessions for " + seat);
 }
 
 // The fleet todo panel: the owner's answer to "who is working on what",
@@ -3495,13 +3573,21 @@ function renderSeatPicker() {
   });
 }
 function seatPicker(rep) {
-  SEAT_CHOICES = ((rep && rep.seats) || []).slice();
+  // Hide ephemeral review-SAs (agent-<hex>, tmp home, done) from the live
+  // picker — they are transient fan-out subagents, not messaging targets. Still
+  // reachable by free-typing the exact name; still queryable in the activity +
+  // sessions views. One less cluttered picker (owner steer 2026-07-23).
+  const all = ((rep && rep.seats) || []).slice();
+  const hidden = all.filter(s => s.ephemeral).length;
+  SEAT_CHOICES = all.filter(s => !s.ephemeral);
   const rank = p => p === "fresh" ? 0 : p === "quiet" ? 1 : 2;
   SEAT_CHOICES.sort((a, b) => rank(a.presence) - rank(b.presence) || (b.last_seen || 0) - (a.last_seen || 0));
   if ($("#seatlist").classList.contains("show")) renderSeatPicker();
   const c = $("#seatpickcount");
   if (c) c.textContent = SEAT_CHOICES.length
-    ? SEAT_CHOICES.length + (SEAT_CHOICES.length === 1 ? " live seat" : " live seats") + " · pick or type @all"
+    ? SEAT_CHOICES.length + (SEAT_CHOICES.length === 1 ? " live seat" : " live seats") +
+      (hidden ? " · " + hidden + " done SA" + (hidden === 1 ? "" : "s") + " hidden" : "") +
+      " · pick or type @all"
     : "no seats joined yet · type @all or a seat";
 }
 function seatPickerKeydown(ev) {

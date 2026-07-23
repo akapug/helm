@@ -179,5 +179,31 @@ class TestNativeLedgerTamper(NativeBase):
         self.assertEqual(c["count"], 2)  # the records still project
 
 
+class TestSeatEphemeralTag(unittest.TestCase):
+    """The picker-declutter tag: an ephemeral review-SA (agent-<hex>, no home,
+    /tmp cwd) is flagged so the live 'message a seat' picker can hide it, while a
+    real seat is NEVER mis-hidden (owner feature 2026-07-23)."""
+
+    def test_ephemeral_sa_is_flagged(self):
+        self.assertTrue(web._seat_ephemeral(
+            {"seat": "agent-047d53ef", "home_room": None,
+             "cwd": "/tmp/claude-xyz/scratch"}))
+
+    def test_real_named_seats_are_never_flagged(self):
+        # real names, or a real home, or a non-/tmp cwd -> keep in the picker
+        for s in (
+            {"seat": "console-design", "home_room": None, "cwd": "/tmp/x"},
+            {"seat": "codex-2", "home_room": "main", "cwd": "/home/p/helm-wt/x"},
+            {"seat": "agent-047d53ef", "home_room": "main", "cwd": "/tmp/x"},
+            {"seat": "agent-047d53ef", "home_room": None, "cwd": "/home/p/proj"},
+            {"seat": "projx-agent", "home_room": None, "cwd": "/tmp/x"},  # not agent-<hex>
+        ):
+            self.assertFalse(web._seat_ephemeral(s), s["seat"])
+
+    def test_fail_safe_on_junk(self):
+        self.assertFalse(web._seat_ephemeral({}))
+        self.assertFalse(web._seat_ephemeral({"seat": None}))
+
+
 if __name__ == "__main__":
     unittest.main()
