@@ -18,12 +18,16 @@ Split every liveness signal into two classes before concluding ANYTHING:
 | proxy down / not serving traffic (`helm seat status`) | file mtime ("quiet for hours") |
 | harness death-notification (orca/herdr fires on completion AND death) | dirty worktree ("left work behind") |
 | `sessions/<pid>.json` in the seat's config dir | no recent commits |
-| chain/commit watermark not advancing on a lane you OWN the deadline for | pane "looks idle" |
+| chain/commit watermark stalled **on a lane you OWN the deadline for** | "no recent commits" (any other lane) |
 
 - Harness completion-notification **silence is POSITIVE evidence of a running
   agent** — a reviewer mid-task is SUPPOSED to hold an incoherent tree.
-- On an **authoritative failure** (proxy dead = the seat cannot reach its
-  model): intervene FAST, state-preserving verb only. Do not wait politely.
+- On an **authoritative failure**, intervene FAST but match the verb to WHAT
+  died: a dead **proxy** (agent process still alive) is fixed by respawning the
+  proxy (`helm seat doctor --ensure`, §2 rung 1) — ZERO agent state lost; only a
+  dead **agent** warrants a resume. Use `helm seat where` to tell them apart.
+  Do not wait politely — but do not relaunch a live agent whose only casualty
+  was its proxy.
 - On **artifact-only quiet** with authoritative signals silent: ASK the owner
   of the work (`helm chat post` to its room) or drive a parallel slice. Never
   rescue. `helm work gc` is for lease-less orphan rooms, never a live owner's tree.
@@ -33,25 +37,36 @@ Canon: `proactive-resume-on-authoritative-stall`, `process-death-is-not-state-de
 
 ## 2. Intervention ladder — state-preserving first
 
-Cheapest rung that fixes it; each rung preserves strictly less state.
+Match the rung to the DISEASE — each preserves as much state as its disease
+allows (NOT a strict order: a dead proxy is cheaper to fix than a dead agent,
+and `/clear` deliberately discards context a resume would keep).
 
-1. **In-place recovery** — 400 ctx-overflow → inject `/clear` in the pane
+1. **Proxy respawn** (`helm seat doctor --ensure`) — proxy dead but the agent
+   process is ALIVE (confirm with `helm seat where`): respawns ONLY the proxy,
+   ZERO agent state lost incl. mid-turn context. The cheapest rescue there is —
+   never resume a live agent whose only casualty was its proxy.
+2. **In-place recovery** — 400 ctx-overflow → inject `/clear` in the pane
    (`ctx-window-recovery-is-clear`); `helm seat autocompact` pre-empts at ~90%.
    `helm watchdog` DETECTS the wedge (a2a alert) — the /clear is interactive,
-   never forged by a background process.
-2. **`helm seat resume <seat>`** — the default rescue. Relaunches via the
-   detected metaharness with `claude --resume/--continue`: context + worktree
-   survive, ~0 work lost. Exactly what a human dev does when claude-code dies.
-3. **Kill-first reseed** (`helm seat spawn <seat>`, `--print` to dry-run) —
+   never forged by a background process. (Discards conversation context — but a
+   400 already made it unrecoverable.)
+3. **`helm seat resume <seat>`** — the default rescue when the AGENT PROCESS
+   died. Relaunches via the detected metaharness with `claude --resume/--continue`:
+   context + worktree survive, ~0 work lost. What a human dev does when
+   claude-code dies.
+4. **Kill-first reseed** (`helm seat spawn <seat>`, `--print` to dry-run) —
    only when CONTEXT was the disease (corrupt/poisoned seat). Spawn self-reap
    can miss a live pane → kill first or you get a double seat. Fresh spawn
    loses everything in-context; reserve it.
-4. **Never** a destructive rescue-commit on an artifact signal.
+5. **Never** a destructive rescue-commit on an artifact signal.
 
 Before ANY kill/relaunch/swap/inject (fleet rule, no exceptions):
 - **Intent-log first**: post what you're about to do and why to the room.
 - **Confirm transcript persistence**: `helm session doctor` — UNKNOWN is not
-  proof of loss, but do not kill until the transcript is proven persisted.
+  proof of loss, but do not kill until the transcript is proven persisted. If
+  UNKNOWN PERSISTS (never resolves to persisted), snapshot the pane scrollback
+  and escalate to the owner before acting — a permanent UNKNOWN must not
+  deadlock the maintainer.
 - **Verify after**: `helm seat where <seat>` (pid/handle/liveness) + a beacon
   post from the reborn seat. A dropped resume must be CAUGHT, not silently lost.
 - Codex panes are **DISPOSABLE, transcripts sacred** — reseed with better
@@ -71,16 +86,18 @@ helm session ls|doctor # persistence tri-state (persisted/UNKNOWN — not proof 
 helm doctor            # global estate health, read-only
 ```
 
-**Landing (cite when merged, don't invent flags until then):**
-- `helm fleet` (branch `lane/fleet-truth-verb`) — composition ground-truth;
-  probe failure gates the verdict, fails closed. Until it lands: `helm chat seats`.
-- `helm seat doctor --ensure` (branch `lane/doctor-ensure`) — proxy watchdog:
-  auto-respawns a silently-dead proxy, startup-grace so it never SIGTERMs a
-  booting one. The systemic fix for the codex-2 silent-starvation class.
-- **Proxy-CPU canary** (same branch, in `seat doctor` output) — a proxy pid at
+**Live composition + watchdog verbs (landed — cite the SHA when you invoke them):**
+- `helm fleet` (c4507e7) — composition ground-truth: every live claude process
+  → seat/sid/daemon/stamps/home, all live-probed; probe failure gates the
+  verdict, fails closed (a row it can't prove is UNKNOWN, never alive).
+  ANSWER FLEET-COMPOSITION QUESTIONS BY RUNNING THIS, never from memory.
+- `helm seat doctor --ensure` (b028672) — proxy watchdog: auto-respawns a
+  silently-dead proxy, startup-grace so it never SIGTERMs a booting one. The
+  systemic fix for the codex-2 silent-starvation class. Wired to a `*/3 * * * *`
+  cron for continuous supervision.
+- **Proxy-CPU canary** (0aadbed, in `helm seat doctor` output) — a proxy pid at
   sustained-high CPU while siblings idle = a THRASHING backend, the leading
-  indicator BEFORE it goes silent. Until it lands: eyeball the proxy pids from
-  `helm seat status` in htop/ps.
+  indicator BEFORE it goes silent. WARN-only (never kills), startup-graced.
 
 ## 4. Fail-loud health — verify work HAPPENS, not reachability
 
@@ -93,7 +110,8 @@ produces nothing, it is not a health check.
 
 `helm rearm` is the land-to-live leg: after landing code, report which
 long-lived processes still hold pre-HEAD code; `--apply` SIGTERMs only stale
-waiters.
+waiters. `--apply` IS a kill — the §2 pre-kill gates (intent-log + transcript
+persistence) apply to it too.
 
 ## 5. Cred exhaustion — the swap leg
 
@@ -126,4 +144,4 @@ Fresh helm-native write (buildr's `maintain-buildr` skill and
 `~/.buildr/cred-rescue-runbook.md` are the ancestors — reboot tiers,
 monitored-pair relaunch, cred/session decoupling all inherited as principles;
 their verbs are buildr/herdr-specific so none port literally). Seat-level
-mechanics: helm memory `seat-relaunch-playbook.md`.
+mechanics: the `seat-relaunch-playbook` maintenance memory.
