@@ -1731,5 +1731,246 @@ class SeatEnsureTest(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+class SeatCpuCanaryTest(unittest.TestCase):
+    """The proxy-CPU canary (struggling-backend leading indicator): htop showed
+    cli-proxy-api pids pegged at 152%/90.6% while healthy siblings idled ~0% —
+    sustained-high CPU on a proxy = a thrashing backend BEFORE it goes silent.
+    Classification is windowed, never a point: stored-prior span when one
+    exists, else a double-read; startup bursts are grace; unreadable /proc is
+    UNKNOWN, not OK. Borrows SeatTest's fixtures without subclassing."""
+
+    def setUp(self):
+        SeatTest.setUp(self)
+        self._cpu_dir_prev = os.environ.get("HELM_PROXY_CPU_DIR")
+        os.environ["HELM_PROXY_CPU_DIR"] = os.path.join(self.tmp, "cpu-canary")
+
+    def tearDown(self):
+        if self._cpu_dir_prev is None:
+            os.environ.pop("HELM_PROXY_CPU_DIR", None)
+        else:
+            os.environ["HELM_PROXY_CPU_DIR"] = self._cpu_dir_prev
+        SeatTest.tearDown(self)
+
+    _plant = SeatTest._plant
+    _add = SeatTest._add
+
+    @staticmethod
+    def _sample(jiffies, ts, age_s=300.0, clk=100):
+        return {"jiffies": jiffies, "age_s": age_s, "clk": clk, "ts": ts}
+
+    def _prior(self, seat_name, pid, jiffies, ts):
+        path = seat._cpu_sample_path(seat_name)
+        with open(path, "w") as f:
+            json.dump({"pid": pid, "jiffies": jiffies, "ts": ts}, f)
+        return path
+
+    # -- the sample reader itself: real /proc, our own pid ------------------
+    def test_proc_cpu_sample_reads_self(self):
+        s = seat._proc_cpu_sample(os.getpid())
+        self.assertIsNotNone(s)
+        self.assertIsInstance(s["jiffies"], int)
+        self.assertGreaterEqual(s["age_s"], 0.0)
+        self.assertGreater(s["clk"], 0)
+
+    def test_proc_cpu_sample_unreadable_is_none(self):
+        # a pid that cannot exist: /proc/<huge>/stat is unreadable — None,
+        # so the canary surfaces UNKNOWN, never a silent OK.
+        self.assertIsNone(seat._proc_cpu_sample(2 ** 22 + 12345678))
+
+    # -- classification: OK vs THRASHING vs UNKNOWN, sustained not spike ----
+    def test_canary_unreadable_proc_is_unknown(self):
+        with mock.patch.object(seat, "_proc_cpu_sample", return_value=None):
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "unknown")
+        self.assertIn("unreadable", note)
+
+    def test_canary_first_sight_double_reads_low_cpu_ok(self):
+        # no stored prior: the canary takes TWO readings a window apart —
+        # 10 jiffies over 1s at clk 100 = 10% CPU -> ok.
+        samples = [self._sample(1000, 100.0), self._sample(1010, 101.0)]
+        with mock.patch.object(seat, "_proc_cpu_sample",
+                               side_effect=samples) as reads, \
+                mock.patch.object(seat.time, "sleep") as slept:
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "ok")
+        self.assertAlmostEqual(pct, 10.0)
+        self.assertAlmostEqual(window, 1.0)
+        self.assertEqual(reads.call_count, 2)
+        slept.assert_called_once()        # the double-read IS the window
+
+    def test_canary_first_sight_high_cpu_thrashing(self):
+        # 150 jiffies over 1s at clk 100 = 150% (the htop evidence shape),
+        # process 300s old (past grace) -> THRASHING.
+        samples = [self._sample(1000, 100.0), self._sample(1150, 101.0)]
+        with mock.patch.object(seat, "_proc_cpu_sample", side_effect=samples), \
+                mock.patch.object(seat.time, "sleep"):
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "thrashing")
+        self.assertAlmostEqual(pct, 150.0)
+        self.assertIn("80", note)         # the threshold rides the note
+
+    def test_canary_startup_burst_within_grace_is_ok(self):
+        # same pegged reading but the process is 5s old: model-load burst,
+        # not thrash — grace says OK and the note says why.
+        samples = [self._sample(1000, 100.0, age_s=4.0),
+                   self._sample(1150, 101.0, age_s=5.0)]
+        with mock.patch.object(seat, "_proc_cpu_sample", side_effect=samples), \
+                mock.patch.object(seat.time, "sleep"):
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "ok")
+        self.assertIn("startup", note)
+
+    def test_canary_sustained_via_stored_prior_no_sleep(self):
+        # a stored prior 60s back turns the reading into a REAL sustain:
+        # 9000 jiffies / clk 100 / 60s = 150% held for a minute -> THRASHING,
+        # no in-process sleep (the cron cadence was the window), and the store
+        # rolls forward so the next run measures the next span.
+        self._prior("codex", 4321, 1000, 1000.0)
+        now = self._sample(10000, 1060.0)
+        with mock.patch.object(seat, "_proc_cpu_sample",
+                               return_value=now) as reads, \
+                mock.patch.object(seat.time, "sleep") as slept:
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "thrashing")
+        self.assertAlmostEqual(pct, 150.0)
+        self.assertAlmostEqual(window, 60.0)
+        self.assertEqual(reads.call_count, 1)
+        slept.assert_not_called()
+        with open(seat._cpu_sample_path("codex")) as f:
+            rolled = json.load(f)
+        self.assertEqual(rolled, {"pid": 4321, "jiffies": 10000, "ts": 1060.0})
+
+    def test_canary_prior_for_other_pid_falls_back_to_double_read(self):
+        # the proxy respawned since the last sample: a prior keyed to the OLD
+        # pid must never fabricate a window for the new one.
+        self._prior("codex", 9999, 1000, 1000.0)
+        samples = [self._sample(1000, 1060.0), self._sample(1005, 1061.0)]
+        with mock.patch.object(seat, "_proc_cpu_sample",
+                               side_effect=samples) as reads, \
+                mock.patch.object(seat.time, "sleep") as slept:
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "ok")
+        self.assertEqual(reads.call_count, 2)
+        slept.assert_called_once()
+
+    def test_canary_threshold_env_tunable(self):
+        # HELM_PROXY_CPU_CANARY_PCT=95: a 90% reading (the htop 90.6% pid)
+        # stays OK under a raised bar — the knob is live, not decorative.
+        os.environ["HELM_PROXY_CPU_CANARY_PCT"] = "95"
+        try:
+            samples = [self._sample(1000, 100.0), self._sample(1090, 101.0)]
+            with mock.patch.object(seat, "_proc_cpu_sample",
+                                   side_effect=samples), \
+                    mock.patch.object(seat.time, "sleep"):
+                state, pct, _, _ = seat._cpu_canary("codex", "codex", 4321)
+        finally:
+            os.environ.pop("HELM_PROXY_CPU_CANARY_PCT", None)
+        self.assertEqual(state, "ok")
+        self.assertAlmostEqual(pct, 90.0)
+
+    def test_canary_pid_vanishing_mid_sample_is_unknown(self):
+        samples = [self._sample(1000, 100.0), None]
+        with mock.patch.object(seat, "_proc_cpu_sample", side_effect=samples), \
+                mock.patch.object(seat.time, "sleep"):
+            state, pct, window, note = seat._cpu_canary("codex", "codex", 4321)
+        self.assertEqual(state, "unknown")
+        self.assertIn("vanished", note)
+
+    # -- the surface: --ensure rows carry the canary, rc semantics ----------
+    def _ensure_with(self, row, canary, args=(), pid=4321):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(seat, "_ensure_row", return_value=row), \
+                mock.patch.object(seat, "_running_pid", return_value=pid), \
+                mock.patch.object(seat, "_cpu_canary", return_value=canary), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat._ensure(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_ensure_thrashing_row_surfaces_and_warns_rc1(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        rc, out, err = self._ensure_with(
+            ("codex", "healthy", "pid 4321 port 8317"),
+            ("thrashing", 152.0, 60.0, ">=80% threshold"))
+        self.assertEqual(rc, 1)           # THRASHING is a WARN, not a page
+        self.assertIn("THRASHING", out)
+        self.assertIn("152", out)
+        self.assertIn("struggling", err)
+
+    def test_ensure_ok_canary_rc0_with_cpu_suffix(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        rc, out, err = self._ensure_with(
+            ("codex", "healthy", "pid 4321 port 8317"),
+            ("ok", 3.0, 60.0, ""))
+        self.assertEqual(rc, 0)
+        self.assertIn("HEALTHY", out)
+        self.assertIn("cpu 3%", out)
+
+    def test_ensure_cpu_unknown_is_never_ok_rc1(self):
+        # requirement: an unreadable /proc is UNKNOWN, not OK — surfaced on
+        # the row and WARN-carried in rc, while liveness stays healthy.
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        rc, out, err = self._ensure_with(
+            ("codex", "healthy", "pid 4321 port 8317"),
+            ("unknown", None, None, "unreadable /proc/4321/stat"))
+        self.assertEqual(rc, 1)
+        self.assertIn("cpu UNKNOWN", out)
+
+    def test_ensure_liveness_unknown_still_rc2_over_warn(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(seat, "_ensure_row",
+                               return_value=("codex", "unknown", "x")), \
+                mock.patch.object(seat, "_cpu_canary") as canary, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat._ensure([])
+        self.assertEqual(rc, 2)           # the page outranks the warn
+        canary.assert_not_called()        # never canary an unproven row
+
+    def test_ensure_json_carries_canary_per_seat(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        rc, out, err = self._ensure_with(
+            ("codex", "healthy", "pid 4321 port 8317"),
+            ("thrashing", 152.0, 60.0, ">=80% threshold"),
+            args=("--ensure", "--json"))
+        self.assertEqual(rc, 1)
+        doc = json.loads(out)
+        self.assertEqual(doc["rc"], 1)
+        self.assertEqual(doc["thrashing"], 1)
+        row = doc["rows"][0]
+        self.assertEqual(row["seat"], "codex")
+        self.assertEqual(row["state"], "healthy")
+        self.assertEqual(row["shown"], "thrashing")
+        self.assertEqual(row["cpu"]["state"], "thrashing")
+        self.assertAlmostEqual(row["cpu"]["pct"], 152.0)
+        self.assertAlmostEqual(row["cpu"]["window_s"], 60.0)
+
+    def test_doctor_json_without_ensure_refused(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["doctor", "--json"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--ensure", err.getvalue())
+
+    def test_doctor_prints_canary_line(self):
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        out = io.StringIO()
+        with mock.patch.object(seat, "_proxy_bin", return_value=None), \
+                mock.patch.object(seat, "_running_pid", return_value=4321), \
+                mock.patch.object(
+                    seat, "_cpu_canary",
+                    return_value=("thrashing", 152.0, 60.0,
+                                  ">=80% threshold")), \
+                contextlib.redirect_stdout(out):
+            seat._doctor([])
+        self.assertIn("cpu canary", out.getvalue())
+        self.assertIn("THRASHING", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

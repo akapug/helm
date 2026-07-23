@@ -295,6 +295,16 @@ def history(rid):
             if str(row.get("id") or "") == str(rid)]
 
 
+def events_by_id():
+    """Every ledger event grouped by row id in a SINGLE pass — the read a
+    whole-ledger projection wants instead of one history() reparse per row
+    (that per-row reparse is O(N^2) on an append-only ledger)."""
+    out = {}
+    for row in eventledger.events(ledger_path()):
+        out.setdefault(str(row.get("id") or ""), []).append(row)
+    return out
+
+
 def _base(recipient, lane, ref, note, deadline_s, repo, sender=None,
           operation_key=None, message_hash=None, rid=None):
     from . import seats
