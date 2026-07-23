@@ -64,11 +64,15 @@ _ROSTER_CONSUMERS = {
         "PUBLISH OWNER: every roster-borne string emits through "
         "_pub_row / _seat_label (roster_report, presence_report, the CLI "
         "glance verbs, the mutation-helper echoes); field-complete guard is "
-        "tests/test_presence.py::RosterLaunderCompletenessTest. The consume-"
-        "ladder readers (_recipients resolves @mention/rfrom tokens to roster "
-        "KEYS, _recipient_cursor matches a cursor row internally, pending "
-        "resolves recipients) emit only through the `pending` CLI's "
-        "_seat_label / the `ack` refusal's _seat_label — same publish owner."),
+        "tests/test_presence.py::RosterLaunderCompletenessTest. Two "
+        "INTERNAL-MATCHING-ONLY reader sets: (a) the work-offer rung's "
+        "_live_seats() reads keys into a casefolded set for the poaching filter "
+        "and never emits one (the offer line carries a dispatch id + lane, no "
+        "roster key); (b) the consume-ladder readers (_recipients resolves "
+        "@mention/rfrom tokens to roster KEYS, _recipient_cursor matches a "
+        "cursor row internally, pending resolves recipients) emit only through "
+        "the `pending` CLI's _seat_label / the `ack` refusal's _seat_label — "
+        "same publish owner."),
     "todos.py": (
         "LAUNDERED: fleet()/_row run the seat KEY + project through _lbl "
         "(_scrub + _clip) before the fleet table AND the /api/todos JSON; "
@@ -99,9 +103,9 @@ _ROSTER_CALL_COUNTS = {
     "codexhomes.py": 1,
     "hooks.py": 1,
     "seat.py": 2,
-    "seats.py": 19,        # +3: _recipients, _recipient_cursor, pending (ack
-                           # ladder); +1: _is_seat membership check — reads
-                           # roster KEYS for a bool only, never emits one
+    "seats.py": 20,        # main's 19 (+3 ack-ladder _recipients/_recipient_
+                           # cursor/pending, +1 _is_seat) + work-offer's
+                           # _live_seats() poaching-filter read (internal-only)
     "todos.py": 1,
     "web.py": 2,
 }
