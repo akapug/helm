@@ -943,12 +943,21 @@ def _rooms_summary_invalidate():
     summary'd state (read-ack zeroing an unread badge; a post/DM landing a row)
     rides web.py, so it busts the cache synchronously and the very next poll
     reflects it. Agent posts arrive via the CLI outside this process and stay
-    TTL-bounded (<=3s — the old 2s poll already tolerated that lag)."""
+    TTL-bounded (<=3s — the old 2s poll already tolerated that lag).
+
+    LOCK-COUPLED (codex-3 re-clear, deterministic repro): a bare pop raced an
+    in-flight compute — a _rooms_summary_cached call that entered its locked
+    compute BEFORE the pop published its now-stale summary AFTER it. Taking
+    the same lock serializes: the pop waits out any in-flight publish, so
+    nothing computed pre-invalidation can survive it. Worst-case stall for
+    the caller = one compute (~200ms post brick #3) — fine for the watcher's
+    250ms tick and trivial for the owner-write handlers."""
     from . import chat
-    try:
-        _ROOMS_SUM_CACHE.pop(str(chat.chat_dir()), None)
-    except Exception:
-        _ROOMS_SUM_CACHE.clear()
+    with _ROOMS_SUM_LOCK:
+        try:
+            _ROOMS_SUM_CACHE.pop(str(chat.chat_dir()), None)
+        except Exception:
+            _ROOMS_SUM_CACHE.clear()
 
 
 def _rooms_summary_cached(roster=None):
@@ -1834,14 +1843,35 @@ def _sse_watcher():
 
 
 def _sse_ensure_watcher():
+    """Arm the watcher once; True = a watcher is running. The arm-flag rolls
+    BACK if Thread.start refuses (codex-3: an unguarded start left
+    watcher=True forever with no thread behind it — no client could ever
+    re-arm, the permanent-wedge shape of P1-4 again one layer up)."""
     with _SSE_COND:
         if _SSE_STATE["watcher"]:
-            return
+            return True
         _SSE_STATE["watcher"] = True
         _SSE_STATE["beat"] = time.time()
         _SSE_STATE["chat_fp"] = _chat_fingerprint()   # baseline, no boot storm
-    threading.Thread(target=_sse_watcher, daemon=True,
-                     name="helm-sse-watcher").start()
+    try:
+        threading.Thread(target=_sse_watcher, daemon=True,
+                         name="helm-sse-watcher").start()
+        return True
+    except Exception:
+        with _SSE_COND:
+            _SSE_STATE["watcher"] = False
+            _SSE_STATE["beat"] = 0.0
+        return False
+
+
+def _sse_stop_watcher():
+    """Server-owned stop (codex-3 P2: the global watcher outlived
+    server_close indefinitely): clear the arm-flag — the loop exits within a
+    tick — and wake every stream so its health check ends it NOW."""
+    with _SSE_COND:
+        _SSE_STATE["watcher"] = False
+        _SSE_STATE["beat"] = 0.0
+        _SSE_COND.notify_all()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1934,7 +1964,11 @@ class Handler(BaseHTTPRequestHandler):
         watcherless server would pin ES_LIVE and wedge every client on the
         stretched poll); a CLOSED SERVER socket ends it (streams must not
         outlive server_close)."""
-        _sse_ensure_watcher()
+        if not _sse_ensure_watcher():
+            # no watcher could arm — honest 503, the client's ES errors and
+            # its 2s poll fallback carries the UI (never a doorbell-less
+            # stream that LOOKS live)
+            return self._json({"error": "sse watcher unavailable"}, 503)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache, no-transform")
@@ -2018,10 +2052,20 @@ class Handler(BaseHTTPRequestHandler):
         pass  # a personal localhost tool; request noise helps no one
 
 
+class _Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer that OWNS the SSE watcher lifecycle: server_close
+    stops the global watcher + wakes every stream to end (codex-3 P2: the
+    watcher outlived server_close indefinitely). A later server — or a later
+    /api/events on a new one — re-arms fresh."""
+    def server_close(self):
+        _sse_stop_watcher()
+        super().server_close()
+
+
 def make_server(port=DEFAULT_PORT):
     """Bound-but-not-serving ThreadingHTTPServer on 127.0.0.1. port=0 -> ephemeral
     (tests); the real port is server_address[1]."""
-    srv = ThreadingHTTPServer((BIND, port), Handler)
+    srv = _Server((BIND, port), Handler)
     srv.daemon_threads = True
     return srv
 

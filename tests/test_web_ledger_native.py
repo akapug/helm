@@ -421,6 +421,51 @@ class TestSseDoorbellWatcher(unittest.TestCase):
             t.join(timeout=3)
         self.assertFalse(t.is_alive())
 
+    def test_invalidate_outwaits_an_inflight_compute(self):
+        # the codex-3 round-3 race, pinned: a compute that entered its locked
+        # fill BEFORE the invalidation must NOT survive it — the lock-coupled
+        # pop waits out the publish, so post-invalidation reads recompute
+        def slow_summary(roster=None):
+            time.sleep(0.15)
+            return [{"room": "stale-world"}]
+        with mock.patch.object(web, "_rooms_summary", slow_summary):
+            t = threading.Thread(target=web._rooms_summary_cached, daemon=True)
+            t.start()
+            time.sleep(0.05)                 # compute is mid-fill, lock held
+            web._rooms_summary_invalidate()  # blocks until publish, then pops
+            t.join(timeout=3)
+        self.assertNotIn(self.d, web._ROOMS_SUM_CACHE)
+
+    def test_arm_rolls_back_when_thread_start_refuses(self):
+        # an unguarded Thread.start left watcher=True with no thread behind
+        # it — permanently unarmable. Now: rollback + honest False...
+        with mock.patch.object(threading.Thread, "start",
+                               side_effect=RuntimeError("no threads")):
+            self.assertFalse(web._sse_ensure_watcher())
+        self.assertFalse(web._SSE_STATE["watcher"])
+        # ...and the NEXT client can arm for real
+        self.assertTrue(web._sse_ensure_watcher())
+        web._SSE_STATE["watcher"] = False    # stop it (the loop exits)
+
+    def test_server_close_stops_the_watcher(self):
+        # server-owned lifecycle: the global watcher must not outlive
+        # server_close (it kept ticking indefinitely before)
+        srv = web.make_server(0)
+        try:
+            with mock.patch.object(web, "_SSE_WATCH_S", 0.01):
+                self.assertTrue(web._sse_ensure_watcher())
+                self.assertTrue(web._SSE_STATE["watcher"])
+        finally:
+            srv.server_close()
+        self.assertFalse(web._SSE_STATE["watcher"])
+        deadline = time.time() + 3
+        while time.time() < deadline and any(
+                t.name == "helm-sse-watcher" and t.is_alive()
+                for t in threading.enumerate()):
+            time.sleep(0.02)
+        self.assertFalse(any(t.name == "helm-sse-watcher" and t.is_alive()
+                             for t in threading.enumerate()))
+
 
 class TestSseDoorbellWire(unittest.TestCase):
     """Non-vacuous WIRE controls (codex-3: no reconnect/death controls
