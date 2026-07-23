@@ -1168,6 +1168,14 @@ def cmd_work(args):
             print(ln, file=sys.stdout if rc == 0 else sys.stderr)
         return rc
     if verb == "gc":
+        # `work gc --bogus --apply` must refuse before scan/enact, not run
+        # the rescue-commit sweep under an arg that does not exist.
+        from .cli import guard_tail
+        rc = guard_tail("helm work gc", rest, flags=("--apply",),
+                        valued=("--repo", "--seat"),
+                        usage="work gc [--apply] [--repo PATH]")
+        if rc is not None:
+            return rc
         rows = gc_scan(root)
         if not rows:
             print("helm work gc: no lane rooms under %s-wt/" % root)
@@ -1185,6 +1193,11 @@ def cmd_work(args):
                     print("        " + ln)
         return 0
     if verb == "list":
+        from .cli import guard_tail
+        rc = guard_tail("helm work list", rest, valued=("--repo", "--seat"),
+                        usage="work list [--repo PATH]")
+        if rc is not None:
+            return rc
         registered, registry_error = _worktree_records(root)
         rows = list_rows(root, registered=registered)
         loose, discovery_errors = unguarded_inventory(
@@ -1244,6 +1257,12 @@ def cmd_work(args):
                           ascii(evidence)))
         return 0
     if verb == "install-guard":
+        from .cli import guard_tail
+        grc = guard_tail("helm work install-guard", rest, flags=("--apply",),
+                         valued=("--repo", "--seat"),
+                         usage="work install-guard [--apply] [--repo PATH]")
+        if grc is not None:
+            return grc
         rc, lines = install_guard(root, apply="--apply" in rest)
         for ln in lines:
             print(ln, file=sys.stdout if rc == 0 else sys.stderr)

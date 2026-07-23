@@ -214,6 +214,12 @@ def scan(accounts=None):
 
 def cmd_who(args):
     """who [--json] — pid→cred attribution table for the live fleet."""
+    # flags-only membership reader — guard the tail before scan():
+    # `who --bogus` silently printed the table and exited 0.
+    from .cli import guard_tail
+    rc = guard_tail("helm who", args, flags=("--json",), usage="who [--json]")
+    if rc is not None:
+        return rc
     rows = scan()
     if "--json" in args:
         print(json.dumps(rows, indent=2))

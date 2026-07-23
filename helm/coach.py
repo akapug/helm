@@ -458,6 +458,24 @@ def cmd_coach(args):
     as_layer = _pop_val(args, "--as")
     id_override = _pop_val(args, "--id")
     supersede_old = _pop_val(args, "--supersede")
+    # the lesson is free text, so guard_tail cannot own this tail — but a
+    # remaining '--' token after the pops is an unknown FLAG, not lesson
+    # prose, and used to be silently dropped: `coach lesson --bogus --apply`
+    # landed the lesson with --bogus eaten. Junk refuses before help, before
+    # plan(); single-dash tokens stay lesson text ("use -j"). A clean tail
+    # carrying -h/--help prints usage and stops.
+    junk = [a for a in args if a.startswith("--") and a != "--help"]
+    if junk:
+        from .cli import suggest
+        print("helm coach: unknown arg '%s'%s (%s)"
+              % (junk[0], suggest(junk[0], ("--apply", "--json", "--as",
+                                            "--id", "--project",
+                                            "--supersede", "--help")),
+                 _USAGE), file=sys.stderr)
+        return 2
+    if any(a in ("-h", "--help") for a in args):
+        print(_USAGE)
+        return 0
     if as_layer and as_layer not in _LAYERS:
         print("helm coach: unknown --as layer '%s' (%s)"
               % (as_layer, "|".join(_LAYERS)), file=sys.stderr)

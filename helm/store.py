@@ -1358,6 +1358,13 @@ def cmd_index(args):
         print("usage: helm index cap [--budget-lines N] [--apply]", file=sys.stderr)
         return 2
     rest = args[1:]
+    # cap MUTATES MEMORY.md under --apply; junk refuses before the actuator.
+    from .cli import guard_tail
+    rc = guard_tail("helm index cap", rest, flags=("--apply",),
+                    valued=("--budget-lines",),
+                    usage="index cap [--budget-lines N] [--apply]")
+    if rc is not None:
+        return rc
     budget = INDEX_BUDGET_LINES
     if "--budget-lines" in rest:
         j = rest.index("--budget-lines")

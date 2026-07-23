@@ -2461,9 +2461,16 @@ def cmd_seat(args):
         print(_USAGE, file=sys.stderr)
         return 2
     verb, rest = args[0], args[1:]
+    from .cli import guard_tail
     if verb in ("list", "status"):
+        rc = guard_tail("helm seat " + verb, rest, usage=_USAGE)
+        if rc is not None:
+            return rc
         return _status(rest)
     if verb == "doctor":
+        rc = guard_tail("helm seat doctor", rest, usage=_USAGE)
+        if rc is not None:
+            return rc
         return _doctor(rest)
     if verb == "autocompact":
         from . import autocompact
@@ -2483,12 +2490,31 @@ def cmd_seat(args):
         if not rest:
             print("usage: helm seat resume <seat>", file=sys.stderr)
             return 2
+        # resume RELAUNCHES the pane — trailing junk refuses before it fires.
+        rc = guard_tail("helm seat resume", rest[1:],
+                        usage="seat resume <seat>")
+        if rc is not None:
+            return rc
         return _resume(rest[0], rest[1:])
     if verb in ("add", "up", "down", "launch", "smoke"):
         if not rest:
             print("usage: helm seat %s <family>" % verb, file=sys.stderr)
             return 2
         family = rest[0]
+        # per-verb tail contract — refuse trailing junk BEFORE anything runs:
+        # `seat down codex --bogus --help` used to STOP the seat and exit 0.
+        tails = {"add": ((), ("--room", "--auth-from", "--key-from",
+                              "--provider")),
+                 "up": ((), ()),
+                 "down": ((), ()),
+                 "smoke": (("--multi",), ()),
+                 "launch": (("--multi",),
+                            ("--room", "--model", "-i", "--instance"))}
+        tflags, tvalued = tails[verb]
+        rc = guard_tail("helm seat " + verb, rest[1:], flags=tflags,
+                        valued=tvalued, usage=_USAGE)
+        if rc is not None:
+            return rc
         # --multi (launch/smoke): the mixed-model fleet shape — no subagent
         # pin, probe agents minted, smoke grows the fan-out leg.
         multi = "--multi" in rest

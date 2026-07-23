@@ -368,6 +368,14 @@ def cmd_brief(args):
     """brief [--hours N] [--json] — the operator's morning brief: session
     activity, knowledge delta, cached seat reality, owner gates. Read-only,
     never probes the network."""
+    # flags-only membership reader — guard the tail before compose():
+    # `brief --bogus` silently rendered the brief and exited 0.
+    from .cli import guard_tail
+    rc = guard_tail("helm brief", args, flags=("--json",),
+                    valued=("--hours",),
+                    usage="brief [--hours N] [--json]")
+    if rc is not None:
+        return rc
     hours = 12.0
     if "--hours" in args:
         try:

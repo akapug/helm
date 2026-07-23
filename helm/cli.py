@@ -40,6 +40,10 @@ def cmd_sync(args):
 
 def cmd_projects(args):
     """projects [--all] — the real project list, newest activity first."""
+    rc = guard_tail("helm projects", args, flags=("--all",),
+                    usage="projects [--all]")
+    if rc is not None:
+        return rc
     reg = registry.load()
     projects = list(reg["projects"].values())
     if not projects:
@@ -73,6 +77,9 @@ def cmd_show(args):
     if not args:
         print("usage: helm show <project>", file=sys.stderr)
         return 2
+    rc = guard_tail("helm show", args[1:], usage="show <project>")
+    if rc is not None:
+        return rc
     import json
     p = registry.get(args[0])
     if p is None:
@@ -80,6 +87,55 @@ def cmd_show(args):
         return 1
     print(json.dumps(p, indent=2, ensure_ascii=False))
     return 0
+
+
+def suggest(word, candidates):
+    """The one nearest-match hint — pure, shared by the root's unknown-verb
+    refusal, guard_tail's unknown-arg refusal, and every subdispatcher's
+    unknown-subverb refusal, so a typo anywhere in the tree says what its
+    author probably meant instead of only the generic usage line."""
+    import difflib
+    near = difflib.get_close_matches(word, list(candidates), n=1)
+    return (" — did you mean '%s'?" % near[0]) if near else ""
+
+
+def guard_tail(prog, args, flags=(), valued=(), usage=None):
+    """The nested-dispatcher honesty contract, companion to main()'s
+    unknown-verb refusal: once a subverb is matched, every REMAINING token
+    must be a known flag. Trailing junk refuses with exit 2 BEFORE any work
+    runs (`seat down codex --bogus` used to stop the seat and exit 0), and
+    `--help` after junk still refuses — the existence probe stays honest.
+    A clean tail carrying -h/--help prints `usage` and returns 0. `valued`
+    flags must carry a non-flag value exactly once. Returns None to proceed,
+    else the exit code for the caller to return."""
+    args = list(args or [])
+    junk, want_help, seen = [], False, set()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            want_help = True
+        elif a in valued:
+            if a in seen:
+                print("%s: duplicate %s" % (prog, a), file=sys.stderr)
+                return 2
+            seen.add(a)
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                print("%s: %s wants a value" % (prog, a), file=sys.stderr)
+                return 2
+            i += 1
+        elif a not in flags:
+            junk.append(a)
+        i += 1
+    if junk:
+        print("%s: unknown arg '%s'%s%s" % (
+            prog, junk[0], suggest(junk[0], tuple(flags) + tuple(valued)),
+            (" (%s)" % usage) if usage else ""), file=sys.stderr)
+        return 2
+    if want_help:
+        print(usage or prog)
+        return 0
+    return None
 
 
 def _lazy(module, fn):
@@ -158,6 +214,14 @@ VERBS = {
     "tidy": _lazy("envtidy", "cmd_tidy"),
     "rearm": _lazy("rearm", "cmd_rearm"),
 }
+
+# Verbs whose handlers read NO arguments at all: nothing below main() will
+# ever look at the tail, so the ROOT guards it — `helm sync --bogus --help`
+# must refuse (exit 2) BEFORE the (possibly mutating) leaf runs, not run
+# sync while --help pretends the flag existed. The sweep test DERIVES this
+# set from the source (AST: the handler never loads its args param) and
+# fails when a new no-arg leaf is born outside it, so the class stays closed.
+NOARG_VERBS = ("home", "sync", "doctor", "human")
 
 _VERB_HELP = {
     "brief": "brief [--hours N] [--json] — the operator's morning brief: sessions, knowledge delta (incl. pinned-starvation tail), seats, owner gates (read-only, never probes)",
@@ -242,12 +306,25 @@ def main(argv=None):
     verb = argv[0]
     fn = VERBS.get(verb)
     if fn is None:
-        print("helm: unknown verb '%s' (helm --help)" % verb, file=sys.stderr)
+        # Honest even under --help: an unknown verb NEVER falls through to the
+        # global usage with exit 0 — that false positive taught the fleet to
+        # distrust `helm <verb> --help` as an existence probe.
+        print("helm: unknown verb '%s'%s (helm --help)" % (verb, suggest(verb, VERBS)),
+              file=sys.stderr)
         return 2
     rest = argv[1:]
     if rest and rest[0] in ("-h", "--help"):
+        # help-FIRST short-circuits with the tail unread — deliberately: the
+        # root does not know a verb's flag surface, so refusing `--help
+        # --json` here would lie about real flags. No work ever runs on this
+        # path; junk-beats-help binds where a handler parses its own tail.
         print("helm " + (_VERB_HELP.get(verb) or (fn.__doc__ or verb).strip().split("\n")[0]))
         return 0
+    if verb in NOARG_VERBS:
+        rc = guard_tail("helm " + verb, rest, usage=_VERB_HELP.get(verb)
+                        or (fn.__doc__ or verb).strip().split("\n")[0])
+        if rc is not None:
+            return rc
     return fn(rest)
 
 

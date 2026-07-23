@@ -700,6 +700,15 @@ def cmd_promote(args):
     """promote [--since Nd] [--cap N] [--apply] — the episodic->durable funnel:
     scan recent USER messages for durable-knowledge markers, write each as a
     drain-intake candidate (dry-run default; drain then gates them)."""
+    # membership reads ('--apply' in args) see no junk — the tail is guarded
+    # BEFORE the scan/write: `promote --bogus --apply` used to WRITE intake
+    # files and exit 0 with --help pretending the flag existed.
+    from .cli import guard_tail
+    rc = guard_tail("helm promote", args, flags=("--apply",),
+                    valued=("--since", "--cap"),
+                    usage="promote [--since Nd] [--cap N] [--apply]")
+    if rc is not None:
+        return rc
     since = 7
     if "--since" in args:
         try:
@@ -827,6 +836,19 @@ def cmd_drain(args):
     identical gauntlet; --rekey is the one-time drained-cohort keyword
     migration; --expire-candidates prunes unconfirmed candidates older than N
     days (14 default). Dry-run by default."""
+    # tail guard before ANY routing work — cmd_drain reads flags only via
+    # membership, so junk used to run the (mutating on --apply) router as if
+    # the typo'd flag existed.
+    from .cli import guard_tail
+    rc = guard_tail("helm drain", args,
+                    flags=("--apply", "--sweep-dups", "--rekey",
+                           "--expire-candidates"),
+                    valued=("--limit", "--project", "--days"),
+                    usage="drain [--apply] [--sweep-dups] [--limit N] "
+                          "[--project P] | drain --rekey [--apply] | drain "
+                          "--expire-candidates [--days N] [--apply]")
+    if rc is not None:
+        return rc
     project = None
     if "--project" in args:
         i = args.index("--project")

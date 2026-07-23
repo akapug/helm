@@ -590,6 +590,10 @@ def cmd_hooks(args):
         return envtidy.cmd_hooks_sync(rest)
 
     if verb == "status":
+        from .cli import guard_tail
+        rc = guard_tail("helm hooks status", rest, usage="hooks status")
+        if rc is not None:
+            return rc
         rows = status_rows()
         if not rows:
             print("helm hooks: no claude homes found")
@@ -647,6 +651,15 @@ def cmd_hooks(args):
         return 0
 
     if verb == "install":
+        # refuse junk BEFORE any home is touched — `hooks install --bogus`
+        # used to run the full install and exit 0 as if --bogus existed.
+        from .cli import guard_tail
+        rc = guard_tail("helm hooks install", rest, flags=("--dry",),
+                        valued=("--harness", "--home"),
+                        usage="hooks install [--harness claude|codex] "
+                              "[--home NAME] [--dry]")
+        if rc is not None:
+            return rc
         harness = "claude"
         home_name = None
         dry = "--dry" in rest
