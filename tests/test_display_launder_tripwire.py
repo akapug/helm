@@ -997,10 +997,38 @@ class ChatRowFromFieldConsumerAllowlistTest(unittest.TestCase):
 
 
 # ── G. source-driven nested transport profile/reason sink tripwire ────────────
-# A transport projection is recognizable in Python by reading BOTH nested
-# identity (`profile`) and network diagnostic (`reason`) fields. Enumerate every
-# such function across helm/*.py: a new renderer/status/JSON adapter becomes a
-# new site and fails until its laundering boundary is explicitly justified.
+# A transport projection may expose either nested identity (`profile`) OR network
+# diagnostic (`reason`) independently. Enumerate every such key reader across
+# helm/*.py: a new renderer/status/JSON adapter becomes a new site and fails
+# until its laundering boundary is explicitly justified.
+
+
+def _transport_projection_functions(source):
+    functions = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        keys = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call) \
+                    and isinstance(child.func, ast.Attribute) \
+                    and child.func.attr in ("get", "pop", "setdefault") \
+                    and child.args and isinstance(child.args[0], ast.Constant):
+                keys.add(child.args[0].value)
+            elif isinstance(child, ast.Subscript) \
+                    and isinstance(child.slice, ast.Constant):
+                keys.add(child.slice.value)
+        projection = {"profile", "reason"} & keys
+        transport = "transport" in node.name or any(
+            isinstance(child, ast.Constant) and child.value == "transport"
+            or isinstance(child, ast.Name) and "transport" in child.id
+            or isinstance(child, ast.Attribute) and "transport" in child.attr
+            for child in ast.walk(node))
+        # `reason` is generic across unrelated domains. The old both-key pair is
+        # unambiguous; a single-key projection must carry transport context.
+        if projection and (len(projection) == 2 or transport):
+            functions.add(node.name)
+    return functions
 
 
 def _transport_projection_sites():
@@ -1009,28 +1037,15 @@ def _transport_projection_sites():
         if not fn.endswith(".py"):
             continue
         with open(os.path.join(PKG, fn), encoding="utf-8") as f:
-            tree = ast.parse(f.read())
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            keys = set()
-            for child in ast.walk(node):
-                if isinstance(child, ast.Call) \
-                        and isinstance(child.func, ast.Attribute) \
-                        and child.func.attr in ("get", "pop", "setdefault") \
-                        and child.args and isinstance(child.args[0], ast.Constant):
-                    keys.add(child.args[0].value)
-                elif isinstance(child, ast.Subscript) \
-                        and isinstance(child.slice, ast.Constant):
-                    keys.add(child.slice.value)
-            if {"profile", "reason"} <= keys:
-                sites.add((fn, node.name))
+            sites.update((fn, name)
+                         for name in _transport_projection_functions(f.read()))
     return sites
 
 
 _TRANSPORT_PROJECTION_CONSUMERS = {
     ("chat.py", "_public_transport"): "publish owner launders profile via _dsan and reason via _safe_reason",
     ("chat.py", "_failure_public"): "incident status owner launders profile and reason before every status/JSON consumer",
+    ("chat.py", "_stamp_sign_failure"): "reason-only row projection routes its transport copy through _public_transport",
     ("chat.py", "_transport_tag"): "CLI, follow, and journal row renderer launders legacy/pre-fix nested fields at the sink",
     ("chat.py", "transport_failure_summary"): "CLI/node/doctor summary launders both nested fields at the sink",
     ("human.py", "status_line"): "TUI renderer launders both nested fields at the sink",
@@ -1038,11 +1053,29 @@ _TRANSPORT_PROJECTION_CONSUMERS = {
 
 
 class TransportProjectionConsumerAllowlistTest(unittest.TestCase):
+    def test_reason_only_and_profile_only_sinks_trip(self):
+        functions = _transport_projection_functions("""
+def reason_only(row):
+    return row["transport"].get("reason")
+
+def profile_only(row):
+    return row["transport"]["profile"]
+
+def unrelated(row):
+    return row.get("code")
+""")
+        self.assertEqual(functions, {"reason_only", "profile_only"})
+
+        live = _transport_projection_sites()
+        for boundary in _TRANSPORT_PROJECTION_CONSUMERS:
+            self.assertIn(boundary, live,
+                          "central laundering boundary stopped being detected")
+
     def test_every_nested_transport_projection_is_allowlisted(self):
         self.assertEqual(
             _transport_projection_sites(),
             set(_TRANSPORT_PROJECTION_CONSUMERS),
-            "nested transport.profile/reason consumer drifted: every new public "
+            "nested transport profile/reason consumer drifted: every new public "
             "projection must pass chat._dsan/_safe_reason before rendering or "
             "JSON emission and be registered with its laundering reason")
 
