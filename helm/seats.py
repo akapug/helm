@@ -285,11 +285,48 @@ def _git_project(cwd):
 
 def derive_home_room(cwd):
     """The seat's DEFAULT project room. Explicit env/CLI rooms are resolved by
-    join before this fallback. Project-less seats stay un-homed (legacy all-room
-    behavior); any identity that normalizes to reserved #main stays un-homed."""
+    resolve_homing before this fallback. Project-less seats stay un-homed
+    (legacy all-room behavior); any identity that normalizes to reserved #main
+    stays un-homed."""
     proj = _git_project(cwd)
     room = pk.slug(proj) if proj else None
     return None if not room or room == "main" else room
+
+
+def safe_cwd():
+    """os.getcwd() failing OPEN to None when the process cwd no longer exists
+    (a pruned lane worktree is a ROUTINE lifecycle state here, not an error).
+    Every homing call site must use this instead of a bare os.getcwd(): an
+    eager getcwd in the chat/hook prologue crashed every default chat verb and
+    all three delivery hooks for a deleted-cwd session, BEFORE any fail-open
+    guard could catch it. resolve_homing/derive_home_room treat None as
+    un-homed, so the session keeps working (in #main) instead of dying."""
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
+def resolve_homing(cli_room=None, cwd=None):
+    """THE one home-room precedence — every writer resolves through here and
+    write_roster is the one enforcement gate behind it. The bug-class this
+    kills: multiple derivations of one truth scattered a live roster's homes
+    across 'main' (a defaulted mirror write), '<project>' (a cwd derivation)
+    and '<env room>' (the launch seam) for seats of the SAME team. Order:
+      1. an explicit CLI/operator room (cli_room)          -> explicit
+      2. HELM_CHAT_ROOM (the launch seam) — explicit unless the seam stamped
+         HELM_CHAT_ROOM_SOURCE=derived                     -> explicit/derived
+      3. the cwd's git-project room (derive_home_room)     -> derived
+    Returns (room, source); (None, None) = un-homed. Paired law (enforced in
+    write_roster): a derived value may NEVER overwrite an explicit/operator
+    one, so a re-join/resume/mirror can never downgrade a deliberate home."""
+    if cli_room:
+        return cli_room, "explicit"
+    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
+    if env_room:
+        return env_room, ("derived" if env_source == "derived" else "explicit")
+    room = derive_home_room(cwd)
+    return room, ("derived" if room else None)
 
 
 def owner_names():
@@ -512,13 +549,24 @@ def write_roster(seat, session=None, cwd=None, home_room=None,
     keeps its own delivery cursor (fan-out, never race-consume). home_room_source
     is `explicit` or `derived`: explicit joins may deliberately move a seat;
     derived joins follow a seat across projects only while its prior home was
-    also derived; they never undo an explicit/operator home or clear."""
+    also derived; they never undo an explicit/operator home or clear. An
+    UNLABELED home_room reads as derived — unknown provenance takes the
+    weakest tier, never the strongest (the old back-compat seam stamped it
+    explicit and let a spawn mirror downgrade a deliberate home)."""
     chat._ensure_dir()
     with _flocked(roster_path() + ".lock"):
         r = roster()
         row = r.get(seat) or {}
         home_room = pk.slug(home_room) if home_room else None
         if home_room_source == "explicit":
+            # Known tier gap (documented; follow-up card): explicit beats
+            # explicit regardless of AGE, so an operator rehome holds only
+            # until a pane launched with env HELM_CHAT_ROOM (explicit, no
+            # derived stamp) restarts — its SessionStart join re-writes the
+            # stale env room. The homing law only forbids DERIVED downgrades;
+            # ranking 'operator' above a stale explicit env (or re-minting
+            # launch.sh on rehome) is the candidate fix, deliberately not
+            # smuggled into this lane.
             old = row.get("home_room")
             if home_room != old:
                 newly_admitted = _rooms_to_baseline(old, home_room)
@@ -531,27 +579,23 @@ def write_roster(seat, session=None, cwd=None, home_room=None,
             else:
                 row.pop("home_room", None)
             row["home_room_source"] = "explicit"
-        elif home_room_source == "derived" and home_room:
+        elif home_room:
+            # derived — or UNLABELED (provenance unknown reads as derived, the
+            # weakest tier): fills a never-homed row or follows a derived-tier
+            # one — and an EXISTING home with no source IS derived-tier, so it
+            # follows too (a pre-upgrade row {home: main, source: None} must
+            # not freeze its stale scattered value against every later derived
+            # join). It can never overwrite an explicit/operator home or
+            # clear, so a re-join/resume/mirror never downgrades a deliberate
+            # home.
             old, source = row.get("home_room"), row.get("home_room_source")
-            if source == "derived" and home_room != old:
-                _baseline_rooms(
-                    seat, row, _rooms_to_baseline(old, home_room))
-                row["home_room"] = home_room
-            elif not old and not source:
+            if source in (None, "derived") and home_room != old:
                 _baseline_rooms(
                     seat, row, _rooms_to_baseline(old, home_room))
                 row["home_room"] = home_room
             if row.get("home_room") == home_room \
                     and source in (None, "derived"):
                 row["home_room_source"] = "derived"
-        elif home_room and home_room != row.get("home_room"):
-            # Back-compat for the old direct write_roster(..., home_room=) seam:
-            # a supplied room was always an explicit operator/launch choice.
-            old = row.get("home_room")
-            _baseline_rooms(
-                seat, row, _rooms_to_baseline(old, home_room))
-            row["home_room"] = home_room
-            row["home_room_source"] = "explicit"
         if session:
             row["session"] = str(session)
             sess = [s for s in row.get("sessions") or [] if s != str(session)]
@@ -593,6 +637,44 @@ def _resolve_seat(r, token):
     return None
 
 
+_STATE_MARKERS = (".cursor.", ".seen.", ".stopfp.", ".scan.")
+
+
+def _key_bounded(name, key):
+    """Does this state filename belong to THIS seat key? Match only at a
+    FIELD BOUNDARY: after '<marker><key>' the name must end or continue with
+    '.' (the .k<sid8>/.lock suffixes — _seat_key's slug+hash alphabet never
+    contains '.'). A bare substring test cross-fired: seat 'foo' (key
+    foo-<h1>) prefix-matched every state file of a seat literally NAMED
+    'foo-<h1>' (its key foo-<h1>-<h2>), so pruning/renaming 'foo' unlinked or
+    moved the LIVE seat's cursors — the same gc state cross-fire class the
+    case-variant fix closed, substring flavor (fable adversarial probe B3)."""
+    for m in _STATE_MARKERS:
+        probe, i = m + key, 0
+        while True:
+            i = name.find(probe, i)
+            if i < 0:
+                break
+            end = i + len(probe)
+            if end == len(name) or name[end] == ".":
+                return True
+            i += 1
+    return False
+
+
+def _bounded_sub(name, ok, nk):
+    """_key_bounded's boundary law applied to the RENAME substitution: swap
+    the key only where it fills a whole '.'-field (bare, or dm-prefixed for
+    the dm-lane room segment) — keys/rooms never contain '.' (slug + hash
+    alphabets), so '.' is a hard field boundary. The raw str.replace it
+    replaces rewrote a ROOM slug that merely EMBEDS the key
+    ('<key>-updates.cursor.<key>' -> room segment corrupted), silently
+    detaching the cursor from its room (fable adversarial probe C10)."""
+    dm_ok, dm_nk = chat.DM_PREFIX + ok, chat.DM_PREFIX + nk
+    return ".".join(nk if s == ok else (dm_nk if s == dm_ok else s)
+                    for s in name.split("."))
+
+
 def _move_seat_state(old, new):
     """Carry every state file from the old seat key to the new one — cursors
     (+ per-session variants + locks), .seen, stop latches, every room. The
@@ -609,15 +691,16 @@ def _move_seat_state(old, new):
         names = os.listdir(d)
     except OSError:
         return
-    markers = (".cursor.", ".seen.", ".stopfp.", ".scan.")
     for n in names:
-        if any(marker + ok in n for marker in markers):
+        if _key_bounded(n, ok):
             try:
                 # replace EVERY key occurrence: a dm-lane cursor carries the
                 # key twice (dm-<key>.cursor.<key>…) and both must move —
-                # the lane file kept its inode, so the cursor stays valid
+                # the lane file kept its inode, so the cursor stays valid.
+                # Segment-bounded (_bounded_sub), never raw str.replace: a
+                # room slug embedding the key must keep its room segment.
                 os.replace(os.path.join(d, n),
-                           os.path.join(d, n.replace(ok, nk)))
+                           os.path.join(d, _bounded_sub(n, ok, nk)))
             except OSError:
                 pass
 
@@ -646,8 +729,9 @@ def rename_seat(old, new):
         # case-INSENSITIVE taken-check: _seat_key casefolds, the reserved check
         # lowers, and _mention_re is re.I — a case-variant name (KIMI vs kimi)
         # is the SAME address + the SAME keyed state downstream, so two such
-        # rows alias mentions, share presence, and cross-fire the reaper onto
-        # the live seat's state (kimi cross-family review, live-probed 2026-07-21).
+        # rows alias mentions, share presence, and cross-fire gc's state
+        # unlink onto the live seat (kimi cross-family review, live-probed
+        # 2026-07-21).
         # Exclude `seat` itself so a pure self-case-change isn't falsely blocked.
         if any(k != seat and k.casefold() == new.casefold() for k in r):
             return False, ("seat name %r is taken (case-insensitive — the "
@@ -1121,7 +1205,7 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
     touch_seen(seat)                       # presence FIRST — a seat muted by the
     if (home.env("CHAT_DELIVER") or "").lower() in ("0", "off", "no"):
         return None                        # kill-switch below is still ALIVE:
-                                           # keep its row fresh so it isn't reaped
+                                           # its presence beat keeps gc off it
     sc = scope if scope is not None else seat_scope(seat)
     # Global order is roster -> cursor: rehome/join baseline cursors while the
     # roster lock is held. Register an unknown session BEFORE taking its cursor
@@ -1255,21 +1339,19 @@ def join(session=None, cwd=None, seat=None, room="main", room_explicit=False,
     (all live rooms for legacy un-homed seats; {home, main} for homed seats),
     so pre-join backlog never floods and later admitted rooms can backfill."""
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
-    # Homing precedence: an explicit CLI room beats the environment; the env
-    # beats derivation. Direct callers' non-main `room` remains explicit for
-    # back-compat. A derived join fills only a never-homed row, so SessionStart
-    # cannot silently undo an operator rehome/clear or move a co-named seat.
+    # Homing precedence lives in ONE function (resolve_homing: explicit CLI
+    # room > env seam > project derivation) — never re-derived here. Direct
+    # callers' non-main `room` remains explicit for back-compat; a caller
+    # that already resolved a derived room passes it through unchanged. A
+    # derived join fills only a never-homed row (write_roster's law), so
+    # SessionStart cannot silently undo an operator rehome/clear or move a
+    # co-named seat.
     direct_room = room_explicit or room != "main"
-    env_room, env_source = home.env_pair("CHAT_ROOM", "CHAT_ROOM_SOURCE")
     if room_source == "derived":
         home_room, source = pk.slug(room), "derived"
-    elif direct_room:
-        home_room, source = pk.slug(room), "explicit"
-    elif env_room:
-        home_room = pk.slug(env_room)
-        source = "derived" if env_source == "derived" else "explicit"
     else:
-        home_room, source = derive_home_room(cwd), "derived"
+        home_room, source = resolve_homing(room if direct_room else None, cwd)
+        home_room = pk.slug(home_room) if home_room else None
     row = write_roster(seat, session=session, cwd=cwd, home_room=home_room,
                        home_room_source=source)
     effective_home = row.get("home_room")
@@ -1932,12 +2014,14 @@ def presence_of(ls):
     return "fresh" if age < FRESH_S else "quiet" if age < QUIET_S else "absent"
 
 
-REAP_S = 3600   # a roster row unseen this long is a throwaway — reap it
+REAP_S = 3600   # presence window: a beat this recent is live evidence on its
+                # own (gc's first keep tier; the CLI hides older rows behind
+                # --all). Presence ALONE never deletes anything anymore.
 
 
 def _unlink_seat_state(seat):
     """Remove every state file keyed on the seat (cursors + locks +
-    per-session variants, .seen, stop latches) — the orphan tail a reaped
+    per-session variants, .seen, stop latches) — the orphan tail a pruned
     row would otherwise leave in the room dir forever. Fail-open per file."""
     key = _seat_key(seat)
     d = chat.chat_dir()
@@ -1949,54 +2033,192 @@ def _unlink_seat_state(seat):
         names = os.listdir(d)
     except OSError:
         return
-    markers = (".cursor.", ".seen.", ".stopfp.", ".scan.")
     for n in names:
-        if any((m + key) in n for m in markers):
+        if _key_bounded(n, key):
             try:
                 os.remove(os.path.join(d, n))
             except OSError:
                 pass
 
 
-def reap_roster(max_age=REAP_S, now=None):
-    """G-roster-reaper -> [reaped seats]. The roster only ever GREW — /tmp
-    throwaway sessions piled up as permanently-absent rows with orphan
-    cursor/seen/latch files. Drop rows unseen for max_age+ and unlink their
-    state. Presence truth is the .seen mtime: deliver touches it at every
-    boundary and an armed beacon's wait loop delivers, so a live-but-idle
-    seat stays fresh; a reaped seat that returns self-heals at its next
-    boundary (cursor re-baselines — acceptable for something absent an
-    hour). Lock-free probe first: the web panel polls the report every 3s
-    and must not churn the roster — only an actually-stale row takes the
-    flock (claims_list's exact pattern). Fail-open total."""
-    now = time.time() if now is None else now
-    cut = now - max_age
+def _transcript_exists(sid, roots):
+    """Any transcript file naming the session under any harness store:
+    claude's <root>/<proj-slug>/<sid>.jsonl, codex's nested
+    rollout-<ts>-<sid>.jsonl."""
+    s = glob.escape(str(sid))
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        if glob.glob(os.path.join(root, "*", s + ".jsonl")):
+            return True
+        if glob.glob(os.path.join(root, "**", "*" + s + "*.jsonl"),
+                     recursive=True):
+            return True
+    return False
+
+
+def _transcript_hit(sids, roots=None):
+    """First remembered session with a transcript on this host, else None.
+    Root discovery is NOT ours: session's persistence census
+    (session._persisting_sids) is the ONE truth owner — the catalog roots
+    (~/.claude + ~/.claude-homes, ~/.codex + ~/.codex-homes) PLUS every helm
+    seat home (~/.helm/_global/seats/**/claude/projects). The previous
+    hand-rolled root list here omitted helm's own seat stores, so an
+    inactive-but-fully-persisted proxy seat probed as junk (codex-2's live
+    reproduction: its own transcript root missing from the list). An
+    explicit roots list (tests / a foreign store) is globbed directly. An
+    INCOMPLETE census raises — probe trouble must keep the row, never pass
+    as proven-absent."""
+    if roots is not None:
+        return next((s for s in sids if _transcript_exists(s, roots)), None)
+    from . import session
+    census = session._persisting_sids()
+    hit = next((s for s in sids if s in census), None)
+    if hit is None and not getattr(census, "complete", True):
+        raise RuntimeError("persistence census incomplete")
+    return hit
+
+
+def _live_process_evidence(seat, sids, proc_dir="/proc"):
+    """Keep-reason when a live process of THIS uid references the seat — its
+    cmdline/environ naming a remembered session id, or its environ carrying
+    HELM_CHAT_NAME=<seat> (a joined pane whose row remembers no session is
+    still a live seat, not junk). FAIL-CLOSED: an unlistable table, or ANY
+    same-uid process whose cmdline/environ cannot be read, returns a
+    keep-reason — an unfinished scan never testifies to absence. Scope is
+    same-uid on purpose: a foreign-uid process cannot host this user's
+    harness, and its environ is unreadable by kernel design — counting that
+    as trouble would fail-close every gc on any real host into a no-op. A
+    process that EXITED mid-scan (ENOENT/ESRCH) is proven not-live and skips
+    — that is evidence of absence, not probe trouble."""
+    sid_needles = [str(s).encode("utf-8") for s in sids if s]
+    seat_needles = [("%s=%s" % (var, seat)).encode("utf-8") + b"\0"
+                    for var in ("HELM_CHAT_NAME", "MELD_CHAT_NAME")]
     try:
-        r = roster()
-        if not any((last_seen(s, row) or 0) < cut for s, row in r.items()):
-            return []
-        victims = []
-        with _flocked(roster_path() + ".lock"):
-            r = roster()
-            for s in list(r):
-                if (last_seen(s, r[s]) or 0) < cut:
+        me = os.getuid()
+        pids = [n for n in os.listdir(proc_dir) if n.isdigit()]
+    except OSError as e:
+        return "process table unlistable (%s) — fail closed" % e
+    for pid in pids:
+        pdir = os.path.join(proc_dir, pid)
+        try:
+            if os.stat(pdir).st_uid != me:
+                continue
+        except OSError:
+            continue                    # exited between listdir and stat
+        blob = b""
+        for leaf in ("cmdline", "environ"):
+            try:
+                with open(os.path.join(pdir, leaf), "rb") as f:
+                    blob += f.read(1 << 20)
+            except (FileNotFoundError, ProcessLookupError):
+                continue                # exited mid-scan: proven not-live
+            except OSError as e:
+                return ("process %s %s unreadable (%s) — fail closed"
+                        % (pid, leaf, e.__class__.__name__))
+        if any(n in blob for n in sid_needles):
+            return "a live process references a remembered session"
+        if any(n in blob for n in seat_needles):
+            return "a live process carries HELM_CHAT_NAME=%s" % seat
+    return None
+
+
+def _gc_keep_reason(seat, row, roots, proc_dir, now):
+    """The ONE keep-evidence probe — the dry-run scan AND the locked apply
+    both run THIS, so no deletion path can ever act on less evidence than
+    the report showed. Returns the keep reason, or None (prunable junk).
+    Any raise is probe trouble: the caller keeps the row (fail closed)."""
+    sids = [x for x in [row.get("session")]
+            + list(row.get("sessions") or []) if x]
+    ls = last_seen(seat, row)
+    if ls and now - ls < REAP_S:
+        return "presence beat %dm ago" % max(0, int((now - ls) / 60))
+    hit = _transcript_hit(sids, roots)
+    if hit:
+        return "transcript exists for session %.12s" % hit
+    return _live_process_evidence(seat, sids, proc_dir)
+
+
+def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
+    """The roster's ONE cleanup owner (`helm chat seat gc`) — a verb someone
+    RUNS, never automatic, and the only code allowed to delete a roster row.
+    (The legacy auto-reap that rode roster_report deleted any stale row on
+    presence ALONE — an inactive-but-fully-persisted seat lost its row to a
+    3-second web poll, bypassing every transcript/process guard and the
+    dry-run gate. Retired, not fenced: a report is a read.) Targets JUNK
+    rows (the /tmp throwaway class). REFUSAL IS THE DEFAULT — a row is kept
+    on ANY live evidence (_gc_keep_reason, the one probe):
+      * a presence beat within REAP_S (.seen mtime / roster last_seen),
+      * a transcript for ANY remembered session, anywhere the session
+        census covers (incl. helm's own seat homes),
+      * a live same-uid process naming ANY remembered session id or
+        carrying the seat's HELM_CHAT_NAME,
+      * probe trouble of any kind (fail-closed).
+    Returns (rows, pruned): rows = [{seat, verdict: keep|prune, why}] for the
+    whole roster; dry-run (apply=False) prunes NOTHING. apply=True deletes a
+    scan-flagged row only after the FULL evidence probe re-runs fresh under
+    the roster lock (TOCTOU: a transcript flushing or a presence beat
+    landing between scan and apply must win), then unlinks its derived seat
+    state (_unlink_seat_state — cursors, .seen, latches, the RAM DM lane)
+    UNDER THE SAME LOCK: row delete + state unlink are one atomic critical
+    section, so a rejoin can only land before (and be re-probed as keep
+    evidence) or after (and keep its fresh state) — never in between."""
+    now = time.time() if now is None else now
+    rows = []
+    for s, row in sorted(roster().items()):
+        sids = [x for x in [row.get("session")]
+                + list(row.get("sessions") or []) if x]
+        try:
+            why = _gc_keep_reason(s, row, roots, proc_dir, now)
+        except Exception as e:                # fail-closed, loudly
+            why = "keep-evidence probe failed (%s)" % e
+        rows.append({
+            "seat": s, "verdict": "keep" if why else "prune",
+            "why": why or (
+                "no transcript for %d remembered session%s, no live "
+                "process, no fresh presence"
+                % (len(sids), "s"[:len(sids) != 1]) if sids else
+                "no remembered sessions, no live process, no fresh presence")})
+    pruned = []
+    if apply:
+        victims = {r["seat"] for r in rows if r["verdict"] == "prune"}
+        if victims:
+            with _flocked(roster_path() + ".lock"):
+                r = roster()
+                for s in list(r):
+                    if s not in victims:
+                        continue
+                    try:      # the SAME full probe, fresh, under the lock
+                        keep = _gc_keep_reason(s, r[s], roots, proc_dir,
+                                               time.time())
+                    except Exception:         # fail closed under the lock too
+                        keep = "probe trouble"
+                    if keep:
+                        continue              # evidence landed since the scan
                     del r[s]
-                    victims.append(s)
-            if victims:
-                pk.write_json(roster_path(), r)
-        for s in victims:
-            _unlink_seat_state(s)
-        return victims
-    except Exception:
-        return []
+                    pruned.append(s)
+                if pruned:
+                    pk.write_json(roster_path(), r)
+                # unlink INSIDE the same lock (codex-2): row delete + state
+                # unlink are ONE critical section. Unlinking after release
+                # left a gap where a SessionStart rejoin recreated the row
+                # plus fresh .seen/cursors/DM lane — and this old invocation
+                # then destroyed the NEW seat's state (live seat reading as
+                # absent with its queued DMs gone). _unlink_seat_state takes
+                # no locks of its own (plain os.remove), so no inversion.
+                for s in pruned:
+                    _unlink_seat_state(s)
+    return rows, pruned
 
 
 def roster_report(room="main"):
     """{"seats": [...], "claims": [...]} — fail-open by caller. Pending is
-    computed from each seat's cursor WITHOUT moving it. One GC leg rides the
-    read (claims_list's precedent): rows absent past REAP_S are reaped here,
-    so every live surface (CLI table, web panel) keeps the roster clean."""
-    reap_roster()
+    computed from each seat's cursor WITHOUT moving it. A report is a READ:
+    it deletes NOTHING. (The legacy auto-reap that rode this verb was a
+    second cleanup owner, dropping stale rows on presence alone — a
+    persisted seat vanished on a poll while gc's evidence probe would have
+    kept it. Cleanup has ONE owner now: gc_roster, a verb someone runs.
+    Absent rows merely hide behind --all in the surfaces.)"""
     seats = []
     for seat, row in sorted(roster().items()):
         # pending is the MULTI-ROOM truth (the owner's panel must show a
@@ -2062,6 +2284,23 @@ def _hook_emit(event):
     return emit
 
 
+def _payload_homing(cwd, room, room_source):
+    """The hook seam homes from the SESSION's payload cwd, not the hook
+    PROCESS's. cmd_chat pre-resolves the default room from its own cwd —
+    normally identical to the session's, but a metaharness may run hooks
+    elsewhere (or the two may diverge), and a derived room from the WRONG
+    cwd would home the seat to the wrong project. So: a DERIVED
+    pre-resolution is re-resolved through THE one resolver against the
+    payload cwd when one is present; explicit rooms (--room, operator env)
+    pass through untouched."""
+    if not cwd or room_source != "derived":
+        return room, room_source
+    r2, s2 = resolve_homing(None, cwd)
+    if not r2:
+        return "main", None                     # payload cwd is project-less
+    return r2, ("derived" if s2 == "derived" else None)
+
+
 def cmd(verb, args, room="main", room_explicit=False, room_source=None):
     """The seats subverbs, reached through `helm chat <verb>`."""
     args = list(args or [])
@@ -2071,7 +2310,8 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             if "--hook-json" in args:
                 d = _hook_stdin()
                 session, cwd = d.get("session_id"), d.get("cwd")
-            seat, line = join(session=session, cwd=cwd or os.getcwd(),
+                room, room_source = _payload_homing(cwd, room, room_source)
+            seat, line = join(session=session, cwd=cwd or safe_cwd(),
                               seat=_flag(args, "--seat"), room=room,
                               room_explicit=room_explicit,
                               room_source=room_source)
@@ -2088,6 +2328,7 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             if "--hook-json" in args:
                 d = _hook_stdin()
                 session, cwd = d.get("session_id"), d.get("cwd")
+                room, _ = _payload_homing(cwd, room, room_source)
             emit = _hook_emit("PostToolUse") if "--hook-json" in args else print
             deliver_any(session=session, room=room,   # every room, one nudge
                         seat=_flag(args, "--seat"), emit=emit, cwd=cwd)
@@ -2135,9 +2376,37 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             ok, msg = rehome_seat(args[1], args[2])
             print("helm chat: " + msg, file=sys.stdout if ok else sys.stderr)
             return 0 if ok else 1
+        if args[:1] == ["gc"]:
+            rest = args[1:]
+            if any(a != "--apply" for a in rest):
+                print("usage: helm chat seat gc [--apply]   (dry-run default; "
+                      "prunes only roster rows with NO live evidence — no "
+                      "transcript, no live process, no fresh presence)",
+                      file=sys.stderr)
+                return 2
+            rows, pruned = gc_roster(apply="--apply" in rest)
+            if not rows:
+                print("helm chat: roster empty — nothing to gc")
+                return 0
+            w = max(len(r["seat"]) for r in rows)
+            for r in rows:
+                print("  %-5s %-*s  %s"
+                      % (r["verdict"].upper(), w, r["seat"], r["why"]))
+            n = sum(r["verdict"] == "prune" for r in rows)
+            if "--apply" in rest:
+                print("helm chat: pruned %d roster row%s (+ derived seat "
+                      "state); %d kept on live evidence"
+                      % (len(pruned), "s"[:len(pruned) != 1],
+                         len(rows) - len(pruned)))
+            else:
+                print("helm chat: %d row%s would be pruned — dry-run "
+                      "(`helm chat seat gc --apply` prunes)"
+                      % (n, "s"[:n != 1]))
+            return 0
         print("usage: helm chat seat rename <sid|oldname> <newname> | "
               "seat mute|unmute <room> [--seat S] | seat mutes [--seat S] | "
-              "rehome <sid|name> <room|main|none>", file=sys.stderr)
+              "seat gc [--apply] | rehome <sid|name> <room|main|none>",
+              file=sys.stderr)
         return 2
     if verb == "stop-guard":
         try:
@@ -2146,6 +2415,7 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                 d = _hook_stdin()
                 session = d.get("session_id")
                 stop_active = bool(d.get("stop_hook_active"))
+                room, _ = _payload_homing(d.get("cwd"), room, room_source)
             blocks, warns = stop_guard(session=session, room=room,
                                        seat=_flag(args, "--seat"),
                                        stop_active=stop_active)
@@ -2181,9 +2451,9 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
         rep = roster_report(room)
         rows = rep["seats"]
         hidden = 0
-        if "--all" not in args:      # absent rows hide by default (rows past
+        if "--all" not in args:      # absent rows hide by default (junk rows
             shown = [s for s in rows if s["presence"] != "absent"]
-            hidden = len(rows) - len(shown)          # REAP_S are already gone)
+            hidden = len(rows) - len(shown)          # leave via seat gc only)
             rows = shown
         if not rows and not hidden:
             print("helm chat: no seats yet — sessions join on their next start "
@@ -2204,8 +2474,9 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                 w, s["seat"], s["presence"], s["pending"],
                 (s.get("project") or ""), scope, source, task))
         if hidden:
-            print("  (%d absent seat%s hidden — --all shows them; unseen "
-                  ">%dm reaps them)" % (hidden, "s"[:hidden != 1], REAP_S // 60))
+            print("  (%d absent seat%s hidden — --all shows them; `helm chat "
+                  "seat gc` prunes evidence-free rows)"
+                  % (hidden, "s"[:hidden != 1]))
         for c in rep["claims"]:
             print("  claim: %s -> %s (%ds left, fence %s)" % (
                 c["resource"], c["holder"], c["remaining"], c["fence"]))

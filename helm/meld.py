@@ -85,7 +85,10 @@ def _recv_timeout():
 def _self_seat():
     from . import seats
     sid = home.session_id()
-    return seats.seat_for_session(sid) or seats.derive_seat(sid, os.getcwd())
+    # safe_cwd, not os.getcwd(): a bare getcwd here crashed ALL five meld
+    # verbs from a deleted cwd (eager-getcwd class); derive_seat handles None.
+    return seats.seat_for_session(sid) or \
+        seats.derive_seat(sid, seats.safe_cwd())
 
 
 def state_path(room, seat):
