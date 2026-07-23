@@ -1337,6 +1337,76 @@ The umbrella: census + hooks sync + mcp sync + worktree gc, all in DRY-RUN, one
 consolidated owner-facing report — *here is everything that would change*.
 `--apply` runs them all backup-first.
 
+## rearm — land-to-live compression
+
+Code lands on main and every fresh `helm` invocation is a process off main, so
+a CLI-class land is live AT LAND. But LONG-LIVED processes keep running the code
+they loaded at start: an armed `helm chat wait --follow` inbox beacon, the web
+service, seat proxies/daemons. Until each re-arms, the fix has not reached them.
+The fleet re-arms them ad hoc today, and an UNOWNED mass-SIGTERM of waiters is a
+known incident class (three beacons killed in one minute, unexplained to their
+owners). `helm rearm` is the CHEAP OWNED pass that closes the gap minutes after
+a land batch (premise `land-to-live-compression-owner-directive`).
+
+### `helm rearm [--apply] [--json]`
+**Dry-run is the DEFAULT** — it reports, mutates NOTHING: (a) every live `helm
+chat wait` waiter with its owning seat and start time, marked **STALE** if it
+started before main's current HEAD commit time; (b) the web-service unit
+(`helm-web`, active + since) and whether it predates HEAD; (c) every OTHER
+long-lived helm process predating HEAD (proxies, daemons — by cmdline match) as
+an **advisory** respawn candidate. It ends on a plain summary line: *N waiters
+stale, web stale?, M advisory*.
+
+`--apply` runs the OWNED re-arm pass, in order: **(1)** posts ONE owned
+**ambient** ANNOUNCE row to `#main` (ambient = renders everywhere, wakes nobody)
+saying the pass is cycling waiters and why; **(2)** SIGTERMs ONLY the stale
+waiters — each owning agent gets its Monitor-exit notification and re-arms on
+the new code at its OWN turn boundary (this is the OWNED version of the
+beacon-killer incident class); **(3)** restarts the web unit **iff** it is active
+AND stale; **(4)** NEVER touches proxies/daemons/seats — they print as advisory
+only. Idempotent: staleness is recomputed from live state each run, so a second
+`--apply` right after finds nothing stale.
+
+**Safety — failed-probe-is-not-absence.** Only a process whose cmdline argv
+EXACTLY matches the waiter shape (a `helm` executable token immediately followed
+by `chat wait`) is ever signaled; the bash Monitor wrapper carries the same
+string inside a single `-c` argument, has no standalone `helm` token, and is
+excluded by construction. Ownership is the `--seat` token; a stale waiter with
+no readable seat, an unreadable start, or an unreachable HEAD (staleness
+unprovable) is SKIPPED and reported, NEVER signaled. Reads `/proc` cmdline +
+stat only.
+
+**The ANNOUNCE row carries the re-arm incantation.** An idle owner is *woken*
+by the Monitor-exit event and re-arms at that turn; a busy owner keeps its
+mid-turn hook delivery — so the deaf window is bounded to the re-arm turn. But a
+resumed/cleared agent can lose its beacon context entirely, so the row spells
+out the exact incantation
+(`Monitor(command: "helm chat wait --seat <your-seat> --follow", persistent: true)`)
+and names the seats it cycled. This is the rearm-INITIATED path (the waiter dies
+from outside); the SELF-rotation recipe an agent uses to swap its OWN beacon
+without a deaf window is the reverse — **arm the successor Monitor FIRST, verify
+one live event lands through it, THEN `TaskStop` the old** (`helm chat wait` has
+no handoff, so a stop-then-arm has a real deaf window).
+
+**Proxies never self-propagate a land.** A per-instance or family cli-proxy
+keeps running the config it loaded until respawned; `rearm` lists each pre-HEAD
+proxy/daemon as advisory with the recipe
+`helm seat down <seat> && helm seat up <seat>` (or the daemon's own restart) —
+per-seat respawn stays the operator's call, never `rearm`'s signal.
+
+```console
+$ helm rearm
+helm rearm — land-to-live: live processes still holding pre-HEAD code (dry-run; `helm rearm --apply` cycles the stale waiters)
+  HEAD 265e8af committed 12m ago
+  waiters (helm chat wait):
+    STALE   pid 1656     seat codex-3                started 41m ago
+    current pid 4174464  seat codex                  started 3m ago
+  web-service: helm-web stale since 40m ago  [--apply restarts]
+  advisory (pre-HEAD long-lived helm procs — respawn candidates, NEVER signaled):
+    pid 88123    helm router         started 2h ago
+helm rearm: 1 waiter stale, web stale, 1 advisory
+```
+
 ```console
 $ helm tidy
 ========================================================================

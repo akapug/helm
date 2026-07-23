@@ -155,6 +155,7 @@ VERBS = {
     "mcp": _lazy("envtidy", "cmd_mcp"),
     "worktree": _lazy("envtidy", "cmd_worktree"),
     "tidy": _lazy("envtidy", "cmd_tidy"),
+    "rearm": _lazy("rearm", "cmd_rearm"),
 }
 
 _VERB_HELP = {
@@ -216,6 +217,7 @@ _VERB_HELP = {
     "mcp": "mcp sync [--apply] — reconcile canonical MCP servers into every home (dry-run default; additive + fail-closed; backup-first, superset-refusal)",
     "worktree": "worktree gc [--apply] — prune orphan worktree-* branches + landed worktrees (dry-run default; rescue-dirty-first, locked/occupied-immune, unmerged-blocked; composes `helm work gc` for lane rooms)",
     "tidy": "tidy [--apply] — the umbrella: census + hooks sync + mcp sync + worktree gc, all dry-run; one consolidated report (--apply runs them all backup-first)",
+    "rearm": "rearm [--apply] [--json] — land-to-live: report (dry-run default) which long-lived processes still hold pre-HEAD code (helm chat wait waiters, the web unit, advisory proxies/daemons); --apply announces (ambient), SIGTERMs ONLY the stale waiters so each owner re-arms on new code at its own turn boundary (the OWNED beacon-cycle), and restarts a stale web unit — proxies/daemons/seats never signaled",
 }
 
 
