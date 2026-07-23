@@ -264,5 +264,70 @@ class TestRosterSingleFlightCache(unittest.TestCase):
         self.assertIn("helm-dogfood", web._ROSTER_REP_CACHE)
 
 
+class TestRoomsSummarySingleFlightCache(unittest.TestCase):
+    """Brick #2 of the poll->push read-model: _rooms_summary (~14s at 224
+    seats x 13 rooms) ran uncached on every /api/chat poll — N clients
+    stacked N computes -> ~60s requests -> thread-pool starvation (the chat
+    half of the 2026-07-23 UI-blank). Single-flight + TTL, and the cache is
+    KEYED BY THE CHAT ROOT so isolated test worlds (fresh tmp roots) can
+    never read each other's cached summary — the cross-test-pollution class
+    from brick #1, closed structurally."""
+
+    def setUp(self):
+        web._ROOMS_SUM_CACHE.clear()
+        self.addCleanup(web._ROOMS_SUM_CACHE.clear)
+        self.calls = {"n": 0}
+
+    def _fake_summary(self, roster=None):
+        self.calls["n"] += 1
+        return [{"room": "main", "total": 1, "last": None,
+                 "owner_unread": 0, "owner_mentions": 0, "seats": []}]
+
+    def test_concurrent_pollers_share_one_compute(self):
+        with mock.patch.object(web, "_rooms_summary", self._fake_summary):
+            threads = [threading.Thread(target=web._rooms_summary_cached)
+                       for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(self.calls["n"], 1)   # single-flight, not 8 stacked
+
+    def test_ttl_freshness_and_expiry(self):
+        with mock.patch.object(web, "_rooms_summary", self._fake_summary):
+            web._rooms_summary_cached()
+            web._rooms_summary_cached()          # within TTL -> cache hit
+            self.assertEqual(self.calls["n"], 1)
+            (key, (at, s)), = web._ROOMS_SUM_CACHE.items()
+            web._ROOMS_SUM_CACHE[key] = (at - (web._ROOMS_SUM_TTL + 1), s)
+            web._rooms_summary_cached()          # expired -> one recompute
+            self.assertEqual(self.calls["n"], 2)
+
+    def test_cache_is_keyed_by_chat_root(self):
+        # two different chat roots -> two independent entries: an isolated
+        # test world (or a future multi-root deployment) can NEVER be served
+        # another root's cached summary
+        with mock.patch.object(web, "_rooms_summary", self._fake_summary):
+            with mock.patch("helm.chat.chat_dir", return_value="/dev/shm/world-a"):
+                web._rooms_summary_cached()
+                web._rooms_summary_cached()      # same root -> cache hit
+            with mock.patch("helm.chat.chat_dir", return_value="/dev/shm/world-b"):
+                web._rooms_summary_cached()      # new root -> own compute
+        self.assertEqual(self.calls["n"], 2)
+        self.assertEqual(sorted(web._ROOMS_SUM_CACHE),
+                         ["/dev/shm/world-a", "/dev/shm/world-b"])
+
+    def test_owner_write_paths_invalidate(self):
+        # read-your-own-writes: an owner action (read-ack / post / dm) busts
+        # the current root's entry so the NEXT poll recomputes — the unread
+        # badge zeroes immediately, the owner's post shows immediately
+        with mock.patch.object(web, "_rooms_summary", self._fake_summary):
+            web._rooms_summary_cached()
+            self.assertEqual(self.calls["n"], 1)
+            web._rooms_summary_invalidate()
+            web._rooms_summary_cached()          # busted -> recompute
+            self.assertEqual(self.calls["n"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

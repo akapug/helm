@@ -900,6 +900,54 @@ def _rooms_summary(roster=None):
     return out
 
 
+# _rooms_summary is the ONE heavy read left on the chat poll path (~14s at
+# 224 seats x 13 rooms: _room_seats' consumers-fallback walks the whole sorted
+# roster calling room_active — a per-seat-per-room cursor READ ~4.4ms — until
+# 6 slots fill; quiet rooms scan deepest). It ran UNCACHED on EVERY /api/chat
+# poll (incremental included), so N clients x 2s stacked N ~14s computes ->
+# the ~60s /api/chat requests that starved the thread pool (the second half
+# of the 2026-07-23 UI-blank; the roster cache was brick #1). Same
+# single-flight TTL treatment — brick #2 of the poll->push read-model — with
+# one upgrade: the cache is KEYED BY THE CHAT ROOT (chat_dir()), so isolated
+# test worlds (fresh tmp roots) can never read each other's cached summary —
+# the cross-test-pollution class kimi caught on brick #1, closed structurally
+# instead of by per-test clears. Prod cardinality: one root, one entry.
+_ROOMS_SUM_CACHE = {}           # chat-root -> (computed_at, summary)
+_ROOMS_SUM_TTL = 3.0
+_ROOMS_SUM_LOCK = threading.Lock()
+
+
+def _rooms_summary_invalidate():
+    """Read-your-own-writes for the owner: every OWNER action that changes the
+    summary'd state (read-ack zeroing an unread badge; a post/DM landing a row)
+    rides web.py, so it busts the cache synchronously and the very next poll
+    reflects it. Agent posts arrive via the CLI outside this process and stay
+    TTL-bounded (<=3s — the old 2s poll already tolerated that lag)."""
+    from . import chat
+    try:
+        _ROOMS_SUM_CACHE.pop(str(chat.chat_dir()), None)
+    except Exception:
+        _ROOMS_SUM_CACHE.clear()
+
+
+def _rooms_summary_cached(roster=None):
+    from . import chat
+    try:
+        key = str(chat.chat_dir())
+    except Exception:
+        key = "?"
+    hit = _ROOMS_SUM_CACHE.get(key)
+    if hit and time.time() - hit[0] < _ROOMS_SUM_TTL:
+        return hit[1]
+    with _ROOMS_SUM_LOCK:
+        hit = _ROOMS_SUM_CACHE.get(key)   # re-check under the lock: the
+        if hit and time.time() - hit[0] < _ROOMS_SUM_TTL:  # single-flight gate
+            return hit[1]
+        summary = _rooms_summary(roster)
+        _ROOMS_SUM_CACHE[key] = (time.time(), summary)
+        return summary
+
+
 def _api_chat(qs):
     """Poll read: rows after ?since= (count already seen) + the new total +
     the transport truth (signed/unsigned + chain head — the panel's tick and
@@ -942,7 +990,7 @@ def _api_chat(qs):
                "lines": chat.public_rows(
                    rows[since if 0 <= since <= total else 0:]),
                "total": total, "transport": chat.transport_status(),
-               "rooms": _rooms_summary(roster),
+               "rooms": _rooms_summary_cached(roster),
                "roster": sorted(_s._seat_label(s) for s in roster),
                "presence": presence}
         out.update(_owner_signal(room, rows))
@@ -961,6 +1009,7 @@ def _api_chat_read_post(payload):
     rows, total = chat.read(room)
     pk.write_json(_owner_read_path(room),
                   {"n": total, "rid": rows[-1].get("id") if rows else None})
+    _rooms_summary_invalidate()   # the badge must zero on the NEXT poll
     return {"ok": True, "room": room, "owner_read": total}, 200
 
 
@@ -990,6 +1039,7 @@ def _api_chat_post(payload):
                     profile=_chat_profile(), origin="web",
                     reply_to=str(payload.get("reply_to") or "") or None)
     chat.mark_owner_unread(room)
+    _rooms_summary_invalidate()   # the owner's own post shows on the NEXT poll
     return {"ok": True, "msg": chat.public_rows([msg])[0],
             "total": chat.read(room)[1]}, 200
 
@@ -1009,6 +1059,7 @@ def _api_chat_dm(payload):
                         profile=_chat_profile(), origin="web")
     if err:
         return {"error": err}, 400
+    _rooms_summary_invalidate()   # a DM lane row is summary'd state too
     return {"ok": True, "msg": chat.public_rows([row])[0]}, 200
 
 
