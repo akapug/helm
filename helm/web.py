@@ -1011,13 +1011,33 @@ def _api_chat_dm(payload):
     return {"ok": True, "msg": chat.public_rows([row])[0]}, 200
 
 
+def _seat_ephemeral(s):
+    """An EPHEMERAL review-subagent: auto-named `agent-<hex>`, no home room, a
+    /tmp cwd — a transient fan-out SA (tonight's fable/ds4pro/opus review SAs),
+    not a conversational seat you would ever message. Tagged so the live
+    'message a seat' picker can hide it while it stays QUERYABLE elsewhere
+    (owner steer 2026-07-23: declutter the picker, do not delete). Fail-safe:
+    any surprise reads False (a real seat is never mis-hidden)."""
+    try:
+        name = str(s.get("seat") or "")
+        rest = name[6:] if name.startswith("agent-") else ""
+        auto = bool(rest) and all(c in "0123456789abcdef" for c in rest)
+        return auto and not s.get("home_room") and "/tmp" in str(s.get("cwd") or "")
+    except Exception:
+        return False
+
+
 def _api_chat_roster(qs):
     """The seats panel's read: roster presence + per-seat pending deliveries
     + live claims (seats.py — the meld-half's M3 parity surface). Read-only,
-    fail-open: any surprise answers empty, never a 500."""
+    fail-open: any surprise answers empty, never a 500. Each seat is tagged
+    `ephemeral` so the live picker can hide done review-SAs (kept queryable)."""
     try:
         from . import seats
-        return seats.roster_report(_q1(qs, "room", "main")), 200
+        rep = seats.roster_report(_q1(qs, "room", "main"))
+        for s in rep.get("seats", []):
+            s["ephemeral"] = _seat_ephemeral(s)
+        return rep, 200
     except Exception:
         return {"seats": [], "claims": [], "unavailable": True}, 200
 
