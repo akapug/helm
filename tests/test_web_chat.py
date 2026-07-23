@@ -501,15 +501,112 @@ class TestWebChat(unittest.TestCase):
     def test_older_page_slice_is_immutable_under_appends(self):
         """The older-page body is signed, immutable history — appending new
         rows never changes an already-fetched slice (cache-safe), while total
-        tracks live."""
+        tracks live. (Previously vacuous: it never asserted the post-append
+        total actually advanced past the cache, so a stale total went unseen.)"""
         for i in range(50):
             chat.post("row %d" % i, room="win", who="agent-a")
         first = self.req("/api/chat?room=win&before=20&win=10")[1]
+        self.assertEqual(first["total"], 50)
         chat.post("newest", room="win", who="agent-a")        # total -> 51
         again = self.req("/api/chat?room=win&before=20&win=10")[1]
         self.assertEqual([m["text"] for m in first["lines"]],
                          [m["text"] for m in again["lines"]])  # slice unchanged
         self.assertEqual(again["base"], 10)
+        self.assertEqual(again["total"], 51)   # NOT the cached 50 — total tracks the append live
+
+    # ── rotation-aware cursor + cache + reply reconciliation (cross-family FIX) ──
+
+    def test_gen_is_stable_across_appends_and_flips_on_rotation(self):
+        """The rotation cursor the client resets on: `gen` (the head-row
+        fingerprint) is STABLE while rows only append and CHANGES the instant
+        the oldest half rotates out — so the client can tell 'rows appended'
+        from 'rows dropped/reindexed' without trusting a stale absolute count."""
+        for i in range(20):
+            chat.post("row %d" % i, room="gen", who="agent-a")
+        d1 = self.req("/api/chat?room=gen&since=0&win=10")[1]
+        gen1, total1 = d1["gen"], d1["total"]
+        self.assertEqual(total1, 20)
+        self.assertTrue(gen1 and gen1 != "0")
+        for i in range(20, 35):                             # append: head untouched
+            chat.post("row %d" % i, room="gen", who="agent-a")
+        d2 = self.req("/api/chat?room=gen&since=%d" % total1)[1]
+        self.assertEqual(d2["gen"], gen1)                   # append never flips the cursor
+        self.assertEqual(d2["total"], 35)
+        self.assertEqual([m["text"] for m in d2["lines"]],  # byte-identical incremental slice
+                         ["row %d" % i for i in range(20, 35)])
+        self.assertTrue(chat._rotate(chat.room_path("gen"), cap=0))  # head becomes a new row
+        d3 = self.req("/api/chat?room=gen&since=35")[1]
+        self.assertNotEqual(d3["gen"], gen1)                # the reset signal fires
+        self.assertLess(d3["total"], total1)                # the oldest half is gone
+
+    def test_rotate_then_regrow_past_the_cursor_is_caught_by_gen_not_total(self):
+        """The exact P1 repro: a client caches since=N; the room rotates (halves)
+        then regrows PAST N. total climbs back above N, so a naive total<since
+        check never fires and the client would MISS the reindexed rows — but
+        `gen` flipped on the rotate, which is the signal the client resets on."""
+        for i in range(30):
+            chat.post("row %d" % i, room="rr", who="agent-a")
+        before = self.req("/api/chat?room=rr&since=0&win=10")[1]
+        since, gen0 = before["total"], before["gen"]        # the client's stored cursor + gen
+        self.assertEqual(since, 30)
+        self.assertTrue(chat._rotate(chat.room_path("rr"), cap=0))   # 30 -> 15
+        for i in range(30, 60):                             # regrow to 45 > since(30)
+            chat.post("row %d" % i, room="rr", who="agent-a")
+        d = self.req("/api/chat?room=rr&since=%d" % since)[1]
+        self.assertGreater(d["total"], since)               # total<since would NOT fire
+        self.assertNotEqual(d["gen"], gen0)                 # but gen flipped -> client resets + repaints
+
+    def test_older_page_cache_is_rotation_aware_never_serves_dropped_rows(self):
+        """P2: the older-page body cache assumed 'rows only append', so after a
+        rotate it served dropped rows + a stale total for up to the TTL. Now it
+        validates on the file fingerprint — a rotate is a cache MISS, so the
+        second fetch reflects the rotated room, never the cached slice."""
+        for i in range(50):
+            chat.post("row %d" % i, room="rot", who="agent-a")
+        first = self.req("/api/chat?room=rot&before=20&win=10")[1]  # caches the slice
+        self.assertEqual(first["total"], 50)
+        self.assertEqual([m["text"] for m in first["lines"]],
+                         ["row %d" % i for i in range(10, 20)])
+        self.assertTrue(chat._rotate(chat.room_path("rot"), cap=0))  # 50 -> 25, oldest gone
+        live_total = chat.read("rot")[1]
+        again = self.req("/api/chat?room=rot&before=20&win=10")[1]
+        self.assertEqual(again["total"], live_total)        # not the stale cached 50
+        self.assertNotEqual([m["text"] for m in again["lines"]],
+                            [m["text"] for m in first["lines"]])   # never the dropped rows
+
+    def test_batch_id_hydration_distinguishes_out_of_window_from_rotated_out(self):
+        """P1 reply reconciliation: a parent ABOVE the loaded window is resolved
+        by id (still present in the room), so its reply renders correctly —
+        only a parent GENUINELY rotated out (id absent) reads 'rotated out'.
+        The ids endpoint is body-only (no transport) — DREGGTEGRITY intact."""
+        pid = self.req("/api/chat",
+                       {"text": "the parent", "name": "agent-a"})[1]["msg"]["id"]
+        for i in range(60):                                 # push the parent above a 50-window
+            chat.post("filler %d" % i, room="main", who="agent-a")
+        got = self.req("/api/chat?room=main&ids=%s" % pid)[1]
+        self.assertEqual([m["id"] for m in got["lines"]], [pid])   # present -> resolvable, NOT "gone"
+        self.assertNotIn("transport", got)                  # body-only, no signal
+        self.assertEqual(got["lines"][0]["text"], "the parent")    # author+snippet are hydratable
+        for _ in range(8):                                  # rotate until the parent is dropped
+            if pid not in [m.get("id") for m in chat.read("main")[0]]:
+                break
+            chat._rotate(chat.room_path("main"), cap=0)
+        self.assertNotIn(pid, [m.get("id") for m in chat.read("main")[0]])
+        gone = self.req("/api/chat?room=main&ids=%s" % pid)[1]
+        self.assertEqual(gone["lines"], [])                 # absent -> the client marks it truly rotated out
+
+    def test_poll_and_older_and_ids_all_carry_the_rotation_gen(self):
+        """Every read shape the client trusts stamps `gen`, so the client can
+        detect rotation on the poll, guard an older-page prepend, and fingerprint
+        a hydration alike."""
+        for i in range(5):
+            chat.post("row %d" % i, room="g2", who="agent-a")
+        poll = self.req("/api/chat?room=g2&since=0&win=3")[1]
+        older = self.req("/api/chat?room=g2&before=3&win=3")[1]
+        ids = self.req("/api/chat?room=g2&ids=nope")[1]
+        self.assertIsInstance(poll["gen"], str)
+        self.assertEqual(older["gen"], poll["gen"])         # same room, same head
+        self.assertIn("gen", ids)
 
 
 if __name__ == "__main__":

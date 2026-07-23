@@ -17,6 +17,7 @@ one self-contained UI file (web_ui.html) served at /. The store and whoami
 modules are built in parallel — their endpoints DEGRADE GRACEFULLY to
 {"unavailable": true} when the module is missing or misbehaves.
 """
+import hashlib
 import json
 import os
 import re
@@ -978,6 +979,25 @@ def _rooms_summary_cached(roster=None):
 CHAT_WIN_DEFAULT = 50
 
 
+def _chat_gen(rows):
+    """A rotation fingerprint: the identity of the room's HEAD row. An append
+    never touches row 0, so this is STABLE across the incremental poll; a rotate
+    (chat._rotate keeps only the newest half — chat.py:_rotate) makes row 0 a
+    DIFFERENT message, so the fingerprint CHANGES. The client's `since` is an
+    ABSOLUTE row count and is meaningless across that reindex (a rotate-then-
+    regrow past the old cursor slips a naive total<since check), so a changed
+    gen is the client's one reliable signal to reset its cursor + repaint.
+    Empty room => '0'. Cheap: hashes one row on a read the caller already did."""
+    if not rows:
+        return "0"
+    h = rows[0]
+    key = "\x00".join((str(h.get("id") or ""), str(h.get("ts") or ""),
+                       str(h.get("from") or ""), str(h.get("tts") or ""),
+                       str(h.get("tfrom") or ""), str(h.get("react") or ""),
+                       str(h.get("text") or "")))
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+
 def _chat_win(qs):
     """Window size from ?win=. Default CHAT_WIN_DEFAULT. `win=0`/`win=all`
     is the escape hatch for a consumer that genuinely needs the whole room
@@ -1002,9 +1022,24 @@ def _chat_win(qs):
 # truth (that is recomputed live on the poll path only, never here). Single-
 # flight TTL, keyed by the chat root like _ROOMS_SUM so isolated test worlds
 # can never read each other's slice.
-_CHAT_OLDER_CACHE = {}          # (chat-root, room, before, win) -> (at, body)
+_CHAT_OLDER_CACHE = {}          # (chat-root, room, before, win, stat) -> (at, body)
 _CHAT_OLDER_TTL = 30.0
 _CHAT_OLDER_LOCK = threading.Lock()
+
+
+def _room_stat(room):
+    """(size, mtime_ns) of a room's file, or (0, 0). The older-page cache's
+    premise 'signed rows only ever append' is FALSE under rotation (chat._rotate
+    rewrites the file to its newest half), so keying the cache on a fingerprint
+    of the file itself makes a rotation — or any append — a cache MISS instead
+    of serving dropped rows / a stale total for up to the TTL. Cheap: one stat,
+    no read; a hit still skips the read+serialize the cache exists to avoid."""
+    from . import chat
+    try:
+        st = os.stat(chat.room_path(room))
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return (0, 0)
 
 
 def _api_chat_older(qs):
@@ -1027,7 +1062,10 @@ def _api_chat_older(qs):
         root = str(chat.chat_dir())
     except Exception:
         root = "?"
-    key = (root, room, before, win)
+    # `stat` in the key is what makes this cache rotation-aware: a rotate (or any
+    # append) changes (size, mtime_ns), so the stale entry can never be served —
+    # we never hand back dropped rows or a stale total.
+    key = (root, room, before, win, _room_stat(room))
     now = time.time()
     hit = _CHAT_OLDER_CACHE.get(key)
     if hit and now - hit[0] < _CHAT_OLDER_TTL:
@@ -1041,9 +1079,30 @@ def _api_chat_older(qs):
         start = max(0, end - win)
         body = {"room": room,
                 "lines": chat.public_rows(rows[start:end]),
-                "base": start, "total": total}
+                "base": start, "total": total, "gen": _chat_gen(rows)}
         _CHAT_OLDER_CACHE[key] = (now, body)
         return dict(body), 200
+
+
+def _api_chat_ids(qs):
+    """Batch id hydration (builders' handleMessagesByIds parity, cap 100): the
+    rows whose id is in ?ids=<csv>, BODY ONLY (no transport/rooms/roster/signal).
+    The client uses it to resolve a reply's parent that sits ABOVE the loaded
+    window WITHOUT paging the whole gap — and, crucially, to tell 'outside the
+    window but STILL in the room' (the id comes back) from 'genuinely rotated
+    out' (the id is absent), so only the latter renders the 'rotated out' chip.
+    DREGGTEGRITY: like the older page this carries NO signing status; the
+    transport truth recomputes live on the poll path, never from here."""
+    from . import chat
+    room = _q1(qs, "room", "main")
+    want = [x for x in (_q1(qs, "ids", "") or "").split(",") if x][:100]
+    if not want:
+        return {"room": room, "lines": [], "gen": "0"}, 200
+    wset = set(want)
+    rows, _total = chat.read(room)
+    hit = [m for m in rows if (m.get("id") or "") in wset]
+    return {"room": room, "lines": chat.public_rows(hit),
+            "gen": _chat_gen(rows)}, 200
 
 
 def _api_chat(qs):
@@ -1067,6 +1126,8 @@ def _api_chat(qs):
         lines[0]) so the client can lazy-load older pages from there."""
     if _q1(qs, "before", None) is not None:
         return _api_chat_older(qs)
+    if _q1(qs, "ids", None) is not None:
+        return _api_chat_ids(qs)
     try:
         since = int(_q1(qs, "since", "0"))
     except ValueError:
@@ -1109,7 +1170,8 @@ def _api_chat(qs):
         # (above) or cached (the older-page); the signing STATUS always recomputes.
         out = {"room": room,
                "lines": chat.public_rows(rows[start:]),
-               "total": total, "transport": chat.transport_status(),
+               "total": total, "gen": _chat_gen(rows),
+               "transport": chat.transport_status(),
                "rooms": _rooms_summary_cached(roster),
                "roster": sorted(_s._seat_label(s) for s in roster),
                "presence": presence}
