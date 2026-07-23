@@ -1058,7 +1058,7 @@ def _fmt_body(m):
 # ---------------------------------------------------------------------------
 
 SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "seat", "dm",
-              "claim", "release", "claims", "verdict", "reveal")
+              "status", "claim", "release", "claims", "verdict", "reveal")
                                                # the delivery lane — seats.py
                                                # (verdict/reveal answer with
                                                # the 0.3 council deferral)
@@ -1095,7 +1095,8 @@ def cmd_chat(args):
     dm <seat> <text...> [--seat S] | node up|down|status |
     meld invite|join|recv|say|status |
     join|deliver|stop-guard [--hook-json] | wait [--any] [--follow] [--seat S]
-    | seats [--all] | seat rename <sid|oldname> <newname>
+    | seats [--all] | status [<one-line>|--clear] [--seat S]
+    | seat rename <sid|oldname> <newname>
     | seat mute|unmute <room> [--seat S] | seat mutes [--seat S]
     | seat gc [--apply] | claim|release <resource> | claims  [--room R]"""
     args = list(args or [])

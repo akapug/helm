@@ -1607,6 +1607,17 @@ frames; this lane is called *delivery*.)
   rode it dropped stale-but-persisted seats on presence alone; retired).
   Junk rows leave only via `helm chat seat gc`, the one cleanup owner. The
   web twin is the **seats** panel in the ledger tab (`GET /api/chat/roster`).
+- **`helm chat status [<one-line> | --clear] [--seat S]`** — the seat's
+  ICQ-style away message: ONE glanceable line of "what am I on", written on
+  the seat's roster row (through the roster writer's flock — no second
+  writer path; scrubbed + clipped to 160 bytes). Bare `status` shows the
+  seat's current line. Every surface composes the same line with the same
+  precedence — **explicit status > live claim** (`working lane/<x>, <ttl>
+  left`) **> home room** — so the web chat's fleet **presence bar** (dot 🟢
+  fresh / 🟡 quiet / ⚫ gone + seat + line, one row per seat, visible from
+  every room, riding the existing `/api/chat` poll), `helm chat seats`, and
+  the ledger seats panel all glance identically. The line persists until
+  overwritten or `--clear`ed; setting it is also a presence beat.
 - **`helm chat seat rename <sid|oldname> <newname>`** — bind a live agent to
   a memorable @name (`old` = seat name or an 8+-char session-id prefix). The
   roster row AND every keyed state file move together, so tracked delivery

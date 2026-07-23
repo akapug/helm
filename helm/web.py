@@ -842,9 +842,16 @@ def _api_chat(qs):
         except Exception:
             roster = {}
         rows, total = chat.read(room)   # one read serves the slice AND the signal
+        try:
+            # the fleet-wide presence bar (dot + one status line per seat) —
+            # rides the poll the panel already runs; light (no cursor scans)
+            presence = _s.presence_report()
+        except Exception:
+            presence = []
         out = {"room": room, "lines": rows[since if 0 <= since <= total else 0:],
                "total": total, "transport": chat.transport_status(),
-               "rooms": _rooms_summary(roster), "roster": sorted(roster)}
+               "rooms": _rooms_summary(roster), "roster": sorted(roster),
+               "presence": presence}
         out.update(_owner_signal(room, rows))
         return out, 200
     except Exception:
