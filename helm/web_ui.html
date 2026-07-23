@@ -2755,6 +2755,24 @@ async function sendReact(div, e) {
 }
 
 /* ---- reply target: the composer's parent pointer (the row's stable id) ---- */
+let CHAT_REPLY_SEED = "";   // the auto-@ this panel prepended (swap/strip target)
+/* clicking reply seeds the composer with "@author " (slack/discord shape —
+   removable text, the visible face of the reply-wakes-parent delivery).
+   Never duplicates an @author the body already carries; retarget or cancel
+   swaps/strips ONLY the untouched seed, never the owner's own words. */
+function chatSeedMention(author) {
+  const el = $("#chattext");
+  if (CHAT_REPLY_SEED && el.value.startsWith(CHAT_REPLY_SEED))
+    el.value = el.value.slice(CHAT_REPLY_SEED.length);
+  CHAT_REPLY_SEED = "";
+  if (!author) return;
+  const re = new RegExp("(^|\\s)@" + author.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+                        "(?=\\s|$)", "i");
+  if (re.test(el.value)) return;   // already mentioned — never duplicate
+  CHAT_REPLY_SEED = "@" + author + " ";
+  el.value = CHAT_REPLY_SEED + el.value;
+  el.setSelectionRange(el.value.length, el.value.length);
+}
 function chatSetReply(div) {
   const id = div.dataset.id || "";
   if (!id) { toast("that message predates row ids — reply by posting normally"); return; }
@@ -2766,10 +2784,12 @@ function chatSetReply(div) {
     '</b><span class="rqt">' + esc(chatSnip(p.text)) +
     '</span><button id="chatreplyx" title="cancel (Esc)">✕</button>';
   $("#chatreplyx").onclick = chatClearReply;
+  chatSeedMention(String(p.from || div.dataset.from || "").trim());
   $("#chattext").focus();
 }
 function chatClearReply() {
   CHAT_REPLY_TO = null;
+  chatSeedMention("");            // cancel strips the untouched auto-@ too
   const strip = $("#chatreply");
   strip.hidden = true; strip.innerHTML = "";
 }
