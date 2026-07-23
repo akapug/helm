@@ -238,6 +238,10 @@ def _entry_line_full(e):
         return "%sMOVE %s: %s" % (pv, e["id"], e.get("statement") or "")
     if t == "reference":
         return "%sREF %s: %s" % (pv, e["id"], e.get("statement") or "")
+    if t == "capability":
+        # a LEVER, not a fact — the CAP prefix + the owner's exact
+        # "you have <verb>: <what> (wired via <hook>, live)" body (e["statement"]).
+        return "%sCAP %s" % (pv, e.get("statement") or "")
     return "%s%s: %s" % (pv, e["id"], e.get("statement") or "")
 
 
@@ -290,14 +294,32 @@ def load_entries(project=None):
     return entries
 
 
+def _lane_entries(project=None):
+    """The store's parsed-entry cache PLUS the live capability self-index — the
+    ONE entry list every JIT lane resolves against (gather + --explain). The
+    capabilities are computed FRESH each turn (their live/absent probe is
+    dynamic — an MCP wired mid-session must not be masked by a stale cache) and
+    NEVER enter the persistent parsed-entry cache. Fail-open: a raising
+    capability layer degrades to the store-only list, never a blocked turn."""
+    entries = load_entries(project)
+    try:
+        from . import capability
+        caps = capability.live_entries(project)
+    except Exception:
+        return entries
+    return entries + caps if caps else entries
+
+
 def _lanes(text, project=None):
     """(pinned_entries, ALL ranked jit matches, the cached entry list) off ONE
-    store parse — the cached list feeds both lanes explicitly through the
-    entries= seam. JIT comes back UNCAPPED so gather can both cap the lane and
-    ledger the pre-cap candidate count; the raw list feeds the cooldown scorer
-    and the coinage known-terms check without another parse."""
+    store parse — the cached list (store entries + the live capability index)
+    feeds both lanes explicitly through the entries= seam. JIT comes back
+    UNCAPPED so gather can both cap the lane and ledger the pre-cap candidate
+    count; the raw list feeds the cooldown scorer and the coinage known-terms
+    check without another parse. Capabilities ride the JIT resolver unmodified
+    (they are load_class jit, so pinned() ignores them)."""
     from . import store
-    entries = load_entries(project)
+    entries = _lane_entries(project)
     return (store.pinned(project=project, entries=entries),
             store.resolve_prompt(text, project=project, cap=len(entries),
                                  entries=entries),
@@ -763,7 +785,7 @@ def _explain(text, project=None, session=None):
     "- id (cooldown, fired Nt ago)" off the seen-state READ-ONLY. A dry look:
     NO ledger row, NO state mutation (an explain must never count as a turn)."""
     from . import store
-    entries = load_entries(project)
+    entries = _lane_entries(project)
     pinned_entries = store.pinned(project=project, entries=entries)
     jit_all = store.resolve_prompt(text, project=project, cap=len(entries),
                                    entries=entries)
@@ -859,7 +881,8 @@ def _cohort(e):
     steering that could anchor it — heuristic moves, sub-certain belief
     priors. None = not cohortable (reflex machinery, unknown ids)."""
     t = e.get("type")
-    if t in ("lexicon", "reference"):
+    if t in ("lexicon", "reference", "capability"):
+        # a wired capability is substrate TRUTH the agent should be fluent in
         return "facts"
     if t == "prior":
         return "facts" if e.get("class") == "certain" else "judgment"

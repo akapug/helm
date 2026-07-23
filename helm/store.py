@@ -114,10 +114,14 @@ TYPE_SUBDIR = {"prior": "premises", "lexicon": "lexicon",
 # corpus category; harmless no-op where absent).
 _SCAN_SUBDIRS = ("premises", "heuristics", "lexicon", "references", "priors")
 
-_TYPE_ORDER = ("prior", "heuristic", "reference", "lexicon", "episodic")
+_TYPE_ORDER = ("prior", "heuristic", "reference", "lexicon", "capability", "episodic")
 
 # The JIT-resolvable types (episodic never fires — load_class dormant).
-_JIT_TYPES = ("prior", "heuristic", "lexicon", "reference")
+# `capability` is never PARSED from disk (capability.py owns its module-constant
+# catalog); it is registered here so the WIRED-substrate self-index — fed in
+# through resolve_prompt's entries= seam by inject — rides the ONE JIT lane
+# (DF-weighted, specificity-gated, cap-4, cooldowned), not a parallel injector.
+_JIT_TYPES = ("prior", "heuristic", "lexicon", "reference", "capability")
 
 
 # ---------------------------------------------------------------------------
