@@ -489,6 +489,33 @@ class DeliverTest(SeatsBase):
             self.assertIsNone(seats.deliver(seat="alice"))
         self.assertEqual(os.stat(seats.roster_path()).st_mtime_ns, before)
 
+    def test_unrenderable_row_is_skipped_and_the_backlog_drains_past_it(self):
+        """A row that PASSES deliverable() but can't be RENDERED — a malformed
+        non-string 'text' on a foreign/corrupt jsonl row — raises in
+        _scrub/_clip BEFORE the cursor commits. Unhandled it re-raises every
+        poll and strands the WHOLE backlog behind it forever. The fix skips it
+        (LOUD, cursor advances past it), so a good row AFTER the offender still
+        delivers = the backlog DRAINS, not merely 'the waiter survives' (OI's
+        acceptance). Pre-fix, 'after' is never delivered (stranded)."""
+        self.seat_up()
+        seats.dm("alice", "before the bad row", who="bob")   # creates the lane
+        lane = seats.dm_lane("alice")
+        with open(chat.room_path(lane), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "t", "from": "bob", "dm": "alice",
+                                "id": "bad", "text": 123}) + "\n")   # non-str!
+            f.write(json.dumps({"ts": "t", "from": "bob", "dm": "alice",
+                                "id": "g2", "text": "after the bad row"}) + "\n")
+        got = []
+        for _ in range(6):                     # drain; a SKIP also returns None
+            line = seats.deliver_any(seat="alice")   # (so don't break on it —
+            if line:                                 #  the offender halts THIS
+                got.append(line)                     #  pass, next resumes past it)
+        blob = " ".join(got)
+        self.assertIn("before the bad row", blob)
+        self.assertIn("after the bad row", blob)   # <- the drain got PAST 'bad'
+        self.assertNotIn("123", blob)              # the offender never rendered
+        self.assertIsNone(seats.deliver_any(seat="alice"))  # drained, no strand
+
 
 class WaitTest(SeatsBase):
     def test_wait_returns_pending_and_advances_cursor(self):
