@@ -217,6 +217,12 @@ class TestRosterSingleFlightCache(unittest.TestCase):
         web._ROSTER_REP_CACHE.clear()
         self.calls = {"n": 0}
 
+    def tearDown(self):
+        # the polluter owns cleanup: the module-level cache holds this test's
+        # fake rep; clear it so a later test's roster endpoint reads its own
+        # planted data, not our leaked {seat: agent-047d53ef} (kimi xrev).
+        web._ROSTER_REP_CACHE.clear()
+
     def _fake_report(self, room):
         self.calls["n"] += 1
         return {"seats": [{"seat": "agent-047d53ef", "home_room": None,
