@@ -1517,9 +1517,22 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
             if rows:
                 if not follow:
                     return chat._fmt(rows[0])
-                for m in rows:
+                # Same firehose class as the seat drain below: >BEACON_DRAIN_CAP
+                # new rows in one poll would emit as a Monitor-event BURST →
+                # auto-stop → SIGTERM → deaf watcher. Bound the pass; advance the
+                # watermark only PAST what we emitted so the residue re-streams
+                # next poll (start = total-len(rows) recovers the base even after
+                # a rotation reset — never a since=total skip that drops rows).
+                start = total - len(rows)
+                for m in rows[:BEACON_DRAIN_CAP]:
                     stream(chat._fmt(m))
-            since = total
+                if len(rows) > BEACON_DRAIN_CAP:
+                    stream("[helm chat] more pending — helm chat read to catch up")
+                    since = start + BEACON_DRAIN_CAP
+                else:
+                    since = total
+            else:
+                since = total
         else:
             drained = 0
             while True:                     # drain currently-matching rows,
