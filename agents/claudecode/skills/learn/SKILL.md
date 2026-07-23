@@ -4,7 +4,7 @@ description: Capture a lesson durably in helm's typed store — premise/heuristi
 license: MIT
 metadata:
   author: helm
-  version: "2.0.0"
+  version: "2.2.0"
 ---
 
 # /learn — durable capture into the helm store
@@ -55,6 +55,19 @@ When the lesson comes from the owner's dictation, post its one-line
 statement to the room the owner scans, tagged `owner-canon`, right after
 capture. Silence changes nothing; an inverted capture gets caught the same
 day instead of three incidents later.
+
+## Resolve FIRST — update beats add (run BEFORE capturing)
+
+Before `store add`, run `helm store resolve` with the lesson's own symptom
+phrases (the same 3+ phrasings you will retest with). A HIT means the store
+already holds this ground: UPDATE that entry (sharpen its statement, widen
+its keywords, `--source` the new incident), `supersede` it if the new lesson
+replaces it, or `confirm` it if the incident just re-proves it — never mint
+a sibling id beside it. Duplicates are worse than misses: they split the
+DF weight of shared keywords, so BOTH entries rank lower than either alone,
+and future updates land on one while the other rots stale (owner-caught
+2026-07-22, the gap live in an 845-entry store). Only a genuine 0-hit
+resolve earns a new id.
 
 ## The am-I-being-stupid gate (run BEFORE capturing)
 
