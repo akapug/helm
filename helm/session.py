@@ -813,6 +813,8 @@ def _census_matches(pid, start, cmdline, environ=None, cwd=None):
         # every OSError to None. The census must preserve EACCES/EIO as UNKNOWN
         # and distinguish them from a gone pid or a proven generation change.
         live_start = _starttime_from_stat(_proc_bytes(pid, "stat"))
+        if live_start is None:
+            return None  # stat was read but unparsable: failed probe, not absence
         if live_start != start or _proc_bytes(pid, "cmdline") != cmdline:
             return False
         if environ is not None and _proc_bytes(pid, "environ") != environ:

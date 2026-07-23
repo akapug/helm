@@ -182,18 +182,24 @@ def scan(accounts=None, status=None):
             continue  # identity cannot be pinned across reads
         ppid = ppid_of(pid)
         env = read_environ(pid)
-        if env is None:  # NO evidence — visible, never default-attributed
+        env_failed = env is None
+        home_failed = False
+        if env_failed:  # NO evidence — visible, never default-attributed
             home, attribution = None, "environ-unreadable"
+        elif env.get(env_key):
+            home, attribution = env[env_key], "env"
+        elif env.get("HOME"):
+            # Provider defaults belong to the PROCESS home, never the
+            # inspector's expanduser("~").
+            home = os.path.join(env["HOME"], suffix)
+            attribution = "default"
         else:
-            # Provider defaults belong to the PROCESS home, not the inspector's
-            # home. Using expanduser here cross-spliced alternate-HOME panes.
-            home = env.get(env_key) or os.path.join(
-                env.get("HOME") or os.path.expanduser("~"), suffix)
-            attribution = "env" if env.get(env_key) else "default"
+            home, attribution, home_failed = None, "home-unproven", True
         try:
             cwd = os.readlink(os.path.join(entry, "cwd"))
+            cwd_failed = False
         except OSError:
-            cwd = None
+            cwd, cwd_failed = None, True
         if provider == "codex":
             session, cands = codex_session_from_fds(pid), []
         elif home and cwd:
@@ -212,6 +218,8 @@ def scan(accounts=None, status=None):
             continue
         if final != start:
             continue  # proven pid reuse, not a failed probe
+        if env_failed or home_failed or cwd_failed:
+            failed(pid)
         procs.append({"pid": pid, "ppid": ppid, "child": False,
                       "provider": provider, "home": home,
                       "attribution": attribution,

@@ -68,7 +68,9 @@ and safe to run at any moment.
 """
 import json
 import os
+import socket
 import subprocess
+import uuid
 
 from . import session
 
@@ -109,14 +111,20 @@ def _generation_intact(pid, start):
     return start is not None and session._proc_start(pid) == start
 
 
-def _cmdline_argv(pid):
-    """NUL-split argv, or None when the probe failed (never [] — a failed
-    read must not look like an empty command line)."""
+def _cmdline_probe(pid):
+    """('ok', argv) | ('gone', None) | ('failed', None)."""
     try:
         with open("/proc/%d/cmdline" % pid, "rb") as f:
-            return f.read().decode("utf-8", "replace").split("\0")
-    except OSError:
-        return None
+            argv = f.read().decode("utf-8", "replace").split("\0")
+        return "ok", argv
+    except OSError as e:
+        return ("gone" if session._gone(e) else "failed"), None
+
+
+def _cmdline_argv(pid):
+    """NUL-split argv, or None outside the daemon census status channel."""
+    status, argv = _cmdline_probe(pid)
+    return argv if status == "ok" else None
 
 
 def _is_daemon_argv(argv):
@@ -158,8 +166,10 @@ def _daemon_pids():
         if not name.isdigit():
             continue
         pid = int(name)
-        argv = _cmdline_argv(pid)
-        if argv is None:
+        status, argv = _cmdline_probe(pid)
+        if status == "gone":
+            continue
+        if status == "failed":
             unproven.add(pid)
             continue
         if not _is_daemon_argv(argv):
@@ -271,6 +281,54 @@ def _orca_json(cli, *args):
     return data if isinstance(data, dict) and data.get("ok") is True else None
 
 
+def _orca_runtime_call(user_data, runtime_id, method, params, timeout=5):
+    """Read-only authenticated Orca runtime RPC, or None on any uncertainty."""
+    try:
+        with open(os.path.join(user_data, "orca-runtime.json")) as f:
+            meta = json.load(f)
+        if meta.get("runtimeId") != runtime_id:
+            return None
+        transports = meta.get("transports")
+        if not isinstance(transports, list):
+            transports = [meta.get("transport")]
+        transport = next((t for t in transports if isinstance(t, dict)
+                          and t.get("kind") == "unix" and t.get("endpoint")),
+                         None)
+        token = meta.get("authToken")
+        if transport is None or not token or not hasattr(socket, "AF_UNIX"):
+            return None
+        request_id = str(uuid.uuid4())
+        request = {"id": request_id, "authToken": token,
+                   "method": method, "params": params}
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(timeout)
+            conn.connect(transport["endpoint"])
+            conn.sendall((json.dumps(request, separators=(",", ":")) +
+                          "\n").encode("utf-8"))
+            buf = b""
+            while len(buf) <= 1024 * 1024:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    if not raw.strip():
+                        continue
+                    reply = json.loads(raw.decode("utf-8"))
+                    if reply.get("_keepalive"):
+                        continue
+                    if (reply.get("id") != request_id
+                            or (reply.get("_meta") or {}).get("runtimeId")
+                            != runtime_id or reply.get("ok") is not True):
+                        return None
+                    result = reply.get("result")
+                    return result if isinstance(result, dict) else None
+    except (OSError, ValueError, TypeError, socket.timeout):
+        return None
+    return None
+
+
 def _orca_terminals(daemon, daemon_start, env):
     """(terminals, failed), bound to the process's daemon and Orca runtime.
 
@@ -311,53 +369,39 @@ def _orca_terminals(daemon, daemon_start, env):
 
 
 def _pane_for(env, terminals):
-    """(handle, proven) from bracketed Orca identity, never cwd/title.
+    """(handle, proven) through Orca's live pane-key resolver.
 
-    The inherited handle wins while the daemon-bound inventory still reports
-    it connected+writable. After an Orca replacement ORCA_PANE_KEY survives,
-    but terminal-list may expose transport ``pty:*`` ids; candidate handles are
-    upgraded through ``terminal show`` before comparing durable tabId:leafId.
+    Spawn-time handle/cwd/title are never authorization. The bracketed process
+    contributes ORCA_PANE_KEY; the daemon-bound runtime remints it to a live
+    handle+pty, and the complete terminal inventory must contain exactly that
+    connected+writable handle+pty+worktree tuple.
     """
     env = env or {}
-
-    def usable(t):
-        return (t.get("connected") is True and t.get("writable") is True
-                and t.get("handle"))
-
-    healthy = [t for t in terminals if usable(t)]
-    handle = env.get("ORCA_TERMINAL_HANDLE")
-    hits = [t["handle"] for t in healthy if t.get("handle") == handle]
-    if len(hits) == 1:
-        return hits[0], True
-    key = env.get("ORCA_PANE_KEY")
-    if not key or ":" not in key:
+    key, user_data = env.get("ORCA_PANE_KEY"), env.get("ORCA_USER_DATA_PATH")
+    healthy = [t for t in terminals if t.get("handle")
+               and t.get("connected") is True and t.get("writable") is True]
+    runtime_ids = {t.get("_runtime_id") for t in terminals
+                   if t.get("_runtime_id")}
+    if not key or not user_data or len(runtime_ids) != 1:
         return None, False
-    tab, leaf = key.split(":", 1)
-    hits = [t["handle"] for t in healthy
-            if t.get("tabId") == tab and t.get("leafId") == leaf]
-    if len(hits) == 1:
-        return hits[0], True
+    runtime_id = next(iter(runtime_ids))
+    result = _orca_runtime_call(
+        user_data, runtime_id, "terminal.resolvePane", {"paneKey": key})
+    resolved = result.get("terminal") if isinstance(result, dict) else None
+    if not isinstance(resolved, dict):
+        return None, False
+    handle, pty = resolved.get("handle"), resolved.get("ptyId")
+    if not handle or not pty:
+        return None, False
+    inherited = env.get("ORCA_TERMINAL_HANDLE")
+    if inherited and inherited != handle and any(
+            t.get("handle") == inherited for t in healthy):
+        return None, False  # live conflicting handle, not an ordinary remint
     worktree = env.get("ORCA_WORKTREE_ID")
-    candidates = [t for t in healthy
-                  if not worktree or t.get("worktreeId") == worktree]
-    hits = []
-    for t in candidates:
-        cli, runtime_id = t.get("_orca_cli"), t.get("_runtime_id")
-        if not cli or not runtime_id:
-            continue
-        data = _orca_json(cli, "terminal", "show", "--terminal", t["handle"])
-        meta = data.get("_meta") if data else None
-        result = data.get("result") if data else None
-        shown = result.get("terminal") if isinstance(result, dict) else None
-        if (not isinstance(meta, dict) or meta.get("runtimeId") != runtime_id
-                or not isinstance(shown, dict)
-                or shown.get("handle") != t["handle"]
-                or shown.get("connected") is not True
-                or shown.get("writable") is not True):
-            continue
-        if shown.get("tabId") == tab and shown.get("leafId") == leaf:
-            hits.append(t["handle"])
-    return (hits[0], True) if len(hits) == 1 else (None, False)
+    hits = [t for t in healthy if t.get("handle") == handle
+            and t.get("ptyId") == pty
+            and (not worktree or t.get("worktreeId") == worktree)]
+    return (handle, True) if len(hits) == 1 else (None, False)
 
 
 def _roster():
@@ -475,6 +519,14 @@ def rows():
         r["pane"], proven = _pane_for(env, terminals)
         if not proven:
             r["unknown"] = True
+    pane_counts = {}
+    for r in hosted:
+        if r["pane"]:
+            pane_counts[r["pane"]] = pane_counts.get(r["pane"], 0) + 1
+    for r in hosted:
+        if r["pane"] and pane_counts[r["pane"]] > 1:
+            r["pane"] = None
+            r["unknown"] = True  # one live pane cannot own two process rows
     # FINAL generation recheck, AFTER every display probe: the host walk
     # re-read /proc later than the census bracket. If the pid's generation
     # changed in between, those fresh reads describe a DIFFERENT process

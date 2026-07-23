@@ -538,9 +538,17 @@ def roster_checked():
         return {}, False
     except (OSError, ValueError, TypeError):
         return {}, True
+    def valid_row(row):
+        if not isinstance(row, dict):
+            return False
+        primary, history = row.get("session"), row.get("sessions")
+        return ((primary is None or isinstance(primary, str))
+                and (history is None or
+                     (isinstance(history, list)
+                      and all(isinstance(s, str) for s in history))))
+
     if not isinstance(value, dict) or not all(
-            isinstance(k, str) and isinstance(v, dict)
-            for k, v in value.items()):
+            isinstance(k, str) and valid_row(v) for k, v in value.items()):
         return {}, True
     return value, False
 

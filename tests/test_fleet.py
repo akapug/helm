@@ -199,7 +199,10 @@ class RosterCheckedTest(unittest.TestCase):
             path = os.path.join(d, "roster.json")
             with mock.patch.object(seats, "roster_path", return_value=path):
                 self.assertEqual(seats.roster_checked(), ({}, False))
-                for value in ("{bad", "[]", '{"seat": "bad"}'):
+                for value in ("{bad", "[]", '{"seat": "bad"}',
+                              '{"seat": {"session": 7}}',
+                              '{"seat": {"sessions": "not-a-list"}}',
+                              '{"seat": {"sessions": ["ok", 7]}}'):
                     with open(path, "w") as f:
                         f.write(value)
                     self.assertEqual(seats.roster_checked(), ({}, True), value)
@@ -429,6 +432,11 @@ class CensusRecheckFailureTest(unittest.TestCase):
         with mock.patch.object(session, "_proc_bytes", side_effect=error):
             self.assertFalse(session._census_matches(41, "g1", b"claude\0"))
 
+    def test_unparsable_live_stat_is_unknown_not_absence(self):
+        with mock.patch.object(session, "_proc_bytes",
+                               return_value=b"41 (claude) malformed"):
+            self.assertIsNone(session._census_matches(41, "g1", b"claude\0"))
+
 
 class WhoCensusContextTest(unittest.TestCase):
     def _census(self, who_rows, failed_pids=()):
@@ -473,11 +481,17 @@ class DaemonScanTest(unittest.TestCase):
     scan_failed=False and later converted into a proven-HEADLESS absence.
     The REAL _daemon_pids runs; only the /proc probes are mocked."""
 
-    def _scan(self, argvs, starts, listing=None):
+    def _scan(self, argvs, starts, listing=None, gone=()):
         names = [str(p) for p in argvs] if listing is None else listing
+
+        def cmdline(pid):
+            if pid in gone:
+                return "gone", None
+            argv = argvs.get(pid)
+            return ("failed", None) if argv is None else ("ok", argv)
+
         with mock.patch.object(fleet.os, "listdir", lambda p: names), \
-             mock.patch.object(fleet, "_cmdline_argv",
-                               lambda p: argvs.get(p)), \
+             mock.patch.object(fleet, "_cmdline_probe", side_effect=cmdline), \
              mock.patch.object(session, "_proc_start",
                                lambda p: starts.get(p)):
             return fleet._daemon_pids()
@@ -496,6 +510,10 @@ class DaemonScanTest(unittest.TestCase):
 
     def test_unreadable_cmdline_is_unproven_not_dropped(self):
         self.assertEqual(self._scan({77: None}, {}), ({}, {77}, False))
+
+    def test_pid_gone_during_cmdline_scan_is_absence_not_partial(self):
+        self.assertEqual(self._scan({77: None}, {}, gone={77}),
+                         ({}, set(), False))
 
     def test_ordinary_processes_enter_neither_set(self):
         self.assertEqual(self._scan({8: ["bash", "-c", "sleep 1"]}, {}),
@@ -940,21 +958,34 @@ class SidParserTest(unittest.TestCase):
 
 
 class PaneIdentityTest(FleetRowsTest):
-    """Pane identity comes from the bracketed Orca pane key, never cwd."""
+    """Pane identity comes from runtime pane-key resolution, never cwd."""
 
-    TERMS = ([{"handle": "term_new", "tabId": "tab", "leafId": "leaf",
-               "worktreePath": "/other", "connected": True,
-               "writable": True}], False)
+    TERMS = ([{"handle": "term_new", "ptyId": "pty-1", "worktreeId": "w1",
+               "connected": True, "writable": True,
+               "_runtime_id": "r1"}], False)
+    ENV = {"ORCA_PANE_KEY": "tab:leaf", "ORCA_USER_DATA_PATH": "/orca",
+           "ORCA_WORKTREE_ID": "w1", "ORCA_TERMINAL_HANDLE": "term_stale"}
+    RESOLVED = {"terminal": {"handle": "term_new", "ptyId": "pty-1"}}
 
     def test_hosted_row_resolves_replacement_handle_by_pane_key(self):
         census = [srow(10, SID_A, "declared", root="/r", cwd="/w/x")]
-        env = {"ORCA_PANE_KEY": "tab:leaf",
-               "ORCA_TERMINAL_HANDLE": "term_stale"}
-        rows, _ = self._rows(
-            {10: env}, census, {99: "s1"}, terminals=self.TERMS,
-            pane_for=fleet._pane_for)
+        with mock.patch.object(fleet, "_orca_runtime_call",
+                               return_value=self.RESOLVED):
+            rows, _ = self._rows(
+                {10: self.ENV}, census, {99: "s1"}, terminals=self.TERMS,
+                pane_for=fleet._pane_for)
         self.assertEqual(rows[0]["pane"], "term_new")
         self.assertFalse(rows[0]["unknown"])
+
+    def test_two_rows_cannot_both_certify_one_pane(self):
+        census = [srow(10, SID_A, "declared", root="/r"),
+                  srow(11, SID_B, "declared", root="/r")]
+        with mock.patch.object(fleet, "_orca_runtime_call",
+                               return_value=self.RESOLVED):
+            rows, _ = self._rows(
+                {10: self.ENV, 11: self.ENV}, census, {99: "s1"},
+                terminals=self.TERMS, pane_for=fleet._pane_for)
+        self.assertTrue(all(r["pane"] is None and r["unknown"] for r in rows))
 
     def test_hosted_row_without_authoritative_pane_key_is_unknown(self):
         census = [srow(10, SID_A, "declared", root="/r", cwd="/w/x")]
@@ -1059,41 +1090,48 @@ class ProbeOrderingTest(unittest.TestCase):
 
 
 class PaneMappingTest(unittest.TestCase):
-    TERMS = [{"handle": "term_1", "tabId": "a", "leafId": "one",
-              "connected": True, "writable": True,
-              "worktreePath": "/decoy"},
-             {"handle": "term_2", "tabId": "b", "leafId": "two",
-              "connected": False, "writable": True,
-              "worktreePath": "/w"}]
+    TERMS = [{"handle": "term_1", "ptyId": "pty-1", "worktreeId": "w1",
+              "connected": True, "writable": True, "_runtime_id": "r1"},
+             {"handle": "term_old", "ptyId": "pty-old",
+              "worktreeId": "w1", "connected": True, "writable": True,
+              "_runtime_id": "r1"}]
+    ENV = {"ORCA_PANE_KEY": "stable-tab:stable-leaf",
+           "ORCA_USER_DATA_PATH": "/orca-data", "ORCA_WORKTREE_ID": "w1"}
+    RESOLVED = {"terminal": {"handle": "term_1", "ptyId": "pty-1",
+                              "tabId": "stable-tab",
+                              "leafId": "stable-leaf"}}
 
-    def test_exact_pane_key_resolves_without_cwd(self):
-        self.assertEqual(fleet._pane_for({"ORCA_PANE_KEY": "a:one"}, self.TERMS),
-                         ("term_1", True))
+    def test_runtime_pane_key_binds_live_handle_pty_and_worktree(self):
+        with mock.patch.object(fleet, "_orca_runtime_call",
+                               return_value=self.RESOLVED) as call:
+            self.assertEqual(fleet._pane_for(self.ENV, self.TERMS),
+                             ("term_1", True))
+        call.assert_called_once_with(
+            "/orca-data", "r1", "terminal.resolvePane",
+            {"paneKey": "stable-tab:stable-leaf"})
 
-    def test_stale_handle_does_not_override_pane_key(self):
-        env = {"ORCA_PANE_KEY": "a:one", "ORCA_TERMINAL_HANDLE": "term_old"}
-        self.assertEqual(fleet._pane_for(env, self.TERMS), ("term_1", True))
+    def test_live_conflicting_inherited_handle_refuses(self):
+        env = dict(self.ENV, ORCA_TERMINAL_HANDLE="term_old")
+        with mock.patch.object(fleet, "_orca_runtime_call",
+                               return_value=self.RESOLVED):
+            self.assertEqual(fleet._pane_for(env, self.TERMS), (None, False))
 
-    def test_transport_ids_upgrade_through_terminal_show(self):
-        terms = [{"handle": "term_new", "tabId": "pty:x", "leafId": "pty:x",
-                  "worktreeId": "w1", "connected": True, "writable": True,
-                  "_orca_cli": "orca", "_runtime_id": "r1"}]
-        shown = {"ok": True, "result": {"terminal": {
-            "handle": "term_new", "tabId": "stable-tab",
-            "leafId": "stable-leaf", "connected": True, "writable": True}},
-            "_meta": {"runtimeId": "r1"}}
-        env = {"ORCA_PANE_KEY": "stable-tab:stable-leaf",
-               "ORCA_WORKTREE_ID": "w1"}
-        with mock.patch.object(fleet, "_orca_json", return_value=shown):
-            self.assertEqual(fleet._pane_for(env, terms), ("term_new", True))
+    def test_stale_absent_handle_allows_identity_proven_remint(self):
+        env = dict(self.ENV, ORCA_TERMINAL_HANDLE="gone-handle")
+        with mock.patch.object(fleet, "_orca_runtime_call",
+                               return_value=self.RESOLVED):
+            self.assertEqual(fleet._pane_for(env, self.TERMS),
+                             ("term_1", True))
 
-    def test_missing_disconnected_or_ambiguous_key_is_unproven(self):
+    def test_missing_key_runtime_or_live_pty_is_unproven(self):
         self.assertEqual(fleet._pane_for({}, self.TERMS), (None, False))
-        self.assertEqual(fleet._pane_for({"ORCA_PANE_KEY": "b:two"}, self.TERMS),
-                         (None, False))
-        dup = self.TERMS + [dict(self.TERMS[0], handle="term_3")]
-        self.assertEqual(fleet._pane_for({"ORCA_PANE_KEY": "a:one"}, dup),
-                         (None, False))
+        with mock.patch.object(fleet, "_orca_runtime_call", return_value=None):
+            self.assertEqual(fleet._pane_for(self.ENV, self.TERMS),
+                             (None, False))
+        wrong = {"terminal": {"handle": "term_1", "ptyId": "other"}}
+        with mock.patch.object(fleet, "_orca_runtime_call", return_value=wrong):
+            self.assertEqual(fleet._pane_for(self.ENV, self.TERMS),
+                             (None, False))
 
 
 if __name__ == "__main__":
