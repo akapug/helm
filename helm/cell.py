@@ -30,10 +30,23 @@ import sys
 from . import home
 
 DEFAULT_NODE_URL = "http://127.0.0.1:8899"
-# dregg REFUSES a turn whose fee budget is below the anchor's real computron cost
-# (its EmitEvent costs ~100; dregg's DEFAULT_ANCHOR_FEE is 1000) — a `fee: 0`
-# submit NEVER commits (see dregg node-target/src/lib.rs). Match it, env-overridable.
+# dregg charges a per-turn computron fee and REFUSES a turn whose declared fee
+# budget is below its real cost — so an ECONOMIC turn must declare >= that cost.
+# Historically that was true of EVERY turn (EmitEvent cost ~100; dregg's
+# DEFAULT_ANCHOR_FEE is 1000), so anchors declared a non-zero fee. dregg's
+# Stage B "coordination-turn class" (leash, not ledger) now WAIVES the admission
+# charge for EmitEvent-only turns with no balance_change on an opting-in node:
+# such a turn ADMITS and COMMITS at fee = 0, so it never drains a cell and never
+# needs a faucet grant (the throttle that degraded signed transport to
+# [unsigned]). helm therefore declares fee = 0 for the coordination class
+# (`is_coordination_actions`) and keeps DEFAULT_ANCHOR_FEE only for turns that
+# carry economic effects. Both bounds are env-overridable.
 DEFAULT_ANCHOR_FEE = 1000
+# The declared fee for a COORDINATION turn (EmitEvent-only, no balance_change).
+# 0 = ride the dregg coordination-exempt class free. Override with
+# HELM_NODE_COORD_FEE for a node that has NOT opted into the exempt class (there
+# the anchor simply fails open — the native record is still the proof).
+DEFAULT_COORD_FEE = 0
 # The OPTIONAL anchor rides the capture path best-effort: keep the bound SMALL so
 # a slow/hung node never noticeably delays capture (the native record is the proof).
 DEFAULT_ANCHOR_TIMEOUT = 2
@@ -52,6 +65,51 @@ def anchor_fee():
         return int(v) if v not in (None, "") else DEFAULT_ANCHOR_FEE
     except (TypeError, ValueError):
         return DEFAULT_ANCHOR_FEE
+
+
+def coord_fee():
+    """The declared fee for a COORDINATION turn (EmitEvent-only, no
+    balance_change) — 0 by default so the turn rides dregg's Stage B
+    coordination-exempt class free (admits + commits without a faucet grant, so
+    signed transport never throttles to [unsigned]). Override with
+    HELM_NODE_COORD_FEE for a node that has not opted into the exempt class."""
+    v = home.env("NODE_COORD_FEE")
+    try:
+        return int(v) if v not in (None, "") else DEFAULT_COORD_FEE
+    except (TypeError, ValueError):
+        return DEFAULT_COORD_FEE
+
+
+def is_coordination_actions(actions):
+    """True iff `actions` is the COORDINATION class dregg's `Turn::is_coordination`
+    admits fee-free: non-empty, and EVERY action declares NO `balance_change` and
+    carries ONLY `emit_event` effects. Any economic effect (transfer/burn/
+    note_spend/create_cell/set_field/…) or any balance_change disqualifies the
+    whole turn, so an economic turn is NEVER zeroed — exactly the node-side
+    disqualification, mirrored client-side so the client-declared `fee` matches
+    what the admission gate will charge."""
+    if not actions:
+        return False
+    for a in actions:
+        if not isinstance(a, dict):
+            return False
+        if a.get("balance_change") is not None:
+            return False
+        effects = a.get("effects") or []
+        if not effects:
+            return False
+        if not all(isinstance(e, dict) and e.get("kind") == "emit_event"
+                   for e in effects):
+            return False
+    return True
+
+
+def turn_fee(actions):
+    """The per-turn fee helm DECLARES for `actions`: 0 for the coordination
+    class (`is_coordination_actions` → dregg waives the admission charge), else
+    the economic `anchor_fee()`. This is the client half of the leash — the
+    declared fee is what the node's admission gate meters against."""
+    return coord_fee() if is_coordination_actions(actions) else anchor_fee()
 
 
 def anchor_timeout():
@@ -139,15 +197,20 @@ def anchor_submit(rec_hash, memo=None, timeout=8):
     word = (rec_hash or "").strip().lower()
     data_words = [word] if len(word) == 64 and all(
         c in "0123456789abcdef" for c in word) else []
+    actions = [{
+        "method": "attest",
+        "effects": [{"kind": "emit_event", "topic": ANCHOR_TOPIC,
+                     "data": data_words}],
+    }]
     body = {
         "agent": "00" * 32,          # advisory only — the node signs as itself
-        "nonce": 0, "fee": anchor_fee(),   # fee:0 NEVER commits on dregg
+        # COORDINATION class: an attest turn is EmitEvent-only with no
+        # balance_change, so `turn_fee` declares 0 and it rides dregg's
+        # coordination-exempt admission free (no cell drain, no faucet grant, no
+        # [unsigned] throttle). An economic turn would declare `anchor_fee()`.
+        "nonce": 0, "fee": turn_fee(actions),
         "memo": memo or ("helm-attest:" + (rec_hash or "")),
-        "actions": [{
-            "method": "attest",
-            "effects": [{"kind": "emit_event", "topic": ANCHOR_TOPIC,
-                         "data": data_words}],
-        }],
+        "actions": actions,
     }
     headers = {}
     tok = home.env("NODE_TOKEN")

@@ -102,24 +102,53 @@ class AnchorSubmitTest(CellBase):
             self.assertIsNone(turn, resp)
             self.assertIn("non-object", err)
 
-    def test_anchor_stamps_supported_fee_env_overridable(self):
-        # B3: fee 0 never commits on dregg — stamp dregg's supported default
-        # (1000), env-overridable via HELM_NODE_ANCHOR_FEE.
+    def test_anchor_declares_coordination_fee_zero_env_overridable(self):
+        # B3 (Stage B): the attest anchor is a COORDINATION turn (EmitEvent-only,
+        # no balance_change), so it declares fee=0 and rides dregg's
+        # coordination-exempt admission free — no cell drain, no faucet grant, no
+        # [unsigned] throttle. Env-overridable via HELM_NODE_COORD_FEE for a node
+        # that has NOT opted into the exempt class.
         seen = {}
 
         def fake_post(url, payload, timeout=8, headers=None):
             seen["fee"] = payload.get("fee")
             return {"accepted": True, "turn_hash": TURN}
 
-        self.assertEqual(cell.DEFAULT_ANCHOR_FEE, 1000)
+        self.assertEqual(cell.DEFAULT_COORD_FEE, 0)
         with mock.patch.object(cell, "post_json", fake_post):
             cell.anchor_submit("ab" * 32)
-        self.assertEqual(seen["fee"], 1000)
-        self.assertNotEqual(seen["fee"], 0)
-        os.environ["HELM_NODE_ANCHOR_FEE"] = "2500"
-        with mock.patch.object(cell, "post_json", fake_post):
-            cell.anchor_submit("ab" * 32)
-        self.assertEqual(seen["fee"], 2500)
+        self.assertEqual(seen["fee"], 0)
+        os.environ["HELM_NODE_COORD_FEE"] = "1000"
+        try:
+            with mock.patch.object(cell, "post_json", fake_post):
+                cell.anchor_submit("ab" * 32)
+            self.assertEqual(seen["fee"], 1000)
+        finally:
+            os.environ.pop("HELM_NODE_COORD_FEE", None)
+
+    def test_turn_fee_zeroes_coordination_only_not_economic(self):
+        # The client half of the leash: fee=0 ONLY for the coordination class
+        # (all effects emit_event, no balance_change); an economic effect or any
+        # balance_change keeps the full anchor_fee() so economic turns are never
+        # zeroed — mirrors dregg Turn::is_coordination.
+        coord = [{"method": "attest",
+                  "effects": [{"kind": "emit_event", "topic": "t"}]}]
+        econ_bc = [{"method": "pay",
+                    "balance_change": {"cell": "x", "delta": -5},
+                    "effects": [{"kind": "emit_event", "topic": "t"}]}]
+        econ_eff = [{"method": "x",
+                     "effects": [{"kind": "transfer"},
+                                 {"kind": "emit_event"}]}]
+        self.assertTrue(cell.is_coordination_actions(coord))
+        self.assertEqual(cell.turn_fee(coord), 0)
+        self.assertFalse(cell.is_coordination_actions(econ_bc))
+        self.assertEqual(cell.turn_fee(econ_bc), cell.anchor_fee())
+        self.assertFalse(cell.is_coordination_actions(econ_eff))
+        self.assertEqual(cell.turn_fee(econ_eff), cell.anchor_fee())
+        # empty forest and effect-less actions are NOT coordination
+        self.assertFalse(cell.is_coordination_actions([]))
+        self.assertFalse(cell.is_coordination_actions([{"method": "x",
+                                                        "effects": []}]))
 
     def test_unreachable_is_failopen(self):
         # real fail-open against the dead port — no mock, must not raise
