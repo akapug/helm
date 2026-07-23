@@ -28,6 +28,7 @@ Two tripwires, deliberately BOTH — one proves today, one guards tomorrow:
      ESC/bidi reaches any stdout/stderr or JSON body. Proves the surfaces are
      clean at HEAD; the grep tripwire keeps them that way.
 """
+import ast
 import contextlib
 import io
 import os
@@ -760,6 +761,30 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
         self.assertIn("pwn", body)
         self.assertIn("hi there", body)            # the text rode through intact
 
+    # -- 10. nested transport profile/reason projections -----------------------
+    def test_nested_transport_identity_and_reason_sinks_are_inert(self):
+        transport = {"state": "DEGRADED", "profile": self.HOSTILE,
+                     "code": "send_failed",
+                     "reason": "node " + self.HOSTILE + " refused",
+                     "first_failure": "then", "last_failure": "now",
+                     "last_age_s": 1, "failure_count": 1,
+                     "remediation": "retry"}
+        row = {"ts": "2026-07-23T00:00:00Z", "from": "agent",
+               "text": "fallback", "transport": transport}
+        public = chat.public_rows([row])[0]["transport"]
+        self._assert_inert("public transport.profile", public["profile"])
+        self._assert_inert("public transport.reason", public["reason"])
+        for label, text in (
+                ("chat._fmt transport", chat._fmt(row)),
+                ("chat._fmt_body transport", chat._fmt_body(row)),
+                ("transport summary", chat.transport_failure_summary(
+                    dict(transport, mode="degraded")))):
+            self._assert_inert(label, text)
+        model = human.model_new()
+        model["status"] = dict(transport, mode="degraded", head=None)
+        self._assert_inert("human status transport",
+                           human.status_line(model, 300))
+
     # -- proof the sweep BITES: the planted from-field is genuinely hostile ----
     def test_planted_from_field_is_actually_hostile(self):
         """Guards the guard: if the plant stopped carrying ESC/bidi the three
@@ -969,6 +994,57 @@ class ChatRowFromFieldConsumerAllowlistTest(unittest.TestCase):
         stale = sorted(set(_FROM_FIELD_CONSUMERS) - live)
         self.assertFalse(stale, "from-field allowlist entries no longer read an "
                          "identity field: %r" % stale)
+
+
+# ── G. source-driven nested transport profile/reason sink tripwire ────────────
+# A transport projection is recognizable in Python by reading BOTH nested
+# identity (`profile`) and network diagnostic (`reason`) fields. Enumerate every
+# such function across helm/*.py: a new renderer/status/JSON adapter becomes a
+# new site and fails until its laundering boundary is explicitly justified.
+
+
+def _transport_projection_sites():
+    sites = set()
+    for fn in sorted(os.listdir(PKG)):
+        if not fn.endswith(".py"):
+            continue
+        with open(os.path.join(PKG, fn), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            keys = set()
+            for child in ast.walk(node):
+                if isinstance(child, ast.Call) \
+                        and isinstance(child.func, ast.Attribute) \
+                        and child.func.attr in ("get", "pop", "setdefault") \
+                        and child.args and isinstance(child.args[0], ast.Constant):
+                    keys.add(child.args[0].value)
+                elif isinstance(child, ast.Subscript) \
+                        and isinstance(child.slice, ast.Constant):
+                    keys.add(child.slice.value)
+            if {"profile", "reason"} <= keys:
+                sites.add((fn, node.name))
+    return sites
+
+
+_TRANSPORT_PROJECTION_CONSUMERS = {
+    ("chat.py", "_public_transport"): "publish owner launders profile via _dsan and reason via _safe_reason",
+    ("chat.py", "_failure_public"): "incident status owner launders profile and reason before every status/JSON consumer",
+    ("chat.py", "_transport_tag"): "CLI, follow, and journal row renderer launders legacy/pre-fix nested fields at the sink",
+    ("chat.py", "transport_failure_summary"): "CLI/node/doctor summary launders both nested fields at the sink",
+    ("human.py", "status_line"): "TUI renderer launders both nested fields at the sink",
+}
+
+
+class TransportProjectionConsumerAllowlistTest(unittest.TestCase):
+    def test_every_nested_transport_projection_is_allowlisted(self):
+        self.assertEqual(
+            _transport_projection_sites(),
+            set(_TRANSPORT_PROJECTION_CONSUMERS),
+            "nested transport.profile/reason consumer drifted: every new public "
+            "projection must pass chat._dsan/_safe_reason before rendering or "
+            "JSON emission and be registered with its laundering reason")
 
 
 if __name__ == "__main__":

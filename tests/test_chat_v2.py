@@ -258,6 +258,42 @@ class TransportTest(V2Base):
         chat._clear_sign_failure(a)
         self.assertEqual([f["profile"] for f in chat.sign_failures()], [b])
 
+    def test_raw_profile_key_stays_exact_while_every_projection_is_inert(self):
+        raw = "seat\x1b[31m\x00\x85‮"
+        clean = chat._dsan(raw)
+        hostile_reason = "node\x1b[2J\x01\x85‮ down"
+        chat._record_sign_failure(
+            raw, chat._diag("send_failed", hostile_reason))
+        chat._record_sign_failure(
+            clean, chat._diag("send_failed", hostile_reason))
+
+        with open(chat.sign_failures_path()) as f:
+            state = json.load(f)
+        self.assertEqual(set(state), {raw, clean})
+        failures = chat.sign_failures()
+        self.assertEqual(len(failures), 2)
+        self.assertEqual({f["profile"] for f in failures}, {clean})
+
+        legacy = {"ts": "2026-07-23T00:00:00Z", "from": "agent",
+                  "text": "fallback",
+                  "transport": {"state": "DEGRADED", "profile": raw,
+                                "code": "send_failed",
+                                "reason": hostile_reason}}
+        projections = [chat._fmt(legacy), chat._fmt_body(legacy),
+                       chat.transport_failure_summary(dict(
+                           legacy["transport"], mode="degraded")),
+                       json.dumps(chat.public_rows([legacy]), ensure_ascii=False)]
+        for projection in projections:
+            for ch in ("\x1b", "\x00", "\x01", "\x85", "‮"):
+                self.assertNotIn(ch, projection)
+        self.assertEqual(chat.public_rows([legacy])[0]["transport"]["profile"],
+                         clean)
+
+        self.assertTrue(chat._clear_sign_failure(raw))
+        remaining = chat.sign_failures()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["profile"], clean)
+
     def test_configured_ready_signer_with_unreachable_node_is_degraded(self):
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
         for outcome in (None, OSError("probe exploded")):

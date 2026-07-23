@@ -165,17 +165,36 @@ def _dsan(s):
                    or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
 
 
+def _public_transport(value):
+    """Copy one transport projection with signer identities display-laundered.
+    The incident map remains keyed by the exact raw profile; only emitted row,
+    status, and JSON copies pass through this boundary."""
+    if not isinstance(value, dict):
+        return value
+    out = dict(value)
+    if isinstance(out.get("profile"), str):
+        out["profile"] = _dsan(out["profile"])
+    if isinstance(out.get("reason"), str):
+        out["reason"] = _safe_reason(out["reason"])
+    if isinstance(out.get("failed_profiles"), list):
+        out["failed_profiles"] = [_public_transport(v)
+                                  for v in out["failed_profiles"]]
+    return out
+
+
 def public_rows(rows):
-    """Copies of `rows` with every NAME field display-laundered — the shape the
-    web /api/chat wire and any JSON sink emits. The stored rows keep their raw
-    identity (reaction/reply matching indexes them); only the emitted copy is
-    laundered, one owner, mirroring seats._pub_row for the roster."""
+    """Copies of `rows` with every identity display-laundered — the shape the
+    web /api/chat wire and any JSON sink emits. The stored rows keep raw NAME
+    fields for reaction/reply matching; transport.profile is an emitted signer
+    identity and is laundered too."""
     out = []
     for m in rows:
         c = dict(m)
         for k in _ID_FIELDS:
             if isinstance(c.get(k), str):
                 c[k] = _dsan(c[k])
+        if "transport" in c:
+            c["transport"] = _public_transport(c["transport"])
         out.append(c)
     return out
 
@@ -337,7 +356,7 @@ def _safe_reason(reason):
     s = _AUTH_VALUE.sub("authorization=[redacted]", s)
     s = _SECRET_VALUE.sub(lambda m: "%s=[redacted]" % m.group(1), s)
     s = _AUTH_SCHEME.sub("auth=[redacted]", s)
-    return " ".join(s.split())[:360]
+    return _dsan(" ".join(s.split()))[:360]
 
 
 def _diag(code, reason, remediation=None, event_epoch=None, event_ts=None):
@@ -386,8 +405,8 @@ def _failure_public(rec, now=None):
     now = _epoch(now, time.time())
     first = _epoch(rec.get("_first_epoch"), now)
     last = _epoch(rec.get("_last_epoch"), first)
-    return {"profile": rec.get("profile") if isinstance(rec.get("profile"), str)
-            else "?",
+    return {"profile": _dsan(rec.get("profile"))
+            if isinstance(rec.get("profile"), str) else "?",
             "code": rec.get("code") if isinstance(rec.get("code"), str)
             else "incident_state_corrupt",
             "reason": _safe_reason(rec["reason"]),
@@ -540,7 +559,7 @@ def _stamp_sign_failure(row, profile, failure):
                "remediation": "%s; RAM incident retention also failed: %s" % (
                    d["remediation"], _safe_reason(
                        "%s: %s" % (exc.__class__.__name__, exc)))}
-    row["transport"] = dict(rec, state="DEGRADED")
+    row["transport"] = _public_transport(dict(rec, state="DEGRADED"))
     return row
 
 
@@ -608,6 +627,7 @@ def transport_failure_summary(st):
     """One loud, bounded operator line from transport_status()."""
     if not isinstance(st, dict) or st.get("mode") != "degraded":
         return ""
+    st = _public_transport(st)
     return ("DEGRADED profile '%s': %s — first %s, last %s (%ss ago), "
             "%d failure%s; remediation: %s" % (
                 st.get("profile") or "?", st.get("reason") or "unknown",
@@ -1340,7 +1360,7 @@ def _transport_tag(m):
     configured-off v1 rows keep the ordinary [unsigned] fact."""
     if m.get("chain") is not None:
         return ""
-    t = m.get("transport")
+    t = _public_transport(m.get("transport"))
     if isinstance(t, dict) and t.get("state") == "DEGRADED":
         return " [DEGRADED %s/%s: %s]" % (
             t.get("profile") or "?", t.get("code") or "signing",

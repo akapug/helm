@@ -121,6 +121,35 @@ class TestWebChat(unittest.TestCase):
         self.assertIn('class="cdiag"', html)
         self.assertIn('⚠ DEGRADED', html)
 
+    def test_cell_profile_is_laundered_in_post_and_poll_json(self):
+        raw = "web\x1b[31m\x01\x85‮"
+        clean = chat._dsan(raw)
+        failure = chat._diag(
+            "send_failed", "node\x1b[2J\x01\x85‮ refused")
+        env = {"HELM_CELL_PROFILE": raw, "HELM_CELL_BIN": "/bin/true",
+               "HELM_CHAT_NODE_URL": "http://127.0.0.1:1"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(chat, "node_head", return_value={"chain_index": 1}), \
+             mock.patch.object(chat, "_sign_send", return_value=(None, failure)):
+            status, posted = self.req("/api/chat", {"text": "still lands"})
+            self.assertEqual(status, 200)
+            status, polled = self.req("/api/chat?since=0")
+            self.assertEqual(status, 200)
+
+        with open(chat.sign_failures_path()) as f:
+            self.assertIn(raw, json.load(f))
+        profiles = [posted["msg"]["transport"]["profile"],
+                    polled["lines"][0]["transport"]["profile"],
+                    polled["transport"]["profile"]]
+        profiles.extend(f["profile"]
+                        for f in polled["transport"]["failed_profiles"])
+        self.assertTrue(profiles)
+        self.assertEqual(set(profiles), {clean})
+        body = json.dumps({"posted": posted, "polled": polled},
+                          ensure_ascii=False)
+        for ch in ("\x1b", "\x00", "\x01", "\x85", "‮"):
+            self.assertNotIn(ch, body)
+
     def test_rooms_sidebar_lists_channels_with_cross_room_signal(self):
         """slice-1: /api/chat carries `rooms` (the channel sidebar) with a
         per-room owner signal, so a mention in a NON-current room is visible

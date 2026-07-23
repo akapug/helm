@@ -335,6 +335,21 @@ class TestWebLedgerOffline(LedgerBase):
         finally:
             chat.acknowledge_sign_failures("retired-seat")
 
+    def test_offline_ledger_launders_transport_profile_and_reason(self):
+        raw = "ledger\x1b[31m\x00\x85‮"
+        reason = "node\x1b[2J\x01\x85‮ down"
+        chat._record_sign_failure(raw, chat._diag("send_failed", reason))
+        try:
+            status, d = self.req("/api/ledger")
+            self.assertEqual(status, 200)
+            self.assertTrue(d["offline"])
+            self.assertEqual(d["transport"]["profile"], chat._dsan(raw))
+            body = json.dumps(d, ensure_ascii=False)
+            for ch in ("\x1b", "\x00", "\x01", "\x85", "‮"):
+                self.assertNotIn(ch, body)
+        finally:
+            chat.acknowledge_sign_failures(raw)
+
     def test_turn_status_fails_open(self):
         status, d = self.req("/api/ledger/turn?hash=" + "a" * 64)
         self.assertEqual(status, 200)

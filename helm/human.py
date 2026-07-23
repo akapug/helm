@@ -84,7 +84,7 @@ def chat_pane(m, width, height):
 
 
 def status_line(m, width):
-    st = m["status"]
+    st = chat._public_transport(m["status"])
     head = ("#%s" % st["head"]) if st.get("head") is not None else "-"
     transport = "%s %s" % (st.get("mode", "?").upper(), head)
     if st.get("mode") == "degraded":

@@ -92,6 +92,13 @@ class RenderTest(HumanBase):
         self.assertIn("DEGRADED #12", loud)
         self.assertIn("seat-a: send failed", loud)
         self.assertIn("last 7s ago", loud)
+        m["status"] = {"mode": "degraded", "head": None,
+                       "profile": "seat\x1b[31m\x00\x85‮",
+                       "reason": "node\x1b[2J\x01\x85‮ down",
+                       "last_age_s": 1}
+        hostile = human.status_line(m, 160)
+        for ch in ("\x1b", "\x00", "\x01", "\x85", "‮"):
+            self.assertNotIn(ch, hostile)
 
     def test_input_line_keeps_the_cursor_end_visible(self):
         m = human.model_new()
