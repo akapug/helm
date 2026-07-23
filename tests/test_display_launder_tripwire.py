@@ -64,7 +64,11 @@ _ROSTER_CONSUMERS = {
         "PUBLISH OWNER: every roster-borne string emits through "
         "_pub_row / _seat_label (roster_report, presence_report, the CLI "
         "glance verbs, the mutation-helper echoes); field-complete guard is "
-        "tests/test_presence.py::RosterLaunderCompletenessTest."),
+        "tests/test_presence.py::RosterLaunderCompletenessTest. The consume-"
+        "ladder readers (_recipients resolves @mention/rfrom tokens to roster "
+        "KEYS, _recipient_cursor matches a cursor row internally, pending "
+        "resolves recipients) emit only through the `pending` CLI's "
+        "_seat_label / the `ack` refusal's _seat_label — same publish owner."),
     "todos.py": (
         "LAUNDERED: fleet()/_row run the seat KEY + project through _lbl "
         "(_scrub + _clip) before the fleet table AND the /api/todos JSON; "
@@ -95,7 +99,9 @@ _ROSTER_CALL_COUNTS = {
     "codexhomes.py": 1,
     "hooks.py": 1,
     "seat.py": 2,
-    "seats.py": 15,
+    "seats.py": 19,        # +3: _recipients, _recipient_cursor, pending (ack
+                           # ladder); +1: _is_seat membership check — reads
+                           # roster KEYS for a bool only, never emits one
     "todos.py": 1,
     "web.py": 2,
 }
@@ -926,11 +932,15 @@ _FROM_FIELD_CONSUMERS = {
         "matching (never emitted raw). Verified by ChatRowFromFieldSinkSweep's "
         "join/invite/say/status/recv-all-markers tests."),
     "seats.py": (
-        "LAUNDERED+INTERNAL: the two EMIT sites — deliver()'s boundary nudge and "
-        "stop_guard()'s undelivered block — launder via chat._dsan; the "
-        "deliverable-matching reads (frm/dm/rfrom in deliverable()) are "
-        "INTERNAL-MATCHING-ONLY, never emitted. Verified by "
-        "ChatRowFromFieldSinkSweep's deliver/stop_guard tests."),
+        "LAUNDERED+INTERNAL: the EMIT sites — deliver()'s boundary nudge, "
+        "stop_guard()'s undelivered block, the `ack` refusal string and the "
+        "`pending`/`ack` CLI success lines — launder via chat._dsan / "
+        "_seat_label; the deliverable-matching reads (frm/dm/rfrom in "
+        "deliverable()) and the consume-ladder matching reads (from/dm/rfrom "
+        "casefolded into dict keys + branch tests in _recipients / "
+        "consume_state / pending / ack) are INTERNAL-MATCHING-ONLY, never "
+        "emitted raw. Verified by ChatRowFromFieldSinkSweep's deliver/"
+        "stop_guard tests + test_ackladder's hostile-name sink test."),
     "web.py": (
         "LAUNDERED+INTERNAL: the owner-mention preview + ledger + channel-row "
         "emits launder via chat._dsan (and the /api/chat body via "
@@ -950,10 +960,12 @@ _FROM_FIELD_CONSUMERS = {
 # trips until a human re-counts AND confirms the new site launders (or is
 # internal). Regenerate deliberately from _from_field_read_sites().
 _FROM_FIELD_READ_COUNTS = {
-    "chat.py": 29,
+    "chat.py": 30,         # +1: _fmt's ack-marker render (laundered via _dsan)
     "homes.py": 1,
     "meld.py": 9,
-    "seats.py": 6,
+    "seats.py": 18,        # +11: the ack/consume-ladder reads (matching +
+                           # laundered emits); +1: consume_state's dm-vs-room
+                           # branch reads .get("dm") for control flow only
     "web.py": 7,
 }
 

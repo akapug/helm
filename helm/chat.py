@@ -1252,7 +1252,7 @@ def _parent_fields(room, ref):
 
 
 def post(text, room="main", who=None, profile=None, sign=None, origin=None,
-         dm=None, ambient=False, reply_to=None):
+         dm=None, ambient=False, reply_to=None, ack=None, ackstate=None):
     """Append one message; returns it. v2: shortcodes expand, and when the
     room node answers the digest rides a signed self-write turn FIRST — the
     row carries {turn, receipt, chain}. Node down -> plain v1 row (rendered
@@ -1297,6 +1297,13 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
         row["origin"] = origin
     if ambient and not dm:
         row["ambient"] = 1
+    if ack:
+        # the ACK / CONSUME LADDER row (seats.ack): a NON-waking marker that
+        # names the target row it closes — seats.deliverable drops it like a
+        # reaction, and the SENDER reads it off `helm chat pending`. The note
+        # (if any) is the text; a blocked ack carries its reason there.
+        row["ack"] = ack
+        row["ackstate"] = ackstate or "done"
     if reply_to:
         row.update(_parent_fields(room, reply_to))
     _touch_poster_presence(row["from"])
@@ -1577,6 +1584,12 @@ def _fmt(m, hhmm=True, idx=None):
             "un-reacted" if m.get("un") else "reacted",
             m["react"], _dsan(m.get("tfrom") or "?"),
             str(m.get("tts") or "")[11:16] or "--:--", tag)
+    if m.get("ack"):        # the consume-ladder ACTED marker (seats.ack)
+        note = (": " + (m.get("text") or "")) if m.get("text") else ""
+        return "%s %s ACK %s -> %s%s%s" % (
+            stamp, _dsan(m.get("from") or "?"),
+            str(m.get("ackstate") or "done").upper(),
+            str(m.get("ack") or "")[:8], note, tag)
     q = quote_of(m, idx) if idx else None
     quote = ' ↳%s "%s"' % (_dsan(q[0]), q[1]) if q else ""
     n = (idx or {}).get("replies", {}).get(tkey(m), 0)
@@ -1743,7 +1756,8 @@ def _fmt_body(m):
 # ---------------------------------------------------------------------------
 
 SEAT_VERBS = ("join", "deliver", "stop-guard", "wait", "seats", "seat", "dm",
-              "status", "claim", "release", "claims", "verdict", "reveal")
+              "ack", "pending", "status", "claim", "release", "claims",
+              "verdict", "reveal")
                                                # the delivery lane — seats.py
                                                # (verdict/reveal answer with
                                                # the 0.3 council deferral)
@@ -1787,6 +1801,22 @@ HELP = {
             "rehome <sid|name> <room|main|none>",
     "dm": "usage: helm chat dm <seat> <text...> [--seat S]  (one private "
           "recipient — never a room)",
+    "ack": "usage: helm chat ack <id> [done|blocked] [--note ...] [--seat S]\n"
+           "  Mark a message ADDRESSED TO YOU as acted — done (loop closed) or "
+           "blocked (--note the\n"
+           "  reason). One append-only ack row on the same lane; the sender "
+           "watches it leave their\n"
+           "  `helm chat pending`. <id> is the row's stable id (helm chat read "
+           "shows it). Only the\n"
+           "  recipient may ack; a foreign or unknown id is refused; an "
+           "identical repeat is a no-op.",
+    "pending": "usage: helm chat pending [--seat S]\n"
+               "  YOUR outbound addressed rows (DMs, @mentions) not yet "
+               "CONSUMED: SENT-not-SEEN (the\n"
+               "  recipient never surfaced it — dead / away / wedged?) or "
+               "SEEN-not-ACTED (surfaced, not\n"
+               "  yet acked). Acked rows drop off — a stranded word is a "
+               "visible object, not silent loss.",
     "claim": "usage: helm chat claim <resource> [--ttl SECONDS] [--seat S] "
              "[--lease ID to extend]  (keep the printed lease id — it is the "
              "release capability)",
