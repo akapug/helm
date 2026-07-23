@@ -860,18 +860,6 @@ def _env_file_value(path, key):
     return None
 
 
-def _iso_epoch(s):
-    """Epoch seconds of an ISO-8601 timestamp ('Z' tolerated); None when the
-    value is absent/unparseable — an unreadable expiry must never look fresh
-    OR stale, it just carries no signal."""
-    import datetime
-    try:
-        return datetime.datetime.fromisoformat(
-            str(s).replace("Z", "+00:00")).timestamp()
-    except (TypeError, ValueError):
-        return None
-
-
 def _hermes_pool_key(provider):
     """(access_token, base_url, err) for a provider from the hermes CLI's
     credential_pool (HERMES_AUTH). credential_pool[provider] is a LIST of
@@ -993,6 +981,7 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
                   file=sys.stderr)
             return 1
     pool_err = None
+    as_err = None
     if not api_key and pool_provider:
         # PREFER the opencode auth store (fresh, owner-maintained); the
         # authstore carries no base_url so the pool-table base_url (set above)
@@ -1008,7 +997,10 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
             if api_key and ent_base:
                 base_url = ent_base   # the pool entry's own base_url wins
             elif not api_key:
-                pool_err = hermes_err or pool_err
+                # both sources tried and failed: report BOTH reasons — the
+                # authstore is the PREFERRED path, so masking its error behind
+                # the hermes one hides the reason the operator most needs.
+                pool_err = "; ".join(e for e in (as_err, hermes_err) if e)
     if not api_key:
         pool_hint = ""
         if pool_provider:
