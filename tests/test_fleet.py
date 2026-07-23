@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import fleet, session, who  # noqa: E402
+from helm import fleet, seats, session, who  # noqa: E402
 
 SID_A = "12345678-1234-1234-1234-123456789abc"
 SID_B = "87654321-4321-4321-4321-cba987654321"
@@ -43,7 +43,7 @@ class FleetRowsTest(unittest.TestCase):
     def _wire(self, envs, census=(), daemons=(), daemons_failed=False,
               daemon_for=None, roster=({}, False), terminals=([], False),
               census_failed=False, who_failed=False, census_partial=False,
-              generation=None):
+              generation=None, pane_for=None, unproven=()):
         merged = []
         for r in census:
             r = dict(r)
@@ -53,18 +53,21 @@ class FleetRowsTest(unittest.TestCase):
         census = {r["pid"]: r for r in merged}
         daemons = dict(daemons)
         daemon_for = daemon_for or (
-            lambda pid, ds, unproven: (("daemon", sorted(ds)[0]) if ds
-                                       else ("headless", None)))
+            lambda pid, start, ds, unproven: (
+                ("daemon", sorted(ds)[0]) if ds else ("headless", None)))
         generation = generation or (lambda pid, start: True)
+        pane_for = pane_for or (lambda env, terms: (None, True))
         return [
             mock.patch.object(fleet, "_census",
                               lambda: (census, census_failed, who_failed,
                                        census_partial)),
             mock.patch.object(fleet, "_daemon_pids",
-                              lambda: (daemons, set(), daemons_failed)),
+                              lambda: (daemons, set(unproven), daemons_failed)),
             mock.patch.object(fleet, "_daemon_for", daemon_for),
             mock.patch.object(fleet, "_roster", lambda: roster),
-            mock.patch.object(fleet, "_orca_terminals", lambda: terminals),
+            mock.patch.object(
+                fleet, "_orca_terminals", lambda daemon, start, env: terminals),
+            mock.patch.object(fleet, "_pane_for", pane_for),
             mock.patch.object(fleet, "_generation_intact", generation),
         ]
 
@@ -174,6 +177,36 @@ class FleetRowsTest(unittest.TestCase):
         rows, _ = self._rows({6: {}}, census, roster=({}, False))
         self.assertFalse(rows[0]["unknown"])
         self.assertIn("(no seat)", self._render({6: {}}, census))
+
+    def test_roster_fallback_uses_session_not_a_nonexistent_pid_field(self):
+        roster = {"codex-2": {"session": SID_A, "sessions": [SID_A]}}
+        census = [srow(6, SID_A, "declared", root="/r")]
+        rows, _ = self._rows({6: {}}, census, roster=(roster, False))
+        self.assertEqual((rows[0]["seat"], rows[0]["seat_src"]),
+                         ("codex-2", "roster"))
+
+    def test_duplicate_roster_session_is_ambiguous_and_unknown(self):
+        roster = {"a": {"session": SID_A}, "b": {"sessions": [SID_A]}}
+        census = [srow(6, SID_A, "declared", root="/r")]
+        rows, _ = self._rows({6: {}}, census, roster=(roster, False))
+        self.assertEqual(rows[0]["seat_src"], "roster-ambiguous")
+        self.assertTrue(rows[0]["unknown"])
+
+
+class RosterCheckedTest(unittest.TestCase):
+    def test_missing_is_empty_but_malformed_or_wrong_shape_is_failed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "roster.json")
+            with mock.patch.object(seats, "roster_path", return_value=path):
+                self.assertEqual(seats.roster_checked(), ({}, False))
+                for value in ("{bad", "[]", '{"seat": "bad"}'):
+                    with open(path, "w") as f:
+                        f.write(value)
+                    self.assertEqual(seats.roster_checked(), ({}, True), value)
+                good = {"seat": {"session": SID_A}}
+                with open(path, "w") as f:
+                    json.dump(good, f)
+                self.assertEqual(seats.roster_checked(), (good, False))
 
 
 class SidDelegationTest(FleetRowsTest):
@@ -323,10 +356,11 @@ class DaemonWalkTest(unittest.TestCase):
     DAEMON_ARGV = ["orca-ide", "/x/daemon-entry.js", "--socket", "/s"]
 
     def _walk(self, tree, daemons, argv=None, start="111", unproven=()):
-        with mock.patch.object(fleet, "_stat_ppid", lambda p: tree.get(p)), \
+        links = {p: ("g%d" % p, parent) for p, parent in tree.items()}
+        with mock.patch.object(fleet, "_stat_link", lambda p: links.get(p)), \
              mock.patch.object(fleet, "_cmdline_argv", lambda p: argv), \
              mock.patch.object(session, "_proc_start", lambda p: start):
-            return fleet._daemon_for(7, daemons, set(unproven))
+            return fleet._daemon_for(7, "g7", daemons, set(unproven))
 
     def test_matching_incarnation_is_a_proven_daemon(self):
         self.assertEqual(self._walk({7: 99}, {99: "111"},
@@ -367,6 +401,70 @@ class DaemonWalkTest(unittest.TestCase):
         # daemon — headless is unprovable through it
         self.assertEqual(self._walk({7: 42, 42: 1}, {}, unproven={42}),
                          ("unknown", None))
+
+    def test_intermediate_parent_reuse_invalidates_the_chain(self):
+        calls = {7: 0}
+
+        def link(pid):
+            if pid == 7:
+                calls[7] += 1
+                return ("g7", 50) if calls[7] == 1 else ("g7", 1)
+            return {50: ("g50", 99)}.get(pid)
+        with mock.patch.object(fleet, "_stat_link", side_effect=link), \
+             mock.patch.object(fleet, "_cmdline_argv",
+                               return_value=self.DAEMON_ARGV), \
+             mock.patch.object(session, "_proc_start", return_value="d1"):
+            self.assertEqual(fleet._daemon_for(7, "g7", {99: "d1"}, set()),
+                             ("unknown", None))
+
+
+class CensusRecheckFailureTest(unittest.TestCase):
+    def test_live_stat_read_failure_is_unknown_not_generation_mismatch(self):
+        error = PermissionError(13, "stat unreadable")
+        with mock.patch.object(session, "_proc_bytes", side_effect=error):
+            self.assertIsNone(session._census_matches(41, "g1", b"claude\0"))
+
+    def test_gone_pid_is_proven_absence(self):
+        error = FileNotFoundError(2, "gone")
+        with mock.patch.object(session, "_proc_bytes", side_effect=error):
+            self.assertFalse(session._census_matches(41, "g1", b"claude\0"))
+
+
+class WhoCensusContextTest(unittest.TestCase):
+    def _census(self, who_rows, failed_pids=()):
+        snap = {"pid": 41, "uid": os.geteuid(), "start": "g1",
+                "cmdline": b"claude\0", "environ": b"HOME=/alt\0",
+                "argv": ["claude"], "env": {"HOME": "/alt"},
+                "cwd": "/w", "stdin": "/dev/pts/1"}
+
+        def scan(accounts=None, status=None):
+            status.update({"listing_failed": False,
+                           "failed_pids": set(failed_pids)})
+            return who_rows
+
+        with mock.patch.object(session.os, "listdir", return_value=["41"]), \
+             mock.patch.object(session, "_census_snapshot",
+                               return_value=("ok", snap)), \
+             mock.patch.object(session, "_session_record",
+                               return_value=(None, "record-missing",
+                                             "/alt/.claude")), \
+             mock.patch.object(session, "_census_matches", return_value=True), \
+             mock.patch.object(session, "_cwd_session_ids", return_value=[]), \
+             mock.patch.object(who, "scan", side_effect=scan):
+            return session._proc_claude_census()["rows"][0]
+
+    def test_who_sid_from_another_home_is_conflict_not_identity(self):
+        wr = {"pid": 41, "provider": "anthropic", "child": False,
+              "home": "/inspector/.claude", "cwd": "/w",
+              "session": SID_A, "session_candidates": []}
+        row = self._census([wr])
+        self.assertIsNone(row["session"])
+        self.assertTrue(row["who_context_mismatch"])
+
+    def test_partial_who_scan_marks_that_pid_failed(self):
+        row = self._census([], failed_pids={41})
+        self.assertIsNone(row["session"])
+        self.assertTrue(row["who_probe_failed"])
 
 
 class DaemonScanTest(unittest.TestCase):
@@ -410,39 +508,58 @@ class DaemonScanTest(unittest.TestCase):
 
 
 class OrcaTerminalsTest(unittest.TestCase):
-    """codex round-2 finding 3: a successful orca command returning valid
-    JSON of the WRONG SCHEMA is a failed probe (pane truth UNKNOWN) — never
-    an AttributeError that crashes the whole truth verb."""
+    """Terminal inventory is bound to one daemon/runtime and must be complete."""
 
-    def _terms(self, stdout, rc=0):
-        proc = subprocess.CompletedProcess([], rc, stdout=stdout, stderr="")
-        with mock.patch.object(fleet.subprocess, "run", return_value=proc):
-            return fleet._orca_terminals()
+    def _terms(self, listing, status=None, daemon_ppid=10, start="g1"):
+        status = status or {
+            "ok": True, "result": {"app": {"pid": 10},
+                                    "runtime": {"runtimeId": "r1"}}}
+        replies = iter((status, listing))
+        env = {"ORCA_USER_DATA_PATH": os.path.expanduser("~/.config/orca")}
+        with mock.patch.object(fleet, "_orca_json",
+                               side_effect=lambda *a: next(replies)), \
+             mock.patch.object(fleet, "_daemon_user_data",
+                               return_value=os.path.realpath(env["ORCA_USER_DATA_PATH"])), \
+             mock.patch.object(fleet, "_stat_ppid", return_value=daemon_ppid), \
+             mock.patch.object(session, "_proc_start", return_value=start):
+            return fleet._orca_terminals(99, "g1", env)
 
-    def test_top_level_list_is_failed_not_a_crash(self):
-        # the review's exact probe: stdout '[]' raised AttributeError before
-        self.assertEqual(self._terms("[]"), ([], True))
+    @staticmethod
+    def listing(terms=(), truncated=False, total=None, runtime="r1"):
+        terms = list(terms)
+        return {"ok": True, "result": {"terminals": terms,
+                                         "truncated": truncated,
+                                         "totalCount": len(terms) if total is None else total},
+                "_meta": {"runtimeId": runtime}}
 
-    def test_wrong_shapes_are_failed_probes(self):
-        for stdout in ('{"result": []}', '{"result": {"terminals": {}}}',
-                       '{"result": {}}', '"ok"', "3",
-                       '{"result": {"terminals": [{"handle": "t"}, 3]}}'):
-            self.assertEqual(self._terms(stdout), ([], True), stdout)
-
-    def test_documented_shape_passes_through_verbatim(self):
-        terms = [{"handle": "t1", "worktreePath": "/w"}]
-        self.assertEqual(
-            self._terms('{"result": {"terminals": '
-                        '[{"handle": "t1", "worktreePath": "/w"}]}}'),
-            (terms, False))
+    def test_documented_complete_shape_is_runtime_bound(self):
+        terms = [{"handle": "t1", "tabId": "a", "leafId": "b",
+                  "connected": True, "writable": True}]
+        got, failed = self._terms(self.listing(terms))
+        self.assertFalse(failed)
+        self.assertEqual(got[0]["handle"], "t1")
+        self.assertEqual((got[0]["_orca_cli"], got[0]["_runtime_id"]),
+                         ("orca", "r1"))
 
     def test_successful_empty_list_is_a_fact_not_a_failure(self):
-        self.assertEqual(self._terms('{"result": {"terminals": []}}'),
-                         ([], False))
+        self.assertEqual(self._terms(self.listing()), ([], False))
 
-    def test_nonzero_exit_and_bad_json_are_failed(self):
-        self.assertEqual(self._terms("", rc=3), ([], True))
-        self.assertEqual(self._terms("not json"), ([], True))
+    def test_truncated_or_count_mismatch_is_failed(self):
+        self.assertEqual(self._terms(self.listing([], truncated=True)),
+                         ([], True))
+        self.assertEqual(self._terms(self.listing([], total=1)), ([], True))
+
+    def test_wrong_runtime_or_daemon_owner_is_failed(self):
+        self.assertEqual(self._terms(self.listing(runtime="other")),
+                         ([], True))
+        self.assertEqual(self._terms(self.listing(), daemon_ppid=11),
+                         ([], True))
+
+    def test_wrong_shapes_are_failed_probes(self):
+        for listing in (None, {"ok": True, "result": []},
+                        {"ok": True, "result": {"terminals": {}}},
+                        {"ok": True, "result": {}}):
+            self.assertEqual(self._terms(listing), ([], True), listing)
 
 
 class UnknownPlumbingTest(FleetRowsTest):
@@ -451,12 +568,13 @@ class UnknownPlumbingTest(FleetRowsTest):
     owner-cannot-see claim."""
 
     def test_unprovable_host_renders_unknown_not_headless(self):
-        unk = lambda pid, ds, unproven: ("unknown", None)  # noqa: E731
+        unk = lambda pid, start, ds, unproven: ("unknown", None)  # noqa: E731
         census = [srow(3, SID_A, "declared", root="/r")]
         rows, _ = self._rows({3: {}}, census, daemon_for=unk)
         self.assertEqual(rows[0]["daemon_state"], "unknown")
         self.assertTrue(rows[0]["unknown"])
-        out = self._render({3: {}}, census, daemon_for=unk)
+        out, rc = self._render_rc({3: {}}, census, daemon_for=unk)
+        self.assertEqual(rc, 1)  # row UNKNOWN must never ride a shell PASS
         self.assertIn("host=?", out)
         self.assertNotIn("HEADLESS", out)
         self.assertNotIn("owner cannot see", out)
@@ -470,7 +588,7 @@ class UnknownPlumbingTest(FleetRowsTest):
         self.assertNotIn("UNKNOWN columns", out)
 
     def test_daemon_scan_failure_makes_every_host_unknown(self):
-        boom = lambda p, ds, unp: self.fail("walk must not run")  # noqa: E731
+        boom = lambda p, start, ds, unp: self.fail("walk must not run")  # noqa: E731
         rows, _ = self._rows({3: {}}, [srow(3, SID_A, "declared", root="/r")],
                              daemons_failed=True, daemon_for=boom)
         self.assertEqual(rows[0]["daemon_state"], "unknown")
@@ -522,7 +640,7 @@ class GenerationBracketTest(FleetRowsTest):
         # The failed recheck must kill the host claim to UNKNOWN — never
         # compose old census facts with the new process's ancestry
         census = [srow(7, SID_A, "declared", root="/r", start="g-old")]
-        wire = dict(daemon_for=lambda pid, ds, unp: ("headless", None),
+        wire = dict(daemon_for=lambda pid, start, ds, unp: ("headless", None),
                     generation=lambda pid, start: False)
         rows, _ = self._rows({7: {"HELM_CHAT_NAME": "old-seat"}}, census,
                              **wire)
@@ -563,13 +681,13 @@ class GenerationBracketTest(FleetRowsTest):
         order = []
         census = {7: srow(7, SID_A, "declared", root="/r", cwd="/w/a")}
 
-        def daemon_for(pid, ds, unp):
+        def daemon_for(pid, start, ds, unp):
             order.append("walk")
             return "daemon", 99
 
-        def terminals():
+        def terminals(daemon, start, env):
             order.append("terminals")
-            return [{"handle": "t", "worktreePath": "/w/a"}], False
+            return [{"handle": "t"}], False
 
         def generation(pid, start):
             order.append("recheck")
@@ -581,6 +699,8 @@ class GenerationBracketTest(FleetRowsTest):
              mock.patch.object(fleet, "_daemon_for", daemon_for), \
              mock.patch.object(fleet, "_roster", lambda: ({}, False)), \
              mock.patch.object(fleet, "_orca_terminals", terminals), \
+             mock.patch.object(fleet, "_pane_for",
+                               lambda env, terms: ("t", True)), \
              mock.patch.object(fleet, "_generation_intact", generation):
             fleet.rows()
         self.assertEqual(order, ["walk", "terminals", "recheck"])
@@ -819,34 +939,30 @@ class SidParserTest(unittest.TestCase):
             ["claude", "--resume", SID_A, "--resume=" + SID_A]), SID_A)
 
 
-class PaneAmbiguityTest(FleetRowsTest):
-    """fable review HIGH: the shared-cwd ambiguity set must contain every
-    sibling claude row not PROVEN pane-less. An unknown-host sibling (its
-    walk failed — it is not refuted, and may be daemon-hosted in that very
-    terminal) makes the cwd join ambiguous; only a proven-HEADLESS sibling
-    (walked to init, proven in no pane) is excludable. Guessing here is the
-    founding failure: text injected into the wrong pane."""
+class PaneIdentityTest(FleetRowsTest):
+    """Pane identity comes from the bracketed Orca pane key, never cwd."""
 
-    TERMS = ([{"handle": "term_1", "worktreePath": "/w/x"}], False)
+    TERMS = ([{"handle": "term_new", "tabId": "tab", "leafId": "leaf",
+               "worktreePath": "/other", "connected": True,
+               "writable": True}], False)
 
-    def _panes(self, sibling_state):
-        census = [srow(10, SID_A, "declared", root="/r", cwd="/w/x"),
-                  srow(11, SID_B, "declared", root="/r", cwd="/w/x")]
-        states = {10: ("daemon", 99), 11: sibling_state}
-        rows, _ = self._rows({10: {}, 11: {}}, census, {99: "s1"},
-                             daemon_for=lambda pid, ds, unp: states[pid],
-                             terminals=self.TERMS)
-        return {r["pid"]: r for r in rows}
+    def test_hosted_row_resolves_replacement_handle_by_pane_key(self):
+        census = [srow(10, SID_A, "declared", root="/r", cwd="/w/x")]
+        env = {"ORCA_PANE_KEY": "tab:leaf",
+               "ORCA_TERMINAL_HANDLE": "term_stale"}
+        rows, _ = self._rows(
+            {10: env}, census, {99: "s1"}, terminals=self.TERMS,
+            pane_for=fleet._pane_for)
+        self.assertEqual(rows[0]["pane"], "term_new")
+        self.assertFalse(rows[0]["unknown"])
 
-    def test_unknown_host_sibling_makes_the_pane_join_ambiguous(self):
-        by = self._panes(("unknown", None))
-        self.assertIsNone(by[10]["pane"])
-
-    def test_proven_headless_sibling_stays_excludable(self):
-        # the affirmative counterpart: a sibling PROVEN in no pane cannot
-        # make the join ambiguous — the hosted row keeps its unique handle
-        by = self._panes(("headless", None))
-        self.assertEqual(by[10]["pane"], "term_1")
+    def test_hosted_row_without_authoritative_pane_key_is_unknown(self):
+        census = [srow(10, SID_A, "declared", root="/r", cwd="/w/x")]
+        out, rc = self._render_rc(
+            {10: {}}, census, daemons={99: "s1"}, terminals=self.TERMS,
+            pane_for=fleet._pane_for, args=("--json",))
+        self.assertEqual(rc, 1)
+        self.assertTrue(json.loads(out)["rows"][0]["unknown"])
 
 
 class EstateProbeExitTest(FleetRowsTest):
@@ -874,7 +990,7 @@ class EstateProbeExitTest(FleetRowsTest):
 
     def test_daemon_scan_failure_gates_exit_code_and_json(self):
         census = [srow(3, SID_A, "declared", root="/r")]
-        boom = lambda p, ds, unp: self.fail("walk must not run")  # noqa: E731
+        boom = lambda p, start, ds, unp: self.fail("walk must not run")  # noqa: E731
         _out, rc = self._render_rc({3: {}}, census, daemons_failed=True,
                                    daemon_for=boom)
         self.assertEqual(rc, 1)
@@ -885,6 +1001,16 @@ class EstateProbeExitTest(FleetRowsTest):
         data, rc = self._bits({3: {}}, census)
         self.assertEqual(rc, 0)
         self.assertFalse(data["daemons_failed"])
+
+    def test_partial_daemon_census_is_a_floor_and_gates_exit(self):
+        census = [srow(3, SID_A, "declared", root="/r")]
+        data, rc = self._bits({3: {}}, census, unproven={77})
+        self.assertEqual(rc, 1)
+        self.assertTrue(data["daemons_partial"])
+        out, rc = self._render_rc({3: {}}, census, unproven={77})
+        self.assertEqual(rc, 1)
+        self.assertIn("DAEMON CENSUS PARTIAL", out)
+        self.assertIn("at least 0 orca daemon", out)
 
     def test_terminal_list_failure_gates_exit_code_and_json(self):
         census = [srow(3, SID_A, "declared", root="/r")]
@@ -933,17 +1059,41 @@ class ProbeOrderingTest(unittest.TestCase):
 
 
 class PaneMappingTest(unittest.TestCase):
-    def test_unique_cwd_join_maps_ambiguity_never_guesses(self):
-        terms = [{"handle": "term_1", "worktreePath": "/w/a"},
-                 {"handle": "term_2", "worktreePath": "/w/b"},
-                 {"handle": "term_3", "worktreePath": "/w/b"}]
-        self.assertEqual(fleet._pane_for("/w/a", terms, set()), "term_1")
-        # two terminals at one path: ambiguous -> None
-        self.assertIsNone(fleet._pane_for("/w/b", terms, set()))
-        # two claude rows share the cwd: ambiguous -> None
-        self.assertIsNone(fleet._pane_for("/w/a", terms, {"/w/a"}))
-        # unknown cwd -> None
-        self.assertIsNone(fleet._pane_for(None, terms, set()))
+    TERMS = [{"handle": "term_1", "tabId": "a", "leafId": "one",
+              "connected": True, "writable": True,
+              "worktreePath": "/decoy"},
+             {"handle": "term_2", "tabId": "b", "leafId": "two",
+              "connected": False, "writable": True,
+              "worktreePath": "/w"}]
+
+    def test_exact_pane_key_resolves_without_cwd(self):
+        self.assertEqual(fleet._pane_for({"ORCA_PANE_KEY": "a:one"}, self.TERMS),
+                         ("term_1", True))
+
+    def test_stale_handle_does_not_override_pane_key(self):
+        env = {"ORCA_PANE_KEY": "a:one", "ORCA_TERMINAL_HANDLE": "term_old"}
+        self.assertEqual(fleet._pane_for(env, self.TERMS), ("term_1", True))
+
+    def test_transport_ids_upgrade_through_terminal_show(self):
+        terms = [{"handle": "term_new", "tabId": "pty:x", "leafId": "pty:x",
+                  "worktreeId": "w1", "connected": True, "writable": True,
+                  "_orca_cli": "orca", "_runtime_id": "r1"}]
+        shown = {"ok": True, "result": {"terminal": {
+            "handle": "term_new", "tabId": "stable-tab",
+            "leafId": "stable-leaf", "connected": True, "writable": True}},
+            "_meta": {"runtimeId": "r1"}}
+        env = {"ORCA_PANE_KEY": "stable-tab:stable-leaf",
+               "ORCA_WORKTREE_ID": "w1"}
+        with mock.patch.object(fleet, "_orca_json", return_value=shown):
+            self.assertEqual(fleet._pane_for(env, terms), ("term_new", True))
+
+    def test_missing_disconnected_or_ambiguous_key_is_unproven(self):
+        self.assertEqual(fleet._pane_for({}, self.TERMS), (None, False))
+        self.assertEqual(fleet._pane_for({"ORCA_PANE_KEY": "b:two"}, self.TERMS),
+                         (None, False))
+        dup = self.TERMS + [dict(self.TERMS[0], handle="term_3")]
+        self.assertEqual(fleet._pane_for({"ORCA_PANE_KEY": "a:one"}, dup),
+                         (None, False))
 
 
 if __name__ == "__main__":

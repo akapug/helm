@@ -149,6 +149,21 @@ class ScanTest(WhoBase):
         self.assertIsNone(r["account"])
         self.assertEqual(r["attribution"], "environ-unreadable")
 
+    def test_default_home_belongs_to_the_process_not_the_inspector(self):
+        alt = os.path.join(self.tmp, "alternate-home")
+        self.plant_proc(610, "claude", start=41,
+                        env=("HOME=" + alt).encode() + b"\0", cwd=self.tmp)
+        rows = {r["pid"]: r for r in who.scan([])}
+        self.assertEqual(rows[610]["home"], os.path.join(alt, ".claude"))
+
+    def test_unreadable_live_stat_reaches_the_completeness_channel(self):
+        d = self.plant_proc(620, "claude", start=42)
+        os.unlink(os.path.join(d, "stat"))
+        status = {}
+        self.assertEqual(who.scan([], status=status), [])
+        self.assertIn(620, status["failed_pids"])
+        self.assertFalse(status["listing_failed"])
+
     def test_pid_gone_between_comm_and_environ_is_skipped(self):
         d = self.plant_proc(700, "claude", start=50)
         os.unlink(os.path.join(d, "stat"))     # died right after the comm read

@@ -523,6 +523,27 @@ def roster():
     return pk.read_json(roster_path(), {}) or {}
 
 
+def roster_checked():
+    """(roster, failed) for truth consumers that cannot accept fail-open {}.
+
+    Missing is a proven empty roster. Unreadable, malformed, or wrong-shaped
+    state is a failed probe: callers render UNKNOWN rather than treating a
+    parse failure as evidence that no seat exists.
+    """
+    try:
+        with open(roster_path(), encoding="utf-8") as f:
+            value = json.load(f)
+    except FileNotFoundError:
+        return {}, False
+    except (OSError, ValueError, TypeError):
+        return {}, True
+    if not isinstance(value, dict) or not all(
+            isinstance(k, str) and isinstance(v, dict)
+            for k, v in value.items()):
+        return {}, True
+    return value, False
+
+
 def touch_seen(seat):
     """The hot-path presence beat: utime a per-seat empty file — no shared
     read-modify-write, no lock, no lost sibling rows."""

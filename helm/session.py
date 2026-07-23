@@ -809,8 +809,11 @@ def _census_matches(pid, start, cmdline, environ=None, cwd=None):
     callers; the census needs the None rung to tell probe-failure from proven
     reuse.)"""
     try:
-        if (_proc_start(pid) != start
-                or _proc_bytes(pid, "cmdline") != cmdline):
+        # Do not call _proc_start here: its legacy contract intentionally folds
+        # every OSError to None. The census must preserve EACCES/EIO as UNKNOWN
+        # and distinguish them from a gone pid or a proven generation change.
+        live_start = _starttime_from_stat(_proc_bytes(pid, "stat"))
+        if live_start != start or _proc_bytes(pid, "cmdline") != cmdline:
             return False
         if environ is not None and _proc_bytes(pid, "environ") != environ:
             return False
@@ -930,16 +933,21 @@ def _proc_claude_census():
             unknown_stubs.append(snap)
         elif status == "partial":
             census_partial = True
-    who_failed = False
+    who_failed, who_failed_pids = False, set()
     try:
         from . import who
-        who_rows = {r["pid"]: r for r in who.scan(accounts=[])
-                    if r.get("provider") == "anthropic" and not r.get("child")}
+        who_status = {}
+        scanned = who.scan(accounts=[], status=who_status)
+        who_rows = {r["pid"]: r for r in scanned
+                    if r.get("provider") == "anthropic"
+                    and r.get("child") is False}
+        who_failed = bool(who_status.get("listing_failed"))
+        who_failed_pids = set(who_status.get("failed_pids") or ())
     except Exception:
-        # broad on purpose (same pattern as fleet._roster): who.scan parses
-        # external JSON/state, so a malformed row can raise KeyError/TypeError
-        # just as plausibly as OSError/ValueError — every shape of failure must
-        # degrade to who_failed, never crash the whole census
+        # broad on purpose: who parses external proc/transcript state, so a
+        # malformed row can raise KeyError/TypeError just as plausibly as an
+        # OSError. Every shape of failure degrades to who_failed, never a
+        # successful negative attribution.
         who_rows, who_failed = {}, True
     cwd_candidates = {}
     rows = []
@@ -960,7 +968,18 @@ def _proc_claude_census():
                 snap["uid"], snap["start"])
         resume = _resume_sid(snap["argv"])
         child = env.get("CLAUDE_CODE_CHILD_SESSION") == "1"
-        attributed = None if child else _who_holder_sid(who_rows.get(pid, {}))
+        who_row = who_rows.get(pid, {})
+        who_sid = None if child else _who_holder_sid(who_row)
+        # PID equality alone is not identity: who must have resolved the SAME
+        # bracketed config root and cwd as this census row. Otherwise a process
+        # with alternate HOME can inherit the inspector's ~/.claude transcript.
+        who_context_mismatch = bool(
+            who_sid and (not root or not who_row.get("home")
+                         or os.path.realpath(who_row["home"])
+                         != os.path.realpath(root)
+                         or who_row.get("cwd") != snap["cwd"]))
+        attributed = None if who_context_mismatch else who_sid
+        who_probe_failed = pid in who_failed_pids
         possible = []
         if (not (child or declared or resume or attributed)
                 and root and snap["cwd"]):
@@ -1006,6 +1025,8 @@ def _proc_claude_census():
                          or _stdin_redirected(snap.get("stdin"))),
             "nonpersistent": _is_nonpersistent(snap.get("argv") or []),
             "probe_failed": False,
+            "who_probe_failed": who_probe_failed,
+            "who_context_mismatch": who_context_mismatch,
         })
     for stub in unknown_stubs:
         # comm proved claude, then a mandatory read failed while the pid
@@ -1026,7 +1047,8 @@ def _proc_claude_census():
             "environ": None, "identity": "unknown", "session": None,
             "possible_sessions": [], "child": False, "ancestor_sid8": "",
             "force": False, "headless": False, "nonpersistent": False,
-            "probe_failed": True,
+            "probe_failed": True, "who_probe_failed": False,
+            "who_context_mismatch": False,
         })
     rows.sort(key=lambda r: r["pid"])
     return {"rows": rows, "listing_failed": listing_failed,

@@ -26,6 +26,7 @@ session_shared marker. Subagents/helpers (an agent anywhere in the ancestor
 chain) are marked child — rotation targets the top-level session, not its
 children. Reads /proc and transcript FILENAMES only — never token contents.
 """
+import errno
 import glob
 import json
 import os
@@ -122,45 +123,72 @@ def _accounts():
         return []
 
 
-def scan(accounts=None):
-    """One row per live claude/codex process, cred-attributed. Accounts map
-    by realpath'd home (the provider's account rows carry the homes, default
-    stores included) — no match stays None, never guessed. Row attribution:
-    env (home named in environ) | default (environ READ, key absent) |
-    environ-unreadable (no evidence; home/account None, row stays visible).
-    starttime bracketing the per-pid reads discards pid-reuse races."""
+def scan(accounts=None, status=None):
+    """One row per live claude/codex process, cred-attributed.
+
+    ``status`` is an optional dict populated with ``listing_failed`` and
+    ``failed_pids``. That completeness channel is consumed by the session
+    census: a per-pid stat/comm/ancestry failure must never look like a
+    successful negative who attribution. The public row-only return stays
+    backward compatible for ``helm who`` and existing callers.
+    """
     if accounts is None:
         accounts = _accounts()
-    defaults = {"anthropic": os.path.expanduser("~/.claude"),
-                "codex": os.path.expanduser("~/.codex")}
+    if status is not None:
+        status.clear()
+        status.update({"listing_failed": False, "failed_pids": set()})
+
+    def failed(pid):
+        if status is not None:
+            status["failed_pids"].add(pid)
+
+    def gone(e):
+        return e.errno in (errno.ENOENT, errno.ESRCH)
+
     by_home = {}
     for a in accounts:
         if a.get("home"):
             by_home.setdefault(os.path.realpath(a["home"]),
                                a.get("name") or a.get("account"))
+    try:
+        names = os.listdir(PROC)
+    except OSError:
+        names = []
+        if status is not None:
+            status["listing_failed"] = True
     procs = []
-    for entry in glob.glob(os.path.join(PROC, "[0-9]*")):
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid, entry = int(name), os.path.join(PROC, name)
         try:
-            pid = int(os.path.basename(entry))
+            if os.stat(entry).st_uid != os.geteuid():
+                continue
             with open(os.path.join(entry, "comm")) as f:
                 comm = f.read().strip()
-        except (OSError, ValueError):
+        except OSError as e:
+            if not gone(e):
+                failed(pid)
             continue
         if comm == "claude":
-            provider, env_key = "anthropic", "CLAUDE_CONFIG_DIR"
+            provider, env_key, suffix = "anthropic", "CLAUDE_CONFIG_DIR", ".claude"
         elif comm == "codex":
-            provider, env_key = "codex", "CODEX_HOME"
+            provider, env_key, suffix = "codex", "CODEX_HOME", ".codex"
         else:
             continue
         start = starttime_of(pid)
         if start == float("inf"):
-            continue  # stat unreadable — identity can't be pinned across reads
+            failed(pid)
+            continue  # identity cannot be pinned across reads
         ppid = ppid_of(pid)
         env = read_environ(pid)
         if env is None:  # NO evidence — visible, never default-attributed
             home, attribution = None, "environ-unreadable"
         else:
-            home = env.get(env_key) or defaults[provider]
+            # Provider defaults belong to the PROCESS home, not the inspector's
+            # home. Using expanduser here cross-spliced alternate-HOME panes.
+            home = env.get(env_key) or os.path.join(
+                env.get("HOME") or os.path.expanduser("~"), suffix)
             attribution = "env" if env.get(env_key) else "default"
         try:
             cwd = os.readlink(os.path.join(entry, "cwd"))
@@ -172,28 +200,51 @@ def scan(accounts=None):
             session, cands = claude_sessions(home, cwd)
         else:
             session, cands = None, []
-        if starttime_of(pid) != start:
-            continue  # pid reused mid-scan — the reads above may mix processes
+        final = starttime_of(pid)
+        if final == float("inf"):
+            try:
+                os.stat(entry)
+            except OSError as e:
+                if not gone(e):
+                    failed(pid)
+            else:
+                failed(pid)
+            continue
+        if final != start:
+            continue  # proven pid reuse, not a failed probe
         procs.append({"pid": pid, "ppid": ppid, "child": False,
                       "provider": provider, "home": home,
                       "attribution": attribution,
                       "account": by_home.get(os.path.realpath(home))
                       if home else None,
-                      "cwd": cwd, "session": session,
+                      "cwd": cwd, "session": session, "_start": start,
                       "session_candidates": cands, "session_shared": False})
     pid_set = {p["pid"] for p in procs}
     for p in procs:
         # walk the FULL ancestor chain: an agent spawned through an
-        # intermediate shell/node is still a child (direct-ppid misses it)
+        # intermediate shell/node is still a child (direct-ppid misses it).
+        # An unreadable live ancestor makes this row's top-level status
+        # unprovable, so it enters failed_pids instead of defaulting to parent 0.
         a, hops = p["ppid"], 0
         while a > 1 and hops <= 25:
             if a in pid_set:
                 p["child"] = True
                 break
-            a, hops = ppid_of(a), hops + 1
+            parent = ppid_of(a)
+            if parent == 0:
+                try:
+                    os.stat(os.path.join(PROC, str(a)))
+                except OSError:
+                    pass
+                else:
+                    failed(p["pid"])
+                break
+            a, hops = parent, hops + 1
+        if hops > 25:
+            failed(p["pid"])
     # SESSION DEDUPE: two independent processes on one session would
-    # double-resume/split-brain an executor. The OLDEST process owns the
-    # session; the rest demote it to a candidate; both sides carry the marker.
+    # double-resume/split-brain an executor. The OLDEST bracketed process owns
+    # the session; never re-read starttime and race the attribution afterward.
     by_session = {}
     for i, p in enumerate(procs):
         if not p["child"] and p["session"]:
@@ -201,13 +252,15 @@ def scan(accounts=None):
     for (_, sid), idxs in by_session.items():
         if len(idxs) < 2:
             continue
-        owner = min(idxs, key=lambda i: starttime_of(procs[i]["pid"]))
+        owner = min(idxs, key=lambda i: procs[i]["_start"])
         for i in idxs:
             procs[i]["session_shared"] = True
             if i != owner:
                 procs[i]["session"] = None
                 if sid not in procs[i]["session_candidates"]:
                     procs[i]["session_candidates"].insert(0, sid)
+    for p in procs:
+        p.pop("_start", None)
     procs.sort(key=lambda p: (p["provider"], p["account"] or "", p["pid"]))
     return procs
 
