@@ -1355,6 +1355,130 @@ def _api_prune_post(payload):
     return out, (400 if "error" in out else 200)
 
 
+# ── multiplayer cave tab: the owner surface over the blind LocalRelay + TTL
+# LocalPresence (multiplayer.py, unchanged). The relay stays blind — the state
+# GET is a thin passthrough of opaque envelopes; the BROWSER folds the demo LWW
+# CRDT (web_ui.html materializeCave, mirroring helm.multiplayer_demo). Presence
+# is decoupled: a heartbeat POST makes the owner a live peer, no doc touched.
+# The adapter boundary is untouched, so a builders.dev bridge slots in with zero
+# changes to this file (register_adapter + HELM_MULTIPLAYER_BACKEND). ──
+MP_OWNER_CONNECTION = "cockpit"
+
+
+def _mp_actor():
+    """The owner seat for cave writes/heartbeats — the same identity the chat
+    post signs under (HELM_CELL_PROFILE else 'david'), never the agent default."""
+    return _chat_profile()
+
+
+def _mp_caves():
+    """Best-effort plaintext cave list. Cave dirs are hashed keys, but every
+    relay doc header carries its cave name in cleartext — read one per dir. A
+    presence-only cave (no doc yet) stays invisible; the demo always writes a
+    doc, so a live cave is always discoverable."""
+    from . import multiplayer
+    root = multiplayer.multiplayer_dir()
+    caves = set()
+    try:
+        cave_dirs = os.listdir(root)
+    except OSError:
+        return []
+    for cd in cave_dirs:
+        p = os.path.join(root, cd)
+        try:
+            names = os.listdir(p)
+        except OSError:
+            continue
+        for n in names:
+            if not n.endswith(".updates.jsonl"):
+                continue
+            try:
+                with open(os.path.join(p, n), "rb") as f:
+                    head = json.loads(f.readline().decode("utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(head, dict) and isinstance(head.get("cave"), str):
+                caves.add(head["cave"])
+                break  # one header names the cave; no need to read the rest
+    return sorted(caves)
+
+
+def _api_mp_state(qs):
+    """The cave tab's poll (open on loopback, like every GET): the blind relay's
+    opaque update log after ?after=CURSOR + the live TTL peers + the discoverable
+    caves. This endpoint NEVER decodes an update — it hands the browser the raw
+    envelopes and lets the client fold the CRDT, exactly as the contract says."""
+    try:
+        from . import multiplayer
+        relay, presence = multiplayer.adapters()
+    except Exception:
+        return {"unavailable": True}, 200
+    cave = _q1(qs, "cave", "main") or "main"
+    doc = _q1(qs, "doc", "board") or "board"
+    after = _q1(qs, "after", "0")
+    reset = False
+    try:
+        state = relay.updates(cave, doc, after)
+    except ValueError as e:
+        # a stale/mismatched cursor (the cave doc's generation rolled, or the
+        # tmpfs was wiped) — restart the client from the head so its accumulated
+        # log cannot silently desync. A bad cave/doc NAME is a real 400.
+        if "cursor" not in str(e):
+            return {"error": str(e)}, 400
+        try:
+            state = relay.updates(cave, doc, 0)
+            reset = True
+        except ValueError as e2:
+            return {"error": str(e2)}, 400
+    try:
+        peers = presence.peers(cave)
+    except ValueError:
+        peers = []
+    updates = [{"id": u.get("id"), "actor": u.get("actor"), "ts": u.get("ts"),
+                "bytes": len(str(u.get("update", "")).encode("utf-8")),
+                "update": u.get("update")} for u in state["updates"]]
+    return {"cave": cave, "doc": doc, "cursor": state["cursor"], "reset": reset,
+            "updates": updates, "peers": peers, "caves": _mp_caves()}, 200
+
+
+def _api_mp_publish(payload):
+    """The cave tab's one write: set a demo LWW cell as the owner. The reference
+    encoder (helm.multiplayer_demo) builds the opaque string HERE so the CLI and
+    web stay bit-identical, then hands the BLIND relay an undecoded update."""
+    from . import multiplayer, multiplayer_demo
+    cave = str(payload.get("cave") or "main")
+    doc = str(payload.get("doc") or "board")
+    key, value = payload.get("key"), payload.get("value")
+    if not isinstance(key, str) or not key.strip():
+        return {"error": "key is required"}, 400
+    if not isinstance(value, str):
+        return {"error": "value must be a string"}, 400
+    relay, presence = multiplayer.adapters()
+    actor = _mp_actor()
+    try:
+        update = multiplayer_demo.encode(key, value, actor)
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    ack = relay.publish(cave, doc, actor, update)
+    # writing keeps the owner present without waiting for the next poll tick
+    presence.heartbeat(cave, actor, "editing", multiplayer.DEFAULT_TTL,
+                       MP_OWNER_CONNECTION)
+    return {"ok": True, "ack": ack}, 200
+
+
+def _api_mp_presence(payload):
+    """The cave tab's owner heartbeat (mutation → bearer). Opening the tab makes
+    the OWNER a live peer; the poll refreshes it so he fades out ~TTL after he
+    closes it. Presence is decoupled from the doc — this never touches the log."""
+    from . import multiplayer
+    cave = str(payload.get("cave") or "main")
+    state = str(payload.get("state") or "watching")
+    _relay, presence = multiplayer.adapters()
+    row = presence.heartbeat(cave, _mp_actor(), state, multiplayer.DEFAULT_TTL,
+                             MP_OWNER_CONNECTION)
+    return {"ok": True, "peer": row}, 200
+
+
 API = {
     "/api/registry": _api_registry,
     "/api/store": _api_store,
@@ -1390,6 +1514,7 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/ledger": _api_ledger,
     "/api/ledger/turn": _api_ledger_turn,
     "/api/ledger/native": _api_ledger_native,
+    "/api/multiplayer/state": _api_mp_state,
 }
 
 POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
@@ -1408,6 +1533,8 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
     "/api/chat/read": _api_chat_read_post,
     "/api/chat/seat": _api_chat_seat,
     "/api/chat/dm": _api_chat_dm,
+    "/api/multiplayer/publish": _api_mp_publish,
+    "/api/multiplayer/presence": _api_mp_presence,
 }
 
 
