@@ -526,6 +526,30 @@ class WaitTest(SeatsBase):
         self.assertIsNone(line)
         self.assertEqual(captured, [])
 
+    def test_wait_follow_bounds_a_backlog_burst_so_the_beacon_cannot_firehose(self):
+        """A --follow beacon arming to a large backlog must NOT replay it as one
+        burst: each emit is a Monitor event, and >~10 in a burst trips Monitor's
+        firehose auto-stop -> SIGTERM, and the seat goes DEAF (live 2026-07-23: a
+        ~36-row backlog killed the beacon <8s every arm). ONE drain pass is
+        capped at BEACON_DRAIN_CAP emits + a single catch-up nudge, never the
+        whole backlog. Pre-fix this pass emitted all 40 (the firehose)."""
+        class _PassDone(Exception):
+            pass
+        seats.join(seat="alice", cwd="/tmp/p")     # baselines the cursor at join
+        for i in range(40):
+            chat.post("@alice backlog %d" % i, who="bob")
+        captured = []
+        # Run EXACTLY ONE drain pass: the post-drain sleep raises out of wait(),
+        # so `captured` holds precisely what a single arming burst would emit.
+        with mock.patch("time.sleep", side_effect=_PassDone):
+            with self.assertRaises(_PassDone):
+                seats.wait(seat="alice", follow=True, poll=0.01,
+                           emit=captured.append)
+        self.assertLessEqual(len(captured), seats.BEACON_DRAIN_CAP + 1)
+        self.assertLess(len(captured), 40)         # NOT the whole backlog
+        # still WAKES the agent and points it at the backlog to catch up
+        self.assertTrue(any("more pending" in c for c in captured))
+
     def test_wait_any_sees_only_rows_after_arming(self):
         import threading
         chat.post("pre-existing", who="bob")
