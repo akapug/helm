@@ -170,22 +170,44 @@ def _is_dispatcher(fn, module_strcolls):
     return False
 
 
+def _mod_tree(mod):
+    """AST of a top-level helm module. A decomposed package (helm/<mod>/) is
+    viewed as the monolith it replaced: one Module whose body concatenates
+    every submodule's body, so structural detectors see the same functions
+    and module-level string collections they saw in the single file."""
+    p = HELM_DIR / (mod + ".py")
+    if p.exists():
+        return ast.parse(p.read_text())
+    body = []
+    for f in sorted((HELM_DIR / mod).glob("*.py")):
+        body.extend(ast.parse(f.read_text()).body)
+    return ast.Module(body=body, type_ignores=[])
+
+
+def _iter_mod_trees():
+    """(modname, tree) for every top-level module or package under helm/."""
+    for p in sorted(HELM_DIR.glob("*.py")):
+        yield p.stem, ast.parse(p.read_text())
+    for d in sorted(HELM_DIR.iterdir()):
+        if d.is_dir() and (d / "__init__.py").exists():
+            yield d.name, _mod_tree(d.name)
+
+
 def discover():
     """Every subverb dispatcher under helm/, straight from the source."""
     out = []
-    for p in sorted(HELM_DIR.glob("*.py")):
-        tree = ast.parse(p.read_text())
+    for stem, tree in _iter_mod_trees():
         mod_strcolls = _collect_strcolls(tree.body, set())
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) \
                     and (node.name == "cmd" or node.name.startswith("cmd_")) \
                     and _is_dispatcher(node, mod_strcolls):
-                out.append((p.stem, node.name))
+                out.append((stem, node.name))
     return out
 
 
 def _fn_node(mod, fn):
-    tree = ast.parse((HELM_DIR / (mod + ".py")).read_text())
+    tree = _mod_tree(mod)
     return next(n for n in tree.body
                 if isinstance(n, ast.FunctionDef) and n.name == fn)
 
@@ -626,8 +648,7 @@ class ApplyReadersAreGuarded(unittest.TestCase):
 
     def _readers(self):
         found = set()
-        for path in sorted(HELM_DIR.glob("*.py")):
-            tree = ast.parse(path.read_text())
+        for stem, tree in _iter_mod_trees():
             for node in tree.body:
                 if not (isinstance(node, ast.FunctionDef)
                         and node.name.startswith("cmd")):
@@ -637,7 +658,7 @@ class ApplyReadersAreGuarded(unittest.TestCase):
                           and isinstance(n.value, str)}
                 if "--apply" in consts \
                         and "guard_tail" not in ast.unparse(node):
-                    found.add((path.stem, node.name))
+                    found.add((stem, node.name))
         return found
 
     def test_every_apply_reader_is_guarded_or_declared(self):
