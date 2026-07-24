@@ -170,23 +170,38 @@ def _is_dispatcher(fn, module_strcolls):
     return False
 
 
+def _sources():
+    """(module, tree) for every source file under helm/: flat modules by
+    stem, and each cluster file of a decomposed package under the PACKAGE
+    name — helm/cred/cli.py is still module `cred` to the CLI (the package
+    __init__ re-exports its handlers), so the audits must see through the
+    package boundary or a dispatcher could be born invisible by moving."""
+    out = []
+    for p in sorted(HELM_DIR.glob("*.py")):
+        out.append((p.stem, ast.parse(p.read_text())))
+    for d in sorted(p for p in HELM_DIR.iterdir() if p.is_dir()):
+        if (d / "__init__.py").exists():
+            for p in sorted(d.glob("*.py")):
+                out.append((d.name, ast.parse(p.read_text())))
+    return out
+
+
 def discover():
     """Every subverb dispatcher under helm/, straight from the source."""
     out = []
-    for p in sorted(HELM_DIR.glob("*.py")):
-        tree = ast.parse(p.read_text())
+    for mod, tree in _sources():
         mod_strcolls = _collect_strcolls(tree.body, set())
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) \
                     and (node.name == "cmd" or node.name.startswith("cmd_")) \
                     and _is_dispatcher(node, mod_strcolls):
-                out.append((p.stem, node.name))
+                out.append((mod, node.name))
     return out
 
 
 def _fn_node(mod, fn):
-    tree = ast.parse((HELM_DIR / (mod + ".py")).read_text())
-    return next(n for n in tree.body
+    return next(n for m, tree in _sources() if m == mod
+                for n in tree.body
                 if isinstance(n, ast.FunctionDef) and n.name == fn)
 
 
@@ -626,8 +641,7 @@ class ApplyReadersAreGuarded(unittest.TestCase):
 
     def _readers(self):
         found = set()
-        for path in sorted(HELM_DIR.glob("*.py")):
-            tree = ast.parse(path.read_text())
+        for mod, tree in _sources():
             for node in tree.body:
                 if not (isinstance(node, ast.FunctionDef)
                         and node.name.startswith("cmd")):
@@ -637,7 +651,7 @@ class ApplyReadersAreGuarded(unittest.TestCase):
                           and isinstance(n.value, str)}
                 if "--apply" in consts \
                         and "guard_tail" not in ast.unparse(node):
-                    found.add((path.stem, node.name))
+                    found.add((mod, node.name))
         return found
 
     def test_every_apply_reader_is_guarded_or_declared(self):
