@@ -643,6 +643,23 @@ class SeatActorBindingTest(ChatBase):
     def _rows(self, room="main"):
         return chat.read(room)[0]
 
+    @contextlib.contextmanager
+    def _signer_configured(self):
+        """Genuinely turn the signed transport ON so _sign_send is REACHABLE on
+        a success path. ChatBase runs transport-off, where _sign_send is never
+        called on ANY path — which alone makes a mismatch's assert_not_called
+        VACUOUS (it passes whether or not the refusal fired). Under this, the
+        equal/omitted path DOES call _sign_send, so a mismatch's no-call is a
+        real, discriminating control (codex-3 xrev note 2026-07-23)."""
+        from helm import cell as cellmod
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        ready = {"configured": True, "usable": True, "state": "ready",
+                 "reason": None}
+        with mock.patch.object(cellmod, "bin_status", return_value=ready), \
+                mock.patch.object(chat, "node_head",
+                                  return_value={"chain_index": 1}):
+            yield
+
     # ---- POST ------------------------------------------------------------
     def test_post_seat_mismatch_refuses_before_any_row(self):
         rc, _out, err = self.run_cmd(["post", "hi", "--seat", "seat-b"])
@@ -699,6 +716,9 @@ class SeatActorBindingTest(ChatBase):
         self.assertEqual(code, 2)
         self.assertIn("cannot act as another seat", err.getvalue())
         self.ss.assert_not_called()                 # no DM signed as seat-b
+        # DIRECT spool control (codex-3 xrev): the recipient's private lane
+        # never grew — the refused DM produced no row anywhere, not just no sig
+        self.assertEqual(chat.read(chat.dm_room("codex"))[1], 0)
 
     def test_dm_verb_ambient_delivers_as_the_actor(self):
         rc, _o, _e = self.run_cmd(["dm", "codex", "hello"])
@@ -720,6 +740,47 @@ class SeatActorBindingTest(ChatBase):
         self.assertIn("cannot act as another seat", err.getvalue())
         self.ss.assert_not_called()                 # no forged signed ACK
         self.assertFalse(any(r.get("ack") == rid for r in self._rows()))
+
+    # ---- NON-VACUOUS controls: prove the no-signer assertions discriminate --
+    # codex-3 xrev note 2026-07-23: the mismatch tests above run transport-off,
+    # where _sign_send is never called on ANY path, so their assert_not_called
+    # alone is vacuous. These run with the signer GENUINELY configured, so the
+    # signer IS reached on success and the refusal's no-call is a real control.
+    def test_post_mismatch_reaches_no_signer_with_transport_on(self):
+        with self._signer_configured():
+            # positive control: the equal-actor path DOES reach _sign_send
+            rc, _o, _e = self.run_cmd(["post", "one", "--seat", "seat-a"])
+            self.assertEqual(rc, 0)
+            self.assertGreaterEqual(self.ss.call_count, 1)   # signer WAS reached
+            self.ss.reset_mock()
+            # the refusal: a mismatch reaches the (now-live) signer ZERO times
+            rc, _o, err = self.run_cmd(["post", "two", "--seat", "seat-b"])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot act as another seat", err)
+        self.ss.assert_not_called()                          # NOW discriminating
+        self.assertFalse(any(r["text"] == "two" for r in self._rows()))
+
+    def test_dm_and_ack_mismatch_reach_no_signer_with_transport_on(self):
+        # dm + ack are THE confirmed forgeries — prove the refusal stops the
+        # signer even when signing is genuinely reachable (non-vacuous).
+        with self._signer_configured():
+            self.ss.reset_mock()
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                dm_rc = chat.cmd_chat(["dm", "codex", "x", "--seat", "seat-b"])
+            self.assertEqual(dm_rc, 2)
+            self.ss.assert_not_called()                      # no DM signed
+            self.assertEqual(chat.read(chat.dm_room("codex"))[1], 0)  # no spool
+            # a real ackable row (seat-a's own post signs; reset before the ack)
+            self.run_cmd(["post", "@seat-c please ack"])
+            rid = self._rows()[-1]["id"]
+            self.ss.reset_mock()
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                ack_rc = chat.cmd_chat(["ack", rid, "done", "--seat", "seat-c"])
+            self.assertEqual(ack_rc, 2)
+            self.ss.assert_not_called()                      # no forged signed ACK
+            self.assertFalse(any(r.get("ack") == rid for r in self._rows()))
 
 
 if __name__ == "__main__":
