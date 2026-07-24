@@ -3287,6 +3287,9 @@ def cmd_seat(args):
     if verb == "silent-drop":
         from . import silent_drop
         return silent_drop.cmd_silent_drop(rest)
+    if verb == "idle-dispatch":
+        from . import idle_dispatch
+        return idle_dispatch.cmd_idle_dispatch(rest)
     if verb == "spawn":
         if not rest:
             print("usage: helm seat spawn <seat> [--room R] [--cwd DIR] "

@@ -1,0 +1,13 @@
+# Periodic trigger for helm-idle-dispatch.service. Persistent=true back-fills a
+# run missed while the machine slept, so a dispatch that stranded overnight
+# still surfaces on the next boot.
+[Unit]
+Description=periodic helm idle-dispatch watchdog (surfaces dispatches stranded on idle seats)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
