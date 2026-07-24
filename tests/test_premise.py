@@ -359,7 +359,7 @@ class AnnotationDurabilityTest(PremiseBase):
 
     def test_capture_annotation_failure_queues_reconciliation(self):
         # force _annotate to refuse (as a shape surprise would)
-        with mock.patch.object(premise, "_annotate", return_value=False):
+        with mock.patch.object(premise._capture, "_annotate", return_value=False):
             rc, out, _ = self.run_verb(premise.cmd_premise, ["law-x | The X truth"])
         self.assertEqual(rc, 0)
         self.assertIn("WARNING: file shape refused", out)
@@ -389,7 +389,7 @@ class AnnotationDurabilityTest(PremiseBase):
             return TURN, None
 
         with mock.patch.object(cell, "anchor_submit", anchor_once), \
-                mock.patch.object(premise, "_annotate", return_value=False):
+                mock.patch.object(premise._capture, "_annotate", return_value=False):
             rc, out, _ = self.run_verb(premise.cmd_premise, ["--retry-queue"])
         self.assertEqual(rc, 1)   # still pending (annotation deferred)
         row = [r for r in _queue(premise) if r.get("id") == "law-x"][0]
