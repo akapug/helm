@@ -458,6 +458,12 @@ class ReplyRenderTest(ReplyBase):
 # ---------------------------------------------------------------------------
 
 class ReplyCliTest(ReplyBase):
+    def setUp(self):
+        super().setUp()
+        # `--seat bob` below ASSERTS this ambient identity (post-actor-binding
+        # contract); these tests exercise reply/threading, not signing.
+        os.environ["HELM_CHAT_NAME"] = "bob"
+
     def test_reply_verb_threads_and_echoes_the_quote(self):
         chat.post("the parent", who="alice")
         rc, out, _ = self.cli("reply", "1", "answering", "--seat", "bob")

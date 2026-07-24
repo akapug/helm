@@ -1203,6 +1203,11 @@ class DMTest(SeatsBase):
                       seats.deliver_any(session="s-rn", seat="newname"))
 
     def test_dm_cli_verbs(self):
+        # Act as ada: `--seat ada` on the dm / post --dm SIGNING verbs ASSERTS
+        # this ambient identity (post-actor-binding contract); `--seat vic` on
+        # the READ below stays a free lane selector. SeatsBase.setUp pops
+        # HELM_CHAT_NAME, so this does not leak to sibling tests.
+        os.environ["HELM_CHAT_NAME"] = "ada"
         seats.join(session="s-v", seat="vic", cwd="/tmp/p")
         # helm chat dm <seat> <text...> [--seat S]
         rc, out, _err = self.cmd("dm", ["vic", "hello", "there", "--seat", "ada"])

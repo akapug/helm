@@ -3085,7 +3085,11 @@ def ack(target_id, state="done", note=None, who=None, session=None):
             and (prev.get("text") or "") == (note or ""):
         return {"target": m, "room": room, "state": state, "row": prev,
                 "dup": True}, None
-    row = chat.post(note or "", room=room, who=seat, profile=seat,
+    # who=seat (the AMBIENT acker, resolved by _seat_actor at the verb) is the
+    # row identity; the signer is the ambient HELM_CELL_PROFILE (profile=None
+    # -> cell.profile_name) — never the --seat claim, so a seat cannot forge a
+    # signed ACK clearing another seat's obligation (codex-3 xrev 2026-07-23).
+    row = chat.post(note or "", room=room, who=seat,
                     ack=tid, ackstate=state)
     return {"target": m, "room": room, "state": state, "row": row,
             "dup": False}, None
@@ -3225,7 +3229,10 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             pass                    # fail-open: never hold a tool boundary
         return 0
     if verb == "dm":
-        sender = chat._seat_flag(args)
+        sender, _serr = chat._seat_actor(args)
+        if _serr:
+            print("helm chat: " + _serr, file=sys.stderr)
+            return 2
         to = args[0] if args else None
         text = " ".join(args[1:]).strip()
         if to and not text and not sys.stdin.isatty():
@@ -3234,15 +3241,17 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             print("usage: helm chat dm <seat> <text...> [--seat S]  "
                   "(one private recipient — never a room)", file=sys.stderr)
             return 2
-        row, err = dm(to, text, who=sender, session=_env_session(),
-                      profile=sender)
+        row, err = dm(to, text, who=sender, session=_env_session())
         if err:
             print("helm chat: " + err, file=sys.stderr)
             return 1
         print("helm chat [dm] %s" % chat._fmt(row))
         return 0
     if verb == "ack":
-        seat = chat._seat_flag(args) or derive_seat(_env_session())
+        seat, _serr = chat._seat_actor(args)
+        if _serr:
+            print("helm chat: " + _serr, file=sys.stderr)
+            return 2
         note = None
         if "--note" in args:
             i = args.index("--note")

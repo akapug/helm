@@ -1923,16 +1923,44 @@ def _pop_flag(args, name):
 
 
 def _seat_flag(args):
-    """Pop `--seat S` out of a verb's argv: the caller's DECLARED identity,
-    threaded into who= AND profile= so the row records the true reactor and
-    the signer attests it (same identity plumbing as a post). None when
-    absent — the ambient whoname() fallback stays for un-seated calls."""
+    """Pop `--seat S` out of a verb's argv: the caller's DECLARED display
+    name. None when absent. NOTE: --seat NEVER selects the signer — use
+    _seat_actor for any verb that posts/signs/acks (codex-3 xrev 2026-07-23);
+    this raw popper stays for the non-signing verbs (mute, status, wait…)."""
     if "--seat" not in args:
         return None
     i = args.index("--seat")
     v = args[i + 1] if i + 1 < len(args) else None
     del args[i:i + 2]
     return v
+
+
+def _seat_actor(args):
+    """Resolve the acting seat for a SIGNING verb (post/reply/react/dm/ack) +
+    enforce --seat as an ASSERTION, never a signer selector. The row identity
+    AND the signer are the AMBIENT session identity (whoname() —
+    HELM_CHAT_NAME / the session-bound seat); the signer profile is the
+    ambient HELM_CELL_PROFILE (cell.profile_name). --seat may only ASSERT it:
+      omitted            -> the ambient actor
+      == ambient (casefold) -> the ambient actor (assertion satisfied)
+      != ambient         -> (None, err): REFUSE the whole verb BEFORE any row
+                            append / ACK transition / signer call — a seat may
+                            not act or sign AS ANOTHER (was: --seat drove
+                            who= AND profile=, so `--seat kimi` signed as kimi;
+                            confirmed forgeable, codex-3 9/10).
+    FOOTGUN SCOPE, honestly: a same-user process can still forge identity by
+    setting HELM_CHAT_NAME/HELM_CELL_PROFILE itself — this prevents ACCIDENTAL
+    --seat drift + the wrong-signer class, NOT a malicious local peer (that
+    needs the owner-key trust domain, held for David; see
+    ~/.helm/helm/prd/OWNER-SIGN-TRUST-MODEL.md). Returns (actor, None) or
+    (None, err)."""
+    claimed = _seat_flag(args)          # pops --seat (None if absent)
+    ambient = whoname()
+    if claimed and str(claimed).strip().casefold() != str(ambient).casefold():
+        return None, ("--seat %r cannot act as another seat: this session is "
+                      "%r — set HELM_CHAT_NAME to your own name to act as it"
+                      % (claimed, ambient))
+    return ambient, None
 
 
 def cmd_chat(args):
@@ -2025,7 +2053,10 @@ def cmd_chat(args):
             verb, args[1:], room, room_explicit=room_given,
             room_source=room_source)
     if verb in ("post", "reply"):
-        seat = _seat_flag(args)
+        seat, _serr = _seat_actor(args)
+        if _serr:
+            print("helm chat: " + _serr, file=sys.stderr)
+            return 2
         if "--reply-to" in args:
             i = args.index("--reply-to")
             if i + 1 >= len(args) or not args[i + 1] \
@@ -2105,7 +2136,7 @@ def cmd_chat(args):
         if to:
             from . import seats
             row, err = seats.dm(to, text, who=seat, reply_to=ref,
-                                session=home.session_id(), profile=seat)
+                                session=home.session_id())
             if err:
                 print("helm chat: " + err, file=sys.stderr)
                 return 1
@@ -2113,7 +2144,7 @@ def cmd_chat(args):
                   % _fmt(row, idx=index_rows(read(dm_room(row.get("dm")
                                                           or to))[0])))
             return 0
-        row = post(text, room, who=seat, profile=seat, reply_to=ref)
+        row = post(text, room, who=seat, reply_to=ref)
         # the echo carries the quote (and the parent's new count): the poster
         # SEES which row it landed under — an unresolvable ref is visible as an
         # orphan right here, not three surfaces later
@@ -2146,7 +2177,10 @@ def cmd_chat(args):
         consume(room, total)
         return 0
     if verb == "react":
-        seat = _seat_flag(args)
+        seat, _serr = _seat_actor(args)
+        if _serr:
+            print("helm chat: " + _serr, file=sys.stderr)
+            return 2
         if len(args) < 3:
             print("usage: helm chat react <n> <:shortcode:|emoji> [--room R] "
                   "[--seat S] (n counts messages, 1-based; -1 = latest; "
@@ -2157,7 +2191,7 @@ def cmd_chat(args):
         except ValueError:
             print("helm chat: react wants a message number", file=sys.stderr)
             return 2
-        row, err = react(n, args[2], room, who=seat, profile=seat)
+        row, err = react(n, args[2], room, who=seat)
         if err:
             print("helm chat: " + err, file=sys.stderr)
             return 1

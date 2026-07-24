@@ -377,6 +377,14 @@ class PendingViewTests(LadderBase):
 
 
 class CliTests(LadderBase):
+    def setUp(self):
+        super().setUp()
+        # The acking session IS recipT (the DM recipient): `--seat recipT` on
+        # the ack SIGNING verb ASSERTS this ambient identity (post-actor-
+        # binding). `pending --seat senderS` below is a READ — its --seat stays
+        # a free lane selector, independent of the ambient acker.
+        os.environ["HELM_CHAT_NAME"] = "recipT"
+
     def test_cli_ack_and_pending_roundtrip(self):
         self.join("recipT")
         row, _ = seats.dm("recipT", "cli path", who="senderS")
@@ -412,9 +420,14 @@ class CliTests(LadderBase):
         self.assertEqual((st, ackstate), ("acted", "blocked"))
 
     def test_cli_ack_foreign_refused_nonzero(self):
+        # A non-recipient cannot ack another seat's obligation. Under post-
+        # actor-binding the acker is the AMBIENT identity, so we BECOME stranger
+        # (not `--seat stranger`, which is refused earlier as a cross-seat claim
+        # — that layer is covered by test_chat.py::SeatActorBindingTest). The
+        # recipient check then refuses: the row is addressed to recipT.
+        os.environ["HELM_CHAT_NAME"] = "stranger"
         row, _ = seats.dm("recipT", "not yours", who="senderS")
-        rc, out, err = self.run_cmd(
-            "ack", [row["id"], "done", "--seat", "stranger"])
+        rc, out, err = self.run_cmd("ack", [row["id"], "done"])
         self.assertEqual(rc, 1)
         self.assertIn("not you", err)
 
@@ -455,9 +468,15 @@ class HostileNameSinkTests(LadderBase):
         self.assertIn(row["id"][:8], out)
 
     def test_ack_refusal_launders_planted_recipient(self):
+        # The refusal message scrubs a planted control/bidi recipient name.
+        # Under post-actor-binding the acker is the AMBIENT identity, so we
+        # BECOME a non-recipient ("stranger") and ack the hostile row without
+        # --seat — the recipient-check refusal (rc 1) fires and its error stays
+        # scrubbed (a cross-seat `--seat` claim is refused earlier; see
+        # test_chat.py::SeatActorBindingTest).
+        os.environ["HELM_CHAT_NAME"] = "stranger"
         row, _name = self._hostile_dm()
-        rc, out, err = self.run_cmd(
-            "ack", [row["id"], "done", "--seat", "stranger"])
+        rc, out, err = self.run_cmd("ack", [row["id"], "done"])
         self.assertEqual(rc, 1)
         self.assertNotIn(self.ESC, err)
         self.assertNotIn(self.BIDI, err)

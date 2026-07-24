@@ -309,6 +309,14 @@ class PostUnknownFlagTest(ChatBase):
     and the tests sat after the __main__ guard where direct unittest
     execution never discovered them (this class now precedes it)."""
 
+    def setUp(self):
+        super().setUp()
+        # Ambient actor for this class: the `--seat tester` calls below ASSERT
+        # this session identity (the post-actor-binding contract) — they do not
+        # SELECT another seat. Identity is incidental here: the class tests
+        # leading-flag PARSING, not who signs.
+        os.environ["HELM_CHAT_NAME"] = "tester"
+
     def _post(self, *args):
         import contextlib
         err, out = io.StringIO(), io.StringIO()
@@ -450,6 +458,13 @@ class HelpBeforeWorkTest(ChatBase):
     (`claim --help` leased a resource named "--help"). The seats/node/meld
     legs are patched to raise, so a regression fails FAST instead of hanging
     the suite."""
+
+    def setUp(self):
+        super().setUp()
+        # `--seat t` in the body tests below ASSERTS this ambient identity
+        # (post-actor-binding contract); the class tests the help gate, not
+        # signing, so the actor is incidental.
+        os.environ["HELM_CHAT_NAME"] = "t"
 
     def _no_dispatch(self, args):
         """cmd_chat(args) with every downstream leg booby-trapped: reaching
@@ -604,6 +619,107 @@ class HelpBeforeWorkTest(ChatBase):
         rc, out, _ = self._no_dispatch(["roster", "--help"])
         self.assertEqual(rc, 0)
         self.assertIn("usage: helm chat seats", out)
+
+
+class SeatActorBindingTest(ChatBase):
+    """codex-3 xrev 2026-07-23 outcome controls: --seat is an ASSERTION, not
+    a signer selector. An actor (ambient HELM_CHAT_NAME) that ASSERTS a
+    DIFFERENT --seat produces NO effect at all — no row, no DM spool change,
+    no ACK transition, no signer call — refused BEFORE any of them. Actor
+    with omitted/equal --seat succeeds, and the signer sees the AMBIENT actor,
+    never the claim. Real dm/ack verbs, not `post --dm`.
+    (Bug it closes: `helm chat dm X --seat kimi` used to sign the DM AS kimi;
+    `helm chat ack --seat kimi` used to forge kimi's signed ACK.)"""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["HELM_CHAT_NAME"] = "seat-a"     # the ambient actor
+        self._ss = mock.patch.object(chat, "_sign_send",
+                                     return_value=(None, chat._diag(
+                                         "send_failed", "off")))
+        self.ss = self._ss.start()
+        self.addCleanup(self._ss.stop)
+
+    def _rows(self, room="main"):
+        return chat.read(room)[0]
+
+    # ---- POST ------------------------------------------------------------
+    def test_post_seat_mismatch_refuses_before_any_row(self):
+        rc, _out, err = self.run_cmd(["post", "hi", "--seat", "seat-b"])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot act as another seat", err)
+        self.assertEqual(self._rows(), [])          # NO row appended
+        self.ss.assert_not_called()                 # NO signer call
+
+    def test_post_ambient_signs_as_the_actor_not_the_claim(self):
+        # This lane's exact contract: the CLI threads NO claimed profile into
+        # the signing owner. post() passes profile=None -> _signed_row falls
+        # back to the AMBIENT cell profile (cell.profile_name()), never the
+        # --seat claim. Re-adding profile=seat (the bug this closes) makes the
+        # profile arg non-None on the equal path and fails here. Mismatch never
+        # reaches _signed_row at all — the refusal tests prove that.
+        with mock.patch.object(chat, "_signed_row",
+                               wraps=chat._signed_row) as sr:
+            rc, _o, _e = self.run_cmd(["post", "hi", "--seat", "seat-a"])  # equal
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._rows()[-1]["from"], "seat-a")   # ambient identity
+        self.assertIsNone(sr.call_args.args[2])                # profile: no claim
+
+    def test_post_no_seat_uses_ambient(self):
+        rc, _o, _e = self.run_cmd(["post", "hi"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._rows()[-1]["from"], "seat-a")
+
+    # ---- REPLY (post --reply-to) ----------------------------------------
+    def test_reply_seat_mismatch_refuses(self):
+        self.run_cmd(["post", "parent"])
+        before = len(self._rows())
+        rc, _o, err = self.run_cmd(
+            ["post", "child", "--reply-to", "1", "--seat", "seat-b"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(len(self._rows()), before)   # no child row
+        self.assertIn("cannot act as another seat", err)
+
+    # ---- REACT -----------------------------------------------------------
+    def test_react_seat_mismatch_refuses_the_toggle(self):
+        self.run_cmd(["post", "target"])
+        self.ss.reset_mock()
+        rc, _o, err = self.run_cmd(["react", "1", ":fire:", "--seat", "seat-b"])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot act as another seat", err)
+        self.ss.assert_not_called()
+        # no reaction landed on the row
+        self.assertFalse(any(r.get("react") for r in self._rows()))
+
+    # ---- DM verb (the confirmed forgery) --------------------------------
+    def test_dm_verb_seat_mismatch_signs_nothing_as_another(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = chat.cmd_chat(["dm", "codex", "secret", "--seat", "seat-b"])
+        self.assertEqual(code, 2)
+        self.assertIn("cannot act as another seat", err.getvalue())
+        self.ss.assert_not_called()                 # no DM signed as seat-b
+
+    def test_dm_verb_ambient_delivers_as_the_actor(self):
+        rc, _o, _e = self.run_cmd(["dm", "codex", "hello"])
+        self.assertEqual(rc, 0)
+        lane = chat.read(chat.dm_room("codex"))[0]
+        self.assertTrue(lane and lane[-1]["from"] == "seat-a")
+
+    # ---- ACK verb (the forgeable obligation clear) ----------------------
+    def test_ack_verb_seat_mismatch_never_transitions(self):
+        from helm import seats
+        # seat-a posts a row addressed to seat-c so there IS an ackable row
+        self.run_cmd(["post", "@seat-c please ack"])
+        rid = self._rows()[-1]["id"]
+        self.ss.reset_mock()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = chat.cmd_chat(["ack", rid, "done", "--seat", "seat-c"])
+        self.assertEqual(code, 2)
+        self.assertIn("cannot act as another seat", err.getvalue())
+        self.ss.assert_not_called()                 # no forged signed ACK
+        self.assertFalse(any(r.get("ack") == rid for r in self._rows()))
 
 
 if __name__ == "__main__":
