@@ -17,7 +17,7 @@ def _anchor_line(meta):
     only show that a turn with the stored hash EXISTS ('turn OBSERVED') — it does
     NOT prove that turn commits this record's hash (attest_anchor_turn is mutable
     frontmatter, swappable for any real turn). So this is never 'CONFIRMED'/
-    independent re-verification until dregg exposes payload disclosure (A1)."""
+    independent re-verification until dregg exposes payload disclosure."""
     aturn = meta.get("attest_anchor_turn")
     if not aturn:
         return "  external anchor: none (native-only)"

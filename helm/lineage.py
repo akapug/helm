@@ -8,7 +8,7 @@ are NEVER cleanup candidates.
 
 This slice derives and renders; it moves nothing. archive_report() is a ranked
 "safe to archive and why" REPORT — the executable archive-move is a later slice
-behind a dry-run+confirm gate (lineage-map-decisions Q3).
+behind a dry-run+confirm gate.
 
 Seed law: lineage_seed.json carries an illustrative founding ancestry (the
 shipped default names no real estate — operators seed their own) and applies

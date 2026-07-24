@@ -1180,7 +1180,7 @@ def _room_lock(room):
     whole append+rotation window — every room writer (CLI, web POST, TUI,
     hooks, log-independent) serializes here. Never the jsonl inode itself:
     rotation replaces that inode, which would let a fresh opener bypass a
-    lock held on the old one (codex C4). Fail-open: a lock that cannot be
+    lock held on the old one. Fail-open: a lock that cannot be
     taken degrades to the unlocked v1 behavior rather than dropping the
     message — the fallback law is drop the GUARANTEE, never the row."""
     import fcntl                  # POSIX advisory lock (Linux fleet)

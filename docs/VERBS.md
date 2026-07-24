@@ -1911,10 +1911,10 @@ keyed room × ACTOR). v1 is 2-party (the pinned pair); 3+ minds use a plain room
 `HELM_MELD_CAP`, `HELM_MELD_RECV_TIMEOUT_S`.
 
 ```console
-$ helm chat meld invite kimi-b "converge the reflex naming"   # → room + next
-$ helm chat meld recv meld-1784663842-converge-the-reflex-nami           # READY → GO
-$ helm chat meld say  meld-1784663842-converge-the-reflex-nami --marker YIELD "propose: …"
-$ helm chat meld say  meld-1784663842-converge-the-reflex-nami --marker DONE "state: converged; next: I land it"
+$ helm chat meld invite kimi-b "converge retry naming"   # → room + next
+$ helm chat meld recv meld-1700000000-converge-retry-naming           # READY → GO
+$ helm chat meld say  meld-1700000000-converge-retry-naming --marker YIELD "propose: …"
+$ helm chat meld say  meld-1700000000-converge-retry-naming --marker DONE "state: converged; next: I land it"
 ```
 
 ### `helm multiplayer publish|read|presence|peers|leave`

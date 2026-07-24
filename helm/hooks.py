@@ -87,7 +87,7 @@ SPECS = (
 DELIVERY_SPECS = tuple(s for s in SPECS
                        if s["name"] in ("deliver", "join", "stop-guard"))
 
-# The beacon's permission grease (owner hit it live): the SessionStart join
+# The beacon's permission grease (seen live): the SessionStart join
 # line DIRECTS `Monitor(command: "helm chat wait … --follow")` as the
 # mandatory first action, but a fresh home/seat has no allow rule for that
 # command — so the very first act of every new session HANGS on a human
@@ -201,7 +201,7 @@ def _hook_cmds(settings, event=HOOK_EVENT):
 def _matcher_ok(group, spec):
     """A spec with a matcher demands EXACTLY that matcher on its group — a
     stale `PostToolUse` group pinned to `Bash` silently misses most tool
-    boundaries (codex B3). Specs without one (UserPromptSubmit) don't care."""
+    boundaries. Specs without one (UserPromptSubmit) don't care."""
     return spec["matcher"] is None or group.get("matcher") == spec["matcher"]
 
 
@@ -215,7 +215,7 @@ def _canonical_entry(spec):
 def _merge_event(out, spec):
     """Merge ONE spec's entry into `out` IN PLACE -> action ok|add|update.
     An owned entry is CURRENT only when command, type AND the containing
-    group's matcher all match (codex B3). A wrong matcher is repaired in
+    group's matcher all match. A wrong matcher is repaired in
     place when the group is exclusively ours; with foreign co-tenants our
     hook relocates to a canonical group and the foreigners keep their group
     byte-identical. MERGE-preserving throughout: only the entry carrying

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The ~/.helm home resolver. HOME-anchored, never cwd-derived — a helm command
-invoked from any worktree resolves the same root every time (the Q132/Q133
+invoked from any worktree resolves the same root every time (the
 cwd-independence class).
 
 Env transition law: HELM_* preferred, legacy MELD_* accepted as fallback (the

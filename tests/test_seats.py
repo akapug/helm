@@ -386,7 +386,7 @@ class DeliverTest(SeatsBase):
         self.assertIn("torn", seats.deliver(seat="alice"))
 
     def test_emit_before_commit_at_least_once(self):
-        """H7: the cursor must NOT advance if emit never completed — a kill
+        """The cursor must NOT advance if emit never completed — a kill
         between select and output re-delivers next boundary."""
         self.seat_up()
         chat.post("@alice precious", who="bob")
@@ -2359,7 +2359,7 @@ class ClaimsTest(SeatsBase):
         self.assertEqual(rc, 0)
 
     def test_aba_stale_holder_cannot_release_regrant(self):
-        """H9 ABA: A's lease expires, B claims; stale A (same name, old
+        """ABA: A's lease expires, B claims; stale A (same name, old
         lease) must not drop B's lease."""
         _ok, _m, lease_a = seats.claim("port-8900", "alice", ttl=0, session="sA")
         ok, _m, lease_b = seats.claim("port-8900", "alice", ttl=60, session="sB")

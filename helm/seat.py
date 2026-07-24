@@ -3023,8 +3023,8 @@ def _proxy_age_s(family, seat):
 # ---------------------------------------------------------------------------
 # proxy-CPU canary — the leading indicator BEFORE a proxy goes silent
 # ---------------------------------------------------------------------------
-# Owner evidence (htop): cli-proxy-api pids at 152% and 90.6% CPU
-# while healthy siblings idle at ~0% — a proxy pegged at SUSTAINED high CPU is
+# Field signature: a cli-proxy-api pid pinned at sustained high CPU
+# while healthy siblings idle near 0% — a proxy pegged at SUSTAINED high CPU is
 # a struggling/looping backend for that seat's model, and the precursor of the
 # silent death doctor --ensure heals after the fact. The canary reads
 # /proc/<pid>/stat utime+stime as a WINDOW, never a point: %CPU over the span

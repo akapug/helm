@@ -8,7 +8,7 @@ assistant turn with stop_reason=end_turn, NO text, NO tool_use, NO real
 thinking, yet usage.output_tokens > 0 (codex DID generate; the answer never
 reached the pane). HTTP still logs 200 (a completed request), so status-code
 monitors are blind. claude-code's own "no visible output" recovery nudge fired
-exactly once in 75 observed cases — the other 74 silent deaths wedged nothing
+in only a fraction of observed cases — the other silent deaths wedged nothing
 but said nothing and woke nothing. This rung turns that silent class LOUD.
 
 THE SIGNATURE (drop-after-generate, NOT a refusal — a refusal is ~0 output

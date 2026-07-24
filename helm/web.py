@@ -1316,7 +1316,7 @@ def _roster_cached(room):
 
 def _api_chat_roster(qs):
     """The seats panel's read: roster presence + per-seat pending deliveries
-    + live claims (seats.py — the meld-half's M3 parity surface). Read-only,
+    + live claims (seats.py — the meld half's parity surface). Read-only,
     fail-open: any surprise answers empty, never a 500. Each seat is tagged
     `ephemeral` so the live picker can hide done review-SAs (kept queryable).
     Served from the single-flight roster cache — poll fan-in never stacks
@@ -1846,7 +1846,7 @@ def _api_mp_publish(payload):
     try:
         update = multiplayer_demo.encode(key, value, actor)
         # relay.publish raises ValueError on the update/doc size caps — that is
-        # bad INPUT (400), not a server fault (uncaught it would 500). (gate LOW)
+        # bad INPUT (400), not a server fault (uncaught it would 500).
         ack = relay.publish(cave, doc, actor, update)
     except ValueError as e:
         return {"error": str(e)}, 400
@@ -2223,7 +2223,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             while True:
                 with sse["cond"]:
-                    # death-aware predicate (round 4 P2): a stop's notify must
+                    # death-aware predicate: a stop's notify must
                     # RELEASE this wait — a seq-only predicate re-slept it and
                     # streams lingered to the full timeout
                     sse["cond"].wait_for(

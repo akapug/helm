@@ -100,7 +100,7 @@ senior dev *on this codebase* knows.
 - green / PASS / compiles / 0-results is SUSPECT until a second method confirms it saw real input (an
   empty-input pass is not a pass).
 - Never claim "done / fixed / working / verified" from inference - run it and cite the evidence, or say
-  "not yet verified." (feedback the owner flagged 2×.)
+  "not yet verified."
 - A verify blocked by "needs a real login / session / cred" is almost never a real block -
   SELF-PROVISION the auth: mint a token, reuse a local cookie/session already on disk, or create
   test-data, and finish the test yourself. Punting a verify to the human when the auth is

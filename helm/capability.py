@@ -149,7 +149,7 @@ CAPABILITIES = (
     },
     {
         "id": "recall",
-        "verb": "cv recall (helm recall)",
+        "verb": "cv recall",
         "tool": "mcp__cv__recall",
         "what": "cold semantic search over past agent sessions — 'have we "
                 "solved this before / where's the prior art'",

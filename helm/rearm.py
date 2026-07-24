@@ -327,9 +327,8 @@ def _announce_text(head_sha, seats, web_restart):
             % (len(seats), "s"[:len(seats) != 1], ", ".join(seats)))
     if web_restart:
         bits.append("restarting the stale web service")
-    # kimi field datapoint (accepted verbatim, 2026-07-22): a resumed/cleared
-    # owner that lost its beacon context needs the EXACT re-arm incantation in
-    # the row — the monitor-exit alone does not carry it.
+    # a resumed/cleared seat that lost its beacon context needs the EXACT
+    # re-arm incantation in the row — the monitor-exit alone does not carry it.
     rearm = (" If your beacon was cycled and you resumed/cleared without it, "
              "re-arm: Monitor(command: \"helm chat wait --seat <your-seat> "
              "--follow\", persistent: true) — if Monitor is DEFERRED, "
@@ -469,9 +468,9 @@ def _print_report(plan, actions, applying):
         for a in adv:
             print("    pid %-8d helm %-14s started %s" % (
                 a["pid"], a["verb"], _age(a["start"])))
-        # kimi field datapoint (accepted, 2026-07-22): a land never
-        # self-propagates to a running proxy — each carries pre-HEAD config
-        # until respawned by its owner (per-instance + family cli-proxies too).
+        # a land never self-propagates to a running proxy — each carries
+        # pre-HEAD config until respawned by its owner (per-instance + family
+        # cli-proxies too).
         print("    respawn recipe: `helm seat down <seat> && helm seat up "
               "<seat>` (or the daemon's own restart) — a land never "
               "self-propagates to a running proxy")

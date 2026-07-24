@@ -521,7 +521,7 @@ def _seat_key(seat):
     """The seat's STATE-FILE key: readable slug + a short hash of the
     casefolded raw seat. pk.slug alone collides ('api.a' and 'api-a' both
     slug to 'api-a'), and a shared cursor lets one seat silently CONSUME the
-    other's rows (codex B1 — loss, not a duplicate). Every per-seat state
+    other's rows (loss, not a duplicate). Every per-seat state
     path (cursor, cursor lock, seen) derives from this one key; case-only
     variants fold together deliberately — case-insensitive @mentions cannot
     address them apart anyway."""
@@ -1319,7 +1319,7 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
             # the cursor commits. Unhandled it re-raises every poll and strands
             # the whole backlog behind it forever. Skip it: fail LOUD to stderr
             # (never a silent drop) and advance the cursor PAST the offender so
-            # the rest drains. H7 holds — this wraps CONSTRUCTION only, never the
+            # the rest drains — this wraps CONSTRUCTION only, never the
             # emit below (an emit that dies must still NOT commit).
             try:
                 os.write(2, ("[helm chat] skipped an unrenderable row %r in %s "
@@ -1356,7 +1356,7 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main"):
     pre-join backlog never floods. Scanning a clean room advances only that
     room's cursor; a hit STOPS the scan, so later rooms keep their pending
     for the next boundary (one nudge per boundary — the budget stays flat).
-    Exceptions propagate exactly like deliver's (H7: an emit that died must
+    Exceptions propagate exactly like deliver's (an emit that died must
     not commit); every caller already wraps fail-open."""
     seat = seat or seat_for_session(session) or derive_seat(session, cwd)
     touch_seen(seat)          # presence even when every room is quiet
@@ -2218,7 +2218,7 @@ def stop_guard(session=None, room="main", seat=None, stop_active=False):
 
 
 # ---------------------------------------------------------------------------
-# claims — the advisory TTL lease (codex C1-lite + H9 hardening)
+# claims — the advisory TTL lease
 # ---------------------------------------------------------------------------
 
 def claims_path():
@@ -2237,7 +2237,7 @@ def _sweep(c):
 
 
 def _binding_ok(row, seat, lease, session):
-    """The C1-lite composite check, validated TOGETHER (codex B2): the lease
+    """The composite check, validated TOGETHER: the lease
     nonce is THE capability (printed once, to the grantee, never listed),
     the supplied seat must be the recorded holder, and when both the grant
     and the caller carry a session they must agree. Never lease-OR-session:
@@ -2256,7 +2256,7 @@ def claim(resource, seat, ttl=DEFAULT_TTL, lease=None, session=None):
     an increasing fence and records the caller's ambient session (display /
     extra binding — never an authorizer). EXTENDING a live lease requires
     the full binding {lease, seat, session-if-recorded}; a display name or
-    a copied session id alone extends nothing (codex B2). Expiry is
+    a copied session id alone extends nothing. Expiry is
     monotonic (tmpfs state dies with the boot; wall time only displays).
     Check+sweep+write hold one flock."""
     chat._ensure_dir()
@@ -2288,7 +2288,7 @@ def release(resource, seat, lease=None, session=None):
     {lease capability, holding seat, session-if-recorded}. A stale holder
     whose lease expired-and-was-regranted fails on the fresh nonce (ABA),
     and a caller who copied a session id out of the roster fails on the
-    lease (codex B2's exact reproduction)."""
+    lease."""
     with _flocked(claims_path() + ".lock"):
         c = _sweep(pk.read_json(claims_path(), {}) or {})
         row = c.get(resource)
@@ -2938,8 +2938,8 @@ def _recipients(m, r=None, include_unresolved=False):
 
 def _row_offsets(room):
     """(dev, ino, [(row, end_off)]) for one lane — every complete row and the
-    byte offset PAST it, the same identity the delivery cursor commits (codex
-    H5). Lets a row be tested against a recipient's cursor.off without moving
+    byte offset PAST it, the same identity the delivery cursor commits. Lets a
+    row be tested against a recipient's cursor.off without moving
     it. Every chat row ends in a newline (chat._append), so there is no
     partial tail to mis-measure."""
     try:
@@ -3506,7 +3506,7 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                   "the release capability)", file=sys.stderr)
             return 2
         # session comes ONLY from the ambient harness env — never a flag: a
-        # roster-visible SID must not be assertable through the CLI (codex B2)
+        # roster-visible SID must not be assertable through the CLI
         ttl = _flag(args, "--ttl")
         ok, msg, _lease = claim(
             args[0], _flag(args, "--seat") or derive_seat(None),

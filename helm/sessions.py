@@ -288,7 +288,7 @@ def credhome_for(sid, latch=True):
 
     session-env/<sid> is the per-home artifact that does NOT follow that
     symlink, so it carries the mapping. But it DECAYS — claude prunes it, and
-    measured on this machine resolution falls from ~91% for sessions touched in
+    in practice, resolution falls from ~91% for sessions touched in
     the last 2 days to ~18% past 30 days. A signal that erodes cannot answer
     "resume ANY session on ANY cred", so every successful lookup is LATCHED
     into a helm-owned index that never prunes. Coverage then freezes at what we

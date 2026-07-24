@@ -36,9 +36,9 @@ Protocol (an earlier prototype's scars kept):
     live incident, for a head-clip);
   * READY carries no floor marker — it is control-only; recv returns it
     exactly once (convener, invited status) and skips it everywhere else
-    (codex F1: control echoes are not chunks);
+    (control echoes are not chunks);
   * recv accepts only PEER rows ending in a real floor marker; own rows and
-    unattributable senders are skipped fail-closed (codex F2);
+    unattributable senders are skipped fail-closed;
   * state is keyed room × ACTOR (`<room>.meld.<seat-key>.json`) — helm's two
     seats always share one chat dir, the exact host-global-state clobber an
     earlier prototype's live dogfood refuted (test-fixtures-isolated-what-
@@ -273,8 +273,8 @@ def _ignored_note(ignored, peer):
 
 def recv(room, timeout=None, seat=None, poll=MELD_POLL, via="meld"):
     """(code, lines) — the blocking marker-aware read: return the next PEER
-    chunk carrying a real floor marker; skip own/unattributable rows (F2),
-    stale epochs (the fence), control echoes (F1), markerless chatter,
+    chunk carrying a real floor marker; skip own/unattributable rows,
+    stale epochs (the fence), control echoes, markerless chatter,
     reactions, and — the pinned-pair law — EVERY row from a seat that is not
     state["peer"] (live-fire 2026-07-23: recv accepted READY and chunks from
     ANY non-self sender; a meld convened for one seat was consummated by
@@ -313,7 +313,7 @@ def recv(room, timeout=None, seat=None, poll=MELD_POLL, via="meld"):
             text, frm = m.get("text") or "", str(m.get("from") or "")
             if m.get("react") or not text or not frm or frm == seat:
                 st["idx"] = here          # own/unattributable/reaction: skip
-                continue                  # fail-closed (F2)
+                continue                  # fail-closed
             em = _EPOCH_RE.search(text)
             if em and int(em.group(1)) != st["epoch"]:
                 st["idx"] = here          # stale epoch: a dead meld's row
@@ -333,7 +333,7 @@ def recv(room, timeout=None, seat=None, poll=MELD_POLL, via="meld"):
                                "YIELD \"<first chunk>\""
                                % (room, st["epoch"], chat._dsan(frm), via, room)] \
                         + _ignored_note(ignored, peer)
-                continue                  # control echo elsewhere (F1)
+                continue                  # control echo elsewhere
             mk = _MARKER_RE.search(text)
             if not mk:
                 st["idx"] = here          # markerless chatter is not a chunk

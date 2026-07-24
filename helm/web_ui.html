@@ -517,7 +517,7 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .crm.hot .crname{color:var(--fg);font-weight:var(--w-med)}
 .crm.cold{opacity:.62}
 /* one seat per line, name ellipsized, age pinned right — a 172px rail must
-   still say WHICH seat and HOW LONG AGO (the truncation the owner flagged) */
+   still say WHICH seat and HOW LONG AGO */
 .crm .crseat{flex:1 1 100%;min-width:0}
 .crm .crseat>span{flex:0 1 auto;min-width:0}
 .crm .crseat b{margin-left:auto;flex:0 0 auto;font-weight:400;font-variant-numeric:tabular-nums;padding-left:4px}
@@ -551,9 +551,8 @@ details.cfgsec>summary:hover{color:var(--fg)}
 .spv{color:var(--fg);font-size:var(--f1);word-break:break-word}
 .spjump{margin-top:10px;width:100%;text-align:left;font-size:var(--f1);padding:6px 10px;border-radius:7px;background:color-mix(in srgb,var(--accent) 14%,transparent);border:1px solid var(--accent);color:var(--accent);cursor:pointer}
 .spjump:hover{background:color-mix(in srgb,var(--accent) 24%,transparent)}
-/* the dregg ticker: ONE glance line under the nav on EVERY view — the owner's
-   "is the fleet signing, what landed last" pulse (owner ask: "get
-   that back at the top of the UI"). Click anywhere -> the full ledger tab. */
+/* the dregg ticker: ONE glance line under the nav on EVERY view — the fleet's
+   "is the fleet signing, what landed last" pulse. Click anywhere -> the full ledger tab. */
 #dreggstrip{padding:5px 18px;border-bottom:1px solid var(--line);font-size:var(--f1);color:var(--mut);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #dreggstrip:hover{background:var(--hover)}
 #dreggstrip .dsok{color:var(--ok);font-weight:var(--w-med)}

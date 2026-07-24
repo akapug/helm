@@ -1775,8 +1775,8 @@ class SeatEnsureTest(unittest.TestCase):
 
 
 class SeatCpuCanaryTest(unittest.TestCase):
-    """The proxy-CPU canary (struggling-backend leading indicator): htop showed
-    cli-proxy-api pids pegged at 152%/90.6% while healthy siblings idled ~0% —
+    """The proxy-CPU canary (struggling-backend leading indicator): a proxy pid
+    pinned at sustained high CPU while healthy siblings idle near 0% —
     sustained-high CPU on a proxy = a thrashing backend BEFORE it goes silent.
     Classification is windowed, never a point: stored-prior span when one
     exists, else a double-read; startup bursts are grace; unreadable /proc is
@@ -1842,7 +1842,7 @@ class SeatCpuCanaryTest(unittest.TestCase):
         slept.assert_called_once()        # the double-read IS the window
 
     def test_canary_first_sight_high_cpu_thrashing(self):
-        # 150 jiffies over 1s at clk 100 = 150% (the htop evidence shape),
+        # 150 jiffies over 1s at clk 100 = 150% (sustained-high shape),
         # process 300s old (past grace) -> THRASHING.
         samples = [self._sample(1000, 100.0), self._sample(1150, 101.0)]
         with mock.patch.object(seat, "_proc_cpu_sample", side_effect=samples), \
@@ -1897,8 +1897,8 @@ class SeatCpuCanaryTest(unittest.TestCase):
         slept.assert_called_once()
 
     def test_canary_threshold_env_tunable(self):
-        # HELM_PROXY_CPU_CANARY_PCT=95: a 90% reading (the htop 90.6% pid)
-        # stays OK under a raised bar — the knob is live, not decorative.
+        # HELM_PROXY_CPU_CANARY_PCT=95: a 90% reading stays OK under a raised
+        # bar — the knob is live, not decorative.
         os.environ["HELM_PROXY_CPU_CANARY_PCT"] = "95"
         try:
             samples = [self._sample(1000, 100.0), self._sample(1090, 101.0)]

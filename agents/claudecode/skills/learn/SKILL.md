@@ -63,7 +63,7 @@ replaces it, or `confirm` it if the incident just re-proves it — never mint
 a sibling id beside it. Duplicates are worse than misses: they split the
 DF weight of shared keywords, so BOTH entries rank lower than either alone,
 and future updates land on one while the other rots stale (owner-caught,
-the gap live in an 845-entry store). Only a genuine 0-hit
+the gap live in a well-populated store). Only a genuine 0-hit
 resolve earns a new id.
 
 ## The am-I-being-stupid gate (run BEFORE capturing)

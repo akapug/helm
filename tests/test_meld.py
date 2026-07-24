@@ -137,7 +137,7 @@ class TestRecv(MeldBase):
         self.assertEqual(code, 0)
         self.assertIn("READY", lines[0])
         self.assertEqual(meld.state(room, "seat-a")["status"], "active")
-        # a second READY row is a control echo now (F1) — skipped, timeout
+        # a second READY row is a control echo now — skipped, timeout
         chat.post("[MELD e:%d] READY:%d (again)" %
                   ((meld.state(room, "seat-a")["epoch"],) * 2),
                   room=room, who="seat-b", sign=False)
@@ -158,10 +158,10 @@ class TestRecv(MeldBase):
                   sign=False)                                   # stale epoch
         chat.post("markerless chatter", room=room, who="seat-b", sign=False)
         chat.post("[MELD e:%d] own row [YIELD]" % epoch, room=room,
-                  who="seat-a", sign=False)                     # own (F2)
+                  who="seat-a", sign=False)                     # own
         chat._append({"ts": pk.now_ts(), "from": "",                # crafted:
                       "text": "[MELD e:%d] anon [YIELD]" % epoch},  # post()
-                     room)                # would name it — unattributable (F2)
+                     room)                # would name it — unattributable
         chat.post("[MELD e:%d] the real chunk [YIELD]" % epoch, room=room,
                   who="seat-b", sign=False)
         code, lines = meld.recv(room, timeout=0, seat="seat-a", poll=0.01)

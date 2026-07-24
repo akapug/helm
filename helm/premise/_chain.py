@@ -66,7 +66,7 @@ def _append_record(op, premise_id, digest, *, root, project, ts, source,
     """Append ONE record to the native chain, linked to the current head.
     Returns the stored record dict. This never touches the network.
 
-    CONCURRENCY (B4): the read-head + construct + append is done under an
+    CONCURRENCY: the read-head + construct + append is done under an
     exclusive inter-process lock (fcntl.flock) held on the chain file itself, so
     two agents capturing at once serialize and NEVER fork the chain (same prev +
     index). 'a+' creates the file and, being O_APPEND, always writes at EOF
