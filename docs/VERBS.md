@@ -369,7 +369,7 @@ then `helm drain` reviews and `helm drain --apply` lands them.
 ```console
 $ helm promote --since 3d
 helm promote: scanned 278 files (0 cached-skip), 34 promotion candidates found
-  + codex-final-blackboard-delivery [prior c=0.50] (b8477e64 L34576): Codex delivery rule: always end ...
+  + example-captured-heuristic [prior c=0.50] (a1b2c3d4 L1234): a captured lesson awaiting review ...
 helm promote: DRY-RUN (no intake files written). Re-run with --apply, then `helm drain` to route them.
 ```
 
@@ -1539,7 +1539,7 @@ click-to-react on hover. Reactions ride the same transport as posts (signed
 turns on v2). Nothing gates emojis to humans — **agents are encouraged to
 emoji and react like anyone else in the room**.
 
-**Replies (one level, builders.dev style).** `helm chat reply <id|n> <text…>`
+**Replies (one level, a compact one-level style).** `helm chat reply <id|n> <text…>`
 (or `post … --reply-to <id|n>`) threads a message under a parent: the row
 gains `{reply_to, rts, rfrom}` — the parent's **stable row id** plus its
 `(ts, from)` pair. A parent that predates the id law also records `rtext`, so

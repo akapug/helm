@@ -118,7 +118,7 @@ Look at the **relay log** panel again. Every row is `id · actor · N B` — an 
 who published, and a **byte size**. Your actual text is **never** shown there,
 because helm never decoded it. The words only exist on the **board**, which your
 *browser* materialized from those opaque blobs. That split — a blind transport
-plus a client-side CRDT — is the whole point, and it's what lets a builders.dev
+plus a client-side CRDT — is the whole point, and it's what lets an external bridge
 remote relay drop in later without helm ever learning what a "board" is.
 
 ---
@@ -156,6 +156,6 @@ can drive the board with `helm multiplayer set …` and verify it with
 
 This is **local** multiplayer — one machine, human + agents in one cave. There's
 no web/hosted cave, no cross-machine sync, no accounts. That remote half is
-builders.dev's, and it slots into the **same** five adapter methods
+an external bridge's, and it slots into the **same** five adapter methods
 (`publish / updates / heartbeat / peers / leave`) without changing helm's core or
 this cockpit tab. See [MULTIPLAYER.md](MULTIPLAYER.md) for the adapter contract.

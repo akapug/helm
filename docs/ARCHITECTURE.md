@@ -126,7 +126,7 @@ Helm's multiplayer boundary is local and adapter-first: an append-only blind
 relay carries opaque client-owned CRDT updates, while a separate TTL channel
 carries disposable presence. Neither interface names a terminal, browser,
 metaharness, model, or CRDT library. The shipped implementation is tmpfs-local;
-builders.dev owns remote/web bridges. See [MULTIPLAYER.md](MULTIPLAYER.md).
+an external remote/web bridge adapter owns those. See [MULTIPLAYER.md](MULTIPLAYER.md).
 
 ## Pluggability
 

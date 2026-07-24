@@ -4,7 +4,7 @@
 <title>helm</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='25' x='16' text-anchor='middle' font-size='26' fill='%237eb8a2'%3E⎈%3C/text%3E%3C/svg%3E">
 <style>
-/* palette: the builders.dev warm token family — helm is dark-first, light derived in-family.
+/* palette: a warm token family — helm is dark-first, light derived in-family.
    data-theme overrides (after the media query, so the toggle wins both ways). */
 :root{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--hl:#2a231a;--ok:#7ecb8b;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
 @media (prefers-color-scheme:light){:root{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--hl:#efe7d8;--ok:#2f9e57;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}}
@@ -2586,7 +2586,7 @@ let CHAT_ROOMS_LAST = []; // last poll's rooms — instant sidebar repaint on sw
 let CHAT_BY_ID = {}, CHAT_BY_KEY = {}, CHAT_REPLYN = {}, CHAT_KIDS = {}, CHAT_REPLY_TO = null;
 let CHAT_ROSTER = [], CHAT_PRESENCE = {};   // @mention completion + seat ages
 let CHAT_DIVIDED = false, CHAT_AWAY = 0;    // the unread divider + jump button
-// ── lazy-load window (aligned 1:1 with builders.dev: recent-50 initial paint +
+// ── lazy-load window (aligned 1:1 with a recent-window: recent-50 initial paint +
 // scroll-up older pages). CHAT_WIN is the one tunable knob; the server default
 // matches it. CHAT_OLDEST_BASE is the ABSOLUTE index of the topmost rendered
 // row — the cursor the older-page fetch scrolls back from (>0 means more above).
@@ -2654,7 +2654,7 @@ function chatParentKey(m) {
   return p ? chatThreadKey(p) : null;
 }
 
-/* the one-level quote (builders.dev style — never nested). FOUR states, so a
+/* the one-level quote (a compact one-level style — never nested). FOUR states, so a
    reply to a parent that is merely ABOVE the loaded window is NOT slandered as
    "rotated out" (the P1 bug): resolved-in-DOM (clickable jump) · resolved-but-
    above-the-window (author+snippet, click loads older then jumps) · PENDING
@@ -2878,7 +2878,7 @@ async function pollChat() {
     let d;
     const want = CHAT_ROOM; // the room this request is FOR — a mid-flight switch drops the render
     const sentSince = CHAT_SINCE; // the cursor we asked from — 0 => initial/reset (windowed) paint
-    // the initial/reset open asks for only the last CHAT_WIN rows (builders.dev
+    // the initial/reset open asks for only the last CHAT_WIN rows (an external bridge
     // getRecent parity); the incremental poll (since>0) stays exactly since=<n>,
     // the untouched 22ms/54KB good path.
     const url = "/api/chat?room=" + encodeURIComponent(want) + "&since=" + sentSince
@@ -2963,7 +2963,7 @@ function chatResetLog() {
   CHAT_GEN = null; CHAT_GONE = new Set(); // a reset re-derives the rotation cursor + the gone-set from scratch
 }
 
-/* lazy-load older history (builders.dev back-scroll parity — the analog of
+/* lazy-load older history (back-scroll parity — the analog of
    getRecent(before, N)): the owner scrolled near the top, there is history
    ABOVE the topmost rendered row (CHAT_OLDEST_BASE>0), so pull the prior page
    and PREPEND it with the viewport pinned (scroll-anchor) — no re-render of the

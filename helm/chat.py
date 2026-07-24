@@ -64,7 +64,7 @@ STABLE ID (chat._append's id law, reused; no second identity is invented) —
 plus {rts, rfrom}, the parent's (ts, from). A parent predating the id law also
 carries {rtext}: ts|from is not unique when one author posts twice inside a
 second, so exact text disambiguates without inventing an identity. One level
-only, builders.dev style: a reply renders with a compact quote of its parent,
+only, a compact one-level style: a reply renders with a compact quote of its parent,
 a parent renders its reply count, and an orphan parent (rotated out) renders
 as such — never a crash. A REPLY WAKES ITS PARENT'S AUTHOR
 (seats.deliverable reads rfrom): replying is a direct address, the same tier

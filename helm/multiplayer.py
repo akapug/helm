@@ -4,7 +4,7 @@
 The durable document model belongs to the client CRDT. Helm is a BLIND relay:
 it assigns an envelope id/timestamp and appends the client's opaque update, but
 never decodes, merges, interprets, or rewrites it. A browser, terminal editor,
-agent harness, or future builders.dev bridge can share one adapter contract
+agent harness, or a future external bridge can share one adapter contract
 without making Helm depend on any of them.
 
 Presence is deliberately separate and ephemeral. Heartbeats live in their own
@@ -336,7 +336,7 @@ def register_adapter(name, factory):
 
 def adapters(name=None):
     """Resolve the selected adapter pair. The CLI ships local only; embeddings
-    and future builders.dev bridges register another factory without changing
+    and a future external bridges register another factory without changing
     the consumer."""
     name = _identity(name or home.env("MULTIPLAYER_BACKEND") or "local", "adapter")
     factory = ADAPTER_FACTORIES.get(name)

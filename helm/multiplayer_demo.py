@@ -8,7 +8,7 @@ computes identically, so arrival order can never change the result.
 
 The relay never runs this. Helm stays a blind transport (multiplayer.py): the
 CRDT lives in the client — this module for the CLI and terminals, mirrored in
-web_ui.html for the browser, and a future builders.dev bridge folds the same log
+web_ui.html for the browser, and a a future external bridge folds the same log
 the same way. Non-demo opaque updates are counted, never decoded — the proof
 that the transport carries strangers' bytes without understanding them.
 """

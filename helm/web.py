@@ -978,7 +978,7 @@ def _rooms_summary_cached(roster=None):
 
 # ── chat window (lazy-load) ──────────────────────────────────────────────
 # The initial/reset open returns only the last CHAT_WIN_DEFAULT rows (aligned
-# 1:1 with builders.dev getRecent(...,50)); deeper history comes from the
+# 1:1 with a getRecent(...,50)); deeper history comes from the
 # older-page fetch (?before=<idx>) as the owner scrolls up. The live
 # incremental poll (since=<total>) is UNTOUCHED — it stays rows[since:] byte
 # for byte, the measured 22ms/54KB good path.
@@ -1721,7 +1721,7 @@ def _api_prune_post(payload):
 # GET is a thin passthrough of opaque envelopes; the BROWSER folds the demo LWW
 # CRDT (web_ui.html materializeCave, mirroring helm.multiplayer_demo). Presence
 # is decoupled: a heartbeat POST makes the owner a live peer, no doc touched.
-# The adapter boundary is untouched, so a builders.dev bridge slots in with zero
+# The adapter boundary is untouched, so an external bridge slots in with zero
 # changes to this file (register_adapter + HELM_MULTIPLAYER_BACKEND). ──
 MP_OWNER_CONNECTION = "cockpit"
 
@@ -1927,17 +1927,17 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 
 
 # ---------- the SSE doorbell (REARCH-web-0.2 leg 2: poll -> push) ----------
-# The settled pattern (builders.dev firehose / a ramspace / glue):
+# The settled pattern (server-push firehose):
 # push says "there's news", the EXISTING cursor read fetches it — events are
 # DOORBELLS, never payloads, so the read endpoints stay the one render truth.
 # ONE watcher thread stat-sweeps the chat room dir (tmpfs, ~13 files) every
 # 250ms and notifies a Condition; each /api/events client blocks on it
 # (thread-per-client is already this server's model). The 250ms tick is also
 # the coalescer: a burst of posts is at most 4 doorbells/s. Keepalive comment
-# every 20s + no-cache/no-transform (the glue anti-proxy-buffering pair);
+# every 20s + no-cache/no-transform (the anti-proxy-buffering headers);
 # EventSource gives the client auto-reconnect for free.
 # ---------- the SSE doorbell (REARCH-web-0.2 leg 2: poll -> push) ----------
-# The settled pattern (builders.dev firehose / a ramspace / glue):
+# The settled pattern (server-push firehose):
 # push says "there's news", the EXISTING cursor read fetches it — events are
 # DOORBELLS, never payloads, so the read endpoints stay the one render truth.
 #

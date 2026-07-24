@@ -112,7 +112,7 @@
   signed row already on disk verifies unchanged; `payload_for()` is the one
   shape-dispatching recomputer and `helm chat verify` re-derives it (honest
   scope: self-consistency, not remote re-verification — the node still cannot
-  disclose a turn's payload). Rendering is one level, builders.dev style — a
+  disclose a turn's payload). Rendering is one level, a compact one-level style — a
   compact parent quote, a `↩N` count, graceful orphans — in `helm chat read`,
   the journal, and the web panel. Threading now REACHES beacon-wake — the
   original "threading is invisible to the beacon" law was inverted 2026-07-22

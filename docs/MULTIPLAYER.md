@@ -1,6 +1,6 @@
 # local multiplayer
 
-Helm owns **local human + agent multiplayer inside one cave**. builders.dev owns
+Helm owns **local human + agent multiplayer inside one cave**. An external bridge adapter owns
 the remote/web product. The boundary between them is an adapter contract, not a
 shared implementation, so neither side needs to know whether the local operator
 uses Orca, herdr, a bare shell, a browser, or another metaharness.
@@ -102,7 +102,7 @@ the payload. Human-readable reads show payload sizes only; CRDT consumers use
 
 - A local editor integrates its CRDT by encoding updates into opaque strings and
   consuming the returned cursor.
-- builders.dev can bridge remote/web caves by implementing the relay/presence
+- an external bridge adapter can bridge remote/web caves by implementing the relay/presence
   contract; Helm's local core does not grow hosted networking.
 - Snapshot/compaction is a client or bridge policy. If added locally, it must be
   a new adapter capability with an explicit cursor epoch, never an in-place log

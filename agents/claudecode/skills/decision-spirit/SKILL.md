@@ -205,7 +205,7 @@ while continuing with the best reversible probe path.
     Bug class: `attention-budget-unmanaged`.
 
 24. **HUMAN-SURFACE PARITY — a human-facing feature without a TUI-GUI the owner has
-    seen and used is NOT DONE** (owner canon 2026-07-08: an entire class — ramspace
+    seen and used is NOT DONE** (owner canon 2026-07-08: an entire class — shared-memory space
     viewers, TUI chat, loop-source editing, the rich away system — fell out of ALL
     tracking because agent-facing primitives get rows and owner-facing surfaces
     don't; no agent feels their absence). CLI parity is the floor, never the finish.
@@ -222,7 +222,7 @@ while continuing with the best reversible probe path.
     to learn current state, the log became the bus - invert it: serve coordination from memory,
     demote disk to write-behind. Prior art: write-behind cache, event-sourcing's in-memory read
     model, LMAX Disruptor, "the database is not your message queue." Bug class:
-    `disk-as-coordination-read-path` / `log-as-bus`. (The inversion the warroom ramspace fell
+    `disk-as-coordination-read-path` / `log-as-bus`. (The inversion the shared-memory space fell
     into - hot state was correct in RAM but agents still read disk rows every turn; the keel of
     the RAM-first re-architecture. 2026-06-21.)
 
