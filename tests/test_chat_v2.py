@@ -894,6 +894,62 @@ class ReactTest(V2Base):
         self.assertIn("reacted 🚀", out.getvalue())
 
 
+class ReadReactIndexAlignmentTest(V2Base):
+    """The read/react index-space split (owner-caught: a 🫡 landed on the wrong
+    post). `read` prints reaction LINES that `react n` silently skips, so a
+    human counting printed lines targets off-by-(reactions-above). The fix
+    surfaces react's own ordinal as `[n]` beside each targetable row; reaction
+    lines carry NO number, so the two index spaces cannot drift."""
+
+    def _read_lines(self, *extra):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            chat.cmd_chat(["read", *extra])
+        return [ln for ln in out.getvalue().splitlines() if ln.strip()]
+
+    def test_read_numbers_are_exactly_the_react_targets(self):
+        chat.post("first", who="a")
+        chat.post("second", who="b")
+        chat.react(1, ":tada:", who="r")     # a reaction ON 'first' — a LINE in
+        chat.post("third", who="c")          # read, but never a react target
+        lines = self._read_lines()
+        numbered = [ln for ln in lines if ln.lstrip().startswith("[")]
+        unnumbered = [ln for ln in lines if not ln.lstrip().startswith("[")]
+        # exactly the 3 messages are numbered; the reaction line is not
+        self.assertEqual(len(numbered), 3)
+        self.assertEqual(len(unnumbered), 1)
+        self.assertIn("reacted", unnumbered[0])       # the skipped react line
+        # the row printed as [3] is 'third'...
+        third = next(ln for ln in numbered if ln.lstrip().startswith("[3]"))
+        self.assertIn("third", third)
+        # ...AND react 3 toggles 'third' — the two index spaces now AGREE
+        row, err = chat.react(3, ":rocket:", who="r")
+        self.assertIsNone(err)
+        self.assertEqual(row["tfrom"], "c")
+
+    def test_react_prefix_marks_targets_and_blanks_reactions(self):
+        # the shared owner both `read` and `read --follow` render through: a
+        # target gets [n]; a reaction row gets an aligned blank, never a number
+        rows = [{"ts": "t1", "from": "a", "text": "x"},
+                {"react": "🎉", "from": "r", "tts": "t1", "tfrom": "a"},
+                {"ts": "t2", "from": "b", "text": "y"}]
+        tag = chat.react_prefix(rows)
+        self.assertEqual(tag(0).strip(), "[1]")   # first message
+        self.assertEqual(tag(1).strip(), "")      # the reaction row: no number
+        self.assertEqual(tag(2).strip(), "[2]")   # second message, react skipped
+        self.assertEqual(len(tag(0)), len(tag(1)))  # columns stay aligned
+
+    def test_since_does_not_shift_the_ordinals(self):
+        # ordinals count the WHOLE room, so a --since suffix keeps the same [n]
+        for t in ("m1", "m2", "m3"):
+            chat.post(t, who="a")
+        shown = [ln for ln in self._read_lines("--since", "2")
+                 if ln.lstrip().startswith("[")]
+        self.assertEqual(len(shown), 1)                # only the 3rd prints
+        self.assertTrue(shown[0].lstrip().startswith("[3]"))   # keeps ordinal 3
+        self.assertIn("m3", shown[0])
+
+
 class ReactToggleTest(V2Base):
     """The confirmed multi-bug (four identical ❤️ rows from one owner click):
     toggle idempotency + reactor identity attestation."""
