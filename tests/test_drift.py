@@ -55,7 +55,7 @@ class TierCrossingTest(DriftBase):
 
 
 class ScopeKeyedSnapshotTest(DriftBase):
-    """Audit HIGH: one scope-blind snapshot let a --project run poison the
+    """Audit finding: one scope-blind snapshot let a --project run poison the
     global baseline and mint tier-crossings that never happened."""
 
     def _shadowed_pair(self):

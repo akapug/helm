@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """configs — the config-management model (decomposed package; public API preserved).
 helm-native (see ATTRIBUTION.md for lineage)
-dissolve-into-helm law. Design record: the predecessor repo's CONFIGS_DESIGN.md.
+dissolve-into-helm law.
 
 One place to SEE and safely EDIT every local claude/codex config — MCPs, hooks,
 skills, rules, memory (CLAUDE.md/AGENTS.md), settings — across all homes and cwds,

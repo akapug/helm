@@ -262,7 +262,7 @@ def get(rid, now=None):
 
 def board_section(now=None):
     """The data a console renders as a 'land loops + where they're stalling'
-    panel. console-design owns the actual anchor; this exposes the rows in a
+    panel. The console owns the actual anchor; this exposes the rows in a
     stable, brief-shaped section dict (title + loops + the stalled subset)."""
     loops_, unavailable = loops(now=now)
     if unavailable:

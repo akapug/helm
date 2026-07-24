@@ -120,7 +120,7 @@ while continuing with the best reversible probe path.
     (lane/record/claim/obligation/session/alert) through its
     FULL life including stuck/terminal states; state the feature's behavior at each
     stage. Features designed as verbs on the primary case ship holes that are just
-    the same object LATER in its own life (owner canon 2026-07-08: stale-claim x
+    the same object LATER in its own life (owner canon: stale-claim x
     read-but-unresolved x deadline-less x dead-beacon — all lifecycle-walk misses;
     "human UX designers would not stand for this"). Bug class:
     `verb-designed-noun-lifecycle-holed`. The smallest correct diff is the one at
@@ -165,7 +165,7 @@ while continuing with the best reversible probe path.
     project's consumption-timing (its consumers-column schedule) as the primitive's gate - but the
     spec belonged to one project, the adapter to another, and the resolution line bound
     only the adapter. Sharpens #15 (trace to owner) + #18 (premise before proposal).
-    **GUARD/WATCHDOG corollary (owner canon 2026-07-08: "this is always the case"):** for
+    **GUARD/WATCHDOG corollary (owner canon: "this is always the case"):** for
     safety nets specifically, per-spec component correctness guarantees NOTHING — the
     COMPOSITION is the unit of correctness. N guards each with a clean conscience can
     jointly guarantee a blind spot (live: work-offer[unclaimed-only+role-exempt] x
@@ -175,7 +175,7 @@ while continuing with the best reversible probe path.
     the coverage matrix (obligation-types x guards; every cell covered/exempt-why/HOLE).
     Bug class: `watchdogs-correct-composition-holed`.
 
-21. **Don't launder vacuity** (Ember/dregg discipline, harvested per prem-ember-alliance).
+21. **Don't launder vacuity** (Ember/dregg discipline).
     A tool, proof, spec, or plan must either discharge its obligation honestly or HAND THE
     UNMET PART BACK explicitly - never launder an open gap (a `sorry`, an unverified
     premise, a matched-buggy-oracle, a stubbed step) into a false "PROVED" / "done." An
@@ -188,7 +188,7 @@ while continuing with the best reversible probe path.
     not refutation).
 
 23. **ATTENTION BUDGET — the supra-principle for every a2a-comms-touching feature**
-    (owner canon 2026-07-08: built into planning, then forgotten; re-learned by incident).
+    (owner canon: built into planning, then forgotten; re-learned by incident).
     Every agent has a finite attention budget; any feature that injects, delivers,
     alerts, or drains MUST be designed against all three legs at once:
     (a) TIMING — what they need arrives WHEN they need it (contextual firing,
@@ -205,7 +205,7 @@ while continuing with the best reversible probe path.
     Bug class: `attention-budget-unmanaged`.
 
 24. **HUMAN-SURFACE PARITY — a human-facing feature without a TUI-GUI the owner has
-    seen and used is NOT DONE** (owner canon 2026-07-08: an entire class — shared-memory space
+    seen and used is NOT DONE** (owner canon: an entire class — shared-memory space
     viewers, TUI chat, loop-source editing, the rich away system — fell out of ALL
     tracking because agent-facing primitives get rows and owner-facing surfaces
     don't; no agent feels their absence). CLI parity is the floor, never the finish.
@@ -226,7 +226,7 @@ while continuing with the best reversible probe path.
     into - hot state was correct in RAM but agents still read disk rows every turn; the keel of
     the RAM-first re-architecture. 2026-06-21.)
 
-25. **EXISTENCE SWEEP before net-new — the dual of #18** (owner canon 2026-07-23:
+25. **EXISTENCE SWEEP before net-new — the dual of #18** (owner canon:
     "you don't tend to notice when they've already mostly built something that
     nevertheless needs improving / implementing elsewhere / refactoring / moving").
     #18 guards the premise you build ON; this guards the thing you are about to

@@ -425,8 +425,8 @@ def seat_coverage():
 
 # ── the retrofit surface (G-seatlaunch-installs): a pane that launched
 # BEFORE its identity/hooks existed sits idle forever — no hook ever fires
-# in an idle PTY, so it can never self-heal into delivery (the live kimi
-# seat: running, absent from the roster, @kimi routing nowhere). The only
+# in an idle PTY, so it can never self-heal into delivery (a live seat:
+# running, absent from the roster, its @-mention routing nowhere). The only
 # fix is a relaunch, so install/launch SURFACE the uncovered running panes.
 
 def running_panes(proc=None):

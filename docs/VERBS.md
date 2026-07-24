@@ -1447,7 +1447,7 @@ per-seat respawn stays the operator's call, never `rearm`'s signal.
 ```console
 $ helm rearm
 helm rearm — land-to-live: live processes still holding pre-HEAD code (dry-run; `helm rearm --apply` cycles the stale waiters)
-  HEAD 265e8af committed 12m ago
+  HEAD a1b2c3d committed 12m ago
   waiters (helm chat wait):
     STALE   pid 1656     seat codex-3                started 41m ago
     current pid 4174464  seat codex                  started 3m ago
@@ -1628,9 +1628,9 @@ cache says `run helm creds`). Input: Enter posts, `:shortcodes:` expand,
 runs the log-after flush unless `HELM_CHAT_LOG=0`. Built as panes so
 brief/sessions views bolt on later.
 
-### The delivery lane — chat at tool boundaries (the meld-half port)
+### The delivery lane — chat at tool boundaries (the delivery-lane port)
 
-Design: `~/.helm/helm/prd/2026-07-20-meldhalf-design.md`. Meld carried a
+Meld carried a
 separate tmpfs whisper channel because it had no room; helm has the room, so
 the lane is a **read cadence over the same room** — zero new transports. (The
 word "whisper" stays reserved for inject's first-turn brief and the v1 ledger
@@ -1835,7 +1835,7 @@ embargo needs an expected-set freeze + reveal state machine; the spec lives
 in the design doc's codex-round section.)
 
 ```console
-$ helm chat post "@codex-seat xrev the meldhalf branch when free"
+$ helm chat post "@codex-seat xrev the delivery-lane branch when free"
 $ helm chat seats                # who's live, what's pending, what's claimed
 $ helm chat claim worktree-main --ttl 1800   # prints the lease id — keep it
 $ helm chat release worktree-main --lease 5f3c9a2d41b0e6f2
@@ -1843,7 +1843,7 @@ $ helm chat release worktree-main --lease 5f3c9a2d41b0e6f2
 
 ### `helm chat meld` (aka `council`, `standup`) — the mindmeld preset
 
-Hyper-speed a2a real-time convergence (premise meld-discipline): both parties
+Hyper-speed a2a real-time convergence: both parties
 reply FAST with what they ALREADY know; a fork that needs research is NOT a
 meld — it falls to async. The preset is THIN by law (one-comms-primitive): a
 meld is a fresh room (`meld-<epoch>-<slug>`) plus a bounded synchronous read
@@ -1852,7 +1852,7 @@ visible live in `helm chat rooms` and the web channel list like any room.
 The convergence discipline — epoch fencing, floor markers, bounds-as-behavior
 — is helm-native (the scars are kept, the channel is helm's).
 
-NAMING (premise council-is-the-number-one-feature, owner canon 2026-07-23):
+NAMING:
 MELD is the GENUS — agents converging quickly — and `meld` stays the primary
 verb. `standup` (informal 2+ convergence; today's 2-party mindmeld included)
 and `council` (the big FORMAL convergence — agenda/quorum/recorded verdict;
@@ -1872,7 +1872,7 @@ aligned with every other chat verb).
   durable row: a tracked peer's delivery lane backfills the newborn room
   from offset 0, so it lands at the peer's next tool boundary (busy) or
   beacon fire (idle) — never lost, only delayed. An UNTRACKED peer gets a
-  loud roster warning instead of that promise (live-fire 2026-07-23: the
+  loud roster warning instead of that promise (a real regression caught in testing: the
   invite asserted delivery to a seat with no lane). `--wait` collapses
   invite + the first recv into one call — every convener's literal next
   command.
@@ -1880,7 +1880,7 @@ aligned with every other chat verb).
   posts the control-only `READY` **@convener** (the wake-back: a READY that
   lands silently strands GO forever). REFUSES a seat the seed did not
   invite — a different-seat join is how melds got hijacked/mis-consummated
-  (live-fire 2026-07-23). The seeded problem is the joiner's first recv
+  (a real regression caught in testing). The seeded problem is the joiner's first recv
   chunk.
 - **`meld recv <room> [--timeout S]`** — the blocking marker-aware read
   (default 90 s): returns the next PEER chunk carrying a real floor marker;
@@ -1901,7 +1901,7 @@ aligned with every other chat verb).
   at 0.5 s).
 - **`meld status`** — this seat's live melds (role, status, exchanges/cap).
 
-LATENCY-PURE (premise comms-presets-optimize-their-novel-purity): every meld
+LATENCY-PURE: every meld
 post rides the v1 RAM append unsigned (`sign=False`) — no signing leg, no
 node round-trip, no disk write mid-meld; the out-of-band log-flush stays the
 durable record. State is RAM, keyed room × ACTOR (two seats share one chat
@@ -1958,8 +1958,7 @@ per-home pin (`CLAUDE_CONFIG_DIR`).
 
 ### `helm work claim|release|gc|list|install-guard`
 
-In-cave git coordination (design: `prd/2026-07-21-in-cave-git-coordination.md`
-— the maintainer's tree + the hotel front desk): the shared checkout is the
+In-cave git coordination (the maintainer's tree + the hotel front desk): the shared checkout is the
 **integrator's tree**; every other seat works in a private room
 `<repo>-wt/<lane>` on branch `lane/<lane>`. Every leg is a reuse — the lease
 IS `helm chat claim` (resource `worktree:<proj>:<lane>`, nonce = room key,
@@ -2350,7 +2349,7 @@ the same bounded command another way.
 
 ### `helm router [up|run|down|status|line|probes]` + `helm seat launch|smoke --multi`
 
-**Mixed models in ONE claude-code process** (proven 2026-07-21, raw conductor
+**Mixed models in ONE claude-code process** (proven with raw conductor
 logs): a Task subagent's `.claude/agents/*.md` frontmatter `model:` string
 goes to the wire per-request, and the proxy routes each request by model
 name. The one law: **never set `CLAUDE_CODE_SUBAGENT_MODEL` for a mixed

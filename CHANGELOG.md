@@ -21,7 +21,7 @@
   transcript roots through `CLUSTERVISION_CLAUDE_ROOTS` on every CV subprocess,
   and the corresponding CV-core multi-root discovery change preserves the one
   recall index across custom `CLAUDE_CONFIG_DIR` homes.
-- Homing review round (fable composition + adversarial lenses @ 8313d9f).
+- Homing review round (fable composition + adversarial lenses).
   HIGH closed: the homing prologue's EAGER `os.getcwd()` crashed every
   default chat verb and all three delivery hooks (join/deliver/stop-guard)
   for a session whose cwd was deleted — a pruned lane worktree is routine;
@@ -31,8 +31,7 @@
   same-class sites (`whoname`'s auto-name, the hook join's cwd fallback) now
   resolve through it. LOW closed: the hook seam re-resolves a DERIVED
   pre-resolution against the hook PAYLOAD's cwd (the session's ground
-  truth) instead of trusting the hook PROCESS's cwd. LOW closed (adversarial
-  B3): `_unlink_seat_state`/`_move_seat_state` match keyed state files at a
+  truth) instead of trusting the hook PROCESS's cwd. LOW closed (adversarial review): `_unlink_seat_state`/`_move_seat_state` match keyed state files at a
   KEY BOUNDARY (`<marker><key>` then `.` or end) — the bare substring test
   let pruning/renaming seat `foo` destroy the delivery ground of a live
   seat literally named foo's key. Documented-accepted LOWs: the catalog's
@@ -42,7 +41,7 @@
   gap (an operator rehome holds until a pane with a stale explicit
   `HELM_CHAT_ROOM` env restarts — follow-up: rank operator above stale
   explicit env or re-mint launch.sh on rehome).
-- Roster GC gets ONE evidence owner (codex-2's independent review, three
+- Roster GC gets ONE evidence owner (an independent cross-family review, three
   HIGHs closed). (1) Transcript truth is no longer a hand-rolled root list —
   `seat gc` delegates to session's persistence census, which covers helm's
   own seat homes (`~/.helm/_global/seats/**/claude/projects`); the old list
@@ -115,7 +114,7 @@
   disclose a turn's payload). Rendering is one level, a compact one-level style — a
   compact parent quote, a `↩N` count, graceful orphans — in `helm chat read`,
   the journal, and the web panel. Threading now REACHES beacon-wake — the
-  original "threading is invisible to the beacon" law was inverted 2026-07-22
+  original "threading is invisible to the beacon" law was inverted
   (the owner's WHY: "I'm tired of typing agent names to mention"): a reply is
   a direct address of the parent's author, mention-tier, any room, casefold —
   and of NOBODY else; every other row wakes exactly what its text alone would

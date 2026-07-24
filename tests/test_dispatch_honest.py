@@ -13,8 +13,8 @@ Four layers:
 
 2. EXEMPT is BRANCH-AWARE, never wholesale: a positional dispatcher may
    still own subverb branches (`sessions resume …`), and each discovered
-   branch literal must be declared WITH a guarded-tail probe — codex-2's
-   exact-SHA pass proved `sessions resume <id> --go --bogus --help`
+   branch literal must be declared WITH a guarded-tail probe — a reviewer's
+   exact-commit pass proved `sessions resume <id> --go --bogus --help`
    spawned a pane and exited 0 behind the wholesale exemption.
 
 3. NoArgRootLeaves closes the class the dispatcher detector structurally
@@ -24,7 +24,7 @@ Four layers:
    from the source and must equal cli.NOARG_VERBS, whose tails the root
    guards.
 
-4. Regression tests pin codex-2's FIX findings (helm-dogfood 2026-07-22):
+4. Regression tests pin the review's FIX findings:
    trailing junk after a KNOWN subverb must refuse BEFORE the side-effecting
    work runs — `seat down codex --bogus --help` stopped the seat and exited
    0 — and `--help` after junk refuses too (the existence probe stays
@@ -308,7 +308,7 @@ class SweepTest(unittest.TestCase):
 
 
 class NoArgRootLeaves(unittest.TestCase):
-    """codex-2 HIGH: cli.main(['sync','--bogus','--help']) returned 0 AND ran
+    """Review finding: cli.main(['sync','--bogus','--help']) returned 0 AND ran
     registry.sync — a MUTATING verb ran on junk while --help falsely
     succeeded, and the dispatcher detector structurally cannot see it (the
     leaf never dispatches). Class closure: derive the no-arg leaves from the
@@ -341,7 +341,7 @@ class NoArgRootLeaves(unittest.TestCase):
                 self.assertIn(tail[0], err, (verb, tail))
 
     def test_sync_junk_with_help_never_syncs(self):
-        # the exact codex-2 probe, pinned: refuse BEFORE the mutating sync.
+        # the exact review probe, pinned: refuse BEFORE the mutating sync.
         with mock.patch("helm.registry.sync") as p:
             rc, out, err = self._main(["sync", "--bogus", "--help"])
         self.assertEqual(rc, 2, (out, err))
@@ -357,7 +357,7 @@ class NoArgRootLeaves(unittest.TestCase):
 
 
 class SessionsResumeTailGuard(unittest.TestCase):
-    """codex-2 HIGH, pinned exactly: the resume branch of the positional
+    """Review finding, pinned exactly: the resume branch of the positional
     cmd_sessions dispatcher guards its tail BEFORE rows_for/spawn."""
 
     def _call(self, argv):
@@ -399,7 +399,7 @@ class SessionsResumeTailGuard(unittest.TestCase):
 
 
 class NearestMatchBelowRoot(unittest.TestCase):
-    """codex-2 MED, pinned exactly: the root's did-you-mean is centralized
+    """Review finding, pinned exactly: the root's did-you-mean is centralized
     (cli.suggest) and wired below root — guard_tail flags AND subdispatcher
     verbs. One typo probe per dispatcher, end to end through cli.main."""
 
@@ -416,7 +416,7 @@ class NearestMatchBelowRoot(unittest.TestCase):
             self.assertIn("did you mean '%s'?" % want, err.getvalue(), argv)
 
 
-# ---------------------------------------------------- codex-2 FIX findings
+# ---------------------------------------------------- review FIX findings
 
 class TrailingJunkRefusesBeforeWork(unittest.TestCase):
     """Known subverb + trailing junk (with or without --help) must exit 2
@@ -500,7 +500,7 @@ class TrailingJunkRefusesBeforeWork(unittest.TestCase):
             self._refuse("autocompact", "cmd_autocompact", argv, "check")
 
     def test_watchdog_junk_with_help_refuses(self):
-        # codex-2 MED: help used to be checked before junk, so
+        # Review finding: help used to be checked before junk, so
         # `watchdog frobnicate --help` exited 0 — a false existence probe.
         self._refuse("watchdog", "cmd_watchdog", ["frobnicate", "--help"],
                      "check")
@@ -515,7 +515,7 @@ class TrailingJunkRefusesBeforeWork(unittest.TestCase):
 
 
 class TidyParserTest(unittest.TestCase):
-    """codex-2 HIGH: `tidy --repo --apply --apply` APPLIED with
+    """Review finding: `tidy --repo --apply --apply` APPLIED with
     root='--apply'. Flag-shaped/missing values and duplicates refuse."""
 
     def _refuse(self, argv, needle):
@@ -554,10 +554,10 @@ class CleanHelpStillHelps(unittest.TestCase):
         self._help("modelrouter", "cmd_router", ["down", "--help"], "_down")
 
 
-# --------------------------------------- fable review findings (2026-07-22)
+# --------------------------------------- review findings
 
 class MembershipReadersRefuseJunk(unittest.TestCase):
-    """The adversarial review's HIGH: handlers that read flags only via
+    """The adversarial review found: handlers that read flags only via
     membership tests (`'--apply' in args`) are invisible to BOTH AST
     detectors and include MUTATING verbs — `helm promote --bogus --apply`
     WROTE 43 intake files with rc 0, and `--help` after junk exited 0."""

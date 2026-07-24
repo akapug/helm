@@ -25,7 +25,7 @@ class ExpandTest(unittest.TestCase):
         self.assertEqual(emoji.expand(None), "")
 
     def test_map_size_and_purity(self):
-        self.assertGreaterEqual(len(emoji.MAP), 120)  # the PRD's ~120 floor
+        self.assertGreaterEqual(len(emoji.MAP), 120)  # the documented ~120 floor
         for k, v in emoji.MAP.items():
             self.assertTrue(v and ":" not in v, (k, v))
 

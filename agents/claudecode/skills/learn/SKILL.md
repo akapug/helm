@@ -26,7 +26,7 @@ helm store add premise "<kebab-id> | <STATEMENT> | <keywords,csv> | <domain>" \
 ```
 
 One pipe-delimited string, not separate args (a malformed capture swallows
-the statement into the id — measured 2026-07-22). Types: `premise` (certain,
+the statement into the id). Types: `premise` (certain,
 conf 1.0 — owner canon and proven facts), `prior` (belief + confidence),
 `heuristic` (a move + trigger), `lexicon` (a term), `reference` (a pointer).
 

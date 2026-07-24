@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""capability — the wired-substrate SELF-INDEX (AX meta-gap, owner 2026-07-23).
+"""capability — the wired-substrate SELF-INDEX (AX meta-gap).
 
 helm's north-star is "agents get the truth about the substrate they run on,
 injected every turn" — but it FAILED ON ITSELF: an agent reasoning about the

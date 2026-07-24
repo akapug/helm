@@ -35,7 +35,7 @@ let me just" OR a "the options are A or B" coming on.
 1. **"It's late / do it tomorrow / needs fresh energy" — OR "I'm deep in a long session / context is
    heavy, defer this big task to fresh context."** You have NO fatigue, NO time-of-day, AND
    CONTEXT-DEPTH IS NOT A GATE EITHER. helm sessions run days-to-weeks; "late in a long session /
-   fatigued context" is the SAME punt as "fresh energy" (owner ruling 2026-06-09, kept as history).
+   fatigued context" is the SAME punt as "fresh energy" (owner ruling, kept as history).
    When context fills, you MANAGE it with tools and proceed: archive open work to the integration board,
    checkpoint to memory, dispatch subagents for big-LoC work, prune + re-triage the tasklist, /compact deliberately.
    A big task is never deferred for "fresh context" — it's decomposed + tooled. Capacity = real

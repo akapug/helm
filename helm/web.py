@@ -943,7 +943,7 @@ def _rooms_summary_invalidate():
     reflects it. Agent posts arrive via the CLI outside this process and stay
     TTL-bounded (<=3s — the old 2s poll already tolerated that lag).
 
-    LOCK-COUPLED (codex-3 re-clear, deterministic repro): a bare pop raced an
+    LOCK-COUPLED (deterministic repro): a bare pop raced an
     in-flight compute — a _rooms_summary_cached call that entered its locked
     compute BEFORE the pop published its now-stale summary AFTER it. Taking
     the same lock serializes: the pop waits out any in-flight publish, so
@@ -1070,7 +1070,7 @@ def _api_chat_older(qs):
         root = "?"
     # The stat is VALIDATED, not keyed. Baking a pre-sampled stat into the key
     # was a TOCTOU: an append between that sample and the serve left the sampled
-    # stat matching the OLD entry, so a stale total got served (codex-3: cached
+    # stat matching the OLD entry, so a stale total got served (cached
     # total 10 while the file already held 11). It also NEVER evicted — every
     # append minted a fresh stat -> a fresh key -> unbounded growth (12 appends,
     # 12 entries). Now the key is version-free (root, room, before, win) and the
@@ -1254,7 +1254,7 @@ def _api_chat_dm(payload):
     """The owner's TRUE 1:1 (the ledger 'message a seat' card routes single-
     seat sends here): one private recipient's lane, never a room post — the
     old path posted '@seat …' into #main and called it a DM (owner-flagged).
-    Exact-token addressee (seats.dm — premise exact-token-addressee-match);
+    Exact-token addressee (seats.dm);
     signed like a post; the recipient's beacon surfaces it."""
     from . import chat, seats
     text = str(payload.get("text") or "").strip()
@@ -1273,7 +1273,7 @@ def _seat_ephemeral(s):
     """An EPHEMERAL review-subagent (auto-named agent-<hex>, no home room, /tmp
     cwd) — a transient fan-out SA, not a conversational seat you would message.
     Tagged so the live 'message a seat' picker can hide it while it stays
-    QUERYABLE elsewhere (owner steer 2026-07-23: declutter, do not delete).
+    QUERYABLE elsewhere (by owner directive: declutter, do not delete).
     Delegates to seats._is_ephemeral_sa — ONE criterion for every surface that
     hides them (picker + the fleet-presence 'online' list)."""
     from . import seats
@@ -1549,7 +1549,7 @@ def _api_ledger_turn(qs):
 # ── ledger/native: the host-local telemetry surface — local reads only ──
 # The cave turn-ledger above is the DURABLE dregg attestation and, now that
 # dregg-primary signing is live (owner posts + premise anchors land as real
-# cave turns — premise dregg-primary-corrects-native-chain-misunderstanding),
+# cave turns — dregg primary corrects the native chain),
 # the PRIMARY evidence. This card is the complementary HOST-LOCAL layer: the
 # blake2b attest-chain (premise.py — a tamper-evident local record, honestly
 # never a dregg proof), the events journal (append-only mutation receipts,
@@ -1926,7 +1926,7 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 }
 
 
-# ---------- the SSE doorbell (REARCH-web-0.2 leg 2: poll -> push) ----------
+# ---------- the SSE doorbell (the web push rearchitecture: poll -> push) ----------
 # The settled pattern (server-push firehose):
 # push says "there's news", the EXISTING cursor read fetches it — events are
 # DOORBELLS, never payloads, so the read endpoints stay the one render truth.
@@ -1936,7 +1936,7 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 # the coalescer: a burst of posts is at most 4 doorbells/s. Keepalive comment
 # every 20s + no-cache/no-transform (the anti-proxy-buffering headers);
 # EventSource gives the client auto-reconnect for free.
-# ---------- the SSE doorbell (REARCH-web-0.2 leg 2: poll -> push) ----------
+# ---------- the SSE doorbell (the web push rearchitecture: poll -> push) ----------
 # The settled pattern (server-push firehose):
 # push says "there's news", the EXISTING cursor read fetches it — events are
 # DOORBELLS, never payloads, so the read endpoints stay the one render truth.
@@ -1974,7 +1974,7 @@ def _chat_fingerprint():
     dir also holds THOUSANDS of cursor/lock/stopwhisper state files (9,085
     measured live) — statting them made 7/8 doorbells noise, and because DMs
     live in the dm/ SUBDIR a flat listdir MISSED real DM appends entirely
-    (codex-3 xrev, both E2E-reproduced). The file NAME is folded into each
+    (both E2E-reproduced). The file NAME is folded into each
     term so two logs swapping identical (mtime,size) cannot cancel
     (collision-safe generation)."""
     from . import chat
@@ -2174,7 +2174,7 @@ class Handler(BaseHTTPRequestHandler):
         comment on 5s of quiet (the short tick doubles as the health/teardown
         cadence). The client's EventSource reconnects itself; a vanished
         client just raises into the quiet except below. Three exits beyond
-        client-gone (codex-3 xrev, all E2E-reproduced): a RECONNECT with a
+        client-gone (all E2E-reproduced): a RECONNECT with a
         stale Last-Event-ID gets an IMMEDIATE catch-up doorbell (events are
         contentless, so one ring replays any gap — the cursor read carries
         the payload); a DEAD WATCHER ends the stream (keepalives from a

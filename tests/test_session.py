@@ -1125,7 +1125,7 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertFalse(session._is_nonpersistent(["claude", "-p", "hi"]))
 
     def test_the_inert_flag_outside_print_mode_never_certifies(self):
-        # fable review MED: the CLI documents --no-session-persistence
+        # Review finding: the CLI documents --no-session-persistence
         # '(only works with --print)' — in an interactive pane the flag is
         # INERT and a real session persists, so the flag alone must never
         # green the row. Sessionless is proven only by flag AND print mode.
@@ -1142,13 +1142,13 @@ class HeadlessCensusTest(unittest.TestCase):
         for target in ("pipe:[4242]", "socket:[9]", "/dev/null", "/tmp/in"):
             self.assertTrue(session._stdin_redirected(target), target)
         # /dev/ptmx is the pty MASTER — isatty-true, a live terminal, never
-        # redirection proof (fable delta-adversarial LOW)
+        # redirection proof (adversarial review)
         for target in ("/dev/pts/4", "/dev/tty2", "/dev/console",
                        "/dev/ptmx", "", None):
             self.assertFalse(session._stdin_redirected(target), target)
 
     def test_a_flag_in_a_value_position_declares_nothing(self):
-        # fable review LOW: commander hands a required option-argument the
+        # Review finding: commander hands a required option-argument the
         # next token even when flag-shaped, so in `--append-system-prompt
         # --no-session-persistence` the flag is PROMPT TEXT. Reading it as
         # declared nonpersistence would green a session the CLI persists —
@@ -1186,7 +1186,7 @@ class HeadlessCensusTest(unittest.TestCase):
     SID_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
     def test_resume_sid_honors_the_option_terminator(self):
-        # codex round-2 HIGH 1, exact probe: a resume token entirely after
+        # Review finding, exact probe: a resume token entirely after
         # `--` is positional prompt prose under the same option-region law as
         # _argv_flag — it must never mint a proven session identity and enter
         # live-holder/DOUBLE-OPEN arithmetic
@@ -1211,7 +1211,7 @@ class HeadlessCensusTest(unittest.TestCase):
             ["claude", "--resume", "--", self.SID_A]))
 
     def test_an_invalid_resume_occurrence_poisons_a_valid_one(self):
-        # codex-2 round-3 MED: the fleet lane's fail-closed law, kept intact
+        # Review finding: the fleet lane's fail-closed law, kept intact
         # while adding the terminator — a valid occurrence beside an invalid
         # one is contradictory evidence, not a majority vote
         for argv in (["claude", "--resume", self.SID_A, "--resume"],
@@ -1231,7 +1231,7 @@ class HeadlessCensusTest(unittest.TestCase):
             self.SID_A)
 
     def test_short_resume_alias_attributes_the_holder(self):
-        # codex advisory HIGH: the real CLI resumes via `-r <sid>`, attached
+        # Review advisory: the real CLI resumes via `-r <sid>`, attached
         # `-r<sid>`, and cluster `-pr <sid>` (commander splits boolean shorts
         # off before a value-taking one) — all measured against the binary.
         # A holder spawned through the short alias must not silently vanish.
@@ -1348,7 +1348,7 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertFalse(session._is_headless(["claude", "--", "-pr"]))
 
     def test_a_cluster_in_a_value_position_is_opaque(self):
-        # fable delta-adversarial HIGH pair: commander hands `--model` the
+        # Adversarial review: commander hands `--model` the
         # next token RAW, so in `--model -cp` the cluster is the MODEL NAME
         # (measured: `claude --model -cr` errors about --print input — no
         # continue, no resume parsed). Expanding it defeated the
@@ -1370,7 +1370,7 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertFalse(session._is_headless(["claude", "--model", "-pc"]))
 
     def test_prose_in_a_value_slot_never_poisons_a_real_holder(self):
-        # the legit-case regression (fable delta-adversarial MED): prompt
+        # the legit-case regression (adversarial review): prompt
         # prose that merely LOOKS like a short cluster must stay opaque —
         # expanding it poisoned the parse and demoted a proven holder
         self.assertEqual(
@@ -1392,8 +1392,8 @@ class HeadlessCensusTest(unittest.TestCase):
             self.SID_A)
 
     def test_measured_booleans_cannot_orphan_their_neighbor(self):
-        # the regression the first value-position guard shipped (fable
-        # delta-composition LOW): with only three measured booleans,
+        # the regression the first value-position guard shipped (adversarial
+        # review): with only three measured booleans,
         # `claude --dangerously-skip-permissions -p` — the fleet's single
         # most common spawn shape — fell to UNKNOWN on a tty. Every flag here
         # is MEASURED boolean against the real CLI (2.1.218, 2026-07-22):
@@ -1462,7 +1462,7 @@ class HeadlessCensusTest(unittest.TestCase):
                 "ancestor_sid8": "", "force": False, "headless": headless,
                 "nonpersistent": False}
         base.update(kw)
-        # identity mirrors the census derivation (codex-2 round-3: synthetic
+        # identity mirrors the census derivation (review note: synthetic
         # rows must not manufacture shapes _proc_claude_rows never emits — a
         # real row with a session but no declared/resume is who-attributed);
         # tests probing the defensive unknown-hint shape override explicitly
@@ -1501,7 +1501,7 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertNotIn("UNKNOWN", out)
 
     def test_an_interactive_pane_with_the_inert_flag_fails_closed(self):
-        # fable review MED, exact probe row: interactive `claude
+        # Review finding, exact probe row: interactive `claude
         # --no-session-persistence` has the flag INERT and a real persisted
         # session — before the fix it certified rc=0 under the false label
         # 'headless one-shot'. It is an UNRESOLVED session, and the render
@@ -1514,7 +1514,7 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertNotIn("headless one-shot", out)
 
     def test_plain_print_mode_without_identity_fails_closed_as_unknown(self):
-        # codex round-2 HIGH 2, exact probe: plain -p persists a transcript by
+        # Review finding, exact probe: plain -p persists a transcript by
         # default, so a -p row with no resolvable SID is an UNRESOLVED
         # session, never "no session by design" — certify must refuse rc=0
         rc, out, err = self.ls([self.row(9, None, True)], {}, certify=True)
@@ -1557,7 +1557,7 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertNotIn("headless one-shot", out)
 
     def test_an_inherited_hint_with_no_live_holder_fails_closed(self):
-        # fable review (composition lens): "risk belongs to its holder" names
+        # Review (composition lens): "risk belongs to its holder" names
         # NOBODY when no holder row exists in the census. The shape is
         # impossible today — _proc_claude_rows only sets `session` from
         # canonical rungs — and an impossible shape must fail closed as
@@ -1573,7 +1573,7 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertNotIn("headless one-shot", out)
 
     def test_who_attribution_is_the_processes_own_identity_not_a_hint(self):
-        # codex-2 round-3 HIGH, exact probe row: _proc_claude_rows suppresses
+        # Review finding, exact probe row: _proc_claude_rows suppresses
         # who for child processes and who dedupes shared sessions, so a
         # surviving identity=='who' row is the process's OWN exact canonical
         # attribution — a proven holder that must stay in live-holder
@@ -1595,7 +1595,7 @@ class HeadlessCensusTest(unittest.TestCase):
         self.assertIn("DOUBLE-OPEN", out)
 
     def test_nonpersistence_never_flips_a_who_attributed_holder_sessionless(self):
-        # codex-2's second probe arm: adding nonpersistent to the who row made
+        # The second probe arm: adding nonpersistent to the who row made
         # _sessionless_oneshot true — certifying green a process whose exact
         # attribution proves it operates on session X while it lives
         r = self.row(2, "sid-x", True, nonpersistent=True)
@@ -1615,7 +1615,7 @@ class HeadlessCensusTest(unittest.TestCase):
             [2])
 
     def test_a_print_mode_resume_is_a_real_holder_and_double_open(self):
-        # BOTH reviewers' HIGH: `claude -p --resume X` operates on a proven
+        # BOTH reviewers flagged: `claude -p --resume X` operates on a proven
         # resumable session; overlapping an interactive holder of X it IS a
         # DOUBLE-OPEN, and excluding it on -p alone hides the violation
         rows = [self.row(1, "sid-x", False),

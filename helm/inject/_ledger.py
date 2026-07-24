@@ -136,11 +136,11 @@ def _seen_save(session, state):
 
 
 # ---------------------------------------------------------------------------
-# lane-split eval — the read-only cohort analyzer (--lane-report)
+# cohort analyzer — the read-only fire-ledger cohort report (--lane-report)
 # ---------------------------------------------------------------------------
 
 def _cohort(e):
-    """The lane-split-eval razor (ember's-claude vision review, 2026-07-19):
+    """The facts-vs-judgment cohort razor:
     'facts' = knowledge that makes a capable model fluent — lexicon terms,
     certain priors (premises / decisions-of-record), references; 'judgment' =
     steering that could anchor it — heuristic moves, sub-certain belief
@@ -188,7 +188,7 @@ def lane_report(project=None):
     are not ledgered), session spread, cooldown suppression, and the
     silent-rate first-half vs second-half trend. DELIVERY ONLY: the ledger
     logs fires, not heeds — anchoring is NOT measurable here; the
-    outcome-marker protocol lives in evals/2026-07-19-lane-split-eval.md."""
+    outcome-marker protocol is measured out-of-band."""
     rows = _ledger_rows()
     try:
         by_id = {str(e["id"]): e for e in load_entries(project)}
@@ -268,5 +268,5 @@ def _lane_report(project=None):
         _pct(r["silent"], r["rows"]), _pct(h1[0], h1[1]), _pct(h2[0], h2[1])))
     print("bytes~ = today's rendering x fires (per-entry bytes are not ledgered).")
     print("DELIVERY ONLY: fires are not heeds — the anchoring verdict needs the")
-    print("outcome markers in evals/2026-07-19-lane-split-eval.md.")
+    print("outcome markers, measured out-of-band.")
     return 0

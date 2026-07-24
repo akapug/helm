@@ -1115,7 +1115,7 @@ class WhisperTest(InjectBase):
 
 
 class SaWhisperTest(InjectBase):
-    """The codex-only SA whisper (owner ask 2026-07-21): a codex-family seat
+    """The codex-only SA whisper (owner ask): a codex-family seat
     gets ONE terse delegate-to-subagents pinned line, justification left out;
     claude-family seats NEVER see it. Family rides the ONE existing resolver
     (HELM_CHAT_NAME -> seat._seat_family), the line walks LAST in
@@ -1157,7 +1157,7 @@ class SaWhisperTest(InjectBase):
 
     def test_claude_family_seats_never_get_it(self):
         self.plant_pinned("pin-a", "always truth")
-        for name in (None, "helm-fable", "claude", "opus-integrator", "fable-2"):
+        for name in (None, "helm-fable", "claude", "integrator-1", "fable-2"):
             self.seat(name)
             got = inject.gather("anything")["pinned"]
             self.assertNotIn(inject.SA_WHISPER, got,
@@ -1216,7 +1216,7 @@ class SaWhisperTest(InjectBase):
 
 
 class ClaimWhisperTest(InjectBase):
-    """The codex-only claim-start whisper (owner ask 2026-07-23): a codex
+    """The codex-only claim-start whisper (owner ask): a codex
     claimed two lanes then STOPPED without starting the writers — law-5's
     'end turns at bounded milestones' read as 'posted my claim'. The second
     SA_LINES line teaches claim-is-a-start-not-a-stop, terse, justification
@@ -1439,8 +1439,7 @@ class CompareBackendTest(InjectBase):
 
 
 class CouncilReachTest(InjectBase):
-    """The council reach rung (premise council-is-the-number-one-feature +
-    feature-and-rsh-must-both-be-wired): the recorded failure was
+    """The council reach rung: the recorded failure was
     SALIENCE — the meld verb existed and agents never reached for it. >= 3
     ping-pong rounds with ONE peer in the home room -> one latched nudge
     naming the exact council invite command; a new streak re-arms."""

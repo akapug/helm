@@ -57,7 +57,7 @@ One row per census (same-uid live claude) process:
   skill-deck env, - = unset).
 
 Every column comes from a live probe; nothing is cached. A FAILED probe is
-UNKNOWN, never an absence fact (premise failed-probe-not-absence): HEADLESS is
+UNKNOWN, never an absence fact: HEADLESS is
 a PROVEN verdict (a fully-parsed ppid walk that reached init, touching no pid
 the daemon scan left unproven); an unparsable hop, exhausted walk, stale or
 unprovable daemon evidence, failed daemon scan, unreadable environ/cwd,

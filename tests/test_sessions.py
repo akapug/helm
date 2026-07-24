@@ -519,7 +519,7 @@ class ResumeKickTest(unittest.TestCase):
 
 
 class AdversarialIdentityTest(unittest.TestCase):
-    """The two classes codex-3's read-only pass confirmed uncovered: a recycled
+    """The two classes a read-only review confirmed uncovered: a recycled
     pid wearing a stale record, and equal-authority binding conflicts."""
 
     def setUp(self):
@@ -559,7 +559,7 @@ class AdversarialIdentityTest(unittest.TestCase):
             self.assertEqual(sessions.live_sids(), {"sid-r": 4242})
 
     def test_rung0_cannot_latch_a_recycled_pids_home(self):
-        # the xrev repro: stale record -> live `sleep` pid -> its unrelated
+        # the cross-family review repro: stale record -> live `sleep` pid -> its unrelated
         # CLAUDE_CONFIG_DIR read as environ TRUTH and latched. With the pid
         # gate closed, rung 0 never fires and nothing is latched.
         with mock.patch.object(sessions, "_pid_is_claude", return_value=False), \

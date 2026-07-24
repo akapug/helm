@@ -188,7 +188,7 @@ class GuardTest(Slice6Base):
         self.assertIn("integer", err)
 
     def test_instance_gate_refuses_zero_padded_alias(self):
-        # fable adversarial LOW: codex-02 parses int()==2 but names a DISTINCT
+        # Adversarial review: codex-02 parses int()==2 but names a DISTINCT
         # proxy home aliasing codex-2's port. The gate refuses non-canonical
         # names up front, while the canonical N>=2 stays admissible.
         self.assertIsNone(seat._instance_gate("codex", "codex-2"))
@@ -272,12 +272,12 @@ class PerInstanceProxyTest(Slice6Base):
 
 
 class ProxyFixRoundTest(Slice6Base):
-    """The codex xrev FIX round on 7bb422a: token never in argv/text, mint-order
+    """A cross-family review FIX round: token never in argv/text, mint-order
     immunity, per-instance spawn fate, birth-identity pid guard, and the
     unsupported-family gate. Each test names the finding it closes."""
 
     def test_launch_line_never_carries_the_literal_token(self):
-        # no-keys-in-argv (the round-2 re-review): launch_line carries NO token
+        # no-keys-in-argv (re-review): launch_line carries NO token
         # at all — neither the literal NOR a NAME=value for the external env
         # binary. The bearer is exported separately by `_token_export`.
         seat._mint_instance_proxy("codex", "codex-2")
@@ -306,7 +306,7 @@ class ProxyFixRoundTest(Slice6Base):
                          full.split("env ", 1)[1])  # env argv carries no secret
 
     def test_token_export_is_mint_order_immune(self):
-        # first-mint (round-1 finding): the export rendered BEFORE the mint
+        # first-mint (review finding): the export rendered BEFORE the mint
         # points at the instance path, so it resolves the token the mint writes.
         pre = seat._token_export("codex", "codex-2")        # pre-mint
         seat._mint_instance_proxy("codex", "codex-2")
@@ -348,7 +348,7 @@ class ProxyFixRoundTest(Slice6Base):
         self.assertEqual(seat._running_pid("codex", "codex-2"), live)
 
     def test_unauthenticated_pid_record_fails_closed(self):
-        # round-2 finding: a BARE pid (legacy, no identity) or a '?' (failed
+        # Review note: a BARE pid (legacy, no identity) or a '?' (failed
         # capture) must NOT be trusted on the alive check alone — that is the
         # reused-pid SIGTERM hazard. `_running_pid` returns None (stale/refused)
         # and `_down` never signals the number. Probe with our OWN live pid.
@@ -437,7 +437,7 @@ class ProxyFixRoundTest(Slice6Base):
         self.assertTrue(os.path.exists(os.path.join(home, "proxy.pid")))
 
     def test_down_survives_a_vanishing_unlink_guard_reread(self):
-        # codex-2 advisory on 224e6b5, SUPERSEDED shape: pre-refactor _down
+        # a review advisory (SUPERSEDED shape): pre-refactor _down
         # re-read the pidfile for ownership AFTER verifying it, and a None/
         # wrong-pid re-read had to refuse (rc 1). The atomicity fix threads ONE
         # authenticated snapshot through signal+unlink, so the ONLY remaining
@@ -537,12 +537,12 @@ class ProxyFixRoundTest(Slice6Base):
 
 
 class FableRoundTest(Slice6Base):
-    """The fable-pair (land-gate) findings on 224e6b5: spawn/resume mint the
+    """The land-gate review findings: spawn/resume mint the
     instance proxy (the silent-dead-seat HIGH), the spawn-seam family/name
     gate, and the hostile-pidfile corpus. Each test names its finding."""
 
     def test_spawn_mints_the_instance_proxy(self):
-        # HIGH: spawn of a never-launched instance produced a DEAD seat —
+        # Finding: spawn of a never-launched instance produced a DEAD seat —
         # launch.sh pointed at the instance port with an EMPTY token, no proxy
         # auto-started, no warning (the seat_cfg-exists gate silently no-opped).
         # Now _spawn mints the instance proxy (idempotent) BEFORE the gate, so
@@ -557,7 +557,7 @@ class FableRoundTest(Slice6Base):
         self.assertTrue(seat._read_token("codex", "codex-2"))
 
     def test_spawn_refuses_proxy_key_family_instances(self):
-        # MED: the family gate lived only on `launch`; `spawn kimi-2` minted a
+        # Finding: the family gate lived only on `launch`; `spawn kimi-2` minted a
         # launch line pointed at a sibling family's port. Now refused rc 2.
         os.makedirs(seat.seat_dir("kimi"), exist_ok=True)
         seat._write_private(os.path.join(seat.seat_dir("kimi"), "config.yaml"),
@@ -569,7 +569,7 @@ class FableRoundTest(Slice6Base):
         self.assertIn("mode=proxy", err.getvalue())
 
     def test_spawn_refuses_instance_one_name(self):
-        # MED: `codex-1` maps onto the family AND base+1 collides with the
+        # Finding: `codex-1` maps onto the family AND base+1 collides with the
         # adjacent family's base port (codex-1 -> 8318 = kimi's). Refused rc 2.
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -578,7 +578,7 @@ class FableRoundTest(Slice6Base):
         self.assertIn("not a distinct instance", err.getvalue())
 
     def test_resume_applies_the_same_instance_gate(self):
-        # MED (fable-comp on 2a93541): the spawn-seam gate lived ONLY on
+        # Finding: the spawn-seam gate lived ONLY on
         # _spawn — `_resume` minted instance assets for the very seats spawn
         # refuses (kimi-2 proxy-key, codex-1 not-distinct). ONE shared
         # predicate now serves both verbs; resume refuses rc 2 BEFORE minting.
@@ -598,10 +598,10 @@ class FableRoundTest(Slice6Base):
             self.assertIn(marker, err.getvalue())
 
     def test_down_threads_one_authenticated_record(self):
-        # HIGH (codex-2 advisory carried forward): _down authenticates from ONE
+        # Review advisory carried forward: _down authenticates from ONE
         # owned snapshot read under the lock, and threads THAT record through
         # signal+unlink — a hostile later re-read can never split the verify
-        # from the kill (the 224e6b5 None-subscript crash class). Probe: the
+        # from the kill (the None-subscript crash class). Probe: the
         # FIRST (authentication) read returns a valid owned record; any LATER
         # read (the unlink guard's re-check) returns None. _down must still
         # complete rc 0 without crashing — the only effect of the hostile
@@ -647,7 +647,7 @@ class FableRoundTest(Slice6Base):
                         "the re-read vanished")
 
     def test_hostile_pidfile_corpus_fails_closed(self):
-        # LOW: every hostile pidfile shape must fail CLOSED (no signal, no
+        # Finding: every hostile pidfile shape must fail CLOSED (no signal, no
         # crash) — including an overflow-sized pid (was an uncaught
         # OverflowError). Probe each through _running_pid with our own live pid.
         home = seat._proxy_home("codex", "codex-2")
@@ -666,7 +666,7 @@ class FableRoundTest(Slice6Base):
                               "hostile pidfile must fail closed (rec): %r" % body)
 
     def test_sub2_pid_reaps_without_kill_advice(self):
-        # fable adversarial MED: a corrupt proxy.pid carrying 0/1/-1 must never
+        # Adversarial review: a corrupt proxy.pid carrying 0/1/-1 must never
         # surface `kill -1`/`kill 0` in _down's remediation — agents paste that
         # advice verbatim and kill -1 SIGTERMs the whole signal set. The record
         # parse itself rejects pid < 2, so _down takes the stale-reap path.

@@ -6,7 +6,7 @@ so a CLI-class land is live AT LAND. But LONG-LIVED processes keep executing
 the code they loaded at start: an armed `helm chat wait --follow` inbox beacon,
 the web service, seat proxies/daemons. Until each re-arms, the fix has not
 reached them. `helm rearm` is the CHEAP OWNED pass that closes that gap
-minutes after a land batch (premise land-to-live-compression-owner-directive).
+minutes after a land batch.
 
   * dry-run DEFAULT: report which live processes still hold PRE-HEAD code —
     every `helm chat wait` waiter (owning seat + start, STALE if it started

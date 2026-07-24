@@ -18,11 +18,6 @@
       the dedup could cause — two DIFFERENT accounts sharing one email — and
       asserting they stay two records, each carrying only its own token.
 
-  (C) REBOOT CHECKLIST — the docs/REBOOT_CHECKLIST_1.4.149.md exists and
-      names the exact checks (with expected results) an operator runs at the
-      live claude 1.4.149 switch, so credhoming parity is re-verifiable by
-      hand at the moment it matters.
-
 Hermetic: HELM_HOME/HELM_CHAT_DIR/HELM_PROC + seat.CODEX_HOMES all point at
 tmp dirs; the exec'd `claude` is a throwaway shim on a scoped PATH; no real
 claude, no real credential home, no login, no network.
@@ -279,30 +274,6 @@ class PerAccountIsolationTest(_SeatBase):
         }, "last_refresh": "2026-07-09T14:52:47.713051089Z"}
         with open(os.path.join(d, "auth.json"), "w") as f:
             json.dump(auth, f)
-
-
-class RebootChecklistTest(unittest.TestCase):
-    """(C) the 1.4.149 reboot checklist is present and concretely actionable."""
-
-    PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "docs", "REBOOT_CHECKLIST_1.4.149.md")
-
-    def test_checklist_exists_and_names_exact_checks(self):
-        self.assertTrue(os.path.exists(self.PATH), self.PATH)
-        with open(self.PATH) as f:
-            text = f.read()
-        # each check the operator runs at the switch is present by command…
-        for cmd in ("helm codex list", "helm seat launch codex",
-                    "helm seat resume codex", "helm doctor",
-                    "HELM_METAHARNESS=none"):
-            self.assertIn(cmd, text, cmd)
-        # …and every check states an EXPECTED result, not just a command
-        self.assertIn("EXPECT", text)
-        # the two owner concerns are each an explicit row
-        self.assertIn("authoritative", text.lower())
-        self.assertIn("isolation", text.lower())
-        # the without-orca path is a first-class row (helm runs standalone)
-        self.assertIn("without", text.lower())
 
 
 if __name__ == "__main__":

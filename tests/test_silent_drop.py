@@ -142,12 +142,12 @@ class SilentDropTest(unittest.TestCase):
              "ts": "2026-07-23T10:00:00Z", "suppressed_since_last": 7}
         self.assertIn("+7 more drops", silent_drop._alert_text(f))
 
-    def test_alert_text_names_seat_tokens_and_integrator(self):
+    def test_alert_text_names_seat_tokens_and_recipient(self):
         txt = silent_drop._alert_text(
             {"seat": "codex", "output_tokens": 103, "session": SID,
              "ts": "2026-07-23T10:00:00Z"})
         self.assertIn("@codex", txt)
-        self.assertIn("@opus-integrator", txt)
+        self.assertIn("@coordinator", txt)
         self.assertIn("103", txt)
         self.assertIn("SILENT-DROP", txt)
 

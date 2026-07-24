@@ -60,7 +60,7 @@ class FakeEstate(unittest.TestCase):
         dsk = j(self.default, "skills")
         os.makedirs(dsk)
         os.symlink(j(self.agents, "orca-cli"), j(dsk, "orca-cli"))
-        _mk_skill(dsk, "fleet-usage", "fleet usage", age=200)
+        _mk_skill(dsk, "team-metrics", "team metrics", age=200)
         # and a skill NEWER than canonical's copy (newest-wins replacement)
         _mk_skill(dsk, "build", "the build skill, newer edit", age=10)
 
@@ -94,7 +94,7 @@ class FakeEstate(unittest.TestCase):
         r = self._sync(apply=False)
         self.assertEqual(r["failed"], [])
         names = {n for n, _ in r["merged"]}
-        self.assertEqual(names, {"personal-skill", "orca-cli", "fleet-usage", "build"})
+        self.assertEqual(names, {"personal-skill", "orca-cli", "team-metrics", "build"})
         self.assertFalse(os.path.exists(os.path.join(self.canon, "personal-skill")))
         self.assertFalse(os.path.islink(
             os.path.join(self.croot, "team-example-com", "skills")))
@@ -116,7 +116,7 @@ class FakeEstate(unittest.TestCase):
         shelf = os.path.join(self.backup, "canonical-displaced")
         self.assertTrue(any(e.startswith("build-") for e in os.listdir(shelf)))
         # stray symlink skill adopted (as a copy or link, name present)
-        self.assertIn("fleet-usage", os.listdir(self.canon))
+        self.assertIn("team-metrics", os.listdir(self.canon))
         # every config dir is now a DIRECT symlink to canonical
         for _label, cdir in self.dirs:
             s = os.path.join(cdir, "skills")

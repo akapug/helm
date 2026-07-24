@@ -4,7 +4,7 @@
 A seat gives a NON-Claude model family the full claude-code harness (hooks,
 skills, subagents) by pointing one isolated claude invocation at a local
 Anthropic-wire proxy (CLIProxyAPI) that authenticates to the family's own
-subscription OAuth. Proven live 2026-07-18 (see the claudex seat eval): codex
+subscription OAuth. Proven live end-to-end: codex
 gpt-5.6-sol passed plain-prompt, tool round-trip, and subagent-spawn legs.
 
 Family table is data: "proxy" families (codex/OpenAI OAuth) need CLIProxyAPI;
@@ -399,7 +399,7 @@ import contextlib as _contextlib
 
 def _instance_gate(family, seat_name):
     """The ONE per-instance admissibility predicate, shared by every verb that
-    can mint instance assets (spawn/resume — the fable MED was this gate
+    can mint instance assets (spawn/resume — a review found this gate
     living on spawn alone, so resume minted the very seats spawn refuses).
     Returns an error string to print, or None when the seat may proceed.
     Per-instance proxies are a proxy-family (OAuth-pool) feature; and the
@@ -419,7 +419,7 @@ def _instance_gate(family, seat_name):
         # whose derived port aliases the canonical instance's (codex-02 ->
         # instances/codex-02 yet port base+2 = codex-2's) — two homes/tokens,
         # one port, a confusing pre-bound-port failure. Refuse non-canonical
-        # up front (fable adversarial LOW).
+        # up front (an adversarial review finding).
         return ("%s is not a canonical instance name — a zero-padded suffix "
                 "aliases `%s-%d`'s port with a separate proxy home; use "
                 "`%s-%d`" % (seat_name, family, int(m.group(1)),
@@ -468,7 +468,7 @@ def _proxy_pid_record(family, seat=None):
     # or the process-group / whole-signal-set selectors for kill(2). Treat a
     # corrupt file carrying one as stale (never signalled, reported down) so
     # _down's remediation never echoes `kill -1`/`kill 0` into advice an agent
-    # would paste verbatim (fable adversarial MED — the signal path was already
+    # would paste verbatim (an adversarial review finding — the signal path was already
     # fail-closed, but the printed suggestion was not).
     if pid < 2:
         return None
@@ -641,7 +641,7 @@ def _config_yaml(port, auth_dir, token):
     (compaction's ~360k summarize — the longest single request a session
     makes) sits silent while the upstream thinks, the proxy reaps the idle
     socket, and Claude Code gets an empty HTTP 200 ('proxy or gateway
-    intercepting') — owner-witnessed on a codex-2 /compact 2026-07-22. The
+    intercepting') — observed on a seat /compact. The
     live family configs carry 15s by hand; the generator must emit it too or
     every re-mint silently strips the fix (as-prevented)."""
     return ('host: "127.0.0.1"\n'
@@ -657,7 +657,7 @@ def _config_yaml(port, auth_dir, token):
             "  disable-control-panel: true\n"
             # heartbeat during long non-streaming thinking passes — see docstring.
             "nonstream-keepalive-interval: 15\n"
-            # the STREAMING leg too (owner-witnessed 2026-07-22: with the
+            # the STREAMING leg too (owner-witnessed: with the
             # nonstream keepalive already loaded, EVERY request at ~90% context
             # still died empty-200 — the stream stalls before/during bytes at
             # extreme payload sizes). keepalive-seconds emits SSE heartbeats so
@@ -753,12 +753,12 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     undo an operator rehome/clear. The command clears inherited room/source
     first, making explicit --room and project-less un-homed launches stable.
     --dangerously-skip-permissions is CANONICAL for a fleet seat
-    (owner-asked 2026-07-21): an agent pane exists to do work unattended, and
+    (owner-asked): an agent pane exists to do work unattended, and
     a per-tool permission prompt strands it silently (the owner had to flip
     kimi/codex into auto-mode by hand). The beacon permit narrows an
     interactive session; a launched seat skips wholesale — it never has a
     human at its keyboard to answer a prompt. `multi` (the proven mixed-model
-    law, premise multimodel-one-cc-proven-per-agent-frontmatter-no-fork):
+    law):
     DROP CLAUDE_CODE_SUBAGENT_MODEL entirely — that env var blunt-pins EVERY
     subagent to one model, overriding the per-agent `model:` frontmatter that
     IS the mixed-fleet mechanism; the probe agents minted beside this line
@@ -781,7 +781,7 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
         ctxenv += " CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d" % fam["max_context"]
     # --multi: no pin (frontmatter routes per-subagent); default: today's line.
     pin = "" if multi else " CLAUDE_CODE_SUBAGENT_MODEL=%s" % model
-    # NO-keys-in-argv (codex-2 re-review): the bearer is NEVER a NAME=value arg
+    # NO-keys-in-argv (hardened by review): the bearer is NEVER a NAME=value arg
     # to the EXTERNAL `env` binary — `env TOKEN=$(cat f)` would put the
     # resolved secret in env's OWN argv (/proc/pid/cmdline). Instead the token
     # is exported into the seat's environ by `_token_export` (a shell builtin,
@@ -978,8 +978,8 @@ def _seed_onboarding(cdir, workdir=None, family=None):
     """Seed a fresh seat's safe boot state without copying identity or sessions.
 
     Onboarding/trust state skips two interactive wizards. Same-family feature
-    cache state preserves Claude Code's deferred tool surface (proven 2026-07-22:
-    cache-less codex-2 omitted Monitor while a cache-backed A/B launch exposed
+    cache state preserves Claude Code's deferred tool surface (a
+    cache-less seat omitted Monitor while a cache-backed A/B launch exposed
     it). Never clobber a seat's own state. Best-effort, non-fatal, but a missing
     feature source is loud because the launched seat may be unwakeable.
     """
@@ -1056,7 +1056,7 @@ def _seed_seat_settings(cdir):
     """CC 2.1.216 records bypass-permissions acceptance in settings.json
     (skipDangerousModePermissionPrompt), NOT .claude.json — so a launched
     --dangerously-skip-permissions seat stalls at the bypass warning without it
-    (proven 2026-07-21: codex-3). Merge it (+ a theme) into the settings.json
+    (verified). Merge it (+ a theme) into the settings.json
     that hooks.install_home just wrote, preserving the delivery-lane hooks.
     Best-effort, non-fatal."""
     from . import pk
@@ -1077,7 +1077,7 @@ def _seed_seat_settings(cdir):
 
 
 # The probe agent body: per-agent `model:` frontmatter is the WHOLE mixed-model
-# mechanism (premise multimodel-one-cc-proven-per-agent-frontmatter-no-fork) —
+# mechanism —
 # the string in `model:` goes to the wire per-request and the proxy conducts.
 _PROBE_AGENT_MD = """---
 name: %(name)s
@@ -1627,7 +1627,7 @@ def _down(family, seat=None):
         # ONE authenticated read, threaded through signal+unlink (the atomic-
         # ownership advisory): the verify and the kill act on the SAME owned
         # snapshot, so a transient re-read failure or malformed replacement
-        # mid-sequence can never split authentication from action (the 224e6b5
+        # mid-sequence can never split authentication from action (the
         # None-subscript crash class) — the record is already in hand.
         owned = _running_pid_rec(family, seat)
         if not owned:
@@ -1940,7 +1940,7 @@ def _resume(seat_name, rest, _locked=False):
         print("helm seat: " + err, file=sys.stderr)
         return 2
     # Same admissibility gate as `_spawn`, BEFORE anything is minted (the
-    # fable MED: resume bypassed it, so `resume kimi-2`/`resume codex-1` minted
+    # a review found: resume bypassed it, so `resume kimi-2`/`resume codex-1` minted
     # instance assets spawn would have refused).
     gate = _instance_gate(family, seat_name)
     if gate:
@@ -1964,8 +1964,8 @@ def _resume(seat_name, rest, _locked=False):
         # must still preserve the seat's DERIVABLE home — re-minting with
         # room=None would stamp the relaunch HELM_CHAT_ROOM-less and the
         # SessionStart join would fall back to #main, silently dropping the
-        # seat out of its project room (the kimi room-drop regression,
-        # 2026-07-23). Fall back to the one precedence (explicit env >
+        # seat out of its project room (a room-drop regression).
+        # Fall back to the one precedence (explicit env >
         # cwd-derived project room); a project-less seat stays un-homed.
         from . import seats as _seats
         room, room_source = _seats.resolve_homing(cwd=sess_cwd)
@@ -1998,7 +1998,7 @@ def _resume(seat_name, rest, _locked=False):
             family, d, room, seat_name, room_source=room_source, multi=multi)
         from . import seats
         # resume must not strand the seat on a dead proxy either (the same
-        # silent-dead-seat class the fable HIGH named in _spawn): mint the
+        # silent-dead-seat class a critical review finding named in _spawn): mint the
         # instance proxy (idempotent) and start it if down, so the relaunched
         # seat's 8319 line has a live proxy behind it.
         fam = FAMILIES[family]
@@ -2668,10 +2668,10 @@ def _spawn(seat_name, rest, _locked=False):
     if err:
         print("helm seat: " + err, file=sys.stderr)
         return 2
-    # Instance-spawn gate (the fable MED — it lived only on `launch`, so
+    # Instance-spawn gate (a review found — it lived only on `launch`, so
     # `spawn kimi-2` / `spawn codex-1` minted launch lines pointed at a SIBLING
     # family's port range). ONE shared predicate with `_resume` (the second
-    # fable MED: the gate on spawn alone let resume mint the refused seats).
+    # a review found: the gate on spawn alone let resume mint the refused seats).
     gate = _instance_gate(family, seat_name)
     if gate:
         print("helm seat: " + gate, file=sys.stderr)
@@ -2732,7 +2732,7 @@ def _spawn(seat_name, rest, _locked=False):
                          room_source=room_source, multi=multi)
     # per-instance proxy fate: an INSTANCE seat owns its OWN proxy
     # (instances/<seat>/), so spawn mints + starts THAT seat's proxy — never
-    # the family's. MINT FIRST (the fable HIGH): a never-launched instance has
+    # the family's. MINT FIRST (a critical review finding): a never-launched instance has
     # no config yet, and gating on its existence silently skipped BOTH the
     # auto-start AND the WARN — a spawn-first codex-2 launched DEAD (launch.sh
     # pointed at 8319, empty token, no proxy) where pre-lane it WORKED on the
@@ -3001,7 +3001,7 @@ def _doctor(args):
 
 
 # A live proxy still binding its port at startup must never read as WEDGED —
-# the fable adversarial MED: two back-to-back 0.5s connect probes with no grace
+# an adversarial review finding: two back-to-back 0.5s connect probes with no grace
 # let a just-launched proxy be SIGTERMed, and cron firing inside the boot window
 # churns kill->respawn->kill. Age source = pidfile mtime: _up writes the pidfile
 # atomically at spawn, so mtime ~= launch time and stays readable even when
@@ -3178,7 +3178,7 @@ def _ensure_row(family, seat):
         _down(family, seat)
     rc = _up(family, quiet=True, seat=seat)
     if rc != 0:
-        # concurrent-_up loser race (fable LOW): a seat launching in the same
+        # concurrent-_up loser race (a minor review finding): a seat launching in the same
         # instant wins the flock, our _up reads 'already running' (rc 1) — that
         # is not a failure, the row is now HEALTHY under the winner. Re-probe
         # before crying UNKNOWN.

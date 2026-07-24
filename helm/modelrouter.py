@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """helm router — the transparent multi-model router (modelrouter.py).
 
-WHY (premise multimodel-one-cc-proven-per-agent-frontmatter-no-fork, proven
-2026-07-21 on raw proxy conductor logs): mixed models in ONE claude-code
+WHY (verified on raw proxy conductor logs): mixed models in ONE claude-code
 process work on stock CLIProxyAPI — a Task subagent's `.claude/agents/*.md`
 frontmatter `model:` string goes to the wire PER-REQUEST and the proxy routes
 each request by model name. The one remaining gap is a CLAUDE parent:
@@ -11,7 +10,7 @@ Task tool or agent frontmatter), so a Claude-parent + codex-subagent instance
 needs ONE local endpoint that speaks to both worlds. This router is that
 endpoint.
 
-CANON (premise multimodel-router-transparent-claude-passthrough-oauth-only):
+CANON:
   - `claude-*` model requests are forwarded VERBATIM to api.anthropic.com —
     claude-code's OWN OAuth Authorization header, body, and headers ride
     untouched; NO substitution, NO re-auth. The router is a localhost relay

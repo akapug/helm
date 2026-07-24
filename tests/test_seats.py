@@ -111,7 +111,7 @@ class AddressingTest(SeatsBase):
         self.assertFalse(seats.deliverable(row("x", "ping @alice-2"), "alice"))
 
     def test_owner_rail_post_no_longer_auto_wakes(self):
-        """Owner steer 2026-07-21: owner-rail posts are no longer a wake class.
+        """Owner-rail posts are no longer a wake class.
         A server-stamped owner post with no @mention does NOT reach a seat (was:
         the 'owner rule' delivered a web/tui-stamped row); an owner post wakes a
         seat only via an @mention or the seat's home room. OWNER_RAILS/owner_names
@@ -201,7 +201,7 @@ class DeliverTest(SeatsBase):
         self.assertIsNone(seats.deliver(seat="alice"))
 
     def test_owner_rail_post_does_not_wake_without_mention(self):
-        """Owner steer 2026-07-21: an owner-rail post with no @mention no longer
+        """An owner-rail post with no @mention no longer
         wakes an un-homed seat; only a mention (or the home room) does."""
         self.seat_up()
         chat.post("course correction", who="owner", origin="web")
@@ -657,11 +657,10 @@ class WaitTest(SeatsBase):
 
 
 class MultiRoomTest(SeatsBase):
-    """Slice 5 (multi-room deliver) + its beacon half: an @mention in ANY room
-    must reach the seat — the owner's live helm-dogfood '@opus-integrator …'
-    post woke nothing because both the beacon and the boundary lane were
-    main-scoped (2026-07-21). (Owner-rail posts are no longer a wake class as of
-    the same day's owner steer — mentions + home room only.)"""
+    """Multi-room deliver + its beacon half: an @mention in ANY room
+    must reach the seat — an owner @mention post in a non-home room woke
+    nothing because both the beacon and the boundary lane were main-scoped.
+    (Owner-rail posts are no longer a wake class — mentions + home room only.)"""
 
     def test_mention_in_never_joined_room_wakes_the_beacon(self):
         """THE bug's reproduction: seat x's only activity is in team-x, a
@@ -692,7 +691,7 @@ class MultiRoomTest(SeatsBase):
         self.assertEqual(out, "")              # nothing left — no re-nudge
 
     def test_owner_post_wakes_only_via_home_or_mention(self):
-        """Owner steer 2026-07-21: owner-rail posts no longer auto-wake — not in
+        """Owner-rail posts no longer auto-wake — not in
         a side room, and no longer in main either. An un-homed seat hears an
         owner post ONLY if @mentioned; a seat HOMED to a room hears owner posts
         there (home = full surface). (Was: owner reach was {home, main}.)"""
@@ -807,7 +806,7 @@ class MultiRoomTest(SeatsBase):
     def test_roster_report_counts_cross_room_pending(self):
         seats.join(session="s-rr", seat="rr", cwd="/tmp/p")
         chat.post("@rr main one", who="bob")
-        chat.post("@rr dogfood two", who="bob", room="helm-dogfood")
+        chat.post("@rr dogfood two", who="bob", room="side-room")
         rep = seats.roster_report("main")
         s = [x for x in rep["seats"] if x["seat"] == "rr"][0]
         self.assertEqual(s["pending"], 2)
@@ -831,9 +830,8 @@ class MultiRoomTest(SeatsBase):
 
 
 class RoomAllowlistTest(SeatsBase):
-    """Homing under the BEACON-SCOPE law (premise beacon-scope-mentions-
-    plus-home-room-owner-posts-not-all, superseding the G1-G3 allowlist —
-    the allowlist starved codex-2 of an @codex-2 mention in #helm-dogfood):
+    """Homing under the BEACON-SCOPE law (superseding the G1-G3 allowlist —
+    the allowlist starved a homed seat of a direct @mention in a non-home room):
     a foreign team's @all / owner-post still never drafts a homed seat, but
     a direct @mention crosses EVERY room, always."""
 
@@ -868,8 +866,8 @@ class RoomAllowlistTest(SeatsBase):
                   room="team-b")
         chat.post("team b chatter", who="bob", room="team-b")
         self.assertIsNone(seats.deliver_any(session="s-ta", seat="ta"))
-        # …but a DIRECT @mention crosses any room, always (THE codex-2 bug:
-        # a homed seat never saw '@codex-2 …' posted in #helm-dogfood)
+        # …but a DIRECT @mention crosses any room, always (THE homed-seat bug:
+        # a homed seat never saw a direct @mention posted in a non-home room)
         chat.post("@ta foreign mention", who="bob", room="team-b")
         self.assertIn("foreign mention",
                       seats.deliver_any(session="s-ta", seat="ta"))
@@ -1020,19 +1018,19 @@ class BeaconScopeTest(SeatsBase):
 
     def test_codex2_repro_foreign_room_mention_wakes_main_homed_beacon(self):
         """THE live bug: codex-2 homed to #main never saw '@codex-2 …'
-        posted in #helm-dogfood — the homing allowlist starved the beacon."""
+        posted in #side-room — the homing allowlist starved the beacon."""
         os.environ["HELM_CHAT_ROOM"] = "main"
         seats.join(session="s-c2", seat="codex-2", cwd="/tmp/p")
         del os.environ["HELM_CHAT_ROOM"]
         self.assertEqual(seats.roster()["codex-2"]["home_room"], "main")
         chat.post("@codex-2 please pick this up", who="owner",
-                  room="helm-dogfood")
+                  room="side-room")
         captured = []
         seats.wait(seat="codex-2", session="s-c2", follow=True, timeout=0.15,
                    poll=0.01, emit=captured.append)
         self.assertEqual(len(captured), 1)
         self.assertIn("please pick this up", captured[0])
-        self.assertIn("#helm-dogfood", captured[0])
+        self.assertIn("#side-room", captured[0])
 
     def test_home_room_surfaces_everything(self):
         seats.join(session="s-h", seat="hm", cwd="/tmp/p", room="team-a")
@@ -1097,7 +1095,7 @@ class BeaconScopeTest(SeatsBase):
 
 
 class DMTest(SeatsBase):
-    """The 1:1 lane (premise exact-token-addressee-match): session/seat-keyed,
+    """The 1:1 lane: session/seat-keyed,
     exactly one recipient, zero room fanout, renders as a DM, signs like a
     post."""
 
@@ -1234,7 +1232,7 @@ class DMTest(SeatsBase):
 
 
 class ProjectHomingTest(SeatsBase):
-    """Multi-PROJECT homing (owner canon main-room-topology): a seat with no
+    """Multi-PROJECT homing (the main-room-topology rule): a seat with no
     explicit HELM_CHAT_ROOM/--room derives its home from the join cwd's git
     project (common-dir parent basename — worktree-agnostic); explicit wins;
     a project-less cwd stays un-homed; rehome_seat is the deliberate move."""
@@ -1647,7 +1645,7 @@ class AutoNameTest(SeatsBase):
             self.assertEqual(chat.whoname(), "wren")
 
     def test_whoname_resolves_the_real_claude_code_session_var(self):
-        """REGRESSION (owner-caught 2026-07-21): Claude Code exports
+        """REGRESSION (owner-caught): Claude Code exports
         CLAUDE_CODE_SESSION_ID, NOT CLAUDE_SESSION_ID — a bare CLI post fell
         through to the anon 'agent' floor and the per-session cursor no-op'd.
         home.session_id() must resolve the real var so whoname() speaks the
@@ -1743,7 +1741,7 @@ class RenameTest(SeatsBase):
 
 
 class RosterTruthTest(SeatsBase):
-    """roster-truth (owner-caught 2026-07-21: 'keep all live agents straight on
+    """roster-truth (owner-caught: 'keep all live agents straight on
     the roster'). A live-but-idle agent must not vanish — presence stays fresh
     when it speaks, and even when its delivery is muted."""
 
@@ -2440,10 +2438,10 @@ class RosterReportTest(SeatsBase):
 
     def test_presence_report_carries_the_shared_ephemeral_tag(self):
         # ONE criterion for every surface that hides review-SAs (the web picker
-        # + the fleet-presence 'online' list, owner feature 2026-07-23):
+        # + the fleet-presence 'online' list):
         # agent-<hex> + no home + /tmp -> ephemeral; a real seat never is.
         self.assertTrue(seats._is_ephemeral_sa("agent-047d53ef", None, "/tmp/x"))
-        self.assertFalse(seats._is_ephemeral_sa("console-design", None, "/tmp/x"))
+        self.assertFalse(seats._is_ephemeral_sa("design-reviewer", None, "/tmp/x"))
         self.assertFalse(seats._is_ephemeral_sa("agent-047d53ef", "main", "/tmp/x"))
         self.assertFalse(seats._is_ephemeral_sa("agent-047d53ef", None, "/home/p"))
         self.assertFalse(seats._is_ephemeral_sa(None, None, None))  # fail-safe
@@ -2468,7 +2466,7 @@ class RosterReportTest(SeatsBase):
 
 
 class ReportNeverMutatesTest(SeatsBase):
-    """codex-2 HIGH: roster_report auto-ran the legacy reap_roster, which
+    """A review found: roster_report auto-ran the legacy reap_roster, which
     deleted ANY stale row on presence alone — an inactive-but-fully-persisted
     seat lost its row to a 3s web poll, bypassing gc's transcript/process
     evidence and the manual dry-run gate. The legacy path is DELETED, not
@@ -2478,7 +2476,7 @@ class ReportNeverMutatesTest(SeatsBase):
         self.assertFalse(hasattr(seats, "reap_roster"))
 
     def test_report_keeps_a_stale_seat_row_identical(self):
-        """codex-2's exact probe: persisted seat present before
+        """The exact probe: persisted seat present before
         roster_report(), row byte-identical after — no matter how stale its
         presence is, the report consults NO deletion evidence at all."""
         seats.join(seat="idle-persisted", session="s-idle", cwd="/tmp/p")
@@ -2700,7 +2698,7 @@ class ReplyWakesParentTest(unittest.TestCase):
             room="main"))
 
     def test_cross_case_self_reply_does_not_self_wake(self):
-        # BOTH reviewers' MED (codex + codex-2 xrev of c2f4856): the test
+        # BOTH reviewers flagged (cross-family review): the test
         # above uses from='Kimi' — exact-case — so it never exercised the
         # real rename path. After a case-only rename kimi -> Kimi, the
         # seat's own pre-rename reply carries from='kimi': the own-post
@@ -2769,15 +2767,15 @@ class HomingOneTruthTest(SeatsBase):
     def test_resolve_homing_is_the_one_precedence(self):
         repo = self._repo()
         # cli beats env beats derivation
-        os.environ["HELM_CHAT_ROOM"] = "helm-dogfood"
+        os.environ["HELM_CHAT_ROOM"] = "side-room"
         self.assertEqual(seats.resolve_homing("team-cli", repo),
                          ("team-cli", "explicit"))
         self.assertEqual(seats.resolve_homing(None, repo),
-                         ("helm-dogfood", "explicit"))
+                         ("side-room", "explicit"))
         # the launch seam's derived marker survives the env hop
         os.environ["HELM_CHAT_ROOM_SOURCE"] = "derived"
         self.assertEqual(seats.resolve_homing(None, repo),
-                         ("helm-dogfood", "derived"))
+                         ("side-room", "derived"))
         del os.environ["HELM_CHAT_ROOM"], os.environ["HELM_CHAT_ROOM_SOURCE"]
         # no cli, no env: the project room, derived
         self.assertEqual(seats.resolve_homing(None, repo),
@@ -2968,7 +2966,7 @@ class RosterGcTest(SeatsBase):
         return [roots], proc
 
     def test_state_unlink_and_move_stop_at_the_key_boundary(self):
-        """Substring cross-fire (fable adversarial B3): seat 'foo' (key
+        """Substring cross-fire (found by an adversarial probe): seat 'foo' (key
         foo-<h1>) must not match the state files of a live seat literally
         NAMED 'foo-<h1>' (its key foo-<h1>-<h2>) — the bare substring test
         let pruning or renaming 'foo' destroy the OTHER seat's delivery
@@ -3002,8 +3000,8 @@ class RosterGcTest(SeatsBase):
             os.path.exists(os.path.join(d, "main.cursor.%s" % key)))
 
     def test_move_keeps_a_room_slug_that_embeds_the_key(self):
-        """PRE-EXISTING boundary-blind rename substitution (fable adversarial
-        probe C10): a room whose slug merely EMBEDS the seat's full key
+        """PRE-EXISTING boundary-blind rename substitution (found by an
+        adversarial probe): a room whose slug merely EMBEDS the seat's full key
         ('<key>-updates') had its ROOM segment rewritten by the raw
         str.replace on rename — the cursor silently detached from its room
         (delivery ground lost to an EOF re-baseline, orphan file left).
@@ -3087,9 +3085,9 @@ class RosterGcTest(SeatsBase):
         self.assertFalse(os.path.exists(seen))             # state went with it
 
     def test_gc_trusts_the_census_for_helm_seat_home_transcripts(self):
-        """codex-2 HIGH (finding 1): the old hand-rolled root list omitted
+        """A review found: the old hand-rolled root list omitted
         ~/.helm/_global/seats/**/claude/projects, so an inactive-but-fully-
-        persisted proxy seat probed as junk (codex-2's own transcript root
+        persisted proxy seat probed as junk (the reviewer's own transcript root
         was missing). roots=None now delegates to session's persistence
         census — the ONE truth owner — which walks the seat homes."""
         from helm import home as _home, transcripts
@@ -3125,7 +3123,7 @@ class RosterGcTest(SeatsBase):
         self.assertIn("murky", seats.roster())
 
     def test_gc_apply_recheck_keeps_row_when_transcript_lands_late(self):
-        """codex-2 HIGH (finding 3): victims were computed before the lock
+        """A review found: victims were computed before the lock
         and the under-lock recheck was presence-only — a transcript flushing
         between scan and apply still lost the row. The FULL evidence probe
         now re-runs fresh under the roster lock."""
@@ -3149,7 +3147,7 @@ class RosterGcTest(SeatsBase):
         self.assertTrue(os.path.exists(seats.seen_path("late")))
 
     def test_gc_unlink_rides_the_roster_lock_no_rejoin_gap(self):
-        """codex-2 HIGH (exact-SHA probe): the row delete committed under the
+        """A review found (exact-commit probe): the row delete committed under the
         roster lock but the derived-state unlink ran AFTER release. A
         SessionStart rejoin slipping into that gap recreated the row plus
         fresh .seen/cursor/DM state — and the old gc invocation then
@@ -3208,7 +3206,7 @@ class RosterGcTest(SeatsBase):
         self.assertTrue(os.path.exists(dm))
 
     def test_gc_process_read_oserror_keeps_the_row(self):
-        """codex-2 HIGH (finding 3): a same-uid process whose cmdline/environ
+        """A review found: a same-uid process whose cmdline/environ
         cannot be read is probe TROUBLE, not absence — the row stays."""
         self._row("murkyproc", session="sid-murkyproc-5")
         roots, proc = self._empty_dirs()
@@ -3229,7 +3227,7 @@ class RosterGcTest(SeatsBase):
         self.assertEqual(pruned, ["plainjunk"])
 
     def test_gc_keeps_sidless_row_with_live_helm_chat_name(self):
-        """codex-2 HIGH (finding 3): a row with NO remembered session had no
+        """A review found: a row with NO remembered session had no
         process evidence at all. A live environ carrying HELM_CHAT_NAME=<seat>
         is a live seat, never junk."""
         self._row("envseat")                     # no session remembered

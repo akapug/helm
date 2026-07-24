@@ -33,7 +33,7 @@ STATUS_DELETE_ELIGIBLE = "delete_eligible"
 # --expire-candidates is the age leg. source: inferred|asked-once|explicit.
 STATUS_CANDIDATE = "candidate"
 # PROVISIONAL (xrev-cleared candidate): a candidate a cross-family /x review has
-# cleared (owner canon 2026-07-22: the technical ones may go PROVISIONALLY LIVE
+# cleared (by design: the technical ones may go PROVISIONALLY LIVE
 # once xrev clears them — xrev is the gate, not the owner). A provisional entry
 # FIRES through the resolver like live (it is usable knowledge) but renders with
 # a visible [provisional] tag everywhere (CLI list + inject line + web) until the

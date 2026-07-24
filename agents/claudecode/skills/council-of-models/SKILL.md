@@ -49,7 +49,7 @@ the same turn.
      `tools: []`, and the focused brief. If model pinning or tool restriction is
      unavailable, return a labeled unavailable/degraded block.
    - `driver = "codex"`: write the focused brief to a temp file and run the
-     codex CLI headless (verified path, re-probed 2026-07-22, codex-cli 0.144.5):
+     codex CLI headless (verified path, codex-cli 0.144.5):
 
 ```bash
 codex exec --cd "$PWD" -s read-only --skip-git-repo-check --ephemeral \

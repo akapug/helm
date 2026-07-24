@@ -34,7 +34,7 @@ tissue.
    "changed / regressed / used to work" question this is the FASTEST answer and you do it FIRST — not
    after hours of grepping current code. Also: `git reflog`, `git stash list`, `git fsck --unreachable`
    for work that may be unmerged/squashed-away.
-   - **a2a-comms symptom → REGRESSED-until-proven-novel** (owner canon 2026-07-13): an a2a bug OR
+   - **a2a-comms symptom → REGRESSED-until-proven-novel** (owner canon): an a2a bug OR
      optimization is presumed previously-solved until the history proves otherwise — so this step,
      BEFORE step 3's hypothesis, is mandatory and has three named sources: (1) sweep the repo
      history — `git log --all --grep=<capability>` — for the prior fix lineage;
@@ -82,7 +82,7 @@ backfill in `dev-process.md`.)
    `env -i PATH="$PATH" HOME="$HOME" bash -c '<probe>'` (NOT `env -u HELM_STOP_GUARD_*`:
    `-u` takes literal names, the glob expands against files — a literal copy unsets nothing):
    a leaked guard-disable var in your pane turns the probe into 0==0 — both sides off, a
-   false PASS (env-leak class 7fd3373; struck the QC layer itself 2026-06-11). Run it; confirm with a SECOND method that
+   false PASS (env-leak class that struck the QC layer itself). Run it; confirm with a SECOND method that
    the *actual reported behavior* goes broken→working on the real, non-empty input. Quote the evidence.
    "compiles / green / launched / sent / it should now" is NOT verified. If your test passed suspiciously
    fast, suspect the TEST (today: a unit "PASS" that was really 0-matched filter; an xrev "approved"

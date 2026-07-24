@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""capability self-index tests — the AX meta-gap fix (owner 2026-07-23).
+"""capability self-index tests — the AX meta-gap fix.
 
 THE test that matters (owner's words): an agent reasoning about a2a/whisper/
 converge gets 'you have helm chat deliver / meld, live' AT THE MOMENT, and a
@@ -128,7 +128,7 @@ class SurfacingTest(CapBase):
             self.assertNotIn("meld", self.jit_ids(text), text)
 
     def test_dregg_protocol_vocab_does_not_false_fire_a2a_levers(self):
-        # Cross-family gate catch (2026-07-23): this fleet debugs dregg CONSTANTLY
+        # Cross-family gate catch: this fleet debugs dregg CONSTANTLY
         # ("consensus root", "converge with the finalized root"), so bare
         # "consensus"/"converge" in the meld+deliver keywords was a relevance
         # regression in the index whose whole job is relevance. Scoped to a2a.

@@ -278,7 +278,7 @@ class CmdTest(ChatBase):
     def test_roster_aliases_seats(self):
         """`helm chat roster` is a friendlier spelling of `seats` — it must
         reach the same dispatch (rc 0), never the unknown-subcommand path
-        (owner asked for the alias 2026-07-21)."""
+        (owner-requested alias)."""
         rc, _, err = self.run_cmd(["roster"])
         self.assertEqual(rc, 0)
         self.assertNotIn("unknown subcommand", err)
@@ -288,7 +288,7 @@ class RowIntegrityTest(ChatBase):
     def test_unicode_line_separator_never_tears_the_row(self):
         """U+2028/U+2029 inside a message (a voice paste can carry them) must
         not split the JSON row for readers — read() splits on exactly \\n,
-        never str.splitlines() (found by the delivery lane 2026-07-20)."""
+        never str.splitlines() (found in delivery testing)."""
         chat.post("voice paste second visual line third", who="bob")
         rows, total = chat.read("main")
         self.assertEqual(total, 1)
@@ -304,7 +304,7 @@ class RowIntegrityTest(ChatBase):
 class PostUnknownFlagTest(ChatBase):
     """post REFUSES an unrecognised LEADING flag instead of publishing it —
     and ONLY leading flags: the body is prose and may talk about flags freely.
-    All three xrev findings on the first cut are pinned here: whole-body
+    All three cross-family review findings on the first cut are pinned here: whole-body
     scanning made flag-prose unsendable, single-dash flags still broadcast,
     and the tests sat after the __main__ guard where direct unittest
     execution never discovered them (this class now precedes it)."""
@@ -334,7 +334,7 @@ class PostUnknownFlagTest(ChatBase):
         self.assertEqual(self._rows(), [])
 
     def test_single_dash_flags_are_refused_too(self):
-        # xrev: startswith("--") left `-x` broadcasting (-h is now a help
+        # Review note: startswith("--") left `-x` broadcasting (-h is now a help
         # ask, answered rc 0 by the dispatcher gate — see HelpBeforeWorkTest)
         rc, _ = self._post("-x")
         self.assertEqual(rc, 2)
@@ -352,7 +352,7 @@ class PostUnknownFlagTest(ChatBase):
         self.assertEqual(self._rows(), [])
 
     def test_prose_about_flags_is_sendable(self):
-        # xrev: the first cut scanned the WHOLE body, so ordinary dev chat
+        # Review note: the first cut scanned the WHOLE body, so ordinary dev chat
         # about CLI flags was unsendable outside stdin
         rc, _ = self._post("--seat", "tester", "please", "use", "--force", "carefully")
         self.assertEqual(rc, 0)
@@ -383,8 +383,7 @@ class DeletedCwdTest(ChatBase):
     """A session whose process cwd was DELETED (a pruned lane worktree — a
     ROUTINE lifecycle state here) must keep chatting. The homing prologue's
     eager os.getcwd() crashed every default chat verb AND all three delivery
-    hooks BEFORE their fail-open guards could catch it (fable composition
-    HIGH @ 8313d9f; main handled this, the lane regressed it). seats.safe_cwd
+    hooks BEFORE their fail-open guards could catch it (a composition review found this; main handled it, the lane regressed it). seats.safe_cwd
     fails open to None -> un-homed -> #main; the session lives."""
 
     def _delete_cwd(self):
@@ -452,7 +451,7 @@ class DeletedCwdTest(ChatBase):
 
 class HelpBeforeWorkTest(ChatBase):
     """--help is answered at the dispatcher, BEFORE any verb runs (the
-    block-before-help class, live-probed 2026-07-22): `wait --help` entered
+    block-before-help class, live-probed): `wait --help` entered
     the wait loop and blocked forever — the mandatory-first-action verb every
     new seat probes — and join/deliver/claim/log-flush DID WORK under --help
     (`claim --help` leased a resource named "--help"). The seats/node/meld
@@ -622,7 +621,7 @@ class HelpBeforeWorkTest(ChatBase):
 
 
 class SeatActorBindingTest(ChatBase):
-    """codex-3 xrev 2026-07-23 outcome controls: --seat is an ASSERTION, not
+    """Outcome controls (cross-family review): --seat is an ASSERTION, not
     a signer selector. An actor (ambient HELM_CHAT_NAME) that ASSERTS a
     DIFFERENT --seat produces NO effect at all — no row, no DM spool change,
     no ACK transition, no signer call — refused BEFORE any of them. Actor
@@ -650,7 +649,7 @@ class SeatActorBindingTest(ChatBase):
         called on ANY path — which alone makes a mismatch's assert_not_called
         VACUOUS (it passes whether or not the refusal fired). Under this, the
         equal/omitted path DOES call _sign_send, so a mismatch's no-call is a
-        real, discriminating control (codex-3 xrev note 2026-07-23)."""
+        real, discriminating control (cross-family review note)."""
         from helm import cell as cellmod
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
         ready = {"configured": True, "usable": True, "state": "ready",
@@ -716,7 +715,7 @@ class SeatActorBindingTest(ChatBase):
         self.assertEqual(code, 2)
         self.assertIn("cannot act as another seat", err.getvalue())
         self.ss.assert_not_called()                 # no DM signed as seat-b
-        # DIRECT spool control (codex-3 xrev): the recipient's private lane
+        # DIRECT spool control (cross-family review): the recipient's private lane
         # never grew — the refused DM produced no row anywhere, not just no sig
         self.assertEqual(chat.read(chat.dm_room("codex"))[1], 0)
 
@@ -742,7 +741,7 @@ class SeatActorBindingTest(ChatBase):
         self.assertFalse(any(r.get("ack") == rid for r in self._rows()))
 
     # ---- NON-VACUOUS controls: prove the no-signer assertions discriminate --
-    # codex-3 xrev note 2026-07-23: the mismatch tests above run transport-off,
+    # cross-family review note: the mismatch tests above run transport-off,
     # where _sign_send is never called on ANY path, so their assert_not_called
     # alone is vacuous. These run with the signer GENUINELY configured, so the
     # signer IS reached on success and the refusal's no-call is a real control.

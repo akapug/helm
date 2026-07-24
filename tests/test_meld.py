@@ -247,8 +247,7 @@ class TestSay(MeldBase):
         — NOT silently regress done-mutual -> done and re-post an @peer mention.
         Pre-fix that regression made `meld status` lie and drove a phantom 90s
         countersign watch for an already-consumed countersign — the exact
-        double-command an agent replays after compaction/resume (fable dual-gate
-        finding, 2026-07-23)."""
+        double-command an agent replays after compaction/resume (a dual-gate review finding)."""
         room, _ = self.open_meld()
         meld.say(room, "DONE", "closing", seat="seat-a")       # a -> done
         meld.recv(room, timeout=0, seat="seat-a", poll=0.01)   # watch, no countersign
@@ -421,7 +420,7 @@ class TestCLI(MeldBase):
 
 class TestSelfSeat(MeldBase):
     def test_self_seat_survives_a_deleted_cwd(self):
-        """LOW (fable adversarial @2b4d496, probe A7): _self_seat's bare
+        """A review finding (probe A7): _self_seat's bare
         os.getcwd() crashed ALL five meld verbs (invite/join/recv/say/status
         default their seat through it, with no fail-open wrapper) when the
         process cwd was a pruned worktree. safe_cwd fails open to None and

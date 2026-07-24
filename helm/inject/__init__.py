@@ -96,14 +96,14 @@ whispers walk LAST in PINNED_BUDGET in SA_LINES order (delegation, then
 claim-start): budget pressure drops the tail nudges, NEVER a premise; each
 fired line is ledgered under its own id. Fail-open.
 
-LANE-REPORT (the lane-split eval's instrument): `helm inject --lane-report` is
+LANE-REPORT (the cohort-analysis instrument): `helm inject --lane-report` is
 a READ-ONLY analyzer over the whole fire-ledger — every fired id classified
 against the current store into the facts cohort (lexicon / certain
 decisions-of-record / references / the operator profile) vs the judgment
 cohort (heuristic moves / sub-certain belief priors), with per-cohort fires,
 byte estimate, session spread, cooldown suppression, and the silent-rate
-trend. Delivery only: fires are not heeds — the outcome-marker protocol lives
-in evals/2026-07-19-lane-split-eval.md. No ledger row, no state mutation.
+trend. Delivery only: fires are not heeds — the outcome-marker protocol is
+measured out-of-band. No ledger row, no state mutation.
 
 COMPARISON BACKEND (the pluggability seam): the local keyword JIT resolver is
 the AUTHORITY; a registered COMPARISON backend (_COMPARE_BACKENDS) runs in

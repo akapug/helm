@@ -469,7 +469,7 @@ class RosterLaunderCompletenessTest(PresenceBase):
 
 
 class StatusDecayTest(PresenceBase):
-    """Reviewer pin (P9): a 3-day-old explicit status must not mask a LIVE
+    """Reviewer pin: a 3-day-old explicit status must not mask a LIVE
     worktree lease — fresh claim beats stale status, fresh status still
     beats the claim, and the status age shows on every surface."""
 

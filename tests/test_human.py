@@ -189,7 +189,7 @@ class ShellSmokeTest(HumanBase):
         self.assertIn("terminal", err.getvalue())
 
     def test_layout_functions_run_at_odd_sizes(self):
-        # the smoke the PRD asks for: import + layout at hostile geometry
+        # the smoke the spec asks for: import + layout at hostile geometry
         chat.post("smoke :rocket:", who="a1")
         m = human.model_new()
         human.model_feed(m, *chat.read())

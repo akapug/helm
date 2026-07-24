@@ -184,7 +184,7 @@ class TestNativeLedgerTamper(NativeBase):
 class TestSeatEphemeralTag(unittest.TestCase):
     """The picker-declutter tag: an ephemeral review-SA (agent-<hex>, no home,
     /tmp cwd) is flagged so the live 'message a seat' picker can hide it, while a
-    real seat is NEVER mis-hidden (owner feature 2026-07-23)."""
+    real seat is NEVER mis-hidden (owner feature)."""
 
     def test_ephemeral_sa_is_flagged(self):
         self.assertTrue(web._seat_ephemeral(
@@ -194,7 +194,7 @@ class TestSeatEphemeralTag(unittest.TestCase):
     def test_real_named_seats_are_never_flagged(self):
         # real names, or a real home, or a non-/tmp cwd -> keep in the picker
         for s in (
-            {"seat": "console-design", "home_room": None, "cwd": "/tmp/x"},
+            {"seat": "design-reviewer", "home_room": None, "cwd": "/tmp/x"},
             {"seat": "codex-2", "home_room": "main", "cwd": "/home/p/helm-wt/x"},
             {"seat": "agent-047d53ef", "home_room": "main", "cwd": "/tmp/x"},
             {"seat": "agent-047d53ef", "home_room": None, "cwd": "/home/p/proj"},
@@ -221,7 +221,7 @@ class TestRosterSingleFlightCache(unittest.TestCase):
     def tearDown(self):
         # the polluter owns cleanup: the module-level cache holds this test's
         # fake rep; clear it so a later test's roster endpoint reads its own
-        # planted data, not our leaked {seat: agent-047d53ef} (kimi xrev).
+        # planted data, not our leaked {seat: agent-047d53ef} (cross-family review).
         web._ROSTER_REP_CACHE.clear()
 
     def _fake_report(self, room):
@@ -259,10 +259,10 @@ class TestRosterSingleFlightCache(unittest.TestCase):
     def test_rooms_cache_independently(self):
         with mock.patch("helm.seats.roster_report", self._fake_report):
             web._roster_cached("main")
-            web._roster_cached("helm-dogfood")
+            web._roster_cached("side-room")
         self.assertEqual(self.calls["n"], 2)
         self.assertIn("main", web._ROSTER_REP_CACHE)
-        self.assertIn("helm-dogfood", web._ROSTER_REP_CACHE)
+        self.assertIn("side-room", web._ROSTER_REP_CACHE)
 
 
 class TestRoomsSummarySingleFlightCache(unittest.TestCase):
@@ -332,7 +332,7 @@ class TestRoomsSummarySingleFlightCache(unittest.TestCase):
 
 class TestSseDoorbellWatcher(unittest.TestCase):
     """The push leg's ground truth, PER-SERVER (meld-converged): each server
-    owns its watcher state, so the round-4 races (generation, refcount,
+    owns its watcher state, so the concurrency races (generation, refcount,
     cross-server kill) are unexpressible — these tests pin the properties
     that REMAIN expressible: fingerprint scope, invalidate-before-ring,
     per-server death detection, crash containment, arm rollback, and
@@ -489,7 +489,7 @@ class TestSseDoorbellWatcher(unittest.TestCase):
         web._sse_stop(self.srv)
 
     def test_invalidate_outwaits_an_inflight_compute(self):
-        # round-3 race, still pinned: a compute that entered its locked fill
+        # concurrency race, still pinned: a compute that entered its locked fill
         # BEFORE the invalidation must not survive it (global cache law)
         def slow_summary(roster=None):
             time.sleep(0.15)
@@ -503,7 +503,7 @@ class TestSseDoorbellWatcher(unittest.TestCase):
         self.assertNotIn(self.d, web._ROOMS_SUM_CACHE)
 
     def test_closing_one_server_never_touches_anothers_watcher(self):
-        # the round-4 cross-server kill, now unexpressible — pinned anyway:
+        # the cross-server kill race, now unexpressible — pinned anyway:
         # A's close stops A's watcher and ONLY A's
         other = web.make_server(0)
         with mock.patch.object(web, "_SSE_WATCH_S", 0.01):

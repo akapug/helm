@@ -136,7 +136,7 @@ class ConfigsModelTest(unittest.TestCase):
 
 
 class WriteModeTest(unittest.TestCase):
-    """codex-seat review HIGH: write_file replaced a 0600 settings.json with a
+    """A cross-family review found: write_file replaced a 0600 settings.json with a
     0644 inode — an existing file must keep its exact mode; a new cred-home
     file is born owner-only."""
 

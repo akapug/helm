@@ -742,7 +742,7 @@ class SeatTest(unittest.TestCase):
         self.assertTrue(line.startswith("ANTHROPIC_AUTH_TOKEN=$(cat "), line)
         self.assertIn("; export ANTHROPIC_AUTH_TOKEN; env -u ANTHROPIC_API_KEY ", line)
         self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8317", line)
-        # no-keys-in-argv (the 7bb422a xrev): the bearer is NEVER the literal —
+        # no-keys-in-argv (cross-family review): the bearer is NEVER the literal —
         # the line reads it from the 0600 token file at exec time, so only the
         # PATH crosses stdout/argv, and the line is mint-order-immune.
         self.assertNotIn(token, line)
@@ -900,7 +900,7 @@ class SeatTest(unittest.TestCase):
         self.assertNotIn("/untrusted/repo", seeded["projects"])   # only trusted paths
         self.assertNotIn("lastCost", seeded["projects"]["/trusted/repo"])  # no session state
         # the intended workdir's trust is SYNTHESIZED (exact-match key the dialog
-        # needs; no ref carries it — the codex-3 stall's root cause)
+        # needs; no ref carries it — the stall's root cause)
         self.assertEqual(seeded["projects"][os.path.realpath(self.tmp)],
                          {"hasTrustDialogAccepted": True, "projectOnboardingSeenCount": 1})
         # bypass acceptance lands in settings.json (CC 2.1.216), not .claude.json
@@ -1259,8 +1259,7 @@ class SeatBornWiredTest(unittest.TestCase):
 
 
 class SeatMultiTest(unittest.TestCase):
-    """--multi (0.2 mixed-model fleets, premise multimodel-one-cc-proven-
-    per-agent-frontmatter-no-fork): the launch line/env DROP the
+    """--multi (0.2 mixed-model fleets): the launch line/env DROP the
     CLAUDE_CODE_SUBAGENT_MODEL blunt pin (it overrides per-agent frontmatter),
     probe agents with per-model `model:` frontmatter are minted, and the smoke
     gate grows a conductor-log-verified fan-out leg. Hermetic: no proxy, no
@@ -1358,7 +1357,7 @@ class SeatMultiTest(unittest.TestCase):
         self.assertFalse(seat._multi_from_launch(launch_sh))
 
     def test_resume_roomless_launch_falls_back_to_project_room(self):
-        """The kimi room-drop regression (2026-07-23): a launch.sh minted
+        """A room-drop regression: a launch.sh minted
         WITHOUT a room stamp (HELM_CHAT_ROOM-less) made _resume recover
         (None, None) and re-mint room=None — the SessionStart join then
         defaulted the seat to #main, silently dropping it out of its project
@@ -1524,7 +1523,7 @@ class SeatMultiTest(unittest.TestCase):
 
 
 class SeatEnsureTest(unittest.TestCase):
-    """doctor --ensure (the proxy watchdog, codex-2 silent-starvation class):
+    """doctor --ensure (the proxy watchdog, silent-starvation class):
     supervise every minted family+instance proxy — healthy rows pass through,
     dead/wedged rows respawn via the LANDED _up (never a second spawn path),
     and any row the watchdog cannot PROVE healthy surfaces UNKNOWN (rc 2),
@@ -1618,7 +1617,7 @@ class SeatEnsureTest(unittest.TestCase):
         self.assertEqual(len(up_calls), 1)
 
     def test_ensure_starting_proxy_within_grace_is_never_killed(self):
-        # THE fable adversarial MED: a HEALTHY just-launched proxy still binding
+        # THE adversarial-review finding: a HEALTHY just-launched proxy still binding
         # its port reads 'live pid + port not answering' -> the OLD code SIGTERMed
         # it. Within the startup-grace window it must be left alone (unknown /
         # STARTING), _down NEVER called — cron firing in the boot window must not
@@ -1667,7 +1666,7 @@ class SeatEnsureTest(unittest.TestCase):
         # a record whose pid is ALIVE but fails identity verification (a reused
         # pid now owned by a stranger, or a legacy bare-pid proxy): the watchdog
         # refuses to signal it AND refuses to respawn over a live foreign
-        # listener — UNKNOWN for a human. (The ds4pro-SIGKILL fix: only an
+        # listener — UNKNOWN for a human. (The SIGKILL-handling fix: only an
         # ALIVE-but-unverifiable pid refuses; a DEAD one respawns.)
         self._plant("home-a")
         self.assertEqual(self._add()[0], 0)
@@ -1684,7 +1683,7 @@ class SeatEnsureTest(unittest.TestCase):
         down.assert_not_called()
 
     def test_ensure_stale_dead_pidfile_respawns(self):
-        # the codex-2 silent-starvation case: a well-formed identity record
+        # the silent-starvation case: a well-formed identity record
         # whose pid has since DIED. _running_pid fails closed to None (corpse),
         # but the record still parses — the watchdog must NOT read it as
         # 'unverifiable, refuse'; the pid is dead, so this is a plain DOWN ->
@@ -1725,7 +1724,7 @@ class SeatEnsureTest(unittest.TestCase):
         self.assertIn("respawn failed", detail)
 
     def test_ensure_concurrent_up_loser_reads_healthy_not_unknown(self):
-        # fable LOW: a seat launching in the same instant wins the flock; our
+        # Review note: a seat launching in the same instant wins the flock; our
         # _up returns rc 1 ('already running'). That is NOT a respawn failure —
         # the row is now HEALTHY under the winner. Re-probe must recover it.
         self._plant("home-a")

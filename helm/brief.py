@@ -172,7 +172,7 @@ def _review_queue():
     """The store's owner-review backlog, estate-wide (the same entry set as the
     knowledge delta — never a project lens): provisional entries (xrev-cleared,
     FIRING but awaiting the owner's ratify) newest-first, plus the raw-candidate
-    count. The owner steer 2026-07-23: this queue must ROUTINELY reach the owner,
+    count. By owner directive: this queue must ROUTINELY reach the owner,
     so it rides the brief he already reads."""
     from . import store
     prov, cand = [], 0

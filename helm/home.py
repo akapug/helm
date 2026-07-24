@@ -10,7 +10,7 @@ corpus; engine runtime state (any tool's ~/.config/<tool>) stays out of it.
 import os
 import re
 
-# A legitimate seat name is an IDENTIFIER: codex-2, opus-integrator, ds4pro —
+# A legitimate seat name is an IDENTIFIER: codex-2, reviewer-1, ds4pro —
 # [A-Za-z0-9._-], bounded. HELM_CHAT_NAME is the one unvalidated join seam every
 # chat surface trusts (roster keys, chat from/tfrom/rfrom, hook pane names,
 # todos, codex capacity, …); it is validated HERE, at the source, exactly once,
@@ -42,7 +42,7 @@ def chat_name():
     enforces that with a source grep).
 
     Returns the name when it is a legitimate seat identifier ([A-Za-z0-9._-],
-    like codex-2 / opus-integrator / ds4pro); None when unset OR empty (callers
+    like codex-2 / reviewer-1 / ds4pro); None when unset OR empty (callers
     fall through to their auto-name floor, preserving the old `if name:` /
     `or "owner"` semantics); and RAISES SeatNameError when the name carries ESC
     / C0-C1 controls / Unicode bidi overrides (U+202A-E, U+2066-9) / any other

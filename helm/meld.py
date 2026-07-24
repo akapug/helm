@@ -3,17 +3,17 @@
 
 A mindmeld is hyper-speed a2a real-time convergence: both parties reply FAST
 with what they ALREADY know; a fork that needs research is NOT a meld — it
-falls to async (premise meld-discipline). The preset is THIN by law
+falls to async. The preset is THIN by law
 (one-comms-primitive): a meld is just a fresh room (`meld-<epoch>-<slug>`)
 plus a bounded synchronous discipline read over it — no new transport, no
 daemon, no second store. The room IS the artifact.
 
-LATENCY-PURE (premise comms-presets-optimize-their-novel-purity): every meld
+LATENCY-PURE: every meld
 post rides the v1 RAM append with sign=False — no signing leg, no node
 round-trip, no disk write mid-meld. The out-of-band log-flush leg remains the
 durable record, same as any room.
 
-WAKE (premise a2a-wake-foolproof-layers — the verb owns it, never agent
+WAKE (the verb owns it, never agent
 discipline): (1) durable row — the invite/READY/DONE rows are ordinary room
 rows; a TRACKED seat's delivery lane backfills a room born after its join
 from offset 0, so the mention that created the meld MUST deliver (seats.py
@@ -49,7 +49,7 @@ Floor markers (the protocol vocabulary, verbatim): [YIELD] hands the floor,
 [ABORT] kills it fail-loud (exit 4).
 
 v1 is 2-party (an earlier prototype's precedent); 3+ minds use a plain room + discipline.
-NAMING (premise council-is-the-number-one-feature, owner canon 2026-07-23):
+NAMING:
 MELD is the GENUS — `meld` stays the primary verb; `standup` (informal 2+
 convergence, includes this 2-party mindmeld) and `council` (the big FORMAL
 convergence — agenda/quorum/recorded verdict, the 0.3 N-of-M machinery) are

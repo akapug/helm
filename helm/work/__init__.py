@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """helm work — in-cave git coordination: worktree lifecycle on the claims
-lane (design: prd/2026-07-21-in-cave-git-coordination.md — the maintainer's
+lane (the maintainer's
 tree + the front desk). The shared checkout is the INTEGRATOR's tree; every
 other seat works in a private room `<repo>-wt/<lane>` on branch
 `lane/<lane>`, checked in and out at the desk.

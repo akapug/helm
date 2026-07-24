@@ -51,7 +51,7 @@ The notify loop: the owner's post (web panel or `helm --human`) drops
 owner-chat-unread reflex fires on that marker every turn until a
 `helm chat read` consumes past it — identical in BOTH transports.
 
-DMs (premise exact-token-addressee-match): `helm chat dm <seat> <text>` (and
+DMs: `helm chat dm <seat> <text>` (and
 `post --dm <seat>`) is a TRUE 1:1 — the row rides the recipient's private
 lane <chat-dir>/dm/<seat-key>.jsonl (the `dm-` room-name prefix is that
 lane's reserved namespace; room_path routes it, list_rooms never shows it),
@@ -254,7 +254,7 @@ def whoname():
     """$HELM_CHAT_NAME, else a session-derived AGENT name — never the operator's
     identity. The unix login is the operator's machine account (e.g. `owner`); an
     agent CLI post that fell through to it impersonated the owner in the room
-    (owner-flagged 2026-07-19). The operator's own surfaces name themselves
+    (owner-flagged). The operator's own surfaces name themselves
     explicitly (web posts as 'owner'; `helm --human` sets HELM_CHAT_NAME), so a
     bare CLI post is ALWAYS an agent — it gets an agent name, never the login.
     A session already in the roster answers with its SEAT name (posts and
@@ -1326,7 +1326,7 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
 def _touch_poster_presence(name):
     """Presence-on-post: a seat that SPEAKS is alive, beacon or no beacon — so
     keep its roster row fresh and the reaper never drops a live-but-idle poster
-    (roster-truth, owner-caught 2026-07-21). Best-effort + local import
+    (roster-truth, owner-caught). Best-effort + local import
     (chat<-seats would cycle); owner/broadcast names are not seats — skip them
     so no spurious presence file is minted."""
     try:
@@ -1735,8 +1735,8 @@ def log_disabled():
 
 def log_flush(rooms=None):
     """Append delivered history to <helm-home>/helm/journal/chat-<date>.log.
-    OUT-OF-BAND ONLY (exit-time / operator / cron) — never from send/read
-    (premise a2a-ram-only-disk-log-after). Idempotent: a per-room high-water
+    OUT-OF-BAND ONLY (exit-time / operator / cron) — never from send/read.
+    Idempotent: a per-room high-water
     mark (row count + tail fingerprint); a rotation under the mark reconciles
     against the fingerprint and logs a loud gap note when history was lost
     before a flush. HELM_CHAT_LOG=0 disables (returns -1); else returns rows
@@ -1913,8 +1913,8 @@ HELP = {
               "doc §11); until it lands the verb answers with the deferral: "
               "use the room + /premise",
 }
-# One preset, three spellings (premise council-is-the-number-one-feature:
-# MELD is the GENUS and stays the primary verb; standup = the informal 2+
+# One preset, three spellings (MELD is the GENUS and stays the primary verb;
+# standup = the informal 2+
 # convergence species — today's 2-party mindmeld included; council = the big
 # FORMAL species, whose N-of-M verdict machinery is 0.3's). Each spelling
 # answers help in its own voice and echoes itself in every printed
@@ -1962,7 +1962,7 @@ def _pop_flag(args, name):
 def _seat_flag(args):
     """Pop `--seat S` out of a verb's argv: the caller's DECLARED display
     name. None when absent. NOTE: --seat NEVER selects the signer — use
-    _seat_actor for any verb that posts/signs/acks (codex-3 xrev 2026-07-23);
+    _seat_actor for any verb that posts/signs/acks (confirmed by cross-family review);
     this raw popper stays for the non-signing verbs (mute, status, wait…)."""
     if "--seat" not in args:
         return None
@@ -1984,12 +1984,11 @@ def _seat_actor(args):
                             append / ACK transition / signer call — a seat may
                             not act or sign AS ANOTHER (was: --seat drove
                             who= AND profile=, so `--seat kimi` signed as kimi;
-                            confirmed forgeable, codex-3 9/10).
+                            confirmed forgeable by cross-family review).
     FOOTGUN SCOPE, honestly: a same-user process can still forge identity by
     setting HELM_CHAT_NAME/HELM_CELL_PROFILE itself — this prevents ACCIDENTAL
     --seat drift + the wrong-signer class, NOT a malicious local peer (that
-    needs the owner-key trust domain, held for the owner; see
-    ~/.helm/helm/prd/OWNER-SIGN-TRUST-MODEL.md). Returns (actor, None) or
+    needs the owner-key trust domain, held for the owner). Returns (actor, None) or
     (None, err)."""
     claimed = _seat_flag(args)          # pops --seat (None if absent)
     ambient = whoname()

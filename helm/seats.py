@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""helm seats — the meld-half's agent-facing lane, collapsed onto the chat
-room (design: prd/2026-07-20-meldhalf-design.md, hardened per the codex
-adversarial round §11 there). Meld carried a separate tmpfs whisper channel
-because it had no room; helm HAS the room, so every capability here is a
+"""helm seats — the agent-facing lane, collapsed onto the chat
+room (hardened by adversarial review). An earlier design carried a separate
+tmpfs whisper channel because it had no room; helm HAS the room, so every capability here is a
 READ PATTERN over /dev/shm/helm-chat plus small RAM state files — zero new
 transports, zero daemons, zero slot files.
 
@@ -75,8 +74,8 @@ All cursor transitions serialize on `<room>.cursor.<seat>.lock`; rows are
 selected/committed by byte offset from ONE fstat'd fd, never by line count.
 Initialized at JOIN. Every hook-facing path is FAIL-OPEN TOTAL.
 
-MULTI-ROOM (slice 5 — the owner's live helm-dogfood '@opus-integrator' post
-woke nothing, 2026-07-21): the lane is not main-scoped. deliver_any (the
+MULTI-ROOM (an owner post in a non-home room woke nothing): the lane is not
+main-scoped. deliver_any (the
 PostToolUse hook) and the wait --follow beacon consider EVERY live room —
 the seat's private DM lane first, then primary, then newest-activity rooms,
 ROOM_SCAN_CAP-bounded — with the same per (seat, room, session) cursor
@@ -87,22 +86,21 @@ self-heal everywhere (pre-join backlog never floods). join baselines every
 existing room; stop-guard and the roster report read pending across the same
 bounded scan.
 
-BEACON SCOPE (premise beacon-scope-mentions-plus-home-room-owner-posts-not-
-all — the live bug: codex-2, homed to #main, never saw an @codex-2 mention
-posted in #helm-dogfood because homing ALLOWLISTED the scan): the scan
+BEACON SCOPE (the live bug: a seat homed to #main never saw its own @seat
+mention posted in a non-home room because homing ALLOWLISTED the scan): the scan
 covers every live room; deliverable() applies the scope per row —
   (a) a @seat mention (or a {dm} row naming the seat) surfaces from ANY room,
       always — a direct address is never filtered;
   (b) ANYTHING in the seat's HOME room (roster home_room) surfaces — the
       team channel is full-surface for its own team;
   (c) @all broadcasts surface in {home, main}; owner-rail posts NO LONGER
-      auto-wake (owner steer 2026-07-21: mentions + home room are enough) —
+      auto-wake (by owner directive: mentions + home room are enough) —
       never fleet-wide across every side room;
   (d) a MUTED room (helm chat seat mute <room> — roster row "mute") stops
       (b)/(c) noise at this seat; (a) still surfaces (mute tunes noise,
       never direct address).
 
-DM (premise exact-token-addressee-match): seats.dm() writes ONE row into the
+DM: seats.dm() writes ONE row into the
 recipient's private lane (chat.dm_room — the `dm-` reserved namespace, a
 dm/ subdir file no room list ever shows). The recipient is the EXACT seat
 token (a casefold roster snap only — never a substring, never a slug fold:
@@ -379,8 +377,7 @@ def seat_scope(seat, r=None):
 
 def deliverable(m, seat, room="main", scope=None):
     """Does this row reach `seat` at a tool boundary, given the ROOM it sits
-    in? The beacon-scope law (premise beacon-scope-mentions-plus-home-room-
-    owner-posts-not-all), top to bottom:
+    in? The beacon-scope law, top to bottom:
       * reactions, AMBIENT rows and the seat's own posts: never. An ambient
         row ({ambient}: the todo mirror's status line) is machine state a
         teammate PULLS — it renders everywhere and wakes nobody, including
@@ -394,7 +391,7 @@ def deliverable(m, seat, room="main", scope=None):
       * the seat's HOME room (roster home_room): EVERY remaining row — the
         team channel is full-surface for its own team.
       * {home, main}: @all broadcasts only. Owner-rail posts (origin web/tui)
-        do NOT wake here (owner steer 2026-07-21: mentions + home-room are
+        do NOT wake here (by owner directive: mentions + home-room are
         enough — an owner post reaches a seat via an @mention or its own home
         room, never as a plain main broadcast). NOT fleet-wide: a side room's
         @all drafts nobody homed elsewhere.
@@ -419,7 +416,7 @@ def deliverable(m, seat, room="main", scope=None):
         # (kimi -> Kimi) the seat's pre-rename rows still carry the old
         # casing, and an exact-case check would let the seat wake on its own
         # reply — the precise identity transition the rfrom rule below
-        # protects (codex + codex-2 xrev of c2f4856, 2026-07-21).
+        # protects (confirmed by cross-family review).
         return False
     if m.get("dm"):
         # exact-token recipient (casefold only), OR the row sits in the
@@ -452,7 +449,7 @@ def deliverable(m, seat, room="main", scope=None):
     if room != "main" and room != home_r:
         return False
     # @all broadcasts still wake in {home, main}. Owner-rail posts NO LONGER
-    # auto-wake (owner steer 2026-07-21: mentions + home-room are enough — an
+    # auto-wake (by owner directive: mentions + home-room are enough — an
     # owner post reaches a seat only via an @mention or its own home room, never
     # as a plain main-room broadcast). OWNER_RAILS/owner_names stay for owner
     # IDENTITY (forgery defense) elsewhere; owner-posts are simply not a wake
@@ -702,7 +699,7 @@ def _key_bounded(name, key):
     foo-<h1>) prefix-matched every state file of a seat literally NAMED
     'foo-<h1>' (its key foo-<h1>-<h2>), so pruning/renaming 'foo' unlinked or
     moved the LIVE seat's cursors — the same gc state cross-fire class the
-    case-variant fix closed, substring flavor (fable adversarial probe B3)."""
+    case-variant fix closed, substring flavor (found by an adversarial probe)."""
     for m in _STATE_MARKERS:
         probe, i = m + key, 0
         while True:
@@ -723,7 +720,7 @@ def _bounded_sub(name, ok, nk):
     alphabets), so '.' is a hard field boundary. The raw str.replace it
     replaces rewrote a ROOM slug that merely EMBEDS the key
     ('<key>-updates.cursor.<key>' -> room segment corrupted), silently
-    detaching the cursor from its room (fable adversarial probe C10)."""
+    detaching the cursor from its room (found by an adversarial probe)."""
     dm_ok, dm_nk = chat.DM_PREFIX + ok, chat.DM_PREFIX + nk
     return ".".join(nk if s == ok else (dm_nk if s == dm_ok else s)
                     for s in name.split("."))
@@ -1179,8 +1176,8 @@ def _scan_rooms(primary="main", seat=None, scope=None, session=None,
     the one-time `bounded=False` caller so every existing room receives an EOF
     admission baseline and pre-join backlog can never emerge in a later slice.
 
-    The scan is deliberately scope-BLIND (premise beacon-scope-mentions-
-    plus-home-room-owner-posts-not-all superseded the G1-G3 homing allowlist):
+    The scan is deliberately scope-BLIND (the beacon-scope law superseded the
+    G1-G3 homing allowlist):
     an @mention anywhere must eventually surface, while deliverable() applies
     per-row scope. DM lanes other than the seat's own stay invisible because
     list_rooms() omits them. Fail-open: an unlistable dir is just the pins."""
@@ -1351,8 +1348,8 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main"):
     the beacon actually call): one deliverable row per boundary from the
     first room that has one — the primary room first, then the rest of
     _scan_rooms' bounded, newest-activity-first list. An @mention in a
-    channel the seat never joined must wake it (the owner's helm-dogfood
-    '@opus-integrator' post, live 2026-07-21), so a TRACKED seat — it holds
+    channel the seat never joined must wake it (an owner post in a non-home
+    room), so a TRACKED seat — it holds
     a primary-room cursor — meeting a cursor-less room BACKFILLS from offset
     0: a room born after its join is all post-join news. An UNtracked seat
     (never joined / reaped / pre-install) keeps the EOF self-heal everywhere:
@@ -1405,7 +1402,7 @@ def resolve_recipient(to):
 def dm(to, text, who=None, session=None, profile=None, sign=None, origin=None,
        reply_to=None):
     """One TRUE 1:1 message -> (row, None) or (None, reason). The recipient
-    is the EXACT seat token (premise exact-token-addressee-match): the only
+    is the EXACT seat token: the only
     resolution ever applied is a casefold snap onto a live roster key —
     never a substring, never a slug fold (team.a and team-a are different
     addressees with different lanes). The row lands in the recipient's
@@ -1882,7 +1879,7 @@ def _unbanked_candidate(dirty, edits, latest):
 
 # ── work-offer: the fleet self-saturation rung (AX primitive #1) ───────────
 # The owner-flagged gap: an idle seat let a dispatched review sit — the fleet
-# does not self-saturate (idle ds4pro never picked up a canary review). This
+# does not self-saturate (an idle seat never picked up a canary review). This
 # rung is the BOTTOM of the ladder (lowest salience): OWN work first (the ask /
 # dispatch / pending-inbox / claim signals all outrank it), then, only when the
 # seat is genuinely idle, ONE terse offer of the top UNOWNED backlog row. It
@@ -2605,8 +2602,8 @@ def _transcript_hit(sids, roots=None):
     (~/.claude + ~/.claude-homes, ~/.codex + ~/.codex-homes) PLUS every helm
     seat home (~/.helm/_global/seats/**/claude/projects). The previous
     hand-rolled root list here omitted helm's own seat stores, so an
-    inactive-but-fully-persisted proxy seat probed as junk (codex-2's live
-    reproduction: its own transcript root missing from the list). An
+    inactive-but-fully-persisted proxy seat probed as junk (reproduced live:
+    its own transcript root missing from the list). An
     explicit roots list (tests / a foreign store) is globbed directly. An
     INCOMPLETE census raises — probe trouble must keep the row, never pass
     as proven-absent."""
@@ -2740,7 +2737,7 @@ def gc_roster(apply=False, roots=None, proc_dir="/proc", now=None):
                     pruned.append(s)
                 if pruned:
                     pk.write_json(roster_path(), r)
-                # unlink INSIDE the same lock (codex-2): row delete + state
+                # unlink INSIDE the same lock: row delete + state
                 # unlink are ONE critical section. Unlinking after release
                 # left a gap where a SessionStart rejoin recreated the row
                 # plus fresh .seen/cursors/DM lane — and this old invocation
@@ -2815,7 +2812,7 @@ def roster_report(room="main"):
     for seat, row in sorted(roster().items()):
         try:
             # pending is the MULTI-ROOM truth (the owner's panel must show a
-            # helm-dogfood mention, not just main), read off the row's newest
+            # non-home-room mention, not just main), read off the row's newest
             # session cursor (hook joins are session-keyed) with the
             # seat-level fallback — cursors never move here.
             hits = _pending_all(
@@ -3088,7 +3085,7 @@ def ack(target_id, state="done", note=None, who=None, session=None):
     # who=seat (the AMBIENT acker, resolved by _seat_actor at the verb) is the
     # row identity; the signer is the ambient HELM_CELL_PROFILE (profile=None
     # -> cell.profile_name) — never the --seat claim, so a seat cannot forge a
-    # signed ACK clearing another seat's obligation (codex-3 xrev 2026-07-23).
+    # signed ACK clearing another seat's obligation (confirmed by cross-family review).
     row = chat.post(note or "", room=room, who=seat,
                     ack=tid, ackstate=state)
     return {"target": m, "room": room, "state": state, "row": row,

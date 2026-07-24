@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """helm.web store-review surface — hermetic contract tests.
 
-The owner review panel near the configs view (owner canon 2026-07-22): a
+The owner review panel near the configs view: a
 candidate + provisional browse/approve/reject surface. GET /api/store/review
 lists the two non-ratified states; POST /api/store/confirm|reject route through
 the SAME store functions the CLI calls (one writer path) and demand the

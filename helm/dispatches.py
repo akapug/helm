@@ -122,8 +122,8 @@ def _resolve_tip(repo, ref):
 def _pre_boundary(ts):
     """True only for an honest pre-boundary timestamp: a non-empty string
     that LOOKS like one (year 2xxx) and sorts before the boundary. Numeric,
-    empty, whitespace, and low-sorting garbage ts all fail CLOSED — the r3
-    isinstance guard alone let '' through (fable delta MED), and the r2
+    empty, whitespace, and low-sorting garbage ts all fail CLOSED — the
+    isinstance guard alone let '' through (a review found), and the earlier
     or-tilde let numerics through; the shape check closes the class."""
     return isinstance(ts, str) and ts.startswith("20") \
         and ts < LEGACY_COMPAT_BOUNDARY
@@ -223,7 +223,7 @@ def _apply(state, row):
     # TERMINAL IS IMMUTABLE: once a dispatch carries a verdict or a cancel, NO
     # later event — v3 OR a legacy-compat retarget/snapshot-verdict — may mutate
     # its status or tip. This guard runs BEFORE the compat branches below, which
-    # do not each re-check terminality (codex-3 xrev: a compat verdict could
+    # do not each re-check terminality (a cross-family review found a compat verdict could
     # otherwise convert cancelled->verdict, a retarget could move a closed tip).
     if state.get("status") in CLOSED_STATES:
         return state
@@ -448,7 +448,7 @@ def _reconcile_send(rid, detail):
       2. readable, rid ABSENT                  -> (None, UNKNOWN)   obligation
          (a missing/rotated/known-empty ledger reads as ({}, None), so a just-
           persisted row can be absent from a READABLE snapshot — that is UNKNOWN,
-          never the stale pre-DM OPEN row; codex-3 xrev 4th defect)
+          never the stale pre-DM OPEN row; found by cross-family review)
       3. readable, present, terminal           -> (row, None)      canonical close
       4. readable, present, open/other         -> (row, NEEDS CONFIRMATION+detail)
     Reads via snapshot() — NOT rows(), which discards the `unavailable` flag."""

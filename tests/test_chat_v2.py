@@ -1013,7 +1013,7 @@ class ReactToggleTest(V2Base):
         self.assertIn("[unsigned]", chat._fmt(row2))
 
     def test_cli_react_and_post_honor_seat(self):
-        # CONTRACT (post-actor-binding, 2026-07-23): `--seat` is an ASSERTION of
+        # CONTRACT (post-actor-binding): `--seat` is an ASSERTION of
         # the ambient session identity, NOT a cross-seat selector. This test
         # used to prove `--seat codex-a` posts/reacts AS codex-a from ANY
         # session; now the acting session IS codex-a (ambient) and `--seat

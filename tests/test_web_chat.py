@@ -347,7 +347,7 @@ class TestWebChat(unittest.TestCase):
                          seats.deliverable(plain, "kimi", "main"))
 
     def test_reply_click_seeds_the_composer_with_the_authors_at(self):
-        """The reply affordance's visible face (owner ask 2026-07-22): the
+        """The reply affordance's visible face (owner ask): the
         endpoint half threads the payload's reply_to, and the SERVED page
         carries the seed-@ mechanism — chatSetReply feeds the parent's author
         into chatSeedMention, which prepends "@author " to the composer and
@@ -377,10 +377,10 @@ class TestWebChat(unittest.TestCase):
     def test_poll_carries_the_live_roster_for_mention_completion(self):
         from helm import seats
         seats.write_roster("example-app-codex", session="s-1")
-        seats.write_roster("helm-opus-integrator", session="s-2")
+        seats.write_roster("helm-integrator", session="s-2")
         d = self.req("/api/chat")[1]
         self.assertEqual(d["roster"],
-                         ["example-app-codex", "helm-opus-integrator"])
+                         ["example-app-codex", "helm-integrator"])
 
     def test_sidebar_rooms_carry_unread_mentions_age_and_seat_presence(self):
         """The badge computation the owner UX rides: a quiet room and a busy
@@ -540,7 +540,7 @@ class TestWebChat(unittest.TestCase):
         self.assertLess(d3["total"], total1)                # the oldest half is gone
 
     def test_rotate_then_regrow_past_the_cursor_is_caught_by_gen_not_total(self):
-        """The exact P1 repro: a client caches since=N; the room rotates (halves)
+        """The exact repro: a client caches since=N; the room rotates (halves)
         then regrows PAST N. total climbs back above N, so a naive total<since
         check never fires and the client would MISS the reindexed rows — but
         `gen` flipped on the rotate, which is the signal the client resets on."""
@@ -557,7 +557,7 @@ class TestWebChat(unittest.TestCase):
         self.assertNotEqual(d["gen"], gen0)                 # but gen flipped -> client resets + repaints
 
     def test_older_page_cache_is_rotation_aware_never_serves_dropped_rows(self):
-        """P2: the older-page body cache assumed 'rows only append', so after a
+        """The older-page body cache assumed 'rows only append', so after a
         rotate it served dropped rows + a stale total for up to the TTL. Now it
         validates on the file fingerprint — a rotate is a cache MISS, so the
         second fetch reflects the rotated room, never the cached slice."""
@@ -575,7 +575,7 @@ class TestWebChat(unittest.TestCase):
                             [m["text"] for m in first["lines"]])   # never the dropped rows
 
     def test_older_cache_hit_revalidates_the_stat_and_serves_live_total(self):
-        """P2 TOCTOU (codex-3): the stale design sampled the room stat at KEY
+        """TOCTOU race (cross-family review): the stale design sampled the room stat at KEY
         BUILD — before the hit — so an append landing between that sample and the
         serve returned a cached stale total (served 10 while the file already held
         11). The fix validates the stat AT the hit (against the stat stored with
@@ -604,7 +604,7 @@ class TestWebChat(unittest.TestCase):
                          ["row %d" % i for i in range(0, 5)])
 
     def test_older_cache_evicts_prior_versions_bounded_to_one_per_room(self):
-        """P2 growth (codex-3): the versioned key (…, stat) NEVER evicted, so
+        """Growth bug (cross-family review): the versioned key (…, stat) NEVER evicted, so
         every append minted a fresh entry — 12 appends left 12 entries, unbounded.
         The fix evicts a room's prior-version pages when a new version is written,
         so the cache holds at most one live entry per room whatever the churn."""
@@ -618,7 +618,7 @@ class TestWebChat(unittest.TestCase):
         self.assertLessEqual(len(room_keys), 1)                   # bounded — not one-per-append
 
     def test_batch_id_hydration_distinguishes_out_of_window_from_rotated_out(self):
-        """P1 reply reconciliation: a parent ABOVE the loaded window is resolved
+        """Reply reconciliation: a parent ABOVE the loaded window is resolved
         by id (still present in the room), so its reply renders correctly —
         only a parent GENUINELY rotated out (id absent) reads 'rotated out'.
         The ids endpoint is body-only (no transport) — DREGGTEGRITY intact."""

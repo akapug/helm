@@ -1,9 +1,9 @@
 """helm.idle_dispatch — the stranded-obligation loud-fail rung.
 
-THE GAP (owner catch 2026-07-24, ds4pro idle-on-an-open-gate): the coordinator
+THE GAP (a coordinator missed an idle reviewer on an open gate): the coordinator
 ASSUMES a dispatched agent is BUSY, but a "quiet" presence dot means BOTH
 "busy on a long turn" AND "idle-done on an open gate" — indistinguishable, so
-only a human glance caught ds4pro sitting idle 68 minutes on an open review.
+only a human glance caught a reviewer sitting idle on an open review.
 This rung turns idle-on-an-open-obligation into an OBSERVABLE SIGNAL: it crosses
 the dispatch ledger (obligation + deadline, dispatches.py) against the
 recipient's presence (seats.presence_of) — the one JOIN neither half computes
@@ -15,12 +15,12 @@ THE SIGNATURE (idle-on-open-dispatch):
     (no recent tool boundary) AND holds NO live claim on dispatch:<id8> AND the
     dispatch is older than IDLE_DISPATCH_S (a soft "should have been picked up"
     window, earlier than the hard deadline so an idle-on-gate surfaces BEFORE it
-    is overdue — ds4pro was idle on a gate, possibly not yet past its deadline).
+    is overdue — a reviewer was idle on a gate, possibly not yet past its deadline).
 
 THE WIRE THAT WAS MISSING: it DMs the dispatch's SENDER (the coordinator),
 never a room broadcast — a broadcast never lands in a parked coordinator's
 `helm chat wait --follow` beacon, so it can't WAKE the one who must re-check.
-That un-wired wake is precisely why ds4pro needed a human. Flag-only, never
+That un-wired wake is precisely why the idle reviewer needed a human. Flag-only, never
 auto-reassign (the codebase disclaims "reassign on age alone").
 
 COMPOSED, not net-new: reuses silent_drop.py's scan->fcntl-.state-latch->
@@ -41,7 +41,7 @@ from . import dispatches, home, seats
 LATCH_TTL_S = 15 * 60          # one alert per stranded dispatch per episode
 IDLE_DISPATCH_S = 15 * 60      # soft "should-be-picked-up" window (== QUIET_S);
                                # earlier than the hard deadline so idle-on-gate
-                               # surfaces BEFORE overdue (ds4pro was idle first)
+                               # surfaces BEFORE overdue (a reviewer was idle first)
 _STATE = "idle_dispatch.json"
 
 _USAGE = """usage: helm seat idle-dispatch [--once] [--dry-run] [--quiet] [--json]

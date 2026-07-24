@@ -520,7 +520,7 @@ class ReplyCliTest(ReplyBase):
 
 
 # ---------------------------------------------------------------------------
-# 5. THE LAW (inverted 2026-07-22): a reply is a direct address of the
+# 5. THE LAW (inverted): a reply is a direct address of the
 #    parent's author — mention-tier — and of nobody else
 # ---------------------------------------------------------------------------
 
@@ -534,7 +534,7 @@ class ReplyWakeTest(ReplyBase):
         return seats.deliverable(row, seat, room)
 
     def test_replying_to_a_seat_wakes_its_author(self):
-        # INVERTED 2026-07-22. This test previously pinned the opposite —
+        # INVERTED. This test previously pinned the opposite —
         # "threading is invisible to the beacon" — which delivered the reply
         # MECHANISM while dropping its PURPOSE: the owner's stated reason for
         # replies was "I'm tired of typing agent names to mention". A reply is
@@ -599,7 +599,7 @@ class ReplyWakeTest(ReplyBase):
 
     def test_deliver_any_end_to_end_reply_wakes_parent(self):
         """Integration proof at the actual boundary hook: a bare reply to the
-        seat's own row DELIVERS (inverted 2026-07-22 — replying replaces
+        seat's own row DELIVERS (inverted — replying replaces
         typing the mention), and a reply to someone else's row does not."""
         seats.join(session="s-codex", seat="codex", cwd="/tmp/reply-wake")
         other = chat.post("alice parent", who="alice")
@@ -613,7 +613,7 @@ class ReplyWakeTest(ReplyBase):
 
 class ReplyDocsContractTest(unittest.TestCase):
     """The superseded law must be DEAD in every contract surface, not just the
-    code (codex round-2 xrev of 2efe3f8: docs/VERBS.md + docs/WEB.md still
+    code (a cross-family review found docs/VERBS.md + docs/WEB.md still
     taught 'threading never changes who a message wakes' after the inversion
     shipped). A doc that contradicts the beacon is an executable-looking trap
     for the next regression, so the docs are pinned like code."""

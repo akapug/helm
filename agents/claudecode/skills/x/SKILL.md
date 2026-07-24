@@ -61,7 +61,7 @@ premise (cheapest-probe-before-fire) before you refute or build on it.
    free pass (any target trivially `!= unknown` while author≠eyes stays unproven — an
    unknown-author escape hatch). If the author family is genuinely unknown and no external
    evidence maps it, emit `x DEGRADED: author family unknown` with `basins=author:unknown vs
-   eyes:<fam>`, `confidence=reduced` — do NOT call it clean cross-family. (codex seq330.)
+   eyes:<fam>`, `confidence=reduced` — do NOT call it clean cross-family.
    - **xrev / xprop / xverify** — require a KNOWN `author_family` and `target.agent != author_family`.
      A pane_id match, or an unknown author, is NOT a clean valid target.
    - **xdiag** — the author/predictor family IS allowed as the diagnoser (author ≈ best-diagnoser),
@@ -69,12 +69,12 @@ premise (cheapest-probe-before-fire) before you refute or build on it.
    **If no valid different-author-family pane exists** (solo, or only the author's family is live),
    do NOT silently fall back to same-basin "review" — emit `x DEGRADED: no cross-family basin vs
    author=<fam>` and mark the verdict `confidence=reduced`. (#89 receipt carries `agent`; the
-   wrong-principal — caller-vs-target instead of author-vs-target — was codex's seq328 catch.)
+   wrong-principal — caller-vs-target instead of author-vs-target — was a cross-family reviewer's catch.)
    - **xfam EXCEPTIONS (evolvable list; owner-ratified):** a **super-SOTA-tier** model ALWAYS
      counts as a valid xfam basin — even reviewing its own family or its own model. Current tier
-     members: **Fable 5** (owner ruling 2026-06-11: "fable always counts as xfam because it's super-sota").
+     members: **Fable 5** (owner ruling: "fable always counts as xfam because it's super-sota").
      So Fable↔Fable review/refutation is VALID xfam — never reject it as same-family (the prior
-     fable-vs-opus = xfam ruling, seq509, stands subsumed). Record verdicts honestly as
+     fable-vs-opus = xfam, stands subsumed). Record verdicts honestly as
      `basins=author:fable vs eyes:fable (super-sota exemption)` so the data stays auditable.
 3. **Dispatch the framed ask** via an action-required chat message (auto-wakes the recipient): a terse,
    evidence-bearing payload stating the move (rev/diag/prop/verify), the artifact
@@ -84,7 +84,7 @@ premise (cheapest-probe-before-fire) before you refute or build on it.
    on real findings; a REFUTE pivots you, an APPROVE clears the gate. Loop until clean
    (REFUTE → fix → re-confirm), per-item not batched (catches earlier, costs no more).
 
-## Rapid path — xrev as a telepathy exchange (xfam-telepathy-xrev, proven 2026-06-15)
+## Rapid path — xrev as a telepathy exchange (xfam-telepathy-xrev)
 
 A quick per-finding xrev/refute can run AS a direct back-and-forth exchange (the RAPID path), composing
 with the durable xrev thread (the recorded verdict) — proven live (claude-Opus ↔ codex-gpt5.5
@@ -102,7 +102,7 @@ round-trip, auto-closed):
   `author_family` still govern WHO you ask. The 600-char ask bound forces the compose pattern:
   detailed claim → the conv message, then a tight pointer ask (see the `telepathy` skill).
 
-## The premium consultant — ONE standing pane, reused (owner ruling 2026-06-10)
+## The premium consultant — ONE standing pane, reused
 
 **Default: keep ONE working premium consultant (currently Fable) and REUSE it for all
 consultation** (QC, /x, arch, brainstorm) — do NOT spawn a fresh one per ask, do NOT run
@@ -118,7 +118,7 @@ default:
    split → boot (auth inherited from the live home cred; fails LOUD on a login picker) →
    verified send → wait → print answer → close. Model flag is the FULL id
    (`claude-fable-5[1m]`); saved defaults may be Opus, never assume auto picks Fable.
-   Live-proven 2026-06-10 (3-run shakedown: model-id form, composer-ready send-verify,
+   Live-proven (3-run shakedown: model-id form, composer-ready send-verify,
    loop-gate exemption all found by dogfood).
 2. **Load it directly** — a tight brief (artifact + REFUTE targets + verdict shape), not
    a transcript. Fresh-context focus is the FEATURE: no burned context, no drift, and the
@@ -129,8 +129,8 @@ default:
    recovery fails or the pane is wedged. Output produced while degraded counts as the model
    that actually served it (xfam accounting follows the serving model).
 4. **Compose with the rulings:** opus-author + ephemeral-fable-final-QC satisfies
-   prem-fable-xfam-final-qc without holding a Fable seat; codex stays the refuter
-   (codex-qc-only); front-load while the plan window lasts (prem-fable-plan-window).
+   the ephemeral-Fable-final-QC discipline without holding a Fable seat; codex stays the refuter
+   (codex stays QC-only); front-load while the plan window lasts.
 
 ## Precision reframe — security review as invariant facts (on-demand)
 
@@ -145,7 +145,7 @@ blockers, and verification evidence still surface (honest-report outranks regist
 **never relabel** non-defensive work as defensive (misrepresentation is the worse failure).
 For an irreducibly vocabulary-dense verdict, route to an xfam reviewer (register-split).
 
-## The loopsaver (self-recovery, proven 2026-06-11)
+## The loopsaver (self-recovery)
 
 A flipped/dropped pane agent recovers ITSELF with full context — proven live (sessions
 branch in-pane, context carries over):
@@ -188,8 +188,8 @@ message sender is YOU, not the author, so the author identity has to ride explic
 downstream attribution of the reviewed work to its author; an unset `reviewed_author`
 strands that credit. Carry it as an explicit field in the closing verdict message on the
 xrev conv.
-Two closure rules, both born from live misses (seq636 ack-claimed-fix-not-applied;
-7310e0a landed pre-QC with a live bug):
+Two closure rules, both born from live misses (ack-claimed-fix-not-applied;
+a change landed pre-QC with a live bug):
 - **A claimed fix is not closed until the REVIEWER re-verifies it** — author "applied"
   ≠ applied; the finder confirms against the artifact, per-item not batched.
 - **For restart / consensus / persistence / recovery fixes the verdict MUST name the
@@ -225,9 +225,9 @@ primitive:
   (record BOTH the author family and the consulting families, so same-basin is auditable) ·
   **`confidence=<high|normal|reduced>`** · **`budget_reason`** when not full. A silently
   downshifted (or skipped) pass reads as "verified" at full confidence when it isn't
-  (#19 automation-fails-loud). (The downshift-is-also-degradation gap was codex's seq326
+  (#19 automation-fails-loud). (The downshift-is-also-degradation gap was a cross-family reviewer's
   xprop finding on this skill.)
-- A sibling stopped on usage mid-`/x` → rotation is a fleet concern (bdev usage tooling), not a helm-seat verb; respawn the reviewer on a healthy account and re-ask;
+- A sibling stopped on usage mid-`/x` → rotation is a fleet concern (the fleet's usage tooling), not a helm-seat verb; respawn the reviewer on a healthy account and re-ask;
   don't give up or ask the human to refill.
 - **Human-capped resource → STATE the consolidation, don't silently thin.** When the human caps a
   review resource ("codex = final-QC only", "cred is scarce", a budget ceiling), say WHICH checks you
@@ -262,4 +262,4 @@ same-family "looks good." That is the difference between *shipped* and *shipped-
 - heuristic **#14** (cross-family refutation != same-family refinement) — the R-line `/x` embodies.
 - `decision-spirit` / `/decide` — the within-model audit `/x` complements with across-model eyes.
 - `reviewer-implements-own-findings` — when the refuter has the context to patch what it finds.
-- (cred rotation lives in the bdev fleet tooling, outside helm seats.)
+- (cred rotation lives in the fleet tooling, outside helm seats.)

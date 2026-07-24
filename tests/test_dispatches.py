@@ -323,7 +323,7 @@ class HistoricalCompatTest(DispatchBase):
         self.assertEqual(closed["reviewed_tip"], self.b)
 
     def test_fresh_retarget_after_boundary_never_rebinds(self):
-        # codex round-1 HIGH: a retarget appended TODAY must be inert — the
+        # Review finding: a retarget appended TODAY must be inert — the
         # row stays needs-redispatch and can never become verdict-closable.
         self._legacy_open("ce1e7dd0", self.a[:7], lane="legacy")
         move = {"id": "ce1e7dd0", "event": "retarget", "tip": self.b,
@@ -371,7 +371,7 @@ class HistoricalCompatTest(DispatchBase):
         self.assertNotIn("4f65d90d", [r["id"] for r in dispatches.open_rows()])
 
     def test_non_string_ts_never_passes_the_compat_boundary(self):
-        # fable adversarial r3: ts=1 stringifies below the boundary — the
+        # Adversarial review: ts=1 stringifies below the boundary — the
         # type-corruption class seq already guards must cover ts too.
         self._legacy_open("ce1e7dd0", self.a[:7], lane="legacy")
         for bad_ts in (1, 123456, 0.5, True, "", " ", "!pre", "1999-01-01T00:00:00Z"):
@@ -386,7 +386,7 @@ class HistoricalCompatTest(DispatchBase):
         self.assertIn("redispatch", why)
 
     def test_post_boundary_legacy_genesis_cannot_fabricate_a_closed_row(self):
-        # fable adversarial r3 (LOW): a legacy-shaped FIRST row appended after
+        # Adversarial review: a legacy-shaped FIRST row appended after
         # the boundary must not invent an already-closed obligation.
         ts = dispatches.pk.now_ts()
         rec = {"id": "1a" * 16, "ts": ts, "recipient": "codex-3",
@@ -397,7 +397,7 @@ class HistoricalCompatTest(DispatchBase):
         got = dispatches.rows()["1a" * 16]
         self.assertEqual(got["status"], "open")     # visible, but never closed
         self.assertEqual(got["migration"], "needs-redispatch")
-        # empty-string ts is NOT an honest pre-boundary stamp (fable delta MED)
+        # empty-string ts is NOT an honest pre-boundary stamp (adversarial review)
         empty = dict(rec, id="4d" * 16, ts="", last_updated="")
         self.assertTrue(eventledger.append(dispatches.ledger_path(), empty))
         self.assertEqual(dispatches.rows()["4d" * 16]["status"], "open")
@@ -418,7 +418,7 @@ class HistoricalCompatTest(DispatchBase):
         self.assertIsNone(got["migration"])
 
     def test_garbage_seq_rows_never_crash_replay_or_blind_good_rows(self):
-        # codex round-1 HIGH: a valid legacy row with seq='not-an-int' made
+        # Review finding: a valid legacy row with seq='not-an-int' made
         # snapshot() raise, turning EVERY obligation into "no usable
         # obligations". The bad row is ignored; the good rows survive.
         good = self.add()
@@ -871,7 +871,7 @@ class CancelTest(DispatchBase):
         self.assertNotIn(row["id"], out)                      # gone from list --open
 
     def test_blocked_dm_cancel_race_appends_no_late_delivered(self):
-        # THE RACE (codex-3 xrev): send() releases the lock for the DM; a
+        # THE RACE (cross-family review): send() releases the lock for the DM; a
         # concurrent cancel terminalizes the row; when the DM returns,
         # _mark_delivered must NOT append a delivered event onto the cancelled
         # row nor report it observed/pending.
@@ -908,7 +908,7 @@ class CancelTest(DispatchBase):
             dispatches.snapshot()[0][holder["id"]]["status"], "cancelled")
 
     def test_apply_terminal_guard_blocks_a_compat_verdict_or_retarget(self):
-        # HIGH1 (codex-3 xrev): once terminal, NO later event — including a
+        # Race 1 (cross-family review): once terminal, NO later event — including a
         # legacy-compat verdict/retarget — may convert the status or move the
         # tip. Probe _apply directly with a legacy (v!=3) CANCELLED state.
         cancelled = {"id": "a" * 16, "status": "cancelled", "v": 1, "seq": 1,
@@ -922,7 +922,7 @@ class CancelTest(DispatchBase):
         self.assertEqual(dispatches._apply(cancelled, compat_retarget), cancelled)
 
     def test_malformed_numeric_wire_types_cannot_close_a_dispatch(self):
-        # HIGH2 (codex-3 xrev): bool is an int subclass and == let True==1 /
+        # Race 2 (cross-family review): bool is an int subclass and == let True==1 /
         # 1.0==1, so a forged strict cancel with a bool/float seq once closed
         # the dispatch. The type-exact strict gate now rejects them.
         row = self.add()                                      # v3 open, seq 0
@@ -942,7 +942,7 @@ class CancelTest(DispatchBase):
 
     def test_a_disk_cancelled_row_never_surfaces_in_idle_dispatch_scan(self):
         # the watchdog reads open_rows(); a cancelled row is excluded, so it can
-        # never be flagged stranded (codex-3 xrev: exercise the real scan)
+        # never be flagged stranded (cross-family review: exercise the real scan)
         from helm import idle_dispatch
         row = self.add(lane="ghost")
         self.age(row["id"], 100000)                           # past the soft window
@@ -975,7 +975,7 @@ class CancelTest(DispatchBase):
         self.assertIn("usage: helm dispatch cancel", err)
 
     def test_existing_op_resend_reports_terminal_state_not_confirmation_debt(self):
-        # codex-3 xrev: a resend of an already-CLOSED operation must report the
+        # Cross-family review: a resend of an already-CLOSED operation must report the
         # TRUE terminal state, never "confirm at the recipient" (a lie on a
         # closed row). Both closed states.
         for closer, label in (("verdict", "VERDICT"), ("cancel", "CANCELLED")):
@@ -1005,7 +1005,7 @@ class CancelTest(DispatchBase):
             self.assertNotIn("confirm at the", out)
 
     def test_failed_or_raising_dm_with_concurrent_close_returns_canonical(self):
-        # codex-3 xrev: when the DM fails OR raises while a cancel/verdict lands,
+        # Cross-family review: when the DM fails OR raises while a cancel/verdict lands,
         # send() must reconcile and return the canonical terminal state (not the
         # stale pre-DM open row) — both closers x both failure modes, and NO
         # late delivered event (exactly two: dispatch + close).
@@ -1044,7 +1044,7 @@ class CancelTest(DispatchBase):
         self.assertFalse(sent)
 
     def test_reconcile_send_case2_UNKNOWN_when_absent_from_readable_ledger(self):
-        # case 2 (codex-3 4th defect): a READABLE snapshot missing the row is
+        # case 2 (cross-family review, 4th defect): a READABLE snapshot missing the row is
         # UNKNOWN, never the stale pre-DM OPEN row — there is no `or fallback`.
         with mock.patch.object(dispatches, "snapshot", return_value=({}, None)):
             r, why, sent = dispatches._reconcile_send("gone", "detail")

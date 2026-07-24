@@ -158,7 +158,7 @@ class FleetRowsTest(unittest.TestCase):
         rows, _ = self._rows({6: {}}, [srow(6, root="/r")], roster=({}, True))
         self.assertEqual((rows[0]["seat"], rows[0]["seat_src"]),
                          (None, "roster-error"))
-        # round-2 finding 4: a failed roster probe is a row-level UNKNOWN —
+        # Review note: a failed roster probe is a row-level UNKNOWN —
         # the JSON bit must agree with the footer, and the render must never
         # claim the affirmative '(no seat)' fact
         self.assertTrue(rows[0]["unknown"])
@@ -213,7 +213,7 @@ class RosterCheckedTest(unittest.TestCase):
 
 
 class SidDelegationTest(FleetRowsTest):
-    """codex+codex-2 finding 1: SID truth is session._proc_claude_rows(),
+    """Review finding: SID truth is session._proc_claude_rows(),
     consumed whole — record, argv, who, cwd-candidate rungs AND the final
     generation recheck — never a fleet-side splice of private helpers."""
 
@@ -231,17 +231,17 @@ class SidDelegationTest(FleetRowsTest):
     def test_fleet_source_rederives_no_sid_or_config_parsing(self):
         # the design law, pinned at the source level: fleet may CALL the
         # census; the private sid/config helpers it once spliced are gone,
-        # and (round-2 finding 1) so are the second comm scan and the
+        # and so are the second comm scan and the
         # unbracketed /proc cwd re-read
         src = inspect.getsource(fleet)
         for banned in ("_proc_snapshot", "_session_record", "_resume_sid",
                        "_sid_for", "_sids_for", "argv~ancestor",
                        "_config_root", "CLAUDE_CONFIG_DIR",
                        "_claude_pids", "glob", "readlink",
-                       # round-3 finding 1: env facts come from the census
+                       # Review note: env facts come from the census
                        # bracket — fleet never re-opens a proc environ file
                        "proc/%d/environ", "_environ(",
-                       # round-3 finding 2: the completeness-blind rows-only
+                       # Review note: the completeness-blind rows-only
                        # shape is not fleet's entry point
                        "_proc_claude_rows"):
             self.assertNotIn(banned, src, banned)
@@ -272,14 +272,14 @@ class SidDelegationTest(FleetRowsTest):
         self.assertIn("live in MULTIPLE pids", out)
 
     def test_rows_come_solely_from_the_census_no_second_scan(self):
-        # round-2 finding 1: a pid the census rejected (its generation
+        # Review note: a pid the census rejected (its generation
         # recheck failed — no two reads cohere) must never be resurrected by
         # a fleet-side comm scan and composed into a row of fictions
         rows, _ = self._rows({5: {}}, census=())
         self.assertEqual(rows, [])
 
     def test_census_none_cwd_is_never_re_read_from_proc(self):
-        # round-2 finding 1: census cwd=None means the BRACKETED probe
+        # Review note: census cwd=None means the BRACKETED probe
         # failed. Use our OWN pid, whose /proc/<pid>/cwd is readable — a
         # surviving unbracketed fallback would return a real path and clear
         # the unknown bit; the row must stay '?' and UNKNOWN
@@ -300,7 +300,7 @@ class SidDelegationTest(FleetRowsTest):
 
 
 class HomeColumnTest(FleetRowsTest):
-    """codex finding 4 / codex-2 finding 3: home is session's canonical
+    """Review finding: home is session's canonical
     config root for the TARGET process — never the inspector's ~/.claude,
     never a fleet-side re-derivation of config policy."""
 
@@ -315,7 +315,7 @@ class HomeColumnTest(FleetRowsTest):
         rows, _ = self._rows({8: {}}, [srow(8, reason="config-untrusted",
                                             root=None)])
         self.assertEqual(rows[0]["home"], "?")
-        # round-2 finding 4: home='?' is unproven evidence — the row-level
+        # Review note: home='?' is unproven evidence — the row-level
         # bit must say so, not hand JSON consumers a false known-row bit
         self.assertTrue(rows[0]["unknown"])
 
@@ -329,7 +329,7 @@ class DaemonDetectionTest(unittest.TestCase):
             self.assertFalse(fleet._is_daemon_argv(argv), argv)
 
     def test_non_orca_runtimes_reading_the_script_are_not_daemons(self):
-        # codex-2 finding 4: the SHAPE must be the orca daemon's, not any
+        # Review note: the SHAPE must be the orca daemon's, not any
         # argv element that basenames to daemon-entry.js
         for argv in (["cat", "/tmp/daemon-entry.js"],
                      ["python", "worker.py", "/tmp/daemon-entry.js"],
@@ -352,7 +352,7 @@ class DaemonDetectionTest(unittest.TestCase):
 
 
 class DaemonWalkTest(unittest.TestCase):
-    """codex finding 2: daemon identity is re-proven at match time (argv
+    """Review finding: daemon identity is re-proven at match time (argv
     still daemon-shaped, starttime still the scanned incarnation) — bare set
     membership across PID reuse is never trusted. The REAL _daemon_for walk
     runs; only the /proc probes are mocked."""
@@ -393,7 +393,7 @@ class DaemonWalkTest(unittest.TestCase):
         self.assertEqual(self._walk(tree, {}), ("unknown", None))
 
     def test_walk_through_an_unproven_pid_is_unknown_never_headless(self):
-        # round-2 finding 2, exact probe: daemon-shaped 99 whose starttime
+        # Review note, exact probe: daemon-shaped 99 whose starttime
         # read failed is UNPROVEN; child 7->99->1 must answer UNKNOWN, not
         # walk through the maybe-daemon to init and claim proven HEADLESS
         self.assertEqual(self._walk({7: 99, 99: 1}, {}, unproven={99}),
@@ -495,7 +495,7 @@ class WhoCensusContextTest(unittest.TestCase):
 
 
 class DaemonScanTest(unittest.TestCase):
-    """codex round-2 finding 2: partial probe failures inside the daemon
+    """Review finding: partial probe failures inside the daemon
     scan must surface as UNPROVEN pids — never be silently dropped behind
     scan_failed=False and later converted into a proven-HEADLESS absence.
     The REAL _daemon_pids runs; only the /proc probes are mocked."""
@@ -600,7 +600,7 @@ class OrcaTerminalsTest(unittest.TestCase):
 
 
 class UnknownPlumbingTest(FleetRowsTest):
-    """codex finding 3 / codex-2 finding 2: a failed probe is UNKNOWN in the
+    """Review finding: a failed probe is UNKNOWN in the
     ROW and the FOOTER — never converted into HEADLESS/no-pane or an
     owner-cannot-see claim."""
 
@@ -651,7 +651,7 @@ class UnknownPlumbingTest(FleetRowsTest):
 
 
 class GenerationBracketTest(FleetRowsTest):
-    """codex-2 round-3 finding 1: a census row is only coherent for ITS
+    """Review finding: a census row is only coherent for ITS
     process generation. Env facts come from the census's bracketed environ
     (never a later live re-read), and the host walk's fresh /proc reads are
     only composed in when a FINAL recheck proves the same generation still
@@ -756,7 +756,7 @@ class GenerationBracketTest(FleetRowsTest):
 
 
 class CensusCompletenessTest(FleetRowsTest):
-    """codex-2 round-3 finding 2: the sole-source census carries a
+    """Review finding: the sole-source census carries a
     completeness channel. A failed /proc enumeration is estate-UNKNOWN
     (exit 1), never a certified-empty fleet; a failed who scan marks every
     sub-declared/resume row sid-UNKNOWN."""
@@ -821,7 +821,7 @@ def pfrow(pid, start="g1"):
 
 
 class PerPidProbeFailureTest(FleetRowsTest):
-    """codex-2 HIGH: per-PID mandatory probe failures below the global bits
+    """Review finding: per-PID mandatory probe failures below the global bits
     must never vanish as proven absence. A post-comm failure is an UNKNOWN
     row in the output AND the exit status; a pre-comm failure is
     census_partial — the estate total is a floor, surfaced like
@@ -879,7 +879,7 @@ class PerPidProbeFailureTest(FleetRowsTest):
 
 @unittest.skipIf(os.geteuid() == 0, "root bypasses file permissions")
 class ProbeFailedEndToEndTest(unittest.TestCase):
-    """The finding's exact probe, END TO END through the CLI: a planted
+    """The exact probe, END TO END through the CLI: a planted
     /proc pid whose comm proves 'claude' and whose cmdline raises
     PermissionError must surface as an UNKNOWN row and a nonzero exit —
     helm fleet must never certify 0 live processes after failing to read a
@@ -962,7 +962,7 @@ class SidParserTest(unittest.TestCase):
             ["claude", "--resume", SID_A, "--resume=" + SID_B]))
 
     def test_valid_resume_beside_an_invalid_occurrence_fails_closed(self):
-        # codex-2 parser note: contradictory evidence poisons the parse —
+        # parser note: contradictory evidence poisons the parse —
         # a valid --resume plus a bare/invalid repeat is UNKNOWN
         self.assertIsNone(session._resume_sid(
             ["claude", "--resume", SID_A, "--resume"]))
@@ -1016,7 +1016,7 @@ class PaneIdentityTest(FleetRowsTest):
 
 
 class EstateProbeExitTest(FleetRowsTest):
-    """fable review MED (both lenses): every estate-wide failed probe — who
+    """A cross-family review (both lenses): every estate-wide failed probe — who
     scan, daemon scan, terminal list — must reach the machine-readable
     verdict exactly like census_failed/census_partial: exit 1 and a named
     --json completeness bit. A scripted consumer keying on rc or the JSON
@@ -1085,7 +1085,7 @@ class EstateProbeExitTest(FleetRowsTest):
 
 
 class ProbeOrderingTest(unittest.TestCase):
-    """fable review LOW: the daemon scan runs AFTER the census bracket. A
+    """A cross-family review: the daemon scan runs AFTER the census bracket. A
     daemon that starts between the two scans — whose freshly-spawned claude
     IS censused — is then in the set, so the ppid walk cannot pass through
     the missing pid to init and read a false proven-HEADLESS (a ghost

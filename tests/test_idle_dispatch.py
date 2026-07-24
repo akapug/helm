@@ -25,7 +25,7 @@ class IdleDispatchTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-idle-")
         self._prior = os.environ.get("HELM_HOME")
         os.environ["HELM_HOME"] = self.tmp
-        # default world: no claims, sender resolves to opus-integrator, every
+        # default world: no claims, sender resolves to coordinator, every
         # recipient is old enough + quiet (idle) unless a test overrides
         self.rows = []
         self.presence = {}      # recipient -> "fresh"|"quiet"|"absent"
@@ -43,7 +43,7 @@ class IdleDispatchTest(unittest.TestCase):
             _live_claims=mock.Mock(side_effect=lambda: dict(self.claims)),
             presence_of=mock.Mock(side_effect=lambda ls: ls),   # ls IS the bucket
             last_seen=mock.Mock(side_effect=lambda rec: self.presence.get(rec, "quiet")),
-            derive_seat=mock.Mock(side_effect=lambda src: "opus-integrator"),
+            derive_seat=mock.Mock(side_effect=lambda src: "coordinator"),
             dm=mock.Mock(side_effect=lambda to, text, **k: self.dms.append((to, text))),
         )
         self.p.start(); self.s.start()
@@ -60,7 +60,7 @@ class IdleDispatchTest(unittest.TestCase):
         self.assertEqual(len(res["alerted"]), 1)
         self.assertEqual(len(self.dms), 1)
         to, text = self.dms[0]
-        self.assertEqual(to, "opus-integrator")           # DM the sender, not a broadcast
+        self.assertEqual(to, "coordinator")           # DM the sender, not a broadcast
         self.assertIn("ds4pro", text)
         self.assertIn("aaaaaaaa", text)                    # the id8
 
@@ -72,9 +72,9 @@ class IdleDispatchTest(unittest.TestCase):
         self.assertEqual(self.dms, [])
 
     def test_self_dispatch_never_dms_yourself(self):
-        # recipient == resolved sender (opus-integrator) -> no coordinator to wake
-        self.rows = [_row("cccccccc3333", "opus-integrator")]
-        self.presence = {"opus-integrator": "absent"}
+        # recipient == resolved sender (coordinator) -> no coordinator to wake
+        self.rows = [_row("cccccccc3333", "coordinator")]
+        self.presence = {"coordinator": "absent"}
         res = idle_dispatch.check()
         self.assertEqual(res["alerted"], [])
 

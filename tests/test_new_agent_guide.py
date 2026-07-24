@@ -263,7 +263,7 @@ class NewAgentGuideTest(unittest.TestCase):
         #   2. this test: assert the post lands in the DERIVED room and not in
         #      `main`.
         # Do not delete the test and do not touch the sentence without the
-        # pin, or the guide silently inverts (staleness-adversary MED 2).
+        # pin, or the guide silently inverts (adversarial review).
         # ====================================================================
         proj = os.path.join(self.tmp, "canary-proj")
         os.makedirs(proj)

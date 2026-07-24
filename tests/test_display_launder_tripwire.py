@@ -390,12 +390,12 @@ class SeatNameSourceSeamTest(unittest.TestCase):
 # blind to. The SOURCE fix closes it: a seat can NEVER post under a hostile
 # HELM_CHAT_NAME because home.chat_name rejects it before whoname/derive_seat
 # return. This class proves (1) the reject fires across every name reader, (2)
-# a legit name (codex-2/opus-integrator/ds4pro) still joins+posts+reads clean,
+# a legit name (codex-2/reviewer-1/ds4pro) still joins+posts+reads clean,
 # and (3) a name planted OUTSIDE the seam (a foreign jsonl row) is still
 # display-laundered on read AND /api/chat — belt (source) and suspenders (sink).
 class ChatHostileNameSweepTest(unittest.TestCase):
     HOSTILE = "lane" + ESC + "[2J" + BIDI + "pwn"
-    LEGIT = ("codex-2", "opus-integrator", "ds4pro")
+    LEGIT = ("codex-2", "reviewer-1", "ds4pro")
 
     _ENV = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
@@ -680,7 +680,7 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
         self.assertIn("lane", t)
 
     # -- 4. meld.join(): the MELD-JOINED display AND the promoted READY TEXT ----
-    #    convener is a SEED ROW's from — HIGH: it entered the POSTED text (@%s
+    #    convener is a SEED ROW's from — it entered the POSTED text (@%s
     #    [MELD…] READY), which chat._fmt then renders raw fleet-wide.
     def test_meld_join_display_and_promoted_text_are_inert(self):
         room = "meld-join-test"
@@ -853,7 +853,7 @@ class ChatRowFromFieldSinkSweepTest(unittest.TestCase):
 # keys are ALWAYS quoted, so this is code-only by nature (no prose match),
 # exactly like _ROSTER_CALL. get/pop/setdefault all READ the value into a sink
 # (r10 adversarial: a raw .pop("from") emit would otherwise evade the sweep);
-# %-dict ("%(from)s") and itemgetter remain a documented LOW residual — exotic
+# %-dict ("%(from)s") and itemgetter remain a documented residual — exotic
 # enough that no current sink uses them and a future one is caught at review.
 _FROM_FIELD_READ = re.compile(
     r"""(?:\.(?:get|pop|setdefault)\(\s*|\[\s*)['"](?:from|tfrom|rfrom|dm|peer)['"]""")

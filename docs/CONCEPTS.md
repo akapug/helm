@@ -73,8 +73,8 @@ scarce resource; spend it only when newly relevant.
 
 Premises (confidence 1.0) are provable, standing truths — so they live as
 *attested records* on a verifiable chain, not just files. The design converged
-2026-07-18 between the build and substrate poles; the attestation model was
-**corrected 2026-07-20 to be native-first** (the earlier "the operator's cell
+between the build and substrate poles; the attestation model was
+**corrected to be native-first** (the earlier "the operator's cell
 signs each premise" plan was not reproducible in stdlib and, per the owner, not
 required — his stated quote *is* the proof). It ships as `helm premise` /
 `helm premise-check` (operational detail: [ATTESTATION.md](ATTESTATION.md)).

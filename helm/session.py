@@ -460,7 +460,7 @@ def _own_session_identity(r):
     every younger same-session process to a candidate — so a row that SURVIVES
     with identity=='who' carries the process's own exact attribution, never
     its parent's. Treating who rows as inherited hints hid a proven holder
-    from live-holder/DOUBLE-OPEN arithmetic (codex-2 round-3 HIGH)."""
+    from live-holder/DOUBLE-OPEN arithmetic (a critical review finding)."""
     return bool(r.get("declared") or r.get("resume")
                 or r.get("identity") == "who")
 
@@ -1181,7 +1181,7 @@ class _PersistenceCensus(dict):
 
 def _persisting_sids():
     """Full sids that HAVE a real transcript on disk — persistence TRUTH, not
-    the env stamp (premise transcript-on-disk-is-persistence-truth-not-env: a
+    the env stamp (a
     child-stamped pane whose transcript is growing on disk is persisting fine,
     and the env heuristic over-flags it MEMORY-ONLY). Sourced from the session
     catalog — the canonical scanner that already follows symlinked homes
@@ -1192,7 +1192,7 @@ def _persisting_sids():
     <seat>]/claude, so its transcripts are invisible to a ~/.claude +
     ~/.claude-homes scan. Measured 2026-07-22: the catalog held 1472 rows and
     ZERO under ~/.helm, so EVERY proxy seat was reported MEMORY-ONLY while
-    writing a multi-MB transcript (codex-2 at 2.9MB, codex-3 at 2.0MB). A
+    writing a multi-MB transcript (seats observed at 2-3MB). A
     persistence surface that lies about the seats is worse than none — it is
     what the fleet uses to decide whether an agent's work is safe to lose."""
     out, complete = {}, True

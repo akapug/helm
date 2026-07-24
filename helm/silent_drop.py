@@ -151,7 +151,7 @@ def _alert_text(f):
     storm = ((" (+%d more drops on this seat suppressed since the last alert — "
               "a drop-storm; known upstream reasoning-only class, watchdog "
               "caught each, seat self-recovers)" % n) if n else "")
-    return ("@%(seat)s @opus-integrator SILENT-DROP detected: codex "
+    return ("@%(seat)s @coordinator SILENT-DROP detected: codex "
             "produced %(output_tokens)s output_tokens but the completion "
             "arrived EMPTY (proxy drop-after-generate, not a refusal). The "
             "turn ended silently — nothing surfaced. transcript %(session)s "

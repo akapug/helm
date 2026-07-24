@@ -639,7 +639,7 @@ class AutocompactTest(unittest.TestCase):
 
 class CmdAutocompactCliSeam(unittest.TestCase):
     """The CLI guard accepts the verb's WHOLE documented+consumed surface.
-    The fable composition review (2026-07-22) caught the guard refusing
+    A composition review caught the guard refusing
     --once — which killed every installed systemd watchdog: the minted unit
     runs `helm seat autocompact --once` on each tick and exited 2 before
     check() ever ran. These pins tie the guard to its two masters: the unit

@@ -532,7 +532,7 @@ class ScopeTest(StoreBase):
         self.assertEqual(e["root"], "helm-global")
 
     def test_retiring_shadow_winner_never_resurrects_the_shadowed(self):
-        # audit HIGH: a stale wide-scope belief shadowed by a narrow-scope
+        # audit finding: a stale wide-scope belief shadowed by a narrow-scope
         # override must STAY buried when the override is retired/superseded —
         # per-root status filtering resurrected it as live.
         store.write_prior({"id": "shipfast", "statement": "old stale belief",
@@ -1594,7 +1594,7 @@ class CandidateTierTest(StoreBase):
 
 
 class ProvisionalTierTest(StoreBase):
-    """Provisional tier (owner canon 2026-07-22): a candidate a cross-family /x
+    """Provisional tier: a candidate a cross-family /x
     review has cleared goes PROVISIONALLY LIVE — it FIRES through the resolver
     like live but stays visibly [provisional]-tagged until the owner ratifies
     (confirm) or rejects it. xrev-clear is the graduation gate; an un-cleared
@@ -1770,7 +1770,7 @@ class ProvisionalTierTest(StoreBase):
 
 
 class NotifyOnGraduationTest(StoreBase):
-    """Push-on-graduation (owner steer 2026-07-23: the provisional queue must
+    """Push-on-graduation (the provisional queue must
     ROUTINELY reach the owner). xrev_clear fires ONE optional ntfy push when
     HELM_NTFY_TOPIC is set. Hermetic: urllib.request.urlopen is mocked — no test
     ever touches the network. Laws under test: bare-topic -> ntfy.sh URL, full

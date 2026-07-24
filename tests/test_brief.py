@@ -291,7 +291,7 @@ class WaitingOnYouTest(BriefBase):
 
 
 class StoreReviewQueueTest(BriefBase):
-    """The owner steer 2026-07-23: the provisional queue must ROUTINELY reach
+    """The provisional queue must ROUTINELY reach
     the owner. helm brief gains a store-review-queue section — provisional
     (firing, awaiting ratify) listed newest-first as `[type] id - statement`
     (clipped 80), candidate count only, omitted entirely when both are zero

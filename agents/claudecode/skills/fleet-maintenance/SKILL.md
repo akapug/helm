@@ -86,16 +86,16 @@ helm session ls|doctor # persistence tri-state (persisted/UNKNOWN — not proof 
 helm doctor            # global estate health, read-only
 ```
 
-**Live composition + watchdog verbs (landed — cite the SHA when you invoke them):**
-- `helm fleet` (c4507e7) — composition ground-truth: every live claude process
+**Live composition + watchdog verbs (landed):**
+- `helm fleet` — composition ground-truth: every live claude process
   → seat/sid/daemon/stamps/home, all live-probed; probe failure gates the
   verdict, fails closed (a row it can't prove is UNKNOWN, never alive).
   ANSWER FLEET-COMPOSITION QUESTIONS BY RUNNING THIS, never from memory.
-- `helm seat doctor --ensure` (b028672) — proxy watchdog: auto-respawns a
+- `helm seat doctor --ensure` — proxy watchdog: auto-respawns a
   silently-dead proxy, startup-grace so it never SIGTERMs a booting one. The
-  systemic fix for the codex-2 silent-starvation class. Wired to a `*/3 * * * *`
+  systemic fix for the reviewer-seat silent-starvation class. Wired to a `*/3 * * * *`
   cron for continuous supervision.
-- **Proxy-CPU canary** (0aadbed, in `helm seat doctor` output) — a proxy pid at
+- **Proxy-CPU canary** (in `helm seat doctor` output) — a proxy pid at
   sustained-high CPU while siblings idle = a THRASHING backend, the leading
   indicator BEFORE it goes silent. WARN-only (never kills), startup-graced.
 

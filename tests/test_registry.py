@@ -163,7 +163,7 @@ class TestSyncSurvival(RegistryBase):
 
 
 class TestReviewHardening(RegistryBase):
-    """Cross-family (codex-seat) review findings, 2026-07-19 — pinned."""
+    """Cross-family review findings — pinned."""
 
     def test_save_never_clobbers_path_mismatched_authored_entry(self):
         # incumbent authored at path A; a merged view carrying same-NAME
