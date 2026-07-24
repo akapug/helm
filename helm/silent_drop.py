@@ -146,12 +146,17 @@ def _state_path():
     return os.path.join(home.helm_home(), home.GLOBAL, ".state", _STATE)
 
 
+def _coordinator():
+    # the seat to @mention on an alert; unset = no @coordinator mention (public default)
+    return os.environ.get("HELM_COORDINATOR_SEAT", "").strip()
+
+
 def _alert_text(f):
     n = f.get("suppressed_since_last") or 0
     storm = ((" (+%d more drops on this seat suppressed since the last alert — "
               "a drop-storm; known upstream reasoning-only class, watchdog "
               "caught each, seat self-recovers)" % n) if n else "")
-    return ("@%(seat)s @coordinator SILENT-DROP detected: codex "
+    return ("@%(seat)s %(coord)sSILENT-DROP detected: codex "
             "produced %(output_tokens)s output_tokens but the completion "
             "arrived EMPTY (proxy drop-after-generate, not a refusal). The "
             "turn ended silently — nothing surfaced. transcript %(session)s "
@@ -159,6 +164,7 @@ def _alert_text(f):
             "generated then lost — consider re-asking. [silent-drop "
             "watchdog]%(storm)s" % {
                 "seat": f["seat"],
+                "coord": (("@%s " % _coordinator()) if _coordinator() else ""),
                 "output_tokens": f.get("output_tokens"),
                 "session": f.get("session"),
                 "ts": f.get("ts"),

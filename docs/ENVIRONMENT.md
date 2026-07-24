@@ -72,7 +72,11 @@ doctor` reports which overrides are in effect.
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
 | `HELM_PROVIDER` | `native` | provider selection — `native` reads the vendors' own usage endpoints directly (stdlib-only, the default); `cli` opts into an external quota CLI | — |
-| `HELM_QUOTA_CLI` | `quota` | the CLI provider — which binary to shell (only used with `HELM_PROVIDER=cli`) | — |
+| `HELM_QUOTA_CLI` | — (required for `cli`) | the CLI provider — which binary to shell (only with `HELM_PROVIDER=cli`; unset falls back to native) | — |
+| `HELM_LEGACY_ARCHIVE_ROOT` | — (none) | home-archive list/restore — an optional legacy archive root recognized (never written) for migrating from a predecessor; unset = no legacy | — |
+| `HELM_LEGACY_ARCHIVE_MARKER` | `.legacy-archive.json` | home-archive — the marker filename inside a legacy archive dir | — |
+| `HELM_PREDECESSOR_PROCESS` | — (none) | keepalive — an optional predecessor process name to also detect for single-writer coexistence during migration | — |
+| `HELM_COORDINATOR_SEAT` | — (none) | watchdog alerts — the seat to @mention on a silent-drop/idle alert; unset = the alert posts without an @coordinator mention | — |
 | `HELM_ALLOCATION_RULES` | `~/.config/helm/allocation.json` | allocation ranking — operator prefer/avoid rules per model substring | — |
 | `HELM_PROBE_LOOP` | — (`1` starts the background re-probe loop lazily on the first history read) | the native provider's burn-history collector | — |
 | `HELM_ALLOC_MODELS` | `fable,opus,gpt-5.5` | the web quota view — which model chips the allocate panel offers | — |

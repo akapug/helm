@@ -261,11 +261,15 @@ def sync(canon=None, dirs=None, backup_root=None, apply=False):
     dir. Idempotent — a fully-wired estate reports zero changes. -> report."""
     canon = os.path.realpath(canon or canonical())
     backup_root = backup_root or BACKUP_ROOT
-    if canon == os.path.realpath(DEFAULT_CANONICAL):
-        os.makedirs(canon, exist_ok=True)  # fresh install: seed an empty canonical hub
     if not os.path.isdir(canon):
-        return {"error": "canonical skills dir missing: %s (set "
-                         "HELM_SKILLS_CANONICAL or restore the canonical hub)" % canon}
+        # a missing CUSTOM hub is a loud error; a missing DEFAULT hub = fresh install
+        if canon != os.path.realpath(DEFAULT_CANONICAL):
+            return {"error": "canonical skills dir missing: %s (set "
+                             "HELM_SKILLS_CANONICAL or restore the canonical hub)" % canon}
+        if not apply:  # a dry-run must NOT mutate a fresh HOME
+            return {"changes": [], "note": "fresh install \u2014 run `helm skillsync "
+                    "--apply` to seed the canonical hub at %s" % canon}
+        os.makedirs(canon, exist_ok=True)  # fresh install: seed the hub on apply
     if dirs is None:
         dirs = config_dirs()
     strays = plan_merge(canon, dirs)

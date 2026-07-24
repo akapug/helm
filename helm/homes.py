@@ -467,8 +467,10 @@ def home_unarchive(name):
         if os.path.basename(p) == name or meta.get("name") == name:
             cands.append((p, meta, marker))
     if not cands:
-        return {"error": f"nothing archived under {name!r} in {ARCHIVE_ROOT} "
-                         f"or {LEGACY_ARCHIVE_ROOT}"}
+        where = str(ARCHIVE_ROOT)
+        if LEGACY_ARCHIVE_ROOT:
+            where += f" or {LEGACY_ARCHIVE_ROOT}"
+        return {"error": f"nothing archived under {name!r} in {where}"}
     p, meta, marker = cands[-1]  # date-suffixed names sort oldest-first per root
     prov = meta.get("provider") or _detect_provider(p)
     dest = meta.get("from") or (os.path.join(ROOTS[prov], meta.get("name", name))

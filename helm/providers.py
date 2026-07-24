@@ -885,9 +885,10 @@ def default_provider():
     choice = (_env("PROVIDER") or "native").strip().lower()
     if choice == "cli":
         binary = _env("QUOTA_CLI", "")
-        if shutil.which(binary):
+        if binary and shutil.which(binary):
             return CliQuotaProvider(binary)
-        # opted into a CLI that isn't installed: fail toward working, loudly
-        print(f"helm: HELM_PROVIDER=cli but {binary!r} not found — using native provider",
+        # opted into cli but no usable HELM_QUOTA_CLI: fail toward working, loudly
+        missing = f"{binary!r} not found" if binary else "HELM_QUOTA_CLI unset"
+        print(f"helm: HELM_PROVIDER=cli but {missing} — using native provider",
               file=sys.stderr)
     return NativeQuotaProvider()
