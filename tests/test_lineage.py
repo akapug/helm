@@ -87,20 +87,20 @@ class TestApplySeed(LineageBase):
         self.assertEqual(len([n for n in reg if n == "vendor"]), 1)
 
     def test_packaged_seed_shape(self):
+        # The shipped seed is illustrative (no real estate); this pins the
+        # SHAPE the loader relies on, not any specific ancestry.
         with open(lineage.SEED_PATH, encoding="utf-8") as f:
             seed = json.load(f)
         self.assertTrue(seed["edges"])
         for e in seed["edges"]:
             for k in ("src", "rel", "dst", "note"):
                 self.assertIn(k, e)
-            self.assertTrue(e["confirmed"])
-        triples = {(e["src"], e["rel"], e["dst"]) for e in seed["edges"]}
-        self.assertIn(("mission-control", "descends-from", "buildr-private-beta"), triples)
-        self.assertIn(("helm", "supersedes", "sesh"), triples)
-        self.assertIn(("polyanna", "checkout-of", "polyana"), triples)
-        self.assertNotIn("tokaware", {e["src"] for e in seed["edges"]})  # deliberately unlinked
-        # cv/dregg are real repos, never seed externals
-        self.assertEqual([x["name"] for x in seed["external"]], ["references", "herdr"])
+            self.assertIsInstance(e["confirmed"], bool)
+        for x in seed["external"]:
+            self.assertIn("name", x)
+            self.assertIn("path", x)
+        # the read-only prior-art root is the one illustrative external
+        self.assertIn("references", [x["name"] for x in seed["external"]])
 
 
 class TestRender(LineageBase):

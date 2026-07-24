@@ -57,7 +57,7 @@ class RearmBase(unittest.TestCase):
         return d
 
     def waiter(self, seat):
-        return ["python3", "/home/owner/.local/bin/helm", "chat", "wait",
+        return ["python3", "/home/u/.local/bin/helm", "chat", "wait",
                 "--seat", seat, "--follow"]
 
     def bash_wrapper(self, seat):

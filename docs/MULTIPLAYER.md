@@ -82,8 +82,8 @@ tab), while the relay stays blind.
 Two local participants can share opaque updates without sharing a harness:
 
 ```console
-$ helm multiplayer presence --cave helm --actor david --connection phone --state editing
-$ printf %s 'base64:opaque-crdt-update-a' | helm multiplayer publish board --stdin --cave helm --actor david
+$ helm multiplayer presence --cave helm --actor owner --connection phone --state editing
+$ printf %s 'base64:opaque-crdt-update-a' | helm multiplayer publish board --stdin --cave helm --actor owner
 $ printf %s 'base64:opaque-crdt-update-b' | helm multiplayer publish board --stdin --cave helm --actor codex
 $ helm multiplayer read board --cave helm --json
 $ helm multiplayer peers --cave helm --json

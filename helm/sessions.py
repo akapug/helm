@@ -73,7 +73,7 @@ def cred_homes():
     """Every claude credential home on this machine, DEREFERENCED and deduped.
 
     ~/.claude-homes carries a short alias symlink beside each real home
-    (cto-example -> cto-example-invalid, owner -> owner-example-invalid, …),
+    (admin -> admin-example-com, you -> alt-example-com, …),
     so a naive listdir double-counts every account and makes a one-account
     question look like a two-account one. realpath collapses the pair."""
     roots = [os.path.expanduser(DEFAULT_HOME)]

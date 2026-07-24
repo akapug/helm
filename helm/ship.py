@@ -342,7 +342,7 @@ def pull():
 
 def hosts():
     """The cross-host view the observation blocks exist for: who observed
-    what, when — live-on-pug, dormant-on-droopy."""
+    what, when — live-on-host-a, dormant-on-host-b."""
     d = os.path.join(home.global_dir(), "hosts")
     try:
         names = sorted(n for n in os.listdir(d) if n.endswith(".json"))

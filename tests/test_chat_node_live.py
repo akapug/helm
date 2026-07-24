@@ -158,14 +158,14 @@ class LiveNodeTest(unittest.TestCase):
     def test_05_reflex_loop_through_the_signed_room(self):
         home.scaffold_global()
         self.assertEqual(reflex.fire("any turn"), [])
-        chat.post("fleet, morning", who="david")
+        chat.post("fleet, morning", who="owner")
         chat.mark_owner_unread()
         self.assertEqual([e["id"] for e in reflex.fire("any turn")],
                          ["owner-chat-unread"])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(chat.cmd_chat(["read"]), 0)
-        self.assertIn("david: fleet, morning", out.getvalue())
+        self.assertIn("owner: fleet, morning", out.getvalue())
         self.assertEqual(reflex.fire("any turn"), [])   # consumed past the post
 
     def test_06_doctor_sees_the_node_and_balances(self):

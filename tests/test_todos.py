@@ -53,7 +53,7 @@ class TodosBase(unittest.TestCase):
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""   # no signer, no node probe
         os.environ["HELM_CHAT_LOG"] = "0"
-        os.environ["HELM_CHAT_OWNER_NAMES"] = "david"
+        os.environ["HELM_CHAT_OWNER_NAMES"] = "owner"
 
     def tearDown(self):
         for k, v in self.env_prior.items():

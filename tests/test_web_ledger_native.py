@@ -97,7 +97,7 @@ def _seed_chat():
     os.makedirs(d, exist_ok=True)
     rows = [{"ts": "2026-07-21T10:00:00Z", "from": "kimi", "text": "hi"},
             {"ts": "2026-07-21T10:00:05Z", "from": "codex", "text": "yo"},
-            {"ts": "2026-07-21T10:00:09Z", "from": "david", "react": "🔥",
+            {"ts": "2026-07-21T10:00:09Z", "from": "owner", "react": "🔥",
              "tts": "2026-07-21T10:00:05Z", "tfrom": "codex"}]
     with open(os.path.join(d, "main.jsonl"), "w", encoding="utf-8") as f:
         f.write("".join(json.dumps(r) + "\n" for r in rows))
@@ -139,7 +139,7 @@ class TestNativeLedger(NativeBase):
         p = d["chat"]
         self.assertEqual((p["rooms"], p["msgs"]), (1, 2))
         # a reaction IS activity — the newest row wins last_*
-        self.assertEqual((p["last_from"], p["last_room"]), ("david", "main"))
+        self.assertEqual((p["last_from"], p["last_room"]), ("owner", "main"))
         self.assertEqual(p["last_ts"], "2026-07-21T10:00:09Z")
 
     def test_read_only(self):

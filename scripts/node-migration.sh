@@ -91,7 +91,7 @@ probe_beat() {  # mint one receipt so /api/receipts (in-memory, EMPTY each boot)
                 # invariant), PROBE_BEAT_INDEX (per-boot, informational only),
                 # PROBE_BEAT_ATTEMPTS (beat tries used; a failed try may or
                 # may not have committed a turn — the gate carries that slack).
-  PROBE_PROFILE="${PROBE_PROFILE:-david}"
+  PROBE_PROFILE="${PROBE_PROFILE:?set PROBE_PROFILE to your cell profile name}"
   PROBE_JSON="$HOME/.dregg/profiles/$PROBE_PROFILE.json"
   [ -f "$PROBE_JSON" ] || die "probe profile missing: $PROBE_JSON"
   PROBE_PUB="$(python3 -c "import json;print(json.load(open('$PROBE_JSON'))['public_key_hex'])")" \

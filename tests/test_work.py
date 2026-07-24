@@ -51,7 +51,7 @@ class WorkBase(unittest.TestCase):
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""
         os.environ["HELM_CHAT_LOG"] = "0"
-        os.environ["HELM_CHAT_OWNER_NAMES"] = "david"
+        os.environ["HELM_CHAT_OWNER_NAMES"] = "owner"
         os.environ["GIT_CONFIG_GLOBAL"] = "/dev/null"
         os.environ["GIT_CONFIG_SYSTEM"] = "/dev/null"
         self.root = os.path.join(self.tmp, "proj")

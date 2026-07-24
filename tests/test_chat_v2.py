@@ -190,7 +190,7 @@ class TransportTest(V2Base):
     def test_diagnostics_scrub_auth_schemes_and_quoted_secret_keys(self):
         cases = (
             "Authorization: Basic dXNlcjpwYXNz",
-            'Authorization: Digest username="david", response="sekrit"',
+            'Authorization: Digest username="owner", response="sekrit"',
             "Authorization='Signature keyId=abc signature=sekrit'",
             "{'bearer_token':'sekrit with spaces'}",
             '{"refresh_token": "also-secret"}',
@@ -961,13 +961,13 @@ class ReactToggleTest(V2Base):
 
     def test_double_react_nets_to_at_most_one(self):
         m = chat.post("hi", who="a1")
-        chat.react(1, ":tada:", who="david")
+        chat.react(1, ":tada:", who="owner")
         self.assertEqual(self._counts(m), {"🎉": 1})    # first click adds
-        row, err = chat.react(1, ":tada:", who="david")  # the retry/re-click
+        row, err = chat.react(1, ":tada:", who="owner")  # the retry/re-click
         self.assertIsNone(err)
         self.assertTrue(row["un"])                       # a tombstone, not a dup
         self.assertEqual(self._counts(m), {})            # toggle-off removes
-        chat.react(1, ":tada:", who="david")             # third click re-adds
+        chat.react(1, ":tada:", who="owner")             # third click re-adds
         self.assertEqual(self._counts(m), {"🎉": 1})     # never more than one
 
     def test_two_seats_counted_and_attributed_distinctly(self):
@@ -985,10 +985,10 @@ class ReactToggleTest(V2Base):
         # the exact bad data in the wild: FOUR identical add rows from one click
         m = chat.post("hi", who="a1")
         for _ in range(4):
-            chat._append({"ts": "2026-07-21T10:00:00", "from": "david",
+            chat._append({"ts": "2026-07-21T10:00:00", "from": "owner",
                           "react": "❤️", "tts": m["ts"], "tfrom": "a1"}, "main")
         self.assertEqual(self._counts(m), {"❤️": 1})    # legend self-heals on read
-        chat.react(1, "❤️", who="david")                 # next click sees ON ->
+        chat.react(1, "❤️", who="owner")                 # next click sees ON ->
         self.assertEqual(self._counts(m), {})            # one tombstone clears all 4
 
     def test_signed_react_binds_the_reactor_identity(self):

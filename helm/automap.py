@@ -120,8 +120,7 @@ def _name_for(root, taken, home):
 def _scan_roots():
     raw = os.environ.get("HELM_SCAN_ROOTS")
     home = os.path.expanduser("~")
-    roots = raw.split(":") if raw else [os.path.join(home, "dev", "akapug"),
-                                       os.path.join(home, "dev")]
+    roots = raw.split(":") if raw else [os.path.join(home, "dev")]
     return [os.path.expanduser(r) for r in roots if r]
 
 

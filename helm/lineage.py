@@ -10,10 +10,11 @@ This slice derives and renders; it moves nothing. archive_report() is a ranked
 "safe to archive and why" REPORT — the executable archive-move is a later slice
 behind a dry-run+confirm gate (lineage-map-decisions Q3).
 
-Seed law: lineage_seed.json carries the owner-confirmed founding ancestry
-(buildr → mc(+dregg+cv) → meld+sesh → helm) and applies idempotently — externals
-only where the path exists and the name is not already a registry project, edges
-only where both endpoints are known (missing endpoints skip quietly + report).
+Seed law: lineage_seed.json carries an illustrative founding ancestry (the
+shipped default names no real estate — operators seed their own) and applies
+idempotently — externals only where the path exists and the name is not already
+a registry project, edges only where both endpoints are known (missing
+endpoints skip quietly + report).
 """
 import os
 import subprocess

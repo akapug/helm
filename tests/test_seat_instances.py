@@ -105,7 +105,7 @@ class LaunchLineInstanceTest(Slice6Base):
 class CapacityTest(Slice6Base):
     def test_pool_of_pro_and_team_folds_tiers(self):
         self._pool_cred("cto", plan="pro")          # ultra -> 3
-        self._pool_cred("simbi", plan="team")       # team  -> 1
+        self._pool_cred("teamco", plan="team")      # team  -> 1
         self._pool_cred("ops", plan="team")         # team  -> 1
         cap = codexhomes.capacity()
         self.assertEqual(cap["total"], 5)

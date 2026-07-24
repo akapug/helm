@@ -36,7 +36,7 @@ honest — author≈best-diagnoser, but never author-alone-confirms).
 Before refuting a fix's *shape* or a design's *details*, verify the indicted code path /
 structure is actually LIVE — populated, on the production path, exercised by the real
 workload. Two strong models can "converge" efficiently on a fix aimed at a subsystem
-production never touches (2026-06-09 simbi-mesh: Opus+codex agreed on a `witness_reach`
+production never touches (a real mesh-service case: Opus+codex agreed on a `witness_reach`
 fix for a structure EMPTY on the live v2 path; the real root was a different subsystem —
 caught only when the next session re-derived the premise from the code). `author ≠ eyes`
 does NOT catch this: both models satisfied it and still agreed on the wrong target.
@@ -195,7 +195,7 @@ Two closure rules, both born from live misses (seq636 ack-claimed-fix-not-applie
 - **For restart / consensus / persistence / recovery fixes the verdict MUST name the
   PRODUCT invariant proven and its must-fail-pre check** — which user-visible property
   the verifier exercises, and that the test FAILS on the pre-fix binary. A test proving
-  a helper field cannot approve a deploy (simbi #96: grounded APPROVE, wrong property —
+  a helper field cannot approve a deploy (a real deploy-review case: grounded APPROVE, wrong property —
   retention proven, restore-reordering not).
 
 ## Account-aware xfam dispatch (preflight, fail-honest)

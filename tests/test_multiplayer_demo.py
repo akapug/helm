@@ -15,13 +15,13 @@ def _env(update, ts, ident, actor="x"):
 
 class DemoCrdtTest(unittest.TestCase):
     def test_encode_roundtrips_through_materialize(self):
-        out = d.materialize([_env(d.encode("greeting", "hello", "david"), 1.0, "a")])
+        out = d.materialize([_env(d.encode("greeting", "hello", "owner"), 1.0, "a")])
         self.assertEqual(out["board"], [{"key": "greeting", "value": "hello",
-                                         "actor": "david", "ts": 1.0}])
+                                         "actor": "owner", "ts": 1.0}])
         self.assertEqual((out["cells"], out["foreign"]), (1, 0))
 
     def test_lww_later_timestamp_wins_in_either_arrival_order(self):
-        early = _env(d.encode("k", "old", "david"), 1.0, "aaa")
+        early = _env(d.encode("k", "old", "owner"), 1.0, "aaa")
         late = _env(d.encode("k", "new", "codex"), 2.0, "bbb")
         for order in ([early, late], [late, early]):
             out = d.materialize(order)

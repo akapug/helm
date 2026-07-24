@@ -20,3 +20,8 @@ docs/DECISION-*.md
 *.png
 .env
 .env.*
+
+# personal/internal surfaces — kept local, never on the remote (as-public repo law)
+agents/claudecode/skills/i-have-audhd/
+evals/*.md
+docs/REBOOT_CHECKLIST_1.4.149.md

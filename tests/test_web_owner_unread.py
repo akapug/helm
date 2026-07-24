@@ -87,15 +87,15 @@ class TestOwnerUnread(unittest.TestCase):
         self.assertNotIn("owner_mention_last", d)
 
     def test_mentions_past_cursor_and_read_ack(self):
-        chat.post("@david ship it?", who="fable-a")
+        chat.post("@owner ship it?", who="fable-a")
         chat.post("agent chatter, no address", who="fable-a")
-        m2 = chat.post("@david second call", who="codex-b")
+        m2 = chat.post("@owner second call", who="codex-b")
         d = self.signal()
         self.assertEqual(d["owner_unread"], 3)   # every agent row is unread
         self.assertEqual(d["owner_mentions"], 2)  # two address the owner
         # dedup key + preview name the NEWEST unseen mention (the decision)
         self.assertEqual(d["owner_mention_last"], "%s|%s" % (m2["ts"], "codex-b"))
-        self.assertEqual(d["owner_mention_preview"], "codex-b: @david second call")
+        self.assertEqual(d["owner_mention_preview"], "codex-b: @owner second call")
         # the owner read the room (chat view open + visible) — cursor advances
         status, ack = self.req("/api/chat/read", {"room": "main"})
         self.assertEqual(status, 200)
@@ -104,12 +104,12 @@ class TestOwnerUnread(unittest.TestCase):
         self.assertEqual((d["owner_read"], d["owner_unread"], d["owner_mentions"]),
                          (3, 0, 0))
         # the next mention is a fresh decision past the moved cursor
-        chat.post("@david again", who="fable-a")
+        chat.post("@owner again", who="fable-a")
         d = self.signal()
         self.assertEqual((d["owner_unread"], d["owner_mentions"]), (1, 1))
 
     def test_read_ack_demands_the_bearer(self):
-        chat.post("@david psst", who="fable-a")
+        chat.post("@owner psst", who="fable-a")
         status, _ = self.req("/api/chat/read", {"room": "main"}, token=False)
         self.assertEqual(status, 403)
         self.assertEqual(self.signal()["owner_mentions"], 1)  # cursor unmoved
@@ -117,9 +117,9 @@ class TestOwnerUnread(unittest.TestCase):
     # ── owner-name matching (the delivery filter's owner rule) ──
 
     def test_name_matching_boundaries_and_case(self):
-        chat.post("@David case-insensitive", who="fable-a")
-        chat.post("@davidx is a different seat", who="fable-a")
-        chat.post("mail david@example.com today", who="fable-a")  # not an @mention
+        chat.post("@Owner case-insensitive", who="fable-a")
+        chat.post("@ownerx is a different seat", who="fable-a")
+        chat.post("mail owner@example.com today", who="fable-a")  # not an @mention
         chat.post("@all broadcast is fleet noise, not an owner call", who="fable-a")
         d = self.signal()
         self.assertEqual(d["owner_unread"], 4)
@@ -128,19 +128,19 @@ class TestOwnerUnread(unittest.TestCase):
     def test_owner_names_env_override(self):
         os.environ["HELM_CHAT_OWNER_NAMES"] = "skipper"
         chat.post("@skipper aye", who="fable-a")
-        chat.post("@david is not the owner here", who="fable-a")
+        chat.post("@owner is not the owner here", who="fable-a")
         d = self.signal()
         self.assertEqual(d["owner_mentions"], 1)
 
     def test_owner_rail_posts_never_badge_the_owner(self):
         # the owner's own web post — even one naming himself — is not a call
-        status, _ = self.req("/api/chat", {"text": "@david note to self"})
+        status, _ = self.req("/api/chat", {"text": "@owner note to self"})
         self.assertEqual(status, 200)
         d = self.signal()
         self.assertEqual((d["owner_unread"], d["owner_mentions"]), (0, 0))
         # a CLI post CLAIMING the owner name (no rail origin) stays an
         # ordinary row — counting it is the impersonation fail-safe
-        chat.post("@david trust me, it's me", who="david")
+        chat.post("@owner trust me, it's me", who="owner")
         d = self.signal()
         self.assertEqual((d["owner_unread"], d["owner_mentions"]), (1, 1))
 
@@ -164,20 +164,20 @@ class TestOwnerUnread(unittest.TestCase):
         self.assertEqual(json.loads(lines[1])["id"], keep["id"])
         with open(chat.room_path("main"), "w", encoding="utf-8") as f:
             f.write(lines[1] + "\n")
-        chat.post("@david fresh call", who="fable-a")
+        chat.post("@owner fresh call", who="fable-a")
         d = self.signal()
         self.assertEqual((d["owner_read"], d["owner_unread"], d["owner_mentions"]),
                          (1, 1, 1))
 
     def test_corrupt_cursor_fails_open_to_zero(self):
-        chat.post("@david hello", who="fable-a")
+        chat.post("@owner hello", who="fable-a")
         with open(web._owner_read_path("main"), "w", encoding="utf-8") as f:
             f.write("not json {")
         d = self.signal()
         self.assertEqual((d["owner_read"], d["owner_mentions"]), (0, 1))
 
     def test_signal_failure_answers_zeros_never_an_error(self):
-        chat.post("@david hello", who="fable-a")
+        chat.post("@owner hello", who="fable-a")
         real = seats.owner_names
         seats.owner_names = None  # not callable — the signal leg raises
         try:

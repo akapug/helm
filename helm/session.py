@@ -1185,7 +1185,7 @@ def _persisting_sids():
     child-stamped pane whose transcript is growing on disk is persisting fine,
     and the env heuristic over-flags it MEMORY-ONLY). Sourced from the session
     catalog — the canonical scanner that already follows symlinked homes
-    (cto-example -> …) and never indexes the derived .flat.jsonl variant.
+    (admin -> …) and never indexes the derived .flat.jsonl variant.
 
     PLUS the SEAT homes, which the catalog does NOT cover: a proxy seat's
     CLAUDE_CONFIG_DIR lives under ~/.helm/_global/seats/<family>[/instances/

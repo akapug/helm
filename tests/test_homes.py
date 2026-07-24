@@ -63,7 +63,7 @@ class HomesTest(unittest.TestCase):
 
     # -- canon: name folding ----------------------------------------------
     def test_canonical_name_folding(self):
-        self.assertEqual(homes.canonical_name("David@X.com"), "david-x-com")
+        self.assertEqual(homes.canonical_name("Owner@example.com"), "owner-example-com")
         self.assertEqual(homes.canonical_name("a.b+c@d-e.io"), "a-b-c-d-e-io")
         self.assertEqual(homes.canonical_name(""), "")
 

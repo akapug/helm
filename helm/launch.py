@@ -79,7 +79,7 @@ def build_env(base, seat, home_path=None, room=None, room_source=None):
 
 
 def home_note(home_path, asked):
-    """The anti-drift line: `--home cto-example` names a DIRECTORY, and a past
+    """The anti-drift line: `--home admin` names a DIRECTORY, and a past
     `/login` may have put a different account inside it. Print who the home
     ACTUALLY holds (cred.account_of reads the content) before exec — the
     operator asked for an account, not a path. Never blocks the launch."""

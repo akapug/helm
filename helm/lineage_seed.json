@@ -1,25 +1,14 @@
 {
-  "_source": "founding brief 2026-07-18 (buildr → mc+tokaware(+dregg+cv) → meld+sesh → helm) + docs/lineage-map-decisions-2026-07-18.md + advisor git-proven corrections (ADVISOR_ANSWERS.md, 2026-07-18): root at herdr, cv truth-engine, tokaware cred/quota layer",
+  "_source": "illustrative seed — the shipped default names no real estate. A host's true project lineage is discovered at runtime via `helm sync` (repo scan) plus operator-authored edges in registry-authored.json. Replace/extend the examples below, or start empty: {\"edges\": [], \"external\": []}.",
   "_deliberately_unlinked": [
-    "dev-homelab (~/dev/homelab) vs homelab (~/dev/akapug/homelab) — unknown relation, left unlinked",
-    "dep-scan signal (projects a repo USES vs builds — cv/dregg consumed as binaries) — designed, not yet a discovery source"
+    "sibling checkouts of one project under different roots — left unlinked until a relation is confirmed",
+    "dependency-use signal (projects a repo USES vs builds — binaries consumed) — a designed, not-yet-wired discovery source"
   ],
   "edges": [
-    {"src": "buildr-private-beta", "rel": "descends-from", "dst": "herdr", "note": "git-proven shared root a57b9728 (herdr → buildr → mc) [advisor 2026-07-18]", "confirmed": true},
-    {"src": "mission-control", "rel": "descends-from", "dst": "buildr-private-beta", "note": "AX-coordination half; shares root a57b9728 [founding brief + advisor 2026-07-18]", "confirmed": true},
-    {"src": "mission-control", "rel": "composes", "dst": "dregg", "note": "truth engine (verifiability); forked_from emberian/dregg — Ember owns the lane, we consume [founding brief + advisor 2026-07-18]", "confirmed": true},
-    {"src": "mission-control", "rel": "composes", "dst": "cv", "note": "truth engine (recall plane); forked_from emberian/cv, shared root 17bb708 [founding brief + advisor 2026-07-18]", "confirmed": true},
-    {"src": "sesh", "rel": "composes", "dst": "tokaware", "note": "contributes cred/quota layer — account-selection-by-headroom inherited tokaware [advisor 2026-07-18]", "confirmed": true},
-    {"src": "meld", "rel": "descends-from", "dst": "mission-control", "note": "founding brief 2026-07-18", "confirmed": true},
-    {"src": "sesh", "rel": "descends-from", "dst": "mission-control", "note": "founding brief 2026-07-18", "confirmed": true},
-    {"src": "helm", "rel": "descends-from", "dst": "meld", "note": "cell/whisper/roster tech continues as helm's substrate layer [founding brief 2026-07-18]", "confirmed": true},
-    {"src": "helm", "rel": "descends-from", "dst": "sesh", "note": "cred-home lifecycle, session catalog, config-cascade inspector absorbed [founding brief 2026-07-18]", "confirmed": true},
-    {"src": "helm", "rel": "supersedes", "dst": "sesh", "note": "sesh the brand dissolves into helm [founding brief 2026-07-18]", "confirmed": true},
-    {"src": "helm", "rel": "descends-from", "dst": "buildr-private-beta", "note": "the human half — buildr's personalization feel [founding brief 2026-07-18]", "confirmed": true},
-    {"src": "polyanna", "rel": "checkout-of", "dst": "polyana", "note": "orca workspace checkout [founding brief 2026-07-18]", "confirmed": true}
+    {"src": "example-app", "rel": "descends-from", "dst": "example-root", "note": "illustrative edge — shape only, no real repo", "confirmed": false},
+    {"src": "example-app", "rel": "composes", "dst": "example-lib", "note": "illustrative edge — a composed dependency", "confirmed": false}
   ],
   "external": [
-    {"name": "references", "path": "~/dev/references", "note": "read-only prior art [founding brief 2026-07-18]"},
-    {"name": "herdr", "path": "~/dev/akapug/herdr-worktrees", "note": "upstream ogulcancelik/herdr — the family ROOT (shared root a57b9728 with buildr/mc); local main checkout absent, worktrees remain [advisor git-proven 2026-07-18]"}
+    {"name": "references", "path": "~/dev/references", "note": "read-only prior art (example external root)"}
   ]
 }

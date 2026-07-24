@@ -348,11 +348,11 @@ def resolve_homing(cli_room=None, cwd=None):
 
 def owner_names():
     """Display names the owner rails post under. HELM_CHAT_OWNER_NAMES csv
-    overrides; default = 'david' (the web surface's name) + the unix login."""
+    overrides; default = 'owner' (the web surface's name) + the unix login."""
     raw = home.env("CHAT_OWNER_NAMES")
     if raw is not None:
         return {n.strip().lower() for n in raw.split(",") if n.strip()}
-    names = {"david"}
+    names = {"owner"}
     try:
         names.add(getpass.getuser().lower())
     except Exception:

@@ -17,7 +17,7 @@ THE CANON (CRED_AUTH_CANON, distilled — violating these bricks accounts):
     across homes (the revocation bomb). Only the 10-hex digest prefix
     survives; token bytes are never printed, logged, or persisted.
   * canonical home name = the account email with every non-alphanumeric char
-    folded to '-'  (david@x.com -> david-x-com). Aliases = symlinks.
+    folded to '-'  (owner@example.com -> owner-example-com). Aliases = symlinks.
   * claude homes: `projects` must SYMLINK to ~/.claude/projects (one shared
     session store) — a REAL projects dir silently strands sessions.
   * archive = MOVE into ~/.helm-home-archive/<name>-<date>/ (reversible),
@@ -52,7 +52,7 @@ LOGIN_CMDS = {"claude": lambda h: f"CLAUDE_CONFIG_DIR={shlex.quote(h)} claude /l
 
 
 def canonical_name(email):
-    """david@x.com -> david-x-com (same fold as the predecessor's _norm — keep them in step)."""
+    """owner@example.com -> owner-example-com (same fold as the predecessor's _norm — keep them in step)."""
     return "".join(ch if ch.isalnum() else "-" for ch in (email or "").lower()).strip("-")
 
 

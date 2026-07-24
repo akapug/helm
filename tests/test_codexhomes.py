@@ -96,14 +96,14 @@ class CodexHomesTest(unittest.TestCase):
 
     # -- list: tier classification, aliases, pooled column ------------------
     def test_list_classifies_ultra_and_team(self):
-        self._plant("cto-example", email="cto@mv.test", plan="pro", plan_in="access")
-        self._plant("team-example", email="hey@simbi.test", plan="team", plan_in="id")
+        self._plant("admin", email="admin@example.com", plan="pro", plan_in="access")
+        self._plant("team-example", email="team@example.com", plan="team", plan_in="id")
         rows = {r["name"]: r for r in codexhomes.codex_list()}
-        self.assertEqual(rows["cto-example"]["tier"], "ultra")
-        self.assertEqual(rows["cto-example"]["plan"], "pro")
+        self.assertEqual(rows["admin"]["tier"], "ultra")
+        self.assertEqual(rows["admin"]["plan"], "pro")
         self.assertEqual(rows["team-example"]["tier"], "team")
-        self.assertEqual(rows["team-example"]["email"], "hey@simbi.test")
-        self.assertFalse(rows["cto-example"]["pooled"])
+        self.assertEqual(rows["team-example"]["email"], "team@example.com")
+        self.assertFalse(rows["admin"]["pooled"])
 
     def test_list_folds_symlink_alias_and_same_account_dirs(self):
         self._plant("real-home", email="one@x.test")
@@ -123,29 +123,29 @@ class CodexHomesTest(unittest.TestCase):
         self.assertIsNone(rows["empty-home"]["email"])
 
     def test_list_cli_table_no_secrets(self):
-        self._plant("cto-example", email="cto@mv.test", plan="pro")
+        self._plant("admin", email="admin@example.com", plan="pro")
         rc, out, err = self._cmd("list")
         self.assertEqual(rc, 0, err)
-        self.assertIn("cto-example", out)
-        self.assertIn("cto@mv.test", out)
+        self.assertIn("admin", out)
+        self.assertIn("admin@example.com", out)
         self.assertIn("ultra", out)
         self._assert_no_secrets(out + err)
 
     # -- pool: flat 0600 record, right fields, source untouched -------------
     def test_pool_writes_flat_0600_record(self):
-        path, auth, exp = self._plant("cto-example", email="cto@mv.test", plan="pro")
+        path, auth, exp = self._plant("admin", email="admin@example.com", plan="pro")
         with open(path, "rb") as f:
             before = f.read()
-        res = codexhomes.codex_pool("cto-example")
+        res = codexhomes.codex_pool("admin")
         self.assertTrue(res.get("ok"), res)
-        dest = os.path.join(codexhomes.pool_dir(), "codex-cto-example.json")
+        dest = os.path.join(codexhomes.pool_dir(), "codex-admin.json")
         self.assertEqual(res["path"], dest)
         self.assertEqual(stat.S_IMODE(os.stat(dest).st_mode), 0o600)
         with open(dest) as f:
             rec = json.load(f)
         t = auth["tokens"]
         self.assertEqual(rec["type"], "codex")
-        self.assertEqual(rec["email"], "cto@mv.test")
+        self.assertEqual(rec["email"], "admin@example.com")
         self.assertEqual(rec["account_id"], t["account_id"])
         self.assertEqual(rec["access_token"], t["access_token"])
         self.assertEqual(rec["id_token"], t["id_token"])
@@ -186,14 +186,14 @@ class CodexHomesTest(unittest.TestCase):
                          "acct-claim-only")
 
     def test_pool_idempotent_refresh(self):
-        self._plant("cto-example")
-        first = codexhomes.codex_pool("cto-example")
+        self._plant("admin")
+        first = codexhomes.codex_pool("admin")
         self.assertFalse(first["updated"])
-        second = codexhomes.codex_pool("cto-example")
+        second = codexhomes.codex_pool("admin")
         self.assertTrue(second.get("ok"), second)
         self.assertTrue(second["updated"])
         pool = os.listdir(codexhomes.pool_dir())
-        self.assertEqual(pool, ["codex-cto-example.json"])
+        self.assertEqual(pool, ["codex-admin.json"])
 
     def test_pool_via_alias_writes_canonical(self):
         self._plant("real-home")
@@ -224,35 +224,35 @@ class CodexHomesTest(unittest.TestCase):
             os.path.join(codexhomes.pool_dir(), "codex-stale-home.json")))
 
     def test_pool_cli_output_no_secrets(self):
-        self._plant("cto-example", email="cto@mv.test")
-        rc, out, err = self._cmd("pool", "cto-example")
+        self._plant("admin", email="admin@example.com")
+        rc, out, err = self._cmd("pool", "admin")
         self.assertEqual(rc, 0, err)
-        self.assertIn("cto@mv.test", out)
+        self.assertIn("admin@example.com", out)
         self.assertIn("hot-reload", out)
         self._assert_no_secrets(out + err)
 
     # -- pooled / unpool round-trip ------------------------------------------
     def test_pooled_unpool_roundtrip(self):
-        self._plant("cto-example", email="cto@mv.test", plan="pro")
-        self._plant("team-example", email="hey@simbi.test", plan="team")
-        codexhomes.codex_pool("cto-example")
+        self._plant("admin", email="admin@example.com", plan="pro")
+        self._plant("team-example", email="team@example.com", plan="team")
+        codexhomes.codex_pool("admin")
         codexhomes.codex_pool("team-example")
         rows = {r["file"]: r for r in codexhomes.codex_pooled()}
         self.assertEqual(len(rows), 2)
-        r = rows["codex-cto-example.json"]
+        r = rows["codex-admin.json"]
         self.assertEqual((r["email"], r["tier"], r["disabled"]),
-                         ("cto@mv.test", "ultra", False))
+                         ("admin@example.com", "ultra", False))
         self.assertEqual(rows["codex-team-example.json"]["tier"], "team")
         # list now shows the pooled linkage
         by_name = {x["name"]: x for x in codexhomes.codex_list()}
-        self.assertEqual(by_name["cto-example"]["pooled"], "codex-cto-example.json")
+        self.assertEqual(by_name["admin"]["pooled"], "codex-admin.json")
         # unpool one — the other survives
-        res = codexhomes.codex_unpool("cto-example")
-        self.assertEqual(res["removed"], ["codex-cto-example.json"])
+        res = codexhomes.codex_unpool("admin")
+        self.assertEqual(res["removed"], ["codex-admin.json"])
         self.assertEqual([r["file"] for r in codexhomes.codex_pooled()],
                          ["codex-team-example.json"])
         # fail-open: unpooling the already-absent name is ok, not error
-        again = codexhomes.codex_unpool("cto-example")
+        again = codexhomes.codex_unpool("admin")
         self.assertTrue(again["ok"])
         self.assertEqual(again["removed"], [])
         self.assertIn("fail-open", again["note"])
@@ -266,14 +266,14 @@ class CodexHomesTest(unittest.TestCase):
         self.assertEqual(res["removed"], ["codex-real-home.json"])
 
     def test_pooled_cli_no_secrets_and_unparseable_reported(self):
-        self._plant("cto-example", email="cto@mv.test")
-        codexhomes.codex_pool("cto-example")
+        self._plant("admin", email="admin@example.com")
+        codexhomes.codex_pool("admin")
         os.makedirs(codexhomes.pool_dir(), exist_ok=True)
         with open(os.path.join(codexhomes.pool_dir(), "junk.json"), "w") as f:
             f.write("{not json")
         rc, out, err = self._cmd("pooled")
         self.assertEqual(rc, 0, err)
-        self.assertIn("cto@mv.test", out)
+        self.assertIn("admin@example.com", out)
         self.assertIn("unparseable", out)
         self._assert_no_secrets(out + err)
 

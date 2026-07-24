@@ -199,19 +199,19 @@ class MultiplayerTest(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def test_cli_two_actor_dogfood_contract(self):
-        rc, out, _ = self._run(["presence", "--cave", "demo", "--actor", "david",
+        rc, out, _ = self._run(["presence", "--cave", "demo", "--actor", "owner",
                                 "--connection", "phone", "--state", "editing"])
         self.assertEqual(rc, 0)
-        self.assertEqual(json.loads(out)["actor"], "david")
+        self.assertEqual(json.loads(out)["actor"], "owner")
         self.assertEqual(self._run(["publish", "board", "--stdin", "--cave", "demo",
-                                    "--actor", "david"], stdin="opaque-a")[0], 0)
+                                    "--actor", "owner"], stdin="opaque-a")[0], 0)
         self.assertEqual(self._run(["publish", "board", "--stdin", "--cave", "demo",
                                     "--actor", "codex"], stdin="opaque-b")[0], 0)
         rc, out, _ = self._run(["read", "board", "--cave", "demo", "--json"])
         self.assertEqual(rc, 0)
         rows = json.loads(out)["updates"]
         self.assertEqual([(r["actor"], r["update"]) for r in rows],
-                         [("david", "opaque-a"), ("codex", "opaque-b")])
+                         [("owner", "opaque-a"), ("codex", "opaque-b")])
         self.assertEqual(self._run(["peers", "--cave", "demo", "--json"])[0], 0)
 
     def test_cli_set_and_status_drive_the_lww_demo_board(self):
@@ -225,7 +225,7 @@ class MultiplayerTest(unittest.TestCase):
 
         with mock.patch.object(multiplayer.time, "time", clock):
             for args in (["set", "board", "greeting", "hello", "--cave", "demo",
-                          "--actor", "david"],
+                          "--actor", "owner"],
                          ["set", "board", "greeting", "hi", "there", "--cave",
                           "demo", "--actor", "codex"],  # later + multi-word value
                          ["set", "board", "status", "building", "--cave", "demo",

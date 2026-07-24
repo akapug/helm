@@ -21,12 +21,12 @@ sesh doctor                      # what works on THIS machine, what's missing (�
 sesh creds                       # accounts: state, 5h/7d battery, weekly windows, homes, hygiene flags
 sesh ls -q herdr --harness claude  # find sessions (also --cwd substring, --json for OpenSession shape)
 sesh cmd 55edcba9                # print THE resume command; auto-picks the best-headroom account
-sesh cmd 55edcba9 --account hey@simbi.com --model fable   # pin account/model
+sesh cmd 55edcba9 --account team@example.com --model fable   # pin account/model
 sesh show 55edcba9 --find "auth bug"   # read the transcript, window centered on the match (»)
 sesh mv 55edcba9 ~/dev/x         # re-home: claude --resume resolves from the new dir (--reset undoes)
 sesh prune 55edcba9 --dry        # estimate a smaller resumable COPY; drop --dry to create it
 sesh capsule 55edcba9            # session × its git-era sha → worktree + resume block (time capsule)
-sesh swap david@mv hey@simbi.com # rollover: every live agent on FROM + its resume command under TO
+sesh swap owner@mv team@example.com # rollover: every live agent on FROM + its resume command under TO
 sesh next                        # which account to launch each model under, right now
 sesh history --hours 48          # per-account quota utilization sparklines
 sesh home ls                     # every credential home: auth, identity, live agents, hygiene
@@ -72,7 +72,7 @@ sesh cmd f3ab12                  # auto-picks best headroom; stderr names the ac
 
 ```
 sesh creds                       # confirm FROM is drained, pick TO by battery
-sesh swap cto@example.invalid hey@simbi.com
+sesh swap admin@example.com team@example.com
 # per seat: finish/park the pane, exit the agent, paste that seat's printed block
 ```
 

@@ -190,7 +190,7 @@ class DefaultPackFiringTest(SeedBase):
     def test_owner_chat_unread_fires_on_marker_only(self):
         # the chat notify loop: marker present -> fires on ANY turn text;
         # consumed (cleared) -> silent again
-        chat.post("agents, status?", who="david")
+        chat.post("agents, status?", who="owner")
         chat.mark_owner_unread()
         self.assertEqual(self.fired("totally unrelated turn"), ["owner-chat-unread"])
         chat.consume(total=chat.read()[1])

@@ -196,7 +196,7 @@
   finished pre-image); and `helm cred list` + doctor's drift row now report
   whether the EVICTED account is recoverable — the BACKUPS column counts the
   ARRIVING account, which reads as `0` at exactly the moment the owner needs
-  to know the evicted one is safe (live estate: `cto-example-invalid`
+  to know the evicted one is safe (live estate: `admin-example-com`
   now says plainly that nothing was ever snapshotted for it).
 
 - Second independent CRED-SAFE-SWITCH review closed the remaining safety gaps:

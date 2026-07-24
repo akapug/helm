@@ -263,7 +263,7 @@ class TestWebLedgerSigned(LedgerBase):
         chat_d = os.environ["HELM_CHAT_DIR"]
         os.makedirs(chat_d, exist_ok=True)
         with open(os.path.join(chat_d, "main.jsonl"), "w") as f:
-            f.write(json.dumps({"ts": "2026-07-21T09:00:00", "from": "david",
+            f.write(json.dumps({"ts": "2026-07-21T09:00:00", "from": "owner",
                                 "text": "hello fleet", "origin": "web",
                                 "turn": HEAD_HASH, "receipt": "f" * 64,
                                 "chain": 12, "id": "aabbccddeeff"}) + "\n")
@@ -297,7 +297,7 @@ class TestWebLedgerSigned(LedgerBase):
         _, by_hash = self._turns_by_hash()
         ab = by_hash[HEAD_HASH]["about"]
         self.assertEqual((ab["kind"], ab["from"], ab["room"], ab["text"]),
-                         ("chat", "david", "main", "hello fleet"))
+                         ("chat", "owner", "main", "hello fleet"))
 
     def test_attest_turn_carries_its_about_label(self):
         _, by_hash = self._turns_by_hash()

@@ -1122,8 +1122,8 @@ class SeatTest(unittest.TestCase):
         self._plant("home-a")
         self.assertEqual(self._add()[0], 0)
         with mock.patch.dict(os.environ, {
-                "HELM_CHAT_NAME": "david", "HELM_CELL_PROFILE": "david",
-                "DREGG_PROFILE": "david", "HELM_CELL_BIN": "/tmp/legacy-signer"}):
+                "HELM_CHAT_NAME": "owner", "HELM_CELL_PROFILE": "owner",
+                "DREGG_PROFILE": "owner", "HELM_CELL_BIN": "/tmp/legacy-signer"}):
             env = seat._seat_env("codex", os.path.join(self.tmp, "smoke"))
         self.assertEqual(env["HELM_CHAT_NAME"], "codex")
         self.assertEqual(env["HELM_CELL_PROFILE"], "codex")
@@ -1386,8 +1386,9 @@ class SeatMultiTest(unittest.TestCase):
         self.assertIsNone(room)
         self.assertIsNone(room_source)
         # the resume fallback recovers the cwd-derived project room, not None
-        # (use the real helm repo — _git_project needs a true git root)
-        fb_room, fb_source = seats.resolve_homing(cwd="/home/owner/dev/akapug/helm")
+        # (_git_project needs a true git root — resolve this repo dynamically)
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        fb_room, fb_source = seats.resolve_homing(cwd=repo_root)
         self.assertIsNotNone(fb_room)
         self.assertEqual(fb_source, "derived")
         # and that room mints HELM_CHAT_ROOM into the relaunch line (not #main)

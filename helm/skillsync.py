@@ -4,15 +4,15 @@ source, every claude-code config dir a symlink to it.
 
 The stranding class this kills: per-skill symlink farms are point-in-time
 copies of the canonical SET — a skill added later (or dropped into one home by
-hand) exists only where it landed. Proven live 2026-07-21: `i-have-audhd` sat
-in one credhome (team-example-com), invisible to the owner's cto session, because
-only the cto homes were whole-dir symlinks to the shared hub.
+hand) exists only where it landed. Proven live: a personal skill sat in one
+credhome, invisible to the owner's other session, because only some homes were
+whole-dir symlinks to the shared hub.
 
-Canonical = the MC instance-home skills hub (HELM_SKILLS_CANONICAL overrides): the
-incumbent both cto homes already point at; its entries are per-skill symlinks
-into the MC repo, so MC skill edits propagate via git with no re-sync — MC
-stays the physics owner, helm owns DISTRIBUTION. It lives outside every
-credhome (survives archive/recreate), and a helm-owned second copy would just
+Canonical = a shared skills hub (default `~/.helm/skills-canonical`;
+HELM_SKILLS_CANONICAL overrides — e.g. to point at an external physics-owner's
+hub whose entries are per-skill symlinks into that source repo, so upstream
+skill edits propagate via git with no re-sync). It lives outside every
+credhome (survives archive/recreate), and a per-home second copy would just
 mint a two-writer drift problem. Lean-configs: canonical holds the one
 approved set; a home symlinked to it CANNOT grow private bloat.
 
@@ -31,7 +31,7 @@ Sync is two phases, dry-run by default (the sweep/drain/gc law):
      be visible after, or the move rolls back. NEVER lose a skill.
 
 Config dirs covered: every real credhome under ~/.claude-homes (alias
-symlinks fold onto their target — cto-example and cto-example-invalid are
+symlinks fold onto their target — admin and admin-example-com are
 one home), the default ~/.claude, and every seat CLAUDE_CONFIG_DIR including
 per-instance dirs (smoke-claude excluded: recreated per smoke run). Seat mint
 (seat._link_skills) calls wire() at birth, so a NEW seat is born canonical;
@@ -46,30 +46,28 @@ import time
 
 from . import home as _home
 
-# The incumbent hub (see module docstring for why it, not a helm-owned copy).
-MC_CANONICAL = os.path.join(
-    os.path.expanduser("~"), "dev", "akapug", "mission-control",
-    ".local", "mc-instance-home", "skills")
+# The default hub (see module docstring; HELM_SKILLS_CANONICAL overrides).
+DEFAULT_CANONICAL = os.path.join(
+    os.path.expanduser("~"), ".helm", "skills-canonical")
 
 BACKUP_ROOT = os.path.join(os.path.expanduser("~"), ".skills-premerge-backup")
 
 
 def canonical():
-    """The canonical skills source: HELM_SKILLS_CANONICAL env else the MC
-    instance-home hub. Deliberately NOT HELM_SKILL_DECK (home_create's
-    content-source knob): on the live host that deck points at the MC REPO's
-    git-tracked skills dir — merging strays (personal/local skills) into a
-    tracked as-public repo dir is exactly the leak sync must never make. The
-    hub is a gitignored .local dir whose entries symlink INTO the repo: repo
-    skills stay repo-owned, local strays stay local, one distribution point."""
+    """The canonical skills source: HELM_SKILLS_CANONICAL env else the default
+    hub. Deliberately NOT HELM_SKILL_DECK (home_create's content-source knob):
+    a deck may point at a git-tracked skills dir — merging strays (personal/
+    local skills) into a tracked as-public repo dir is exactly the leak sync
+    must never make. A well-formed hub is a gitignored dir whose entries can
+    symlink INTO a source repo: repo skills stay repo-owned, local strays stay
+    local, one distribution point."""
     c = _home.env("SKILLS_CANONICAL")
     if c:
         return os.path.realpath(os.path.expanduser(c))
-    # Realpath the default too: MC_CANONICAL's .local/mc-instance-home resolves
-    # to the physical ~/.mc store, and mint (canonical()) vs sync (which
-    # realpaths) must agree on the path STRING or a wired home relinks off the
-    # raw path on the next sync (bit live 2026-07-21 18:06).
-    return os.path.realpath(MC_CANONICAL)
+    # Realpath the default too: a hub may itself be a symlink to a physical
+    # store, and mint (canonical()) vs sync (which realpaths) must agree on the
+    # path STRING or a wired home relinks off the raw path on the next sync.
+    return os.path.realpath(DEFAULT_CANONICAL)
 
 
 def config_dirs(claude_root=None, default_claude=None, seats_root=None):
@@ -265,7 +263,7 @@ def sync(canon=None, dirs=None, backup_root=None, apply=False):
     backup_root = backup_root or BACKUP_ROOT
     if not os.path.isdir(canon):
         return {"error": "canonical skills dir missing: %s (set "
-                         "HELM_SKILLS_CANONICAL or restore the MC checkout)" % canon}
+                         "HELM_SKILLS_CANONICAL or restore the canonical hub)" % canon}
     if dirs is None:
         dirs = config_dirs()
     strays = plan_merge(canon, dirs)

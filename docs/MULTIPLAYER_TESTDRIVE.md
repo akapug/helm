@@ -25,7 +25,7 @@ helm web --open
 A browser opens to the helm cockpit. In the top nav, click **cave**.
 
 **Working looks like:** three panels appear —
-- **presence** (left): within ~2 seconds a row **`david · cockpit · watching`**
+- **presence** (left): within ~2 seconds a row **`owner · cockpit · watching`**
   shows up with a **green dot**. That's *you* — opening the tab makes you a live
   peer. The `cave` / `board` boxes at the top read `main` / `board`.
 - **board** (middle): "no cells yet — set one below", with a key box, a value
@@ -39,11 +39,11 @@ Leave this tab open for the rest of the walkthrough.
 ## 2. Set a cell yourself
 
 In the **board** panel, type a **key** of `greeting` and a **value** of
-`hello from david`, then click **set →** (or press Enter).
+`hello from owner`, then click **set →** (or press Enter).
 
 **Working looks like:**
-- the **board** immediately shows a row: **`greeting  hello from david  david`**.
-- the **relay log** on the right gains one line: a short id, `david`, and a byte
+- the **board** immediately shows a row: **`greeting  hello from owner  owner`**.
+- the **relay log** on the right gains one line: a short id, `owner`, and a byte
   size like `81 B` — **not** your text. The relay stored an opaque blob; it never
   reads your words. The **cursor** near the top ticks forward.
 
@@ -71,21 +71,21 @@ board through the same blind relay, and you're watching both land.
 ## 4. Watch convergence (last-writer-wins)
 
 Now make them **collide on the same key**. In the terminal, set `greeting` —
-the key you already set as `david` in step 2 — but as `codex`:
+the key you already set as `owner` in step 2 — but as `codex`:
 
 ```bash
 helm multiplayer set board greeting "hi from the terminal" --cave main --actor codex
 ```
 
 **Working looks like:** on the board, the **`greeting`** row **flips** from
-`hello from david` (david) to **`hi from the terminal` (codex)** within ~2s. The
+`hello from owner` (owner) to **`hi from the terminal` (codex)** within ~2s. The
 later write won. That's the CRDT resolving the conflict — a last-writer-wins map.
 Both clients, given the same relay log, land on the *same* board regardless of
 who polled first. The relay itself never decided anything; it just kept the
 opaque updates in order and the **client** folded them.
 
 Set the same key again from the browser (board panel: key `greeting`, any new
-value, **set →**) and it flips back to `david`. Back and forth — the newest set
+value, **set →**) and it flips back to `owner`. Back and forth — the newest set
 always wins.
 
 ---
@@ -105,7 +105,7 @@ helm multiplayer presence --cave main --actor codex --state building --connectio
 - after ~10s with no further heartbeat, its dot turns **amber** (quiet).
 - after ~30s the `codex` row **disappears** entirely — the heartbeat expired.
 
-Your own `david · cockpit` row stays green the whole time, because the open web
+Your own `owner · cockpit` row stays green the whole time, because the open web
 tab re-heartbeats you every 2 seconds. Close the cave tab (or switch to another
 tab) and, ~30s later, you'd fade out too. Presence is pure attention state — it
 never touches the board; an actor vanishing never disturbs a single cell.

@@ -470,7 +470,7 @@ class ChatHostileNameSweepTest(unittest.TestCase):
         import json
         with open(chat.room_path("main"), "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": "2026-07-22T00:00:00", "from": self.HOSTILE,
-                                "text": "@david look here", "turn": "t1"},
+                                "text": "@owner look here", "turn": "t1"},
                                ensure_ascii=False) + "\n")
         rows, total = chat.read("main")
         self.assertEqual(total, 1)

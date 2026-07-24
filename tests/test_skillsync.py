@@ -37,16 +37,16 @@ class FakeEstate(unittest.TestCase):
         self.backup = j(self.tmp, "premerge-backup")
         self.croot = j(self.tmp, "claude-homes")
 
-        # simbi: symlink-farm home + STRANDED real skills (the audhd class)
-        simbi = j(self.croot, "team-example-com", "skills")
-        os.makedirs(simbi)
-        os.symlink(j(self.canon, "build"), j(simbi, "build"))
-        _mk_skill(simbi, "i-have-audhd", "stranded", age=100)
-        _mk_skill(simbi, "orca-cli", "orca newest", age=50)
+        # team: symlink-farm home + STRANDED real skills (the stranding class)
+        team = j(self.croot, "team-example-com", "skills")
+        os.makedirs(team)
+        os.symlink(j(self.canon, "build"), j(team, "build"))
+        _mk_skill(team, "personal-skill", "stranded", age=100)
+        _mk_skill(team, "orca-cli", "orca newest", age=50)
         os.symlink(j(self.croot, "team-example-com"), j(self.croot, "team-example"))
 
         # cto: already a whole-dir symlink to canonical (idempotent no-op)
-        cto = j(self.croot, "cto-example-com")
+        cto = j(self.croot, "admin-example-com")
         os.makedirs(cto)
         os.symlink(self.canon, j(cto, "skills"))
 
@@ -69,7 +69,7 @@ class FakeEstate(unittest.TestCase):
         self.seats = j(self.tmp, "seats")
         cdx = j(self.seats, "codex", "claude")
         os.makedirs(cdx)
-        os.symlink(simbi, j(cdx, "skills"))
+        os.symlink(team, j(cdx, "skills"))
         os.makedirs(j(self.seats, "codex", "instances", "codex-2", "claude"))
         os.makedirs(j(self.seats, "codex", "smoke-claude"))  # must be skipped
 
@@ -94,8 +94,8 @@ class FakeEstate(unittest.TestCase):
         r = self._sync(apply=False)
         self.assertEqual(r["failed"], [])
         names = {n for n, _ in r["merged"]}
-        self.assertEqual(names, {"i-have-audhd", "orca-cli", "fleet-usage", "build"})
-        self.assertFalse(os.path.exists(os.path.join(self.canon, "i-have-audhd")))
+        self.assertEqual(names, {"personal-skill", "orca-cli", "fleet-usage", "build"})
+        self.assertFalse(os.path.exists(os.path.join(self.canon, "personal-skill")))
         self.assertFalse(os.path.islink(
             os.path.join(self.croot, "team-example-com", "skills")))
         self.assertFalse(os.path.exists(self.backup))
@@ -105,8 +105,8 @@ class FakeEstate(unittest.TestCase):
         self.assertEqual(r["failed"], [])
         # union: the stranded skill is canonical now
         self.assertTrue(os.path.isfile(
-            os.path.join(self.canon, "i-have-audhd", "SKILL.md")))
-        # newest-wins: simbi's orca-cli (newer) beat the default home's symlink
+            os.path.join(self.canon, "personal-skill", "SKILL.md")))
+        # newest-wins: team's orca-cli (newer) beat the default home's symlink
         with open(os.path.join(self.canon, "orca-cli", "SKILL.md")) as f:
             self.assertEqual(f.read(), "orca newest")
         # newest-wins vs canonical itself: the newer 'build' replaced it,
@@ -122,15 +122,15 @@ class FakeEstate(unittest.TestCase):
             s = os.path.join(cdir, "skills")
             self.assertTrue(os.path.islink(s), s)
             self.assertEqual(os.path.realpath(s), os.path.realpath(self.canon), s)
-        # superset: every skill visible in simbi before is visible after
+        # superset: every skill visible in team before is visible after
         view = set(os.listdir(os.path.join(self.croot, "team-example-com", "skills")))
-        self.assertLessEqual({"build", "i-have-audhd", "orca-cli"}, view)
+        self.assertLessEqual({"build", "personal-skill", "orca-cli"}, view)
         # the original real dirs survive whole in the backup root
         saved = os.path.join(self.backup, "team-example-com")
         snap = os.listdir(saved)
         self.assertEqual(len(snap), 1)
         self.assertTrue(os.path.isfile(os.path.join(
-            saved, snap[0], "i-have-audhd", "SKILL.md")))
+            saved, snap[0], "personal-skill", "SKILL.md")))
         # hidden canonical internals untouched
         self.assertTrue(os.path.isdir(os.path.join(self.canon, ".system")))
 
@@ -155,7 +155,7 @@ class FakeEstate(unittest.TestCase):
         self.assertEqual(r["failed"], [])
         s = os.path.join(newborn, "skills")
         self.assertTrue(os.path.islink(s))
-        self.assertIn("i-have-audhd", os.listdir(s))
+        self.assertIn("personal-skill", os.listdir(s))
 
     def test_missing_canonical_is_a_loud_error(self):
         r = skillsync.sync(canon=os.path.join(self.tmp, "gone"),
@@ -172,7 +172,7 @@ class FakeEstate(unittest.TestCase):
         action, detail = skillsync.wire("team-example-com", cdir, self.canon,
                                         self.backup, apply=True)
         self.assertEqual(action, "FAIL")
-        self.assertIn("i-have-audhd", detail)
+        self.assertIn("personal-skill", detail)
         self.assertFalse(os.path.islink(os.path.join(cdir, "skills")))
 
     def test_indirect_symlink_normalized(self):
@@ -209,7 +209,7 @@ class CanonicalResolutionTest(unittest.TestCase):
             # path string); the deck still never steers it.
             self.assertEqual(
                 skillsync.canonical(),
-                os.path.realpath(skillsync.MC_CANONICAL))
+                os.path.realpath(skillsync.DEFAULT_CANONICAL))
         finally:
             if deck_old is None:
                 del os.environ["HELM_SKILL_DECK"]

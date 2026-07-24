@@ -58,7 +58,7 @@ STAGE_ORDER = {"OPEN": 0, "AWAITING_REVIEW": 1, "READY": 2,
                "MERGED_LOCAL": 3, "LANDED": 4}
 
 # Trunk is main-or-master; the landing target is the upstream trunk when a
-# remote publishes one, else the local trunk (David's local-first estate never
+# remote publishes one, else the local trunk (the owner's local-first estate never
 # pushes, so local trunk IS the landing target there).
 LOCAL_TRUNK = ("refs/heads/main", "refs/heads/master")
 UPSTREAM_TRUNK = ("refs/remotes/origin/main", "refs/remotes/origin/master",

@@ -1224,15 +1224,15 @@ def _api_chat_read_post(payload):
 
 def _chat_profile():
     """Server-side signing identity for the owner's web posts: the server's
-    HELM_CELL_PROFILE (the PRD's contract), else the owner's cell `david` —
+    HELM_CELL_PROFILE (the PRD's contract), else the owner's cell `owner` —
     never the agent default (the web panel IS the owner surface)."""
     return os.environ.get("HELM_CELL_PROFILE") \
-        or os.environ.get("MELD_AGENT_PROFILE") or "david"
+        or os.environ.get("MELD_AGENT_PROFILE") or "owner"
 
 
 def _api_chat_post(payload):
     """The owner's post: append (signed server-side when the room node
-    answers) + mark owner-unread. name defaults to david.
+    answers) + mark owner-unread. name defaults to owner.
 
     Optional `reply_to` = the parent row's id (the panel's reply button holds
     it): the row threads under that parent and, when signed, its digest BINDS
@@ -1244,7 +1244,7 @@ def _api_chat_post(payload):
     if not isinstance(text, str) or not text.strip():
         return {"error": 'payload wants {"text": "..."} (non-empty)'}, 400
     room = str(payload.get("room") or "main")
-    msg = chat.post(text.strip(), room, who=str(payload.get("name") or "david"),
+    msg = chat.post(text.strip(), room, who=str(payload.get("name") or "owner"),
                     profile=_chat_profile(), origin="web",
                     reply_to=str(payload.get("reply_to") or "") or None)
     chat.mark_owner_unread(room)
@@ -1264,7 +1264,7 @@ def _api_chat_dm(payload):
     if not text:
         return {"error": "empty text"}, 400
     row, err = seats.dm(str(payload.get("to") or ""), text,
-                        who=str(payload.get("name") or "david"),
+                        who=str(payload.get("name") or "owner"),
                         profile=_chat_profile(), origin="web")
     if err:
         return {"error": err}, 400
@@ -1417,7 +1417,7 @@ def _api_chat_react(payload):
         return {"error": 'payload wants {"emoji", "tts", "tfrom"}'}, 400
     room = str(payload.get("room") or "main")
     row, err = chat.react((tts, tfrom), e, room,
-                          who=str(payload.get("name") or "david"),
+                          who=str(payload.get("name") or "owner"),
                           profile=_chat_profile())
     if err:
         return {"error": err}, 400
@@ -1731,7 +1731,7 @@ MP_OWNER_CONNECTION = "cockpit"
 
 def _mp_actor():
     """The owner seat for cave writes/heartbeats — the same identity the chat
-    post signs under (HELM_CELL_PROFILE else 'david'), never the agent default."""
+    post signs under (HELM_CELL_PROFILE else 'owner'), never the agent default."""
     return _chat_profile()
 
 

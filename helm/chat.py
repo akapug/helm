@@ -252,10 +252,10 @@ def _ensure_dir():
 
 def whoname():
     """$HELM_CHAT_NAME, else a session-derived AGENT name — never the operator's
-    identity. The unix login is the operator's machine account (pug/david); an
+    identity. The unix login is the operator's machine account (e.g. `owner`); an
     agent CLI post that fell through to it impersonated the owner in the room
     (owner-flagged 2026-07-19). The operator's own surfaces name themselves
-    explicitly (web posts as 'david'; `helm --human` sets HELM_CHAT_NAME), so a
+    explicitly (web posts as 'owner'; `helm --human` sets HELM_CHAT_NAME), so a
     bare CLI post is ALWAYS an agent — it gets an agent name, never the login.
     A session already in the roster answers with its SEAT name (posts and
     deliveries speak one name — the rename verb rebinds both); an unknown
@@ -1988,7 +1988,7 @@ def _seat_actor(args):
     FOOTGUN SCOPE, honestly: a same-user process can still forge identity by
     setting HELM_CHAT_NAME/HELM_CELL_PROFILE itself — this prevents ACCIDENTAL
     --seat drift + the wrong-signer class, NOT a malicious local peer (that
-    needs the owner-key trust domain, held for David; see
+    needs the owner-key trust domain, held for the owner; see
     ~/.helm/helm/prd/OWNER-SIGN-TRUST-MODEL.md). Returns (actor, None) or
     (None, err)."""
     claimed = _seat_flag(args)          # pops --seat (None if absent)

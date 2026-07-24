@@ -622,9 +622,9 @@ helm mentor observe myproject — last 7d: 5 sessions scanned:
     identified-fix-filed-not-fixed       2 sessions, 3 mentions
       teach: helm mentor teach myproject "identified-fix-filed-not-fixed | <steer>" --pattern "identified\-fix\-filed\-not\-fixed"
 $ helm mentor teach myproject "identified-fix-filed-not-fixed | an identified fix lands in-pass, never a TODO" --attest
-helm mentor: TAUGHT 'identified-fix-filed-not-fixed' -> myproject (prompt) by david
+helm mentor: TAUGHT 'identified-fix-filed-not-fixed' -> myproject (prompt) by owner
 $ helm mentor review myproject
-  identified-fix-filed-not-fixed  taught 2026-07-19T09:00:00Z by david [attested]
+  identified-fix-filed-not-fixed  taught 2026-07-19T09:00:00Z by owner [attested]
     fired since taught: 3 turns (inject ledger)
 ```
 
@@ -669,7 +669,7 @@ an in-place edit would orphan the attestation.
 $ helm premise --supersede naming-extremes "naming-poles | metaphors live at the poles"
 helm premise: LIVE 'naming-poles' [certain 1.00] - metaphors live at the poles
   supersedes 'naming-extremes' — tombstoned (delete_eligible, file kept)
-  attested (native): record 4d8a4c1306028e80 at chain_index 7 — recorded by 'david'
+  attested (native): record 4d8a4c1306028e80 at chain_index 7 — recorded by 'owner'
   chain: -> prior record 29114915ece8b4c2 (attest_supersedes_record)
 ```
 
@@ -766,8 +766,8 @@ $ helm sessions resume 3f2a
 cd ~/dev/myproject && claude --resume 3f2a9c81-...
 $ helm sessions resume 3f2a --go          # actually open it in a pane
 helm sessions: resumed 3f2a1b9c via orca — pane term_aae27b65…
-  cred: /home/owner/.claude-homes/team-example-com
-  cwd : /home/owner/dev/akapug/harvester
+  cred: /home/u/.claude-homes/team-example-com
+  cwd : /home/u/dev/example-project
 ```
 
 `resume` prints the exact command; `--go` runs it. The command PINS
@@ -1147,15 +1147,15 @@ plus the codex* seats live on the roster.
 ```console
 $ helm codex list
 helm codex: 4 codexhomes under ~/.codex-homes (2 pooled -> ~/.helm/_global/seats/codex/auth)
-  cto-example-invalid  cto@example.invalid  ultra  1f04aa08…  pooled:codex-cto-example-invalid.json
-  team-example-com              hey@simbi.com              team   9c21be77…  -
+  admin-example-com  admin@example.com  ultra  1f04aa08…  pooled:codex-admin-example-com.json
+  team-example-com              team@example.com              team   9c21be77…  -
 $ helm codex pool team-example-com
-helm codex: pooled hey@simbi.com -> ~/.helm/_global/seats/codex/auth/codex-team-example-com.json (team, account 9c21be77…)
+helm codex: pooled team@example.com -> ~/.helm/_global/seats/codex/auth/codex-team-example-com.json (team, account 9c21be77…)
   the proxy hot-reloads its auth-dir — no restart needed
 $ helm codex capacity
 helm codex: fleet seat capacity 4 (what the POOL holds, ultra=3/cred via HELM_CODEX_ULTRA_SEATS, team=1)
-  cto@example.invalid      ultra  3 seats
-  hey@simbi.com                  team   1 seat
+  admin@example.com      ultra  3 seats
+  team@example.com                  team   1 seat
   live codex seats: codex, codex-2
 ```
 
@@ -1193,9 +1193,9 @@ guards entry to it.
 ```console
 $ helm codex launch -i 3
 helm codex: launch gate (fresh = rollout tail <60m, near >= 80%)
-  ok      owner-example-invalid  owner@example.invalid  ultra  pooled  12% used
-  near    cto-example-invalid    cto@example.invalid     ultra  pooled  85% used
-  unknown team-example-com                hey@simbi.com                team   -       (rollout tail stale)
+  ok      you-example-com  you@example.com  ultra  pooled  12% used
+  near    admin-example-com    admin@example.com     ultra  pooled  85% used
+  unknown team-example-com                team@example.com                team   -       (rollout tail stale)
 env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL=http://127.0.0.1:8317 … HELM_CHAT_NAME=codex-3 …
 ```
 
@@ -1302,7 +1302,7 @@ Idempotent: a wired estate reports zero changes, so re-running after minting a
 new credhome (or adding a skill to canonical) is the whole maintenance story.
 Seat mint (`helm seat add`) links new seats to the same canonical at birth.
 This kills the stranding class where a skill dropped into one home's private
-farm stayed invisible everywhere else (the 2026-07-21 `i-have-audhd` case).
+farm stayed invisible everywhere else (a real stranded-skill case).
 
 ## tidy — the estate janitor
 
@@ -1330,8 +1330,8 @@ nothing, mutates nothing.
 $ helm env census
 helm env census — 9 config dir(s)
   home                       kind      hooks miss strays
-  cto-example-invalid  home      8     0    0
-  owner-example-invalid        home      8     0    1
+  admin-example-com  home      8     0    0
+  alt-example-com        home      8     0    1
   seat:codex                 seat      3     0    0
 ...
 ```
@@ -1516,7 +1516,7 @@ successful signed turn by that profile clears it. No signer configured is not
 an incident: it keeps the same honest tag with zero signing traffic (no probe,
 no unlock), and status says `unsigned (no signer)` rather than letting a
 reachable node imply signed posts. Agents sign as `HELM_CELL_PROFILE` (else
-`helm-agent`); the owner's web posts sign server-side as `david`. `helm chat
+`helm-agent`); the owner's web posts sign server-side as `owner`. `helm chat
 node up` provisions
 the room node (`helm-chat-node.service`, `dregg-cave-node` on
 `/dev/shm/helm-chat-node`, port 8898, faucet ON — the node auto-funds joining
@@ -1930,11 +1930,11 @@ touching document state. The default cave is
 `HELM_MULTIPLAYER_ACTOR`, then the normal chat/seat identity.
 
 ```console
-$ helm multiplayer presence --cave helm --actor david --connection phone --state editing
-$ printf %s 'base64:opaque-update' | helm multiplayer publish board --stdin --cave helm --actor david
+$ helm multiplayer presence --cave helm --actor owner --connection phone --state editing
+$ printf %s 'base64:opaque-update' | helm multiplayer publish board --stdin --cave helm --actor owner
 $ helm multiplayer read board --cave helm --after 0 --json
 $ helm multiplayer peers --cave helm --json
-$ helm multiplayer leave --cave helm --actor david --connection phone
+$ helm multiplayer leave --cave helm --actor owner --connection phone
 ```
 
 The default adapter stores both channels in tmpfs, but the interfaces are
@@ -2208,7 +2208,7 @@ to do: `helm ship pull`, then re-ship.
 
 `helm ship hosts` reads the per-host observation blocks
 (`_global/hosts/<host>.json` — one file per host, so they never conflict):
-who observed what, when — live-on-pug, dormant-on-droopy.
+who observed what, when — live-on-host-a, dormant-on-host-b.
 
 ```console
 $ helm ship

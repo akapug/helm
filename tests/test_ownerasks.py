@@ -40,7 +40,7 @@ class AsksBase(unittest.TestCase):
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""
-        os.environ["HELM_CHAT_OWNER_NAMES"] = "david"
+        os.environ["HELM_CHAT_OWNER_NAMES"] = "owner"
         os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
 
     def tearDown(self):

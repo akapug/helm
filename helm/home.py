@@ -44,7 +44,7 @@ def chat_name():
     Returns the name when it is a legitimate seat identifier ([A-Za-z0-9._-],
     like codex-2 / opus-integrator / ds4pro); None when unset OR empty (callers
     fall through to their auto-name floor, preserving the old `if name:` /
-    `or "david"` semantics); and RAISES SeatNameError when the name carries ESC
+    `or "owner"` semantics); and RAISES SeatNameError when the name carries ESC
     / C0-C1 controls / Unicode bidi overrides (U+202A-E, U+2066-9) / any other
     format-Cf. A control-char seat name is never legitimate, so it is REJECTED
     at the source — it never becomes a roster key, a chat from-field, a hook

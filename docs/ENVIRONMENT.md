@@ -27,7 +27,7 @@ overrides are in effect.
 
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
-| `HELM_SCAN_ROOTS` | `~/dev/akapug:~/dev` (the shipped default — set your own checkout roots) | the repo-scan tier of `helm sync` — colon-separated roots under which git repos register as shelf projects | — |
+| `HELM_SCAN_ROOTS` | `~/dev` (the shipped default — set your own checkout roots) | the repo-scan tier of `helm sync` — colon-separated roots under which git repos register as shelf projects | — |
 | `HELM_CLAUDE_ROOTS` | — (extra roots; `~/.claude/projects` is always scanned) | the session catalog — colon-separated additional Claude transcript roots | `SESH_CLAUDE_ROOTS` |
 | `HELM_CODEX_ROOTS` | — (extra roots; `~/.codex/sessions` and `~/.codex-homes` are always scanned) | the session catalog — additional Codex transcript roots | `SESH_CODEX_ROOTS` |
 | `HELM_CATALOG` | — (`scanner` forces the built-in scanner, skipping the `cv` recall index as catalog source) | the session catalog | `SESH_CATALOG` |
@@ -50,13 +50,13 @@ overrides are in effect.
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
 | `HELM_CHAT_DIR` | `/dev/shm/helm-chat` (tmpfs — the rooms live in RAM) | `helm chat` + the web chat panel — the room dir (one `<room>.jsonl` + `<room>.owner-unread` marker per room, plus the RAM-side transport caches `.cells.json`/`.node-token`); the override is how tests point it at a tmp dir | — |
-| `HELM_CHAT_NAME` | — (the best local identity guess: session id, then user) | `helm chat post` — the `from` name on every message; `helm --human` posts as it (else `david`) | — |
+| `HELM_CHAT_NAME` | — (the best local identity guess: session id, then user) | `helm chat post` — the `from` name on every message; `helm --human` posts as it (else `owner`) | — |
 | `HELM_CHAT_ROOM` | unset; join/launch derive the current git project's canonical Helm name, while project-less seats remain un-homed | chat commands, join/delivery hooks, `helm launch`, and multimodel seat presets — explicit values win; a homed seat's inbox is allowlisted to `{home, main}` while a project-less un-homed seat retains the legacy all-room inbox | `MELD_CHAT_ROOM` |
 | `HELM_CHAT_ROOM_SOURCE` | — | internal launch provenance. `derived` marks a project default so a later SessionStart cannot overwrite an operator `helm chat seat rehome`; explicit rooms carry no derived marker. Room + source resolve atomically from one namespace, so a preferred `HELM_CHAT_ROOM` never inherits stale `MELD_*` provenance | `MELD_CHAT_ROOM_SOURCE` |
 | `HELM_CHAT_NODE_URL` | `http://127.0.0.1:8898` (after the node-state file's `url`) | the chat ROOM NODE — chat v2's signed transport. **Set-but-empty disables the signed transport entirely** (the hermetic-test/ops kill switch); the node migration repoints this at the team node | `MELD_CHAT_NODE_URL` |
 | `HELM_CHAT_NODE_BIN` | `dregg-cave-node` on `PATH`, else `~/.local/bin/dregg-cave-node` | `helm chat node up` — the room-node daemon binary | `MELD_CHAT_NODE_BIN` |
 | `HELM_CHAT_LOG` | on (`0`/`off`/`no` disables) | `helm chat log-flush` + the `helm --human` exit flush — the log-after leg's operator switch | `MELD_CHAT_LOG` |
-| `HELM_CHAT_OWNER_NAMES` | `david` + the unix login (csv override) | the delivery lane (`helm chat deliver`) — senders whose posts reach every seat at tool boundaries WITHOUT an @mention (the owner steers mid-flight) | — |
+| `HELM_CHAT_OWNER_NAMES` | `owner` + the unix login (csv override) | the delivery lane (`helm chat deliver`) — senders whose posts reach every seat at tool boundaries WITHOUT an @mention (the owner steers mid-flight) | — |
 | `HELM_CHAT_DELIVER` | on (`0`/`off`/`no` disables) | the delivery lane's kill switch — the PostToolUse nudge goes silent fleet-wide; the room, roster and inject lanes are untouched | — |
 
 ## local multiplayer

@@ -694,7 +694,7 @@ table.roster tr.eph td{opacity:.5;font-style:italic}
   <details class="grp" id="homescard">
     <summary>credential homes<span class="gmeta">one home = one login — helm prepares, YOU run every login</span></summary>
     <div id="homeform">
-      <input id="hEmail" placeholder="new home: account email (david@x.com → home david-x-com)" autocomplete="off">
+      <input id="hEmail" placeholder="new home: account email (owner@example.com → home owner-example-com)" autocomplete="off">
       <select id="hProv"><option value="claude">claude</option><option value="codex">codex</option></select>
       <button class="chip" id="hCreate">new home</button>
       <div id="hCmd" style="flex-basis:100%"></div>
@@ -894,7 +894,7 @@ table.roster tr.eph td{opacity:.5;font-style:italic}
         <input id="caveVal" placeholder="value…" maxlength="400" required aria-label="cell value">
         <button class="chip" id="caveSet" type="submit">set →</button>
       </form>
-      <div id="caveMsg">you write as <b>david</b>; a terminal or agent writes as itself — set the same key from both and watch the later write win.</div>
+      <div id="caveMsg">you write as <b>owner</b>; a terminal or agent writes as itself — set the same key from both and watch the later write win.</div>
     </section>
     <section class="cavecol" id="caveLog">
       <h3>relay log <span class="csub">opaque envelopes · arrival order · helm never reads them</span></h3>
@@ -2809,7 +2809,7 @@ function chatJumpReplies(div) {
 
 function chatRow(m) {
   const who = String(m.from || "?");
-  const owner = who === (($("#chatname").value || "david").trim() || "david");
+  const owner = who === (($("#chatname").value || "owner").trim() || "owner");
   // Receipt truth on the row itself: signed tick, or a LOUD attempted-signing
   // fallback. Configured-off v1 rows stay quietly unsigned; the transport strip
   // explains that room-wide fact.
@@ -3192,7 +3192,7 @@ function notifyOwner(n, preview) {
 }
 
 async function sendReact(div, e) {
-  const name = $("#chatname").value.trim() || "david";
+  const name = $("#chatname").value.trim() || "owner";
   try {
     await post("/api/chat/react", {room: CHAT_ROOM, emoji: e, name,
                                    tts: div.dataset.ts, tfrom: div.dataset.from});
@@ -3278,7 +3278,7 @@ function chatAcPick(i) {
 async function sendChat() {
   const text = $("#chattext").value.trim();
   if (!text) return;
-  const name = $("#chatname").value.trim() || "david";
+  const name = $("#chatname").value.trim() || "owner";
   const reply_to = CHAT_REPLY_TO;   // captured before the strip clears
   localStorage.setItem("helm.chatname", name);
   $("#chattext").value = "";
@@ -3290,7 +3290,7 @@ async function sendChat() {
 }
 
 function initChat() {
-  $("#chatname").value = localStorage.getItem("helm.chatname") || "david";
+  $("#chatname").value = localStorage.getItem("helm.chatname") || "owner";
   if (!CHAT_WIRED) {
     CHAT_WIRED = true;
     $("#chatsend").onclick = sendChat;
@@ -3393,7 +3393,7 @@ pollChat();
 /* ================= cave view — local multiplayer over the blind relay =================
    Three panels off one 2s poll: presence (TTL heartbeat), the demo board
    (a last-writer-wins map the CLIENT materializes), and the raw relay log
-   (opaque envelopes helm never decodes). The owner writes as `david`; a
+   (opaque envelopes helm never decodes). The owner writes as `owner`; a
    terminal/agent writes as itself; the same log folds to the same board on
    both — that convergence is the whole demo. The fold mirrors
    helm/multiplayer_demo.materialize exactly. ============================= */
@@ -4058,7 +4058,7 @@ async function sendSeatMsg(ev) {
   ev.preventDefault();
   const key = $("#seatkey").value.trim(), line = $("#seatline").value.trim(), m = $("#seatmsg");
   if (!line) return;
-  const name = localStorage.getItem("helm.chatname") || "david";
+  const name = localStorage.getItem("helm.chatname") || "owner";
   const target = key && (key.startsWith("@") ? key : "@" + key);
   closeSeatPicker();
   m.className = ""; m.textContent = "sending…";

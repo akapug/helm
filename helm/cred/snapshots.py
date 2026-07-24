@@ -216,7 +216,7 @@ def folded_dir(folded):
 
 def account_dir(email):
     """The snapshot dir for an account: ~/.cred-backups/<folded-email>/ — the
-    same fold homes.py names homes with (david@x.com -> david-x-com)."""
+    same fold homes.py names homes with (owner@example.com -> owner-example-com)."""
     return folded_dir(homes.canonical_name(email))
 
 

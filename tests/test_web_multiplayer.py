@@ -85,23 +85,23 @@ class TestWebMultiplayer(unittest.TestCase):
         self.assertEqual(s, 403)
         self.assertEqual(self.req("/api/multiplayer/state?cave=demo&doc=board")[1]
                          ["updates"], [])
-        # with the bearer it lands as the owner seat 'david'
+        # with the bearer it lands as the owner seat 'owner'
         s, d = self.req("/api/multiplayer/publish",
                         {"cave": "demo", "key": "greeting", "value": "hi"})
         self.assertEqual(s, 200)
-        self.assertEqual(d["ack"]["actor"], "david")
+        self.assertEqual(d["ack"]["actor"], "owner")
         s, d = self.req("/api/multiplayer/state?cave=demo&doc=board")
-        self.assertEqual([u["actor"] for u in d["updates"]], ["david"])
+        self.assertEqual([u["actor"] for u in d["updates"]], ["owner"])
         self.assertEqual(d["caves"], ["demo"])  # discoverable off the doc header
 
     def test_two_actors_converge_by_lww_through_the_blind_relay(self):
         # the owner writes greeting via the endpoint...
         self.req("/api/multiplayer/publish",
-                 {"cave": "demo", "key": "greeting", "value": "hello david"})
+                 {"cave": "demo", "key": "greeting", "value": "hello owner"})
         # ...a 'terminal' (another client) writes the SAME key LATER, straight
         # through the blind relay, plus a second key
         relay, _ = multiplayer.adapters()
-        time.sleep(0.01)  # a real gap so codex's ts strictly follows david's
+        time.sleep(0.01)  # a real gap so codex's ts strictly follows owner's
         relay.publish("demo", "board", "codex",
                       multiplayer_demo.encode("greeting", "hi codex", "codex"))
         relay.publish("demo", "board", "codex",
@@ -125,10 +125,10 @@ class TestWebMultiplayer(unittest.TestCase):
                         {"cave": "demo", "state": "watching"})
         self.assertEqual(s, 200)
         self.assertEqual((d["peer"]["actor"], d["peer"]["connection"]),
-                         ("david", "cockpit"))
+                         ("owner", "cockpit"))
         s, d = self.req("/api/multiplayer/state?cave=demo&doc=board")
         self.assertEqual([(p["actor"], p["state"]) for p in d["peers"]],
-                         [("david", "watching")])
+                         [("owner", "watching")])
 
     def test_publish_rejects_bad_key_and_state_rejects_bad_cave_name(self):
         self.assertEqual(self.req("/api/multiplayer/publish",

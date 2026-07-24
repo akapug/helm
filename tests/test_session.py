@@ -307,7 +307,7 @@ class LawTest(SessionBase):
         cwd = "/work/project with spaces"
         with open(os.path.join(cred, ".claude.json"), "w") as f:
             json.dump({"projects": {cwd: {"hasTrustDialogAccepted": True}}}, f)
-        home_rows = [{"name": "cto-example", "path": cred, "aliases": [],
+        home_rows = [{"name": "admin", "path": cred, "aliases": [],
                       "projects_link_ok": True}]
         import helm.homes as homes_mod
         with self._sid("aaaa1111-integrator"), \
@@ -316,14 +316,14 @@ class LawTest(SessionBase):
             # live copy -> refuse (no incantation line printed)
             with mock.patch.object(session, "open_pids", return_value=[57699]):
                 rc, out, _ = run(session.cmd_port,
-                                 ["--cred", "cto-example", "aaaa1111"])
+                                 ["--cred", "admin", "aaaa1111"])
             self.assertEqual(rc, 1)
             self.assertIn("LAW 1", out)
             self.assertNotIn("claude --resume", out)
             # clear -> print with quoted credhome/cwd + FORCE
             with mock.patch.object(session, "open_pids", return_value=[]):
                 rc, out, _ = run(session.cmd_port,
-                                 ["--cred", "cto-example", "aaaa1111"])
+                                 ["--cred", "admin", "aaaa1111"])
             self.assertEqual(rc, 0)
             self.assertIn("CLAUDE_CONFIG_DIR='" + cred + "'", out)
             self.assertIn("cd '" + cwd + "'", out)
@@ -1107,7 +1107,7 @@ class HeadlessCensusTest(unittest.TestCase):
         # verbatim argv measured 2026-07-22 — the call that flipped a CERTIFIED
         # estate to a memory-only FAIL twenty minutes later. It is excluded on
         # its EXPLICIT nonpersistence evidence, not on -p alone.
-        argv = ["/home/owner/.local/bin/claude", "-p", "--output-format", "json",
+        argv = ["/home/u/.local/bin/claude", "-p", "--output-format", "json",
                 "--no-session-persistence", "--exclude-dynamic-system-prompt"]
         self.assertTrue(session._is_headless(argv))
         self.assertTrue(session._is_nonpersistent(argv))

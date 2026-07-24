@@ -141,7 +141,7 @@ FAMILIES = {
              # k3's real window is 1M (live-probed api.kimi.com/coding/v1/models
              # context_length=1048576, 2026-07-23); minting the max teaches CC
              # past its hardcoded 200k non-claude default so the gauge AND
-             # autocompact track the true window (David: kimi was being
+             # autocompact track the true window (owner note: kimi was being
              # compacted ~5x too often).
              "max_context": 1000000,
              "probe_models": ("kimi-k3",)},

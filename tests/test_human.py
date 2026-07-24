@@ -53,8 +53,8 @@ class ModelTest(HumanBase):
         self.assertEqual([r["text"] for r in m["rows"]], ["9"])
         self.assertEqual(m["total"], 1)
 
-    def test_operator_name_env_then_david(self):
-        self.assertEqual(human.operator_name(), "david")
+    def test_operator_name_env_then_owner(self):
+        self.assertEqual(human.operator_name(), "owner")
         os.environ["HELM_CHAT_NAME"] = "skipper"
         self.assertEqual(human.operator_name(), "skipper")
 
@@ -132,7 +132,7 @@ class SubmitTest(HumanBase):
         self.assertEqual(m["input"], "")
         rows, total = chat.read()
         self.assertEqual(total, 1)
-        self.assertEqual(rows[0]["from"], "david")
+        self.assertEqual(rows[0]["from"], "owner")
         self.assertEqual(rows[0]["text"], "hello fleet 🔥")
         # the OWNER posted: the marker drops so agents get the reflex nudge
         self.assertTrue(os.path.exists(chat.marker_path("main")))

@@ -1459,7 +1459,7 @@ class CouncilReachTest(InjectBase):
         os.environ["HELM_CHAT_NODE_URL"] = ""
         os.environ["HELM_CHAT_ROOM"] = "workroom"
         os.environ["HELM_CHAT_NAME"] = "seat-a"
-        os.environ["HELM_CHAT_OWNER_NAMES"] = "david"
+        os.environ["HELM_CHAT_OWNER_NAMES"] = "owner"
 
     def tearDown(self):
         for k, v in self.extra_prior.items():
@@ -1533,7 +1533,7 @@ class CouncilReachTest(InjectBase):
         self._pingpong(2)
         self.assertIsNone(inject._council_reach(None, None))   # 2 < 3 rounds
         chat.post("q", room="workroom", who="seat-a")
-        chat.post("from the human", room="workroom", who="david")
+        chat.post("from the human", room="workroom", who="owner")
         self.assertIsNone(inject._council_reach(None, None))   # owner talk
         for i in range(5):
             chat.post("mono%d" % i, room="workroom", who="seat-b")

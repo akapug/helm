@@ -122,7 +122,7 @@ class RoomTest(ChatBase):
 
 class MarkerTest(ChatBase):
     def test_mark_and_consume_semantics(self):
-        chat.post("agents?", who="david")
+        chat.post("agents?", who="owner")
         chat.mark_owner_unread()
         mp = chat.marker_path("main")
         with open(mp) as f:
@@ -134,17 +134,17 @@ class MarkerTest(ChatBase):
         self.assertFalse(chat.consume(total=9))   # no marker -> nothing to clear
 
     def test_cli_read_clears_the_marker(self):
-        chat.post("fleet, look alive", who="david")
+        chat.post("fleet, look alive", who="owner")
         chat.mark_owner_unread()
         rc, out, _ = self.run_cmd(["read"])
         self.assertEqual(rc, 0)
-        self.assertIn("david: fleet, look alive", out)
+        self.assertIn("owner: fleet, look alive", out)
         self.assertFalse(os.path.exists(chat.marker_path("main")))
 
     def test_reflex_fires_while_marker_exists_and_not_after(self):
         home.scaffold_global()  # seeds the pack; marker path resolves to tmp
         self.assertEqual(reflex.fire("any turn text"), [])
-        chat.post("ship it", who="david")
+        chat.post("ship it", who="owner")
         chat.mark_owner_unread()
         fired = [e["id"] for e in reflex.fire("any turn text")]
         self.assertEqual(fired, ["owner-chat-unread"])

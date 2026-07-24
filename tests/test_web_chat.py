@@ -187,7 +187,7 @@ class TestWebChat(unittest.TestCase):
         for the summed badge — the fix for the single-room-invisible hole."""
         from helm import chat
         self.req("/api/chat", {"text": "hello main"})            # owner in main
-        chat.post("@david urgent", room="team-fe", who="codex")  # agent elsewhere
+        chat.post("@owner urgent", room="team-fe", who="codex")  # agent elsewhere
         status, d = self.req("/api/chat")                        # viewing main
         self.assertEqual(status, 200)
         rooms = {r["room"]: r for r in d["rooms"]}
@@ -202,10 +202,10 @@ class TestWebChat(unittest.TestCase):
         target = d["lines"][0]
         status, d = self.req("/api/chat/react",
                              {"emoji": ":tada:", "tts": target["ts"],
-                              "tfrom": target["from"], "name": "david"})
+                              "tfrom": target["from"], "name": "owner"})
         self.assertEqual(status, 200)
         self.assertEqual(d["msg"]["react"], "🎉")
-        self.assertEqual(d["msg"]["tfrom"], "david")
+        self.assertEqual(d["msg"]["tfrom"], "owner")
         status, d = self.req("/api/chat?since=0")
         self.assertEqual(d["total"], 2)  # reaction rows ride the same poll
         self.assertEqual(d["lines"][1]["react"], "🎉")
@@ -228,7 +228,7 @@ class TestWebChat(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(d["ok"])
         self.assertEqual(d["total"], 1)
-        self.assertEqual(d["msg"]["from"], "david")          # the default name
+        self.assertEqual(d["msg"]["from"], "owner")          # the default name
         self.assertEqual(d["msg"]["text"], "morning, fleet")  # trimmed
         with open(chat.marker_path("main")) as f:
             self.assertEqual(f.read(), "1")  # marker carries the post-time count
@@ -270,7 +270,7 @@ class TestWebChat(unittest.TestCase):
         from helm import seats
         seats.join(session="s-web-dm", seat="codex", cwd="/tmp/p")
         status, d = self.req("/api/chat/dm", {"to": "codex", "text": " go ",
-                                              "name": "david"})
+                                              "name": "owner"})
         self.assertEqual(status, 200)
         self.assertTrue(d["ok"])
         self.assertEqual(d["msg"]["dm"], "codex")
@@ -299,7 +299,7 @@ class TestWebChat(unittest.TestCase):
         self.assertTrue(os.path.exists(chat.marker_path("main")))
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(chat.cmd_chat(["read"]), 0)
-        self.assertIn("david: anyone up?", out.getvalue())
+        self.assertIn("owner: anyone up?", out.getvalue())
         self.assertFalse(os.path.exists(chat.marker_path("main")))
 
     # ── threading + the sidebar's activity signal (the owner surface) ──
@@ -395,7 +395,7 @@ class TestWebChat(unittest.TestCase):
         seats.write_roster("noisy-seat", session="s-noisy")
         chat.post("quiet corner", room="team-quiet", who="noisy-seat")
         for i in range(8):
-            chat.post("@david row %d" % i, room="team-busy", who="noisy-seat")
+            chat.post("@owner row %d" % i, room="team-busy", who="noisy-seat")
         rooms = {r["room"]: r for r in self.req("/api/chat")[1]["rooms"]}
         self.assertEqual(rooms["team-quiet"]["owner_unread"], 1)
         self.assertEqual(rooms["team-busy"]["owner_unread"], 8)
@@ -492,7 +492,7 @@ class TestWebChat(unittest.TestCase):
         """The badge is computed from the FULL rows, never the window — 40
         unread land, the window shows 10, owner_unread is still 40."""
         for i in range(40):
-            chat.post("@david row %d" % i, room="main", who="agent-a")
+            chat.post("@owner row %d" % i, room="main", who="agent-a")
         d = self.req("/api/chat?room=main&since=0&win=10")[1]
         self.assertEqual(len(d["lines"]), 10)                 # windowed body
         self.assertEqual(d["owner_unread"], 40)               # full-rows signal
