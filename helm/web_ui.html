@@ -2747,7 +2747,7 @@ function chatReconcileQuotes() {
   });
 }
 
-/* Batch-resolve the parents of PENDING quotes by id (builders' handleMessagesByIds
+/* Batch-resolve the parents of PENDING quotes by id (a reference handleMessagesByIds
    parity, cap 100). The response tells "above the window but still in the room"
    (id present -> index it, the quote resolves to author+snippet) from "genuinely
    rotated out" (id absent -> CHAT_GONE, only NOW does the quote read "rotated
@@ -3317,7 +3317,7 @@ function initChat() {
     };
     $("#chatlog").addEventListener("scroll", () => {
       chatJumpSync();
-      // near the top with history above -> pull the prior page (builders'
+      // near the top with history above -> pull the prior page (a reference
       // SCROLL_THRESHOLD parity; single-flight guarded inside chatLoadOlder)
       if ($("#chatlog").scrollTop < 80) chatLoadOlder();
     });

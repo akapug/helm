@@ -1049,7 +1049,7 @@ def _room_stat(room):
 
 
 def _api_chat_older(qs):
-    """Older-history page (the analog of builders' getRecent(before, n)): the
+    """Older-history page (the analog of a reference getRecent(before, n)): the
     immutable body of rows[max(0,before-win):before] for a room, plus the
     absolute `base` of the first row returned and the live `total`. BODY ONLY —
     no transport, no rooms, no roster, no signal, no presence. Signed history is
@@ -1104,7 +1104,7 @@ def _api_chat_older(qs):
 
 
 def _api_chat_ids(qs):
-    """Batch id hydration (builders' handleMessagesByIds parity, cap 100): the
+    """Batch id hydration (a reference handleMessagesByIds parity, cap 100): the
     rows whose id is in ?ids=<csv>, BODY ONLY (no transport/rooms/roster/signal).
     The client uses it to resolve a reply's parent that sits ABOVE the loaded
     window WITHOUT paging the whole gap — and, crucially, to tell 'outside the

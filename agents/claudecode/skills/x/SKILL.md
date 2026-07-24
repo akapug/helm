@@ -213,7 +213,7 @@ cross-family pass (never silently self-review).
 
 Model diversity costs tokens. The discipline is to make the cost *fit*, not to drop the
 primitive:
-- **Check the budget** (the `usage` skill / `mcp__builders-dev__usage`) when a junction is
+- **Check the budget** (the `usage` skill / your quota MCP) when a junction is
   expensive or the swarm is near a quota edge.
 - **Scale the rigor to the budget**: tight → a single terse refuter (angel-mode: hints
   only, min-tokens); ample → a 3–5 vote adversarial panel or perspective-diverse

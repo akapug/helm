@@ -116,17 +116,15 @@ def hooks_for(label):
 # ---------------------------------------------------------------------------
 # the canonical MCP set
 # ---------------------------------------------------------------------------
-# name -> server config (or None = report-only). The default is REPORT-ONLY:
-# on the live host every credhome already reaches builders-dev via ENABLED
-# PLUGINS (survey mcp_variance), so minting a RAW mcpServers entry for it
-# would create the exact duplicate-shadow the survey warns about. mcp sync
-# therefore only ADDS a raw server when (a) the name is missing from the home's
-# EFFECTIVE set (not provided by any plugin or raw entry) AND (b) a concrete
-# config is in hand — supplied by HELM_MCPS_CANONICAL (a JSON file
-# {name: config|null}). Anything else is surfaced to the owner, never guessed
-# (fail-closed). The universal intersection names below are what the census
-# checks every home can actually reach.
-CANONICAL_MCPS = {"builders-dev": None}
+# name -> server config (or None = report-only). The default set is EMPTY: a
+# public helm assumes no specific canonical MCP. When one IS expected on every
+# home, supply it via HELM_MCPS_CANONICAL (a JSON file {name: config|null}).
+# mcp sync then only ADDS a raw server when (a) the name is missing from the
+# home's EFFECTIVE set (not provided by any plugin or raw entry) AND (b) a
+# concrete config is in hand. For a name a plugin already provides, minting a
+# RAW mcpServers entry would create the exact duplicate-shadow the survey warns
+# about, so anything else is surfaced to the owner, never guessed (fail-closed).
+CANONICAL_MCPS = {}
 
 
 def canonical_mcps():
@@ -220,7 +218,7 @@ def home_mcps(cdir):
     ep = settings.get("enabledPlugins") if isinstance(settings, dict) else None
     if isinstance(ep, dict):
         plugins = sorted(k for k, v in ep.items() if v)
-    # a plugin `builders-dev@mc` provides the `builders-dev` MCP (survey map).
+    # a plugin `<name>@<source>` provides the `<name>` MCP (survey map).
     plugin_mcps = [p.split("@", 1)[0] for p in plugins]
     return {"raw": raw, "plugins": plugins,
             "effective": sorted(set(raw) | set(plugin_mcps))}

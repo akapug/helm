@@ -465,7 +465,7 @@ class TestWebChat(unittest.TestCase):
         self.assertNotIn("base", d2)
 
     def test_older_page_returns_the_prior_window_body_only(self):
-        """?before=<idx> is the analog of builders getRecent(before): the
+        """?before=<idx> is the analog of a reference getRecent(before): the
         immutable slice rows[before-win:before], its `base`, and the live
         total — BODY ONLY (no transport/rooms/roster/signal/presence)."""
         for i in range(60):

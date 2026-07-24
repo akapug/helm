@@ -1357,7 +1357,7 @@ overrides). Fail-CLOSED by construction: a server is ADDED to a home's
 `.claude.json` `mcpServers` only when (a) the name is missing from the home's
 EFFECTIVE set (not already provided by a plugin or a raw entry) AND (b) a
 concrete config is in hand — otherwise the gap is SURFACED to the owner, never
-guessed (blindly minting a raw `builders-dev` entry where a plugin already
+guessed (blindly minting a raw plugin-provided entry where a plugin already
 provides it would create the exact duplicate-shadow the census warns about).
 The default canonical carries no configs, so `--apply` is report-only until an
 override supplies them. Backup-first, superset-preserving (an existing server
