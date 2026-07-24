@@ -25,3 +25,8 @@ docs/DECISION-*.md
 agents/claudecode/skills/i-have-audhd/
 evals/*.md
 docs/REBOOT_CHECKLIST_1.4.149.md
+
+# internal skills + license decision memo — kept local, never on the remote
+agents/claudecode/skills/sesh/
+agents/claudecode/skills/vendor-as-public/
+docs/LICENSE-TODO.md

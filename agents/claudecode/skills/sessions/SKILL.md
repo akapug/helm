@@ -96,7 +96,7 @@ git **worktree** used as both `--cwd` and `CLAUDE_PROJECT_DIR` (real project che
    `resurrect <id> --project-dir ../helm-wt/<role>-home`.
    Dry-run to confirm the carried context + resume line, then `--apply` and resume with the emitted
    `CLAUDE_PROJECT_DIR=<worktree>` so the expert gets its OWN isolated `.remember` channel (see "Expert
-   channel isolation" above — history: a Mission Control shared-checkout resurrect once poisoned an expert
+   channel isolation" above — history: a shared-checkout resurrect once poisoned an expert
    with the primary session's buffer; that is exactly what the exit-8/exit-9 rails now prevent).
 
 ## Scope: default harness roots ONLY (helm seat homes are NOT covered)

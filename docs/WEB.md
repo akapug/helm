@@ -35,7 +35,7 @@ $ helm web --port 8080 --open
   `Authorization: Bearer <MUTATION_TOKEN>` — 403 without. The token is minted
   fresh per process and handed to the UI by template substitution
   (`__HELM_TOKEN__` in `web_ui.html` is replaced at serve time; the file on
-  disk stays raw). `HELM_API_TOKEN` (legacy `SESH_API_TOKEN`) pins it — set
+  disk stays raw). `HELM_API_TOKEN` pins it — set
   that when a script or a long-lived service needs stable POST access.
 - **Bounded writes.** POST bodies over 64 KB are rejected; every mutation is
   reversible by construction (renames, moves-to-trash, backups — the
