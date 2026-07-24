@@ -7,7 +7,7 @@ description: >
   layout, worktrees, status, and recent history, then cite what matters.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
@@ -44,15 +44,15 @@ Then read repo instructions and public entry points:
    adjacent implementation before adding a parallel one.
 4. **History explains shape.** Use `git log -p --follow`, `git blame`, and
    commit messages for why a file is this way.
-5. **Check active work.** Claims, worktrees, dirty state, and MC messages tell you
+5. **Check active work.** Claims, worktrees, dirty state, and chat messages tell you
    who owns what now.
-6. **Cite before claiming.** File/line, command output, commit, or MC seq beats
+6. **Cite before claiming.** File/line, command output, commit, or a chat seq beats
    inference.
 
-## MC Context
+## Coordination Context
 
-When coordination matters, read `mc cockpit get --ambient` and relevant
-`mc comms` convs. Do not inspect a client view as source of truth.
+When coordination matters, read `helm chat` for the relevant rooms. Do not
+inspect a client view as source of truth.
 
 ## Output Shape
 

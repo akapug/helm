@@ -35,7 +35,7 @@ let me just" OR a "the options are A or B" coming on.
 1. **"It's late / do it tomorrow / needs fresh energy" — OR "I'm deep in a long session / context is
    heavy, defer this big task to fresh context."** You have NO fatigue, NO time-of-day, AND
    CONTEXT-DEPTH IS NOT A GATE EITHER. helm sessions run days-to-weeks; "late in a long session /
-   fatigued context" is the SAME punt as "fresh energy" (owner ruling 2026-06-09, MC-era, kept as history).
+   fatigued context" is the SAME punt as "fresh energy" (owner ruling 2026-06-09, kept as history).
    When context fills, you MANAGE it with tools and proceed: archive open work to the integration board,
    checkpoint to memory, dispatch subagents for big-LoC work, prune + re-triage the tasklist, /compact deliberately.
    A big task is never deferred for "fresh context" — it's decomposed + tooled. Capacity = real
@@ -58,7 +58,7 @@ let me just" OR a "the options are A or B" coming on.
    (their infra, spare cloud accounts, a home cluster, alt providers, local docker). A false binary
    ("rush the risky live deploy OR punt") almost always hides a safe third path. Example (owner ruling
    2026-06-09): proposing live-cluster deploy vs a sub-slice when the real criterion was "test safely" -
-   and a spare cheap box / fly.io / local docker / the /homelab nodes all satisfied it with zero live
+   and a spare cheap box / fly.io / local docker / spare self-hosted nodes all satisfied it with zero live
    risk. Diverge to the option space *first*, then converge with decision-spirit.
 
 ### The only real gates (what a deferral MUST cite, or it's a punt)

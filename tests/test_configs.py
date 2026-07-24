@@ -2,7 +2,7 @@
 """helm.configs + the web configs/skills surface — hermetic contract tests.
 
 Env is planted BEFORE helm.configs is imported (its roots freeze at import,
-behavior-preserved from sesh): HELM_CONFIG_ROOTS -> a tmp cwd tree, HELM_HOME
+behavior-preserved): HELM_CONFIG_ROOTS -> a tmp cwd tree, HELM_HOME
 -> a tmp helm home. The skills census is pointed at a tmp skill home by
 patching skills._skill_homes (the test_skills pattern) and the web trash dir
 at a tmp dir — the real ~/.claude / ~/.helm / ~/.cache are never touched.
@@ -31,7 +31,6 @@ os.makedirs(_PROJ)
 os.makedirs(_HOMEDIR)
 os.makedirs(_SKILLS)
 os.environ["HELM_CONFIG_ROOTS"] = _ROOT
-os.environ.pop("SESH_CONFIG_ROOTS", None)
 os.environ.setdefault("HELM_HOME", os.path.join(_TMP, "helm-home"))
 
 with open(os.path.join(_PROJ, ".mcp.json"), "w") as f:
@@ -352,7 +351,7 @@ class HomeSubdirConfigTest(unittest.TestCase):
         """A security boundary, not an oversight: the web UI writes the file
         and the next hook invocation RUNS it as the owner. A JSON config can
         only misconfigure; a .sh hook can do anything."""
-        for rel in ("statusline.sh", "buildr-codex-hook.py"):
+        for rel in ("statusline.sh", "codex-hook.py"):
             p = os.path.join(_HOMEDIR, rel)
             with open(p, "w") as f:
                 f.write("#!/bin/sh\necho hi\n")

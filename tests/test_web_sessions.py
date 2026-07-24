@@ -170,7 +170,7 @@ class TestWebSessions(unittest.TestCase):
         status, d = self.req("/api/catalog")
         self.assertEqual(status, 200)
         for key in ("rows", "stats", "scanned_at"):
-            self.assertIn(key, d, "sesh /api/catalog shape: missing %s" % key)
+            self.assertIn(key, d, "/api/catalog shape: missing %s" % key)
         sids = {r["i"] for r in d["rows"]}
         self.assertLessEqual({SID_A, SID_B, SID_SYN, SID_CX}, sids)
         row = next(r for r in d["rows"] if r["i"] == SID_A)
@@ -209,7 +209,7 @@ class TestWebSessions(unittest.TestCase):
         self.assertEqual(d["scope"], "alpha")
         hit = d["hits"][0]
         for key in ("harness", "id8", "date", "title", "snippet", "sid", "cvid", "syn"):
-            self.assertIn(key, hit, "sesh /api/search hit shape: missing %s" % key)
+            self.assertIn(key, hit, "/api/search hit shape: missing %s" % key)
         self.assertIn("flux capacitor", hit["snippet"])
         # synthetic=1 surfaces the reference transcript too
         status, d = self.req("/api/search?" + q + "&synthetic=1")
@@ -253,11 +253,11 @@ class TestWebSessions(unittest.TestCase):
 
     # -- /api/cmd ----------------------------------------------------------
     def test_cmd_omitted_account_degrades_to_default(self):
-        # broken provider => no creds => "(default)" (sesh's degraded handling)
+        # broken provider => no creds => "(default)" (degraded handling)
         status, d = self.req("/api/cmd?sid=%s" % SID_A[:12])
         self.assertEqual(status, 200, d)
         for key in ("cmd", "preflight", "warnings", "session"):
-            self.assertIn(key, d, "sesh /api/cmd shape: missing %s" % key)
+            self.assertIn(key, d, "/api/cmd shape: missing %s" % key)
         self.assertIn("claude", d["cmd"])
         self.assertIn("--resume %s" % SID_A, d["cmd"])
         self.assertIn("cd ", d["cmd"])  # recorded cwd exists -> cd prefix

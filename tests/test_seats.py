@@ -782,13 +782,13 @@ class MultiRoomTest(SeatsBase):
     def test_conamed_sessions_fan_out_cross_room(self):
         """Per (seat, room, session) cursors: BOTH co-named sessions see the
         side-room mention, each exactly once."""
-        seats.join(session="s-one", seat="fab", cwd="/tmp/p")
-        seats.join(session="s-two", seat="fab", cwd="/tmp/p")
-        chat.post("@fab ship it", who="bob", room="team-fab")
-        self.assertIn("ship it", seats.deliver_any(session="s-one", seat="fab"))
-        self.assertIn("ship it", seats.deliver_any(session="s-two", seat="fab"))
-        self.assertIsNone(seats.deliver_any(session="s-one", seat="fab"))
-        self.assertIsNone(seats.deliver_any(session="s-two", seat="fab"))
+        seats.join(session="s-one", seat="alpha", cwd="/tmp/p")
+        seats.join(session="s-two", seat="alpha", cwd="/tmp/p")
+        chat.post("@alpha ship it", who="bob", room="team-alpha")
+        self.assertIn("ship it", seats.deliver_any(session="s-one", seat="alpha"))
+        self.assertIn("ship it", seats.deliver_any(session="s-two", seat="alpha"))
+        self.assertIsNone(seats.deliver_any(session="s-one", seat="alpha"))
+        self.assertIsNone(seats.deliver_any(session="s-two", seat="alpha"))
 
     def test_stop_guard_blocks_on_cross_room_pending(self):
         seats.join(session="s-sg", seat="sg", cwd="/tmp/p")
@@ -1767,7 +1767,7 @@ class RosterTruthTest(SeatsBase):
 
 
 class StopGuardTest(SeatsBase):
-    """The idle gate (buildr/mc arbiter port). Hermetic: room + claims in tmp,
+    """The idle gate (arbiter port). Hermetic: room + claims in tmp,
     HELM_ADOPTED_DIR in tmp so the silent index-cap leg can never touch a live
     MEMORY.md."""
 

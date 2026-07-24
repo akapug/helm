@@ -1,13 +1,13 @@
 ---
 name: interpret-goal
 description: >
-  Turn a large objective into driveable, bounded MC sub-goals with verifiable
+  Turn a large objective into driveable, bounded sub-goals with verifiable
   exit conditions. Use when the user gives a high-level objective, asks the
   agent to set the sub-goals, or an autonomous run needs a concrete finish line.
   Each sub-goal includes an as-the-user or real-surface verification gate.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
@@ -27,7 +27,7 @@ decompose and proceed.
 ## Steps
 
 1. **Ground the objective.** Read the source: user message, PRD, issue, task, or
-   MC record. Quote the actual requested outcome.
+   coordination record. Quote the actual requested outcome.
 2. **Decompose into 2-6 sub-goals.** Each gets:
    - one-line exit condition;
    - owner;

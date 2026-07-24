@@ -7,13 +7,13 @@ description: >
   discovered from code, git, docs, cockpit, comms, or another model's logic.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
 # /grill-me - surface context cruxes before building
 
-The human may hold context the agent cannot derive from the repo or MC state.
+The human may hold context the agent cannot derive from the repo or helm state.
 `/grill-me` extracts those cruxes before work is built on a false premise. It is
 about information, not permission: decide and act on tractable substrate, but ask
 for the facts only the human can know.
@@ -25,8 +25,7 @@ for the facts only the human can know.
 - When the user invokes `/grill-me`.
 
 Do not use it for discoverable facts. Find environment, path, version, wiring,
-ownership, claim, or delivery facts through local files, git, `mc cockpit`, and
-`mc comms`.
+ownership, claim, or delivery facts through local files, git, and `helm chat`.
 
 ## Question Filter
 
@@ -38,7 +37,7 @@ Ask the question when all are true:
 
 Do not ask when:
 
-- The fact is discoverable locally or from MC state.
+- The fact is discoverable locally or from helm state.
 - The issue is a logic/design premise a cross-family reviewer can refute.
 - The detail is non-load-bearing; choose a conservative default and proceed.
 

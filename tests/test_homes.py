@@ -23,7 +23,7 @@ class HomesTest(unittest.TestCase):
         homes.DEFAULTS = {"claude": j("default-claude"), "codex": j("default-codex")}
         homes.SHARED_PROJECTS = j("default-claude", "projects")
         homes.ARCHIVE_ROOT = j("helm-home-archive")
-        homes.LEGACY_ARCHIVE_ROOT = j("sesh-home-archive")
+        homes.LEGACY_ARCHIVE_ROOT = j("legacy-home-archive")
         homes._agent_procs = lambda: []
         for r in homes.ROOTS.values():
             os.makedirs(r)
@@ -187,8 +187,8 @@ class HomesTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(d))
         self.assertFalse(os.path.exists(os.path.join(d, homes.MARKER)))
 
-    # -- legacy sesh archives: read both, write new ------------------------
-    def test_legacy_sesh_archive_listed_and_restorable(self):
+    # -- legacy archives: read both, write new ------------------------
+    def test_legacy_archive_listed_and_restorable(self):
         origin = os.path.join(homes.ROOTS["codex"], "old-codex")
         legacy = os.path.join(homes.LEGACY_ARCHIVE_ROOT, "old-codex-20250101")
         os.makedirs(legacy)

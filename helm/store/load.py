@@ -228,7 +228,7 @@ def _parse_entry(path, name):
     A typed-prefix file that fails its typed parse (the live store carries
     ~200 prem-/lex- named files that are really bulk memory: name+description
     only, no id/statement) FALLS BACK to episodic — visible in the inventory,
-    never injected — where mc's resolvers silently dropped it."""
+    never injected — where the legacy resolvers silently dropped it."""
     if name == "MEMORY.md" or name.startswith("reflex-"):
         return None
     if name.startswith((PRIOR_PREFIX, LEGACY_PREFIX)):

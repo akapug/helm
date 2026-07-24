@@ -3,13 +3,11 @@
 helm takes no config file — every knob is an environment variable, and every
 one has a working default. A fresh clone needs **none of these** set.
 
-**The env transition law (the "env2" pattern):** helm absorbed two predecessor
-tools, and their variables are honored forever as fallbacks. Every variable
-below resolves `HELM_<name>` first; if unset, the legacy spelling
-(`MELD_*` for the home/substrate lineage, `SESH_*` for the session/quota
-lineage) is read; only then does the default apply. Legacy names are **read,
-never written** — new code always spells `HELM_*`. `helm doctor` reports which
-overrides are in effect.
+**The env transition law:** a handful of variables accept a legacy `MELD_*`
+spelling as a fallback. Every variable below resolves `HELM_<name>` first; if
+unset, any legacy spelling is read; only then does the default apply. Legacy
+names are **read, never written** — new code always spells `HELM_*`. `helm
+doctor` reports which overrides are in effect.
 
 ## the home
 
@@ -28,15 +26,15 @@ overrides are in effect.
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
 | `HELM_SCAN_ROOTS` | `~/dev` (the shipped default — set your own checkout roots) | the repo-scan tier of `helm sync` — colon-separated roots under which git repos register as shelf projects | — |
-| `HELM_CLAUDE_ROOTS` | — (extra roots; `~/.claude/projects` is always scanned) | the session catalog — colon-separated additional Claude transcript roots | `SESH_CLAUDE_ROOTS` |
-| `HELM_CODEX_ROOTS` | — (extra roots; `~/.codex/sessions` and `~/.codex-homes` are always scanned) | the session catalog — additional Codex transcript roots | `SESH_CODEX_ROOTS` |
-| `HELM_CATALOG` | — (`scanner` forces the built-in scanner, skipping the `cv` recall index as catalog source) | the session catalog | `SESH_CATALOG` |
+| `HELM_CLAUDE_ROOTS` | — (extra roots; `~/.claude/projects` is always scanned) | the session catalog — colon-separated additional Claude transcript roots | — |
+| `HELM_CODEX_ROOTS` | — (extra roots; `~/.codex/sessions` and `~/.codex-homes` are always scanned) | the session catalog — additional Codex transcript roots | — |
+| `HELM_CATALOG` | — (`scanner` forces the built-in scanner, skipping the `cv` recall index as catalog source) | the session catalog | — |
 
 ## configs
 
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
-| `HELM_CONFIG_ROOTS` | `~/dev` | `helm configs` — colon-separated roots for the project-scope config tree walk | `SESH_CONFIG_ROOTS` |
+| `HELM_CONFIG_ROOTS` | `~/dev` | `helm configs` — colon-separated roots for the project-scope config tree walk | — |
 | `HELM_SKILL_DECK` | — (no deck; nothing provisioned) | `helm homes create` — a directory of skill dirs (each carrying a `SKILL.md`), symlinked into every new claude home's `skills/` so any credential loads the same setup; existing entries are never touched | — |
 
 ## the training corpus
@@ -73,18 +71,18 @@ overrides are in effect.
 
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
-| `HELM_PROVIDER` | `native` | provider selection — `native` reads the vendors' own usage endpoints directly (stdlib-only, the default); `cli` opts into an external quota CLI | `SESH_PROVIDER` |
-| `HELM_QUOTA_CLI` | `tokaware` | the CLI provider — which binary to shell (only used with `HELM_PROVIDER=cli`) | `SESH_QUOTA_CLI` |
-| `HELM_ALLOCATION_RULES` | `~/.config/helm/allocation.json` (legacy `~/.config/sesh/` honored) | allocation ranking — operator prefer/avoid rules per model substring | `SESH_ALLOCATION_RULES` |
-| `HELM_PROBE_LOOP` | — (`1` starts the background re-probe loop lazily on the first history read) | the native provider's burn-history collector | `SESH_PROBE_LOOP` |
-| `HELM_ALLOC_MODELS` | `fable,opus,gpt-5.5` | the web quota view — which model chips the allocate panel offers | `SESH_ALLOC_MODELS` |
+| `HELM_PROVIDER` | `native` | provider selection — `native` reads the vendors' own usage endpoints directly (stdlib-only, the default); `cli` opts into an external quota CLI | — |
+| `HELM_QUOTA_CLI` | `quota` | the CLI provider — which binary to shell (only used with `HELM_PROVIDER=cli`) | — |
+| `HELM_ALLOCATION_RULES` | `~/.config/helm/allocation.json` | allocation ranking — operator prefer/avoid rules per model substring | — |
+| `HELM_PROBE_LOOP` | — (`1` starts the background re-probe loop lazily on the first history read) | the native provider's burn-history collector | — |
+| `HELM_ALLOC_MODELS` | `fable,opus,gpt-5.5` | the web quota view — which model chips the allocate panel offers | — |
 | `HELM_CRED_BACKUP_ROOT` | `~/.cred-backups` | `helm cred backup` / `switch-guard` / `heal` — the credential snapshot root (`0700` dirs, `0600` files). Point it at an encrypted volume if you want the snapshots there; the override is also how tests keep the real root untouched | — |
 
 ## the web app
 
 | variable | default | read by | legacy fallback |
 |---|---|---|---|
-| `HELM_API_TOKEN` | a fresh random token per process | `helm web` — pins the anti-CSRF mutation bearer (useful for scripted POSTs or a long-lived service; see [WEB.md](WEB.md)) | `SESH_API_TOKEN` |
+| `HELM_API_TOKEN` | a fresh random token per process | `helm web` — pins the anti-CSRF mutation bearer (useful for scripted POSTs or a long-lived service; see [WEB.md](WEB.md)) | — |
 
 (`__HELM_TOKEN__` seen in `web_ui.html` is not an environment variable — it is
 the template placeholder the server substitutes the live token into at serve
@@ -140,7 +138,7 @@ credentials and never calls a real endpoint in tests.
 minted family/instance seat root to every CV subprocess, so proxy-seat
 transcripts participate in the one recall index without a second scanner.
 
-`MC_HOME` — `helm whoami` merges its profile scaffold from a Mission Control
-user-profile at `$MC_HOME/user-profile/profile.json` (default
-`~/.mc/mission-control`) when one exists. Absent, the profile starts fresh —
-no dependency either way.
+`HELM_PROFILE_SCAFFOLD` — an optional path to an external `profile.json`;
+`helm whoami` merges its `know-your-user` fields in (content wins over
+emptiness, never the reverse). Unset, the profile starts fresh — no dependency
+either way.

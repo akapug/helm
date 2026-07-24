@@ -263,7 +263,7 @@
 - Kimi proxy-key seat — API-key provider families join the seat roster
   (`helm seat add kimi`, key baked into the seat's 0600 config, never read
   from the environment again) behind the same proxy as the OAuth seats.
-- tokaware parity — creds crosscheck against a local-session second source,
+- Credential crosscheck parity — creds crosscheck against a local-session second source,
   shared-refresh-token-family hygiene in list/verify/doctor, `helm attribute`
   (token-effort rollup) + `helm who` (pid→cred attribution, evidence-only),
   hermetic providers.py test coverage, and a git-presence doctor row.

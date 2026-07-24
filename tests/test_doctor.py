@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """doctor tests — hermetic: a synthetic HELM_HOME in a tempdir with a broken
 symlink, a missing repo path, a stale memory_dir, an adoption conflict, and a
-dup-prefix adopted store. Never touches the real ~/.helm, ~/.mc, ~/.claude."""
+dup-prefix adopted store. Never touches the real ~/.helm, ~/.claude."""
 import contextlib
 import io
 import os
@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from helm import chat, doctor, home, pk, whoami
+from helm import chat, doctor, home, pk, registry, whoami
 
 
 def levels(results, level):
@@ -24,12 +24,12 @@ class DoctorBase(unittest.TestCase):
         os.makedirs(scan)  # a live source for the registry projection row
         self.envp = mock.patch.dict(os.environ, {
             "HELM_HOME": self.helm_home,
-            "MC_HOME": os.path.join(self.tmp.name, "mc-home"),
             "HELM_CACHE_DIR": os.path.join(self.tmp.name, "cache"),
             "HELM_SCAN_ROOTS": scan,
         })
         self.envp.start()
         os.environ.pop("MELD_HOME", None)
+        os.environ.pop("HELM_PROFILE_SCAFFOLD", None)
         self.assertTrue(home.helm_home().startswith(self.tmp.name))
 
     def tearDown(self):
@@ -41,7 +41,7 @@ class DoctorBase(unittest.TestCase):
         home.scaffold_global()
         repo = os.path.join(self.tmp.name, "repos", "good")
         os.makedirs(repo)
-        for name in ("good", "gone-repo", "brokelink", "memstale", "mission-control"):
+        for name in ("good", "gone-repo", "brokelink", "memstale", "example-adopted"):
             if name != "brokelink":
                 home.scaffold_project(name)
         os.symlink(os.path.join(self.tmp.name, "no-such-target"),
@@ -54,7 +54,7 @@ class DoctorBase(unittest.TestCase):
             "gone-repo": rec("gone-repo", os.path.join(self.tmp.name, "repos", "gone")),
             "brokelink": rec("brokelink", repo),
             "memstale": rec("memstale", repo, mem=os.path.join(self.tmp.name, "no-such-mem")),
-            "mission-control": rec("mission-control", repo),
+            "example-adopted": rec("example-adopted", repo),
         }})
 
     def seed_adopted(self):
@@ -117,8 +117,12 @@ class TestChecks(DoctorBase):
 
     def test_adoption_conflict_real_dir_warns(self):
         self.seed_home()
-        results = doctor.check_adoption()
-        self.assertTrue(any("mission-control" in m and "adoption conflict" in m
+        # no adopted home ships by default; a deployment registers one — seed a
+        # neutral entry so the adoption-conflict check still has coverage.
+        with mock.patch.object(registry, "ADOPTED_HOMES",
+                               {"example-adopted": "/external/example-adopted"}):
+            results = doctor.check_adoption()
+        self.assertTrue(any("example-adopted" in m and "adoption conflict" in m
                             for m in levels(results, doctor.WARN)))
 
     def test_adopted_store_counts_and_dup_warn(self):
@@ -360,6 +364,8 @@ class TestCmdDoctor(DoctorBase):
         adopted = self.seed_adopted()
         before = self.snapshot(self.tmp.name)
         with mock.patch.object(home, "adopted_memory_dir", lambda: adopted), \
+                mock.patch.object(registry, "ADOPTED_HOMES",
+                                  {"example-adopted": "/external/example-adopted"}), \
                 mock.patch.object(doctor, "check_cv",
                                   lambda: [(doctor.OK, "cv stub")]), \
                 mock.patch.object(doctor, "check_cred_families",

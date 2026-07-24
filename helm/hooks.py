@@ -64,7 +64,7 @@ SPECS = (
      "timeout": 2, "own": ("chat deliver --hook-json",), "matcher": "*"},
     {"name": "join", "event": "SessionStart", "args": "chat join --hook-json",
      "timeout": 5, "own": ("chat join --hook-json",), "matcher": "*"},
-    # stop-guard: the IDLE GATE (buildr/mc arbiter capability). Blocks a stop
+    # stop-guard: the IDLE GATE (the work-arbiter capability, helm-native). Blocks a stop
     # on undelivered mentions/held leases (once per pending-fingerprint),
     # warns to arm the beacon on a clean stop, silently runs the index cap.
     # Stop takes no matcher (like UserPromptSubmit).

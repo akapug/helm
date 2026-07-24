@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """helm meld — the mindmeld preset. Hermetic: HELM_CHAT_DIR + HELM_HOME are
 tmp dirs, HELM_CHAT_NODE_URL set-but-empty kills the signed transport,
-ambient session ids scrubbed (test_seats.py's exact envelope). Lineage pins:
-mc-meld.sh scars (epoch fence, F1 control echoes, F2 fail-closed self-skip,
+ambient session ids scrubbed (test_seats.py's exact envelope). Pins the meld
+preset scars (epoch fence, F1 control echoes, F2 fail-closed self-skip,
 room×actor state, clip-proof invite head) + the helm-native laws (act-moment
 mentions only, latency-pure sign=False, bounds as behavior)."""
 import contextlib
@@ -63,7 +63,7 @@ class TestInvite(MeldBase):
         self.assertIn("PROBLEM: converge the wire format", seed)
         self.assertTrue(seed.endswith("[HOLD]"))
         self.assertIn("MELD DISCIPLINE", seed)         # discipline rides the seed
-        # clip-proof head (buildr #115 inverted): the join command must sit
+        # clip-proof head (inverted from a live incident): the join command must sit
         # inside the first 200 BYTES — the delivery clip can never eat it.
         head = seats._clip(seats._scrub(inv))
         self.assertIn("helm chat meld join %s" % room, head)
@@ -110,7 +110,7 @@ class TestJoinReady(MeldBase):
         self.assertIn("READY:", ready["text"])
         self.assertIsNone(meld._MARKER_RE.search(ready["text"]))  # control-only
         self.assertTrue(seats.deliverable(ready, "seat-a"))       # wake-back:
-        # a READY that lands silently strands GO forever (buildr live-incident)
+        # a READY that lands silently strands GO forever (a live incident)
         st = meld.state(room, "seat-b")
         self.assertEqual((st["role"], st["status"], st["peer"]),
                          ("joiner", "active", "seat-a"))
@@ -121,7 +121,7 @@ class TestJoinReady(MeldBase):
             meld.join("meld-1-x", seat="seat-b")
 
     def test_state_is_room_x_actor(self):
-        """The mc-meld live-dogfood REFUTE: both actors share one chat dir;
+        """The meld live-dogfood REFUTE: both actors share one chat dir;
         the joiner's state write must never clobber the convener's role."""
         room, _ = self.open_meld()
         self.assertNotEqual(meld.state_path(room, "seat-a"),

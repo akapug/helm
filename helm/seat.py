@@ -827,7 +827,7 @@ def _link_skills(cdir):
     CANONICAL source, the same target every credhome carries — a seat is born
     with exactly the fleet set, and a skill added to canonical is instantly
     visible here. Only when no canonical dir exists on this host (foreign
-    machine, no MC checkout, no HELM_SKILLS_CANONICAL) fall back to mirroring the
+    machine, no HELM_SKILLS_CANONICAL) fall back to mirroring the
     minting host's own CLAUDE_CONFIG_DIR skills, as before. Symlink (not
     copy) so skill edits propagate live; a stale or indirect symlink is
     normalized to the canonical target, but a REAL skills dir is never

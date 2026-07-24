@@ -1,6 +1,6 @@
 """helm.web configs-editor surface — hermetic contract tests (slice C).
 
-The sesh /api/configs/* + /api/physics-diff contracts over configs.py/physics.py,
+The /api/configs/* + /api/physics-diff contracts over configs.py/physics.py,
 plus the uniform mutation hardening: EVERY POST demands the per-process bearer
 (web.MUTATION_TOKEN) and answers 403 without it.
 
@@ -113,7 +113,7 @@ class TestWebConfigs(unittest.TestCase):
         status, d = self.req("/api/configs/tree")
         self.assertEqual(status, 200)
         for key in ("roots", "count", "config_roots", "home_roots"):
-            self.assertIn(key, d, "sesh /api/configs/tree shape: missing %s" % key)
+            self.assertIn(key, d, "/api/configs/tree shape: missing %s" % key)
         self.assertEqual(d["config_roots"], [os.path.realpath(self.root)])
         nodes = []
         for r in d["roots"]:
@@ -151,7 +151,7 @@ class TestWebConfigs(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("planted memory", d["content"])
         self.assertTrue(d["editable"])
-        # sesh contract: a refused read answers 200 + error field + empty content
+        # contract: a refused read answers 200 + error field + empty content
         status, d = self.req("/api/configs/file?path=/etc/passwd")
         self.assertEqual(status, 200)
         self.assertIn("error", d)

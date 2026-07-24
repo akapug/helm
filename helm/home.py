@@ -77,8 +77,8 @@ def validate_seat_arg(raw):
     return raw
 
 
-# Per-project concept-category chain (the buildr .local family, lifted to a
-# user-level product-namespace home). Order is the organic dev cycle:
+# Per-project concept-category chain (a .local product-namespace family, lifted
+# to a user-level home). Order is the organic dev cycle:
 # priors art feeds prd, build happens in the repo, evals then journal then archive.
 PROJECT_CATEGORIES = (
     "premises", "heuristics", "lexicon", "prd", "journal", "evals", "archive",
@@ -233,8 +233,7 @@ def scaffold_global():
 def scaffold_project(name):
     """Ensure one project's chain exists. Idempotent, additive — never deletes.
     Returns the project dir. A symlinked project home (adoption of an existing
-    external chain, e.g. mission-control -> ~/.mc/mission-control) is honored
-    and never re-scaffolded inside."""
+    external chain via symlink) is honored and never re-scaffolded inside."""
     p = project_dir(name)
     if os.path.islink(p):
         return p

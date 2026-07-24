@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """helm store — the ONE typed personal-knowledge store resolver.
 
-The unification of the four near-clone mc resolvers (priors.py + lexicon.py +
+The unification of the four near-clone legacy resolvers (priors.py + lexicon.py +
 heuristics_store.py + the episodic memory reader) behind one loader, one JIT
 resolver, one lifecycle. The store spans several PHYSICAL ROOTS but reads as
 one logical store; every entry records where it lives:

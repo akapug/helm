@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Idle-home keepalive: refresh a claude credential home's OAuth token before its
 refresh chain rots — the ONE place in helm that writes credential files.
-ABSORBED from the predecessor (sesh/server/keepalive.py), behavior-preserving,
-every hard-won rule intact (no live runtime consumer existed at absorption —
-verified by /proc scan; a leftover predecessor sweep is still detected and
+Every hard-won rule intact (a leftover predecessor sweep is still detected and
 `helm keepalive` refuses to run beside it):
 
   * ROTATION MUST PERSIST. The token endpoint rotates the refresh_token on every
@@ -24,8 +22,6 @@ verified by /proc scan; a leftover predecessor sweep is still detected and
 
 Every action (refresh, skip, refusal, failure) is appended to
 ~/.cache/helm/keepalive-log.jsonl — token VALUES never appear anywhere.
-(catalog.CACHE_DIR seeds itself once from the legacy ~/.cache/sesh/, so the
-predecessor's log history carries over; new writes are helm-only.)
 """
 import fcntl
 import glob
@@ -82,9 +78,9 @@ def _live_holder_pid(home_path):
 
 
 def _predecessor_pids():
-    """Live predecessor keepalive processes (the sesh copy uses a DIFFERENT lock
-    file, so our sweep lock can't see it — detect it directly and refuse to run
-    a second credential writer beside it)."""
+    """Live predecessor keepalive processes (a predecessor copy uses a DIFFERENT
+    lock file, so our sweep lock can't see it — detect it directly and refuse to
+    run a second credential writer beside it)."""
     me = str(os.getpid())
     out = []
     for f in glob.glob("/proc/[0-9]*/cmdline"):
@@ -99,7 +95,7 @@ def _predecessor_pids():
         argv0 = cmdline.split("\0", 1)[0]
         if "python" not in os.path.basename(argv0):
             continue
-        if "keepalive" in cmdline and ("sesh" in cmdline or "helm" in cmdline):
+        if "keepalive" in cmdline and "helm" in cmdline:
             out.append((pid, "keepalive"))   # never return argv: it may carry pasted secrets
     return out
 

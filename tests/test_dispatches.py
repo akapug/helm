@@ -389,20 +389,20 @@ class HistoricalCompatTest(DispatchBase):
         # fable adversarial r3 (LOW): a legacy-shaped FIRST row appended after
         # the boundary must not invent an already-closed obligation.
         ts = dispatches.pk.now_ts()
-        fab = {"id": "1a" * 16, "ts": ts, "recipient": "codex-3",
+        rec = {"id": "1a" * 16, "ts": ts, "recipient": "codex-3",
                "lane": "fabricated", "ref": self.a[:7], "note": None,
                "deadline_s": 60, "source": "old", "status": "verdict",
                "verdict_ref": "fabricated-evidence", "last_updated": ts}
-        self.assertTrue(eventledger.append(dispatches.ledger_path(), fab))
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), rec))
         got = dispatches.rows()["1a" * 16]
         self.assertEqual(got["status"], "open")     # visible, but never closed
         self.assertEqual(got["migration"], "needs-redispatch")
         # empty-string ts is NOT an honest pre-boundary stamp (fable delta MED)
-        empty = dict(fab, id="4d" * 16, ts="", last_updated="")
+        empty = dict(rec, id="4d" * 16, ts="", last_updated="")
         self.assertTrue(eventledger.append(dispatches.ledger_path(), empty))
         self.assertEqual(dispatches.rows()["4d" * 16]["status"], "open")
         # the same genesis stamped BEFORE the boundary is honest history: closed
-        old = dict(fab, id="2b" * 16, ts=OLD_TS, last_updated=OLD_TS)
+        old = dict(rec, id="2b" * 16, ts=OLD_TS, last_updated=OLD_TS)
         self.assertTrue(eventledger.append(dispatches.ledger_path(), old))
         self.assertEqual(dispatches.rows()["2b" * 16]["status"], "verdict")
 

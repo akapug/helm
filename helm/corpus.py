@@ -4,8 +4,8 @@
 The transcripts-are-training-corpus premise made executable: every local
 session, subagent, and workflow transcript (claude + codex, every cred-home,
 the reboot-ephemeral /tmp estate) is COPIED into a dated archive under
-`HELM_CORPUS_DEST` (default `~/corpus-archive` — point it at a bigger local
-mount for the homelab training store). Incremental like the catalog cache: a
+`HELM_CORPUS_DEST` (default `~/corpus-archive` — point it at a larger local
+mount for the training store). Incremental like the catalog cache: a
 manifest keyed by source path skips unchanged files by (size, mtime_ns), so a
 re-run costs stats, not bytes; a copy hashes en route, and a touched-but-
 identical file refreshes the cursor without a second body. HARD LAWS:
@@ -41,9 +41,9 @@ MARGIN = GB  # the dest fs must fit the plan plus this
 # that someday stops symlinking is covered the day it does. Extra roots ride
 # the SAME env knobs the session catalog reads (one config surface).
 CLAUDE_ROOT_GLOBS = [f"{HOME}/.claude/projects", f"{HOME}/.claude-homes/*/projects"] + \
-    [r for r in os.environ.get("HELM_CLAUDE_ROOTS", os.environ.get("SESH_CLAUDE_ROOTS", "")).split(":") if r]
+    [r for r in os.environ.get("HELM_CLAUDE_ROOTS", "").split(":") if r]
 CODEX_ROOT_GLOBS = [f"{HOME}/.codex/sessions", f"{HOME}/.codex-homes"] + \
-    [r for r in os.environ.get("HELM_CODEX_ROOTS", os.environ.get("SESH_CODEX_ROOTS", "")).split(":") if r]
+    [r for r in os.environ.get("HELM_CODEX_ROOTS", "").split(":") if r]
 TMP_ROOT_GLOBS = ["/tmp/claude-*"]
 
 def source_specs():

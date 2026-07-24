@@ -14,9 +14,8 @@ out. A mixed-era registry.json migrates its authored fields out ONCE, at load,
 losslessly. Sync law: additive and idempotent — a re-sync refreshes
 observations, never deletes a known project, never touches authored fields.
 
-Adoption law: where a project already has a knowledge home (mission-control's
-~/.mc/mission-control), ~/.helm/<name> becomes a SYMLINK to it — one chain,
-never a second copy.
+Adoption law: where a project already has an existing knowledge home,
+~/.helm/<name> becomes a SYMLINK to it — one chain, never a second copy.
 
 Also home of the PROJECTION REGISTRY (projections() + projection_survey()):
 constitution laws 2+3 as an executable manifest — every on-disk store helm
@@ -35,9 +34,8 @@ from . import automap, home, pk
 AUTHORED_FIELDS = ("edges", "notes", "aliases", "external", "retired")
 
 # Existing knowledge homes helm adopts by symlink instead of scaffolding.
-ADOPTED_HOMES = {
-    "mission-control": os.path.join(os.path.expanduser("~"), ".mc", "mission-control"),
-}
+# Populated by deployments that point a project at an external chain.
+ADOPTED_HOMES = {}
 
 
 def _authored_load():

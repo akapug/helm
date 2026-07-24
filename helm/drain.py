@@ -41,11 +41,11 @@ _FM_DEFAULTS = {"name": "", "description": "", "type": "", "load_class": "",
 TYPED_PREFIXES = ("prior-", "lex-", "heuristic-", "ref-", "reflex-")
 DRAIN_CONFIDENCE = 0.9  # human feedback is strong evidence, not certainty
 
-# Built-in alias map: bulk global entries name a project by a short/old handle
-# the registry knows under a different canonical name — the 60 unroutable
-# global entries. Per-project authored `aliases` (registry AUTHORED_FIELDS) are
-# folded in on top when present (registry.py is another lane's — we only READ).
-_BUILTIN_ALIASES = {"buildr": "buildr-private-beta", "mc": "mission-control"}
+# Built-in alias map: bulk global entries can name a project by a short/old
+# handle the registry knows under a different canonical name. Per-project
+# authored `aliases` (registry AUTHORED_FIELDS) are folded in on top when present
+# (registry.py is another lane's — we only READ). No built-in defaults ship.
+_BUILTIN_ALIASES = {}
 
 
 def _mem_dir():
@@ -86,7 +86,7 @@ def _alias_map(reg):
 def _route_target(base, blob, project_names, aliases):
     """The project an entry routes to, canonical names first (filename prefix or
     exact, then a specific >=6-char description word), aliases second — a short
-    alias like 'mc' matches by filename only (a 2-char word wallpapers)."""
+    alias matches by filename only (a 2-char word wallpapers)."""
     low = base.lower()
     for pn in project_names:
         if low.startswith(pn.lower() + "-") or low == pn.lower():

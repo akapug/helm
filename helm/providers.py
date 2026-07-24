@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""The credential/quota provider seam. ABSORBED from sesh
-(server/providers.py, behavior-preserving) per the dissolve-into-helm law;
-rebrand only — HELM_* env preferred with legacy SESH_* fallback, cache under
-~/.cache/helm/ (seeded once from the sesh cache when present).
+"""The credential/quota provider seam — HELM_* env, cache under ~/.cache/helm/.
 
 Everything helm knows about accounts, quota windows, burn history, allocation,
 and resume-command truth flows through ONE interface, so a host app (or a future
@@ -21,14 +18,14 @@ The contract (all methods return plain JSON-able data, never token contents):
     preflight(account, sid, agent)       -> {resolvable, live_holder_pid, reason, ...}
 
 Two implementations live here:
-  CliQuotaProvider    — shells a local quota CLI (tokaware) with --json verbs.
+  CliQuotaProvider    — shells a local quota CLI (quota) with --json verbs.
   NativeQuotaProvider — first-principles, stdlib-only: scans the credential homes
                         and probes the vendors' own usage endpoints directly.
                         This is the deprecation path for the external CLI.
 
-Selection (default_provider): HELM_PROVIDER=native (or legacy SESH_PROVIDER)
-forces native; anything else uses the CLI provider — unless the CLI binary is
-absent, in which case native is the automatic fallback.
+Selection (default_provider): HELM_PROVIDER=native forces native; anything else
+uses the CLI provider — unless the CLI binary is absent, in which case native is
+the automatic fallback.
 """
 import base64
 import calendar
@@ -53,11 +50,8 @@ class ProviderError(RuntimeError):
 
 
 def _env(name, default=None):
-    """HELM_<name> preferred; legacy SESH_<name> accepted as fallback (the
-    same env-transition law as helm/catalog.py)."""
+    """HELM_<name> lookup (the same env convention as helm/catalog.py)."""
     v = os.environ.get("HELM_" + name)
-    if v is None:
-        v = os.environ.get("SESH_" + name)
     return default if v is None else v
 
 
@@ -65,7 +59,7 @@ class CliQuotaProvider:
     """Backend = a local quota/allocation CLI with --json verbs (configurable binary)."""
 
     def __init__(self, binary=None):
-        self.binary = binary or _env("QUOTA_CLI", "tokaware")
+        self.binary = binary or _env("QUOTA_CLI", "quota")
 
     def _run(self, *args, timeout=45):
         try:
@@ -199,8 +193,7 @@ class NativeQuotaProvider:
                utilization; resets_at_ms is that gauge's reset. exhausted =
                any session/period gauge at >=100%.
     allocate   headroom ranking, optionally shaped by operator rules from
-               ~/.config/helm/allocation.json (legacy ~/.config/sesh/ honored;
-               env override HELM_ALLOCATION_RULES / SESH_ALLOCATION_RULES):
+               ~/.config/helm/allocation.json (env override HELM_ALLOCATION_RULES):
                {"models": {"<model-substring>": {"prefer": [...], "avoid": [...]}},
                 "drain_pin": {"enabled": true}}. No file -> pure headroom ranking.
     """
@@ -215,14 +208,6 @@ class NativeQuotaProvider:
     def __init__(self, history_path=None):
         self.history_path = history_path or os.path.expanduser(
             "~/.cache/helm/native-usage-history.jsonl")
-        if history_path is None and not os.path.exists(self.history_path):
-            legacy = os.path.expanduser("~/.cache/sesh/native-usage-history.jsonl")
-            if os.path.exists(legacy):  # one-time seed: sesh's observations carry over
-                try:
-                    os.makedirs(os.path.dirname(self.history_path), exist_ok=True)
-                    shutil.copyfile(legacy, self.history_path)
-                except OSError:
-                    pass
         self.claude_root = os.path.expanduser("~/.claude-homes")
         self.codex_root = os.path.expanduser("~/.codex-homes")
         self._lock = threading.Lock()
@@ -509,7 +494,7 @@ class NativeQuotaProvider:
             return []
         members = list(groups.values())
         # STAGGERED probes, 2 lanes max: tonight's 429s came from bursting all
-        # identities at the vendor simultaneously (two sesh lanes compounding it).
+        # identities at the vendor simultaneously (two lanes compounding it).
         # A ~0.7s stagger per submit keeps a full roster under any sane rate limit
         # while still overlapping network waits.
         results = [None] * len(members)
@@ -757,11 +742,9 @@ class NativeQuotaProvider:
     def _allocation_rules():
         """Operator allocation rules, optional. Missing file -> {} (pure headroom
         ranking, unchanged behavior); a present-but-broken file warns on stderr.
-        Path: env override, else ~/.config/helm/, else the legacy sesh file."""
+        Path: env override, else ~/.config/helm/allocation.json."""
         helm_p = os.path.expanduser("~/.config/helm/allocation.json")
-        path = _env("ALLOCATION_RULES") or (
-            helm_p if os.path.exists(helm_p)
-            else os.path.expanduser("~/.config/sesh/allocation.json"))
+        path = _env("ALLOCATION_RULES") or helm_p
         rules = _read_json(path)
         if rules is None and os.path.exists(path):
             print(f"helm: allocation rules unreadable, ignoring: {path}", file=sys.stderr)
@@ -896,11 +879,10 @@ class NativeQuotaProvider:
 def default_provider():
     """NATIVE is the default (deprecation flip 2026-07-12): helm reads the
     providers' own usage endpoints directly. A legacy quota CLI is opt-in via
-    HELM_PROVIDER=cli (+ optional HELM_QUOTA_CLI naming the binary); the
-    SESH_* spellings still work."""
+    HELM_PROVIDER=cli (+ optional HELM_QUOTA_CLI naming the binary)."""
     choice = (_env("PROVIDER") or "native").strip().lower()
     if choice == "cli":
-        binary = _env("QUOTA_CLI", "tokaware")
+        binary = _env("QUOTA_CLI", "quota")
         if shutil.which(binary):
             return CliQuotaProvider(binary)
         # opted into a CLI that isn't installed: fail toward working, loudly

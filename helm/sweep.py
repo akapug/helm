@@ -6,7 +6,7 @@ carries superseded premises fires stale knowledge into live turns, and salience
 is the scarce resource. The family tree already knows what died — a project
 `descends-from` / `supersedes` an ancestor — so sweep walks those lineage edges
 and proposes superseding the ancestor-era entries the store still holds by their
-successor-era twins (the sesh-era premise superseded by its helm successor).
+successor-era twins (an ancestor-era premise superseded by its successor).
 
 Never on weak signal. A proposal needs BOTH a directed lineage succession edge
 AND a same-slug (same base after stripping the era token) or high keyword-overlap
@@ -49,8 +49,8 @@ MIN_BASE = 4            # a same-slug base shorter than this is a bare type-pref
 
 def _tokens(name):
     """The era tokens for a project name: its full slug plus each distinctive
-    hyphen segment (>= 4 chars, non-generic) — so `buildr-private-beta` tags
-    both `lex-buildr--*` (via `buildr`) and its own full slug."""
+    hyphen segment (>= 4 chars, non-generic) — so `project-a-private-beta` tags
+    both `lex-project-a--*` (via `project-a`) and its own full slug."""
     s = pk.slug(name)
     toks = {s}
     for seg in s.split("-"):
@@ -61,13 +61,13 @@ def _tokens(name):
 
 def _has_token(slug, token):
     """token present as a whole word in slug (bounded by non-alphanumeric) —
-    `helm` matches `helm-x` and `sesh_x`, never `helmet` or `rebuildr`."""
+    `helm` matches `helm-x` and `old_x`, never `helmet` or `rebuilt`."""
     return re.search(r"(?<![a-z0-9])" + re.escape(token) + r"(?![a-z0-9])", slug) is not None
 
 
 def _base(slug, tokens):
     """slug with every era token stripped and separators collapsed — the
-    era-independent identity two twins share (`sesh-rollover` / `helm-rollover`
+    era-independent identity two twins share (`old-rollover` / `helm-rollover`
     -> `rollover`). Longest token first so a full slug is removed before a
     segment it contains."""
     b = slug

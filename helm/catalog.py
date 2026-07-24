@@ -10,13 +10,6 @@ import json, os, glob, re, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
 CACHE_DIR = os.path.join(HOME, ".cache", "helm")
-_LEGACY_CACHE_DIR = os.path.join(HOME, ".cache", "sesh")
-if os.path.isdir(_LEGACY_CACHE_DIR) and not os.path.isdir(CACHE_DIR):
-    try:
-        import shutil
-        shutil.copytree(_LEGACY_CACHE_DIR, CACHE_DIR)  # one-time seed from the legacy cache
-    except OSError:
-        pass
 CACHE = os.path.join(CACHE_DIR, "catalog-cache.json")
 
 # extra transcript roots (colon-separated) via env — machine-local paths never live in code
@@ -24,9 +17,9 @@ CACHE = os.path.join(CACHE_DIR, "catalog-cache.json")
 # ~/.claude/projects (inode dedup folds it) but a REAL per-account store must
 # still count — the roster gc trusts this catalog as its transcript truth.
 CLAUDE_ROOTS = [f"{HOME}/.claude/projects", f"{HOME}/.claude-homes/*/projects"] + \
-    [r for r in os.environ.get("HELM_CLAUDE_ROOTS", os.environ.get("SESH_CLAUDE_ROOTS", "")).split(":") if r]
+    [r for r in os.environ.get("HELM_CLAUDE_ROOTS", "").split(":") if r]
 CODEX_ROOTS = [f"{HOME}/.codex/sessions", f"{HOME}/.codex-homes"] + \
-    [r for r in os.environ.get("HELM_CODEX_ROOTS", os.environ.get("SESH_CODEX_ROOTS", "")).split(":") if r]
+    [r for r in os.environ.get("HELM_CODEX_ROOTS", "").split(":") if r]
 
 
 def _files():
@@ -292,7 +285,7 @@ def _build_from_cv():
     scanner retire). Returns (rows, stats) or None if cv can't answer (→ scanner
     fallback). The one remaining gap vs the scanner is git branch, which cv doesn't
     emit yet (emberian/cv#15) — non-load-bearing, blank until it lands."""
-    if (os.environ.get("HELM_CATALOG") or os.environ.get("SESH_CATALOG")) == "scanner":
+    if os.environ.get("HELM_CATALOG") == "scanner":
         return None
     import subprocess
     try:

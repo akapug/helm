@@ -14,11 +14,8 @@ mistake. That means: a typed store entry, symptom-vocabulary keywords, and a
 resolve-test proving it fires. A lesson in prose, a chat message, or a memory
 file is not captured — it is parked.
 
-**This routes to HELM's store** (`helm store`), never to Mission Control
-artifacts. MC is a different project with its own physics; helm owns its own.
-If you find yourself editing `mission-control/…` or reaching for `mc …` verbs
-from a helm seat, STOP — that is the cross-project bleed this skill was
-rewritten to end (2026-07-22, the codex-orch scope-leak incident).
+**This routes to helm's typed store** (`helm store`) — a lesson in prose, a
+chat message, or a memory file is parked, not captured.
 
 ## The capture
 

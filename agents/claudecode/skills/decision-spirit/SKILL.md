@@ -161,8 +161,8 @@ while continuing with the best reversible probe path.
     evolution (confederalism for architecture: local coherence + federated coherence).
     Trace ownership to the REAL owner, not one consumer's local note - a consumer's wire-in
     TIMING is not the primitive's availability or ownership. Bug class:
-    `seam-read-from-one-side`. Live: "OpenSession is polyana-Gate-B-gated" read polyana's
-    consumption-timing (its CONSUMERS-column schedule) as the primitive's gate - but the
+    `seam-read-from-one-side`. Live: "a shared session primitive is Gate-B-gated" read one
+    project's consumption-timing (its consumers-column schedule) as the primitive's gate - but the
     spec belonged to one project, the adapter to another, and the resolution line bound
     only the adapter. Sharpens #15 (trace to owner) + #18 (premise before proposal).
     **GUARD/WATCHDOG corollary (owner canon 2026-07-08: "this is always the case"):** for

@@ -250,7 +250,7 @@ class KeepaliveTest(unittest.TestCase):
     # -- cmd leg: second-instance refusal + sweep smoke ---------------------
     def test_cmd_keepalive_refuses_beside_live_keepalive(self):
         keepalive._predecessor_pids = lambda: [
-            ("999", "python3 /home/x/sesh/server/keepalive.py --sweep")]
+            ("999", "python3 /home/x/helm/server/keepalive.py --sweep")]
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             rc = keepalive.cmd_keepalive(["--apply"])

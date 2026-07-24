@@ -14,7 +14,7 @@ from .. import pk
 
 _slug = pk.slug
 
-# Confidence machinery (ported from mc priors.py — same constants, same laws).
+# Confidence machinery (the priors confidence law — constants + laws).
 CERTAIN = 1.0            # confidence == CERTAIN -> class certain (a premise)
 DORMANT_BELOW = 0.4      # confidence < this -> load_class dormant (never injects)
 ACT_AT = 0.85            # confidence >= this -> auto-act tier
@@ -49,24 +49,24 @@ STATUS_PROVISIONAL = "provisional"
 INJECTABLE_STATUSES = (STATUS_LIVE, STATUS_PROVISIONAL)
 
 # PINNED priors inject EVERY turn (load_class always). Pin = a `pin: true`
-# flag OR membership here (belt-and-suspenders, same tuple as mc so the live
+# flag OR membership here (belt-and-suspenders, the canonical tuple so the live
 # store's pins survive the adoption).
 PINNED_SLUGS = ("human-is-context-free", "build-the-full-depgraph", "drift-is-the-enemy")
 
 LEGACY_PREFIX = "prem-"
 PRIOR_PREFIX = "prior-"
 
-# SPECIFICITY guard (anti-wallpaper, ported from mc priors.py): a JIT entry
+# SPECIFICITY guard (anti-wallpaper, the priors specificity law): a JIT entry
 # must match the turn via at least one SPECIFIC (non-generic) keyword or its
 # id — a generic-only match would wallpaper nearly every turn.
 GENERIC_KEYWORDS = frozenset({
     "build", "code", "fix", "test", "work", "task", "run", "make", "do", "the", "a", "an",
-    "is", "it", "this", "that", "agent", "buildr", "change", "file", "add", "use", "new",
+    "is", "it", "this", "that", "agent", "change", "file", "add", "use", "new",
     "now", "get", "set", "go", "and", "or", "to", "of", "in", "on", "for", "with",
 })
-# Heuristics carry the mc heuristics_store extras on top of the shared set.
+# Heuristics carry the heuristics-store extras on top of the shared set.
 _HEURISTIC_GENERIC = GENERIC_KEYWORDS | {"move", "apply", "domain", "heuristic", "strategy"}
-_MIN_HEURISTIC_TOKEN = 3  # mc heuristics_store._MIN_TOKEN
+_MIN_HEURISTIC_TOKEN = 3  # the heuristics-store minimum token length
 
 # Where each type's NEW writes land inside a helm root (the adopted root stays
 # flat and is only ever an explicit target).
@@ -87,7 +87,7 @@ _JIT_TYPES = ("prior", "heuristic", "lexicon", "reference", "capability")
 
 
 # ---------------------------------------------------------------------------
-# derivation (class + load_class are DERIVED, never authored — mc priors law)
+# derivation (class + load_class are DERIVED, never authored — the priors law)
 # ---------------------------------------------------------------------------
 
 def _coerce_conf(raw):

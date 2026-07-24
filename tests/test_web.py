@@ -22,7 +22,7 @@ PROJECTS = {
         "last_seen": 1900000000.0, "active_days": 4,
         "sessions": {"claude": 5, "codex": 2}, "harness_refs": {"claude": ["-fake-dev-alpha"]},
         "cwds": ["/fake/dev/alpha", "/fake/dev/alpha/worktrees/x"],
-        "edges": [{"rel": "forked-from", "to": "mission-control", "note": "", "confirmed": True}],
+        "edges": [{"rel": "forked-from", "to": "project-b", "note": "", "confirmed": True}],
     },
     "beta": {
         "name": "beta", "path": "/fake/dev/beta", "kind": "dir", "status": "dormant",
@@ -122,7 +122,7 @@ class TestWeb(unittest.TestCase):
         self.assertEqual(set(reg["projects"]), {"alpha", "beta"})
         alpha = reg["projects"]["alpha"]
         self.assertEqual(alpha["sessions"], {"claude": 5, "codex": 2})
-        self.assertEqual(alpha["edges"][0]["to"], "mission-control")
+        self.assertEqual(alpha["edges"][0]["to"], "project-b")
 
     def test_store_degrades_or_summarizes(self):
         status, _, body = self.get("/api/store")

@@ -1440,7 +1440,7 @@ class CompareBackendTest(InjectBase):
 
 class CouncilReachTest(InjectBase):
     """The council reach rung (premise council-is-the-number-one-feature +
-    feature-and-rsh-must-both-be-wired): the recorded buildr failure was
+    feature-and-rsh-must-both-be-wired): the recorded failure was
     SALIENCE — the meld verb existed and agents never reached for it. >= 3
     ping-pong rounds with ONE peer in the home room -> one latched nudge
     naming the exact council invite command; a new streak re-arms."""

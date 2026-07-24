@@ -4,8 +4,8 @@
 <title>helm</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='25' x='16' text-anchor='middle' font-size='26' fill='%237eb8a2'%3E⎈%3C/text%3E%3C/svg%3E">
 <style>
-/* palette: the sesh/builders.dev warm token family — helm is dark-first, light derived in-family.
-   data-theme overrides (after the media query, so the toggle wins both ways) ported from sesh. */
+/* palette: the builders.dev warm token family — helm is dark-first, light derived in-family.
+   data-theme overrides (after the media query, so the toggle wins both ways). */
 :root{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--hl:#2a231a;--ok:#7ecb8b;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
 @media (prefers-color-scheme:light){:root{--bg:#faf7f2;--fg:#1c1813;--mut:#7a7167;--sub:#a39a8e;--line:#e8e2d8;--line2:#ded6c9;--card:#fff;--elev:#fdfbf7;--hover:#f4efe7;--accent:#3e8a6e;--accent-soft:rgba(62,138,110,.12);--claude:#c9772e;--codex:#3f7fae;--opencode:#7a5fc0;--code:#f1ece3;--codefg:#5a4a34;--hl:#efe7d8;--ok:#2f9e57;--warn:#a87a1d;--bad:#c24339;--ext:#3f7fae;--shadow:0 1px 3px rgba(28,24,19,.07),0 4px 14px rgba(28,24,19,.05)}}
 :root[data-theme=dark]{--bg:#14110d;--fg:#e8e4df;--mut:#8a8680;--sub:#6a6560;--line:#2a251f;--line2:#3a3530;--card:#1a1612;--elev:#211c16;--hover:#1f1a15;--accent:#7eb8a2;--accent-soft:rgba(126,184,162,.15);--claude:#e0a561;--codex:#4ea8de;--opencode:#b39ddb;--code:#211c16;--codefg:#cbb98f;--hl:#2a231a;--ok:#7ecb8b;--warn:#e8c96a;--bad:#e8594f;--ext:#4ea8de;--shadow:0 1px 3px rgba(0,0,0,.3),0 6px 18px rgba(0,0,0,.22)}
@@ -187,7 +187,7 @@ header{padding:18px 0 4px}
 footer{margin:26px 0 46px;font-size:var(--f1);color:var(--sub);display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 footer .fmark{color:color-mix(in srgb,var(--accent) 70%,var(--sub))}
 
-/* ================= quota view (CSS ported from sesh, on helm's variables) ================= */
+/* ================= quota view (CSS on helm's variables) ================= */
 /* ---------- attention row ----------
    Uniform pills: same height, same weight, one border. Colour is a single
    signal dot on the left, not a full-pill wash — so the row reads as one
@@ -293,7 +293,7 @@ table.accts tbody tr:hover td{background:color-mix(in srgb,var(--hl) 55%,transpa
 .homehdr{padding:8px 16px;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line)}
 .dupwarn{color:var(--bad);font-size:var(--f1);margin:6px 0}
 
-/* ================= sessions view (CSS ported from sesh, on helm's variables) ================= */
+/* ================= sessions view (CSS on helm's variables) ================= */
 #sesscontrols{position:sticky;top:48px;z-index:15;background:color-mix(in srgb,var(--bg) 94%,transparent);backdrop-filter:blur(8px);padding:12px 0 10px;border-bottom:1px solid var(--line)}
 #sesscontrols .row1{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 #view-sessions input[type=search]{flex:1 1 300px;min-width:200px;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:10px 14px;font-size:var(--f3)}
@@ -370,7 +370,7 @@ mark{background:var(--accent);color:var(--bg);border-radius:2px;padding:0 1px}
 #cwdedit.show{display:flex}
 #cwdedit input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:var(--r-sm);padding:6px 10px;font:var(--f1) var(--mono)}
 
-/* ================= configs view (CSS ported from sesh, on helm's variables) ================= */
+/* ================= configs view (CSS on helm's variables) ================= */
 #cfgbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0 12px}
 #cfgFilter{flex:1;min-width:200px;padding:7px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:var(--f2)}
 #cfgFilter:focus{border-color:var(--accent);outline:none}
@@ -960,7 +960,7 @@ function toast(m, ms) {
   h._t = setTimeout(() => h.classList.remove("show"), ms || 2600);
 }
 
-/* ---------- nav (sesh navtab pattern; helm is the default view) ---------- */
+/* ---------- nav (navtab pattern; helm is the default view) ---------- */
 const VIEWS = ["helm", "quota", "sessions", "configs", "chat", "roster", "cave", "ledger"];
 function showView(v) {
   $$(".navtab").forEach(t => t.classList.toggle("on", t.dataset.v === v));
@@ -1227,7 +1227,7 @@ async function load() {
 }
 load();
 
-/* ================= quota view (ported from sesh ui.html, behavior-preserving) =================
+/* ================= quota view =================
    Slice B closed slice A's named seams: chart day-bars jump to the sessions view
    filtered to that day, burn session chips open the transcript drawer, and the
    account row-select feeds the sessions view's resume-as strip + team tray.
@@ -1782,10 +1782,10 @@ $("#hCreate").onclick = async () => {
 };
 $("#homescard").addEventListener("toggle", () => { if ($("#homescard").open) loadHomes(); });
 
-/* ================= sessions view (ported from sesh ui.html, behavior-preserving) =================
-   Renames vs sesh (collision-avoidance with the helm view, behavior identical):
+/* ================= sessions view =================
+   Local renames (collision-avoidance with the helm view):
    #q -> #sq, #count -> #sesscount, render() -> renderSessions(); mutations carry
-   the per-process bearer TOKEN via post() (sesh's apiFetch, slice-C hardening). */
+   the per-process bearer TOKEN via post() (the apiFetch gate, slice-C hardening). */
 let DATA = [], CONTENT = null, SYN_ON = false, TEAM = [];
 const state = {q: "", h: new Set(["claude", "codex"]), view: "recent", recent: true};
 const cut = new Date(Date.now() - 45 * 864e5).toISOString().slice(0, 10);
@@ -1867,7 +1867,7 @@ function contentGroup() {
   const scoped = (CONTENT.source || "").startsWith("scoped");
   const more = !scoped && capped && (CONTENT.limit || 40) < 400 ? ` <button class="chip" style="padding:2px 10px;font-size:.76rem" onclick="runContent(${(CONTENT.limit || 40) * 4})">show more</button>` : "";
   const hid = CONTENT.hidden ? ` · <span class="flagchip">${CONTENT.hidden} reference transcript${CONTENT.hidden > 1 ? "s" : ""} hidden</span> (training data — “refs” toggle to include)` : "";
-  const drowned = !scoped && n <= 1 && CONTENT.hidden >= 50 ? `<br><span class="flagchip">⚠ the real sessions are buried under reference transcripts — type a project into the <b>scope</b> box (e.g. “goodtimes”) to grep real sessions directly</span>` : "";
+  const drowned = !scoped && n <= 1 && CONTENT.hidden >= 50 ? `<br><span class="flagchip">⚠ the real sessions are buried under reference transcripts — type a project into the <b>scope</b> box (e.g. “my-app”) to grep real sessions directly</span>` : "";
   const where = scoped ? ` in <b>${esc(CONTENT.scope)}</b>` : "";
   d.innerHTML = `<div class="deephdr"><b>${scoped ? n : (capped ? "top " + n : n)}</b> ${scoped ? "real session" : "work"} match${n === 1 ? "" : "es"}${where}${capped && !scoped ? " (more exist)" : ""} for “${esc(CONTENT.q)}” — click a snippet to read it${hid}${more}${drowned}</div><div class="rows"></div>`;
   d.querySelector(".rows").innerHTML = CONTENT.hits.map(h => {
@@ -1920,7 +1920,7 @@ function renderSessions() {
       const scoped = $("#scope").value.trim();
       host.innerHTML = `<div class="empty">no title/cwd match for “${esc(state.q.trim())}”.<br>`
         + (scoped ? `searching inside <b>${esc(scoped)}</b>'s real sessions…`
-          : `<b>Fastest:</b> type a project in the <b>scope</b> box (e.g. “goodtimes”) → instant search of its real sessions.<br><b>Or</b> press <b>Enter</b> to scan every transcript (~10-30s; mostly reference summarizers).`)
+          : `<b>Fastest:</b> type a project in the <b>scope</b> box (e.g. “my-app”) → instant search of its real sessions.<br><b>Or</b> press <b>Enter</b> to scan every transcript (~10-30s; mostly reference summarizers).`)
         + `</div>`;
     }
     return;
@@ -2264,12 +2264,12 @@ $$("#view-sessions .chip.h").forEach(ch => ch.onclick = () => {
 { const vm = localStorage.getItem("helm.viewmode"); if (vm) { state.view = vm; $("#viewmode").value = vm; } }
 renderPresets(); trayCount();
 
-/* ================= configs view (ported from sesh ui.html, behavior-preserving) =================
+/* ================= configs view =================
    The cwd tree + homes (top of the cascade) on the left; the detail pane on the
    right: files at the selection, the resolved cascade (what a seat here loads),
    the safety-first editor (backup → validate → atomic via POST /api/configs/file),
    MCP entry quick-ops, backups + one-click restore. Mutations ride post() (bearer
-   TOKEN). helm addition beyond sesh: a physics-diff panel on home selection. */
+   TOKEN). A physics-diff panel renders on home selection. */
 const CFG = {tree: null, homes: null, harness: "claude", home: null, ch: "all", loaded: false, openDirs: new Set(), sel: null};
 const cfgPost = (url, body) => post(url, body).catch(e => ({error: String(e.message || e)}));
 /* ---------- store review: candidate + provisional owner queue ----------
@@ -2620,7 +2620,7 @@ const chatAgo = s => !s && s !== 0 ? "" : s < 60 ? Math.max(0, Math.round(s)) + 
 const chatIso = t => { const e = Date.parse(t || ""); return isNaN(e) ? null : (Date.now() - e) / 1e3; };
 const chatSnip = s => { const one = String(s || "").replace(/\s+/g, " ").trim();
   return one.length > 90 ? one.slice(0, 89) + "…" : one; };
-// keep the DISTINGUISHING tail: 'goodtimes-platform-codex' truncated from the
+// keep the DISTINGUISHING tail: 'example-platform-codex' truncated from the
 // left still says '…platform-codex'; the full name rides the title tooltip
 const chatShort = s => String(s || "").length <= 15 ? String(s || "") : "…" + String(s).slice(-14);
 

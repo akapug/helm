@@ -105,12 +105,12 @@ class FleetRowsTest(unittest.TestCase):
         envs = {10: {"HELM_CHAT_NAME": "a-seat",
                      "CLAUDE_CODE_CHILD_SESSION": "1",
                      "CLAUDE_CODE_SESSION_ID": "x",
-                     "HELM_SKILL_DECK": "/home/u/dev/mission-control/skills"}}
+                     "HELM_SKILL_DECK": "/home/u/dev/helm/skills"}}
         census = [srow(10, SID_A, "declared", root="/h/.claude")]
         rows, daemons = self._rows(envs, census, {99: "111"})
         r = rows[0]
         self.assertEqual((r["seat"], r["stamps"], r["deck"], r["daemon"]),
-                         ("a-seat", 2, "MC", 99))
+                         ("a-seat", 2, "helm", 99))
         self.assertEqual((r["sid"], r["sid_src"]), (SID_A, "record"))
         self.assertFalse(r["unknown"])
         self.assertEqual(daemons, [99])

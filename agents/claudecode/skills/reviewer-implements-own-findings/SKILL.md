@@ -7,7 +7,7 @@ description: >
   broad, subtle, or high-stakes changes.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
@@ -49,12 +49,11 @@ Verification: <commands/checks>
 Report: files + tests + residual risk.
 ```
 
-## MC Record Shape
+## Record Shape
 
 ```bash
-mc comms send --from pane:<reviewer> --to pane:<owner> --conv <lane> \
-  --priority action-required \
-  --payload '<finding, patch status, verification, commit sha or blocker>'
+helm chat post --room <lane> \
+  "@<owner> finding, patch status, verification, commit sha or blocker"
 ```
 
 If the reviewer commits, the final record must include the sha and verification.

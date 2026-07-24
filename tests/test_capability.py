@@ -3,16 +3,18 @@
 
 THE test that matters (owner's words): an agent reasoning about a2a/whisper/
 converge gets 'you have helm chat deliver / meld, live' AT THE MOMENT, and a
-deep-code-analysis prompt gets polyana (WHEN WIRED) — the same salience gate +
+'solved this before?' prompt gets recall (WHEN WIRED) — the same salience gate +
 per-turn budget + cooldown as store entries, never a parallel injector. Also
 pins: generic-only never fires (salience law), a powerpack surfaces ONLY when
-wired (probe/flag), private-hold (polyana) surfaces to its OWN wired agent but
-is WITHHELD from the public set, and the `helm capabilities` browse verb.
+wired (probe/flag), the private-hold VISIBILITY mechanism (a held powerpack
+surfaces to its OWN wired agent but is WITHHELD from the public set — exercised
+here with a neutral synthetic fixture, since no held powerpack ships), and the
+`helm capabilities` browse verb.
 
 Hermetic: HELM_HOME / HELM_ADOPTED_DIR / HELM_CACHE_DIR are tmp; the HELM_CAP_*
 flags are pinned per-test so no assertion depends on this machine's real MCP
-wiring (a dev box that actually has cv/polyana would otherwise poison the
-'absent' cases)."""
+wiring (a dev box that actually has cv would otherwise poison the 'absent'
+cases)."""
 import contextlib
 import io
 import os
@@ -20,6 +22,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -31,7 +34,24 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
             "HELM_CACHE_DIR", "MELD_CACHE_DIR",
             "HELM_CF_ENDPOINT", "MELD_CF_ENDPOINT", "HELM_CF_TOKEN", "MELD_CF_TOKEN",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME",
-            "HELM_CAP_RECALL", "HELM_CAP_POLYANA")
+            "HELM_CAP_RECALL", "HELM_CAP_EXAMPLE_HOLD")
+
+
+# A neutral private-hold powerpack fixture — no held powerpack ships in the
+# public catalog, so the VISIBILITY mechanism (public_set withhold, [hold]
+# render) is exercised against this synthetic row monkeypatched into the catalog.
+def _hold_cap():
+    return {
+        "id": "example-hold",
+        "verb": "example-hold analyze",
+        "tool": "mcp__example_hold__probe",
+        "what": "a neutral private-hold powerpack fixture",
+        "wired_via": "the example-hold MCP server",
+        "keywords": "zzq-hold-fixture-trigger,example-hold analyze fixture",
+        "tier": capability.TIER_POWERPACK,
+        "visibility": capability.VIS_HOLD,
+        "mcp": "example-hold",
+    }
 
 
 class CapBase(unittest.TestCase):
@@ -44,10 +64,10 @@ class CapBase(unittest.TestCase):
         os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
         os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
         os.makedirs(os.environ["HELM_ADOPTED_DIR"])
-        # powerpacks default OFF so a dev box with real cv/polyana never leaks in;
+        # powerpacks default OFF so a dev box with real cv never leaks in;
         # each test that wants one wired sets its flag explicitly.
         os.environ["HELM_CAP_RECALL"] = "0"
-        os.environ["HELM_CAP_POLYANA"] = "0"
+        os.environ["HELM_CAP_EXAMPLE_HOLD"] = "0"
 
     def tearDown(self):
         for k, v in self.env_prior.items():
@@ -140,36 +160,29 @@ class SurfacingTest(CapBase):
         ids = self.jit_ids("have we solved this before somewhere?")
         self.assertIn("recall", ids)
 
-    def test_deep_code_analysis_surfaces_polyana_when_wired(self):
-        os.environ["HELM_CAP_POLYANA"] = "1"
-        ids = self.jit_ids("do a deep cross-language code analysis of this module")
-        self.assertIn("polyana", ids)
-
-    def test_a2a_prompt_does_not_surface_polyana_or_recall(self):
-        # salience is DISJOINT: the converge moment must not drag in code-analysis
-        # or cold-recall levers.
-        os.environ["HELM_CAP_POLYANA"] = "1"
+    def test_a2a_prompt_does_not_surface_recall(self):
+        # salience is DISJOINT: the converge moment must not drag in the
+        # cold-recall lever.
         os.environ["HELM_CAP_RECALL"] = "1"
         ids = self.jit_ids("let's a2a converge with another seat on this")
-        self.assertNotIn("polyana", ids)
         self.assertNotIn("recall", ids)
 
 
 class PowerpackWiredGateTest(CapBase):
     def test_powerpack_absent_does_not_surface_even_on_trigger(self):
-        # polyana OFF (setUp default): its trigger prompt fires NOTHING.
-        ids = self.jit_ids("do a deep cross-language code analysis of this module")
-        self.assertNotIn("polyana", ids)
+        # recall OFF (setUp default): its trigger prompt fires NOTHING.
+        ids = self.jit_ids("have we solved this before somewhere?")
+        self.assertNotIn("recall", ids)
 
     def test_flag_true_wires_powerpack(self):
-        os.environ["HELM_CAP_POLYANA"] = "1"
+        os.environ["HELM_CAP_RECALL"] = "1"
         live = {e["id"] for e in capability.live_entries()}
-        self.assertIn("polyana", live)
+        self.assertIn("recall", live)
 
     def test_flag_false_holds_powerpack_dark(self):
-        os.environ["HELM_CAP_POLYANA"] = "0"
+        os.environ["HELM_CAP_RECALL"] = "0"
         live = {e["id"] for e in capability.live_entries()}
-        self.assertNotIn("polyana", live)
+        self.assertNotIn("recall", live)
 
     def test_core_capabilities_always_live(self):
         # core needs no flag/probe — helm's own substrate is always wired.
@@ -181,10 +194,9 @@ class PowerpackWiredGateTest(CapBase):
 class SalienceLawTest(CapBase):
     def test_generic_only_prompt_fires_no_capability(self):
         # a bland build/run/fix prompt touches no capability trigger -> silent.
-        os.environ["HELM_CAP_POLYANA"] = "1"
         os.environ["HELM_CAP_RECALL"] = "1"
         ids = self.jit_ids("build and run the code then fix the test")
-        for cid in ("meld", "chat-deliver", "recall", "polyana", "council",
+        for cid in ("meld", "chat-deliver", "recall", "council",
                     "dispatch", "work-claims", "store"):
             self.assertNotIn(cid, ids)
 
@@ -195,11 +207,10 @@ class SalienceLawTest(CapBase):
 class BudgetAndCooldownTest(CapBase):
     def test_capabilities_obey_jit_cap(self):
         # capabilities ride the SAME cap-4 lane — never an unbounded wallpaper.
-        os.environ["HELM_CAP_POLYANA"] = "1"
         os.environ["HELM_CAP_RECALL"] = "1"
         # a prompt that brushes many triggers at once
         lines = self.jit("meld converge a2a whisper dispatch delegate claim a lane "
-                         "recall prior art deep code analysis panel of models")
+                         "recall prior art panel of models")
         self.assertLessEqual(len(lines), inject.JIT_CAP)
 
     def test_capability_cools_after_firing(self):
@@ -213,21 +224,32 @@ class BudgetAndCooldownTest(CapBase):
 
 
 class VisibilityHoldTest(CapBase):
-    def test_polyana_is_private_hold(self):
-        row = next(c for c in capability.CAPABILITIES if c["id"] == "polyana")
+    """The private-hold VISIBILITY mechanism, exercised against a neutral
+    synthetic powerpack (no held powerpack ships in the public catalog)."""
+
+    def _patched(self):
+        return mock.patch.object(
+            capability, "CAPABILITIES", capability.CAPABILITIES + (_hold_cap(),))
+
+    def test_synthetic_powerpack_is_private_hold(self):
+        with self._patched():
+            row = next(c for c in capability.CAPABILITIES if c["id"] == "example-hold")
         self.assertEqual(row["visibility"], capability.VIS_HOLD)
 
-    def test_public_set_withholds_polyana(self):
-        os.environ["HELM_CAP_POLYANA"] = "1"  # wired, yet still withheld from public
-        pub = {c["id"] for c in capability.public_set()}
-        self.assertNotIn("polyana", pub)
+    def test_public_set_withholds_private_hold(self):
+        os.environ["HELM_CAP_EXAMPLE_HOLD"] = "1"  # wired, yet withheld from public
+        with self._patched():
+            pub = {c["id"] for c in capability.public_set()}
+        self.assertNotIn("example-hold", pub)
         self.assertIn("meld", pub)
 
     def test_private_hold_still_surfaces_to_own_wired_agent(self):
-        # the hold bars the PUBLIC export, NOT the local reasoning moment.
-        os.environ["HELM_CAP_POLYANA"] = "1"
-        ids = self.jit_ids("do a deep cross-language code analysis of this module")
-        self.assertIn("polyana", ids)
+        # the hold bars the PUBLIC export, NOT the local wiring: visibility is
+        # not a gate in live_entries.
+        os.environ["HELM_CAP_EXAMPLE_HOLD"] = "1"
+        with self._patched():
+            live = {e["id"] for e in capability.live_entries()}
+        self.assertIn("example-hold", live)
 
 
 class BrowseVerbTest(CapBase):
@@ -237,28 +259,34 @@ class BrowseVerbTest(CapBase):
             rc = capability.cmd_capabilities(list(args))
         return rc, out.getvalue(), err.getvalue()
 
+    def _hold_patch(self):
+        return mock.patch.object(
+            capability, "CAPABILITIES", capability.CAPABILITIES + (_hold_cap(),))
+
     def test_full_index_groups_core_and_powerpack(self):
-        os.environ["HELM_CAP_POLYANA"] = "1"
-        rc, out, _ = self._run([])
+        os.environ["HELM_CAP_EXAMPLE_HOLD"] = "1"
+        with self._hold_patch():
+            rc, out, _ = self._run([])
         self.assertEqual(rc, 0)
         self.assertIn("CORE", out)
         self.assertIn("POWERPACK", out)
         self.assertIn("helm chat deliver", out)
         self.assertIn("wired via", out)
-        self.assertIn("[hold: private]", out)   # polyana tagged
+        self.assertIn("[hold: private]", out)   # the held fixture tagged
         self.assertIn("●", out)                 # a live dot present
 
     def test_absent_powerpack_shows_open_dot(self):
-        rc, out, _ = self._run([])  # polyana OFF (setUp)
+        rc, out, _ = self._run([])  # recall OFF (setUp)
         self.assertEqual(rc, 0)
         self.assertIn("○", out)     # an absent dot present
         self.assertIn("absent", out)
 
-    def test_public_flag_withholds_polyana(self):
-        os.environ["HELM_CAP_POLYANA"] = "1"
-        rc, out, _ = self._run(["--public"])
+    def test_public_flag_withholds_private_hold(self):
+        os.environ["HELM_CAP_EXAMPLE_HOLD"] = "1"
+        with self._hold_patch():
+            rc, out, _ = self._run(["--public"])
         self.assertEqual(rc, 0)
-        self.assertNotIn("polyana", out)
+        self.assertNotIn("example-hold", out)
         self.assertIn("helm chat meld", out)
 
     def test_json_shape(self):
@@ -267,7 +295,7 @@ class BrowseVerbTest(CapBase):
         self.assertEqual(rc, 0)
         rows = json.loads(out)
         ids = {r["id"] for r in rows}
-        self.assertIn("polyana", ids)
+        self.assertIn("recall", ids)
         for r in rows:
             self.assertIn("live", r)
             self.assertIn("wired_via", r)

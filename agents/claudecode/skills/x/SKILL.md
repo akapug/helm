@@ -1,11 +1,11 @@
 ---
 name: x
-description: Cross-family analysis — bring a DIFFERENT model family's eyes to any quality-critical junction. THE mc primitive — quality via model diversity, designed around budget not blocked by it. Use on /x, xrev, xdiag, xprop, or xverify, or at any junction where the best possible analysis matters — before landing code (review), on a live stall (diagnose), on a design or proposal (refute), or on a load-bearing claim (verify). Also the resident reflex behind heuristic 14 (cross-family refutation, not same-family refinement).
+description: Cross-family analysis — bring a DIFFERENT model family's eyes to any quality-critical junction. THE helm primitive — quality via model diversity, designed around budget not blocked by it. Use on /x, xrev, xdiag, xprop, or xverify, or at any junction where the best possible analysis matters — before landing code (review), on a live stall (diagnose), on a design or proposal (refute), or on a load-bearing claim (verify). Also the resident reflex behind heuristic 14 (cross-family refutation, not same-family refinement).
 ---
 
 # /x — cross-family analysis (the diversity primitive)
 
-> **The primitive mc optimizes for: highest-quality output via MODEL DIVERSITY at
+> **The primitive helm optimizes for: highest-quality output via MODEL DIVERSITY at
 > every quality-critical junction.** A second pair of eyes from a *different* model
 > family catches what a same-family refinement cannot — different training, different
 > blind spots, genuine refutation instead of agreeable echo. This is not a luxury step;
@@ -47,7 +47,7 @@ premise (cheapest-probe-before-fire) before you refute or build on it.
 
 ## How to run it (mechanics — reuse, don't reinvent)
 
-1. **Resolve the sibling by ROLE, with a receipt** — `mc comms resolve <label>` (roster truth)
+1. **Resolve the sibling by ROLE, with a receipt** — `helm chat roster` / role lookup (roster truth)
    (e.g. `team`, `driver`). Receipt-by-construction: exit 0 + `{pane_id, label, workspace_id,
    matched_by, role, agent}`, or `not_found`/`ambiguous` — so a mis-target is impossible to
    miss. NEVER cache a pane id.
@@ -76,7 +76,7 @@ premise (cheapest-probe-before-fire) before you refute or build on it.
      So Fable↔Fable review/refutation is VALID xfam — never reject it as same-family (the prior
      fable-vs-opus = xfam ruling, seq509, stands subsumed). Record verdicts honestly as
      `basins=author:fable vs eyes:fable (super-sota exemption)` so the data stays auditable.
-3. **Dispatch the framed ask** via an action-required MC message (auto-wakes the recipient): a terse,
+3. **Dispatch the framed ask** via an action-required chat message (auto-wakes the recipient): a terse,
    evidence-bearing payload stating the move (rev/diag/prop/verify), the artifact
    (commit / file / claim), and EXACTLY what to attack. Ask for a structured verdict
    (APPROVE / REFUTE / CONFIRM_RESOLVED + concrete findings), not a vibe.
@@ -86,13 +86,13 @@ premise (cheapest-probe-before-fire) before you refute or build on it.
 
 ## Rapid path — xrev as a telepathy exchange (xfam-telepathy-xrev, proven 2026-06-15)
 
-A quick per-finding xrev/refute can run AS a `telepathy` exchange (the RAPID path), composing
-with the durable MC xrev conv (the recorded verdict) — proven live (claude-Opus ↔ codex-gpt5.5
-round-trip, cid-auto-closed):
-- Fire it as a telepathy channel: **`mc cockpit telepathy --sender <you> --conv <xrev-id> --participant <peer>`**
-  then `mc comms send --conv <xrev-id> --priority action-required --payload "refute: <bounded claim>"` —
-  the action-required wake rouses an idle peer (F6); the reply lands on the same conv, **non-blocking**
-  (you keep working; poll the conv between actions).
+A quick per-finding xrev/refute can run AS a direct back-and-forth exchange (the RAPID path), composing
+with the durable xrev thread (the recorded verdict) — proven live (claude-Opus ↔ codex-gpt5.5
+round-trip, auto-closed):
+- Fire it as a direct channel to the peer, then post an action-required
+  `refute: <bounded claim>` to the same thread (`helm chat post`) —
+  the action-required wake rouses an idle peer (F6); the reply lands on the same thread, **non-blocking**
+  (you keep working; read the thread between actions).
 - **Reach for telepathy-xrev**: ONE bounded finding you can keep working through ("is this right?"
   to a different-family peer mid-flow). **Reach for a durable conv xrev**: the recorded PASS/NOT_PASS
   gate (multi-finding, the audit trail, the closure contract) — the comms log stores the message.
@@ -114,7 +114,7 @@ default:
 1. **Spawn fresh per ask.** From a claude leader, the cheapest form is a SUBAGENT with
    `model: fable` (fresh context, focused brief, dies with its verdict). For a pane-based
    consultation (cross-harness caller, or the human watches), ONE command does the whole
-   loop: spawn a fresh reviewer cell — `mc agent start xrev-<slug> --no-focus -- claude --model <family> --dangerously-skip-permissions`, brief it with the self-contained question, collect the verdict over comms —
+   loop: spawn a fresh reviewer seat in a pane (via `orca-cli`) — `claude --model <family> --dangerously-skip-permissions`, brief it with the self-contained question, collect the verdict over chat —
    split → boot (auth inherited from the live home cred; fails LOUD on a login picker) →
    verified send → wait → print answer → close. Model flag is the FULL id
    (`claude-fable-5[1m]`); saved defaults may be Opus, never assume auto picks Fable.
@@ -147,23 +147,23 @@ For an irreducibly vocabulary-dense verdict, route to an xfam reviewer (register
 
 ## The loopsaver (self-recovery, proven 2026-06-11)
 
-A flipped/dropped pane agent recovers ITSELF with full context — proven live (nonces
-proven in the buildr era; sessions branch in-pane, context carries over):
+A flipped/dropped pane agent recovers ITSELF with full context — proven live (sessions
+branch in-pane, context carries over):
 1. Write your recovery payload to a scratch file (template below).
-2. Arm the detached wake BEFORE acting:
-   `setsid nohup sh -c 'sleep 20; mc pane run <YOUR-PANE-ID> "$(cat <recovery-file>)"' >/dev/null 2>&1 &`
-3. Self-send: `mc pane run <YOUR-PANE-ID> "/branch <name>"`
+2. Arm the detached wake BEFORE acting (send to your OWN pane after a delay, via `orca-cli` pane send):
+   `setsid nohup sh -c 'sleep 20; <orca-cli pane send> <YOUR-PANE-ID> "$(cat <recovery-file>)"' >/dev/null 2>&1 &`
+3. Self-send: `<orca-cli pane send> <YOUR-PANE-ID> "/branch <name>"`
 4. End turn. `/branch` lands a NEW session in-pane with full context; the wake fires into it
    and restarts work. Known limits: TaskList is session-scoped (the payload must carry task
-   pointers); verify the new session id re-registered (`mc pane get <pane>`); do not
+   pointers); verify the new session id re-registered (`orca-cli` pane get); do not
    shorten the wake delay below 15s (an early wake lands as composer text — harmless, the
    next turn picks it up).
 
 PAYLOAD TEMPLATE (the post-/branch brief — same shape as a post-reboot brief):
 "RECOVERY: you are <label>, resumed in-pane via /branch after a model flip; context carried
  over. (1) RE-ARM: <Monitors//loop/goal that were armed, or none>. (2) IN-FLIGHT: <task +
- exact next action>. (3) PENDING: check addressed asks — `mc comms pending --conv <conv>
- <last-handled-seq>`. (4) Session-id check: `mc pane get <pane>` (confirm
+ exact next action>. (3) PENDING: check addressed asks — `helm chat pending`.
+ (4) Session-id check via `orca-cli` pane get (confirm
  re-registration). Continue now."
 
 ## Reviewer-died protocol (the timeboxed degradation rung)
@@ -173,7 +173,7 @@ cannot revive a same-basin seat: (1) arm a TIMEBOXED review-window Monitor (~7 m
 its return; (2) on expiry, run the best available review (xfam pane if any, else
 structured self-review) and document the BASIS as a comment ON the artifact/PR
 ("reviewer X died, basis: <what reviewed it instead>"); (3) merge with the verdict
-marked `confidence=reduced`. Exercised 4x live (goodtimes 2026-06-11) — the documented
+marked `confidence=reduced`. Exercised 4x live — the documented
 degradation beats both silent self-merge and indefinite stall. Composes with the
 account-aware preflight above (try entitled/fallback seats FIRST, degrade LAST).
 
@@ -183,7 +183,7 @@ Every verdict is STRUCTURED, never prose-only: `verdict` (APPROVE / REFUTE /
 LAND-WITH-FIX / CONFIRM_RESOLVED) + `findings[]` (each: target, evidence with
 file:line or live probe, severity) + the receipt trio (`rigor`/`basins`/`confidence`).
 On a code-review verdict, also set **`reviewed_author`** = the agent who authored the
-code under review (you, the reviewer, populate it — author != reviewer means the MC
+code under review (you, the reviewer, populate it — author != reviewer means the chat
 message sender is YOU, not the author, so the author identity has to ride explicitly). It feeds
 downstream attribution of the reviewed work to its author; an unset `reviewed_author`
 strands that credit. Carry it as an explicit field in the closing verdict message on the
@@ -227,7 +227,7 @@ primitive:
   downshifted (or skipped) pass reads as "verified" at full confidence when it isn't
   (#19 automation-fails-loud). (The downshift-is-also-degradation gap was codex's seq326
   xprop finding on this skill.)
-- A sibling stopped on usage mid-`/x` → rotation is a fleet concern (bdev usage tooling), not an mc-cell verb; respawn the reviewer on a healthy account and re-ask;
+- A sibling stopped on usage mid-`/x` → rotation is a fleet concern (bdev usage tooling), not a helm-seat verb; respawn the reviewer on a healthy account and re-ask;
   don't give up or ask the human to refill.
 - **Human-capped resource → STATE the consolidation, don't silently thin.** When the human caps a
   review resource ("codex = final-QC only", "cred is scarce", a budget ceiling), say WHICH checks you
@@ -262,4 +262,4 @@ same-family "looks good." That is the difference between *shipped* and *shipped-
 - heuristic **#14** (cross-family refutation != same-family refinement) — the R-line `/x` embodies.
 - `decision-spirit` / `/decide` — the within-model audit `/x` complements with across-model eyes.
 - `reviewer-implements-own-findings` — when the refuter has the context to patch what it finds.
-- (cred rotation lives in the bdev fleet tooling, outside mc cells.)
+- (cred rotation lives in the bdev fleet tooling, outside helm seats.)

@@ -1,12 +1,12 @@
 ---
 name: tlz
 description: >
-  Run the trusted-list-zero task discipline for MC cells. Use when your task list
+  Run the trusted-list-zero task discipline for helm seats. Use when your task list
   has bloated, completed items lack evidence, delegated work is mis-owned,
   waiting items need chasing, or the user asks to clean up tasks. Alias: gtd.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
@@ -28,7 +28,7 @@ Success: no known open loop is uncaptured.
 Before a raw item rests on the list, decide:
 
 - **One-turn action?** Do it now.
-- **Delegated?** Send the owner an action-required MC record and keep only a
+- **Delegated?** Send the owner an action-required chat record and keep only a
   waiting stub.
 - **Multi-step?** Make a project plus one next action.
 - **Not actionable?** Move to reference, someday, or drop.
@@ -71,21 +71,20 @@ Each finding gets a re-clarify, chase, drop, or dispatch decision.
 Pick the next action by leverage, not recency. Keep the active set small. Return
 to parked items as active work clears.
 
-## MC Handoff Shape
+## Handoff Shape
 
 ```bash
-mc comms send --from pane:<you> --to pane:<owner> --conv <lane> \
-  --priority action-required \
-  --payload '<delegated task, evidence, expected reply shape>'
+helm chat post --room <lane> \
+  "@<owner> delegated task, evidence, expected reply shape"
 ```
 
-Track the waiting stub by recipient, conv, seq/hash, and expected result.
+Track the waiting stub by recipient, room, seq/hash, and expected result.
 
 ## Success Criteria
 
 - Every task has an owner and one next state.
 - Done items cite live evidence.
-- Delegated work has a return path through MC comms.
+- Delegated work has a return path through `helm chat`.
 - The active set is small enough to scan.
 
 ## Cross-Refs

@@ -30,8 +30,8 @@ SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lineage_se
 # under the project it duplicates.
 ANCESTRY_RELS = ("descends-from", "forked-from", "checkout-of")
 
-# Rels rendered as components under the SOURCE node (mc composes dregg -> dregg
-# indents under mc).
+# Rels rendered as components under the SOURCE node (a parent composes dregg ->
+# dregg indents under the parent).
 COMPOSE_RELS = ("composes",)
 
 # Rels that never make a dormant node a lineage ANCHOR of an active project:

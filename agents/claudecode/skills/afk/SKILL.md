@@ -69,8 +69,8 @@ contract behind it.
    optional. Post the outcome as a durable `helm chat` row and, when it should
    survive the session, a `helm store` entry, so later resumes know the north
    star. An armed outcome is what keeps an overnight AFK driving the OUTCOME
-   instead of degrading to monitor-ticks (the overnight-drift retro — MC
-   history). Never downgrade an outcome into passive monitoring.
+   instead of degrading to monitor-ticks (the overnight-drift retro). Never
+   downgrade an outcome into passive monitoring.
 
 ## Away Operating Contract
 

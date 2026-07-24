@@ -3,22 +3,22 @@ name: xchk
 description: >
   Use when a load-bearing claim must be verified before anyone builds on it, a
   "did this regress / is that stale?" question needs grounding, or sources
-  conflict. Given a topic or claim, /xchk runs one disciplined MC-native sweep
+  conflict. Given a topic or claim, /xchk runs one disciplined helm-native sweep
   across web or primary sources, local docs, memory, implementation, git history,
-  comms/cockpit messages, and cross-family refutation. It returns a cited verdict
+  chat messages, and cross-family refutation. It returns a cited verdict
   plus red herrings. Aliases: xcheck, cross-check, ground-truth-this,
   red-herring-check.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
 # /xchk - ground a topic or claim
 
 The job is to establish what is actually true before anyone builds on it. Output
-a cited verdict, not a file dump. MC state is headless and API-first: use local
-files, git, `mc cockpit`, and `mc comms` messages as sources; do not depend on a
+a cited verdict, not a file dump. helm state is headless and API-first: use local
+files, git, and `helm chat` messages as sources; do not depend on a
 client view.
 
 ## When To Use
@@ -43,7 +43,7 @@ a citation or an explicit no-hit token.
 | 3 | memory | relevant memory cited, or `NO_PRIOR_MATCH` |
 | 4 | implementation | owner code path read at `file:line`, or `NOT_IN_CODE` |
 | 5 | git history | introducing or last-touching commit cited by sha/date, or `NO_HISTORY` |
-| 6 | comms / cockpit | relevant `mc comms poll/pending/lifecycle` or `mc cockpit get` message cited by seq/hash, or `NO_MC_MESSAGE` |
+| 6 | chat | relevant `helm chat read/pending` message cited by seq/hash, or `NO_CHAT_MESSAGE` |
 | 7 | cross-family refute | `/x` xverify verdict from a different model family, or `x DEGRADED: <reason>` |
 
 Strong confidence needs three aligned sources, or one authoritative source plus a
@@ -84,7 +84,7 @@ SWEEP RECEIPT:
 - memory: <cite / NO_PRIOR_MATCH>
 - code: <file:line / NOT_IN_CODE>
 - git: <sha+date / NO_HISTORY>
-- mc: <seq/hash/lifecycle / NO_MC_RECORD>
+- chat: <seq/hash / NO_CHAT_RECORD>
 - cross-family: <verdict / x DEGRADED: ...>
 - confidence basis: <why this confidence is justified>
 ```
@@ -97,7 +97,7 @@ was unavailable, mark the verdict unresolved or reduced.
 - Every applicable source has a citation or explicit no-hit token.
 - The red-herring pass ran and names either findings or "none found".
 - Confidence is bounded by the evidence, not by agent agreement.
-- MC coordination facts come from `cockpit`/`comms` API reads, not TUI state.
+- Coordination facts come from `helm chat` API reads, not TUI state.
 
 ## Cross-Refs
 

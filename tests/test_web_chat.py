@@ -376,11 +376,11 @@ class TestWebChat(unittest.TestCase):
 
     def test_poll_carries_the_live_roster_for_mention_completion(self):
         from helm import seats
-        seats.write_roster("goodtimes-platform-codex", session="s-1")
+        seats.write_roster("example-app-codex", session="s-1")
         seats.write_roster("helm-opus-integrator", session="s-2")
         d = self.req("/api/chat")[1]
         self.assertEqual(d["roster"],
-                         ["goodtimes-platform-codex", "helm-opus-integrator"])
+                         ["example-app-codex", "helm-opus-integrator"])
 
     def test_sidebar_rooms_carry_unread_mentions_age_and_seat_presence(self):
         """The badge computation the owner UX rides: a quiet room and a busy

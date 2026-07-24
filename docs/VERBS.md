@@ -315,9 +315,8 @@ frequency-then-length ranked, cap 8).
 
 `--project P` drains P's OWN claude memory dir (the adopted per-project pile)
 with the identical classify/apply gauntlet — including the upgrade op below. A
-registry **alias map** (built-in `buildr → buildr-private-beta`, `mc →
-mission-control`, plus any authored per-project `aliases`) routes the otherwise
-unroutable project entries; a short alias (`mc`) matches by filename only (a
+registry **alias map** (authored per-project `aliases`) routes the otherwise
+unroutable project entries; a short alias matches by filename only (a
 2-char word wallpapers a description scan).
 
 **The upgrade op (drain v2).** Typed-PREFIX files that never carried typed
@@ -404,12 +403,12 @@ inject, and a corpus whose majority carries superseded premises fires stale
 knowledge into live turns — so sweep walks the family tree's succession edges
 (`supersedes`, `descends-from`, `forked-from`; a `checkout-of` worktree
 duplicate is not a succession and is excluded) and proposes superseding the
-ancestor-era entries the store still holds by their successor-era twins (the
-sesh-era premise superseded by its helm successor).
+ancestor-era entries the store still holds by their successor-era twins (a
+predecessor-era premise superseded by its helm successor).
 
 **Never on weak signal.** A proposal needs BOTH a directed lineage edge AND a
 match between an ancestor-era entry and a successor-era one: *same-slug* (equal
-base after stripping the era token — `sesh-rollover` / `helm-rollover` →
+base after stripping the era token — `legacy-rollover` / `helm-rollover` →
 `rollover`) or *high-overlap* (keyword/statement Jaccard ≥ 0.6). Term-mention
 alone never qualifies — an entry that merely *mentions* a dead harness while
 stating a live lesson is not superseded, which is why the dry-run quotes both
@@ -426,10 +425,10 @@ registry or unreadable store yields a clean line, never a crash.
 ```console
 $ helm sweep
 helm sweep — 1 lineage supersession proposed across 1 edge (PROPOSE-ONLY; nothing superseded):
-  [same-slug] sesh-rollover-policy -> helm-rollover-policy   (helm supersedes sesh)
-      old: "on rollover, re-home the sesh session under the freshest account"
+  [same-slug] legacy-rollover-policy -> helm-rollover-policy   (helm supersedes legacy)
+      old: "on rollover, re-home the legacy session under the freshest account"
       new: "on rollover, helm re-homes the session under the freshest account"
-      ->  helm store supersede <ts> sesh-rollover-policy helm-rollover-policy lineage: helm supersedes sesh + same base slug 'rollover-policy'
+      ->  helm store supersede <ts> legacy-rollover-policy helm-rollover-policy lineage: helm supersedes legacy + same base slug 'rollover-policy'
 helm sweep: DRY-RUN (nothing superseded). Re-run with --apply to tombstone via store.supersede (files KEPT — re-promotable).
 ```
 
@@ -562,9 +561,9 @@ The owner's parity surface is the web tab's **fleet todos** panel (and
 ```console
 $ helm todos --all
   seat              in-progress                                 done    age
-  goodtimes-claude  —                                            2/2      5s
+  project-a-claude  —                                            2/2      5s
   helm-claude       wire helm todos + roster + web panel         2/4      5s
-  polyana-codex     Add the Scala gate to the cosmo matrix       0/2      5s
+  project-b-codex   add the example integration test             0/2      5s
   (1 seat with no mirrored todos — they fill on the next TodoWrite/Task* call)
 ```
 
@@ -1282,8 +1281,8 @@ different-name copies, and hygiene issues (e.g. a skill dir with no SKILL.md).
 
 ### `helm skills sync [--apply]`
 Universal skill distribution — the deliberate mutation verb the census
-anticipated. One canonical skills source (the MC instance-home hub — a
-gitignored symlink farm into the MC repo, never the repo's own tracked dir;
+anticipated. One canonical skills source (a designated canonical hub — a
+gitignored symlink farm outside the repo's own tracked dir;
 `HELM_SKILLS_CANONICAL` overrides), and every claude-code config dir — each real
 credhome under `~/.claude-homes` (alias symlinks fold onto their target), the
 default `~/.claude`, every seat and seat-instance `CLAUDE_CONFIG_DIR` — becomes
@@ -1690,7 +1689,7 @@ frames; this lane is called *delivery*.)
   persistent Monitor armed on `wait --follow` is meld's SSE watcher, natively;
   fail-open + bounded poll, so a delivery hiccup never crashes the beacon.
 - **`helm chat stop-guard [--hook-json] [--seat S]`** — the IDLE GATE (Stop
-  hook; the buildr/mc stop-arbiter capability, helm-native). Posture resolves
+  hook; a stop-arbiter capability, helm-native). Posture resolves
   once, checks run inline, and ALL blocking messages surface in ONE exit-2
   (fix everything in one shot); WARN lines ride along without changing the
   exit. Checks: **BLOCK** on undelivered @mentions/owner rows past the seat's
@@ -1850,8 +1849,8 @@ meld — it falls to async. The preset is THIN by law (one-comms-primitive): a
 meld is a fresh room (`meld-<epoch>-<slug>`) plus a bounded synchronous read
 discipline over it — no new transport, no daemon; the room IS the artifact,
 visible live in `helm chat rooms` and the web channel list like any room.
-Protocol lineage: mc-meld.sh / the MC mindmeld skill (epoch fencing, floor
-markers, bounds-as-behavior — the scars are kept, the channel is helm's).
+The convergence discipline — epoch fencing, floor markers, bounds-as-behavior
+— is helm-native (the scars are kept, the channel is helm's).
 
 NAMING (premise council-is-the-number-one-feature, owner canon 2026-07-23):
 MELD is the GENUS — agents converging quickly — and `meld` stays the primary
@@ -1869,7 +1868,7 @@ aligned with every other chat verb).
   statement (ending `[HOLD]`, discipline line + `invited=<peer>` included)
   into the fresh room, then posts the `@peer` invite with the protocol head
   FIRST — room + join command inside the first 200 bytes, so the delivery
-  clip can never eat the join instruction (buildr #115). The invite is a
+  clip can never eat the join instruction. The invite is a
   durable row: a tracked peer's delivery lane backfills the newborn room
   from offset 0, so it lands at the peer's next tool boundary (busy) or
   beacon fire (idle) — never lost, only delayed. An UNTRACKED peer gets a
@@ -1906,8 +1905,8 @@ LATENCY-PURE (premise comms-presets-optimize-their-novel-purity): every meld
 post rides the v1 RAM append unsigned (`sign=False`) — no signing leg, no
 node round-trip, no disk write mid-meld; the out-of-band log-flush stays the
 durable record. State is RAM, keyed room × ACTOR (two seats share one chat
-dir — the mc-meld host-global-state clobber, refuted in its live dogfood, is
-structural here). v1 is 2-party (the pinned pair); 3+ minds use a plain room
+dir — a host-global-state clobber avoided structurally here, since state is
+keyed room × ACTOR). v1 is 2-party (the pinned pair); 3+ minds use a plain room
 + discipline until the 0.3 council machinery lands N-of-M. Env:
 `HELM_MELD_CAP`, `HELM_MELD_RECV_TIMEOUT_S`.
 
@@ -2182,7 +2181,7 @@ prd/journal/evals/archive, know-your-user, reflexes, priors/references, and
 **DERIVED** re-derives per host via `helm sync` and never ships:
 `registry.json` at any depth (the `_global` projection and every per-project
 mirror), `.state/`, caches, `seats/` (host-local seat runtime — carries
-provider auth). Adopted-by-symlink homes (mission-control) are host-local:
+provider auth). Adopted-by-symlink homes are host-local:
 the symlink is ignored; that chain ships from its own repo. RAM-canon (chat
 rooms, tmpfs node state) never touches this disk — always out of scope.
 
@@ -2218,7 +2217,7 @@ helm ship --dry (nothing touched):
   remote: none configured — would COMMIT ONLY (add --remote <private-url>)
   would ship: 82 authored files, 0.9MB
   derived (never ships): .state/ x1 adopted-symlink x1 registry.json x22 seats/ x1
-  adopted symlink homes (host-local): mission-control
+  adopted symlink homes (host-local): external-hub
   secret scan: clean (9 patterns over 82 files)
   apply with: helm ship --apply [--remote <private-url>]
 ```

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """store tests — hermetic: every root (adopted + helm-global + project) points
-at a tempdir via HELM_HOME + HELM_ADOPTED_DIR. The real ~/.claude, ~/.helm and
-~/.mc are never read or written."""
+at a tempdir via HELM_HOME + HELM_ADOPTED_DIR. The real ~/.claude and ~/.helm
+are never read or written."""
 import contextlib
 import io
 import json
@@ -503,8 +503,8 @@ class EpisodicTest(StoreBase):
 class TypedFallbackTest(StoreBase):
     def test_typed_prefix_without_typed_fields_reads_as_episodic(self):
         # the live store carries prem-/lex- named files that are really bulk
-        # memory (name+description, type: project, no id/statement) — mc drops
-        # them; helm keeps them visible as episodic, never injected
+        # memory (name+description, type: project, no id/statement) — the legacy
+        # store drops them; helm keeps them visible as episodic, never injected
         pk.atomic_write(os.path.join(self.adopted, "prem-bulk-note.md"),
                         '---\nname: prem-bulk-note\ndescription: "canon paragraph"\n'
                         'metadata:\n  node_type: memory\n  type: project\n---\nbody\n')
@@ -1152,7 +1152,7 @@ class AdoptProjectMemdirsTest(StoreBase):
         self.projmem = os.path.join(self.tmp, "projmem")
         os.makedirs(self.projmem)
         pk.write_json(home.registry_path(), {"version": 1, "projects": {
-            "polyana": {"name": "polyana", "path": "/dev/polyana", "kind": "git",
+            "example-app": {"name": "example-app", "path": "/dev/example-app", "kind": "git",
                         "sessions": {}, "cwds": []}}})
 
     def tearDown(self):
@@ -1162,20 +1162,20 @@ class AdoptProjectMemdirsTest(StoreBase):
     def _patch(self):
         return mock.patch.object(
             home, "claude_memory_dir_for",
-            side_effect=lambda p: self.projmem if p == "/dev/polyana" else "/nonexistent-xyz")
+            side_effect=lambda p: self.projmem if p == "/dev/example-app" else "/nonexistent-xyz")
 
     def test_project_adopted_root_fires_its_own_priors(self):
-        store.write_prior({"id": "polyana-law", "statement": "polyana's own prior",
-                           "confidence": 0.9, "keywords": "polyanaword"},
+        store.write_prior({"id": "example-app-law", "statement": "example-app's own prior",
+                           "confidence": 0.9, "keywords": "exampleword"},
                           root_dir=self.projmem)
         with self._patch():
             store._ADOPTED_PROJECT_CACHE.clear()
-            self.assertIn("adopted-project", [t[0] for t in store.roots(project="polyana")])
-            e = self.one(store.load_all(project="polyana"), "polyana-law")
-            self.assertEqual((e["root"], e["scope"]), ("adopted-project", "project:polyana"))
+            self.assertIn("adopted-project", [t[0] for t in store.roots(project="example-app")])
+            e = self.one(store.load_all(project="example-app"), "example-app-law")
+            self.assertEqual((e["root"], e["scope"]), ("adopted-project", "project:example-app"))
             self.assertEqual([x["id"] for x in
-                              store.resolve_prompt("polyanaword now", project="polyana")],
-                             ["polyana-law"])
+                              store.resolve_prompt("exampleword now", project="example-app")],
+                             ["example-app-law"])
         # without the project lens the adopted-project root is NOT in play
         self.assertEqual(store.load_all(), [])
 
@@ -1185,14 +1185,14 @@ class AdoptProjectMemdirsTest(StoreBase):
                            "confidence": 0.9}, root_dir=self.projmem)
         with self._patch():
             store._ADOPTED_PROJECT_CACHE.clear()
-            e = self.one(store.load_all(project="polyana"), "foo")
+            e = self.one(store.load_all(project="example-app"), "foo")
             self.assertEqual((e["statement"], e["root"]),
                              ("adopted-project sense", "adopted-project"))
         self.seed_prior("foo", "authored project sense", conf=0.9,
-                        root_dir=self.project_dir("polyana", "premises"))
+                        root_dir=self.project_dir("example-app", "premises"))
         with self._patch():
             store._ADOPTED_PROJECT_CACHE.clear()
-            e = self.one(store.load_all(project="polyana"), "foo")
+            e = self.one(store.load_all(project="example-app"), "foo")
             self.assertEqual((e["statement"], e["root"]),
                              ("authored project sense", "project"))
 
@@ -1200,7 +1200,7 @@ class AdoptProjectMemdirsTest(StoreBase):
         # a project lens with no registry file adds no adopted-project root
         os.remove(home.registry_path())
         store._ADOPTED_PROJECT_CACHE.clear()
-        self.assertEqual([t[0] for t in store.roots(project="polyana")],
+        self.assertEqual([t[0] for t in store.roots(project="example-app")],
                          ["adopted", "helm-global", "project"])
 
 

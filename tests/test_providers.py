@@ -118,8 +118,7 @@ class NativeBase(unittest.TestCase):
         self.envp = mock.patch.dict(os.environ, {"HOME": self.tmp})
         self.envp.start()
         self.addCleanup(self.envp.stop)
-        for var in ("HELM_PROVIDER", "SESH_PROVIDER", "HELM_ALLOCATION_RULES",
-                    "SESH_ALLOCATION_RULES", "HELM_PROBE_LOOP", "SESH_PROBE_LOOP"):
+        for var in ("HELM_PROVIDER", "HELM_ALLOCATION_RULES", "HELM_PROBE_LOOP"):
             os.environ.pop(var, None)
         self.hist = os.path.join(self.tmp, "history.jsonl")
         self.p = NativeQuotaProvider(history_path=self.hist)

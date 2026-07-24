@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """helm homes — credential-home lifecycle for claude AND codex (stdlib only).
-helm-native (see ATTRIBUTION.md for lineage)
-dissolve-into-helm law; rebrand only — new archives land in
-~/.helm-home-archive/, legacy ~/.sesh-home-archive/ stays readable/restorable.
+New archives land in ~/.helm-home-archive/; an older on-disk archive format
+stays readable/restorable (read both, write new).
 
 THE CANON (CRED_AUTH_CANON, distilled — violating these bricks accounts):
   * one home = one device login = one token family. Credentials are NEVER
@@ -21,9 +20,9 @@ THE CANON (CRED_AUTH_CANON, distilled — violating these bricks accounts):
   * claude homes: `projects` must SYMLINK to ~/.claude/projects (one shared
     session store) — a REAL projects dir silently strands sessions.
   * archive = MOVE into ~/.helm-home-archive/<name>-<date>/ (reversible),
-    never delete; refused while a live agent sits on the home. Legacy sesh
-    legacy archives (~/.sesh-home-archive/, marker .sesh-archive.json) are still
-    listed and restorable — read both, write new.
+    never delete; refused while a live agent sits on the home. An older
+    legacy archive format (its own root + marker) is still listed and
+    restorable — read both, write new.
 
 Every public function returns a JSON-able dict (or list); errors are
 {"error": "..."} — loud, attributed, never an exception across the API edge.
@@ -43,8 +42,8 @@ SHARED_PROJECTS = os.path.join(HOME, ".claude", "projects")
 ARCHIVE_ROOT = os.path.join(HOME, ".helm-home-archive")
 MARKER = ".helm-archive.json"  # metadata only: name/provider/from/aliases — no token contents
 # the legacy archive root — recognized forever for list/restore, never written to
-LEGACY_ARCHIVE_ROOT = os.path.join(HOME, ".sesh-home-archive")
-LEGACY_MARKER = ".sesh-archive.json"
+LEGACY_ARCHIVE_ROOT = os.path.join(HOME, ".helm-legacy-home-archive")
+LEGACY_MARKER = ".legacy-archive.json"
 
 # the human runs these; helm only prints them (logins are human-only, per canon)
 LOGIN_CMDS = {"claude": lambda h: f"CLAUDE_CONFIG_DIR={shlex.quote(h)} claude /login",
@@ -170,7 +169,7 @@ def _home_row(provider, path, aliases, procs, default=False):
 
 
 def _archive_marker(path):
-    """(meta, marker_file) — helm marker wins, legacy sesh marker still honored."""
+    """(meta, marker_file) — helm marker wins, legacy marker still honored."""
     for marker in (MARKER, LEGACY_MARKER):
         meta = _read_json(os.path.join(path, marker))
         if meta is not None:
@@ -455,7 +454,7 @@ def home_archive(name, provider=None):
 
 def home_unarchive(name):
     """Restore an archived home to where it came from (newest archive wins).
-    Searches BOTH archive roots — helm and the legacy sesh one."""
+    Searches BOTH archive roots — helm and the legacy one."""
     name = (name or "").strip()
     if not name:
         return {"error": "need a home name (see `helm homes archives`)"}

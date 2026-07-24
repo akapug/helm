@@ -239,7 +239,7 @@ def _council_path():
 def _council_reach(session, cwd):
     """The COUNCIL REACH rung — (line, ledger-id) or None. Premise
     council-is-the-number-one-feature + feature-and-rsh-must-both-be-wired:
-    the recorded buildr failure was SALIENCE — the meld verb existed and
+    the recorded failure was SALIENCE — the meld verb existed and
     agents never reached for it, because no per-turn surface advertised it.
     Signal: this seat has ping-ponged >= COUNCIL_ROUNDS rounds with exactly
     ONE other seat in its home room — async back-and-forth that a bounded

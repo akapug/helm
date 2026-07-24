@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emoji for helm comms — the unported buildr/mc piece (PRD addendum
+"""Emoji for helm comms — the comms-emoji piece (PRD addendum
 2026-07-19): shortcode expansion at post time on every input surface (CLI,
 web, TUI), UTF-8 purity end-to-end, and a degrade path (demojize) so a
 terminal that cannot encode an emoji shows the shortcode text instead of

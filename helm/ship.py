@@ -18,7 +18,7 @@ Laws:
     patterns BEFORE any commit exists; a hit refuses loudly and unstages.
   - remote must be PRIVATE (journal/premise content is operator-internal);
     no remote configured = commit-only, said explicitly, never an error.
-  - adopted-by-symlink homes (mission-control) are host-local: the symlink
+  - adopted-by-symlink homes are host-local: the symlink
     is ignored — that chain ships from its own repo, never from here.
   - per-host observation blocks (_global/hosts/<host>.json) carry what THIS
     host observed — the one projection-derived artifact that ships, because

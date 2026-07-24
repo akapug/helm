@@ -4,9 +4,9 @@ THIS=who). The know-your-user leg: what makes helm feel like a teammate instead 
 tool, and the reason it exists at all.
 
 Store: ~/.helm/_global/know-your-user/
-  profile.json   the one operator profile (schema v2, superset of the mc v1
-                 scaffold; merge_scaffold() imports the mc store in place —
-                 content wins over emptiness in both directions).
+  profile.json   the one operator profile (schema v2). merge_scaffold() folds
+                 in an optional external scaffold profile in place — content
+                 wins over emptiness in both directions.
   notes/         dated superseding notes — guidance grows as markdown with
                  frontmatter (the store-evolution verdict), not bare JSON
                  strings. A note naming a predecessor in `supersedes` hides it;
@@ -76,14 +76,12 @@ def notes_dir():
     return os.path.join(store_dir(), "notes")
 
 
-def mc_profile_path():
-    """The mc scaffold this store merges from. Mirrors mc's MC_HOME contract
-    (env MC_HOME expanded, else ~/.mc/mission-control) — kept in sync by
-    convention, same as mc's own hooks/lib duplication."""
-    raw = os.environ.get("MC_HOME")
-    root = os.path.expanduser(raw) if raw else os.path.join(
-        os.path.expanduser("~"), ".mc", "mission-control")
-    return os.path.join(root, "user-profile", "profile.json")
+def scaffold_profile_path():
+    """The optional external scaffold this store merges from — the full path to
+    a profile.json, named by env HELM_PROFILE_SCAFFOLD. Unset -> None (no
+    scaffold; merge_scaffold() is then a no-op)."""
+    raw = os.environ.get("HELM_PROFILE_SCAFFOLD")
+    return os.path.expanduser(raw) if raw else None
 
 
 def _empty_profile():
@@ -93,7 +91,7 @@ def _empty_profile():
         "guidance": [],
         "interview_status": "",  # "" (never offered) | "offered" | "done"
         "updated_at": "",
-        "source": "fresh",  # "fresh" | "merged-from-mc"
+        "source": "fresh",  # "fresh" | "merged-from-scaffold"
     }
 
 
@@ -106,7 +104,7 @@ def _norm_guidance(g):
 def load_profile():
     """Fail-open: missing/garbled -> empty (a corrupt store degrades to
     re-interviewable, never breaks a turn). Unknown top-level keys from a newer
-    schema carry through so a re-save never drops them (mc's forward-compat law)."""
+    schema carry through so a re-save never drops them (the forward-compat law)."""
     d = pk.read_json(profile_path())
     base = _empty_profile()
     if not isinstance(d, dict):
@@ -139,30 +137,32 @@ def _content_key(p):
             p["interview_status"], p["source"])
 
 
-def merge_scaffold(mc_path=None):
-    """Import the mc know-your-user scaffold (content AND bookkeeping) into the
-    helm profile. Content wins over emptiness in both directions: an mc field
-    never clobbers non-empty helm content, an empty mc field never erases
-    anything, interview_status only ever ranks UP (offered never downgrades
-    done). Idempotent — a no-change merge does not rewrite the store."""
+def merge_scaffold(scaffold_path=None):
+    """Import an external know-your-user scaffold (content AND bookkeeping) into
+    the helm profile. Content wins over emptiness in both directions: a scaffold
+    field never clobbers non-empty helm content, an empty scaffold field never
+    erases anything, interview_status only ever ranks UP (offered never
+    downgrades done). No scaffold configured -> a no-op. Idempotent — a
+    no-change merge does not rewrite the store."""
     p = load_profile()
     before = _content_key(p)
-    mc = pk.read_json(mc_path if mc_path is not None else mc_profile_path())
-    if isinstance(mc, dict):
-        lvl = str(mc.get("technical_level") or "").strip()
+    path = scaffold_path if scaffold_path is not None else scaffold_profile_path()
+    ext = pk.read_json(path) if path else None
+    if isinstance(ext, dict):
+        lvl = str(ext.get("technical_level") or "").strip()
         if lvl and not p["technical_level"]:
             p["technical_level"] = lvl
-        for g in _norm_guidance(mc.get("guidance")):
+        for g in _norm_guidance(ext.get("guidance")):
             if g not in p["guidance"]:
                 p["guidance"].append(g)
-        status = str(mc.get("interview_status") or "").strip()
+        status = str(ext.get("interview_status") or "").strip()
         if _STATUS_RANK.get(status, 0) > _STATUS_RANK.get(p["interview_status"], 0):
             p["interview_status"] = status
         if _content_key(p) != before:
             # only an ACTUAL import stamps the source — an empty scaffold must
             # not clobber a richer provenance note (it did once: a derived
             # profile's source was overwritten by a no-op merge)
-            p["source"] = "merged-from-mc"
+            p["source"] = "merged-from-scaffold"
     if not os.path.exists(profile_path()) or _content_key(p) != before:
         save_profile(p)
     return p

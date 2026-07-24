@@ -147,7 +147,7 @@ a high-% teammate whose window resets SOON should SPEND (stay full pair), same a
 Generalizes to any leader->teammate pair; see `/lead`. So the full pace decision is two-axis: the
 driver's budget (BURST/HOLD/ROTATE/PARK) AND each teammate's role rung.
 
-Apply the budget through MC's own `/afk <soft|hard> --subagent-cap <N>` front door (choose the
+Apply the budget through helm's own `/afk <soft|hard> --subagent-cap <N>` front door (choose the
 posture being set or preserved), or use the AFK modal cap; the inject hook then surfaces it as a
 per-turn fact so the whole team paces to it. **Re-evaluate at each reset boundary** (the cheapest
 re-plan moment) and on any sibling usage-stop. The budget is a function of usage over the reset clock,

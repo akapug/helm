@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """helm transcripts — reading INSIDE sessions, and the two safe mutations.
-ABSORBED from the predecessor (sesh/server/sesh.py), behavior-preserving, per
-the dissolve-into-helm law (see ATTRIBUTION.md).
 
 Four capabilities, one module:
   * deep_search    — content search inside transcripts (scoped grep or cv
@@ -16,11 +14,9 @@ Four capabilities, one module:
 plus make_cmd (the pasteable account-aware resume command) because the same
 line range owns it and the web slice's /api/cmd needs it.
 
-Signatures are IDENTICAL to the source module — the slice-B web routes call
-these directly. State lives under ~/.cache/helm/ (catalog.CACHE_DIR seeds
-itself once from the legacy ~/.cache/sesh/, so cwd-overrides and mints carry
-over). Thread-safe: the same single-flight cache the server used, so the CLI
-and an embedding web server share one code path.
+The slice-B web routes call these directly. State lives under ~/.cache/helm/.
+Thread-safe: a single-flight cache, so the CLI and an embedding web server
+share one code path.
 """
 import json
 import os

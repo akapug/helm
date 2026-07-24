@@ -53,8 +53,8 @@ One row per census (same-uid live claude) process:
   (session's canonical config root; '?' when untrusted/unproven), daemon
   (ppid-walk to an orca daemon whose incarnation is re-proven at match time),
   pane (orca terminal handle when the join is unambiguous; '?' otherwise —
-  never guessed), stamps (child-session trio count), deck (MC = stale MC
-  skill-deck env, helm = repointed, - = unset).
+  never guessed), stamps (child-session trio count), deck (helm = repointed
+  skill-deck env, - = unset).
 
 Every column comes from a live probe; nothing is cached. A FAILED probe is
 UNKNOWN, never an absence fact (premise failed-probe-not-absence): HEADLESS is
@@ -500,8 +500,7 @@ def rows():
             "stamps": None if env_unknown else
                       sum(1 for k in stamp_keys if k in env),
             "deck": "?" if env_unknown else
-                    ("MC" if "mission-control" in deck or "/.mc/" in deck
-                     else "helm" if deck else "-"),
+                    ("helm" if deck else "-"),
         })
     hosted = [r for r in out if r["daemon_state"] == "daemon"]
     terms_failed, inventories = False, {}

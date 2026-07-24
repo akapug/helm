@@ -19,9 +19,9 @@ HOME = os.path.expanduser("~")
 BACKUP_DIR = os.path.join(HOME, ".cache", "helm", "config-backups")
 
 # cwd roots to browse for project-scoped configs (colon-separated env override;
-# HELM_* preferred, legacy SESH_* accepted — the env2 pattern catalog.py uses).
+# the same env convention catalog.py uses).
 CWD_ROOTS = [r for r in os.environ.get(
-    "HELM_CONFIG_ROOTS", os.environ.get("SESH_CONFIG_ROOTS", f"{HOME}/dev")).split(":") if r]
+    "HELM_CONFIG_ROOTS", f"{HOME}/dev").split(":") if r]
 # helm seats are full isolated claude config homes living under the helm home
 # (<helm_home>/_global/seats/<family>/claude — settings.json, .claude.json,
 # sessions). helm_home honors HELM_HOME/MELD_HOME. The delivery-lane wiring

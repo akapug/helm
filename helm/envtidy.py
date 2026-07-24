@@ -117,16 +117,16 @@ def hooks_for(label):
 # the canonical MCP set
 # ---------------------------------------------------------------------------
 # name -> server config (or None = report-only). The default is REPORT-ONLY:
-# on the live host every credhome already reaches builders-dev + polyana via
-# ENABLED PLUGINS (survey mcp_variance), so minting a RAW mcpServers entry for
-# them would create the exact duplicate-shadow the survey warns about. mcp sync
+# on the live host every credhome already reaches builders-dev via ENABLED
+# PLUGINS (survey mcp_variance), so minting a RAW mcpServers entry for it
+# would create the exact duplicate-shadow the survey warns about. mcp sync
 # therefore only ADDS a raw server when (a) the name is missing from the home's
 # EFFECTIVE set (not provided by any plugin or raw entry) AND (b) a concrete
 # config is in hand — supplied by HELM_MCPS_CANONICAL (a JSON file
 # {name: config|null}). Anything else is surfaced to the owner, never guessed
 # (fail-closed). The universal intersection names below are what the census
 # checks every home can actually reach.
-CANONICAL_MCPS = {"builders-dev": None, "polyana": None}
+CANONICAL_MCPS = {"builders-dev": None}
 
 
 def canonical_mcps():

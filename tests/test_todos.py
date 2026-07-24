@@ -314,7 +314,7 @@ class TransitionPostTest(TodosBase):
         in-place TaskUpdate mutated the snapshot it was diffed against and the
         whole Task* family — what the live fleet actually emits — never posted
         a single transition."""
-        self.seat("polyana-codex")
+        self.seat("example-codex")
         record.record(self.ev(tool="TaskCreate", tin={"subject": "Scala gate"},
                               resp="Task #41 created successfully"))
         self.assertEqual(self.room(), [], "a new PENDING task is not news")
@@ -323,7 +323,7 @@ class TransitionPostTest(TodosBase):
         rows = self.room()
         self.assertEqual(len(rows), 1)
         self.assertIn("Scala gate", rows[0]["text"])
-        self.assertEqual(rows[0]["from"], "polyana-codex")
+        self.assertEqual(rows[0]["from"], "example-codex")
 
     def test_apply_task_never_mutates_the_caller_list(self):
         before = todos._items(todo_list(("a", "pending")))

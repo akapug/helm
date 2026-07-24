@@ -67,9 +67,9 @@ class ShipBase(unittest.TestCase):
         self._write(g, ".state", "inject-ledger.jsonl", "{}\n")
         self._write(g, "seats/codex/auth", "codex-team.json",
                     '{"token": "%s"}\n' % FAKE_TOKEN)
-        ext = os.path.join(self.tmp, "external-mc")
+        ext = os.path.join(self.tmp, "external-adopted")
         os.makedirs(ext)
-        os.symlink(ext, os.path.join(self.hh, "mc-adopted"))
+        os.symlink(ext, os.path.join(self.hh, "ext-adopted"))
 
     def _write(self, *parts_and_text):
         *parts, name, text = parts_and_text
@@ -103,7 +103,7 @@ class DryRunTest(ShipBase):
         self.assertIn("none configured", out)          # remote honesty
         self.assertIn("secret scan: clean", out)       # seats/ auth never in the set
         self.assertIn("seats/", out)                   # named among derived
-        self.assertIn("mc-adopted", out)               # symlink home surfaced
+        self.assertIn("ext-adopted", out)               # symlink home surfaced
 
     def test_dry_would_refuse_on_secret(self):
         self._write(self.hh, "_global/premises", "prior-leak.md",
@@ -131,7 +131,7 @@ class ApplyTest(ShipBase):
             self.assertNotEqual(os.path.basename(path), "registry.json", path)
             self.assertNotIn(".state/", path)
             self.assertNotIn("seats/", path)
-            self.assertFalse(path.startswith("mc-adopted"), path)
+            self.assertFalse(path.startswith("ext-adopted"), path)
         # git's own classifier agrees with the python-side one
         self.assertEqual(self.g(self.hh, "check-ignore", "_global/registry.json").returncode, 0)
         self.assertEqual(self.g(self.hh, "check-ignore", "alpha/registry.json").returncode, 0)

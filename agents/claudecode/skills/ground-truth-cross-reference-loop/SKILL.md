@@ -3,11 +3,11 @@ name: ground-truth-cross-reference-loop
 description: >
   Use when debugging is not converging, a failure mode is novel, a substrate or
   architecture decision is expensive to reverse, or a claim depends on multiple
-  uncertain sources. Cross-reference docs, implementation, history, MC messages,
+  uncertain sources. Cross-reference docs, implementation, history, chat messages,
   probes, and cross-family refutation before the next costly experiment.
 license: MIT
 metadata:
-  author: mc
+  author: helm
   version: "1.0.0"
 ---
 
@@ -38,8 +38,8 @@ one weak source.
 1. **Official docs/specs**: product docs, language specs, API references.
 2. **Source**: owner implementation, not only comments or wrappers.
 3. **History**: `git log`, `git blame`, prior commits, and release notes.
-4. **MC messages**: `mc comms poll`, `mc comms lifecycle`, `mc cockpit get`, and
-   relevant conv history.
+4. **Chat messages**: `helm chat read`, `helm chat pending`, and relevant
+   room history.
 5. **Project memory or plans**: prior class, PRD, task, or dogfood evidence.
 6. **Cross-family refutation**: a different model family attacks the premise.
 7. **Cheapest probe**: grep, unit repro, API call, or minimal live check that can
@@ -55,7 +55,7 @@ Before the next costly experiment, answer:
 - What do the official docs or specs say?
 - What does the implementation actually do?
 - What changed in history?
-- What MC message or live state confirms the coordination/runtime fact?
+- What chat message or live state confirms the coordination/runtime fact?
 - What prior class or plan matches?
 - What would a different model family attack?
 - What cheapest probe could disprove the next step?
@@ -70,7 +70,7 @@ Ground-truth cross-reference:
 - docs: <source / NO_DOCS_APPLICABLE>
 - source: <file:line / NOT_IN_CODE>
 - history: <sha/date / NO_HISTORY>
-- mc: <seq/hash/lifecycle/cockpit / NO_MC_RECORD>
+- chat: <seq/hash/room / NO_RECORD>
 - memory_or_plan: <locator / NO_PRIOR_MATCH>
 - cross_family: <verdict / DEGRADED: reason>
 - cheapest_probe: <command/check + result>
@@ -98,5 +98,5 @@ Ground-truth cross-reference:
 
 - `/xchk` for a one-pass user-facing grounded verdict.
 - `decision-spirit` for design/substrate composition calls.
-- `/learn` when the result should become a durable MC rule, skill, hook, or
+- `/learn` when the result should become a durable helm rule, skill, hook, or
   memory.

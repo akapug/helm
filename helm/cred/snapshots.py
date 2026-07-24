@@ -624,7 +624,7 @@ def restore(snapshot_path, config_dir, require_free=False):
         # home, a session launching into this drifted dir in the few ms
         # between this probe and the replaces below starts on bytes we are
         # about to swap. Three probes bracket the window (plan, post-backup
-        # re-probe, here), sesh never launches into DRIFT homes, the occupant
+        # re-probe, here), helm never launches into DRIFT homes, the occupant
         # is snapshotted first so nothing is lost, and that session's own
         # next credential write re-drifts the home so heal refuses (held)
         # thereafter. Accepted residual — not fixable at this layer.

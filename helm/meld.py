@@ -28,26 +28,27 @@ parties sit inside recv polling the room directly at MELD_POLL, so a meld
 never floods the peer's delivery cursor with stale nudges (post-meld
 boundary spam / stop-guard blocks — the mention-backlog class).
 
-Protocol (mc-meld.sh lineage, scars kept):
+Protocol (an earlier prototype's scars kept):
   * every protocol row is epoch-fenced `[MELD e:<epoch>]` — a reused room
     can never replay a dead meld's leftovers into a new session;
   * the invite's protocol head (room + join command) comes FIRST so the
-    200-byte delivery clip can never eat the join instruction (buildr #115,
-    inverted for a head-clip);
+    200-byte delivery clip can never eat the join instruction (inverted from a
+    live incident, for a head-clip);
   * READY carries no floor marker — it is control-only; recv returns it
     exactly once (convener, invited status) and skips it everywhere else
     (codex F1: control echoes are not chunks);
   * recv accepts only PEER rows ending in a real floor marker; own rows and
     unattributable senders are skipped fail-closed (codex F2);
   * state is keyed room × ACTOR (`<room>.meld.<seat-key>.json`) — helm's two
-    seats always share one chat dir, the exact host-global-state clobber the
-    mc-meld live dogfood refuted (test-fixtures-isolated-what-production-shares).
+    seats always share one chat dir, the exact host-global-state clobber an
+    earlier prototype's live dogfood refuted (test-fixtures-isolated-what-
+    production-shares).
 
-Floor markers (the lineage vocabulary, verbatim): [YIELD] hands the floor,
+Floor markers (the protocol vocabulary, verbatim): [YIELD] hands the floor,
 [HOLD] more coming from the same speaker, [DONE] leaving the meld,
 [ABORT] kills it fail-loud (exit 4).
 
-v1 is 2-party (mc-meld precedent); 3+ minds use a plain room + discipline.
+v1 is 2-party (an earlier prototype's precedent); 3+ minds use a plain room + discipline.
 NAMING (premise council-is-the-number-one-feature, owner canon 2026-07-23):
 MELD is the GENUS — `meld` stays the primary verb; `standup` (informal 2+
 convergence, includes this 2-party mindmeld) and `council` (the big FORMAL
@@ -202,7 +203,7 @@ def invite(peer, topic, seat=None, via="meld"):
 def join(room, seat=None, via="meld"):
     """(lines) — join a meld: parse epoch + convener + invited from the seed,
     post the control-only READY (@convener — the wake-back; a READY that
-    lands silently strands GO forever, buildr live-incident), state
+    lands silently strands GO forever, a live incident), state
     joiner/active with idx=0 so the seeded problem is the first recv chunk.
     REFUSES a seat the seed did not invite (live-fire 2026-07-23: a meld
     convened for one seat was consummated by another with zero warning —

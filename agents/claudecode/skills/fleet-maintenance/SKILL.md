@@ -134,14 +134,12 @@ fleet's merges on one family's remaining budget.
 ## 7. Re-grounding a confused (not dead) seat
 
 `cv pack "<task>"` compiles a context bundle from the whole session corpus;
-`cv show <id> --find TERM` reads what a prior seat knew (see `/recall`,
-`/sesh`). Pane-level control (read/wait/send keystrokes, spawn in worktrees)
+`cv show <id> --find TERM` reads what a prior seat knew (see `/recall`).
+Pane-level control (read/wait/send keystrokes, spawn in worktrees)
 is orca's: use the `orca-cli` skill primitives — don't reinvent PTY plumbing.
 
 ## Prior art
 
-Fresh helm-native write (buildr's `maintain-buildr` skill and
-`~/.buildr/cred-rescue-runbook.md` are the ancestors — reboot tiers,
-monitored-pair relaunch, cred/session decoupling all inherited as principles;
-their verbs are buildr/herdr-specific so none port literally). Seat-level
+Fresh helm-native write; reboot tiers, monitored-pair relaunch, and
+cred/session decoupling are inherited as principles. Seat-level
 mechanics: the `seat-relaunch-playbook` maintenance memory.

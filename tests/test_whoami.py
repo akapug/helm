@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""whoami tests — hermetic: tempfile + HELM_HOME/MC_HOME env overrides; never
-touches the real ~/.helm, ~/.mc, ~/.claude."""
+"""whoami tests — hermetic: tempfile + HELM_HOME/HELM_PROFILE_SCAFFOLD env
+overrides; never touches the real ~/.helm, ~/.claude."""
 import contextlib
 import io
 import os
@@ -15,69 +15,69 @@ from helm import home, pk, whoami
 class WhoamiBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.mc_dir = os.path.join(self.tmp.name, "mc-home")
+        self.scaffold_path = os.path.join(self.tmp.name, "scaffold", "profile.json")
         self.envp = mock.patch.dict(os.environ, {
             "HELM_HOME": os.path.join(self.tmp.name, "helm-home"),
-            "MC_HOME": self.mc_dir,
+            "HELM_PROFILE_SCAFFOLD": self.scaffold_path,
         })
         self.envp.start()
         os.environ.pop("MELD_HOME", None)
         # belt+braces: every write in these tests must land inside the tempdir
         self.assertTrue(home.helm_home().startswith(self.tmp.name))
-        self.assertTrue(whoami.mc_profile_path().startswith(self.tmp.name))
+        self.assertTrue(whoami.scaffold_profile_path().startswith(self.tmp.name))
 
     def tearDown(self):
         self.envp.stop()
         self.tmp.cleanup()
 
-    def write_mc(self, profile, path=None):
-        path = path or whoami.mc_profile_path()
+    def write_scaffold(self, profile, path=None):
+        path = path or whoami.scaffold_profile_path()
         pk.write_json(path, profile)
         return path
 
 
 class TestMergeScaffold(WhoamiBase):
-    def test_imports_mc_content_and_bookkeeping(self):
-        path = self.write_mc({"schema_version": 1, "technical_level": "expert",
+    def test_imports_scaffold_content_and_bookkeeping(self):
+        path = self.write_scaffold({"schema_version": 1, "technical_level": "expert",
                               "guidance": ["short replies"], "interview_status": "offered",
                               "updated_at": "2026-07-10T07:04:31Z"},
-                             path=os.path.join(self.tmp.name, "fake-mc", "profile.json"))
-        p = whoami.merge_scaffold(mc_path=path)
+                             path=os.path.join(self.tmp.name, "ext-scaffold", "profile.json"))
+        p = whoami.merge_scaffold(scaffold_path=path)
         self.assertEqual(p["schema_version"], whoami.SCHEMA_VERSION)
         self.assertEqual(p["technical_level"], "expert")
         self.assertEqual(p["guidance"], ["short replies"])
         self.assertEqual(p["interview_status"], "offered")
-        self.assertEqual(p["source"], "merged-from-mc")
+        self.assertEqual(p["source"], "merged-from-scaffold")
         self.assertTrue(os.path.exists(whoami.profile_path()))
 
     def test_idempotent_no_rewrite_on_second_run(self):
-        path = self.write_mc({"technical_level": "technical",
+        path = self.write_scaffold({"technical_level": "technical",
                               "guidance": ["no emojis"], "interview_status": "offered"})
-        first = whoami.merge_scaffold(mc_path=path)
+        first = whoami.merge_scaffold(scaffold_path=path)
         with open(whoami.profile_path()) as f:
             raw = f.read()
-        second = whoami.merge_scaffold(mc_path=path)
+        second = whoami.merge_scaffold(scaffold_path=path)
         self.assertEqual(first, second)
         self.assertEqual(second["guidance"], ["no emojis"])  # no duplicate append
         with open(whoami.profile_path()) as f:
             self.assertEqual(f.read(), raw)  # untouched on no-change
 
-    def test_empty_mc_fields_never_clobber_helm_content(self):
+    def test_empty_scaffold_fields_never_clobber_helm_content(self):
         whoami.save_profile({"schema_version": 2, "technical_level": "technical",
                              "guidance": ["batch deploys"], "interview_status": "done",
                              "updated_at": "", "source": "fresh"})
-        path = self.write_mc({"technical_level": "", "guidance": [],
+        path = self.write_scaffold({"technical_level": "", "guidance": [],
                               "interview_status": "offered"})
-        p = whoami.merge_scaffold(mc_path=path)
+        p = whoami.merge_scaffold(scaffold_path=path)
         self.assertEqual(p["technical_level"], "technical")
         self.assertEqual(p["guidance"], ["batch deploys"])
         self.assertEqual(p["interview_status"], "done")  # offered never downgrades done
         # a no-op merge must NOT stamp the source: an empty scaffold once
-        # clobbered a derived profile's provenance note with "merged-from-mc"
+        # clobbered a derived profile's provenance note with "merged-from-scaffold"
         self.assertEqual(p["source"], "fresh")
 
-    def test_no_mc_profile_is_fresh(self):
-        p = whoami.merge_scaffold(mc_path=os.path.join(self.tmp.name, "nope.json"))
+    def test_no_scaffold_profile_is_fresh(self):
+        p = whoami.merge_scaffold(scaffold_path=os.path.join(self.tmp.name, "nope.json"))
         self.assertEqual(p["source"], "fresh")
         self.assertEqual(p["technical_level"], "")
         self.assertEqual(p["interview_status"], "")
@@ -221,7 +221,7 @@ class TestInterviewConfirm(WhoamiBase):
     POP = {"schema_version": 2, "technical_level": "expert founder-operator",
            "guidance": ["headline first", "never punt", "batch deploys"],
            "interview_status": "offered", "updated_at": "",
-           "source": "derived-from-buildr/mc-corpus 2026-07-19"}
+           "source": "derived-from-corpus 2026-07-19"}
 
     def populate(self):
         whoami.save_profile(dict(self.POP, guidance=list(self.POP["guidance"])))

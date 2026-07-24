@@ -32,7 +32,7 @@ class CredBase(unittest.TestCase):
         homes.DEFAULTS = {"claude": j("default-claude"), "codex": j("default-codex")}
         homes.SHARED_PROJECTS = j("default-claude", "projects")
         homes.ARCHIVE_ROOT = j("helm-home-archive")
-        homes.LEGACY_ARCHIVE_ROOT = j("sesh-home-archive")
+        homes.LEGACY_ARCHIVE_ROOT = j("legacy-home-archive")
         homes._agent_procs = lambda: []
         for r in homes.ROOTS.values():
             os.makedirs(r)

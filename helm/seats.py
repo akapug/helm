@@ -45,7 +45,7 @@ The legs:
               Monitor is the only path.
   * claims  — advisory TTL lease with session+nonce+fence binding and
               monotonic expiry (the worktree-collision class).
-  * stop-guard — Stop hook: the IDLE GATE (buildr/mc arbiter capability,
+  * stop-guard — Stop hook: the IDLE GATE (the work-arbiter capability,
               helm-native). BLOCKS a stop while undelivered mentions/owner
               rows sit past the seat's cursor (once per pending-fingerprint —
               never an infinite loop) or while THIS session holds a live
@@ -1600,9 +1600,9 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
 
 
 # ---------------------------------------------------------------------------
-# stop-guard (Stop hook) — the idle gate. buildr/mc capability, helm-native:
+# stop-guard (Stop hook) — the idle gate. A work-arbiter capability, helm-native:
 # an agent must not idle past its inbox or walk away holding a lease. Arbiter
-# shape (buildr-stop-arbiter law): resolve posture ONCE, inline checks against
+# shape (the stop-arbiter law): resolve posture ONCE, inline checks against
 # it, surface ALL blocking messages in ONE exit-2 (fix everything in one
 # shot); WARN lines ride along without changing the exit. Block-once-per-
 # pending-fingerprint (guard-stop-inbox-beacon law): the FIRST stop on a given
@@ -1684,7 +1684,7 @@ def _off(name):
 # ── stop-whisper: the CONTEXTUAL continuation lane ─────────────────────────
 # Lineage: per-toolcall-whispers-are-the-goal (contextual injection is the END
 # GOAL; the cure for slop is BUDGETS — bytes caps, contextual gating,
-# fail-closed-to-nothing — never removal) + the mc work-arbiter's hold-once-
+# fail-closed-to-nothing — never removal) + the work-arbiter's hold-once-
 # per-fingerprint-then-release + reflex.py's counter thresholds (field-tested
 # 3/8) and salience law. A Stop hook's only agent-visible channel is the
 # block reason (exit 2 stderr), so a whisper IS a soft hold: it fires ONCE

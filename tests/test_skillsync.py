@@ -31,7 +31,7 @@ class FakeEstate(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="helm-skillsync-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         j = os.path.join
-        self.canon = j(self.tmp, "mc-hub", "skills")
+        self.canon = j(self.tmp, "skill-hub", "skills")
         _mk_skill(self.canon, "build", "the build skill", age=9000)
         os.makedirs(j(self.canon, ".system"))          # hidden: stays private
         self.backup = j(self.tmp, "premerge-backup")

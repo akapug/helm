@@ -14,14 +14,14 @@ verb/what -> the surfaced line. So a capability rides the ONE JIT resolver
 gated (generic-only never fires), cap-4, per-session cooldown — with NO parallel
 injector. When the agent's current reasoning touches a capability's trigger, the
 capability surfaces one terse line: "you have <verb>: <what> (wired via <hook>,
-live)". The owner never has to say "reach for cv / a meld / polyana now".
+live)". The owner never has to say "reach for cv / a meld now".
 
 live/absent is a PROBE, not a static fact: a POWERPACK only surfaces if actually
 wired (its MCP server present, or an explicit HELM_CAP_<id> flag). CORE is helm's
 own substrate — always live. VISIBILITY gates the PUBLIC export only: a
-private-hold powerpack (polyana) still surfaces to its OWN wired agent (that is
-the whole point — deep-code-analysis reasoning should reach for it), but helm
-does NOT advertise it in any public powerpack catalog (public_set withholds it).
+private-hold powerpack still surfaces to its OWN wired agent (that is the whole
+point — its reasoning moment should reach for it), but helm does NOT advertise it
+in any public powerpack catalog (public_set withholds it).
 """
 import os
 
@@ -161,21 +161,6 @@ CAPABILITIES = (
         "visibility": VIS_PUBLIC,
         "mcp": "cv",
     },
-    {
-        "id": "polyana",
-        "verb": "polyana (pa_scan / pa_trace / pa_xray)",
-        "tool": "mcp__polyana__pa_scan",
-        "what": "deep cross-language code analysis — run/trace/step-debug/"
-                "bug-scan across 8 languages, findings CONFIRMED by execution",
-        "wired_via": "the polyana MCP server",
-        "keywords": "polyana,deep code analysis,cross-language,cross language,"
-                    "polyglot,step-debug,step through,bug scan,code analysis,"
-                    "find impls,goto def,semantic navigation,confirm impl,"
-                    "trace across languages",
-        "tier": TIER_POWERPACK,
-        "visibility": VIS_HOLD,
-        "mcp": "polyana",
-    },
 )
 
 
@@ -277,10 +262,9 @@ def _entry(cap):
 def live_entries(project=None, env=None):
     """The WIRED capabilities as JIT entries for the inject resolver — every
     capability whose live-probe passes. Visibility is NOT a gate here: a
-    private-hold powerpack (polyana) still surfaces to its OWN wired agent (the
-    deep-code-analysis reasoning moment must reach for it); the hold bars only
-    the PUBLIC export (public_set). Fail-open per row: a raising probe drops
-    that one capability, never the lane."""
+    private-hold powerpack still surfaces to its OWN wired agent (its reasoning
+    moment must reach for it); the hold bars only the PUBLIC export (public_set).
+    Fail-open per row: a raising probe drops that one capability, never the lane."""
     env = os.environ if env is None else env
     mcps = _probe_mcps_if_needed(env)
     out = []
@@ -307,8 +291,8 @@ def all_capabilities(env=None):
 
 
 def public_set(env=None):
-    """The SHAREABLE capability set: public-visibility only. private-hold
-    (polyana) is withheld — helm does not advertise it in any public powerpack
+    """The SHAREABLE capability set: public-visibility only. A private-hold
+    powerpack is withheld — helm does not advertise it in any public powerpack
     catalog (owner packaging note, 2026-07-23)."""
     return [c for c in all_capabilities(env=env) if c.get("visibility") == VIS_PUBLIC]
 

@@ -19,11 +19,11 @@ from .resolve import pinned
 
 
 # ---------------------------------------------------------------------------
-# writers — byte-shape-compatible with the mc writers (same key order)
+# writers — byte-shape-compatible on-disk (same key order)
 # ---------------------------------------------------------------------------
 
 def write_prior(e, root_dir=None, path=None):
-    """Write a prior-*.md (mc priors._write shape). class/load_class re-derived
+    """Write a prior-*.md (the prior-*.md shape). class/load_class re-derived
     on write so a stale authored value can never desync from confidence."""
     if path is None:
         path = os.path.join(root_dir or _default_dir("prior"),
@@ -95,7 +95,7 @@ def write_prior(e, root_dir=None, path=None):
 
 
 def _lexicon_path(term, scope, root_dir=None):
-    """The mc term_path law: global -> lex-<term>.md; narrower authored scope
+    """The term_path law: global -> lex-<term>.md; narrower authored scope
     prefixes lex-<scope-slug>--<term>.md so a project define never clobbers
     global."""
     name = "lex-" + _slug(term) + ".md" if scope == "global" \
@@ -104,7 +104,7 @@ def _lexicon_path(term, scope, root_dir=None):
 
 
 def write_lexicon(e, root_dir=None, path=None):
-    """Write a lex-*.md (mc lexicon._write_term shape)."""
+    """Write a lex-*.md (the lex-*.md shape)."""
     term = e.get("term") or str(e.get("id") or "")
     scope = e.get("term_scope") or "global"
     if path is None:
@@ -152,7 +152,7 @@ def write_lexicon(e, root_dir=None, path=None):
 
 
 def write_heuristic(e, root_dir=None, path=None):
-    """Write a heuristic-*.md (mc heuristics_store._write shape). confidence is
+    """Write a heuristic-*.md (the heuristic-*.md shape). confidence is
     always 1 (a move, not a belief) so it is NOT a field; load_class always jit."""
     if path is None:
         path = os.path.join(root_dir or _default_dir("heuristic"),
@@ -250,7 +250,7 @@ _WRITERS = {"prior": write_prior, "heuristic": write_heuristic,
 
 
 # ---------------------------------------------------------------------------
-# lifecycle — evidence, supersede, retire (the mc laws, root-aware)
+# lifecycle — evidence, supersede, retire (the lifecycle laws, root-aware)
 # ---------------------------------------------------------------------------
 
 def apply_evidence(pid, ts, delta, reason, by="agent", kind=None, project=None):

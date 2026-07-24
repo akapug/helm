@@ -93,7 +93,7 @@ class TestWebQuota(unittest.TestCase):
         homes.DEFAULTS = {"claude": j("default-claude"), "codex": j("default-codex")}
         homes.SHARED_PROJECTS = j("default-claude", "projects")
         homes.ARCHIVE_ROOT = j("helm-home-archive")
-        homes.LEGACY_ARCHIVE_ROOT = j("sesh-home-archive")
+        homes.LEGACY_ARCHIVE_ROOT = j("legacy-home-archive")
         homes._agent_procs = lambda: []
         for r in homes.ROOTS.values():
             os.makedirs(r)
@@ -167,7 +167,7 @@ class TestWebQuota(unittest.TestCase):
                     "name_lies", "active", "tier", "headroom", "state", "status",
                     "resets_at_ms", "windows_left", "windows_per_week",
                     "windows_verdict"):
-            self.assertIn(key, row, "sesh /api/creds shape: missing %s" % key)
+            self.assertIn(key, row, "/api/creds shape: missing %s" % key)
         self.assertEqual(row["name"], ACCT)
         self.assertEqual(row["state"], "ok")
         self.assertEqual(row["headroom"], 72.5)
@@ -181,7 +181,7 @@ class TestWebQuota(unittest.TestCase):
         try:
             status, d = self.req("/api/creds")
             self.assertEqual(status, 200, "creds must never 500")
-            # sesh shape on ProviderError is [] ; {"unavailable": true} also legal
+            # the shape on ProviderError is [] ; {"unavailable": true} also legal
             self.assertTrue(d == [] or (isinstance(d, dict) and d.get("unavailable")),
                             "expected empty-or-unavailable, got %r" % d)
         finally:

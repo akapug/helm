@@ -35,13 +35,12 @@ BIND = "127.0.0.1"
 DEFAULT_PORT = 7433
 UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_ui.html")
 
-# Per-process anti-CSRF bearer (sesh's MUTATION_TOKEN, ported): a hostile page
-# can fire cross-origin POSTs at 127.0.0.1 but can never READ our UI to learn
-# the token, so EVERY POST demands it (403 without). It reaches the browser by
-# template substitution — _ui() replaces __HELM_TOKEN__ when serving the page.
-# HELM_API_TOKEN (legacy SESH_API_TOKEN) pins it; else fresh each process.
-MUTATION_TOKEN = (os.environ.get("HELM_API_TOKEN")
-                  or os.environ.get("SESH_API_TOKEN") or secrets.token_hex(16))
+# Per-process anti-CSRF bearer: a hostile page can fire cross-origin POSTs at
+# 127.0.0.1 but can never READ our UI to learn the token, so EVERY POST demands
+# it (403 without). It reaches the browser by template substitution — _ui()
+# replaces __HELM_TOKEN__ when serving the page.
+# HELM_API_TOKEN pins it; else fresh each process.
+MUTATION_TOKEN = (os.environ.get("HELM_API_TOKEN") or secrets.token_hex(16))
 
 # One store entry projects to these keys on the wire — the strip never needs bodies.
 ENTRY_KEYS = ("id", "type", "confidence", "load_class", "scope")
@@ -218,13 +217,13 @@ def _api_configs_cascade(qs):
     return configs.resolve(home_p, cwd, harness), 200
 
 
-# ── configs editor surface (sesh /api/configs/* contracts, ported exactly) ──
+# ── configs editor surface (the /api/configs/* contracts) ──
 # configs.py owns all behavior (recognition gate, backup→validate→atomic write,
 # entry ops, restore); these handlers only adapt query/payload shapes.
 
 def _api_configs_tree(qs):
     """The cwd tree of dirs holding project configs. ?root= narrows the scan;
-    live session cwds are folded in (sesh: catalog rows' cwd)."""
+    live session cwds are folded in (from catalog rows' cwd)."""
     from . import configs
     cwds = []
     try:
@@ -242,7 +241,7 @@ def _api_configs_homes():
 
 def _api_configs_resolve(qs):
     """What a seat (home, cwd, harness) loads — the cascade with MCP
-    winner/shadowed annotation. home= is a name or a path (sesh contract)."""
+    winner/shadowed annotation. home= is a name or a path."""
     from . import configs
     hp = _resolve_home_path(_q1(qs, "home") or "")
     if not hp:
@@ -253,7 +252,7 @@ def _api_configs_resolve(qs):
 
 def _api_configs_file(qs):
     """One recognized config file's content (+editability). Refusals answer 200
-    with an error field + empty content — the sesh contract the UI renders."""
+    with an error field + empty content — the contract the UI renders."""
     from . import configs
     p = _q1(qs, "path")
     if not p:
@@ -369,9 +368,8 @@ def _api_skills_delete(payload):
 
 
 # ── quota surface: creds / history / burn / allocate / status / homes ──
-# ABSORBED from sesh (server/sesh.py route handlers, behavior-preserving):
-# same JSON shapes, so the ported quota UI works unmodified. providers.py owns
-# every fact about accounts/windows/history; these handlers only cache + join.
+# providers.py owns every fact about accounts/windows/history; these handlers
+# only cache + join.
 
 _qlock = threading.Lock()
 _qstate = {}
@@ -388,7 +386,7 @@ def _provider():
 
 
 def _cached(key, ttl, fn):
-    """Single-flight TTL cache (ported from sesh): concurrent misses on one key
+    """Single-flight TTL cache: concurrent misses on one key
     share one build instead of racing."""
     while True:
         with _qlock:
@@ -580,7 +578,7 @@ def get_burn(hours=48):
 
 def _alloc_models():
     return (os.environ.get("HELM_ALLOC_MODELS")
-            or os.environ.get("SESH_ALLOC_MODELS") or "fable,opus,gpt-5.5").split(",")
+            or "fable,opus,gpt-5.5").split(",")
 
 
 def get_allocations():
@@ -640,7 +638,7 @@ def _api_allocate():
 
 
 def _api_quota_status():
-    """Same shape as sesh /api/status: is a provider present, how many accounts,
+    """The /api/status shape: is a provider present, how many accounts,
     does cv exist, how big is the cached catalog."""
     import shutil
     try:
@@ -657,8 +655,7 @@ def _api_quota_status():
     return {
         "provider": {"configured": qcli,
                      "present": qcli == "native" or bool(shutil.which(
-                         os.environ.get("HELM_QUOTA_CLI")
-                         or os.environ.get("SESH_QUOTA_CLI") or "tokaware")),
+                         os.environ.get("HELM_QUOTA_CLI") or "quota")),
                      "accounts": creds_n,
                      "degraded": creds_n == 0,
                      "fallback": "(default) account resume works without a provider"},
@@ -672,7 +669,7 @@ def _api_quota_status():
 # ── credential homes: the quota view's homes card (homes.py backend) ──
 
 def _api_homes():
-    """Every credential home (live, broken-alias, archived) — sesh /api/homes shape."""
+    """Every credential home (live, broken-alias, archived) — /api/homes shape."""
     try:
         from . import homes
         return homes.homes_list()
@@ -1615,10 +1612,10 @@ def _api_ledger_native(qs):
 
 
 # ── sessions surface: catalog / search / session / cmd / cwd / prune ──
-# ABSORBED contracts from sesh (server/sesh.py route handlers): same query
-# params + response shapes, thin wrappers over transcripts.py (which owns the
-# behavior: single-flight caches, cv seams, overrides). Same degrade law: an
-# unexpected failure answers {"unavailable": true}, never a 500.
+# Session-read contracts: query params + response shapes, thin wrappers over
+# transcripts.py (which owns the behavior: single-flight caches, cv seams,
+# overrides). Degrade law: an unexpected failure answers {"unavailable": true},
+# never a 500.
 
 def _transcripts():
     from . import transcripts
@@ -1627,7 +1624,7 @@ def _transcripts():
 
 def _catalog_opensession(rows):
     """Catalog rows with OpenSession-aligned metadata names (cwd is metadata,
-    never identity) — sesh /api/catalog?format=opensession, ported."""
+    never identity) — /api/catalog?format=opensession."""
     return [{
         "harness": r["h"], "id": r["i"], "cwd": r.get("cwd") or r["c"], "title": r["t"],
         "git": {"branch": r["b"]} if r["b"] else {},
@@ -1687,7 +1684,7 @@ def _api_cmd(qs):
         return {"error": "need sid="}, 400
     acct = _q1(qs, "account")
     if not acct:
-        # sesh's degraded-account handling: with no provider (or none reporting)
+        # degraded-account handling: with no provider (or none reporting)
         # an omitted account is well-defined — the machine's default account.
         try:
             degraded = not get_creds()
@@ -1930,7 +1927,7 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 
 
 # ---------- the SSE doorbell (REARCH-web-0.2 leg 2: poll -> push) ----------
-# The lineage's settled pattern (builders.dev firehose / MC ramspace / glue):
+# The settled pattern (builders.dev firehose / a ramspace / glue):
 # push says "there's news", the EXISTING cursor read fetches it — events are
 # DOORBELLS, never payloads, so the read endpoints stay the one render truth.
 # ONE watcher thread stat-sweeps the chat room dir (tmpfs, ~13 files) every
@@ -1940,7 +1937,7 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 # every 20s + no-cache/no-transform (the glue anti-proxy-buffering pair);
 # EventSource gives the client auto-reconnect for free.
 # ---------- the SSE doorbell (REARCH-web-0.2 leg 2: poll -> push) ----------
-# The lineage's settled pattern (builders.dev firehose / MC ramspace / glue):
+# The settled pattern (builders.dev firehose / a ramspace / glue):
 # push says "there's news", the EXISTING cursor read fetches it — events are
 # DOORBELLS, never payloads, so the read endpoints stay the one render truth.
 #
@@ -2149,7 +2146,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "not found: %s" % path}, 404)
         # mutations are NEVER open: browser CSRF can fire cross-origin POSTs at
         # 127.0.0.1, so every mutation demands the per-process bearer the UI
-        # carries (sesh's _mut_authed, ported; helm answers 403).
+        # carries (the _mut_authed gate; helm answers 403).
         if self.headers.get("Authorization", "") != "Bearer " + MUTATION_TOKEN:
             return self._json({"error": "forbidden (mutations always require "
                                         "the bearer token the UI carries)"}, 403)
@@ -2252,7 +2249,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = f.read()
         except OSError:
             return self._json({"error": "web_ui.html missing beside web.py"}, 500)
-        # the sesh token hand-off, ported: the UI file stays raw on disk; the
+        # the token hand-off: the UI file stays raw on disk; the
         # per-process mutation bearer is templated in at serve time.
         body = body.replace(b"__HELM_TOKEN__", MUTATION_TOKEN.encode())
         self._send(body, "text/html; charset=utf-8", no_cache=True)
