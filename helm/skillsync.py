@@ -266,9 +266,13 @@ def sync(canon=None, dirs=None, backup_root=None, apply=False):
         if canon != os.path.realpath(DEFAULT_CANONICAL):
             return {"error": "canonical skills dir missing: %s (set "
                              "HELM_SKILLS_CANONICAL or restore the canonical hub)" % canon}
-        if not apply:  # a dry-run must NOT mutate a fresh HOME
-            return {"changes": [], "note": "fresh install \u2014 run `helm skillsync "
-                    "--apply` to seed the canonical hub at %s" % canon}
+        if not apply:  # a dry-run must NOT mutate a fresh HOME; return the FULL
+            # result shape (empty) so cmd_sync renders it, + a note that guides
+            # the fresh install to `--apply`
+            return {"canonical": canon, "backup_root": backup_root, "apply": False,
+                    "merged": [], "wired": [], "failed": [],
+                    "note": "fresh install - run `helm skills sync --apply` to "
+                            "seed the canonical hub at %s" % canon}
         os.makedirs(canon, exist_ok=True)  # fresh install: seed the hub on apply
     if dirs is None:
         dirs = config_dirs()
@@ -302,6 +306,8 @@ def cmd_sync(args):
         return 1
     mode = "APPLIED" if apply else "dry-run (--apply to execute)"
     print("helm skills sync [%s] — canonical: %s" % (mode, r["canonical"]))
+    if r.get("note"):
+        print("  " + r["note"])
     for name, action in r["merged"]:
         print("  merge  %-24s %s" % (name, action))
     changed = 0
