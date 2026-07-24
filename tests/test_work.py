@@ -322,8 +322,8 @@ class UnguardedRoomTest(WorkBase):
         with open(os.path.join(d, run + ".json"), "w") as f:
             json.dump({"runId": run, "status": status}, f)
         sessions = {sid} if live else set()
-        with mock.patch.object(work, "_claude_homes", return_value=[home]), \
-                mock.patch.object(work, "_live_claude_sessions",
+        with mock.patch.object(work._lanes, "_claude_homes", return_value=[home]), \
+                mock.patch.object(work._lanes, "_live_claude_sessions",
                                   return_value=sessions):
             yield
 
@@ -344,8 +344,8 @@ class UnguardedRoomTest(WorkBase):
         with open(os.path.join(d, room + ".jsonl"), "w") as f:
             f.write(json.dumps(msg) + "\n")
         sessions = {sid} if live else set()
-        with mock.patch.object(work, "_claude_homes", return_value=[home]), \
-                mock.patch.object(work, "_live_claude_sessions",
+        with mock.patch.object(work._lanes, "_claude_homes", return_value=[home]), \
+                mock.patch.object(work._lanes, "_live_claude_sessions",
                                   return_value=sessions):
             yield
 
@@ -432,8 +432,8 @@ class UnguardedRoomTest(WorkBase):
 
     def test_missing_harness_metadata_fails_unknown(self):
         self.foreign("wf_orphan00-7")
-        with mock.patch.object(work, "_claude_homes", return_value=[]), \
-                mock.patch.object(work, "_live_claude_sessions", return_value=set()):
+        with mock.patch.object(work._lanes, "_claude_homes", return_value=[]), \
+                mock.patch.object(work._lanes, "_live_claude_sessions", return_value=set()):
             rc, out, _err = self.work("list")
         self.assertIn("UNGUARDED UNKNOWN", out)
         self.assertIn("no matching harness metadata", out)
@@ -446,7 +446,7 @@ class UnguardedRoomTest(WorkBase):
         os.symlink(target, path)
         records = [{"path": path, "branch": "refs/heads/worktree-wf_escape00-8",
                     "locked": False, "reason": ""}]
-        with mock.patch.object(work, "_room_status") as status_call:
+        with mock.patch.object(work._lanes, "_room_status") as status_call:
             rows, errors = work.unguarded_inventory(self.root, registered=records)
         self.assertEqual(errors, [])
         self.assertEqual(rows[0]["harness"], "unknown")
@@ -459,7 +459,7 @@ class UnguardedRoomTest(WorkBase):
         self.assertEqual(_sh(path, "git", "init", "-q").returncode, 0)
         records = [{"path": path, "branch": "refs/heads/worktree-wf_foreign0-9",
                     "locked": False, "reason": ""}]
-        with mock.patch.object(work, "_room_status") as status_call:
+        with mock.patch.object(work._lanes, "_room_status") as status_call:
             rows, _errors = work.unguarded_inventory(self.root, registered=records)
         self.assertIn("not a regular worktree link", rows[0]["hard_unknown"])
         status_call.assert_not_called()
@@ -471,7 +471,7 @@ class UnguardedRoomTest(WorkBase):
         path = os.path.join(self.root, ".claude", "worktrees", "wf_parent00-1")
         records = [{"path": path, "branch": "refs/heads/worktree-wf_parent00-1",
                     "locked": False, "reason": ""}]
-        with mock.patch.object(work, "_room_status") as status_call:
+        with mock.patch.object(work._lanes, "_room_status") as status_call:
             rows, _errors = work.unguarded_inventory(self.root, registered=records)
         self.assertIn("container escapes", rows[0]["hard_unknown"])
         status_call.assert_not_called()
@@ -482,7 +482,7 @@ class PorcelainSafetyTest(WorkBase):
         weird = os.fsencode(self.root) + b"/.claude/worktrees/agent-deadbeef\\\n\xff"
         raw = (b"worktree " + weird + b"\0HEAD abc\0branch refs/heads/x\0"
                b"locked because\0\0")
-        with mock.patch.object(work, "_git_bytes", return_value=(0, raw, b"")):
+        with mock.patch.object(work._lanes, "_git_bytes", return_value=(0, raw, b"")):
             rows, error = work._worktree_records(self.root)
         self.assertIsNone(error)
         self.assertEqual(os.fsencode(rows[0]["path"]), weird)
@@ -490,9 +490,9 @@ class PorcelainSafetyTest(WorkBase):
         self.assertEqual(rows[0]["reason"], "because")
 
     def test_worktree_registry_failure_and_truncation_are_not_empty_success(self):
-        with mock.patch.object(work, "_git_bytes", return_value=(1, b"", b"boom")):
+        with mock.patch.object(work._lanes, "_git_bytes", return_value=(1, b"", b"boom")):
             self.assertEqual(work._worktree_records(self.root), ([], "boom"))
-        with mock.patch.object(work, "_git_bytes",
+        with mock.patch.object(work._lanes, "_git_bytes",
                                return_value=(0, b"worktree /tmp/no-nul", b"")):
             rows, error = work._worktree_records(self.root)
         self.assertEqual(rows, [])
@@ -539,7 +539,7 @@ class PorcelainSafetyTest(WorkBase):
         self.assertIn("deleted", row["unknown"])
         record = (b"1 .M S.M. 160000 160000 160000 a b sub\0")
         fake_stat = os.stat(path)
-        with mock.patch.object(work, "_git_bytes", return_value=(0, record, b"")), \
+        with mock.patch.object(work._lanes, "_git_bytes", return_value=(0, record, b"")), \
                 mock.patch.object(work.os, "lstat", return_value=fake_stat):
             row = work._room_status(path)
         self.assertIn("submodule", row["unknown"])
@@ -572,7 +572,7 @@ class PorcelainSafetyTest(WorkBase):
         with open(os.path.join(path, "ignored", "secret"), "w") as f:
             f.write("ignored")
         self.assertFalse(work._room_status(path)["dirty"])
-        with mock.patch.object(work, "_git_bytes",
+        with mock.patch.object(work._lanes, "_git_bytes",
                                return_value=(-1, b"", b"timeout")):
             row = work._room_status(path)
         self.assertTrue(row["dirty"])
@@ -735,7 +735,7 @@ class GuardTest(WorkBase):
                 raise OSError("injected install failure")
             return real(path, snap)
 
-        with mock.patch.object(work, "_put_snapshot", side_effect=fail_third):
+        with mock.patch.object(work._guard, "_put_snapshot", side_effect=fail_third):
             rc, _out, err = self.work("install-guard", "--apply")
         self.assertEqual(rc, 1)
         self.assertIn("rolled back", err)
