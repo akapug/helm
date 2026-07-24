@@ -2036,10 +2036,10 @@ an unsafe/unreadable ledger is **UNAVAILABLE / owner debt UNKNOWN** on both
 `list` (nonzero) and stop-whisper, never silently rendered as zero. Mutations
 still never traceback, and a failed `add` says NOT RECORDED loudly.
 
-### `helm dispatch send <recipient> <lane> <message...> --ref TIP [--key K] | add <recipient> <lane> --ref TIP | verdict <id> <full-reviewed-tip> <evidence> | list [--open|--overdue] [--json]`
+### `helm dispatch send <recipient> <lane> <message...> --ref TIP [--key K] | add <recipient> <lane> --ref TIP | verdict <id> <full-reviewed-tip> <evidence> | cancel <id> <reason...> | list [--open|--overdue] [--json]`
 
 The DISPATCH ledger is the durable obligation behind work handed to another
-seat. The shipping surface is deliberately small — three events, immutable
+seat. The shipping surface is deliberately small — four events, immutable
 rows, no exactly-once machinery:
 
 * **`send`** persists the obligation FIRST, then attempts exactly one DM. The
@@ -2053,10 +2053,16 @@ rows, no exactly-once machinery:
 * **`add`** records a handoff performed by another transport; it still
   requires `--ref`, so no new row is ever born without the exact tip its
   verdict must name. Its delivery starts NEEDS CONFIRMATION.
-* **`verdict`** is the ONLY closer. It takes the full exact reviewed commit
-  id and refuses unless it equals the row's dispatched tip — a stale verdict
-  can never close moved work. Identical verdict retries are idempotent;
+* **`verdict`** closes a REVIEWED obligation. It takes the full exact reviewed
+  commit id and refuses unless it equals the row's dispatched tip — a stale
+  verdict can never close moved work. Identical verdict retries are idempotent;
   conflicting ones are refused.
+* **`cancel`** honestly ABANDONS an open obligation with a reason — the only
+  truthful terminal when a verdict will never come (recipient departed, work
+  moot, superseded). It binds no reviewed tip, refuses a dispatch that already
+  carries a verdict (that one is already honestly closed), and drops the row
+  from every open / overdue / land read — so a stranded dispatch stops nagging
+  the idle-watchdog without laundering a review that never happened.
 
 There is **no ack, bind, or retarget** — those verbs are gone. Historical
 ref-less rows (the short-lived v2 schema) stay visible as **NEEDS

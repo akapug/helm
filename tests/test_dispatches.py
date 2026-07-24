@@ -795,5 +795,183 @@ class LedgerSeparationTest(DispatchBase):
         self.assertIs(dispatches.eventledger, ownerasks.eventledger)
 
 
+class CancelTest(DispatchBase):
+    """`helm dispatch cancel <id> <reason>` — the honest terminal event for an
+    ABANDONED dispatch (recipient gone / work moot), distinct from a verdict.
+    Closes the gap the idle-dispatch watchdog exposed: today a stranded
+    dispatch could only be closed by a FALSE verdict laundering a review that
+    never happened."""
+
+    def test_cancel_closes_an_open_dispatch_and_records_the_reason(self):
+        row = self.add(lane="stranded")
+        self.assertIn(row["id"], [r["id"] for r in dispatches.open_rows()])
+        out, why = dispatches.mark_cancel(row["id"], "recipient gone, work moot")
+        self.assertIsNone(why)
+        self.assertEqual(out["status"], "cancelled")
+        self.assertEqual(out["cancel_reason"], "recipient gone, work moot")
+        self.assertEqual(dispatches.open_rows(), [])          # dropped from open
+
+    def test_cancel_replays_cancelled_from_a_FRESH_disk_snapshot(self):
+        # the event must survive an append-only replay, not just live in RAM
+        row = self.add()
+        dispatches.mark_cancel(row["id"], "abandoned")
+        replayed = dispatches.snapshot()[0][row["id"]]        # re-read from disk
+        self.assertEqual(replayed["status"], "cancelled")
+        self.assertEqual(replayed["cancel_reason"], "abandoned")
+
+    def test_cancel_is_terminal_and_idempotent_on_the_same_reason(self):
+        row = self.add()
+        first, why = dispatches.mark_cancel(row["id"], "moot")
+        self.assertIsNone(why)
+        again, why = dispatches.mark_cancel(row["id"], "moot")     # idempotent
+        self.assertIsNone(why)
+        self.assertEqual(again["status"], "cancelled")
+        self.assertEqual(len(dispatches.history(row["id"])), 2)    # open + cancel
+        _r, why = dispatches.mark_cancel(row["id"], "different")   # not re-writable
+        self.assertIn("already cancelled", why)
+
+    def test_a_verdicted_dispatch_cannot_be_cancelled(self):
+        row = self.add()
+        dispatches.mark_verdict(row["id"], self.a, "reviewed")
+        _r, why = dispatches.mark_cancel(row["id"], "too late")
+        self.assertIn("already has a verdict", why)
+
+    def test_a_cancelled_dispatch_cannot_be_verdicted(self):
+        row = self.add()
+        dispatches.mark_cancel(row["id"], "abandoned")
+        _r, why = dispatches.mark_verdict(row["id"], self.a, "reviewed")
+        self.assertIsNotNone(why)                              # cancelled is terminal
+        self.assertEqual(dispatches.snapshot()[0][row["id"]]["status"], "cancelled")
+
+    def test_cancel_requires_a_reason(self):
+        row = self.add()
+        _r, why = dispatches.mark_cancel(row["id"], "")
+        self.assertIn("reason", why)
+        self.assertEqual(dispatches.snapshot()[0][row["id"]]["status"], "open")
+
+    def test_cancel_of_no_such_dispatch_is_refused(self):
+        _r, why = dispatches.mark_cancel("deadbeefdeadbeef", "nope")
+        self.assertIn("no such dispatch", why)
+
+    def test_a_cancelled_dispatch_is_not_overdue_nor_a_stop_candidate(self):
+        # the whole point: cancelling a STRANDED dispatch stops the watchdog
+        row = self.add(lane="ghost", deadline_s=60)
+        self.age(row["id"], 3600)                              # 1h old, deadline 60s
+        self.assertTrue(dispatches.overdue())                 # overdue while open
+        cand, _kind, _un = dispatches.stop_candidate()
+        self.assertEqual(cand["id"], row["id"])               # a stop candidate WHILE open
+        dispatches.mark_cancel(row["id"], "recipient absent")
+        self.assertEqual(dispatches.overdue(), [])            # silent once cancelled
+        cand, _kind, _un = dispatches.stop_candidate()
+        self.assertIsNone(cand)
+        rc, out, _err = run(dispatches.cmd_dispatch, ["list", "--open"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn(row["id"], out)                      # gone from list --open
+
+    def test_blocked_dm_cancel_race_appends_no_late_delivered(self):
+        # THE RACE (codex-3 xrev): send() releases the lock for the DM; a
+        # concurrent cancel terminalizes the row; when the DM returns,
+        # _mark_delivered must NOT append a delivered event onto the cancelled
+        # row nor report it observed/pending.
+        row = self.add(lane="raced")
+        dispatches.mark_cancel(row["id"], "recipient absent")
+        before = len(dispatches.history(row["id"]))           # [dispatch, cancel]
+        observed, err = dispatches._mark_delivered(row["id"], "late-dm-post")
+        self.assertIsNone(err)
+        self.assertEqual(observed["status"], "cancelled")     # true state, not observed
+        self.assertNotEqual(observed.get("delivery"), "observed")
+        self.assertEqual(len(dispatches.history(row["id"])), before)   # NO late event
+        self.assertEqual(dispatches.open_rows(), [])          # no open / overdue leak
+        self.assertEqual(dispatches.overdue(), [])
+
+    def test_send_render_is_honest_when_cancelled_mid_delivery(self):
+        # the CLI must surface CANCELLED, never a false "PENDING VERDICT", when a
+        # cancel lands during send's DM window
+        holder = {}
+
+        def dm_cancels_then_delivers(*a, **k):
+            r = dispatches.open_rows()[0]                      # the just-persisted row
+            holder["id"] = r["id"]
+            dispatches.mark_cancel(r["id"], "cancelled mid-DM")
+            return {"id": "delivered-post"}, None
+        with mock.patch.object(seats, "dm", side_effect=dm_cancels_then_delivers):
+            rc, out, _err = run(dispatches.cmd_dispatch,
+                                ["send", "codex-3", "raced-lane", "hello",
+                                 "--ref", self.a, "--repo", self.repo])
+        self.assertEqual(rc, 0)
+        self.assertIn("CANCELLED", out)
+        self.assertNotIn("PENDING VERDICT", out)
+        self.assertEqual(len(dispatches.history(holder["id"])), 2)     # no delivered
+        self.assertEqual(
+            dispatches.snapshot()[0][holder["id"]]["status"], "cancelled")
+
+    def test_apply_terminal_guard_blocks_a_compat_verdict_or_retarget(self):
+        # HIGH1 (codex-3 xrev): once terminal, NO later event — including a
+        # legacy-compat verdict/retarget — may convert the status or move the
+        # tip. Probe _apply directly with a legacy (v!=3) CANCELLED state.
+        cancelled = {"id": "a" * 16, "status": "cancelled", "v": 1, "seq": 1,
+                     "tip": "b" * 40, "cancel_reason": "moot"}
+        compat_verdict = {"id": "a" * 16, "status": "verdict",
+                          "verdict_ref": "forged", "reviewed_tip": "b" * 40,
+                          "ts": "2026-07-01T00:00:00Z"}      # pre-boundary => compat
+        self.assertEqual(dispatches._apply(cancelled, compat_verdict), cancelled)
+        compat_retarget = {"id": "a" * 16, "event": "retarget", "tip": "c" * 40,
+                           "ts": "2026-07-01T00:00:00Z"}
+        self.assertEqual(dispatches._apply(cancelled, compat_retarget), cancelled)
+
+    def test_malformed_numeric_wire_types_cannot_close_a_dispatch(self):
+        # HIGH2 (codex-3 xrev): bool is an int subclass and == let True==1 /
+        # 1.0==1, so a forged strict cancel with a bool/float seq once closed
+        # the dispatch. The type-exact strict gate now rejects them.
+        row = self.add()                                      # v3 open, seq 0
+        for bad_seq in (True, 1.0):
+            forged = {"v": 3, "event": "cancel", "seq": bad_seq, "id": row["id"],
+                      "ts": "2026-07-24T00:00:00Z", "reason": "forged"}  # post-boundary
+            eventledger.append_unlocked(dispatches.ledger_path(), forged)
+        self.assertEqual(dispatches.snapshot()[0][row["id"]]["status"], "open")
+
+    def test_malformed_genesis_seq_type_creates_no_state(self):
+        # HIGH2: a genesis whose seq is a bool must not open an obligation
+        forged = {"v": 3, "event": "dispatch", "seq": True, "id": "d" * 32,
+                  "status": "open", "tip": "e" * 40, "ts": "2026-07-24T00:00:00Z",
+                  "recipient": "codex-3", "lane": "L", "deadline_s": 3600}
+        eventledger.append_unlocked(dispatches.ledger_path(), forged)
+        self.assertNotIn("d" * 32, dispatches.snapshot()[0])
+
+    def test_a_disk_cancelled_row_never_surfaces_in_idle_dispatch_scan(self):
+        # the watchdog reads open_rows(); a cancelled row is excluded, so it can
+        # never be flagged stranded (codex-3 xrev: exercise the real scan)
+        from helm import idle_dispatch
+        row = self.add(lane="ghost")
+        self.age(row["id"], 100000)                           # past the soft window
+        dispatches.mark_cancel(row["id"], "recipient absent")
+        self.assertFalse(any(f["id"] == row["id"] for f in idle_dispatch.scan()))
+
+    def test_a_cancelled_dispatch_is_not_a_land_loop(self):
+        # landreq reads the FULL snapshot; a cancelled row (has a tip) must be
+        # excluded, else it tracks forever as an AWAITING_REVIEW land loop
+        from helm import landreq
+        row = self.add(lane="ghost-lane")
+        dispatches._mark_delivered(row["id"], "post-1")
+        loops, unavailable = landreq.project()
+        self.assertIsNone(unavailable)
+        self.assertIn(row["id"], loops)                       # a loop while open
+        dispatches.mark_cancel(row["id"], "abandoned")
+        loops, _ = landreq.project()
+        self.assertNotIn(row["id"], loops)                    # gone once cancelled
+
+    def test_cancel_verb_cli_end_to_end(self):
+        row = self.add(lane="cli")
+        rc, out, _err = run(dispatches.cmd_dispatch,
+                            ["cancel", row["id"], "recipient", "gone"])
+        self.assertEqual(rc, 0)
+        self.assertIn("CANCELLED", out)
+        self.assertIn("recipient gone", out)
+        # missing reason -> usage rc 2, no state change
+        rc, _out, err = run(dispatches.cmd_dispatch, ["cancel", row["id"]])
+        self.assertEqual(rc, 2)
+        self.assertIn("usage: helm dispatch cancel", err)
+
+
 if __name__ == "__main__":
     unittest.main()

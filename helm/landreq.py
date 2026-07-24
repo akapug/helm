@@ -22,7 +22,9 @@ opportunities to optimize workflows"):
                    landing target when no upstream is configured
 
 Landing is observed only once a verdict is attached (READY is where landing
-arms), matching the dispatch ledger's own three-event grammar. Verdict polarity
+arms), matching the dispatch ledger's own grammar. A CANCELLED dispatch is
+abandoned, never a land loop — excluded upstream, before it reaches a state.
+Verdict polarity
 (PASS vs REFUTE) and SUPERSEDED are not expressible on the reduced dispatch
 ledger, so REFUTED/SUPERSEDED are deferred to a later revision. Stdlib-only,
 import-safe, read-only: list/show/stalls never mutate.
@@ -210,8 +212,9 @@ def project(now=None):
     by_id = dispatches.events_by_id()   # one grouped ledger read, not N reparses
     cache, out = {}, {}
     for rid, row in current.items():
-        if row.get("migration") or not row.get("tip"):
-            continue
+        if row.get("migration") or not row.get("tip") \
+                or row.get("status") == "cancelled":
+            continue        # a cancelled dispatch is abandoned — no land loop
         try:
             out[rid] = _lr(row, by_id.get(rid, ()), cache, now)
         except Exception:

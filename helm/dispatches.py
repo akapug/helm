@@ -5,8 +5,12 @@ Shipping state is deliberately small:
 
 * ``dispatch`` opens one exact-tip obligation (persisted before delivery),
 * ``delivered`` records that the local DM call returned a row,
-* ``verdict`` is the only closer and names the exact reviewed tip.
+* ``verdict`` closes an obligation by naming the exact reviewed tip,
+* ``cancel`` honestly ABANDONS an open obligation with a reason (no reviewed
+  tip) — the truthful terminal when a verdict will never come (recipient gone,
+  work moot), so a stranded row need never be closed by a false verdict.
 
+Both ``verdict`` and ``cancel`` are terminal and mutually exclusive.
 No ACK, retarget, bind, replay-time branch/worktree lookup, automatic retry, or
 cross-crash exactly-once claim. Ambiguous delivery remains open as NEEDS
 CONFIRMATION; retrying the same operation never sends again. Deadlines are
@@ -128,7 +132,7 @@ def _pre_boundary(ts):
 def _int_seq(value, fallback):
     """Adopt a row's seq only when it is a real integer — a type-corrupt seq
     must never enter replay state, where int(state.seq)+1 would crash."""
-    return value if isinstance(value, int) else fallback
+    return value if type(value) is int else fallback   # bool is an int subclass
 
 
 def _valid_identity(row):
@@ -136,7 +140,7 @@ def _valid_identity(row):
         return False
     if not _TOKEN.fullmatch(str(row.get("recipient") or "")):
         return False
-    if row.get("seq") is not None and not isinstance(row.get("seq"), int):
+    if row.get("seq") is not None and type(row.get("seq")) is not int:
         return False              # type-corrupt seq would crash replay
     lane, err = _clean(row.get("lane"), "lane", 160)
     if err or lane != row.get("lane"):
@@ -157,7 +161,8 @@ def _new_state(row):
         return None
     event = row.get("event")
     status = row.get("status")
-    if event == "dispatch" and row.get("v") == 3 and row.get("seq") == 0:
+    if event == "dispatch" and type(row.get("v")) is int and row.get("v") == 3 \
+            and type(row.get("seq")) is int and row.get("seq") == 0:
         if status != "open" or not _TIP.fullmatch(str(row.get("tip") or "")):
             return None
         out = dict(row)
@@ -194,15 +199,33 @@ def _new_state(row):
     return out
 
 
+# A dispatch is CLOSED once it carries a VERDICT (a review happened) or a
+# CANCEL (honestly abandoned with a reason). Both are TERMINAL and drop the row
+# from the open / overdue / stop / land reads, so a stranded dispatch stops
+# nagging the watchdog the moment it is cancelled — no false verdict needed.
+CLOSED_STATES = ("verdict", "cancelled")
+
+
+def _open(row):
+    return row.get("status") not in CLOSED_STATES
+
+
 def _apply(state, row):
     """Apply only immutable evidence events; malformed later rows preserve the
     preceding good obligation.
 
     Every compatibility branch is gated to LEGACY-opened states (v1/v2): an
     obligation opened by a v3 dispatch row accepts nothing but strict
-    seq-ordered ``delivered``/``verdict`` events, so a well-shaped forged
-    snapshot, ack, or retarget row can never close it or move its tip."""
+    seq-ordered ``delivered``/``verdict``/``cancel`` events, so a well-shaped
+    forged snapshot, ack, or retarget row can never close it or move its tip."""
     if str(row.get("id") or "") != state["id"]:
+        return state
+    # TERMINAL IS IMMUTABLE: once a dispatch carries a verdict or a cancel, NO
+    # later event — v3 OR a legacy-compat retarget/snapshot-verdict — may mutate
+    # its status or tip. This guard runs BEFORE the compat branches below, which
+    # do not each re-check terminality (codex-3 xrev: a compat verdict could
+    # otherwise convert cancelled->verdict, a retarget could move a closed tip).
+    if state.get("status") in CLOSED_STATES:
         return state
     event = row.get("event")
     legacy = state.get("v") != 3
@@ -228,7 +251,8 @@ def _apply(state, row):
                    seq=_int_seq(row.get("seq"), state.get("seq", 0)))
         return out
     expected = int(state.get("seq") or 0) + 1
-    strict = row.get("v") == 3 and row.get("seq") == expected
+    strict = type(row.get("v")) is int and row.get("v") == 3 \
+        and type(row.get("seq")) is int and row.get("seq") == expected
     if event == "delivered" and state["status"] == "open" \
             and (strict or compat):
         ref, err = _clean(row.get("delivery_ref"), "delivery ref", 256)
@@ -247,6 +271,17 @@ def _apply(state, row):
                        verdict_ref=evidence, seq=expected)
             return out
         return state
+    # CANCEL: honest terminal abandonment of an OPEN dispatch (reviewer gone,
+    # work moot). v3-native — no compat history exists — and unlike a verdict
+    # it binds NO reviewed tip, only a reason. Terminal: a cancelled or
+    # verdict'd obligation ignores every later event.
+    if event == "cancel" and state["status"] == "open" and strict:
+        reason, err = _clean(row.get("reason"), "cancel reason", 256)
+        if err or not reason:
+            return state
+        out = dict(state)
+        out.update(status="cancelled", cancel_reason=reason, seq=expected)
+        return out
     # Historical snapshot verdicts/retarget-derived verdicts (compat only).
     if compat and row.get("status") == "verdict" and row.get("verdict_ref"):
         reviewed = str(row.get("reviewed_tip") or state.get("tip") or "").lower()
@@ -388,8 +423,10 @@ def _mark_delivered(rid, delivery_ref):
         row = current.get(str(rid))
         if not row:
             return None, "no such dispatch: %s" % rid
-        if row.get("delivery") == "observed" or row.get("status") == "verdict":
-            return row, None
+        if row.get("delivery") == "observed" or not _open(row):
+            return row, None            # already observed, OR CLOSED (verdict or
+                                        # cancelled) — never append a late
+                                        # delivered event onto a terminal row
         event = {"v": 3, "event": "delivered", "seq": row["seq"] + 1,
                  "id": row["id"], "ts": pk.now_ts(), "delivery_ref": ref}
         if not eventledger.append_unlocked(path, event):
@@ -459,7 +496,10 @@ def send(recipient, lane, message, ref, note=None, deadline_s=DEFAULT_DEADLINE_S
     observed, err = _mark_delivered(row["id"], delivered.get("id"))
     if err:
         return row, err + "; NEEDS CONFIRMATION", False
-    return observed, None, True
+    # The lock is released for the DM, so a concurrent cancel/verdict may have
+    # terminalized the row mid-flight — report the TRUE state, never a false
+    # "delivery observed" on a dispatch that is already closed.
+    return observed, None, _open(observed)
 
 
 def mark_verdict(rid, reviewed_tip, evidence):
@@ -483,6 +523,9 @@ def mark_verdict(rid, reviewed_tip, evidence):
             if row.get("reviewed_tip") == reviewed and row.get("verdict_ref") == evidence:
                 return row, None
             return None, "dispatch %s already has a verdict (closed)" % rid
+        if row["status"] == "cancelled":
+            return None, ("dispatch %s was cancelled (abandoned) — a verdict "
+                          "asserts a review happened, so it is refused" % rid)
         if not row.get("tip"):
             return None, "historical dispatch lacks an exact tip; redispatch it"
         if reviewed != row["tip"]:
@@ -500,6 +543,43 @@ def mark_verdict(rid, reviewed_tip, evidence):
     return out, None
 
 
+def mark_cancel(rid, reason):
+    """Honestly ABANDON an open dispatch with a reason — the only truthful
+    terminal event when a verdict will never come (recipient gone, work moot,
+    superseded). Idempotent on the same reason; refuses a dispatch that already
+    carries a verdict (that one is already honestly closed)."""
+    reason, err = _clean(reason, "cancel reason", 256)
+    if err:
+        return None, err
+    if not reason:
+        return None, "cancel needs a reason (why the dispatch is abandoned)"
+    path = ledger_path()
+    with eventledger.locked(path) as held:
+        if not held:
+            return None, "ledger unwritable (%s) — cancel NOT recorded" % path
+        current, unavailable = snapshot()
+        if unavailable:
+            return None, "dispatch ledger unavailable: %s" % unavailable
+        row = current.get(str(rid or ""))
+        if not row:
+            return None, "no such dispatch: %s (helm dispatch list)" % rid
+        if row["status"] == "cancelled":
+            if row.get("cancel_reason") == reason:
+                return row, None            # idempotent re-cancel
+            return None, "dispatch %s already cancelled" % rid
+        if row["status"] == "verdict":
+            return None, ("dispatch %s already has a verdict (closed) — a "
+                          "reviewed dispatch is not cancelled" % rid)
+        event = {"v": 3, "event": "cancel", "seq": row["seq"] + 1,
+                 "id": row["id"], "ts": pk.now_ts(), "reason": reason}
+        if not eventledger.append_unlocked(path, event):
+            return None, "ledger unwritable (%s) — cancel NOT recorded" % path
+    out = dict(row)
+    out.update(status="cancelled", cancel_reason=reason, seq=event["seq"])
+    pk.event("dispatch-cancel", row["id"], reason)
+    return out, None
+
+
 def _age_s(row, now=None):
     try:
         stamp = time.strptime(str(row.get("ts") or ""), "%Y-%m-%dT%H:%M:%SZ")
@@ -510,13 +590,12 @@ def _age_s(row, now=None):
 
 
 def open_rows():
-    out = [r for r in rows().values() if r.get("status") != "verdict"]
+    out = [r for r in rows().values() if _open(r)]
     return sorted(out, key=lambda r: (str(r.get("ts") or ""), r["id"]))
 
 
 def _is_overdue(row, now=None):
-    return row.get("status") != "verdict" \
-        and _age_s(row, now) >= int(row["deadline_s"])
+    return _open(row) and _age_s(row, now) >= int(row["deadline_s"])
 
 
 def overdue():
@@ -528,7 +607,7 @@ def stop_candidate():
     current, unavailable = snapshot()
     if unavailable:
         return None, None, unavailable
-    ordered = sorted((r for r in current.values() if r["status"] != "verdict"),
+    ordered = sorted((r for r in current.values() if _open(r)),
                      key=lambda r: (str(r.get("ts") or ""), r["id"]))
     migrate = next((r for r in ordered if r.get("migration")), None)
     if migrate:
@@ -546,7 +625,7 @@ USAGE = ("usage: helm dispatch send <recipient> <lane> <message...> --ref TIP "
          "[--key K] [--note N] [--deadline SECONDS] [--repo PATH] | add "
          "<recipient> <lane> --ref TIP [--note N] [--deadline SECONDS] "
          "[--repo PATH] | verdict <id> <full-reviewed-tip> <evidence> | "
-         "list [--open|--overdue] [--json]")
+         "cancel <id> <reason...> | list [--open|--overdue] [--json]")
 
 
 def _parse(rest, names):
@@ -569,6 +648,8 @@ def _parse(rest, names):
 def _label(row):
     if row.get("status") == "verdict":
         return "VERDICT"
+    if row.get("status") == "cancelled":
+        return "CANCELLED"
     if row.get("migration"):
         return "NEEDS REDISPATCH"
     if row.get("delivery") != "observed":
@@ -617,9 +698,9 @@ def cmd_dispatch(args):
             if why:
                 print("helm dispatch: " + why, file=sys.stderr)
                 return 1
-            print("helm dispatch: %s @%s %s — PENDING VERDICT%s" % (
-                row["id"], row["recipient"], row["lane"],
-                " (delivery observed)" if sent else " / NEEDS CONFIRMATION"))
+            print("helm dispatch: %s @%s %s — %s%s" % (
+                row["id"], row["recipient"], row["lane"], _label(row),
+                " (delivery observed)" if sent else ""))
             return 0
         row = add(pos[0], pos[1], opts["--ref"], note=opts.get("--note"),
                   deadline_s=deadline, repo=opts.get("--repo"))
@@ -639,6 +720,20 @@ def cmd_dispatch(args):
             return 1
         print("helm dispatch: %s — VERDICT at %s" % (row["id"], row["tip"][:12]))
         return 0
+    if verb == "cancel":
+        if len(rest) < 2:
+            print("usage: helm dispatch cancel <id> <reason...>  "
+                  "(honestly abandon a stranded dispatch — recipient gone / "
+                  "work moot; never a substitute for a real verdict)",
+                  file=sys.stderr)
+            return 2
+        row, why = mark_cancel(rest[0], " ".join(rest[1:]))
+        if why:
+            print("helm dispatch: " + why, file=sys.stderr)
+            return 1
+        print("helm dispatch: %s — CANCELLED (%s)" % (
+            row["id"], row.get("cancel_reason") or ""))
+        return 0
     if verb == "list":
         current, unavailable = snapshot()
         if unavailable:
@@ -653,7 +748,7 @@ def cmd_dispatch(args):
         selected = sorted(current.values(),
                           key=lambda r: (str(r.get("ts") or ""), r["id"]))
         if "--open" in flags:
-            selected = [r for r in selected if r["status"] != "verdict"]
+            selected = [r for r in selected if _open(r)]
         elif "--overdue" in flags:
             now = time.time()
             selected = [r for r in selected if _is_overdue(r, now)]

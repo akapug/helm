@@ -10,7 +10,8 @@ recipient's presence (seats.presence_of) — the one JOIN neither half computes
 today. dispatches is sender-side + clock-only; presence is timestamp-only.
 
 THE SIGNATURE (idle-on-open-dispatch):
-    an OPEN dispatch row (status != verdict) whose RECIPIENT is quiet/absent
+    an OPEN dispatch row (not verdict, not cancelled — via dispatches._open,
+    which open_rows() applies) whose RECIPIENT is quiet/absent
     (no recent tool boundary) AND holds NO live claim on dispatch:<id8> AND the
     dispatch is older than IDLE_DISPATCH_S (a soft "should have been picked up"
     window, earlier than the hard deadline so an idle-on-gate surfaces BEFORE it
