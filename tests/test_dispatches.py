@@ -97,7 +97,7 @@ class DispatchBase(unittest.TestCase):
 
 
 class LifecycleTest(DispatchBase):
-    def test_delivery_observation_is_not_done_only_exact_tip_verdict_closes(self):
+    def test_delivery_observation_is_not_done_an_exact_tip_verdict_closes(self):
         row = self.add(lane="session-pid-resolver")
         self.assertEqual(row["status"], "open")
         self.assertEqual(row["delivery"], "needs-confirmation")
@@ -292,11 +292,12 @@ OLD_TS = "2026-07-01T00:00:00Z"     # before LEGACY_COMPAT_BOUNDARY
 
 
 class HistoricalCompatTest(DispatchBase):
-    """The shipping surface is dispatch/delivered/verdict only. Rows the old
+    """The shipping surface is dispatch/delivered/verdict/cancel. Rows the old
     schemas already wrote keep replaying truthfully — never rebound, never
     silently dropped — and the removed verbs stay removed. Compat honors only
     rows stamped BEFORE the boundary: appending removed-class events today
-    drives nothing, however well-shaped."""
+    drives nothing, however well-shaped; a terminal (verdict OR cancel) row is
+    immutable against every later event."""
 
     def _legacy_open(self, rid, ref, ts=OLD_TS, lane=None):
         row = {"id": rid, "ts": ts, "recipient": "codex-3",
@@ -631,7 +632,8 @@ class StorageSafetyTest(DispatchBase):
         self.assertTrue(eventledger.append(dispatches.ledger_path(), fake))
         got = dispatches.rows()[row["id"]]
         # The forged row stays VISIBLE in history (append-only ledger) but a
-        # v3 obligation only closes on a strict verdict event naming its tip.
+        # v3 obligation only closes on a strict verdict event naming its tip
+        # (or a strict cancel event) — never a well-formed forged close.
         self.assertEqual(got["status"], "open")
         self.assertEqual(len(dispatches.history(row["id"])), 2)
 
@@ -971,6 +973,105 @@ class CancelTest(DispatchBase):
         rc, _out, err = run(dispatches.cmd_dispatch, ["cancel", row["id"]])
         self.assertEqual(rc, 2)
         self.assertIn("usage: helm dispatch cancel", err)
+
+    def test_existing_op_resend_reports_terminal_state_not_confirmation_debt(self):
+        # codex-3 xrev: a resend of an already-CLOSED operation must report the
+        # TRUE terminal state, never "confirm at the recipient" (a lie on a
+        # closed row). Both closed states.
+        for closer, label in (("verdict", "VERDICT"), ("cancel", "CANCELLED")):
+            with mock.patch.object(seats, "dm", return_value=({"id": "p1"}, None)):
+                r, why, sent = dispatches.send(
+                    "codex-3", "lane-" + closer, "hi", self.a,
+                    key="op-" + closer, repo=self.repo)
+            self.assertTrue(sent, why)
+            if closer == "verdict":
+                dispatches.mark_verdict(r["id"], self.a, "reviewed")
+            else:
+                dispatches.mark_cancel(r["id"], "abandoned")
+            # resend the SAME operation — the existed branch fires
+            r2, why2, sent2 = dispatches.send(
+                "codex-3", "lane-" + closer, "hi", self.a,
+                key="op-" + closer, repo=self.repo)
+            self.assertEqual(r2["id"], r["id"])            # same operation
+            self.assertIsNone(why2)                        # NOT confirmation debt
+            self.assertFalse(sent2)
+            self.assertEqual(dispatches._label(r2), label)  # honest terminal render
+            # and the CLI verb reports it honestly: rc 0, terminal label, no lie
+            rc, out, _ = run(dispatches.cmd_dispatch,
+                             ["send", "codex-3", "lane-" + closer, "hi", "--ref",
+                              self.a, "--key", "op-" + closer, "--repo", self.repo])
+            self.assertEqual(rc, 0)
+            self.assertIn(label, out)
+            self.assertNotIn("confirm at the", out)
+
+    def test_failed_or_raising_dm_with_concurrent_close_returns_canonical(self):
+        # codex-3 xrev: when the DM fails OR raises while a cancel/verdict lands,
+        # send() must reconcile and return the canonical terminal state (not the
+        # stale pre-DM open row) — both closers x both failure modes, and NO
+        # late delivered event (exactly two: dispatch + close).
+        def make_dm(closer, mode):
+            def dm(*a, **k):
+                rid = dispatches.open_rows()[0]["id"]
+                if closer == "cancel":
+                    dispatches.mark_cancel(rid, "closed during DM")
+                else:
+                    dispatches.mark_verdict(rid, self.a, "reviewed")
+                if mode == "raise":
+                    raise RuntimeError("DM blew up")
+                return None, "boom: DM failed"
+            return dm
+        n = 0
+        for closer, label in (("cancel", "CANCELLED"), ("verdict", "VERDICT")):
+            for mode in ("error", "raise"):
+                n += 1
+                with mock.patch.object(seats, "dm",
+                                       side_effect=make_dm(closer, mode)):
+                    r, why, sent = dispatches.send(
+                        "codex-3", "rf-%s-%s" % (closer, mode), "hi", self.a,
+                        key="rf-%d" % n, repo=self.repo)
+                self.assertFalse(sent)
+                self.assertIsNone(why)                     # canonical terminal, no debt
+                self.assertEqual(dispatches._label(r), label)
+                self.assertEqual(len(dispatches.history(r["id"])), 2)  # no late event
+
+    def test_reconcile_send_case1_UNKNOWN_when_ledger_unavailable(self):
+        # case 1: a canonical-read FAILURE surfaces UNKNOWN (row=None)
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=({}, "ledger locked")):
+            r, why, sent = dispatches._reconcile_send("someid", "detail")
+        self.assertIsNone(r)
+        self.assertIn("UNKNOWN", why)
+        self.assertFalse(sent)
+
+    def test_reconcile_send_case2_UNKNOWN_when_absent_from_readable_ledger(self):
+        # case 2 (codex-3 4th defect): a READABLE snapshot missing the row is
+        # UNKNOWN, never the stale pre-DM OPEN row — there is no `or fallback`.
+        with mock.patch.object(dispatches, "snapshot", return_value=({}, None)):
+            r, why, sent = dispatches._reconcile_send("gone", "detail")
+        self.assertIsNone(r)                               # NOT a fallback OPEN row
+        self.assertIn("UNKNOWN", why)
+        self.assertFalse(sent)
+
+    def test_reconcile_send_case3_returns_the_canonical_terminal_state(self):
+        # case 3: a present terminal row is returned as-is (why=None)
+        with mock.patch.object(
+                dispatches, "snapshot",
+                return_value=({"x": {"status": "cancelled"}}, None)):
+            r, why, sent = dispatches._reconcile_send("x", "detail")
+        self.assertEqual(r["status"], "cancelled")
+        self.assertIsNone(why)
+        self.assertFalse(sent)
+
+    def test_reconcile_send_case4_open_row_needs_confirmation(self):
+        # case 4: a present OPEN row -> NEEDS CONFIRMATION with the detail
+        with mock.patch.object(
+                dispatches, "snapshot",
+                return_value=({"x": {"status": "open"}}, None)):
+            r, why, sent = dispatches._reconcile_send("x", "transport failed")
+        self.assertEqual(r["status"], "open")
+        self.assertIn("NEEDS CONFIRMATION", why)
+        self.assertIn("transport failed", why)
+        self.assertFalse(sent)
 
 
 if __name__ == "__main__":

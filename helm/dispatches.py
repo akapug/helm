@@ -436,12 +436,45 @@ def _mark_delivered(rid, delivery_ref):
     return out, None
 
 
+def _reconcile_send(rid, detail):
+    """The canonical live result after send()'s DM window. The ledger lock is
+    released for the network DM, so by the time we return the row may have been
+    TERMINALIZED (a concurrent cancel/verdict) or storage may have gone away.
+    This is the ONE owner of the send-path invariant: the live return never
+    disagrees with the durable ledger — and NEVER carries a pre-DM row.
+
+    TOTAL over (unavailable?) x (rid present?) x (_open?) — meld-converged:
+      1. snapshot unavailable                 -> (None, UNKNOWN)   storage gone
+      2. readable, rid ABSENT                  -> (None, UNKNOWN)   obligation
+         (a missing/rotated/known-empty ledger reads as ({}, None), so a just-
+          persisted row can be absent from a READABLE snapshot — that is UNKNOWN,
+          never the stale pre-DM OPEN row; codex-3 xrev 4th defect)
+      3. readable, present, terminal           -> (row, None)      canonical close
+      4. readable, present, open/other         -> (row, NEEDS CONFIRMATION+detail)
+    Reads via snapshot() — NOT rows(), which discards the `unavailable` flag."""
+    current, unavailable = snapshot()
+    if unavailable:
+        return None, ("dispatch ledger unavailable (%s) — obligation UNKNOWN"
+                      % unavailable), False
+    row = current.get(str(rid))
+    if row is None:
+        return None, ("dispatch %s absent from the ledger after delivery — "
+                      "obligation UNKNOWN" % rid), False
+    if not _open(row):
+        return row, None, False
+    return row, ("dispatch persisted but delivery is NEEDS CONFIRMATION: %s"
+                 % detail), False
+
+
 def send(recipient, lane, message, ref, note=None, deadline_s=DEFAULT_DEADLINE_S,
          key=None, repo=None, sign=None):
     """Persist first, attempt one DM, never auto-retry an existing operation.
 
-    Returns (row, reason, sent_now). Existing rows return NEEDS CONFIRMATION
-    without another side effect.
+    Returns (row, reason, sent_now). An existing OPEN operation returns NEEDS
+    CONFIRMATION (never re-DMs); an existing CLOSED one returns its true
+    terminal state. After the DM the return reflects CANONICAL durable state
+    via _reconcile_send — UNKNOWN (row=None) if the ledger cannot be read,
+    never a stale pre-DM row.
     """
     message = str(message or "").strip()
     if not message or len(message) > 16000 or "\x00" in message:
@@ -478,6 +511,10 @@ def send(recipient, lane, message, ref, note=None, deadline_s=DEFAULT_DEADLINE_S
     if why:
         return None, why, False
     if existed:
+        if not _open(row):
+            # the prior obligation is already TERMINAL (verdict or cancel) —
+            # report that true state, never confirmation debt on a closed row
+            return row, None, False
         # One operation = at most one send, ever. A prior attempt whose
         # delivery evidence is missing is AMBIGUOUS, not absent — resending
         # here is exactly the duplicate-message hazard the reduced core
@@ -491,11 +528,14 @@ def send(recipient, lane, message, ref, note=None, deadline_s=DEFAULT_DEADLINE_S
     except Exception as exc:
         delivered, dm_err = None, "%s: %s" % (type(exc).__name__, exc)
     if dm_err or not delivered:
-        return row, ("dispatch persisted but delivery is NEEDS CONFIRMATION: %s"
-                     % (dm_err or "DM returned no row")), False
+        # the DM failed/raised — reconcile against the durable ledger (a cancel
+        # may have landed during it; storage may be unavailable -> UNKNOWN)
+        return _reconcile_send(row["id"], dm_err or "DM returned no row")
     observed, err = _mark_delivered(row["id"], delivered.get("id"))
     if err:
-        return row, err + "; NEEDS CONFIRMATION", False
+        # the delivered-write failed (lock/storage) — same reconciliation: never
+        # carry the stale pre-DM row, surface UNKNOWN if the ledger is unreadable
+        return _reconcile_send(row["id"], err)
     # The lock is released for the DM, so a concurrent cancel/verdict may have
     # terminalized the row mid-flight — report the TRUE state, never a false
     # "delivery observed" on a dispatch that is already closed.
