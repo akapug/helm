@@ -1,33 +1,10 @@
-# internal planning — never pushed, never committed (as-public repo law)
-BUILD_BRIEF.md
-ADVISOR_QUESTIONS.md
-docs/helm-inventory-owner-decisions-*.md
-docs/lineage-map-decisions-*.md
-.remember/
+# build + tooling artifacts
 __pycache__/
 *.pyc
 .pytest_cache/
-PROGRESS.md
-ADVISOR_ANSWERS.md
-HANDOFF_NEXT_SESSION.md
-MORNING_BRIEF_*.md
-DOGFOOD_*.md
-docs/MULTIMODEL_SEATS_ADDENDUM.md
-docs/PARITY_MATRIX.md
-docs/DECISION-*.md
 .playwright-mcp/
 .claude/settings.json
+.remember/
 *.png
 .env
 .env.*
-
-# personal/internal surfaces — kept local, never on the remote (as-public repo law)
-agents/claudecode/skills/i-have-audhd/
-evals/*.md
-docs/REBOOT_CHECKLIST_1.4.149.md
-
-# internal skills + license decision memo — kept local, never on the remote
-agents/claudecode/skills/sesh/
-agents/claudecode/skills/vendor-as-public/
-docs/LICENSE-TODO.md
-agents/claudecode/skills/fleet-usage/
