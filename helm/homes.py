@@ -20,9 +20,9 @@ THE CANON (CRED_AUTH_CANON, distilled — violating these bricks accounts):
   * claude homes: `projects` must SYMLINK to ~/.claude/projects (one shared
     session store) — a REAL projects dir silently strands sessions.
   * archive = MOVE into ~/.helm-home-archive/<name>-<date>/ (reversible),
-    never delete; refused while a live agent sits on the home. An older
-    legacy archive format (its own root + marker) is still listed and
-    restorable — read both, write new.
+    never delete; refused while a live agent sits on the home. An optional
+    owner-configured legacy archive root (HELM_LEGACY_ARCHIVE_ROOT, unset by
+    default) is also listed and restorable when set — read both, write new.
 
 Every public function returns a JSON-able dict (or list); errors are
 {"error": "..."} — loud, attributed, never an exception across the API edge.
@@ -41,9 +41,10 @@ ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
 SHARED_PROJECTS = os.path.join(HOME, ".claude", "projects")
 ARCHIVE_ROOT = os.path.join(HOME, ".helm-home-archive")
 MARKER = ".helm-archive.json"  # metadata only: name/provider/from/aliases — no token contents
-# the legacy archive root — recognized forever for list/restore, never written to
-LEGACY_ARCHIVE_ROOT = os.path.join(HOME, ".helm-legacy-home-archive")
-LEGACY_MARKER = ".legacy-archive.json"
+# optional owner-configured legacy archive root — recognized for list/restore
+# when set, never written to; empty (default) means no legacy archive exists
+LEGACY_ARCHIVE_ROOT = os.environ.get("HELM_LEGACY_ARCHIVE_ROOT", "")
+LEGACY_MARKER = os.environ.get("HELM_LEGACY_ARCHIVE_MARKER", ".legacy-archive.json")
 
 # the human runs these; helm only prints them (logins are human-only, per canon)
 LOGIN_CMDS = {"claude": lambda h: f"CLAUDE_CONFIG_DIR={shlex.quote(h)} claude /login",
@@ -181,6 +182,8 @@ def _archive_dirs():
     """Every archived-home dir across BOTH archive roots (helm first, then legacy)."""
     out = []
     for root in (ARCHIVE_ROOT, LEGACY_ARCHIVE_ROOT):
+        if not root:
+            continue
         for p in sorted(glob.glob(os.path.join(root, "*"))):
             if os.path.isdir(p) and not os.path.islink(p):
                 out.append(p)

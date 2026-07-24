@@ -59,9 +59,11 @@ class CliQuotaProvider:
     """Backend = a local quota/allocation CLI with --json verbs (configurable binary)."""
 
     def __init__(self, binary=None):
-        self.binary = binary or _env("QUOTA_CLI", "quota")
+        self.binary = binary or _env("QUOTA_CLI", "")
 
     def _run(self, *args, timeout=45):
+        if not self.binary:
+            raise ProviderError("no quota CLI configured; set HELM_QUOTA_CLI")
         try:
             p = subprocess.run([self.binary, *args], capture_output=True, text=True,
                                timeout=timeout)
@@ -882,7 +884,7 @@ def default_provider():
     HELM_PROVIDER=cli (+ optional HELM_QUOTA_CLI naming the binary)."""
     choice = (_env("PROVIDER") or "native").strip().lower()
     if choice == "cli":
-        binary = _env("QUOTA_CLI", "quota")
+        binary = _env("QUOTA_CLI", "")
         if shutil.which(binary):
             return CliQuotaProvider(binary)
         # opted into a CLI that isn't installed: fail toward working, loudly

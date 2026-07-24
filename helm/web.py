@@ -1222,7 +1222,10 @@ def _api_chat_read_post(payload):
 def _chat_profile():
     """Server-side signing identity for the owner's web posts: the server's
     HELM_CELL_PROFILE (the PRD's contract), else the owner's cell `owner` —
-    never the agent default (the web panel IS the owner surface)."""
+    never the agent default (the web panel IS the owner surface).
+    "owner" is the generic ship-time default; the owner personalizes their
+    display name at runtime via the panel's `name` field (or HELM_CHAT_NAME,
+    the same seam human.py's TUI reads) — never hardcoded here."""
     return os.environ.get("HELM_CELL_PROFILE") \
         or os.environ.get("MELD_AGENT_PROFILE") or "owner"
 

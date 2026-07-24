@@ -261,6 +261,8 @@ def sync(canon=None, dirs=None, backup_root=None, apply=False):
     dir. Idempotent — a fully-wired estate reports zero changes. -> report."""
     canon = os.path.realpath(canon or canonical())
     backup_root = backup_root or BACKUP_ROOT
+    if canon == os.path.realpath(DEFAULT_CANONICAL):
+        os.makedirs(canon, exist_ok=True)  # fresh install: seed an empty canonical hub
     if not os.path.isdir(canon):
         return {"error": "canonical skills dir missing: %s (set "
                          "HELM_SKILLS_CANONICAL or restore the canonical hub)" % canon}

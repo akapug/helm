@@ -41,6 +41,9 @@ LOG_PATH = os.path.join(catalog.CACHE_DIR, "keepalive-log.jsonl")
 LOCK_PATH = os.path.join(catalog.CACHE_DIR, "keepalive.lock")
 CLAUDE_HOMES_ROOT = os.path.join(HOME, ".claude-homes")
 CODEX_HOMES_ROOT = os.path.join(HOME, ".codex-homes")
+# optional owner-configured predecessor process name (e.g. a prior tool this
+# keepalive replaced) — empty (default) means no predecessor is recognized
+PREDECESSOR = os.environ.get("HELM_PREDECESSOR_PROCESS", "")
 
 
 def _log(event):
@@ -80,7 +83,9 @@ def _live_holder_pid(home_path):
 def _predecessor_pids():
     """Live predecessor keepalive processes (a predecessor copy uses a DIFFERENT
     lock file, so our sweep lock can't see it — detect it directly and refuse to
-    run a second credential writer beside it)."""
+    run a second credential writer beside it). An optional owner-configured
+    predecessor process name (HELM_PREDECESSOR_PROCESS) extends detection to a
+    prior tool this keepalive replaced, on top of helm's own process match."""
     me = str(os.getpid())
     out = []
     for f in glob.glob("/proc/[0-9]*/cmdline"):
@@ -95,7 +100,7 @@ def _predecessor_pids():
         argv0 = cmdline.split("\0", 1)[0]
         if "python" not in os.path.basename(argv0):
             continue
-        if "keepalive" in cmdline and "helm" in cmdline:
+        if "keepalive" in cmdline and ("helm" in cmdline or (PREDECESSOR and PREDECESSOR in cmdline)):
             out.append((pid, "keepalive"))   # never return argv: it may carry pasted secrets
     return out
 

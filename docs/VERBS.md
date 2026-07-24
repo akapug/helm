@@ -2278,9 +2278,7 @@ helm path):
 **A note on `helm seat`:** the multimodel-seat verb (giving a non-Claude
 model family the full claude-code harness through a local wire proxy —
 `seat add|up|down|launch|spawn|where|resume|smoke|autocompact|list|status|doctor`) is
-wired into the dispatcher; see
-[MULTIMODEL_SEATS_ADDENDUM.md](MULTIMODEL_SEATS_ADDENDUM.md)
-while its live proving rounds finish.
+wired into the dispatcher, while its live proving rounds finish.
 
 **`helm seat spawn <seat>` — the harness-agnostic SELF-ONBOARDING spawn.**
 A hand-spawned seat is a bare idle pane: no beacon, no work, not
