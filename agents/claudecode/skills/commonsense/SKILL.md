@@ -56,8 +56,8 @@ let me just" OR a "the options are A or B" coming on.
    the FULL option space - including cheaper/safer/lateral ways to meet that criterion, not just the
    obvious one; (c) inventory the RESOURCES THE USER ALREADY HAS that you can't see from inside the repo
    (their infra, spare cloud accounts, a home cluster, alt providers, local docker). A false binary
-   ("rush the risky live deploy OR punt") almost always hides a safe third path. Example (owner ruling
-   2026-06-09): proposing live-cluster deploy vs a sub-slice when the real criterion was "test safely" -
+   ("rush the risky live deploy OR punt") almost always hides a safe third path. Example (owner
+   ruling): proposing live-cluster deploy vs a sub-slice when the real criterion was "test safely" -
    and a spare cheap box / fly.io / local docker / spare self-hosted nodes all satisfied it with zero live
    risk. Diverge to the option space *first*, then converge with decision-spirit.
 

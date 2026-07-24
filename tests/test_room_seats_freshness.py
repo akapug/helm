@@ -1,6 +1,6 @@
 """_room_seats' consumers-fallback (second loop) is O(fresh), not O(all).
 
-The 2026-07-23 UI-blank second half: _rooms_summary was ~14s because
+The UI-blank class, second half: _rooms_summary was ~14s because
 _room_seats walked EVERY seat in the roster (~224, mostly DEAD ephemeral
 review-SAs) calling seats.room_active — several pk.read_json disk cursor reads
 each — until 6 sidebar slots filled. Quiet rooms scanned the whole roster.

@@ -28,7 +28,7 @@ CLAIM_WHISPER_ID = "whisper:codex-claim-start"  # the claim-is-a-start nudge's l
 CLAIM_WHISPER = ("Claiming a lane is a START, not a milestone — launch the "
                  "writer this same turn; end your turn only when work is "
                  "visibly moving.")
-SA_FAMILIES = frozenset(("codex",))  # codexes-only (owner asks 2026-07-21/23)
+SA_FAMILIES = frozenset(("codex",))  # codexes-only (owner ask)
 SA_LINES = ((SA_WHISPER, SA_WHISPER_ID),  # the budget-tail walk order: the
             (CLAIM_WHISPER, CLAIM_WHISPER_ID))  # later line degrades first
 

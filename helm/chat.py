@@ -1204,7 +1204,7 @@ def _room_lock(room):
 def _append(row, room):
     """ONE serialized write path for every room writer: id-stamp, append the
     whole row in one write, flush, then rotate — all under the room lock.
-    The stable per-row id is what delivery cursors key on (codex H5); rows
+    The stable per-row id is what delivery cursors key on; rows
     predating it (or hand-written) simply have no id and never match one."""
     row.setdefault("id", os.urandom(6).hex())
     path = room_path(room)

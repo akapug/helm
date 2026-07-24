@@ -6,7 +6,7 @@ description: >
   regressed / debug this / it stopped working / used to work / fix the bug". Same spine as /build
   (decision-spirit + xrev), different basin: building asks "what's the right thing to build?"; fixing
   asks "what is ACTUALLY happening, and how do I not make it worse?". It binds the regression-preventing
-  reflexes TO the act of fixing - because that is exactly when they erode (the 2026-06-08 cascade was a
+  reflexes TO the act of fixing - because that is exactly when they erode (a real cascade was a
   fix session that skipped ground-truth + verify and burned hours).
 license: MIT
 metadata:
@@ -19,7 +19,7 @@ metadata:
 `/fix` is `/build` in the repair basin. Same physics (decision-spirit, the 19 heuristics, xrev), but a
 fix that ships on a guess, claims green without proof, or leaves the old path reachable is a NEW bug.
 These are the reflexes bound to fixing - you need them most exactly when you're under pressure to "just
-fix it." Everything below earned its place from a real 2026-06-08 failure; this skill is that day's scar
+fix it." Everything below earned its place from a real failure; this skill is that failure's scar
 tissue.
 
 ## OPENING MOVE — do these THREE before you touch a single line (non-negotiable)
@@ -38,7 +38,7 @@ tissue.
      optimization is presumed previously-solved until the history proves otherwise — so this step,
      BEFORE step 3's hypothesis, is mandatory and has three named sources: (1) sweep the repo
      history — `git log --all --grep=<capability>` — for the prior fix lineage;
-     (2) search the helm store (`helm store resolve` / `/recall`) for the owner's advice + design
+     (2) search the helm store (`helm store resolve`) for the owner's advice + design
      docs on the capability; (3) DEPLOY-TIER
      check — a landed-but-not-live fix reads IDENTICAL to a regression (a BINARY fix on `main` whose
      daemon never swapped is not live; the "what stopped FIRING?" question applied to the deploy

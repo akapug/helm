@@ -46,7 +46,7 @@ genuine vision calls.
 inputs.** For any RECOVERABLE action (durable state, rollback path, respawn-proven),
 idle-awaiting-owner costs the same as broken-awaiting-owner — owner attention on
 return — but TRYING has upside: some chance of being done instead of inactive (owner
-canon 2026-07-08: "what's the functional difference between you being idle while I'm
+canon: "what's the functional difference between you being idle while I'm
 gone and broken while I'm gone?"). Attempt with the rollback prepared; park only what
 a failure would make irrecoverable. Bug class: `recoverable-parked-for-owner`.
 

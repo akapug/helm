@@ -3,7 +3,7 @@
 Hermetic: HELM_CHAT_DIR + HELM_HOME are tmp dirs, HELM_CHAT_NODE_URL
 set-but-empty kills the signed transport, HELM_CHAT_OWNER_NAMES pinned, the
 ambient CLAUDE/CODEX session ids scrubbed. Hook legs are fed synthetic hook
-JSON and captured AT THE FD level — the one-write emit law (codex H7) writes
+JSON and captured AT THE FD level — the one-write emit law writes
 fd 1 directly, bypassing sys.stdout."""
 import contextlib
 import io
@@ -139,13 +139,13 @@ class JoinTest(SeatsBase):
         seat, line = seats.join(session="sess-1234", cwd="/tmp/projx", seat="alice")
         self.assertEqual(seat, "alice")
         self.assertIn("seat 'alice'", line)
-        self.assertIn("Monitor", line)   # the idle-beacon RSH pointer (M11)
+        self.assertIn("Monitor", line)   # the idle-beacon RSH pointer
         row = seats.roster()["alice"]
         self.assertEqual(row["session"], "sess-1234")
         self.assertEqual(row["project"], "projx")
         # pre-join backlog never floods…
         self.assertIsNone(seats.deliver(seat="alice"))
-        # …but a message between JOIN and the FIRST boundary delivers (H5.5)
+        # …but a message between JOIN and the FIRST boundary delivers
         chat.post("@alice early word", who="bob")
         self.assertIn("early word", seats.deliver(seat="alice"))
 
@@ -252,7 +252,7 @@ class DeliverTest(SeatsBase):
     def test_inode_change_resets_and_suppresses_replayed_rows(self):
         """Rotation/replacement (inode change) resets to 0; rows up to and
         including the cursor's last row id are suppressed, later ones
-        deliver — duplicates acceptable, loss is not (H5)."""
+        deliver — duplicates acceptable, loss is not."""
         self.seat_up()
         chat.post("@alice one", who="bob")
         self.assertIn("one", seats.deliver(seat="alice"))
@@ -353,7 +353,7 @@ class DeliverTest(SeatsBase):
 
     def test_same_size_replacement_detected(self):
         """A replacement of EQUAL size must not hide behind a size check —
-        the inode is the identity (H5.1)."""
+        the inode is the identity."""
         self.seat_up()
         chat.post("agent noise", who="bob")
         self.assertIsNone(seats.deliver(seat="alice"))   # cursor at EOF
@@ -2558,7 +2558,7 @@ class WebRosterTest(SeatsBase):
         with mock.patch.object(seats, "roster_report", side_effect=RuntimeError):
             # WITHIN the TTL a backend failure serves the cached rep — the
             # grace the cache exists for: a transient seats hiccup must not
-            # blank the owner's panel (the 2026-07-23 UI-blank class)
+            # blank the owner's panel (the UI-blank class)
             obj, code = web._api_chat_roster({})
             self.assertEqual(code, 200)
             self.assertEqual(obj["seats"][0]["seat"], "alice")
@@ -2745,7 +2745,7 @@ class ReplyWakesParentTest(unittest.TestCase):
         self.assertIn("ReplyWakesParentTest", flat)
 
 class HomingOneTruthTest(SeatsBase):
-    """The as-prevented roster-scatter law (owner mandate 2026-07-21): a live
+    """The as-prevented roster-scatter law (owner mandate): a live
     roster held THREE home_room truths for one team — 'main' (a defaulted
     spawn-mirror write), '<project>' (a cwd derivation), '<env room>' (the
     launch seam) — because every writer re-derived the precedence privately.

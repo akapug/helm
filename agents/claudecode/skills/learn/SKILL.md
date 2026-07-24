@@ -62,8 +62,8 @@ its keywords, `--source` the new incident), `supersede` it if the new lesson
 replaces it, or `confirm` it if the incident just re-proves it — never mint
 a sibling id beside it. Duplicates are worse than misses: they split the
 DF weight of shared keywords, so BOTH entries rank lower than either alone,
-and future updates land on one while the other rots stale (owner-caught
-2026-07-22, the gap live in an 845-entry store). Only a genuine 0-hit
+and future updates land on one while the other rots stale (owner-caught,
+the gap live in an 845-entry store). Only a genuine 0-hit
 resolve earns a new id.
 
 ## The am-I-being-stupid gate (run BEFORE capturing)
@@ -72,7 +72,7 @@ One question, every capture: **do we own the thing that misbehaved?** If the
 misbehaving code is ours (helm, our scripts, our hooks), this is a FIX LANE,
 not a rule — open it, and store at most a class pointer until the fix lands.
 Rules are for truths we cannot change. A store entry teaching agents to route
-around our own bug is self-bug-canonization (the --help incident, 2026-07-22:
+around our own bug is self-bug-canonization (the --help incident:
 a 3-line cli.py fix lived as a fleet-wide behavioral prior instead).
 
 ## What does NOT go in the store

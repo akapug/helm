@@ -22,15 +22,15 @@ The legs:
   * join    — SessionStart hook: roster row (RAM presence, keyed on the seat's
               HELM_CHAT_NAME so a seat joins as its family name) + cursor
               INITIALIZED HERE (a message posted between session start and
-              the first tool boundary must deliver — codex H5.5) + the seat's
+              the first tool boundary must deliver) + the seat's
               identity/protocol line as session context. That line DIRECTS the
               agent to arm its idle-wake beacon (a persistent Monitor on
               `helm chat wait --follow`) as a MANDATORY first action — the only
               thing that wakes an idle PTY agent (native-wake-only-agent-armed).
   * deliver — PostToolUse hook: the tool-boundary nudge. At most ONE row per
               boundary, 200-byte clip, control-char scrub, information-not-
-              instruction label. AT-LEAST-ONCE, NEVER AT-MOST-ONCE (codex
-              H7): the hook response is emitted in ONE unbuffered write and
+              instruction label. AT-LEAST-ONCE, NEVER AT-MOST-ONCE: the
+              hook response is emitted in ONE unbuffered write and
               the cursor commits only AFTER — a kill in between produces a
               duplicate next boundary, which beats silence. Every fire
               touches the seat's own `.seen` file (presence for free); the
@@ -38,7 +38,7 @@ The legs:
   * wait    — the beacon: block until a row addressed to the seat lands
               (Monitor arms it). --follow keeps the room open and streams EACH
               new matching row as one line (one line = one agent wake), never
-              returning on a match. NOTE (codex M11): this is busy-turn parity
+              returning on a match. NOTE: this is busy-turn parity
               plus an idle beacon the join context line makes MANDATORY to arm —
               nothing external can wake an idle PTY agent, so the self-armed
               Monitor is the only path.
@@ -57,7 +57,7 @@ correct embargo needs an expected-set freeze, a reveal state machine, salted
 commitments and batch-row reveal; the 0.3 spec is recorded in the design
 doc §11. No live consumer today, so: record, don't build.
 
-Cursor law (codex H5): `<room>.cursor.<seat>[.<sid8>]` holds {dev, ino, off,
+Cursor law: `<room>.cursor.<seat>[.<sid8>]` holds {dev, ino, off,
 rid, active} — the room file's identity, the byte offset of the first
 unprocessed row, the last processed row's stable id, and whether the seat
 actually consumed room traffic (an EOF join baseline is not presence). The cursor is PER (seat,
@@ -510,7 +510,7 @@ class _flocked:
 
 # ---------------------------------------------------------------------------
 # roster (RAM presence) — full row at join; per-seat `.seen` touch on the
-# hot path (codex H8 / freeze bar 6: deliver never rewrites shared state)
+# hot path (freeze bar 6: deliver never rewrites shared state)
 # ---------------------------------------------------------------------------
 
 def roster_path():
@@ -920,7 +920,7 @@ def rehome_seat(token, room):
 
 
 # ---------------------------------------------------------------------------
-# the cursor (codex H5) + the tail scan both deliver and the report use
+# the cursor + the tail scan both deliver and the report use
 # ---------------------------------------------------------------------------
 
 def _sid8(session):
@@ -1037,7 +1037,7 @@ def _baseline_room_cursors(room, seat, sessions=()):
 
 
 def _init_cursor(room, seat, session=None, at_start=False):
-    """Baseline at the CURRENT end of room — at JOIN time (codex H5.5), so
+    """Baseline at the CURRENT end of room — at JOIN time, so
     everything posted after session start delivers at the first boundary.
     A fresh SESSION cursor inherits the seat-level baseline when one exists
     (pre-split installs tracked the seat file; those rows must not be
@@ -1245,9 +1245,9 @@ def deliver(session=None, room="main", seat=None, emit=None, cwd=None,
             backfill=False, scope=None):
     """The tool-boundary nudge, ONE room: at most ONE deliverable row, oldest
     first; later matches stay PENDING (their count shows, their cursor ground
-    is not consumed — codex H6). Returns the label line or None.
+    is not consumed). Returns the label line or None.
 
-    At-least-once (codex H7): when `emit` is given it is called with the
+    At-least-once: when `emit` is given it is called with the
     line BEFORE the cursor commits; emit must do its one unbuffered write.
     A kill between emit and commit re-delivers next boundary.
 
@@ -1521,7 +1521,7 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
     timeout. Seat mode IS a delivery (advances the cursor via deliver's
     at-least-once path); --any watches the room without touching cursors.
     Busy-turn parity comes from the PostToolUse hook; an IDLE seat gets
-    woken only if it armed a Monitor on this — opt-in by design (M11).
+    woken only if it armed a Monitor on this — opt-in by design.
 
     --follow (the idle-wake beacon) NEVER returns on a match: it streams EACH
     new matching row as one emitted line — one Monitor line = one agent wake —
@@ -1739,7 +1739,7 @@ def _dispatch_candidate():
     handed to another seat and have not checked on. One cheap local read of
     the dispatch ledger; whispers the OLDEST OVERDUE row, never the list.
 
-    This is the durable half of the owner's ask (2026-07-21): "we definitely
+    This is the durable half of the owner's ask: "we definitely
     need some timer fallback for anything that is sent to them, to make sure
     it is remembered to check on their progress". Per-session Monitor
     watchdogs die at compaction; this rung re-fires from disk in whatever
@@ -3162,7 +3162,7 @@ def _env_session():
 
 
 def _hook_emit(event):
-    """ONE unbuffered write of the whole hook response (codex H7): no
+    """ONE unbuffered write of the whole hook response: no
     partial stdout can reach the harness, and the cursor commit that follows
     emit() is provably after the output left the process."""
     def emit(line):

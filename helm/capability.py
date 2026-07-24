@@ -153,7 +153,7 @@ CAPABILITIES = (
         "tool": "mcp__cv__recall",
         "what": "cold semantic search over past agent sessions — 'have we "
                 "solved this before / where's the prior art'",
-        "wired_via": "clustervision (cv) MCP + the recall skill",
+        "wired_via": "clustervision (cv) MCP",
         "keywords": "recall,have we solved,solved this before,prior art,"
                     "prior session,past session,cold recall,already solved,"
                     "seen this before,did we do this,previously,dejavu",
@@ -293,7 +293,7 @@ def all_capabilities(env=None):
 def public_set(env=None):
     """The SHAREABLE capability set: public-visibility only. A private-hold
     powerpack is withheld — helm does not advertise it in any public powerpack
-    catalog (owner packaging note, 2026-07-23)."""
+    catalog (owner packaging note)."""
     return [c for c in all_capabilities(env=env) if c.get("visibility") == VIS_PUBLIC]
 
 

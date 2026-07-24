@@ -835,7 +835,7 @@ def _room_seats(room, rows, roster):
     Each row also carries `last_seen` (the raw beat, epoch seconds): the
     sidebar renders it as an AGE ('3m'), because a coloured dot with no legend
     and no clock cannot answer the owner's only question — is this seat working
-    right now, or has it been quiet for an hour? (owner UX pass 2026-07-21)"""
+    right now, or has it been quiet for an hour? (owner UX pass)"""
     from . import seats as _s
     seen, out = set(), []
 
@@ -925,7 +925,7 @@ def _rooms_summary(roster=None):
 # it ran UNCACHED on EVERY /api/chat
 # poll (incremental included), so N clients x 2s stacked N ~14s computes ->
 # the ~60s /api/chat requests that starved the thread pool (the second half
-# of the 2026-07-23 UI-blank; the roster cache was brick #1). Same
+# of the UI-blank class; the roster cache was brick #1). Same
 # single-flight TTL treatment — brick #2 of the poll->push read-model — with
 # one upgrade: the cache is KEYED BY THE CHAT ROOT (chat_dir()), so isolated
 # test worlds (fresh tmp roots) can never read each other's cached summary —
@@ -1287,7 +1287,7 @@ def _seat_ephemeral(s):
 # roster_report is the ONE heavy read on the poll path (~2.4s at 200 seats: it
 # walks pending per seat). Uncached, N clients x 2s polls ran N CONCURRENT
 # 2.4s computes on the threaded server -> CPU pegged -> 25s responses ->
-# BrokenPipeError -> the owner's UI went blank (live incident 2026-07-23).
+# BrokenPipeError -> the owner's UI went blank (a live incident).
 # Single-flight TTL cache: ONE compute per freshness window; every other
 # poller is served from memory (decision-spirit #22 — memory is the
 # coordination read-path; the recompute is the write-behind). The TTL sits
@@ -1944,8 +1944,8 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 # push says "there's news", the EXISTING cursor read fetches it — events are
 # DOORBELLS, never payloads, so the read endpoints stay the one render truth.
 #
-# LIFECYCLE IS PER-SERVER (meld-converged 2026-07-23, CD design + kimi
-# concurrency clear): each _Server owns its OWN watcher thread + state, so
+# LIFECYCLE IS PER-SERVER (meld-converged design, concurrency clear): each
+# _Server owns its OWN watcher thread + state, so
 # the three round-4 races are UNEXPRESSIBLE rather than guarded — no
 # generation race (a closed server never re-arms), no refcount (nothing
 # shared to count), no cross-server kill (B never sees A's close). Doorbells

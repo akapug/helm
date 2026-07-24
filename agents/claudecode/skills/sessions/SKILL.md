@@ -112,6 +112,6 @@ claim it on helm seat-home sessions; that gap is real and open.
 
 - `--apply` writes to real cv storage. Always dry-run first and read the preview.
 - This copies sessions; it never deletes. To retire a source session, do that deliberately and separately.
-- Not for reading/searching a session's CONTENT for recall — that's the `recall` skill.
+- Not for reading/searching a session's CONTENT for recall — that's separate cv/store recall (`cv show`).
 - Cross-harness `convert` is best-effort on format fidelity; verify the ported session opens in the target
   harness before relying on it (the verify rail checks existence, not semantic fidelity).

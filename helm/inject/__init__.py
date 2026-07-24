@@ -81,7 +81,7 @@ read. Budget-capped (WHISPER_CAP) and fully FAIL-OPEN: brief unavailable -> no
 whisper, never a blocked hook. `--explain` renders it read-only (stamps nothing);
 a quiet window (no sessions/knowledge/gates) whispers nothing but still latches.
 
-CODEX WHISPERS (the codex-only nudges — owner asks 2026-07-21/23): a turn
+CODEX WHISPERS (the codex-only nudges — owner ask): a turn
 fired inside a codex-family seat appends terse pinned-lane lines, each
 justification-free (owner-spec style). Two today: the SA-delegation nudge
 (orchestrate your subagents for reviews/reads/research; whisper:codex-sa) and

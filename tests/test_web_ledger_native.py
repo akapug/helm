@@ -210,7 +210,7 @@ class TestSeatEphemeralTag(unittest.TestCase):
 class TestRosterSingleFlightCache(unittest.TestCase):
     """The poll-fan-in guard: roster_report is the one heavy read on the 2s
     poll path; uncached, N concurrent polls stacked N computes and blanked the
-    owner's UI (live incident 2026-07-23). The cache must be SINGLE-FLIGHT
+    owner's UI (a live incident). The cache must be SINGLE-FLIGHT
     (concurrent pollers share one compute), TTL-fresh, and publish-ready
     (ephemeral baked in) — decision-spirit #22: memory is the read-path."""
 
@@ -269,7 +269,7 @@ class TestRoomsSummarySingleFlightCache(unittest.TestCase):
     """Brick #2 of the poll->push read-model: _rooms_summary (~14s at 224
     seats x 13 rooms) ran uncached on every /api/chat poll — N clients
     stacked N computes -> ~60s requests -> thread-pool starvation (the chat
-    half of the 2026-07-23 UI-blank). Single-flight + TTL, and the cache is
+    half of the UI-blank class). Single-flight + TTL, and the cache is
     KEYED BY THE CHAT ROOT so isolated test worlds (fresh tmp roots) can
     never read each other's cached summary — the cross-test-pollution class
     from brick #1, closed structurally."""

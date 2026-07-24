@@ -1,6 +1,6 @@
 """helm.silent_drop — the empty-completion loud-fail rung.
 
-THE BUG CLASS (owner hypothesis, kimi investigation 2026-07-23): the codex
+THE BUG CLASS: the codex
 cc-proxy (router-for-me/CLIProxyAPI) translates an upstream codex completion
 into Anthropic SSE for claude-code. On a security/crypto-heavy turn the
 generated TEXT is DROPPED at that boundary — the transcript records an

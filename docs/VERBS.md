@@ -668,8 +668,8 @@ an in-place edit would orphan the attestation.
 $ helm premise --supersede naming-extremes "naming-poles | metaphors live at the poles"
 helm premise: LIVE 'naming-poles' [certain 1.00] - metaphors live at the poles
   supersedes 'naming-extremes' — tombstoned (delete_eligible, file kept)
-  attested (native): record 4d8a4c1306028e80 at chain_index 7 — recorded by 'owner'
-  chain: -> prior record 29114915ece8b4c2 (attest_supersedes_record)
+  attested (native): record a1b2c3d4e5f60718 at chain_index 7 — recorded by 'owner'
+  chain: -> prior record b2c3d4e5f6a70819 (attest_supersedes_record)
 ```
 
 ### `helm premise-check <id> [--chain] [--project P]`
@@ -686,13 +686,13 @@ Y").
 ```console
 $ helm premise-check naming-poles
   digest: MATCH prem:b2b:9f2c...
-  native chain: VERIFIED — record 4d8a4c130602 at index 7 links to 29114915ece8…
+  native chain: VERIFIED — record a1b2c3d4e5f6 at index 7 links to b2c3d4e5f6a7…
   external anchor: none (native-only)
 $ helm premise-check --chain naming-poles
   1. naming-extremes [delete_eligible] - metaphors live at the extremes only
   2. naming-poles [live] - metaphors live at the poles
-       native chain VERIFIED — record 4d8a4c130602 at index 7 links to 29114915ece8…
-       link 1->2 ATTESTED — native record linkage verified (29114915ece8 -> 4d8a4c130602)
+       native chain VERIFIED — record a1b2c3d4e5f6 at index 7 links to b2c3d4e5f6a7…
+       link 1->2 ATTESTED — native record linkage verified (b2c3d4e5f6a7 -> a1b2c3d4e5f6)
   biography:
     held 'metaphors live at the extremes only' until 2026-07-19T..., then 'metaphors live at the poles' — LIVE now
 ```
@@ -1838,7 +1838,7 @@ in the design doc's codex-round section.)
 $ helm chat post "@codex-seat xrev the delivery-lane branch when free"
 $ helm chat seats                # who's live, what's pending, what's claimed
 $ helm chat claim worktree-main --ttl 1800   # prints the lease id — keep it
-$ helm chat release worktree-main --lease 5f3c9a2d41b0e6f2
+$ helm chat release worktree-main --lease c3d4e5f6a7b8091a
 ```
 
 ### `helm chat meld` (aka `council`, `standup`) — the mindmeld preset
@@ -2012,7 +2012,7 @@ everywhere; from inside a repo the root resolves itself.
 
 ```console
 $ helm work claim webui            # path  branch  lease  ttl — keep the lease
-$ helm work release webui --lease 5f3c9a2d41b0e6f2      # dirty? --park saves it
+$ helm work release webui --lease d4e5f6a7b8091a2b      # dirty? --park saves it
 $ helm work gc                     # the verdict table, dry; --apply enforces
 ```
 

@@ -134,7 +134,7 @@ fleet's merges on one family's remaining budget.
 ## 7. Re-grounding a confused (not dead) seat
 
 `cv pack "<task>"` compiles a context bundle from the whole session corpus;
-`cv show <id> --find TERM` reads what a prior seat knew (see `/recall`).
+`cv show <id> --find TERM` reads what a prior seat knew.
 Pane-level control (read/wait/send keystrokes, spawn in worktrees)
 is orca's: use the `orca-cli` skill primitives — don't reinvent PTY plumbing.
 

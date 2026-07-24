@@ -234,7 +234,7 @@ primitive:
   are consolidating and how — e.g. *"self-verify each slice live + one batched cross-family final-QC
   instead of per-slice refute"* — BEFORE proceeding, so the human sees the rigor tradeoff they are
   authorizing rather than a silent thinning. The consolidated plan still degrades LOUD (the receipt
-  carries `rigor`/`budget_reason`). (Fable-5 eval 2026-06-09: a codex-cred cap forced overriding the
+  carries `rigor`/`budget_reason`). (Fable-5 eval: a codex-cred cap forced overriding the
   default per-slice cadence and the RSH had no slot to make the consolidation explicit.)
 
 ## Engagement modes (codex/cross-family intensity)
