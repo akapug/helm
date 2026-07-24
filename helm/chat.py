@@ -1338,9 +1338,45 @@ def _touch_poster_presence(name):
         pass
 
 
+def react_ordinals(rows):
+    """Map each row's LIST POSITION -> its 1-based react target ordinal (the
+    `n` for `helm chat react n`), or None for a reaction row (not targetable).
+
+    This is the SAME filter react() resolves against (non-react rows), so the
+    `[n]` that `read` prints beside a row is EXACTLY the number `react n`
+    toggles — reactions interleaved above notwithstanding. Without it the two
+    index spaces diverged silently: `read` renders every row (reaction lines
+    included) while `react n` counts only non-react rows, so a human counting
+    the printed lines lands off-by-(reactions-above) — owner-caught when a 🫡
+    landed on the wrong post."""
+    out, n = {}, 0
+    for i, m in enumerate(rows):
+        if m.get("react"):
+            out[i] = None            # a reaction row: shown, but never a target
+        else:
+            n += 1
+            out[i] = n
+    return out
+
+
+def react_prefix(rows):
+    """A `tag(i)` fn that renders row i's read prefix: `[n] ` for a react
+    target, an aligned blank for a reaction row (width-matched to the widest
+    ordinal). ONE owner so `read` and `read --follow` print the SAME [n] the
+    `react n` verb targets — the two read surfaces can never drift apart."""
+    ords = react_ordinals(rows)
+    w = max((len("[%d]" % o) for o in ords.values() if o), default=0)
+
+    def tag(i):
+        o = ords.get(i)
+        return (("[%d]" % o).rjust(w) if o else " " * w) + " "
+    return tag
+
+
 def react(target, code, room="main", who=None, profile=None, sign=None):
-    """TOGGLE a reaction. target: 1-based message ordinal (negatives count
-    from the end) or an explicit (ts, from) pair (the web panel's form).
+    """TOGGLE a reaction. target: 1-based message ordinal (the `[n]` shown by
+    `helm chat read`; negatives count from the end) or an explicit (ts, from)
+    pair (the web panel's form).
     `code` is a :shortcode: or a raw emoji. Returns (row, None) or
     (None, reason). Rides the same transport as a post.
 
@@ -1664,9 +1700,10 @@ def _follow(room, since=0):
         while True:
             rows, total = read(room)
             idx = index_rows(rows)
-            msgs = rows[since if 0 <= since <= total else 0:]
-            for m in msgs:
-                print(_fmt(m, idx=idx), flush=True)
+            tag = react_prefix(rows)      # same [n] as `read` — react targets it
+            start = since if 0 <= since <= total else 0
+            for i, m in enumerate(rows[start:], start):
+                print(tag(i) + _fmt(m, idx=idx), flush=True)
             consume(room, total)
             since = total
             time.sleep(POLL_S)
@@ -2136,9 +2173,11 @@ def cmd_chat(args):
             return _follow(room, since)
         rows, total = read(room)
         idx = index_rows(rows)            # the WHOLE room indexes the thread:
-        msgs = rows[since if 0 <= since <= total else 0:]   # a quote resolves
-        for m in msgs:                    # to a parent older than --since
-            print(_fmt(m, idx=idx))
+        tag = react_prefix(rows)          # [n] beside a row IS its `react n`,
+        start = since if 0 <= since <= total else 0   # counted over the WHOLE
+        msgs = rows[start:]               # room so --since never shifts [n]
+        for i, m in enumerate(rows[start:], start):   # a quote resolves to a
+            print(tag(i) + _fmt(m, idx=idx))          # parent older than --since
         if not msgs:
             print("helm chat [%s]: no messages — post one: helm chat post "
                   "<text>%s" % (label, " (or: helm chat dm <seat> <text>)"
@@ -2149,8 +2188,9 @@ def cmd_chat(args):
         seat = _seat_flag(args)
         if len(args) < 3:
             print("usage: helm chat react <n> <:shortcode:|emoji> [--room R] "
-                  "[--seat S] (n counts messages, 1-based; -1 = latest; "
-                  "same react again toggles it off)", file=sys.stderr)
+                  "[--seat S] (n is the [n] shown by `helm chat read`, 1-based; "
+                  "-1 = latest; same react again toggles it off)",
+                  file=sys.stderr)
             return 2
         try:
             n = int(args[1])
