@@ -911,16 +911,27 @@ def _strip_comment(code):
     return code
 
 
+def _from_field_files():
+    """helm/*.py plus one level of package submodules ('inject/_whisper.py') —
+    a module decomposed into a PACKAGE must never blind this sweep: its read
+    sites keep being scanned, keyed by the package-relative path."""
+    out = [fn for fn in sorted(os.listdir(PKG)) if fn.endswith(".py")]
+    for d in sorted(os.listdir(PKG)):
+        sub = os.path.join(PKG, d)
+        if os.path.isdir(sub) and os.path.exists(os.path.join(sub, "__init__.py")):
+            out += [os.path.join(d, fn) for fn in sorted(os.listdir(sub))
+                    if fn.endswith(".py")]
+    return out
+
+
 def _from_field_read_sites():
-    """[(module, lineno, text)] for every helm/*.py line that reads a chat/meld
-    row's IDENTITY field — a from/tfrom/rfrom/dm/peer dict accessor, or the
+    """[(module, lineno, text)] for every helm source line that reads a chat/
+    meld row's IDENTITY field — a from/tfrom/rfrom/dm/peer dict accessor, or the
     meld `convener` local. Source-driven, like _roster_call_sites: a new reader
     shows up here with no edit to this test, then fails unless its module is
     allowlisted (and its module count re-pinned)."""
     sites = []
-    for fn in sorted(os.listdir(PKG)):
-        if not fn.endswith(".py"):
-            continue
+    for fn in _from_field_files():
         st = {"in": False, "q": None}
         with open(os.path.join(PKG, fn), encoding="utf-8") as fh:
             for i, line in enumerate(fh, 1):
@@ -974,7 +985,7 @@ _FROM_FIELD_CONSUMERS = {
         "NOT-A-CHAT-ROW: meta.get('from') is a provider-migration SOURCE PATH "
         "(the home's origin dir), never a chat/meld identity — it reaches no "
         "chat sink. Listed so a future `.get(\"from\")` here is re-justified."),
-    "inject.py": (
+    "inject/_whisper.py": (
         "LAUNDERED+INTERNAL: _council_reach's from reads (the ping-pong "
         "suffix walk, the owner check, the mid-meld state peer match) are "
         "INTERNAL-MATCHING-ONLY; the ONE emit — the council-reach whisper "
@@ -990,7 +1001,7 @@ _FROM_FIELD_CONSUMERS = {
 _FROM_FIELD_READ_COUNTS = {
     "chat.py": 30,         # +1: _fmt's ack-marker render (laundered via _dsan)
     "homes.py": 1,
-    "inject.py": 4,   # _council_reach: suffix walk x3 + mid-meld peer match
+    "inject/_whisper.py": 4,  # _council_reach: suffix walk x3 + mid-meld peer match
     "meld.py": 10,    # +1: recv's pinned-pair peer read (st.get("peer"))
     "seats.py": 18,        # +11: the ack/consume-ladder reads (matching +
                            # laundered emits); +1: consume_state's dm-vs-room
