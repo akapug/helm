@@ -143,6 +143,8 @@ class SilentDropTest(unittest.TestCase):
         self.assertIn("+7 more drops", silent_drop._alert_text(f))
 
     def test_alert_text_names_seat_tokens_and_recipient(self):
+        os.environ["HELM_COORDINATOR_SEAT"] = "coordinator"
+        self.addCleanup(os.environ.pop, "HELM_COORDINATOR_SEAT", None)
         txt = silent_drop._alert_text(
             {"seat": "codex", "output_tokens": 103, "session": SID,
              "ts": "2026-07-23T10:00:00Z"})

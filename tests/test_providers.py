@@ -466,7 +466,7 @@ class SelectionTest(NativeBase):
                 contextlib.redirect_stderr(err):
             self.assertIsInstance(providers.default_provider(), NativeQuotaProvider)
         self.assertIn("using native provider", err.getvalue())
-        with mock.patch.dict(os.environ, {"HELM_PROVIDER": "cli"}), \
+        with mock.patch.dict(os.environ, {"HELM_PROVIDER": "cli", "HELM_QUOTA_CLI": "myquota"}), \
                 mock.patch.object(providers.shutil, "which", lambda b: "/bin/" + b):
             prov = providers.default_provider()
         self.assertIsInstance(prov, providers.CliQuotaProvider)
