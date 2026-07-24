@@ -276,6 +276,36 @@ class BuildEnvTest(CellBase):
         self.assertEqual(env["DREGG_API_TOKEN"], "direct")
         self.assertNotIn("DREGG_NODE_PASSPHRASE", env)
 
+    def test_signer_env_file_fills_gaps_but_os_environ_wins(self):
+        # An operator's signer.env configures the signer's runtime posture (e.g.
+        # a marshal-only devnet's DREGG_ALLOW_UNAUDITED_PQ) ONCE, read fresh on
+        # every signed turn so a running seat picks it up with no relaunch.
+        # Absent file => no-op; the file fills GAPS only, real env WINS.
+        self.assertNotIn("DREGG_ALLOW_UNAUDITED_PQ", cell.build_env())  # absent file
+        sp = os.path.join(cell.home.helm_home(), "signer.env")
+        os.makedirs(os.path.dirname(sp), exist_ok=True)
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write("# devnet marshal-only posture\n"
+                    "DREGG_ALLOW_UNAUDITED_PQ=1\n"
+                    "\n"
+                    "DREGG_API_TOKEN=fromfile\n")
+        os.environ["DREGG_API_TOKEN"] = "fromenv"   # explicit env must WIN
+        env = cell.build_env()
+        self.assertEqual(env["DREGG_ALLOW_UNAUDITED_PQ"], "1")  # gap filled
+        self.assertEqual(env["DREGG_API_TOKEN"], "fromenv")     # env beats file
+
+    def test_signer_env_file_explicit_path_and_malformed_lines(self):
+        sp = os.path.join(self.tmp, "custom-signer.env")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write("# comment\nNOEQUALS\n  DREGG_ALLOW_UNAUDITED_PQ = 1 \n")
+        os.environ["HELM_CELL_ENV_FILE"] = sp
+        try:
+            env = cell.build_env()
+            self.assertEqual(env["DREGG_ALLOW_UNAUDITED_PQ"], "1")  # trimmed
+            self.assertNotIn("NOEQUALS", env)                       # skipped
+        finally:
+            os.environ.pop("HELM_CELL_ENV_FILE", None)
+
 
 class A2ATransportTest(CellBase):
     STUB = ("#!/bin/sh\n"

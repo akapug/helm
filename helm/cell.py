@@ -290,12 +290,43 @@ _USAGE = """usage: helm cell <verb> [args]
                                                  (attestation never needs it)"""
 
 
+def _signer_env_file():
+    """The OPTIONAL operator-set deployment env for the signer subprocess:
+    HELM_CELL_ENV_FILE else <helm-home>/signer.env. Absent => no-op ({})."""
+    p = home.env("CELL_ENV_FILE") \
+        or os.path.join(home.helm_home(), "signer.env")
+    try:
+        with open(p, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return {}
+    out = {}
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        k, v = ln.split("=", 1)
+        k = k.strip()
+        if k:
+            out[k] = v.strip()
+    return out
+
+
 def build_env():
     """Subprocess env for the OPTIONAL a2a transport: a copy of os.environ with
     each set HELM_* mapped onto its signer-facing names (legacy MELD_* and
     dregg-native DREGG_*; HELM wins; absent HELM leaves a directly-set
-    MELD_*/DREGG_* untouched — the env2 pattern)."""
-    env = dict(os.environ)
+    MELD_*/DREGG_* untouched — the env2 pattern).
+
+    An operator's `signer.env` (see `_signer_env_file`) fills GAPS only — real
+    os.environ / HELM_* mappings WIN — so a deployment configures the signer's
+    runtime posture ONCE (e.g. a marshal-only devnet's DREGG_ALLOW_UNAUDITED_PQ,
+    read fresh on every signed turn, so an already-running seat picks it up with
+    no relaunch) without editing per-seat launch env. Absent file => unchanged;
+    an env that explicitly sets the same key overrides the file (production
+    leaving the file absent stays audited)."""
+    env = dict(_signer_env_file())
+    env.update(os.environ)
     for h, m in ENV_MAP:
         v = os.environ.get(h)
         if v is not None:
