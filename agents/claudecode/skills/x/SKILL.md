@@ -72,7 +72,7 @@ premise (cheapest-probe-before-fire) before you refute or build on it.
    wrong-principal — caller-vs-target instead of author-vs-target — was a cross-family reviewer's catch.)
    - **xfam EXCEPTIONS (evolvable list; owner-ratified):** a **super-SOTA-tier** model ALWAYS
      counts as a valid xfam basin — even reviewing its own family or its own model. Current tier
-     members: **Fable 5** (owner ruling: "fable always counts as xfam because it's super-sota").
+     members: **Fable 5**.
      So Fable↔Fable review/refutation is VALID xfam — never reject it as same-family (the prior
      fable-vs-opus = xfam, stands subsumed). Record verdicts honestly as
      `basins=author:fable vs eyes:fable (super-sota exemption)` so the data stays auditable.
@@ -91,7 +91,7 @@ with the durable xrev thread (the recorded verdict) — proven live (claude-Opus
 round-trip, auto-closed):
 - Fire it as a direct channel to the peer, then post an action-required
   `refute: <bounded claim>` to the same thread (`helm chat post`) —
-  the action-required wake rouses an idle peer (F6); the reply lands on the same thread, **non-blocking**
+  the action-required wake rouses an idle peer; the reply lands on the same thread, **non-blocking**
   (you keep working; read the thread between actions).
 - **Reach for telepathy-xrev**: ONE bounded finding you can keep working through ("is this right?"
   to a different-family peer mid-flow). **Reach for a durable conv xrev**: the recorded PASS/NOT_PASS

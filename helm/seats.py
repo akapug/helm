@@ -52,10 +52,9 @@ The legs:
               beacon; silently runs `helm index cap --apply`. Fail-open
               total; HELM_STOP_GUARD=0 kills it.
 
-Council (embargoed verdicts) is DEFERRED to 0.3 — the codex round showed a
-correct embargo needs an expected-set freeze, a reveal state machine, salted
-commitments and batch-row reveal; the 0.3 spec is recorded in the design
-doc §11. No live consumer today, so: record, don't build.
+Council (embargoed verdicts) is DEFERRED to 0.3: a correct embargo needs an
+expected-set freeze, a reveal state machine, salted commitments and batch-row
+reveal. No live consumer today, so: record, don't build.
 
 Cursor law: `<room>.cursor.<seat>[.<sid8>]` holds {dev, ino, off,
 rid, active} — the room file's identity, the byte offset of the first
@@ -129,8 +128,8 @@ BEACON_DRAIN_CAP = 4     # emitted wakes per --follow drain pass. An idle beacon
                          # arming to a large backlog must NOT replay it as one
                          # burst: each emit is a Monitor event, and >~10 events
                          # in a burst trips Monitor's firehose auto-stop → SIGTERM
-                         # (exit 143), and the seat goes DEAF (live 2026-07-23:
-                         # a seat with a ~36-row backlog died <8s every arm). Cap
+                         # (exit 143), and the seat goes DEAF (a seat with a
+                         # large backlog can die within seconds on every arm). Cap
                          # the pass; the remainder delivers next poll, and the
                          # agent's own catch-up `helm chat read` advances the
                          # cursor to drain the rest. Single-shot mode is unbounded
@@ -781,7 +780,7 @@ def rename_seat(old, new):
         # lowers, and _mention_re is re.I — a case-variant name (KIMI vs kimi)
         # is the SAME address + the SAME keyed state downstream, so two such
         # rows alias mentions, share presence, and cross-fire gc's state
-        # unlink onto the live seat (kimi cross-family review, live-probed
+        # unlink onto the live seat (cross-family review, live-probed
         # 2026-07-21).
         # Exclude `seat` itself so a pure self-case-change isn't falsely blocked.
         if any(k != seat and k.casefold() == new.casefold() for k in r):
@@ -1878,7 +1877,7 @@ def _unbanked_candidate(dirty, edits, latest):
 
 
 # ── work-offer: the fleet self-saturation rung (AX primitive #1) ───────────
-# The owner-flagged gap: an idle seat let a dispatched review sit — the fleet
+# The saturation gap: an idle seat let a dispatched review sit — the fleet
 # does not self-saturate (an idle seat never picked up a canary review). This
 # rung is the BOTTOM of the ladder (lowest salience): OWN work first (the ask /
 # dispatch / pending-inbox / claim signals all outrank it), then, only when the
@@ -2863,7 +2862,7 @@ def roster_report(room="main"):
 # row, or it was active in a later second) -> ACTED (an explicit ack row on
 # the same one-writer chat path). `pending` is the sender's view of everything
 # not yet ACTED, so a message sent to a dead / wedged / away recipient is a
-# VISIBLE object, not silent loss (owner-flagged: the notify-me gap).
+# VISIBLE object, not silent loss (closing the notify-me gap).
 # ---------------------------------------------------------------------------
 
 _MENTION_TOKEN = re.compile(r"(?<![A-Za-z0-9._-])@([A-Za-z0-9._-]{1,64})")
@@ -3533,8 +3532,8 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
                 c["resource"], c["holder"], c["remaining"], c["fence"]))
         return 0
     if verb in ("verdict", "reveal"):
-        print("helm chat: council is deferred to 0.3 (codex review — see the "
-              "design doc §11); use the room + /premise for now", file=sys.stderr)
+        print("helm chat: council (embargoed verdicts) is deferred to 0.3; "
+              "use the room + /premise for now", file=sys.stderr)
         return 2
     print("helm chat: unknown subcommand '%s'" % verb, file=sys.stderr)
     return 2

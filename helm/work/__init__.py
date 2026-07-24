@@ -28,7 +28,7 @@ add:
                    second is a pointer-only safety net. Existing hooks remain
                    first-class participants, preserved byte-for-byte.
 
-Tripwires (design §5): per-file claims, approval steps, a second registry,
+Tripwires (over-engineering signals): per-file claims, approval steps, a second registry,
 queues/priorities on lanes, a daemon — any of these is the over-engineering slide; stop.
 """
 # The top-level imports the pre-split module exposed as public attributes.

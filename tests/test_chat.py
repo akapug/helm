@@ -304,7 +304,7 @@ class RowIntegrityTest(ChatBase):
 class PostUnknownFlagTest(ChatBase):
     """post REFUSES an unrecognised LEADING flag instead of publishing it —
     and ONLY leading flags: the body is prose and may talk about flags freely.
-    All three cross-family review findings on the first cut are pinned here: whole-body
+    All three findings on the first cut are pinned here: whole-body
     scanning made flag-prose unsendable, single-dash flags still broadcast,
     and the tests sat after the __main__ guard where direct unittest
     execution never discovered them (this class now precedes it)."""

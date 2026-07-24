@@ -139,7 +139,7 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual(env["PATH"], "/bin")  # everything else rides through
 
     def test_cmd_launch_survives_a_deleted_cwd(self):
-        """A review finding (probe A6): the seat DEFAULT called
+        """The seat DEFAULT called
         stable_seat() — a bare os.getcwd() — BEFORE the safe_cwd resolver
         line, so `helm launch` from a pruned worktree with neither --seat nor
         HELM_CHAT_NAME died with FileNotFoundError instead of launching

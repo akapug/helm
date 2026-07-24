@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# NODE MIGRATION — the one-node cutover (PRD CHAT_V2, owner-approved
-# 2026-07-19 "you can unify the caves without me").
+# NODE MIGRATION — the one-node cutover.
 #
 # Migrates the team node (upstream unit dregg-cave.service, :8899 — the
 # owner's attestation chain) to RAM-hot (tmpfs data-dir) with disk as

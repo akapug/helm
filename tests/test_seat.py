@@ -1617,7 +1617,7 @@ class SeatEnsureTest(unittest.TestCase):
         self.assertEqual(len(up_calls), 1)
 
     def test_ensure_starting_proxy_within_grace_is_never_killed(self):
-        # THE adversarial-review finding: a HEALTHY just-launched proxy still binding
+        # THE hardened case: a HEALTHY just-launched proxy still binding
         # its port reads 'live pid + port not answering' -> the OLD code SIGTERMed
         # it. Within the startup-grace window it must be left alone (unknown /
         # STARTING), _down NEVER called — cron firing in the boot window must not

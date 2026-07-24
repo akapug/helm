@@ -1,6 +1,6 @@
-/* Client-runtime harness for the helm chat panel (brick #4 round 2).
+/* Client-runtime harness for the helm chat panel.
  *
- * Round 1's tests asserted only the SERVER's /api/chat shape, so three
+ * An earlier pass asserted only the SERVER's /api/chat shape, so three
  * CLIENT-JS ordering defects slipped through. This harness runs the ACTUAL
  * pollChat / chatHydrateParents / chatLoadOlder / chatResetLog source lifted
  * verbatim from helm/web_ui.html against a faithful fake server (mirrors
@@ -197,7 +197,7 @@ const renderedIds = () => LOG.querySelectorAll(".chatmsg").map(el => el.getAttri
 // ───────────────────────── scenarios ─────────────────────────
 // DEFECT 1a: a rotation IMMEDIATELY AFTER a reset must still be detected — the
 // windowed reset open has to leave CHAT_GEN stamped (not wiped) or the very next
-// poll misses the reindexed tail (codex-3: 70 mixed old+new instead of new20..69).
+// poll misses the reindexed tail (70 mixed old+new instead of new20..69).
 async function scenario_post_reset_rotation() {
   resetClient();
   SERVER.rows = range(50).map(n => ({id: "old" + n, from: "a", ts: "t" + n, text: "old-" + n}));

@@ -284,11 +284,11 @@ class ConfigsWebTest(unittest.TestCase):
 
 
 class HomeSubdirConfigTest(unittest.TestCase):
-    """The owner reported the configs UI was 'mostly uneditable'. Measured: of
-    500 files under the config homes, 457 were unrecognized — but nearly all
-    of those SHOULD be (credential stores, .bak copies, runtime state, plugin
-    metadata). What was left was declarative human-authored config living ONE
-    LEVEL DOWN in a home, which the gate had no pattern for."""
+    """The configs UI showed most files as uneditable. The bulk of files
+    under the config homes are correctly unrecognized (credential stores,
+    .bak copies, runtime state, plugin metadata). What was left was
+    declarative human-authored config living ONE LEVEL DOWN in a home, which
+    the gate had no pattern for."""
 
     def setUp(self):
         for d in ("commands", "rules"):

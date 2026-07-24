@@ -377,7 +377,7 @@ def _print(value, as_json):
         # relay/actor data, so C1 (U+009B) and bidi (U+202E) must escape to
         # \\uXXXX — still valid JSON, machine-parseable, terminal-safe (the human
         # -readable path already launders via _display). Same for every other
-        # --json emission below (gate FIX, 2026-07-23).
+        # --json emission below.
         print(json.dumps(value, ensure_ascii=True, sort_keys=True))
         return
     if isinstance(value, list):

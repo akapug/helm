@@ -179,7 +179,7 @@ def post_json(url, payload, timeout=8, headers=None):
 # chain (premise.py) is the primary, offline proof. IF a dregg node is
 # configured + reachable, helm MAY post the record's hash to the node's thin
 # /turn/submit ingress as an EXTERNAL ANCHOR. The node signs the turn with its
-# OWN operator cell (confused-deputy hardening, dregg F-P1-3: the request
+# OWN operator cell (confused-deputy hardening: the request
 # `agent` is advisory only) — so the honest claim is "dregg node <url> anchored
 # this digest at turn <hash>", NEVER "the user's cell signed". Best-effort +
 # FAIL-OPEN: node absent/locked/refusing => no anchor, the native record still
@@ -239,7 +239,7 @@ def verify_anchor(turn_hash, timeout=4):
     hash? (observed, detail). Tries /api/turn/<hash>/proof then the starbridge
     receipt filter.
 
-    HONEST SCOPE (helm A1): this only OBSERVES that a turn with the stored hash
+    HONEST SCOPE: this only OBSERVES that a turn with the stored hash
     EXISTS on the node — it does NOT prove that turn's EmitEvent carries the
     entry's native record hash. attest_anchor_turn is mutable frontmatter and is
     not part of the native record, so an unrelated real turn could be substituted
@@ -346,7 +346,7 @@ def _usable(b):
     executable — a directory or a non-executable file (mode 0600, etc.) is NOT
     a usable binary. os.path.exists() would say yes and let status claim
     'signed' + let the signing leg burn an unlock lap; isfile + X_OK is the
-    minimum honest meaning of 'signer ready' (codex day-review #1)."""
+    minimum honest meaning of 'signer ready'."""
     return bool(b and os.path.isfile(b) and os.access(b, os.X_OK))
 
 

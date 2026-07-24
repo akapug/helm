@@ -56,7 +56,7 @@ convergence — agenda/quorum/recorded verdict, the 0.3 N-of-M machinery) are
 SPECIES spellings routed to this same preset, never replacements. Every
 spelling echoes itself back in the printed next-commands (`via`).
 
-PINNED PAIR (live-fire 2026-07-23): a meld is its invited pair. The seed
+PINNED PAIR: a meld is its invited pair. The seed
 carries `invited=<peer>`; join REFUSES any other seat; recv accepts READY
 and chunks ONLY from state["peer"] — a third seat can no longer GO, hijack,
 or kill a meld with a forged DONE/ABORT. Identity is env-first
@@ -101,7 +101,7 @@ def _recv_timeout():
 
 def _self_seat():
     from . import seats
-    # ENV-FIRST, aligned with chat.whoname (live-fire 2026-07-23 identity
+    # ENV-FIRST, aligned with chat.whoname (the identity
     # trap): the roster-first order here silently ignored HELM_CHAT_NAME for
     # any session already in the roster — the invite fired AND the peer
     # joined under the roster seat instead of the exported one, zero warning.
@@ -150,7 +150,7 @@ def invite(peer, topic, seat=None, via="meld"):
     carries `invited=<peer>` — the pinned pair's durable half (join refuses
     any other seat; recv accepts only this one). An untracked peer gets a
     LOUD warning instead of the unconditional 'wakes at its next boundary'
-    line (live-fire: the invite asserted delivery to a seat with no lane)."""
+    line (the invite asserted delivery to a seat with no lane)."""
     seat = seat or _self_seat()
     peer = (peer or "").lstrip("@")
     if not peer:
@@ -205,7 +205,7 @@ def join(room, seat=None, via="meld"):
     post the control-only READY (@convener — the wake-back; a READY that
     lands silently strands GO forever, a live incident), state
     joiner/active with idx=0 so the seeded problem is the first recv chunk.
-    REFUSES a seat the seed did not invite (live-fire 2026-07-23: a meld
+    REFUSES a seat the seed did not invite (a meld
     convened for one seat was consummated by another with zero warning —
     downstream, the convener's DONE @mentioned a ghost). Pre-pin seeds
     (no invited= field) grandfather in unpinned."""
@@ -229,9 +229,8 @@ def join(room, seat=None, via="meld"):
         raise SystemExit(
             "helm %s: room %s was convened for %s, not %s — join under the "
             "invited name (HELM_CHAT_NAME=%s or --seat %s). A different-seat "
-            "join is how melds got hijacked/mis-consummated (live-fire "
-            "2026-07-23)." % (via, room, invited, chat._dsan(seat),
-                              invited, invited))
+            "join is how melds got hijacked/mis-consummated." % (
+                via, room, invited, chat._dsan(seat), invited, invited))
     # convener is a SEED ROW's from-field — planted/foreign (a pre-fix or
     # foreign-node seed) it may carry ESC/bidi. Launder it before it enters
     # BOTH the MELD-JOINED display line AND the posted READY text (chat._fmt
@@ -276,14 +275,14 @@ def recv(room, timeout=None, seat=None, poll=MELD_POLL, via="meld"):
     chunk carrying a real floor marker; skip own/unattributable rows,
     stale epochs (the fence), control echoes, markerless chatter,
     reactions, and — the pinned-pair law — EVERY row from a seat that is not
-    state["peer"] (live-fire 2026-07-23: recv accepted READY and chunks from
+    state["peer"] (recv once accepted READY and chunks from
     ANY non-self sender; a meld convened for one seat was consummated by
     another, and a third seat could kill any meld with a forged DONE/ABORT).
     Bounds are behavior: cap/timeout → (EXIT_BOUND, fall-to-async
     instruction); [ABORT] → (EXIT_ABORT, loud). READY returns exactly once —
     to the invited convener, flipping it active (the GO moment). After your
-    own [DONE] recv becomes the COUNTERSIGN WATCH (closer-went-blind,
-    live-fire): it returns the peer's closing DONE/ABORT — flipping
+    own [DONE] recv becomes the COUNTERSIGN WATCH (closer-went-blind):
+    it returns the peer's closing DONE/ABORT — flipping
     done-mutual and counting the exchange — instead of refusing."""
     seat = seat or _self_seat()
     st = state(room, seat)
@@ -479,7 +478,7 @@ def cmd(args, via="meld"):
     """helm chat meld|council|standup invite <peer> <topic...> [--wait] |
     join <room> | recv <room> [--timeout S] | say <room> --marker M
     <text...> | status — every verb takes --seat S (explicit per-command
-    identity; live-fire: ambient-only identity forced env -u gymnastics for
+    identity; ambient-only identity forced env -u gymnastics for
     one-off council seats). `via` is the spelling the operator typed — it
     echoes back in every printed next-command."""
     args = list(args or [])

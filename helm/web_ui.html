@@ -2655,7 +2655,7 @@ function chatParentKey(m) {
 
 /* the one-level quote (a compact one-level style — never nested). FOUR states, so a
    reply to a parent that is merely ABOVE the loaded window is NOT slandered as
-   "rotated out" (the P1 bug): resolved-in-DOM (clickable jump) · resolved-but-
+   "rotated out": resolved-in-DOM (clickable jump) · resolved-but-
    above-the-window (author+snippet, click loads older then jumps) · PENDING
    (an id parent we have not hydrated yet — chatHydrateParents resolves it) ·
    gone (a pre-id reply with no surviving twin, OR an id the server confirmed is
@@ -2762,7 +2762,7 @@ async function chatHydrateParents() {
   if (!ids.length) return;
   const want = CHAT_ROOM;
   // Hydrate in <=100-id CHUNKS (the server caps ids= at 100) and mark an id GONE
-  // only within the chunk that actually REQUESTED it. The round-1 bug sent
+  // only within the chunk that actually REQUESTED it. An earlier bug sent
   // ids.slice(0,100) yet marked EVERY pending id absent, so with 101 pending
   // parents the 101st — never sent — was falsely branded "rotated out" though its
   // parent still lives in the room. Never mark absent an id that was never asked.
@@ -2893,8 +2893,8 @@ async function pollChat() {
     // slice (rows[sentSince:] on the rotated file) is the WRONG rows AND our
     // rendered log holds dropped rows. Discard it, reset the cursor, and re-poll
     // for a fresh windowed open. (total<since below only catches a rotation that
-    // ALSO shrank below the cursor; a rotate-then-regrow PAST it — the reported
-    // P1 — slips through, so the gen is the one reliable signal.)
+    // ALSO shrank below the cursor; a rotate-then-regrow PAST it
+    // slips through, so the gen is the one reliable signal.)
     if (typeof d.gen === "string" && sentSince > 0 && CHAT_GEN !== null && d.gen !== CHAT_GEN) {
       CHAT_SINCE = 0; chatResetLog();     // clears CHAT_GEN too; the reset open restamps it
       setTimeout(pollChat, 0);            // finally clears the lock first, then the windowed repaint
@@ -3016,9 +3016,9 @@ function chatJumpSync() {
    Fail-open: absent/empty (older server) degrades to just main + the live
    room; a just-typed channel (no post yet, so no server row) still shows.
 
-   ACTIVITY IS THE POINT (owner-caught: he sat on a 4-row room
-   while 88 rows landed in another with no signal): every room shows its
-   unread count, an @ flag when any of it addresses him, and the AGE of its
+   ACTIVITY IS THE POINT (a quiet room can hide while another fills with
+   unread rows unnoticed): every room shows its
+   unread count, an @ flag when any of it addresses the owner, and the AGE of its
    last message — so a quiet room reads quiet (dimmed) and the busy one is
    impossible to miss. */
 function chatRooms(rooms) {
@@ -4081,8 +4081,7 @@ function initLedger() {
 }
 
 /* ---------- dregg ticker: the signed-turn pulse on every view ----------
-   Owner ask 2026-07-23 ("get that back at the top of the UI"): the dregg
-   signing / cave-turn activity, prominent + global. Reuses /api/ledger (the
+   Keeps the dregg signing / cave-turn activity prominent + global. Reuses /api/ledger (the
    ledger tab's own read); its OWN slow timer (8s — a pulse, not a poll storm)
    and a DECISION-keyed dedup: the strip re-renders only when the signing MODE
    or the NEWEST TURN changes, never on cosmetic churn. Fail-quiet: an errored

@@ -44,8 +44,8 @@ CAPABILITIES = (
         "what": "push a per-toolcall whisper to the fleet — fires on EVERY "
                 "tool call, fleet-wide (the a2a/whisper/meld primitive)",
         "wired_via": "the PostToolUse hook (helm chat)",
-        # the owner canon COUPLES these: "the per-toolcall whisper meld = helm
-        # chat deliver" — so whisper/meld/converge ARE this verb's trigger
+        # these are COUPLED: the per-toolcall whisper meld = helm
+        # chat deliver — so whisper/meld/converge ARE this verb's trigger
         # context, and it co-fires with `meld` on the a2a-converge moment.
         "keywords": "a2a,whisper,per-toolcall,per toolcall,whisper meld,meld,"
                     # NO bare "converge" — it collides with dregg protocol vocab

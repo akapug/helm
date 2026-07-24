@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """helm chat node — supervision of the chat room node (a dregg tmpfs node).
 
-INTERIM SCAFFOLDING by design (one-node-per-team law, PRD 2026-07-19): the
+INTERIM SCAFFOLDING by design (one-node-per-team law): the
 target topology is one team node; interim, chat gets its OWN tmpfs node so a signed
 chat turn can never land on a disk-persisted chain. Everything here is
 node-agnostic — the node migration (scripts/node-migration.sh)

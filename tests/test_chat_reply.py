@@ -525,7 +525,7 @@ class ReplyCliTest(ReplyBase):
 # ---------------------------------------------------------------------------
 
 class ReplyWakeTest(ReplyBase):
-    """A reply wakes the parent's author (the owner's WHY: replying replaces
+    """A reply wakes the parent's author (the intent: replying replaces
     typing the @mention) and otherwise EXACTLY what its text alone would have
     woken. Asserted against seats.deliverable() — the beacon's own decision
     function — not a proxy for it."""

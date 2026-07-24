@@ -33,8 +33,8 @@ conf 1.0 — owner canon and proven facts), `prior` (belief + confidence),
 ## The three laws of a capture that actually fires
 
 1. **Verbatim source.** The owner's exact words go in `--source`. The
-   statement is your compression of them — and compressions invert (measured
-   3 inversions in 24h, 2026-07-22). Keep the original attached so an
+   statement is your compression of them — and compressions invert in
+   practice. Keep the original attached so an
    inversion stays catchable.
 2. **Symptom keywords, not diagnosis keywords.** Write the words someone has
    BEFORE they know the answer ("pane died", "still waiting", "happened
@@ -62,8 +62,8 @@ its keywords, `--source` the new incident), `supersede` it if the new lesson
 replaces it, or `confirm` it if the incident just re-proves it — never mint
 a sibling id beside it. Duplicates are worse than misses: they split the
 DF weight of shared keywords, so BOTH entries rank lower than either alone,
-and future updates land on one while the other rots stale (owner-caught,
-the gap live in a well-populated store). Only a genuine 0-hit
+and future updates land on one while the other rots stale (a gap that
+surfaces live in a well-populated store). Only a genuine 0-hit
 resolve earns a new id.
 
 ## The am-I-being-stupid gate (run BEFORE capturing)

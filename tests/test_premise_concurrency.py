@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B4 — the native append-only chain MUST be concurrency-safe. It is the fleet's
+"""The native append-only chain MUST be concurrency-safe. It is the fleet's
 PRIMARY proof: two agents capturing at once must not fork it (both reading the
 same head and appending records with the same prev + index). _append_record
 holds an exclusive inter-process lock (fcntl.flock) across read-head + construct

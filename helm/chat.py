@@ -9,7 +9,7 @@ HELM_CHAT_DIR overrides (tests point it at a tmp dir). This is ephemeral
 presence-chat, NOT the durable record — /premise anything that must outlive
 the room; past SIZE_CAP the oldest half rotates out (RAM etiquette).
 
-v2 — THE SIGNED TRANSPORT (PRD CHAT_V2, premises a2a-ram-only-disk-log-after
+v2 — THE SIGNED TRANSPORT (premises a2a-ram-only-disk-log-after
 + comms-presets-optimize-their-novel-purity): when the chat ROOM NODE (a
 dregg node whose data-dir lives on tmpfs — chatnode.py supervises it)
 answers, every post also rides a signed self-write turn on the poster's cell
@@ -37,7 +37,7 @@ layer): `helm chat log-flush` appends delivered history OUT-OF-BAND to
 <helm-home>/helm/journal/chat-<date>.log, idempotent via a per-room
 high-water mark, disable with HELM_CHAT_LOG=0. Never called from send/read.
 
-Emojis (PRD addendum): shortcodes expand at post time on every surface
+Emojis: shortcodes expand at post time on every surface
 (:fire: -> 🔥, emoji.py), reactions ride the same transport as typed rows
 {react, tts, tfrom} rendered inline under their target. Reacting is a TOGGLE
 per (reactor, emoji, target): the second identical react appends a tombstone
@@ -59,7 +59,7 @@ stamped {dm: <recipient>} so only the EXACT-token recipient's beacon/boundary
 delivers it. No room ever sees it; it renders as a DM, not a room row; it
 signs like any post.
 
-Replies (PRD CHAT_REPLY): a row may carry {reply_to} — the PARENT ROW'S
+Replies: a row may carry {reply_to} — the PARENT ROW'S
 STABLE ID (chat._append's id law, reused; no second identity is invented) —
 plus {rts, rfrom}, the parent's (ts, from). A parent predating the id law also
 carries {rtext}: ts|from is not unique when one author posts twice inside a
@@ -253,8 +253,8 @@ def _ensure_dir():
 def whoname():
     """$HELM_CHAT_NAME, else a session-derived AGENT name — never the operator's
     identity. The unix login is the operator's machine account (e.g. `owner`); an
-    agent CLI post that fell through to it impersonated the owner in the room
-    (owner-flagged). The operator's own surfaces name themselves
+    agent CLI post that fell through to it impersonated the owner in the room.
+    The operator's own surfaces name themselves
     explicitly (web posts as 'owner'; `helm --human` sets HELM_CHAT_NAME), so a
     bare CLI post is ALWAYS an agent — it gets an agent name, never the login.
     A session already in the roster answers with its SEAT name (posts and
@@ -1326,7 +1326,7 @@ def post(text, room="main", who=None, profile=None, sign=None, origin=None,
 def _touch_poster_presence(name):
     """Presence-on-post: a seat that SPEAKS is alive, beacon or no beacon — so
     keep its roster row fresh and the reaper never drops a live-but-idle poster
-    (roster-truth, owner-caught). Best-effort + local import
+    (roster-truth). Best-effort + local import
     (chat<-seats would cycle); owner/broadcast names are not seats — skip them
     so no spurious presence file is minted."""
     try:
@@ -1347,8 +1347,8 @@ def react_ordinals(rows):
     toggles — reactions interleaved above notwithstanding. Without it the two
     index spaces diverged silently: `read` renders every row (reaction lines
     included) while `react n` counts only non-react rows, so a human counting
-    the printed lines lands off-by-(reactions-above) — owner-caught when a 🫡
-    landed on the wrong post."""
+    the printed lines lands off-by-(reactions-above) — a 🫡 could land
+    on the wrong post."""
     out, n = {}, 0
     for i, m in enumerate(rows):
         if m.get("react"):
@@ -1904,13 +1904,13 @@ HELP = {
     # loop below (each spelling in its own voice) — main's static "meld" entry
     # is superseded by that restructure, so it is dropped here on purpose.
     # verdict/reveal EXIST as dispatchable verbs but are deferred to 0.3
-    # (council — design doc §11): --help answers honestly with the deferral
+    # (council): --help answers honestly with the deferral
     # instead of the bare rc-2 message the verb itself returns.
-    "verdict": "usage: helm chat verdict — DEFERRED to 0.3 (council, design "
-               "doc §11); until it lands the verb answers with the deferral: "
+    "verdict": "usage: helm chat verdict — DEFERRED to 0.3 (council); "
+               "until it lands the verb answers with the deferral: "
                "use the room + /premise",
-    "reveal": "usage: helm chat reveal — DEFERRED to 0.3 (council, design "
-              "doc §11); until it lands the verb answers with the deferral: "
+    "reveal": "usage: helm chat reveal — DEFERRED to 0.3 (council); "
+              "until it lands the verb answers with the deferral: "
               "use the room + /premise",
 }
 # One preset, three spellings (MELD is the GENUS and stays the primary verb;
@@ -2123,10 +2123,10 @@ def cmd_chat(args):
         # REFUSE an unrecognised LEADING flag instead of POSTING it.
         #
         # Everything post does not consume falls into the message body, so a
-        # misremembered flag does not fail — it publishes. Live 2026-07-22:
-        # six `--to <seat>` posts went to #main as public messages, `post
-        # --help` posted the literal string "--help" fleet-wide for a day, and
-        # `-h` (single dash) broadcast the same way.
+        # misremembered flag does not fail — it publishes. For example, a
+        # `--to <seat>` post would land in #main as a public message, `post
+        # --help` would post the literal string "--help" fleet-wide, and
+        # `-h` (single dash) would broadcast the same way.
         #
         # SCOPE (xrev-corrected): only the LEADING OPTION POSITIONS are
         # policed — scanning the whole body made ordinary prose about CLI

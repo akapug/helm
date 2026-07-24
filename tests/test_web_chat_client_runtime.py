@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Client-RUNTIME contract tests for the chat panel (brick #4 round 2).
+"""Client-RUNTIME contract tests for the chat panel.
 
-Round 1 pinned only the SERVER's /api/chat shape, so three CLIENT-JS ordering
+An earlier pass pinned only the SERVER's /api/chat shape, so three CLIENT-JS ordering
 defects landed green: (1) pollChat wiped the just-stamped generation/base by
 running chatResetLog AFTER stamping them, so a rotation right after any reset
 missed rows and a post-reset older-page could not hydrate; (2) chatHydrateParents

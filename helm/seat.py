@@ -141,8 +141,8 @@ FAMILIES = {
              # k3's real window is 1M (live-probed api.kimi.com/coding/v1/models
              # context_length=1048576, 2026-07-23); minting the max teaches CC
              # past its hardcoded 200k non-claude default so the gauge AND
-             # autocompact track the true window (owner note: kimi was being
-             # compacted ~5x too often).
+             # autocompact track the true window (the old 200k default
+             # compacted kimi ~5x too often).
              "max_context": 1000000,
              "probe_models": ("kimi-k3",)},
     # ds4pro = DeepSeek v4 Pro, served by whichever OpenAI-compatible gateway
@@ -419,7 +419,7 @@ def _instance_gate(family, seat_name):
         # whose derived port aliases the canonical instance's (codex-02 ->
         # instances/codex-02 yet port base+2 = codex-2's) — two homes/tokens,
         # one port, a confusing pre-bound-port failure. Refuse non-canonical
-        # up front (an adversarial review finding).
+        # up front.
         return ("%s is not a canonical instance name — a zero-padded suffix "
                 "aliases `%s-%d`'s port with a separate proxy home; use "
                 "`%s-%d`" % (seat_name, family, int(m.group(1)),
@@ -468,7 +468,7 @@ def _proxy_pid_record(family, seat=None):
     # or the process-group / whole-signal-set selectors for kill(2). Treat a
     # corrupt file carrying one as stale (never signalled, reported down) so
     # _down's remediation never echoes `kill -1`/`kill 0` into advice an agent
-    # would paste verbatim (an adversarial review finding — the signal path was already
+    # would paste verbatim (the signal path was already
     # fail-closed, but the printed suggestion was not).
     if pid < 2:
         return None
@@ -657,7 +657,7 @@ def _config_yaml(port, auth_dir, token):
             "  disable-control-panel: true\n"
             # heartbeat during long non-streaming thinking passes — see docstring.
             "nonstream-keepalive-interval: 15\n"
-            # the STREAMING leg too (owner-witnessed: with the
+            # the STREAMING leg too (with the
             # nonstream keepalive already loaded, EVERY request at ~90% context
             # still died empty-200 — the stream stalls before/during bytes at
             # extreme payload sizes). keepalive-seconds emits SSE heartbeats so
@@ -1998,7 +1998,7 @@ def _resume(seat_name, rest, _locked=False):
             family, d, room, seat_name, room_source=room_source, multi=multi)
         from . import seats
         # resume must not strand the seat on a dead proxy either (the same
-        # silent-dead-seat class a critical review finding named in _spawn): mint the
+        # silent-dead-seat class named in _spawn): mint the
         # instance proxy (idempotent) and start it if down, so the relaunched
         # seat's 8319 line has a live proxy behind it.
         fam = FAMILIES[family]
@@ -2732,7 +2732,7 @@ def _spawn(seat_name, rest, _locked=False):
                          room_source=room_source, multi=multi)
     # per-instance proxy fate: an INSTANCE seat owns its OWN proxy
     # (instances/<seat>/), so spawn mints + starts THAT seat's proxy — never
-    # the family's. MINT FIRST (a critical review finding): a never-launched instance has
+    # the family's. MINT FIRST: a never-launched instance has
     # no config yet, and gating on its existence silently skipped BOTH the
     # auto-start AND the WARN — a spawn-first codex-2 launched DEAD (launch.sh
     # pointed at 8319, empty token, no proxy) where pre-lane it WORKED on the
@@ -3000,8 +3000,8 @@ def _doctor(args):
     return 0 if b and c and not err else 1
 
 
-# A live proxy still binding its port at startup must never read as WEDGED —
-# an adversarial review finding: two back-to-back 0.5s connect probes with no grace
+# A live proxy still binding its port at startup must never read as WEDGED:
+# two back-to-back 0.5s connect probes with no grace
 # let a just-launched proxy be SIGTERMed, and cron firing inside the boot window
 # churns kill->respawn->kill. Age source = pidfile mtime: _up writes the pidfile
 # atomically at spawn, so mtime ~= launch time and stays readable even when
@@ -3178,7 +3178,7 @@ def _ensure_row(family, seat):
         _down(family, seat)
     rc = _up(family, quiet=True, seat=seat)
     if rc != 0:
-        # concurrent-_up loser race (a minor review finding): a seat launching in the same
+        # concurrent-_up loser race: a seat launching in the same
         # instant wins the flock, our _up reads 'already running' (rc 1) — that
         # is not a failure, the row is now HEALTHY under the winner. Re-probe
         # before crying UNKNOWN.

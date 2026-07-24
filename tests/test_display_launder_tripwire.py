@@ -981,7 +981,7 @@ _FROM_FIELD_CONSUMERS = {
         "recent-activity roster lookup (frm in roster), and the react-target "
         "payload.get('tfrom') are INTERNAL-MATCHING-ONLY; the _chat_gen "
         "rotation fingerprint hashes row0's from/tfrom into a sha1 (INTERNAL "
-        "rotation-detection hash, brick #4 lazy-load — never a display sink). "
+        "rotation-detection hash, lazy-load — never a display sink). "
         "Verified by RosterSinkSweep's /api/chat + /api/ledger tests."),
     "homes.py": (
         "NOT-A-CHAT-ROW: meta.get('from') is a provider-migration SOURCE PATH "
@@ -1009,7 +1009,7 @@ _FROM_FIELD_READ_COUNTS = {
                            # laundered emits); +1: consume_state's dm-vs-room
                            # branch reads .get("dm") for control flow only
     "web.py": 9,   # +2: _chat_gen rotation-fingerprint hashes row0 from/tfrom
-                   # (internal sha1, never a display sink; brick #4 lazy-load)
+                   # (internal sha1, never a display sink; lazy-load)
 }
 
 

@@ -115,8 +115,8 @@ def env_pair(name, companion):
 # The harness session-id vars, in resolution order. CLAUDE_CODE_SESSION_ID is
 # the REAL var Claude Code exports; CLAUDE_SESSION_ID is the legacy/hook-injected
 # alias (the SessionStart join hook passes session_id explicitly, so it worked
-# even while a bare CLI post fell through to the anon floor — owner-caught
-# 2026-07-21: a manual `helm chat post` posted as 'agent', and the a2a per-session
+# even while a bare CLI post fell through to the anon floor: a manual
+# `helm chat post` posted as 'agent', and the a2a per-session
 # cursor silently no-op'd for every claude-code session). CODEX_SESSION_ID is the
 # codex seat. One resolver so no call site misses the real var again.
 _SESSION_ENV = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID")

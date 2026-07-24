@@ -396,7 +396,7 @@ class DeliverTest(SeatsBase):
         self.assertIn("precious", seats.deliver(seat="alice"))   # re-delivered
 
     def test_slug_colliding_seats_never_share_state(self):
-        """Codex B1's exact reproduction: pk.slug('api.a') == pk.slug('api-a')
+        """Exact reproduction: pk.slug('api.a') == pk.slug('api-a')
         yet they are distinct address tokens — each must keep its own
         cursor/seen state, neither may consume the other's rows."""
         self.assertNotEqual(seats.cursor_path("main", "api.a"),
@@ -580,8 +580,8 @@ class WaitTest(SeatsBase):
     def test_wait_follow_bounds_a_backlog_burst_so_the_beacon_cannot_firehose(self):
         """A --follow beacon arming to a large backlog must NOT replay it as one
         burst: each emit is a Monitor event, and >~10 in a burst trips Monitor's
-        firehose auto-stop -> SIGTERM, and the seat goes DEAF (live 2026-07-23: a
-        ~36-row backlog killed the beacon <8s every arm). ONE drain pass is
+        firehose auto-stop -> SIGTERM, and the seat goes DEAF (a large
+        backlog can kill the beacon within seconds on every arm). ONE drain pass is
         capped at BEACON_DRAIN_CAP emits + a single catch-up nudge, never the
         whole backlog. Pre-fix this pass emitted all 40 (the firehose)."""
         class _PassDone(Exception):
@@ -1017,7 +1017,7 @@ class BeaconScopeTest(SeatsBase):
     posts/@all never fleet-wide; (d) mute tunes (b)/(c), never (a)."""
 
     def test_codex2_repro_foreign_room_mention_wakes_main_homed_beacon(self):
-        """THE live bug: codex-2 homed to #main never saw '@codex-2 …'
+        """The reproduction: codex-2 homed to #main never saw '@codex-2 …'
         posted in #side-room — the homing allowlist starved the beacon."""
         os.environ["HELM_CHAT_ROOM"] = "main"
         seats.join(session="s-c2", seat="codex-2", cwd="/tmp/p")
@@ -1645,7 +1645,7 @@ class AutoNameTest(SeatsBase):
             self.assertEqual(chat.whoname(), "wren")
 
     def test_whoname_resolves_the_real_claude_code_session_var(self):
-        """REGRESSION (owner-caught): Claude Code exports
+        """REGRESSION: Claude Code exports
         CLAUDE_CODE_SESSION_ID, NOT CLAUDE_SESSION_ID — a bare CLI post fell
         through to the anon 'agent' floor and the per-session cursor no-op'd.
         home.session_id() must resolve the real var so whoname() speaks the
@@ -1741,8 +1741,8 @@ class RenameTest(SeatsBase):
 
 
 class RosterTruthTest(SeatsBase):
-    """roster-truth (owner-caught: 'keep all live agents straight on
-    the roster'). A live-but-idle agent must not vanish — presence stays fresh
+    """roster-truth (keep all live agents straight on
+    the roster). A live-but-idle agent must not vanish — presence stays fresh
     when it speaks, and even when its delivery is muted."""
 
     def test_post_refreshes_poster_presence(self):
@@ -2335,7 +2335,7 @@ class ClaimsTest(SeatsBase):
         self.assertEqual(seats.claims_list(), [])
 
     def test_cli_cannot_assert_a_copied_session(self):
-        """Codex B2's exact reproduction, CLI-level: caller B copies A's
+        """Exact reproduction, CLI-level: caller B copies A's
         roster-visible SID; --session no longer exists and the ambient env
         session opens nothing without the lease capability."""
         with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sA"}):
@@ -2384,7 +2384,7 @@ class ClaimsTest(SeatsBase):
         self.assertIn("not claimed", msg)
 
     def test_list_poll_with_live_claims_never_writes(self):
-        """Day-review #4: the roster GET polls claims_list every 3s — a
+        """The roster GET polls claims_list every 3s — a
         read with every claim live must leave .claims.json byte-for-byte
         alone (same inode, same mtime), not rewrite it under the lock."""
         seats.claim("db-migrate", "alice", ttl=60, session="sA")
@@ -2523,7 +2523,7 @@ class ReportNeverMutatesTest(SeatsBase):
 
 class RoomLockTest(SeatsBase):
     def test_concurrent_appenders_under_tiny_rotation_cap(self):
-        """Codex C4's demanded test: concurrent writers crossing the
+        """Concurrent writers crossing the
         rotation cap must never tear/interleave a JSON row, and the newest
         rows must survive rotation."""
         import threading
@@ -2651,7 +2651,7 @@ class ChatDispatchTest(SeatsBase):
 
 
 class ReplyWakesParentTest(unittest.TestCase):
-    """The owner's WHY was the spec: replies exist so he can stop typing
+    """The intent was the spec: replies exist to replace typing
     @names. A reply is therefore a direct address of the parent's author —
     mention-tier, any room — and only of the parent's author.
 

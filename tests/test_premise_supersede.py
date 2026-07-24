@@ -115,7 +115,7 @@ class SupersedeFlowTest(SupBase):
         self.assertNotIn("attest_supersedes_record", new)
         self.assertIn("  replaced_by: law-v2", self.entry_raw("law-v1"))
         # the chain-start record commits op=create (no record to link), so the
-        # checker VERIFIES the new premise on BOTH paths (codex re-review catch)
+        # checker VERIFIES the new premise on BOTH paths
         self.assertEqual(premise.chain_records()[-1]["op"], "create")
         rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-v2"])
         self.assertEqual(rc, 0)
@@ -260,7 +260,7 @@ class ChainCheckTest(SupBase):
         _e, err = store.mark_superseded("law-c", "law-d", pk.now_ts())
         self.assertIsNone(err)
         rc, out, _ = self.run_verb(premise.cmd_premise_check, ["--chain", "law-a"])
-        # Store-only hop is UNBACKED, not corrupt: the corrected B2 contract maps
+        # Store-only hop is UNBACKED, not corrupt: the corrected contract maps
         # missing native proof to EXIT_NO_NATIVE_PROOF (3) — distinct from broken
         # (1) and from a fully-attested chain (0). Not-attested must never read 0.
         self.assertEqual(rc, premise.EXIT_NO_NATIVE_PROOF)

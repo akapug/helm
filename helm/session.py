@@ -460,7 +460,7 @@ def _own_session_identity(r):
     every younger same-session process to a candidate — so a row that SURVIVES
     with identity=='who' carries the process's own exact attribution, never
     its parent's. Treating who rows as inherited hints hid a proven holder
-    from live-holder/DOUBLE-OPEN arithmetic (a critical review finding)."""
+    from live-holder/DOUBLE-OPEN arithmetic."""
     return bool(r.get("declared") or r.get("resume")
                 or r.get("identity") == "who")
 

@@ -311,7 +311,7 @@ class DeliveryLaneTest(HooksBase):
         self.assertFalse(rows["(default-claude)"]["deliver"])
 
     def test_wrong_matcher_on_exclusive_group_repaired_in_place(self):
-        """Codex B3's exact reproduction: the exact deliver command under a
+        """Exact reproduction: the exact deliver command under a
         Bash-pinned group misses most tool boundaries — status must call it
         NOT live, and install must repair the matcher."""
         deliver = next(s for s in hooks.SPECS if s["name"] == "deliver")

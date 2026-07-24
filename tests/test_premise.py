@@ -225,7 +225,7 @@ class CheckTest(PremiseBase):
                                              "(payload binding unavailable)")):
             rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-x"])
         self.assertEqual(rc, 0)
-        # A1: turn OBSERVED, never CONFIRMED — existence, not payload binding
+        # turn OBSERVED, never CONFIRMED — existence, not payload binding
         self.assertIn("external anchor: turn OBSERVED", out)
         self.assertNotIn("CONFIRMED", out)
 
@@ -266,7 +266,7 @@ class CheckTest(PremiseBase):
         self.assertIn("native chain: BROKEN", out)
 
     def test_no_attestation_recorded_is_nonzero_and_distinct(self):
-        # B2: absence of the primary proof MUST NOT read as success. It exits on
+        # absence of the primary proof MUST NOT read as success. It exits on
         # its own contract (EXIT_NO_NATIVE_PROOF), distinct from broken (1).
         self.run_verb(premise.cmd_premise, ["law-x | The X truth", "--no-attest"])
         rc, out, _ = self.run_verb(premise.cmd_premise_check, ["law-x"])
@@ -283,7 +283,7 @@ class CheckTest(PremiseBase):
 
 
 class BindingTest(PremiseBase):
-    """B1 — the native record must BIND to the exact premise. A record that is
+    """The native record must BIND to the exact premise. A record that is
     internally valid but commits a DIFFERENT claim (a foreign premise's record,
     or the OLD record after the statement changed) is BROKEN, never VERIFIED,
     and premise-check exits non-zero — even when the mutable frontmatter
@@ -341,7 +341,7 @@ class BindingTest(PremiseBase):
         self.assertTrue(ok2)
 
     def test_payload_without_native_record_is_not_success(self):
-        # B2: a matching payload but NO native record hash is not verification —
+        # a matching payload but NO native record hash is not verification —
         # absence of the primary proof exits non-zero (distinct: NOT ATTESTED).
         self.run_verb(premise.cmd_premise, ["law-x | The X truth", "--no-attest"])
         e = store._find("law-x")
@@ -354,7 +354,7 @@ class BindingTest(PremiseBase):
 
 
 class AnnotationDurabilityTest(PremiseBase):
-    """B5 — a failed in-place annotation must NEVER orphan the native record: a
+    """A failed in-place annotation must NEVER orphan the native record: a
     durable reconciliation row is queued and --retry-queue re-annotates it."""
 
     def test_capture_annotation_failure_queues_reconciliation(self):

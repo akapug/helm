@@ -161,11 +161,11 @@ while continuing with the best reversible probe path.
     evolution (confederalism for architecture: local coherence + federated coherence).
     Trace ownership to the REAL owner, not one consumer's local note - a consumer's wire-in
     TIMING is not the primitive's availability or ownership. Bug class:
-    `seam-read-from-one-side`. Live: "a shared session primitive is Gate-B-gated" read one
+    `seam-read-from-one-side`. Live: "a shared session primitive is blocked on a downstream gate" read one
     project's consumption-timing (its consumers-column schedule) as the primitive's gate - but the
     spec belonged to one project, the adapter to another, and the resolution line bound
     only the adapter. Sharpens #15 (trace to owner) + #18 (premise before proposal).
-    **GUARD/WATCHDOG corollary (owner canon: "this is always the case"):** for
+    **GUARD/WATCHDOG corollary (owner canon):** for
     safety nets specifically, per-spec component correctness guarantees NOTHING — the
     COMPOSITION is the unit of correctness. N guards each with a clean conscience can
     jointly guarantee a blind spot (live: work-offer[unclaimed-only+role-exempt] x

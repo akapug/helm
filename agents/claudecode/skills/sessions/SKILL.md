@@ -66,7 +66,7 @@ git **worktree** used as both `--cwd` and `CLAUDE_PROJECT_DIR` (real project che
 - **Worktree mandatory (fail-loud).** `--project-dir` must be a *linked* worktree, never the shared/main
   checkout — refused with exit 8. The guard checks the git-dir (`git rev-parse --git-dir` of a linked
   worktree lives under `<main>/.git/worktrees/`), so any linked worktree passes regardless of where its
-  directory sits — verified live against `../helm-wt/deck-fix` (accepted) and the main checkout (refused).
+  directory sits — verified live against a linked worktree (accepted) and the main checkout (refused).
   Mint the room with `helm work claim <lane>` (helm's worktree lifecycle: lease + guard rails), not raw
   `git worktree add`.
 - **Pre-create the isolated `.remember`** on `--apply` — defuses `bootstrap-dirs.sh`'s one-shot migration

@@ -554,7 +554,7 @@ class CleanHelpStillHelps(unittest.TestCase):
         self._help("modelrouter", "cmd_router", ["down", "--help"], "_down")
 
 
-# --------------------------------------- review findings
+# --------------------------------------- membership reader hardening
 
 class MembershipReadersRefuseJunk(unittest.TestCase):
     """The adversarial review found: handlers that read flags only via

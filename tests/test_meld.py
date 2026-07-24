@@ -2,7 +2,7 @@
 """helm meld — the mindmeld preset. Hermetic: HELM_CHAT_DIR + HELM_HOME are
 tmp dirs, HELM_CHAT_NODE_URL set-but-empty kills the signed transport,
 ambient session ids scrubbed (test_seats.py's exact envelope). Pins the meld
-preset scars (epoch fence, F1 control echoes, F2 fail-closed self-skip,
+preset scars (epoch fence, control echoes, fail-closed self-skip,
 room×actor state, clip-proof invite head) + the helm-native laws (act-moment
 mentions only, latency-pure sign=False, bounds as behavior)."""
 import contextlib
@@ -221,9 +221,9 @@ class TestSay(MeldBase):
             meld.say(room, "MAYBE", "x", seat="seat-a")
 
     def test_done_status_transitions(self):
-        """After your own DONE, recv is the COUNTERSIGN WATCH (live-fire
-        2026-07-23: the closer went blind — recv refused, so the convener
-        could never confirm the peer's close through the meld surface)."""
+        """After your own DONE, recv is the COUNTERSIGN WATCH (the closer
+        went blind — recv refused, so the convener could never confirm the
+        peer's close through the meld surface)."""
         room, _ = self.open_meld()
         out = "\n".join(meld.say(room, "DONE", "closing", seat="seat-a"))
         self.assertIn("countersign", out)             # the closer is told how
@@ -247,7 +247,7 @@ class TestSay(MeldBase):
         — NOT silently regress done-mutual -> done and re-post an @peer mention.
         Pre-fix that regression made `meld status` lie and drove a phantom 90s
         countersign watch for an already-consumed countersign — the exact
-        double-command an agent replays after compaction/resume (a dual-gate review finding)."""
+        double-command an agent replays after compaction/resume."""
         room, _ = self.open_meld()
         meld.say(room, "DONE", "closing", seat="seat-a")       # a -> done
         meld.recv(room, timeout=0, seat="seat-a", poll=0.01)   # watch, no countersign
@@ -299,7 +299,7 @@ class TestConvergenceLoop(MeldBase):
 
 
 class TestPinnedPair(MeldBase):
-    """Live-fire 2026-07-23: recv accepted READY + chunks from ANY non-self
+    """recv once accepted READY + chunks from ANY non-self
     seat — a meld convened for one seat was consummated by another, and a
     third seat could kill any meld with a forged DONE/ABORT."""
 
@@ -343,8 +343,8 @@ class TestPinnedPair(MeldBase):
 
 class TestIdentity(MeldBase):
     def test_self_seat_is_env_first_like_whoname(self):
-        """Live-fire 2026-07-23 identity trap: roster-first _self_seat
-        silently overrode HELM_CHAT_NAME for any roster-known session."""
+        """The identity trap: roster-first _self_seat silently overrode
+        HELM_CHAT_NAME for any roster-known session."""
         seats.join(session="sid-x", cwd=self.tmp, seat="roster-name")
         os.environ["CLAUDE_SESSION_ID"] = "sid-x"
         self.assertEqual(meld._self_seat(), "roster-name")  # roster floor holds
@@ -410,7 +410,7 @@ class TestCLI(MeldBase):
 
     def test_invite_wait_collapses_invite_and_first_recv(self):
         """--wait = invite + recv in one call (every convener's literal next
-        command, live-fire want)."""
+        command)."""
         os.environ["HELM_MELD_RECV_TIMEOUT_S"] = "0"
         rc = meld.cmd(["invite", "seat-b", "wire", "--wait", "--seat", "seat-a"])
         self.assertEqual(rc, meld.EXIT_BOUND)         # blocked, bounded out
@@ -420,7 +420,7 @@ class TestCLI(MeldBase):
 
 class TestSelfSeat(MeldBase):
     def test_self_seat_survives_a_deleted_cwd(self):
-        """A review finding (probe A7): _self_seat's bare
+        """_self_seat's bare
         os.getcwd() crashed ALL five meld verbs (invite/join/recv/say/status
         default their seat through it, with no fail-open wrapper) when the
         process cwd was a pruned worktree. safe_cwd fails open to None and

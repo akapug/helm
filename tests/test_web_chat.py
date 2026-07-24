@@ -266,7 +266,7 @@ class TestWebChat(unittest.TestCase):
     def test_dm_endpoint_is_a_true_dm_never_a_room_post(self):
         """The ledger 'message a seat' card's fixed route: POST /api/chat/dm
         hits ONE recipient's private lane — the old path posted '@seat …'
-        into #main and called it a DM (owner-flagged)."""
+        into #main and called it a DM."""
         from helm import seats
         seats.join(session="s-web-dm", seat="codex", cwd="/tmp/p")
         status, d = self.req("/api/chat/dm", {"to": "codex", "text": " go ",
@@ -347,7 +347,7 @@ class TestWebChat(unittest.TestCase):
                          seats.deliverable(plain, "kimi", "main"))
 
     def test_reply_click_seeds_the_composer_with_the_authors_at(self):
-        """The reply affordance's visible face (owner ask): the
+        """The reply affordance's visible face: the
         endpoint half threads the payload's reply_to, and the SERVED page
         carries the seed-@ mechanism — chatSetReply feeds the parent's author
         into chatSeedMention, which prepends "@author " to the composer and

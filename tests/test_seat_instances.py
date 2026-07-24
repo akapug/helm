@@ -2,7 +2,7 @@
 """slice 6 — N-codex-per-credhome. Hermetic: tmpdir HELM_HOME + pool dir,
 hand-built unsigned JWTs for plan/exp claims, no real creds / proxy /
 network. launch_line identity-shape + capacity policy + asset mint + the
-launch guards, per the design doc's test plan."""
+launch guards."""
 import base64
 import contextlib
 import io
@@ -277,7 +277,7 @@ class ProxyFixRoundTest(Slice6Base):
     unsupported-family gate. Each test names the finding it closes."""
 
     def test_launch_line_never_carries_the_literal_token(self):
-        # no-keys-in-argv (re-review): launch_line carries NO token
+        # no-keys-in-argv: launch_line carries NO token
         # at all — neither the literal NOR a NAME=value for the external env
         # binary. The bearer is exported separately by `_token_export`.
         seat._mint_instance_proxy("codex", "codex-2")
@@ -306,7 +306,7 @@ class ProxyFixRoundTest(Slice6Base):
                          full.split("env ", 1)[1])  # env argv carries no secret
 
     def test_token_export_is_mint_order_immune(self):
-        # first-mint (review finding): the export rendered BEFORE the mint
+        # first-mint: the export rendered BEFORE the mint
         # points at the instance path, so it resolves the token the mint writes.
         pre = seat._token_export("codex", "codex-2")        # pre-mint
         seat._mint_instance_proxy("codex", "codex-2")
@@ -368,7 +368,7 @@ class ProxyFixRoundTest(Slice6Base):
             self.assertFalse(os.path.exists(os.path.join(home, "proxy.pid")))
 
     def test_config_emits_top_level_nonstream_keepalive(self):
-        # owner-witnessed /compact empty-HTTP-200 (2026-07-22): a long
+        # /compact empty-HTTP-200: a long
         # non-streaming summarize sits silent, the proxy reaps the idle socket.
         # The fix is a TOP-LEVEL key — NonStreamKeepAliveInterval lives on
         # SDKConfig (yaml:",inline" into root), NOT under streaming: (that
@@ -382,7 +382,7 @@ class ProxyFixRoundTest(Slice6Base):
         self.assertIn("\nnonstream-keepalive-interval: 15\n", kcfg)
 
     def test_config_emits_streaming_survival_block(self):
-        # the owner's restart-loop class (2026-07-22): with the nonstream
+        # the restart-loop class: with the nonstream
         # keepalive LOADED, EVERY request at ~90% context still died empty-200 —
         # the STREAMING leg stalls before/during bytes at extreme payload sizes.
         # StreamingConfig has ONLY two knobs (no timeout field exists in the
@@ -537,9 +537,9 @@ class ProxyFixRoundTest(Slice6Base):
 
 
 class FableRoundTest(Slice6Base):
-    """The land-gate review findings: spawn/resume mint the
-    instance proxy (the silent-dead-seat HIGH), the spawn-seam family/name
-    gate, and the hostile-pidfile corpus. Each test names its finding."""
+    """Spawn/resume mint the
+    instance proxy (the silent-dead-seat class), the spawn-seam family/name
+    gate, and the hostile-pidfile corpus. Each test names its case."""
 
     def test_spawn_mints_the_instance_proxy(self):
         # Finding: spawn of a never-launched instance produced a DEAD seat —

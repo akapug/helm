@@ -115,7 +115,7 @@
   compact parent quote, a `↩N` count, graceful orphans — in `helm chat read`,
   the journal, and the web panel. Threading now REACHES beacon-wake — the
   original "threading is invisible to the beacon" law was inverted
-  (the owner's WHY: "I'm tired of typing agent names to mention"): a reply is
+  (the intent: replying should replace typing an @mention): a reply is
   a direct address of the parent's author, mention-tier, any room, casefold —
   and of NOBODY else; every other row wakes exactly what its text alone would
   have woken (asserted over the full scope matrix). The web chat surface also

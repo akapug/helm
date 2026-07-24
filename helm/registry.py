@@ -41,8 +41,7 @@ ADOPTED_HOMES = {}
 def _authored_load():
     """The authored layer, with a corruption net: an unparseable file is backed
     up beside itself BEFORE any caller can save over it — authored content is
-    unrebuildable, so a garbled byte must never cascade into an empty rewrite
-    (cross-family review finding, 2026-07-19)."""
+    unrebuildable, so a garbled byte must never cascade into an empty rewrite."""
     path = home.authored_path()
     val = pk.read_json(path)
     if isinstance(val, dict):
@@ -127,7 +126,7 @@ def save(reg):
                 # a same-name entry authored against a DIFFERENT path: never
                 # clobber it (unrebuildable) — the newcomer's authored fields
                 # land under the path-qualified key; both survive, load()
-                # resolves by path stamp (cross-family review finding)
+                # resolves by path stamp
                 entries[_qualified(name, keep["path"])] = keep
             else:
                 entries[name] = keep

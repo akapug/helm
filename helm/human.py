@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""helm --human — the operator's TUI (stdlib curses only). v1 scope per the
-PRD: the chat room (scrollback + live follow + an input line posting as the
+"""helm --human — the operator's TUI (stdlib curses only). v1 scope: the
+chat room (scrollback + live follow + an input line posting as the
 operator) + a one-line status strip (transport signed/unsigned + chain head,
 quota headline from CACHED creds only — never a probe). Runs beautifully as
 an orca pane; exits clean on q (empty input) or Ctrl-C.

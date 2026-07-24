@@ -49,7 +49,7 @@ tissue.
    read — *before* you burn an expensive live cycle (fire / reseed / restart / redeploy). A live cycle
    tests one config, costs real resources, and its snapshots can LIE (a `cp` of a mid-write store reads
    all-None; a torn binary "succeeds" then fails to fetch) — so it churns iterations a deterministic
-   probe would have settled in one. (Live 2026-06-18: a standalone build BEFORE a live reboot caught a
+   probe would have settled in one. (A standalone build BEFORE a live reboot can catch a
    broken artifact fetch the reboot would have aborted on.) No edit before a named hypothesis.
    bug-class `live-cycle-churn-when-a-deterministic-probe-would-discriminate`.
 

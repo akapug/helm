@@ -188,7 +188,7 @@ class TestSeatEphemeralTag(unittest.TestCase):
 
     def test_ephemeral_sa_is_flagged(self):
         self.assertTrue(web._seat_ephemeral(
-            {"seat": "agent-047d53ef", "home_room": None,
+            {"seat": "agent-deadbeef", "home_room": None,
              "cwd": "/tmp/claude-xyz/scratch"}))
 
     def test_real_named_seats_are_never_flagged(self):
@@ -196,8 +196,8 @@ class TestSeatEphemeralTag(unittest.TestCase):
         for s in (
             {"seat": "design-reviewer", "home_room": None, "cwd": "/tmp/x"},
             {"seat": "codex-2", "home_room": "main", "cwd": "/home/p/helm-wt/x"},
-            {"seat": "agent-047d53ef", "home_room": "main", "cwd": "/tmp/x"},
-            {"seat": "agent-047d53ef", "home_room": None, "cwd": "/home/p/proj"},
+            {"seat": "agent-deadbeef", "home_room": "main", "cwd": "/tmp/x"},
+            {"seat": "agent-deadbeef", "home_room": None, "cwd": "/home/p/proj"},
             {"seat": "projx-agent", "home_room": None, "cwd": "/tmp/x"},  # not agent-<hex>
         ):
             self.assertFalse(web._seat_ephemeral(s), s["seat"])
@@ -210,7 +210,7 @@ class TestSeatEphemeralTag(unittest.TestCase):
 class TestRosterSingleFlightCache(unittest.TestCase):
     """The poll-fan-in guard: roster_report is the one heavy read on the 2s
     poll path; uncached, N concurrent polls stacked N computes and blanked the
-    owner's UI (a live incident). The cache must be SINGLE-FLIGHT
+    console UI. The cache must be SINGLE-FLIGHT
     (concurrent pollers share one compute), TTL-fresh, and publish-ready
     (ephemeral baked in) — decision-spirit #22: memory is the read-path."""
 
@@ -221,12 +221,12 @@ class TestRosterSingleFlightCache(unittest.TestCase):
     def tearDown(self):
         # the polluter owns cleanup: the module-level cache holds this test's
         # fake rep; clear it so a later test's roster endpoint reads its own
-        # planted data, not our leaked {seat: agent-047d53ef} (cross-family review).
+        # planted data, not our leaked {seat: agent-deadbeef} (cross-family review).
         web._ROSTER_REP_CACHE.clear()
 
     def _fake_report(self, room):
         self.calls["n"] += 1
-        return {"seats": [{"seat": "agent-047d53ef", "home_room": None,
+        return {"seats": [{"seat": "agent-deadbeef", "home_room": None,
                            "cwd": "/tmp/claude-x/s"}], "claims": []}
 
     def test_concurrent_pollers_share_one_compute(self):
@@ -266,13 +266,13 @@ class TestRosterSingleFlightCache(unittest.TestCase):
 
 
 class TestRoomsSummarySingleFlightCache(unittest.TestCase):
-    """Brick #2 of the poll->push read-model: _rooms_summary (~14s at 224
+    """Part of the poll->push read-model: _rooms_summary (~14s at 224
     seats x 13 rooms) ran uncached on every /api/chat poll — N clients
     stacked N computes -> ~60s requests -> thread-pool starvation (the chat
     half of the UI-blank class). Single-flight + TTL, and the cache is
     KEYED BY THE CHAT ROOT so isolated test worlds (fresh tmp roots) can
-    never read each other's cached summary — the cross-test-pollution class
-    from brick #1, closed structurally."""
+    never read each other's cached summary — the cross-test-pollution class,
+    closed structurally."""
 
     def setUp(self):
         web._ROOMS_SUM_CACHE.clear()
@@ -403,7 +403,7 @@ class TestSseDoorbellWatcher(unittest.TestCase):
         self.assertFalse(web._sse_tick(self.srv))           # quiet = no ring
 
     def test_stopped_server_tick_is_a_noop(self):
-        # kimi pressure-test #2: an in-flight tick on a stopped server acts
+        # an in-flight tick on a stopped server acts
         # on NOTHING — running is checked under the server's own cond
         self._append("main.jsonl")
         self.assertFalse(web._sse_tick(self.srv))           # running=False

@@ -81,9 +81,9 @@ read. Budget-capped (WHISPER_CAP) and fully FAIL-OPEN: brief unavailable -> no
 whisper, never a blocked hook. `--explain` renders it read-only (stamps nothing);
 a quiet window (no sessions/knowledge/gates) whispers nothing but still latches.
 
-CODEX WHISPERS (the codex-only nudges — owner ask): a turn
+CODEX WHISPERS (the codex-only nudges): a turn
 fired inside a codex-family seat appends terse pinned-lane lines, each
-justification-free (owner-spec style). Two today: the SA-delegation nudge
+justification-free (terse by design). Two today: the SA-delegation nudge
 (orchestrate your subagents for reviews/reads/research; whisper:codex-sa) and
 the claim-start nudge (claiming a lane is a START, not a milestone — a codex
 claimed two lanes then idled on turn-discipline law-5, reading 'posted my

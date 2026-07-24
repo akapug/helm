@@ -557,7 +557,7 @@ class TransportTest(V2Base):
                          ("join_failed", "newer", 2))
 
     def test_no_signer_short_circuits_the_signing_leg(self):
-        """Day-review #1: with HELM_CELL_BIN unset a signed turn is
+        """With HELM_CELL_BIN unset a signed turn is
         impossible — the leg must decline instantly: no join, no revive
         (the live unlock POST that burned the node's 5/60s budget on every
         fleet post), and _signed_row's sign=None probe must not even touch
@@ -895,7 +895,7 @@ class ReactTest(V2Base):
 
 
 class ReadReactIndexAlignmentTest(V2Base):
-    """The read/react index-space split (owner-caught: a 🫡 landed on the wrong
+    """The read/react index-space split (a 🫡 could land on the wrong
     post). `read` prints reaction LINES that `react n` silently skips, so a
     human counting printed lines targets off-by-(reactions-above). The fix
     surfaces react's own ordinal as `[n]` beside each targetable row; reaction

@@ -1578,7 +1578,7 @@ rotation renders an orphan rather than guessing.
 **A reply wakes its parent's author.** `seats.deliverable()` reads `rfrom` —
 the parent author stamped at post time — and treats a reply to a seat's row
 as a direct address of that seat: mention-tier, any room, before mute (the
-owner's WHY: replying *instead of* typing the @mention). Only the parent's
+intent: replying *instead of* typing the @mention). Only the parent's
 author wakes; for every other seat the pointer changes nothing, so a reply
 stays quieter than the mention it replaces. (Tested as a law, not an
 observation: `tests/test_chat_reply.py::ReplyWakeTest`.)
@@ -1831,8 +1831,8 @@ above is advisory coordination between cooperating same-uid processes in a
 the server-side owner rails stamped (`origin: web|tui`); a CLI post claiming
 an owner name delivers as an ordinary mention. Principal cryptography stays
 dregg's. (Council — embargoed verdicts — is DEFERRED to 0.3: a correct
-embargo needs an expected-set freeze + reveal state machine; the spec lives
-in the design doc's codex-round section.)
+embargo needs an expected-set freeze + reveal state machine; the spec is
+recorded for a later release.)
 
 ```console
 $ helm chat post "@codex-seat xrev the delivery-lane branch when free"

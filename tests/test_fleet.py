@@ -522,7 +522,7 @@ class DaemonScanTest(unittest.TestCase):
                          ({99: "111"}, set(), False))
 
     def test_daemon_shape_without_starttime_is_unproven_not_dropped(self):
-        # the review's exact probe: daemon argv recognized, _proc_start=None
+        # daemon argv recognized, _proc_start=None
         # -> previously ({}, False); now the pid survives as UNPROVEN
         self.assertEqual(self._scan({99: self.DAEMON}, {}),
                          ({}, {99}, False))
@@ -672,7 +672,7 @@ class GenerationBracketTest(FleetRowsTest):
         self.assertFalse(r["unknown"])
 
     def test_reused_pid_display_probes_are_discarded_not_composed(self):
-        # the review's exact probe: old canonical row (sid/home/cwd) + a
+        # old canonical row (sid/home/cwd) + a
         # reused pid answering the walk as proven-HEADLESS with a new seat.
         # The failed recheck must kill the host claim to UNKNOWN — never
         # compose old census facts with the new process's ancestry

@@ -925,11 +925,11 @@ def _rooms_summary(roster=None):
 # it ran UNCACHED on EVERY /api/chat
 # poll (incremental included), so N clients x 2s stacked N ~14s computes ->
 # the ~60s /api/chat requests that starved the thread pool (the second half
-# of the UI-blank class; the roster cache was brick #1). Same
-# single-flight TTL treatment — brick #2 of the poll->push read-model — with
+# of the UI-blank class; the roster cache was the first such cache). Same
+# single-flight TTL treatment — part of the poll->push read-model — with
 # one upgrade: the cache is KEYED BY THE CHAT ROOT (chat_dir()), so isolated
 # test worlds (fresh tmp roots) can never read each other's cached summary —
-# the cross-test-pollution class kimi caught on brick #1, closed structurally
+# the cross-test-pollution class, closed structurally
 # instead of by per-test clears. Prod cardinality: one root, one entry.
 _ROOMS_SUM_CACHE = {}           # chat-root -> (computed_at, summary)
 _ROOMS_SUM_TTL = 3.0
@@ -948,7 +948,7 @@ def _rooms_summary_invalidate():
     compute BEFORE the pop published its now-stale summary AFTER it. Taking
     the same lock serializes: the pop waits out any in-flight publish, so
     nothing computed pre-invalidation can survive it. Worst-case stall for
-    the caller = one compute (~200ms post brick #3) — fine for the watcher's
+    the caller = one compute (~200ms) — fine for the watcher's
     250ms tick and trivial for the owner-write handlers."""
     from . import chat
     with _ROOMS_SUM_LOCK:
@@ -1221,7 +1221,7 @@ def _api_chat_read_post(payload):
 
 def _chat_profile():
     """Server-side signing identity for the owner's web posts: the server's
-    HELM_CELL_PROFILE (the PRD's contract), else the owner's cell `owner` —
+    HELM_CELL_PROFILE (the documented contract), else the owner's cell `owner` —
     never the agent default (the web panel IS the owner surface).
     "owner" is the generic ship-time default; the owner personalizes their
     display name at runtime via the panel's `name` field (or HELM_CHAT_NAME,
@@ -1256,7 +1256,7 @@ def _api_chat_post(payload):
 def _api_chat_dm(payload):
     """The owner's TRUE 1:1 (the ledger 'message a seat' card routes single-
     seat sends here): one private recipient's lane, never a room post — the
-    old path posted '@seat …' into #main and called it a DM (owner-flagged).
+    old path posted '@seat …' into #main and called it a DM.
     Exact-token addressee (seats.dm);
     signed like a post; the recipient's beacon surfaces it."""
     from . import chat, seats
@@ -1287,7 +1287,7 @@ def _seat_ephemeral(s):
 # roster_report is the ONE heavy read on the poll path (~2.4s at 200 seats: it
 # walks pending per seat). Uncached, N clients x 2s polls ran N CONCURRENT
 # 2.4s computes on the threaded server -> CPU pegged -> 25s responses ->
-# BrokenPipeError -> the owner's UI went blank (a live incident).
+# BrokenPipeError -> the console UI went blank.
 # Single-flight TTL cache: ONE compute per freshness window; every other
 # poller is served from memory (decision-spirit #22 — memory is the
 # coordination read-path; the recompute is the write-behind). The TTL sits
@@ -1946,14 +1946,14 @@ POST_API = {  # fn(payload_dict) -> (obj, status); ALL demand the mutation token
 #
 # LIFECYCLE IS PER-SERVER (meld-converged design, concurrency clear): each
 # _Server owns its OWN watcher thread + state, so
-# the three round-4 races are UNEXPRESSIBLE rather than guarded — no
+# the three cross-server races are UNEXPRESSIBLE rather than guarded — no
 # generation race (a closed server never re-arms), no refcount (nothing
 # shared to count), no cross-server kill (B never sees A's close). Doorbells
 # are content-free (data:{}), so there is no cross-server seq space to
 # preserve: any fresh watcher answers "did the fingerprint change" and the
-# content always arrives via the client's normal cursor poll (kimi's
-# dissolve-beats-mechanize verdict). The rooms-summary cache stays GLOBAL —
-# it is orthogonal, lock-coupled, and TTL-bounded (round-3 fix).
+# content always arrives via the client's normal cursor poll (the
+# dissolve-beats-mechanize design). The rooms-summary cache stays GLOBAL —
+# it is orthogonal, lock-coupled, and TTL-bounded.
 _SSE_WATCH_S = 0.25
 _SSE_DEAD_S = 5.0    # a beat older than this = that server's watcher died
 
@@ -2006,9 +2006,9 @@ def _chat_fingerprint():
 def _sse_tick(srv, boot=None):
     """One watcher heartbeat for THIS server: refresh its beat; on a
     fingerprint change invalidate the (global) rooms-summary cache BEFORE
-    ringing — the poll a doorbell triggers must read FRESH state (round-2
-    finding). A stopped server's in-flight tick is a no-op (running checked
-    under the server's own cond — kimi pressure-test #2), and so is a
+    ringing — the poll a doorbell triggers must read FRESH state. A stopped
+    server's in-flight tick is a no-op (running checked under the server's
+    own cond), and so is a
     SUPERSEDED thread's (boot mismatch — direct/test callers pass None)."""
     fp = _chat_fingerprint()
     sse = srv._sse
@@ -2028,7 +2028,7 @@ def _sse_tick(srv, boot=None):
 
 def _sse_watcher_dead(sse):
     """The stream loop's health predicate, scoped to THAT SERVER's state
-    (kimi's one CLEAR condition): not running, or armed-but-silent past
+    (one CLEAR condition): not running, or armed-but-silent past
     _SSE_DEAD_S. A dead watcher must END its server's streams — otherwise
     keepalives keep ES_LIVE true and every client sits on the stretched 10s
     poll forever. One server's death can never false-trigger another's."""
@@ -2059,8 +2059,8 @@ def _sse_watcher(srv, boot):
 
 def _sse_ensure_watcher(srv):
     """Arm THIS server's watcher if none runs; True = one is running. The
-    per-server cond serializes racing streams (kimi pressure-test #1); the
-    state rolls back if Thread.start refuses (round-3 fix) so a start
+    per-server cond serializes racing streams; the
+    state rolls back if Thread.start refuses so a start
     failure is an honest 503, never a permanently-armed flag."""
     sse = srv._sse
     with sse["cond"]:
@@ -2086,7 +2086,7 @@ def _sse_ensure_watcher(srv):
 def _sse_stop(srv):
     """Stop THIS server's watcher (server_close): drop running — the loop
     exits within a tick — and wake its streams so the death-aware wait ends
-    them NOW, not at timeout (round-4 P2)."""
+    them NOW, not at timeout."""
     sse = srv._sse
     with sse["cond"]:
         sse["running"] = False

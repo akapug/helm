@@ -1115,7 +1115,7 @@ class WhisperTest(InjectBase):
 
 
 class SaWhisperTest(InjectBase):
-    """The codex-only SA whisper (owner ask): a codex-family seat
+    """The codex-only SA whisper: a codex-family seat
     gets ONE terse delegate-to-subagents pinned line, justification left out;
     claude-family seats NEVER see it. Family rides the ONE existing resolver
     (HELM_CHAT_NAME -> seat._seat_family), the line walks LAST in
@@ -1216,7 +1216,7 @@ class SaWhisperTest(InjectBase):
 
 
 class ClaimWhisperTest(InjectBase):
-    """The codex-only claim-start whisper (owner ask): a codex
+    """The codex-only claim-start whisper: a codex
     claimed two lanes then STOPPED without starting the writers — law-5's
     'end turns at bounded milestones' read as 'posted my claim'. The second
     SA_LINES line teaches claim-is-a-start-not-a-stop, terse, justification

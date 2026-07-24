@@ -94,7 +94,7 @@ class AnchorSubmitTest(CellBase):
         self.assertIn("locked", err)
 
     def test_non_dict_json_fails_open_never_raises(self):
-        # A2: a valid JSON list/string/number is NOT acceptance — guard with
+        # a valid JSON list/string/number is NOT acceptance — guard with
         # isinstance(dict) before .get(), fail open, never raise AttributeError.
         for resp in ([1, 2, 3], "ok", 42, [{"turn_hash": TURN}]):
             with mock.patch.object(cell, "post_json", return_value=resp):
@@ -103,7 +103,7 @@ class AnchorSubmitTest(CellBase):
             self.assertIn("non-object", err)
 
     def test_anchor_declares_coordination_fee_zero_env_overridable(self):
-        # B3 (Stage B): the attest anchor is a COORDINATION turn (EmitEvent-only,
+        # (Stage B): the attest anchor is a COORDINATION turn (EmitEvent-only,
         # no balance_change), so it declares fee=0 and rides dregg's
         # coordination-exempt admission free — no cell drain, no faucet grant, no
         # [unsigned] throttle. Env-overridable via HELM_NODE_COORD_FEE for a node
@@ -185,7 +185,7 @@ class AnchorSubmitTest(CellBase):
 
 class VerifyAnchorTest(CellBase):
     def test_proof_present_is_turn_observed_not_payload_bound(self):
-        # A1: a present proof means the turn EXISTS, not that it commits this
+        # a present proof means the turn EXISTS, not that it commits this
         # record's hash — the detail says so honestly.
         with mock.patch.object(cell, "get_json",
                                return_value={"turn_hash": TURN, "proof_len": 12}):
