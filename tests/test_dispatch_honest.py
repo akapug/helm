@@ -35,6 +35,7 @@ Four layers:
 import ast
 import contextlib
 import importlib
+import inspect
 import io
 import os
 import pathlib
@@ -171,21 +172,33 @@ def _is_dispatcher(fn, module_strcolls):
 
 
 def discover():
-    """Every subverb dispatcher under helm/, straight from the source."""
+    """Every subverb dispatcher under helm/, straight from the source. A CLI
+    module decomposed into a PACKAGE (helm/store/) keeps its package name as
+    the mod key — that is how VERBS + importlib address its re-exported
+    handlers — so its submodule dispatchers map to (package, fn)."""
     out = []
-    for p in sorted(HELM_DIR.glob("*.py")):
+    files = sorted(HELM_DIR.glob("*.py")) + sorted(HELM_DIR.glob("*/*.py"))
+    for p in files:
+        if p.name == "__init__.py":
+            continue
         tree = ast.parse(p.read_text())
         mod_strcolls = _collect_strcolls(tree.body, set())
+        mod = p.stem if p.parent == HELM_DIR else p.parent.name
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) \
                     and (node.name == "cmd" or node.name.startswith("cmd_")) \
                     and _is_dispatcher(node, mod_strcolls):
-                out.append((p.stem, node.name))
+                out.append((mod, node.name))
     return out
 
 
 def _fn_node(mod, fn):
-    tree = ast.parse((HELM_DIR / (mod + ".py")).read_text())
+    # follow the handler to its real source file: a decomposed CLI module
+    # (helm/store/) re-exports its handlers from submodules, so mod + ".py" is
+    # no longer where the def lives.
+    func = getattr(importlib.import_module("helm." + mod), fn)
+    src = pathlib.Path(inspect.getsourcefile(inspect.unwrap(func)))
+    tree = ast.parse(src.read_text())
     return next(n for n in tree.body
                 if isinstance(n, ast.FunctionDef) and n.name == fn)
 
