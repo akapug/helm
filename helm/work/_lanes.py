@@ -5,13 +5,12 @@ Agent/Workflow inventory. Moved verbatim from the pre-split helm/work.py.
 import json
 import os
 import stat
-import subprocess
 import time
 
-from .. import automap
+from .. import automap, vcs
 from ._common import (
-    _AGENT_ROOM_RE, _WORKFLOW_ROOM_RE, _claude_homes, _load_json_nofollow,
-    _read_small_nofollow,
+    _AGENT_ROOM_RE, _WORKFLOW_ROOM_RE, PEEK_DIRNAME, _claude_homes,
+    _load_json_nofollow, _read_small_nofollow,
 )
 
 
@@ -26,14 +25,12 @@ def _git_bytes(where, *args, timeout=30, env=None):
     `env` OVERLAYS the ambient environment for this one call (never replaces
     it — git needs HOME/PATH/GIT_CONFIG_*). It is how the ref-guard is handed
     the single bit distinguishing the sanctioned branch creator from a
-    forbidden one, scoped to the call rather than leaked into the process."""
-    try:
-        r = subprocess.run(["git", "-C", where] + list(args),
-                           capture_output=True, timeout=timeout,
-                           env=dict(os.environ, **env) if env else None)
-        return r.returncode, r.stdout, r.stderr
-    except Exception as exc:
-        return -1, b"", os.fsencode(str(exc))
+    forbidden one, scoped to the call rather than leaked into the process.
+
+    The spawn itself lives behind the VCS seam (helm/vcs.py `run`); this stays
+    the module's ONE named git boundary, so the porcelain readers below have a
+    single point to be reasoned about (and injected at)."""
+    return vcs.backend(where).run(where, *args, timeout=timeout, env=env)
 
 
 def _git(where, *args, timeout=30, env=None):
@@ -70,32 +67,14 @@ def lane_branch(lane):
 
 def _worktree_records(root):
     """(rows, error) from git's NUL porcelain. `-z` disables C quoting and
-    preserves spaces, newlines, backslashes, and non-UTF8 path bytes."""
-    rc, out, err = _git_bytes(root, "worktree", "list", "--porcelain", "-z",
-                              timeout=10)
-    if rc != 0:
-        return [], os.fsdecode(err) or "git worktree list failed"
-    if out and not out.endswith(b"\0"):
-        return [], "truncated git worktree porcelain"
-    rows, cur = [], None
-    try:
-        for field in out.split(b"\0"):
-            if not field:
-                cur = None
-            elif field.startswith(b"worktree "):
-                cur = {"path": os.fsdecode(field[9:]), "branch": None,
-                       "locked": False, "reason": ""}
-                rows.append(cur)
-            elif cur is None:
-                raise ValueError("worktree field before record")
-            elif field.startswith(b"branch "):
-                cur["branch"] = os.fsdecode(field[7:])
-            elif field == b"locked" or field.startswith(b"locked "):
-                cur["locked"] = True
-                cur["reason"] = os.fsdecode(field[7:]) if len(field) > 7 else ""
-    except (ValueError, UnicodeError) as exc:
-        return [], "invalid git worktree porcelain: %s" % exc
-    return rows, None
+    preserves spaces, newlines, backslashes, and non-UTF8 path bytes.
+
+    THE BACKEND is the authority: it owns both the argv it issues and the
+    format it parses (a jj backend answers from `jj workspace list`). Only the
+    raw SPAWN is handed in — `read=_git_bytes` keeps this module's single git
+    boundary in the path, so every spawn _lanes makes is still findable (and
+    injectable) in one place."""
+    return vcs.backend(root).worktrees(root, read=_git_bytes)
 
 
 def worktrees(root):
@@ -133,23 +112,95 @@ def _occupants(path):
     return _occupants_many([path])[0][path]
 
 
+def _disposable_worktree_occupant(pid, proc_root="/proc"):
+    """Host-agnostic GC query; metaharness-specific evidence lives at the
+    adapter seam rather than accumulating in worktree policy."""
+    from .. import harness
+    return harness.disposable_worktree_pid(pid, proc_root=proc_root)
+
+
+def _panes_bound_to(path):
+    """([handles], error) for panes the metaharness holds in `path`. Same seam
+    discipline as the occupant query above — GC asks, the adapter knows."""
+    from .. import harness
+    return harness.worktree_panes(path)
+
+
+def managed_room_kind(root, path):
+    """The one cleanup-owner classifier: `lane`, `peek`, `harness`, or None.
+    A peek room's owner is `helm work peek --drop` — naming the kind here is
+    what keeps envtidy's stray-worktree sweep (which skips every managed
+    kind) and the lane sweeps structurally blind to it, rather than each
+    surface growing its own exclusion filter."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent == os.path.abspath(root.rstrip(os.sep) + "-wt"):
+        return "lane"
+    if parent == os.path.join(os.path.abspath(root.rstrip(os.sep) + "-wt"),
+                              PEEK_DIRNAME):
+        return "peek"
+    if parent == os.path.join(os.path.abspath(root.rstrip(os.sep)),
+                              ".claude", "worktrees"):
+        return "harness"
+    return None
+
+
 def lane_rows(root, registered=None):
     """The project's normal lane rooms: direct children of `<root>-wt/`."""
-    box = os.path.abspath(root.rstrip(os.sep) + "-wt")
     rows = []
     for w in registered if registered is not None else worktrees(root):
         path = os.path.abspath(w["path"])
-        if os.path.dirname(path) == box:
+        if managed_room_kind(root, path) == "lane":
             row = dict(w)
             row["lane"] = os.path.basename(path)
             rows.append(row)
     return rows
 
 
+def auto_rows(root, registered=None):
+    """The HARNESS-MINTED rooms: direct children of `<root>/.claude/worktrees/`.
+
+    Subagent (`agent-<id>`) and workflow (`wf_<id>`) worktrees, created per run
+    by the harness and reaped by NOTHING. lane_rows deliberately matches only
+    `<root>-wt/`, so every gc that consumed it was blind to these by
+    construction — the sweep looked complete and covered less than half the
+    tree.
+
+    MEASURED 2026-07-28: 12 of 29 registered worktrees were harness-minted, all
+    abandoned, TWO carrying uncommitted work from lanes whose agents had died.
+    They are also the rows the OWNER sees: orca lists every worktree in its
+    sidebar, so 12 unreadable `wf_c8548678-d78-1`-shaped entries sat between him
+    and the 6 seats he actually talks to. He had to hunt for a live seat among
+    them ("i see, he is here in the sidebar, hidden among all the random other
+    ones"). Signal, not count, was the complaint.
+
+    Returned in the SAME row shape as a lane so every existing verdict rule
+    applies unchanged — occupancy still keeps, dirty still RESCUES to its own
+    branch, merged still allows `-d`. This widens what the sweep can see; it
+    weakens nothing about what the sweep may do.
+    """
+    rows = []
+    for w in registered if registered is not None else worktrees(root):
+        path = os.path.abspath(w["path"])
+        if managed_room_kind(root, path) == "harness":
+            row = dict(w)
+            row["lane"] = os.path.basename(path)
+            row["harness_minted"] = True
+            rows.append(row)
+    return rows
+
+
 def _status_entries(raw):
-    """Parse `git status --porcelain=v2 -z` into (path_bytes, submodule).
+    """Parse `git status --porcelain=v2 -z` into (path_bytes, submodule, kind).
     Rename/copy source paths are consumed but deliberately not timed: the
-    destination is the uncommitted path. Any v1/human record is rejected."""
+    destination is the uncommitted path. Any v1/human record is rejected.
+
+    `kind` is the record letter git itself used (b"1" ordinary, b"2"
+    rename/copy, b"u" UNMERGED, b"?" untracked). It is carried because the
+    parser ALREADY distinguished an unmerged record and then threw that away:
+    every caller collapsed it into plain "dirty", so a checkout sitting in a
+    conflict was indistinguishable from one with edits in it. Extending the ONE
+    parser rather than adding a second that re-counts conflicts — one question,
+    one authority (the duplicate-`_helm_sources` lesson)."""
     if raw and not raw.endswith(b"\0"):
         raise ValueError("truncated porcelain v2 record")
     fields, entries, i = raw.split(b"\0"), [], 0
@@ -162,26 +213,52 @@ def _status_entries(raw):
             parts = field.split(b" ", 8)
             if len(parts) != 9:
                 raise ValueError("malformed ordinary record")
-            entries.append((parts[8], parts[2]))
+            entries.append((parts[8], parts[2], kind))
         elif kind == b"2":
             parts = field.split(b" ", 9)
             if len(parts) != 10 or not parts[9] or i >= len(fields) - 1 \
                     or not fields[i]:
                 raise ValueError("malformed rename/copy record")
-            entries.append((parts[9], parts[2]))
+            entries.append((parts[9], parts[2], kind))
             i += 1  # exact original path, including newlines/NUL framing
         elif kind == b"u":
             parts = field.split(b" ", 10)
             if len(parts) != 11:
                 raise ValueError("malformed unmerged record")
-            entries.append((parts[10], parts[2]))
+            entries.append((parts[10], parts[2], kind))
         elif field.startswith(b"? "):
-            entries.append((field[2:], b"N..."))
+            entries.append((field[2:], b"N...", b"?"))
         elif field.startswith(b"! ") or field.startswith(b"# "):
             continue
         else:
             raise ValueError("non-v2 or unknown status record")
     return entries
+
+
+#: markers git leaves while an operation that CAN be continued or aborted runs
+_OP_MARKERS = (("MERGE_HEAD", "merge"), ("CHERRY_PICK_HEAD", "cherry-pick"),
+               ("REVERT_HEAD", "revert"), ("BISECT_LOG", "bisect"),
+               ("rebase-merge", "rebase"), ("rebase-apply", "rebase"))
+
+
+def _operation_in_progress(path):
+    """The name of the git operation this checkout is mid-way through, "" for
+    none, or None when we could not look.
+
+    None is a THIRD answer on purpose: "I could not read the git dir" is not
+    "there is no operation", and reporting the second for the first is the
+    could-not-look-recorded-as-a-fact class this repo has now hit at the
+    filesystem, argv, event-ledger and roster layers in one day."""
+    rc, gitdir, _err = _git(path, "rev-parse", "--absolute-git-dir", timeout=5)
+    if rc != 0 or not gitdir:
+        return None
+    try:
+        for marker, name in _OP_MARKERS:
+            if os.path.exists(os.path.join(gitdir, marker)):
+                return name
+    except OSError:
+        return None
+    return ""
 
 
 def _room_status(path, now=None):
@@ -195,17 +272,22 @@ def _room_status(path, now=None):
     if rc != 0:
         return {"dirty": True, "wrote_ago": None, "clock_skew": False,
                 "unknown": "git status failed: %s" %
-                (os.fsdecode(err).strip() or "unknown error")}
+                (os.fsdecode(err).strip() or "unknown error"),
+                "conflicts": 0, "operation": None,
+                "dangling_conflict": False}
     if not out:
         return {"dirty": False, "wrote_ago": None, "clock_skew": False,
-                "unknown": None}
+                "unknown": None, "conflicts": 0, "operation": None,
+                "dangling_conflict": False}
     try:
         entries = _status_entries(out)
     except ValueError as exc:
         return {"dirty": True, "wrote_ago": None, "clock_skew": False,
-                "unknown": "unsafe status record: %s" % exc}
+                "unknown": "unsafe status record: %s" % exc,
+                "conflicts": 0, "operation": None,
+                "dangling_conflict": False}
     newest, incomplete = None, []
-    for rel_bytes, sub in entries:
+    for rel_bytes, sub, _kind in entries:
         rel = os.fsdecode(rel_bytes)
         if os.path.isabs(rel) or os.pardir in rel.split(os.sep):
             incomplete.append("path escaped checkout")
@@ -221,8 +303,22 @@ def _room_status(path, now=None):
     now = time.time() if now is None else now
     skew = newest is not None and newest > now
     age = None if newest is None else max(0, int(now - newest))
+    conflicts = sum(1 for _rel, _sub, kind in entries if kind == b"u")
+    operation = _operation_in_progress(path) if conflicts else ""
     return {"dirty": True, "wrote_ago": age, "clock_skew": skew,
-            "unknown": "; ".join(sorted(set(incomplete))) or None}
+            "unknown": "; ".join(sorted(set(incomplete))) or None,
+            "conflicts": conflicts, "operation": operation,
+            # THE STATE NO AGENT CAN RECOVER FROM BY REFLEX, and the one that hit
+            # this repo's shared checkout FIVE times in one day: conflict stages
+            # in the index with NO operation in progress — the shape a conflicted
+            # `git stash apply/pop` leaves. `git merge --abort` correctly refuses
+            # (git sees no merge), so the natural next move is `reset --hard`,
+            # which is exactly the move that would destroy a hand-resolution —
+            # AND, because it is tree-wide while the conflict is per-path, every
+            # unrelated uncommitted change in the room as well. The remedy the
+            # CLI prints is therefore per-path `restore`, never a hard reset.
+            # UNKNOWN operation is never treated as dangling: we did not look.
+            "dangling_conflict": bool(conflicts) and operation == ""}
 
 
 def _wrote_ago(path):
@@ -395,8 +491,12 @@ def unguarded_inventory(root, registered=None, registry_error=None):
     homes, live_sessions = _claude_homes(), _live_claude_sessions()
     rows = []
     for w, path, room, issue in candidates:
+        # the unsafe-checkout branch carries the conflict keys too: a caller
+        # reading them must not KeyError on exactly the rooms we could not trust
         status_row = ({"dirty": True, "wrote_ago": None, "clock_skew": False,
-                       "unknown": issue} if issue else _room_status(path))
+                       "unknown": issue, "conflicts": 0, "operation": None,
+                       "dangling_conflict": False}
+                      if issue else _room_status(path))
         if issue:
             harness, harness_note = "unknown", "unsafe checkout not inspected"
             occupants = []
@@ -415,6 +515,9 @@ def unguarded_inventory(root, registered=None, registry_error=None):
                      "dirty": status_row["dirty"],
                      "wrote_ago": status_row["wrote_ago"],
                      "clock_skew": status_row["clock_skew"],
+                     "conflicts": status_row["conflicts"],
+                     "operation": status_row["operation"],
+                     "dangling_conflict": status_row["dangling_conflict"],
                      "harness": harness, "harness_note": harness_note,
                      "hard_unknown": "; ".join(dict.fromkeys(hard_unknown)) or None,
                      "unknown": "; ".join(dict.fromkeys(unknown)) or None})
