@@ -453,11 +453,12 @@ class HostileNameSinkTests(LadderBase):
     ESC, BIDI = "\x1b[2J", "‮"
 
     def _hostile_dm(self, sender="senderS"):
-        # a row whose recipient carries control/bidi — planted OUTSIDE the
-        # validated join seam (chat.post does not re-validate the dm token).
+        # Historical/corrupt row planted below chat.post's final-write validator:
+        # the current writer rejects this token, but readers still launder bytes
+        # that an older writer or hand-edited ledger already persisted.
         name = "evil%s%s" % (self.ESC, self.BIDI)
-        row = chat.post("payload", who=sender, dm=name)
-        return row, name
+        row = {"ts": pk.now_ts(), "from": sender, "text": "payload", "dm": name}
+        return chat._append(row, chat.dm_room(name)), name
 
     def test_pending_launders_planted_recipient(self):
         row, _name = self._hostile_dm()
