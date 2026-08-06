@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased (0.2)
+## Unreleased
+
+_Nothing yet._
+
+## 0.2.0 — 2026-08-06
 
 - Proxy-seat autocompaction is now operational rather than alert-only. The
   actuator resolves the authoritative `spawn.json` pane identity; mutable Claude

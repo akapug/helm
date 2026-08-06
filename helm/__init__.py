@@ -11,4 +11,4 @@ references; it never duplicates. Every projection is read-only as truth: an
 edit lands in the source, and the projection re-derives.
 """
 
-__version__ = "0.1.0-alpha"
+__version__ = "0.2.0"

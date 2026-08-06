@@ -200,7 +200,13 @@ one wrote twice) in [docs/TESTIMONIALS.md](docs/TESTIMONIALS.md).
 
 ```console
 $ git clone git@github.com:akapug/helm.git && cd helm
-$ ./bin/helm --version                        # runs straight from the checkout
+$ ./install.sh           # checks python3, links ~/.local/bin/helm, runs doctor
+```
+
+Or skip the script — helm runs straight from the checkout:
+
+```console
+$ ./bin/helm --version
 $ ln -s "$PWD/bin/helm" ~/.local/bin/helm      # optional: `helm` everywhere
 ```
 
