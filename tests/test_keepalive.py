@@ -173,20 +173,20 @@ class KeepaliveTest(unittest.TestCase):
 
     def test_log_names_the_ACCOUNT_and_a_pre_image_precedes_the_rotation(self):
         """The audit log's worst old bug: it recorded the DIR NAME, so a home
-        holding another account logged `refreshed admin` about someone else's
+        holding another account logged `refreshed ops-example` about someone else's
         token. The account now rides every record, read from the home's own
         .claude.json (cred.py) — and the pre-image lands BEFORE the write."""
-        d = self._plant_home("admin", {"refreshToken": "OLD-R", "expiresAt": 0})
+        d = self._plant_home("ops-example", {"refreshToken": "OLD-R", "expiresAt": 0})
         with open(os.path.join(d, ".claude.json"), "w") as f:
-            json.dump({"oauthAccount": {"emailAddress": "owner@example.com"}}, f)
+            json.dump({"oauthAccount": {"emailAddress": "user@example.com"}}, f)
         backups = os.path.join(self.tmp, "cred-backups")
         resp = _FakeResp({"access_token": "NEW-A", "refresh_token": "NEW-R",
                           "expires_in": 3600})
         with mock.patch.dict(os.environ, {"HELM_CRED_BACKUP_ROOT": backups}), \
                 mock.patch("urllib.request.urlopen", return_value=resp):
             res = keepalive.refresh_home(d, apply=True)
-        self.assertEqual(res["home"], "admin")            # the label survives
-        self.assertEqual(res["account"], "owner@example.com")   # …beside the TRUTH
+        self.assertEqual(res["home"], "ops-example")            # the label survives
+        self.assertEqual(res["account"], "user@example.com")   # …beside the TRUTH
         pre = os.path.join(res["pre_image"], "credentials.json")
         with open(pre) as fh:                              # the PRE-rotation bytes
             self.assertEqual(json.load(fh)["claudeAiOauth"]["refreshToken"], "OLD-R")

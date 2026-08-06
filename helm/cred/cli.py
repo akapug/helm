@@ -269,7 +269,7 @@ def _print_heal(args):
 
 
 def cmd_cred(args):
-    """cred [list|backup [--all] [--apply]|switch-guard [--install] [--apply]|heal [--apply] [--quiet]]"""
+    """cred [list|ls [--json]|backup [--all] [--apply]|switch-guard|guard [--install] [--apply]|heal [--apply] [--quiet]]  (ls = list; guard = switch-guard)"""
     args = list(args)
     verb = args[0] if args and not args[0].startswith("-") else "list"
     rest = args[1:] if args and not args[0].startswith("-") else args

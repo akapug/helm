@@ -15,6 +15,9 @@ one per raw working directory, decoded from what each harness actually records:
             <acct>/sessions/**) — line 1 is session_meta with payload.cwd.
   opencode: ~/.local/share/opencode/storage/project/<hash>.json — `worktree`
             is already the real path.
+  pi:       ~/.pi/agent/sessions/<slug>/<ts>_<uuid>.jsonl — line 1 is a
+            {"type":"session"} record carrying the REAL cwd, same law as
+            claude/codex: decode the path from inside, never from the slug.
 
 Scanners are read-only and fail-open per file: one corrupt session never
 breaks the map.
@@ -184,5 +187,60 @@ def opencode_observations(storage=None):
     return out
 
 
+# --- pi ---------------------------------------------------------------------
+# pi (earendil-works/pi-coding-agent) stores one JSONL per session under a
+# path-slug directory, and line 1 is `{"type":"session","id":…,"cwd":…}` — the
+# real working directory, recorded inside the file. So the same law that
+# governs claude and codex applies unchanged: decode the cwd from the CONTENT,
+# never from `--home-user-dev-project--`, which is lossy by construction (it
+# cannot distinguish a hyphen in a directory name from a path separator).
+#
+# THE SESSION-DIR ENV VAR IS NOT A FIXED NAME. pi derives it from APP_NAME:
+# `ENV_SESSION_DIR = ${APP_NAME.toUpperCase()}_CODING_AGENT_SESSION_DIR`, where
+# APP_NAME comes from package.json's `piConfig.name` and defaults to "pi" — pi's
+# own source comments name TAU_CODING_AGENT_DIR as the rebranded case. So the
+# override is looked up under any *_CODING_AGENT_SESSION_DIR spelling present in
+# the environment rather than a single hardcoded key, and the default path is
+# used when none is set.
+
+_PI_SESSION_ENV = "_CODING_AGENT_SESSION_DIR"
+
+
+def pi_session_root(env=None):
+    """pi's session home: an APP_NAME-derived env override, else ~/.pi/agent."""
+    env = os.environ if env is None else env
+    for key, val in env.items():
+        if key.endswith(_PI_SESSION_ENV) and val:
+            return val
+    return os.path.join(os.path.expanduser("~"), ".pi", "agent", "sessions")
+
+
+def pi_observations(root=None):
+    root = root or pi_session_root()
+    if not os.path.isdir(root):
+        return []
+    by_cwd = {}
+    for p in glob.glob(os.path.join(root, "*", "*.jsonl")):
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        cwd = _sniff_cwd(p)
+        if not cwd:
+            continue          # fail-open per file: one unreadable session
+        o = by_cwd.setdefault(cwd, {                    # never breaks the map
+            "harness": "pi", "cwd": cwd, "sessions": 0,
+            "last_seen": 0.0, "days": set(), "refs": [],
+        })
+        o["sessions"] += 1
+        o["last_seen"] = max(o["last_seen"], st.st_mtime)
+        o["days"].add(_day(st.st_mtime))
+        # the ref is the session UUID, which is what pi's own --session takes
+        name = os.path.basename(p)[:-6]
+        o["refs"].append(name.split("_", 1)[-1] if "_" in name else name)
+    return list(by_cwd.values())
+
+
 def all_observations():
-    return claude_observations() + codex_observations() + opencode_observations()
+    return (claude_observations() + codex_observations()
+            + opencode_observations() + pi_observations())

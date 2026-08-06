@@ -13,9 +13,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import tempfile
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
-from helm import creds, homes, sessions  # noqa: E402
+from helm import creds, homes, seat, sessions  # noqa: E402
 from helm.providers import ProviderError  # noqa: E402
 
 SID = "aaaaaaaa-1111-2222-3333-444444444444"
@@ -195,8 +196,14 @@ class ResumeCommandTest(unittest.TestCase):
     binary so a paste into a stamped shell can't resume as a subprocess
     child (transcript persistence silently OFF)."""
 
-    UNSET = ("env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID "
-             "-u CLAUDE_CODE_BRIDGE_SESSION_ID ")
+    # DERIVED FROM THE SEAM, NEVER RE-SPELLED. This constant used to hand-copy
+    # the child-stamp prefix, so it went stale the instant the proxy triple
+    # joined it (#107) — five tests failed for pinning a prefix rather than a
+    # behaviour. What THESE tests own is COMPOSITION: that the command carries
+    # the prefix, in the right place, without corrupting the quoted cd. The
+    # prefix's CONTENTS are pinned exactly once, in test_seat's
+    # paste-prefix arm, which fails if either register goes missing.
+    UNSET = seat.paste_unset_prefix()
 
     def test_claude_format(self):
         self.assertEqual(

@@ -18,7 +18,7 @@ The contract (all methods return plain JSON-able data, never token contents):
     preflight(account, sid, agent)       -> {resolvable, live_holder_pid, reason, ...}
 
 Two implementations live here:
-  CliQuotaProvider    — shells a local quota CLI (quota) with --json verbs.
+  CliQuotaProvider    — shells a local quota CLI (HELM_QUOTA_CLI) with --json verbs.
   NativeQuotaProvider — first-principles, stdlib-only: scans the credential homes
                         and probes the vendors' own usage endpoints directly.
                         This is the deprecation path for the external CLI.
@@ -59,11 +59,13 @@ class CliQuotaProvider:
     """Backend = a local quota/allocation CLI with --json verbs (configurable binary)."""
 
     def __init__(self, binary=None):
+        # config-driven, no baked default binary: an unset HELM_QUOTA_CLI means
+        # no CLI quota provider (native is the default provider anyway)
         self.binary = binary or _env("QUOTA_CLI", "")
 
     def _run(self, *args, timeout=45):
         if not self.binary:
-            raise ProviderError("no quota CLI configured; set HELM_QUOTA_CLI")
+            raise ProviderError("no quota CLI configured (set HELM_QUOTA_CLI)")
         try:
             p = subprocess.run([self.binary, *args], capture_output=True, text=True,
                                timeout=timeout)
@@ -415,9 +417,31 @@ class NativeQuotaProvider:
 
         if acct["provider"] == "anthropic":
             creds = _read_json(os.path.join(acct["home"], ".credentials.json")) or {}
-            token = (creds.get("claudeAiOauth") or {}).get("accessToken")
+            oauth = creds.get("claudeAiOauth") or {}
+            token = oauth.get("accessToken")
             if not token:
                 return rows("api-error", "no-credentials")
+            # PRESENT-BUT-EXPIRED IS ITS OWN STATE, NOT api-error.
+            # Named `expired-token`, deliberately NOT `stale-token`: the prior
+            # no-stale-cred-live-probe retired "stale" from cred design (a
+            # snapshot-age heuristic that snuck in), and this is the opposite
+            # — a HARD fact read from the token's own expiresAt, more precise
+            # than "stale" and free of that word's baggage.
+            # Measured live: four healthy Max 20x accounts read
+            # "api-error" because helm's stored token was 201-401h (13-17 DAYS)
+            # stale — orca does the live switching and refreshes its OWN store,
+            # nothing refreshes helm's ~/.claude-homes copy. api-error reads as
+            # "the account is broken"; the truth is "helm's COPY of the token
+            # is dead", and the owner cannot act on the first framing. A dead
+            # token also guarantees a 401, so returning here SKIPS a doomed
+            # round-trip. expiresAt is epoch ms; absent -> fall through and let
+            # the live call be the authority (never guess an account healthy).
+            exp = oauth.get("expiresAt")
+            if isinstance(exp, (int, float)) and exp / 1000 < time.time():
+                days = int((time.time() - exp / 1000) / 86400)
+                return rows("expired-token",
+                            "reauth-needed (helm's token expired %dd ago; "
+                            "orca refreshes its own store, not this one)" % days)
             try:
                 data = self._get_json(ANTHROPIC_USAGE_URL, {"Authorization": "Bearer " + token})
             except urllib.error.HTTPError as e:
@@ -730,8 +754,8 @@ class NativeQuotaProvider:
             blocked = []
             if state == "exhausted" or (isinstance(headroom, (int, float)) and headroom <= 0):
                 blocked.append("exhausted")
-            elif state == "api-error":
-                blocked.append(s.get("status") or "api-error")
+            elif state in ("api-error", "expired-token"):
+                blocked.append(s.get("status") or state)
             # codex "unknown" stays eligible: the CLI self-refreshes creds on launch
             out.append({"account": a["name"], "eligible": not blocked,
                         "headroom_pct": headroom, "tier": s.get("tier") or a.get("tier"),
@@ -881,14 +905,16 @@ class NativeQuotaProvider:
 def default_provider():
     """NATIVE is the default (deprecation flip 2026-07-12): helm reads the
     providers' own usage endpoints directly. A legacy quota CLI is opt-in via
-    HELM_PROVIDER=cli (+ optional HELM_QUOTA_CLI naming the binary)."""
+    HELM_PROVIDER=cli + HELM_QUOTA_CLI naming the binary (required — the
+    shipped tree bakes no default binary)."""
     choice = (_env("PROVIDER") or "native").strip().lower()
     if choice == "cli":
         binary = _env("QUOTA_CLI", "")
         if binary and shutil.which(binary):
             return CliQuotaProvider(binary)
-        # opted into cli but no usable HELM_QUOTA_CLI: fail toward working, loudly
-        missing = f"{binary!r} not found" if binary else "HELM_QUOTA_CLI unset"
-        print(f"helm: HELM_PROVIDER=cli but {missing} — using native provider",
+        # opted into a CLI that is unset or not installed: fail toward working,
+        # loudly (which binary to shell is a site choice, not shipped code's)
+        why = f"{binary!r} not found" if binary else "HELM_QUOTA_CLI is unset"
+        print(f"helm: HELM_PROVIDER=cli but {why} — using native provider",
               file=sys.stderr)
     return NativeQuotaProvider()

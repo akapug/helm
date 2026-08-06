@@ -61,11 +61,12 @@ class OrcaAdapterTest(unittest.TestCase):
     def test_read_builds_exact_command_and_joins_tail(self):
         with self._patch(_orca_reply({"terminal": {
                 "handle": "t1", "tail": ["line one", "line two"]}})) as run:
-            text = self.ad.read("t1", limit=500)
+            text = self.ad.read("t1", limit=500, timeout=0.5)
         self.assertEqual(text, "line one\nline two")
         self.assertEqual(run.call_args[0][0],
                          ["/fake/bin/orca", "terminal", "read", "--terminal",
                           "t1", "--limit", "500", "--json"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.5)
 
     def test_send_with_and_without_enter(self):
         with self._patch(_orca_reply({})) as run:
@@ -78,6 +79,11 @@ class OrcaAdapterTest(unittest.TestCase):
             self.assertEqual(run.call_args[0][0],
                              ["/fake/bin/orca", "terminal", "send",
                               "--terminal", "t1", "--text", "raw", "--json"])
+            self.ad.send("t1", "", enter=True)
+            self.assertEqual(run.call_args[0][0],
+                             ["/fake/bin/orca", "terminal", "send",
+                              "--terminal", "t1", "--text", "", "--enter",
+                              "--json"])
 
     def test_stop_builds_close(self):
         with self._patch(_orca_reply({})) as run:
@@ -98,11 +104,28 @@ class OrcaAdapterTest(unittest.TestCase):
             {"handle": "t1", "title": "codex", "preview": "",
              "status": "connected", "writable": True, "pty_id": "pty-1",
              "tab_id": "tab-1", "leaf_id": "leaf-1",
-             "worktree_id": "wt-1", "worktree": "/w"},
+             "worktree_id": "wt-1", "worktree": "/w", "orphaned": False,
+             "last_output_at": None},
             {"handle": "t2", "title": "", "preview": "",
              "status": "disconnected", "writable": False, "pty_id": None,
              "tab_id": None, "leaf_id": None, "worktree_id": None,
-             "worktree": None}])
+             "worktree": None, "orphaned": False, "last_output_at": None}])
+
+    def test_list_carries_orphaned(self):
+        """The field that was DROPPED and broke every pane read after the orca
+        .46 remint. A pane can be connected=True and writable=True while its PTY
+        has no live renderer (orphaned=True), and reads against it return empty.
+        _pane_row must carry it so _pane_live can stop answering True on it —
+        there is no helm-side heuristic that distinguishes an orphaned PTY from
+        an idle one, only orca's own statement."""
+        with self._patch(_orca_reply({"terminals": [
+                {"handle": "t1", "connected": True, "writable": True,
+                 "orphaned": True},
+                {"handle": "t2", "connected": True, "writable": True,
+                 "orphaned": False}]})):
+            rows = self.ad.list()
+        self.assertTrue(rows[0]["orphaned"])
+        self.assertFalse(rows[1]["orphaned"])
 
     def test_resolve_pane_uses_remint_stable_key(self):
         reply = {"terminal": {"handle": "new", "ptyId": "pty-1",
@@ -172,11 +195,12 @@ class HerdrAdapterTest(unittest.TestCase):
         reply = _herdr_reply({"type": "pane_read",
                               "read": {"text": "tail text\nhere", "pane_id": "w3:p1"}})
         with self._patch(reply) as run:
-            text = self.ad.read("w3:p1", limit=40)
+            text = self.ad.read("w3:p1", limit=40, timeout=0.5)
         self.assertEqual(text, "tail text\nhere")
         self.assertEqual(run.call_args[0][0],
                          ["/fake/bin/herdr", "pane", "read", "w3:p1",
                           "--source", "recent", "--lines", "40"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.5)
 
     def test_send_enter_uses_pane_run_literal_uses_send_text(self):
         with self._patch(_herdr_reply({})) as run:
@@ -186,6 +210,9 @@ class HerdrAdapterTest(unittest.TestCase):
             self.ad.send("w3:p1", "y", enter=False)
             self.assertEqual(run.call_args[0][0],
                              ["/fake/bin/herdr", "pane", "send-text", "w3:p1", "y"])
+            self.ad.send("w3:p1", "", enter=True)
+            self.assertEqual(run.call_args[0][0],
+                             ["/fake/bin/herdr", "pane", "run", "w3:p1", ""])
 
     def test_stop_builds_pane_close(self):
         with self._patch(_herdr_reply({})) as run:
@@ -197,6 +224,306 @@ class HerdrAdapterTest(unittest.TestCase):
         with self._patch(_herdr_error(message="no such pane")):
             with self.assertRaisesRegex(harness.HarnessError, "no such pane"):
                 self.ad.read("w9:p9")
+
+
+class SeatHomeWorktreeTest(unittest.TestCase):
+    """The ONE seat-home isolation method, implemented for all three
+    metaharness cases. The floor runs against a throwaway git repo; the two
+    CLI adapters are asserted at the `_run` seam so real git keeps working
+    underneath them."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-home-wt-")
+        self.repo = os.path.join(self.tmp, "proj")
+        os.makedirs(self.repo)
+        self._git("init", "-q", "-b", "main", ".")
+        self._git("config", "user.email", "t@t")
+        self._git("config", "user.name", "t")
+        with open(os.path.join(self.repo, "a.txt"), "w") as f:
+            f.write("hi\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "init")
+        self.wt = os.path.join(self.tmp, "proj-wt", "seats", "codex")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _git(self, *args, where=None):
+        import subprocess
+        return subprocess.run(["git", "-C", where or self.repo] + list(args),
+                              capture_output=True, text=True)
+
+    # --- the floor (headless / none / any adapter without the method) -------
+
+    def test_path_and_branch_are_pure_deterministic_functions(self):
+        self.assertEqual(harness.seat_worktree_path("/r/proj", "codex-2"),
+                         os.path.join("/r/proj-wt", "seats", "codex-2"))
+        self.assertEqual(harness.seat_worktree_path("/r/proj/", "codex"),
+                         os.path.join("/r/proj-wt", "seats", "codex"))
+        self.assertEqual(harness.seat_branch("codex-2"), "seat/codex-2")
+
+    def test_native_creates_the_home_on_its_own_branch(self):
+        path = harness.ensure_home_worktree("codex", self.repo)
+        self.assertEqual(path, self.wt)
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(self._git("rev-parse", "--abbrev-ref", "HEAD",
+                                   where=path).stdout.strip(), "seat/codex")
+        # NO worktree lock: a lane lock IS a task lease, a seat HOME is
+        # long-lived and a lock would make prune/remove/gc refuse forever.
+        self.assertNotIn("locked", self._git("worktree", "list").stdout)
+
+    def test_reuse_is_idempotent_and_keeps_the_seat_bytes(self):
+        path = harness.ensure_home_worktree("codex", self.repo)
+        with open(os.path.join(path, "wip.txt"), "w") as f:
+            f.write("mid-flight\n")
+        again = harness.ensure_home_worktree("codex", self.repo)
+        self.assertEqual(again, path)
+        self.assertTrue(os.path.exists(os.path.join(path, "wip.txt")))
+        rows = [l for l in self._git("worktree", "list").stdout.splitlines()
+                if os.path.join("seats", "codex") in l]
+        self.assertEqual(len(rows), 1)
+
+    def test_stale_admin_record_is_pruned_and_the_home_reprovisioned(self):
+        """A reseed/rm -rf leaves git's admin record behind; a plain re-add
+        would fail. The record whose checkout is already gone is pruned first,
+        which cannot touch a live sibling room."""
+        path = harness.ensure_home_worktree("codex", self.repo)
+        shutil.rmtree(path)
+        again = harness.ensure_home_worktree("codex", self.repo)
+        self.assertEqual(again, path)
+        self.assertTrue(os.path.isdir(path))
+
+    def test_unknown_bytes_at_the_home_path_are_refused_not_adopted(self):
+        os.makedirs(self.wt)
+        with open(os.path.join(self.wt, "someones-work.txt"), "w") as f:
+            f.write("not ours\n")
+        with self.assertRaisesRegex(harness.HarnessError, "not a registered"):
+            harness.ensure_home_worktree("codex", self.repo)
+        self.assertTrue(os.path.exists(os.path.join(self.wt,
+                                                    "someones-work.txt")))
+
+    def test_unsafe_seat_names_are_refused(self):
+        for bad in ("", "..", "../escape", "-x", "a/b", " codex"):
+            with self.assertRaises(harness.HarnessError):
+                harness.ensure_home_worktree(bad, self.repo)
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "proj-wt")))
+
+    def test_base_falls_back_when_the_named_base_does_not_exist(self):
+        """A repo whose integration branch is not `main` still gets a home."""
+        self._git("branch", "-m", "main", "trunk")
+        path = harness.ensure_home_worktree("codex", self.repo)
+        self.assertTrue(os.path.isdir(path))
+
+    def test_find_repo_root_folds_a_worktree_to_the_main_checkout(self):
+        path = harness.ensure_home_worktree("codex", self.repo)
+        self.assertEqual(harness.find_repo_root(path), self.repo)
+        self.assertEqual(harness.find_repo_root(self.repo), self.repo)
+        self.assertIsNone(harness.find_repo_root(None))      # deleted cwd, no raise
+        self.assertIsNone(harness.find_repo_root(self.tmp))  # outside any checkout
+
+    # --- herdr: explicit --path + adopt (the no-orca-overfit proof) ---------
+
+    def test_herdr_create_uses_helms_deterministic_path_and_guard_env(self):
+        ad = harness.HerdrAdapter("/fake/bin/herdr")
+        with mock.patch.object(ad, "_run", return_value={}) as run:
+            path = ad.ensure_home_worktree("codex", self.repo)
+        self.assertEqual(path, self.wt)
+        listing, create = run.call_args_list[0], run.call_args_list[1]
+        self.assertEqual(listing[0][0], ["worktree", "list", "--cwd",
+                                         self.repo, "--json"])
+        self.assertEqual(create[0][0], [
+            "worktree", "create", "--cwd", self.repo,
+            "--branch", "seat/codex", "--base", "main", "--path", self.wt,
+            "--label", "helm seat codex", "--no-focus", "--json"])
+        # the shared-tree ref-guard's sanctioned-creator bit, scoped to the call
+        self.assertEqual(create[1]["env"], {"HELM_WORK_CLAIM": "1"})
+
+    def test_herdr_reuse_short_circuits_on_its_own_registry(self):
+        ad = harness.HerdrAdapter("/fake/bin/herdr")
+        os.makedirs(self.wt)
+        rows = {"worktrees": [{"path": self.wt, "branch": "seat/codex"}]}
+        with mock.patch.object(ad, "_run", return_value=rows) as run:
+            path = ad.ensure_home_worktree("codex", self.repo)
+        self.assertEqual(path, self.wt)
+        self.assertEqual(len(run.call_args_list), 1)   # list only, no create
+
+    def test_herdr_create_failure_falls_back_to_native_then_adopts(self):
+        """herdr does the git work in its DAEMON, whose env we cannot reach, so
+        a ref-guard refusal must still leave the seat with its checkout — via
+        the native floor plus herdr's real `worktree open --path` adopt."""
+        ad = harness.HerdrAdapter("/fake/bin/herdr")
+        calls = []
+
+        def flaky(args, timeout=60, env=None):
+            calls.append(list(args))
+            if args[1] == "create":
+                raise harness.HarnessError("refused by the shared-tree guard")
+            return {}
+
+        with mock.patch.object(ad, "_run", side_effect=flaky):
+            path = ad.ensure_home_worktree("codex", self.repo)
+        self.assertEqual(path, self.wt)
+        self.assertTrue(os.path.isdir(path))           # native floor delivered
+        self.assertEqual(calls[-1], ["worktree", "open", "--cwd", self.repo,
+                                     "--path", self.wt, "--label",
+                                     "helm seat codex", "--no-focus", "--json"])
+
+    def test_herdr_adopt_failure_still_returns_a_working_checkout(self):
+        ad = harness.HerdrAdapter("/fake/bin/herdr")
+        with mock.patch.object(ad, "_run",
+                               side_effect=harness.HarnessError("herdr down")):
+            path = ad.ensure_home_worktree("codex", self.repo)
+        self.assertEqual(path, self.wt)
+        self.assertTrue(os.path.isdir(path))
+
+    # --- orca: native path + fail-open RPC adoption (the CLI cannot adopt) ---
+
+    def test_orca_uses_the_native_deterministic_path(self):
+        """The checkout is helm-native and the orca board entry is attempted
+        through the DAEMON RPC — `orca worktree set` could never do it, because
+        `set` only selects a worktree orca already knows."""
+        ad = harness.OrcaAdapter("/fake/bin/orca")
+        with mock.patch.object(ad, "adopt_worktree",
+                               return_value=(True, "adopted")) as adopt, \
+                mock.patch.object(ad, "_run", return_value={}) as run:
+            path = ad.ensure_home_worktree("codex", self.repo)
+        self.assertEqual(path, self.wt)
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(self._git("rev-parse", "--abbrev-ref", "HEAD",
+                                   where=path).stdout.strip(), "seat/codex")
+        adopt.assert_called_once_with(self.repo, self.wt)
+        run.assert_not_called()   # no CLI leg is involved in adoption any more
+
+    def test_orca_visibility_failure_is_fail_open(self):
+        """Adoption is a nicety; the checkout is the contract. Every adoption
+        failure mode (daemon down, folder-kind project, garbage reply) must cost
+        the seat nothing."""
+        ad = harness.OrcaAdapter("/fake/bin/orca")
+        with mock.patch.object(ad, "rpc",
+                               return_value=(None, "orca daemon down")):
+            path = ad.ensure_home_worktree("codex", self.repo)
+        self.assertEqual(path, self.wt)
+        self.assertTrue(os.path.isdir(path))
+
+    def test_orca_adopt_uses_the_selector_shape_the_daemon_accepts(self):
+        """The wire shape is {"repo": "<selector>", "updates": {...}} — read from
+        the installed app bundle, not guessed. A flat `repoId` (the shape a
+        first guess produces) is answered `invalid_argument: Missing repo
+        selector`, so pinning the accepted shape is the point of this test."""
+        ad = harness.OrcaAdapter("/fake/bin/orca")
+        calls = []
+
+        def fake_rpc(method, params, **kw):
+            calls.append((method, params))
+            if method == "repo.list":
+                return {"repos": [{"id": "r1", "path": self.repo,
+                                   "kind": "git"}]}, None
+            return {"repo": {}}, None
+
+        with mock.patch.object(ad, "rpc", side_effect=fake_rpc):
+            ok, detail = ad.adopt_worktree(self.repo, self.wt)
+        self.assertTrue(ok, detail)
+        self.assertEqual(calls[-1][0], "repo.update")
+        self.assertEqual(calls[-1][1], {
+            "repo": "id:r1",
+            "updates": {"externalWorktreeVisibility": "show",
+                        "importedExternalWorktreePaths": [self.wt]}})
+
+    def test_orca_adopt_preserves_worktrees_adopted_before_us(self):
+        """importedExternalWorktreePaths is READ-MODIFY-WRITTEN. A blind write
+        would silently un-adopt every other worktree on the project."""
+        ad = harness.OrcaAdapter("/fake/bin/orca")
+        sent = {}
+
+        def fake_rpc(method, params, **kw):
+            if method == "repo.list":
+                return {"repos": [{
+                    "id": "r1", "path": self.repo, "kind": "git",
+                    "importedExternalWorktreePaths": ["/other/lane"]}]}, None
+            sent.update(params)
+            return {"repo": {}}, None
+
+        with mock.patch.object(ad, "rpc", side_effect=fake_rpc):
+            ok, _ = ad.adopt_worktree(self.repo, self.wt)
+        self.assertTrue(ok)
+        self.assertEqual(sent["updates"]["importedExternalWorktreePaths"],
+                         ["/other/lane", self.wt])
+
+    def test_orca_adopt_is_idempotent_on_an_already_imported_path(self):
+        ad = harness.OrcaAdapter("/fake/bin/orca")
+        sent = {}
+
+        def fake_rpc(method, params, **kw):
+            if method == "repo.list":
+                return {"repos": [{
+                    "id": "r1", "path": self.repo, "kind": "git",
+                    "importedExternalWorktreePaths": [self.wt]}]}, None
+            sent.update(params)
+            return {"repo": {}}, None
+
+        with mock.patch.object(ad, "rpc", side_effect=fake_rpc):
+            ad.adopt_worktree(self.repo, self.wt)
+        self.assertEqual(sent["updates"]["importedExternalWorktreePaths"],
+                         [self.wt])
+
+    def test_orca_adopt_refuses_to_reclassify_a_folder_context(self):
+        """MEASURED on this machine: orca holds helm as kind="folder", which has
+        no externalWorktreeVisibility at all, so discovery never runs for it
+        (git reported 102 helm worktrees; orca's worktree.list knew 1). The
+        schema WOULD accept updates.kind="git", but that rearranges the owner's
+        sidebar — helm reports it instead of doing it silently."""
+        ad = harness.OrcaAdapter("/fake/bin/orca")
+        calls = []
+
+        def fake_rpc(method, params, **kw):
+            calls.append(method)
+            return {"repos": [{"id": "r1", "path": self.repo,
+                               "kind": "folder"}]}, None
+
+        with mock.patch.object(ad, "rpc", side_effect=fake_rpc):
+            ok, detail = ad.adopt_worktree(self.repo, self.wt)
+        self.assertFalse(ok)
+        self.assertIn("folder", detail)
+        self.assertIn("reclassified", detail)
+        self.assertNotIn("repo.update", calls)   # nothing was mutated
+
+    def test_orca_adopt_on_an_unregistered_repo_says_so(self):
+        ad = harness.OrcaAdapter("/fake/bin/orca")
+        with mock.patch.object(ad, "rpc", return_value=({"repos": []}, None)):
+            ok, detail = ad.adopt_worktree(self.repo, self.wt)
+        self.assertFalse(ok)
+        self.assertIn("not have", detail)
+
+    # --- the seam itself ---------------------------------------------------
+
+    def test_all_three_cases_answer_the_same_deterministic_path(self):
+        """The point of the seam: helm is metaharness-AGNOSTIC. Same seat, same
+        repo, same answer — headless, herdr, orca."""
+        expected = harness.seat_worktree_path(self.repo, "codex")
+        floor = harness.ensure_home_worktree("codex", self.repo)
+        herdr = harness.HerdrAdapter("/fake/bin/herdr")
+        orca = harness.OrcaAdapter("/fake/bin/orca")
+        with mock.patch.object(herdr, "_run", return_value={}), \
+                mock.patch.object(orca, "_run", return_value={}):
+            self.assertEqual(herdr.ensure_home_worktree("codex", self.repo),
+                             expected)
+            self.assertEqual(orca.ensure_home_worktree("codex", self.repo),
+                             expected)
+        self.assertEqual(floor, expected)
+
+    def test_run_env_overlays_rather_than_replaces_the_environment(self):
+        """The guard bit must ride WITHOUT stripping HOME/PATH from the CLI."""
+        ad = harness.HerdrAdapter("/fake/bin/herdr")
+        with mock.patch.object(harness.subprocess, "run",
+                               return_value=FakeProc(_herdr_reply({}))) as run:
+            ad._run(["worktree", "create"], env={"HELM_WORK_CLAIM": "1"})
+        env = run.call_args[1]["env"]
+        self.assertEqual(env["HELM_WORK_CLAIM"], "1")
+        self.assertEqual(env.get("PATH"), os.environ.get("PATH"))
+        with mock.patch.object(harness.subprocess, "run",
+                               return_value=FakeProc(_herdr_reply({}))) as run:
+            ad._run(["pane", "list"])
+        self.assertIsNone(run.call_args[1]["env"])   # inherit when not asked
 
 
 class DetectTest(unittest.TestCase):
@@ -253,12 +580,26 @@ class DoctorMetaharnessTest(unittest.TestCase):
         self.assertIn("herdr", res[0][1])
 
 
-class FakeAdapter:
-    """Records the uniform pane ops seat resume drives."""
+# A pane whose composer is EMPTY — i.e. one that took its turn. Synthetic, but
+# shaped exactly like a real frame, because `submit` proves delivery by reading
+# the composer back and a double that returns "" models an UNREADABLE pane
+# (UNKNOWN), not a working one.
+ADVANCED_PANE = "\n".join(("─" * 40, "❯", "─" * 40,
+                           "  opus-5 | ~/dev/example/repo",
+                           "  ⏵⏵ bypass permissions on"))
+
+
+class FakeAdapter(harness._CLIAdapter):
+    """Records the uniform pane ops seat resume drives.
+
+    Subclasses the real base so it inherits the REAL `submit` — the split send
+    and the read-back verification — instead of a second implementation that
+    could agree with a broken one.
+    """
     name, path = "fake", "/bin/fake"
 
     def __init__(self, rows=()):
-        self.rows, self.spawned, self.stopped = list(rows), [], []
+        self.rows, self.spawned, self.stopped, self.sent = list(rows), [], [], []
 
     def spawn(self, command, title=None, cwd=None):
         self.spawned.append((command, title, cwd))
@@ -267,11 +608,11 @@ class FakeAdapter:
     def list(self):
         return list(self.rows)
 
-    def read(self, handle, limit=3000):
-        return ""
+    def read(self, handle, limit=3000, timeout=60):
+        return ADVANCED_PANE
 
     def send(self, handle, text, enter=True):
-        pass
+        self.sent.append((handle, text, enter))
 
     def stop(self, handle):
         self.stopped.append(handle)
@@ -280,9 +621,18 @@ class FakeAdapter:
 class SeatResumeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-resume-")
-        self._env = {k: os.environ.get(k) for k in ("HELM_HOME", "MELD_HOME")}
+        self._env = {k: os.environ.get(k)
+                     for k in ("HELM_HOME", "MELD_HOME",
+                               "HELM_SPAWN_SEND_DELAY",
+                               "HELM_SUBMIT_SETTLE_S")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm-home")
         os.environ.pop("MELD_HOME", None)
+        # resume now delivers the wake-path re-arm prompt with spawn's own
+        # boot grace; a real 5s sleep per test is suite poison
+        os.environ["HELM_SPAWN_SEND_DELAY"] = "0"
+        # `submit` settles between typing and the bare Enter; a real settle per
+        # test is the same suite poison as the boot grace above.
+        os.environ["HELM_SUBMIT_SETTLE_S"] = "0"
         self.timer = mock.patch.object(seat, "_ensure_autocompact_timer")
         self.ensure_timer = self.timer.start()
 
@@ -393,19 +743,27 @@ class SeatResumeTest(unittest.TestCase):
         with open(os.path.join(d, "spawn.json")) as f:
             self.assertEqual(json.load(f)["handle"], fake.rows[0]["handle"])
 
-    def test_resume_uses_session_id_and_sniffed_cwd_when_resolvable(self):
+    def test_resume_uses_session_id_and_sniffed_cwd_when_resolvable(self):  # noqa: VACUOUS_ASSERTION — positive controls: the exact --resume command, the sniffed-cwd equality, and the registered sid
         d, launch = self._mint()
         sid = "0199aaaa-bbbb-cccc-dddd-eeeeffff0000"
+        # the sniffed cwd must EXIST now (a recorded cwd that no longer
+        # exists refuses instead of spawning somewhere stale), and
+        # TEMP_ROOTS is patched so the fixture tree is not itself classed
+        # throwaway (tests/test_resume_cwd.py's law)
+        spot = os.path.join(self.tmp, "work", "spot")
+        os.makedirs(spot)
         proj = os.path.join(d, "claude", "projects", "-work-spot")
         os.makedirs(proj)
         with open(os.path.join(proj, sid + ".jsonl"), "w") as f:
-            f.write(json.dumps({"cwd": "/work/spot", "type": "user"}) + "\n")
+            f.write(json.dumps({"cwd": spot, "type": "user"}) + "\n")
         fake = FakeAdapter()
-        rc, out, err, _ = self._resume(["codex"], fake)
+        from helm import seats
+        with mock.patch.object(seats, "TEMP_ROOTS", ("/dev/shm",)):
+            rc, out, err, _ = self._resume(["codex"], fake)
         self.assertEqual(rc, 0, err)
         command, _, cwd = fake.spawned[0]
         self.assertEqual(command, "%s --resume %s" % (shlex.quote(launch), sid))
-        self.assertEqual(cwd, "/work/spot")
+        self.assertEqual(cwd, spot)
         self.assertIn("--resume", out)
         with open(os.path.join(d, "spawn.json")) as f:
             self.assertEqual(json.load(f)["session"], sid)

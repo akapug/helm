@@ -194,6 +194,43 @@ class ProbeTest(NativeBase):
     def http_error(self, code):
         return urllib.error.HTTPError("http://x", code, "boom", None, io.BytesIO(b""))
 
+    def _set_expiry(self, home, expires_at_ms):
+        p = os.path.join(home, ".credentials.json")
+        creds = json.load(open(p))
+        creds["claudeAiOauth"]["expiresAt"] = expires_at_ms
+        json.dump(creds, open(p, "w"))
+
+    def test_expired_token_is_its_own_state_not_api_error(self):  # noqa: VACUOUS_ASSERTION — three positive assertions (state==expired-token, status contains reauth-needed + 15d); the fn.assert_not_called() absence has its unconditional positive control in the sibling test_live_token_still_probes_the_network (fn.assert_called_once)
+        """A present-but-EXPIRED token is its own state and never touches the
+        network — rows that previously read as 'api-error' were tokens dead
+        for 13-17 days."""
+        import time as _t
+        home = self.claude_home("stale", "u@x.com")
+        self._set_expiry(home, int((_t.time() - 15 * 86400) * 1000))
+        (cred, _hist), fn = self.probe(self.acct(home), {"limits": []})
+        self.assertEqual(cred["cred_state"], "expired-token")
+        self.assertIn("reauth-needed", cred["status"])
+        self.assertIn("15d", cred["status"])
+        fn.assert_not_called()          # a dead token never pays for a 401
+
+    def test_live_token_still_probes_the_network(self):
+        """The polarity control: a token whose expiry is in the FUTURE (or
+        absent) must reach the live call, so the stale check cannot swallow a
+        healthy account into a false expired-token."""
+        import time as _t
+        home = self.claude_home("live", "u@x.com")
+        self._set_expiry(home, int((_t.time() + 3600) * 1000))
+        data = {"limits": [{"kind": "session", "percent": 10,
+                            "resets_at": "1970-01-01T00:01:00Z"}]}
+        (cred, _), fn = self.probe(self.acct(home), data)
+        self.assertEqual(cred["cred_state"], "ok")
+        fn.assert_called_once()
+        # and expiry ABSENT (the fixture default) also reaches the network
+        home2 = self.claude_home("noexp", "v@x.com")
+        (cred2, _), fn2 = self.probe(self.acct(home2), data)
+        self.assertEqual(cred2["cred_state"], "ok")
+        fn2.assert_called_once()
+
     def test_anthropic_ok_and_exhausted(self):
         home = self.claude_home("a", "u@x.com")
         data = {"limits": [{"kind": "session", "percent": 30,
@@ -387,6 +424,15 @@ class AllocateTest(NativeBase):
         self.assertEqual([r["account"] for r in rows], ["cx"])
         self.assertTrue(rows[0]["eligible"])
 
+    def test_an_expired_anthropic_token_is_ineligible(self):  # noqa: VACUOUS_ASSERTION — exact eligible/blocked_by tuple is an unconditional structural assertion on the allocator result
+        account = {"name": "expired", "provider": "anthropic", "home": "/dead",
+                   "usable": True, "tier": "Max"}
+        state = {"account": "expired", "cred_state": "expired-token",
+                 "headroom_pct": None, "tier": "Max", "status": "reauth-needed"}
+        row = self.alloc("claude-fable-5", [account], [state])[0]
+        self.assertEqual((row["eligible"], row["blocked_by"]),
+                         (False, ["reauth-needed"]))
+
     def test_rules_prefer_avoid_and_low_headroom_avoid_blocks(self):
         states = [dict(s) for s in self.STATES]
         states[1].update(cred_state="ok", headroom_pct=5, status="allowed")  # dry: low
@@ -460,21 +506,42 @@ class LaunchPreflightTest(NativeBase):
 class SelectionTest(NativeBase):
     def test_default_is_native_cli_optin_falls_back_when_missing(self):
         self.assertIsInstance(providers.default_provider(), NativeQuotaProvider)
+        # cli opt-in with a named binary that isn't installed -> native, loudly
         err = io.StringIO()
-        with mock.patch.dict(os.environ, {"HELM_PROVIDER": "cli"}), \
+        with mock.patch.dict(os.environ, {"HELM_PROVIDER": "cli",
+                                          "HELM_QUOTA_CLI": "fakequota"}), \
                 mock.patch.object(providers.shutil, "which", lambda b: None), \
                 contextlib.redirect_stderr(err):
             self.assertIsInstance(providers.default_provider(), NativeQuotaProvider)
         self.assertIn("using native provider", err.getvalue())
-        with mock.patch.dict(os.environ, {"HELM_PROVIDER": "cli", "HELM_QUOTA_CLI": "myquota"}), \
+        with mock.patch.dict(os.environ, {"HELM_PROVIDER": "cli",
+                                          "HELM_QUOTA_CLI": "fakequota"}), \
                 mock.patch.object(providers.shutil, "which", lambda b: "/bin/" + b):
             prov = providers.default_provider()
         self.assertIsInstance(prov, providers.CliQuotaProvider)
+        self.assertEqual(prov.binary, "fakequota")
+
+    def test_cli_optin_without_binary_config_falls_back_loudly(self):
+        # no baked default binary (the quota CLI is a site choice, not shipped
+        # code's): HELM_PROVIDER=cli with HELM_QUOTA_CLI unset -> native, loudly
+        env = {"HELM_PROVIDER": "cli"}
+        os.environ.pop("HELM_QUOTA_CLI", None)
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(providers.shutil, "which",
+                                  lambda b: "/bin/" + b), \
+                contextlib.redirect_stderr(err):
+            self.assertIsInstance(providers.default_provider(), NativeQuotaProvider)
+        self.assertIn("HELM_QUOTA_CLI is unset", err.getvalue())
 
     def test_cli_provider_error_paths(self):
         cli = providers.CliQuotaProvider(binary="definitely-not-a-real-binary")
         with self.assertRaises(ProviderError):
             cli._run("list")
+        # an unconfigured binary raises the config error, never subprocess junk
+        os.environ.pop("HELM_QUOTA_CLI", None)
+        with self.assertRaises(ProviderError):
+            providers.CliQuotaProvider()._run("list")
         done = mock.Mock(returncode=0, stdout="not json", stderr="")
         with mock.patch.object(providers.subprocess, "run", return_value=done):
             with self.assertRaises(ProviderError):

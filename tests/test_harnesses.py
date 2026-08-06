@@ -177,12 +177,14 @@ class CodexSidecarTest(unittest.TestCase):
 
 
 class AllObservationsTest(unittest.TestCase):
-    def test_concatenates_the_three_scanners(self):
+    def test_concatenates_every_scanner(self):
         with mock.patch.object(harnesses, "claude_observations", return_value=[{"harness": "claude"}]), \
              mock.patch.object(harnesses, "codex_observations", return_value=[{"harness": "codex"}]), \
-             mock.patch.object(harnesses, "opencode_observations", return_value=[{"harness": "opencode"}]):
+             mock.patch.object(harnesses, "opencode_observations", return_value=[{"harness": "opencode"}]), \
+             mock.patch.object(harnesses, "pi_observations", return_value=[{"harness": "pi"}]):
             out = harnesses.all_observations()
-        self.assertEqual({o["harness"] for o in out}, {"claude", "codex", "opencode"})
+        self.assertEqual({o["harness"] for o in out},
+                         {"claude", "codex", "opencode", "pi"})
 
 
 if __name__ == "__main__":

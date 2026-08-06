@@ -171,6 +171,8 @@ def _lineage_record(rows_seen):
                                  os.O_WRONLY | os.O_CREAT, 0o600), "w")
         fcntl.flock(lock, fcntl.LOCK_EX)
     except OSError:
+        if lock:
+            lock.close()
         lock = None          # unlocked fallback — no worse than the old race
     try:
         fams = _lineage_load()
