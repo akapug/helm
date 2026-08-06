@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """configs — the config-management model (decomposed package; public API preserved).
-helm-native (see ATTRIBUTION.md for lineage)
-dissolve-into-helm law.
+helm-native
+dissolve-into-helm law. Design record: the predecessor repo's CONFIGS_DESIGN.md.
 
 One place to SEE and safely EDIT every local claude/codex config — MCPs, hooks,
 skills, rules, memory (CLAUDE.md/AGENTS.md), settings — across all homes and cwds,
@@ -30,8 +30,18 @@ from ._common import (
     physics,
 )
 # module-level constants (mutable roots the callers/tests rebind)
+# HOME_ROOT_HARNESS travels WITH HOME_ROOTS: a fixture that rebinds the
+# authorization list and expects a provider must rebind the provenance table
+# too, and the monkeypatch fanout below carries both into _common where
+# harness_for reads them.
 from ._common import (
-    HOME, BACKUP_DIR, CWD_ROOTS, HOME_ROOTS, MANAGED_DIRS,
+    HOME, BACKUP_DIR, CWD_ROOTS, HOME_ROOTS, HOME_ROOT_HARNESS, MANAGED_DIRS,
+    HARNESSES, harness_for,
+    # _HELM_HOME is a ROOT like the rest and belongs here for the same reason:
+    # the fanout below rebinds package attributes into the cluster modules, so
+    # a name only bound in _common could be SET through the package but not
+    # READ back — a fixture cannot save-and-restore what it cannot getattr.
+    _HELM_HOME,
     _MAX_CONFIG_BYTES, _RENAME_EXCHANGE,
 )
 # classify cluster
@@ -45,7 +55,7 @@ from ._resolve import (
 )
 # read / edit / backups cluster
 from ._io import (
-    read_file, write_file, entry_op, list_backups, restore,
+    read_file, write_file, transform_json_file, entry_op, list_backups, restore,
     _validate, _renameat2,
 )
 # cli cluster

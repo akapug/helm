@@ -23,14 +23,24 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _TMP = tempfile.mkdtemp(prefix="helm-test-configs-")
-_ROOT = os.path.join(_TMP, "dev")
+_ENV_KEYS = ("HELM_CONFIG_ROOTS", "HELM_HOME")
+_ENV_PRIOR = {k: os.environ.get(k) for k in _ENV_KEYS}
+# PLANT INTO THE ROOT THE FREEZE ALREADY USED. helm/configs/_common.py computes
+# CWD_ROOTS at IMPORT time, so by the time this module runs the roots may already
+# be frozen — they are, whenever any earlier test module reached helm.configs
+# first. Making our own root and assigning the env below then plants fixtures
+# somewhere the frozen CWD_ROOTS does not look, which is exactly why
+# `pytest tests/test_envtidy.py tests/test_configs.py` failed three tests while
+# this module passed alone. tests/conftest.py guarantees HELM_CONFIG_ROOTS is a
+# tmp path before ANY import, so honouring it here is both correct and safe.
+_ROOT = os.environ.get("HELM_CONFIG_ROOTS") or os.path.join(_TMP, "dev")
 _PROJ = os.path.join(_ROOT, "proj")
 _HOMEDIR = os.path.join(_TMP, "claude-home")     # a synthetic cred home
 _SKILLS = os.path.join(_TMP, "skills")           # a synthetic skill home
-os.makedirs(_PROJ)
+os.makedirs(_PROJ, exist_ok=True)
 os.makedirs(_HOMEDIR)
 os.makedirs(_SKILLS)
-os.environ["HELM_CONFIG_ROOTS"] = _ROOT
+os.environ["HELM_CONFIG_ROOTS"] = _ROOT   # a no-op when conftest set it
 os.environ.setdefault("HELM_HOME", os.path.join(_TMP, "helm-home"))
 
 with open(os.path.join(_PROJ, ".mcp.json"), "w") as f:
@@ -41,6 +51,14 @@ with open(os.path.join(_HOMEDIR, "settings.json"), "w") as f:
     json.dump({"model": "opus"}, f)
 
 from helm import configs, skills, web  # noqa: E402
+
+_CWD_ROOTS_PRIOR = list(configs.CWD_ROOTS)
+_HOME_ROOTS_PRIOR = list(configs.HOME_ROOTS)
+
+# unittest discovery can import helm.configs while walking the helm package,
+# before it imports this test module. Mutate the shared frozen list in place so
+# every configs submodule sees the planted root under either test runner.
+configs.CWD_ROOTS[:] = [_ROOT]
 
 # the synthetic cred home must be on the resolve allowlist (resolve refuses
 # homes outside HOME_ROOTS — the audit's arbitrary-directory read gate)
@@ -85,6 +103,33 @@ class ConfigsModelTest(unittest.TestCase):
         self.assertIn(os.path.join(os.path.abspath(_PROJ), "CLAUDE.md"),
                       r["memory"]["projectClaudeMdChain"])
         self.assertIn("user", [l["layer"] for l in r["settingsLayers"]])
+
+    def test_pi_cascade_resolves(self):
+        pi_home = os.path.join(_TMP, "pi-home")
+        os.makedirs(pi_home, exist_ok=True)
+        with open(os.path.join(pi_home, "settings.json"), "w") as f:
+            json.dump({"defaultModel": "gemini-3.6-flash-high", "defaultProjectTrust": "always"}, f)
+        pi_proj_dir = os.path.join(_ROOT, "pi_proj")
+        pi_proj = os.path.join(pi_proj_dir, ".pi")
+        os.makedirs(pi_proj, exist_ok=True)
+        with open(os.path.join(pi_proj, "settings.json"), "w") as f:
+            json.dump({"defaultModel": "claude-sonnet-5"}, f)
+        configs.HOME_ROOTS.append(pi_home)
+        self.addCleanup(configs.HOME_ROOTS.remove, pi_home)
+
+        r = configs.resolve(pi_home, pi_proj_dir, "pi")
+        self.assertEqual(r["harness"], "pi")
+        self.assertEqual(r["settingsHighlights"]["defaultModel"], "claude-sonnet-5")
+        self.assertEqual(r["settingsHighlights"]["defaultProjectTrust"], "always")
+
+        # CLI --harness pi wiring test
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                configs.cmd_configs(["cascade", pi_proj_dir, "--harness", "pi", "--home", pi_home]), 0)
+        cas = json.loads(out.getvalue())
+        self.assertEqual(cas["harness"], "pi")
+        self.assertEqual(cas["settingsHighlights"]["defaultModel"], "claude-sonnet-5")
 
     def test_read_refuses_unrecognized(self):
         r = configs.read_file("/etc/passwd")
@@ -181,7 +226,6 @@ class ConfigsWebTest(unittest.TestCase):
         cls.thread.join(timeout=5)
         skills._skill_homes = cls._orig_homes
         web.TRASH_DIR = cls._orig_trash
-        shutil.rmtree(_TMP, ignore_errors=True)
 
     def get(self, path):
         url = "http://127.0.0.1:%d%s" % (self.port, path)
@@ -225,6 +269,20 @@ class ConfigsWebTest(unittest.TestCase):
         status, d = self.get("/api/configs/cascade?harness=bogus")
         self.assertEqual(status, 400)
         self.assertIn("error", d)
+
+    def test_api_configs_cascade_pi(self):
+        pi_home = os.path.join(_TMP, "pi-home-api")
+        os.makedirs(pi_home, exist_ok=True)
+        with open(os.path.join(pi_home, "settings.json"), "w") as f:
+            json.dump({"defaultModel": "gemini-3.6-flash-high"}, f)
+        configs.HOME_ROOTS.append(pi_home)
+        self.addCleanup(configs.HOME_ROOTS.remove, pi_home)
+
+        q = urllib.parse.urlencode({"cwd": _PROJ, "home": pi_home, "harness": "pi"})
+        status, d = self.get("/api/configs/cascade?" + q)
+        self.assertEqual(status, 200)
+        self.assertEqual(d["harness"], "pi")
+        self.assertEqual(d["settingsHighlights"]["defaultModel"], "gemini-3.6-flash-high")
 
     def test_api_cascade_refuses_unlisted_home(self):
         outside = os.path.join(_TMP, "not-a-home-web")
@@ -372,6 +430,17 @@ class HomeSubdirConfigTest(unittest.TestCase):
         self.assertEqual(configs._ext_type("/x/rules/default.rules"), "text")
         ok, err = configs._validate("text", "anything at all\n")
         self.assertTrue(ok, err)
+
+
+def tearDownModule():
+    configs.CWD_ROOTS[:] = _CWD_ROOTS_PRIOR
+    configs.HOME_ROOTS[:] = _HOME_ROOTS_PRIOR
+    for k, v in _ENV_PRIOR.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    shutil.rmtree(_TMP, ignore_errors=True)
 
 
 if __name__ == "__main__":

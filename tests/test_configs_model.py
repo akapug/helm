@@ -29,9 +29,17 @@ class ConfigsModelInternalsTest(unittest.TestCase):
         os.makedirs(self.home)
         os.makedirs(self.codexhome)
         self._orig = {k: getattr(configs, k) for k in
-                      ("CWD_ROOTS", "HOME_ROOTS", "BACKUP_DIR", "MANAGED_DIRS")}
+                      ("CWD_ROOTS", "HOME_ROOTS", "HOME_ROOT_HARNESS",
+                       "BACKUP_DIR", "MANAGED_DIRS")}
         configs.CWD_ROOTS = [self.cwdroot]
         configs.HOME_ROOTS = [self.home, self.codexhome]
+        # harness_for is a lookup, so a synthetic root DECLARES its harness.
+        # These two used to get their answer from the directory names
+        # `claude-home` / `codex-home` — i.e. from the name-guessing heuristic
+        # that has since been removed. The dirs keep their readable names; the
+        # fact now comes from the fixture, the only place that actually knows it.
+        configs.HOME_ROOT_HARNESS = {os.path.realpath(self.home): "claude",
+                                     os.path.realpath(self.codexhome): "codex"}
         configs.BACKUP_DIR = j("backups")
         configs.MANAGED_DIRS = (j("managed"),)
 
@@ -141,6 +149,138 @@ class ConfigsModelInternalsTest(unittest.TestCase):
         self.assertIn("invalid TOML", res["error"])
         with open(p) as f:
             self.assertEqual(f.read(), 'model = "a"\n')
+
+    # -- bounded JSON transform CAS -----------------------------------------
+    def _owned_transform(self, data):
+        data["helmOwned"] = True
+        return data, {"owned": True}
+
+    def _owned_verify(self, candidate, before, metadata):
+        expected = dict(before, helmOwned=True)
+        return metadata == {"owned": True} and candidate == expected
+
+    def test_transform_passes_exact_read_revision_and_retries_two_conflicts(self):
+        p = self._write(os.path.join(self.home, "settings.json"), '{"foreign0": 0}\n')
+        real = configs.write_file
+        seen = []
+
+        def race(path, content, expected_revision=None):
+            current = configs.read_file(path)
+            seen.append((expected_revision, current["revision"]))
+            if len(seen) < 3:
+                data = json.loads(current["content"])
+                data["foreign%d" % len(seen)] = len(seen)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                return {"error": "conflict", "code": "conflict"}
+            return real(path, content, expected_revision=expected_revision)
+
+        with mock.patch.object(configs, "write_file", side_effect=race):
+            out = configs.transform_json_file(
+                p, self._owned_transform, verify=self._owned_verify)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["attempts"], 3)
+        self.assertTrue(all(expected == actual for expected, actual in seen))
+        with open(p, encoding="utf-8") as f:
+            got = json.load(f)
+        self.assertEqual(got, {"foreign0": 0, "foreign1": 1,
+                               "foreign2": 2, "helmOwned": True})
+
+    def test_transform_stops_at_three_conflicts_and_keeps_latest_foreign_bytes(self):
+        p = self._write(os.path.join(self.home, "settings.json"), '{}\n')
+        calls = []
+
+        def always_race(path, _content, expected_revision=None):
+            current = configs.read_file(path)
+            calls.append(expected_revision)
+            data = json.loads(current["content"])
+            data["foreign%d" % len(calls)] = len(calls)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, sort_keys=True)
+            return {"error": "conflict", "code": "conflict"}
+
+        with mock.patch.object(configs, "write_file", side_effect=always_race):
+            out = configs.transform_json_file(
+                p, self._owned_transform, verify=self._owned_verify)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["code"], "conflict")
+        self.assertEqual(out["attempts"], 3)
+        self.assertEqual(len(calls), 3)
+        with open(p, encoding="utf-8") as f:
+            got = json.load(f)
+        self.assertEqual(got, {"foreign1": 1, "foreign2": 2, "foreign3": 3})
+        self.assertNotIn("helmOwned", got)
+
+    def test_transform_missing_file_create_race_rederives_from_foreign_file(self):
+        p = os.path.join(self.home, "settings.json")
+        real = configs.write_file
+        calls = []
+
+        def create_race(path, content, expected_revision=None):
+            calls.append(expected_revision)
+            if len(calls) == 1:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump({"foreign": "created"}, f)
+                return {"error": "conflict", "code": "conflict"}
+            return real(path, content, expected_revision=expected_revision)
+
+        with mock.patch.object(configs, "write_file", side_effect=create_race):
+            out = configs.transform_json_file(
+                p, self._owned_transform, verify=self._owned_verify)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["attempts"], 2)
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"foreign": "created", "helmOwned": True})
+
+    def test_transform_preserves_post_commit_foreign_write_and_retries(self):
+        p = self._write(os.path.join(self.home, "settings.json"), '{"base": 1}\n')
+        real = configs.write_file
+        wrote = []
+
+        def foreign_after(path, content, expected_revision=None):
+            out = real(path, content, expected_revision=expected_revision)
+            if out.get("ok") and not wrote:
+                wrote.append(1)
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                data["foreignAfter"] = True
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+            return out
+
+        with mock.patch.object(configs, "write_file", side_effect=foreign_after):
+            out = configs.transform_json_file(
+                p, self._owned_transform, verify=self._owned_verify)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["attempts"], 2)
+        self.assertTrue(out["wrote"])
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f),
+                             {"base": 1, "helmOwned": True, "foreignAfter": True})
+
+    def test_transform_non_conflict_failure_is_not_retried(self):
+        p = self._write(os.path.join(self.home, "settings.json"), '{"base": 1}\n')
+        failure = {"error": "disk full", "code": "stage"}
+        with mock.patch.object(configs, "write_file", return_value=failure) as write:
+            out = configs.transform_json_file(
+                p, self._owned_transform, verify=self._owned_verify)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["attempts"], 1)
+        self.assertEqual(write.call_count, 1)
+        with open(p, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"base": 1})
+
+    def test_transform_semantic_noop_preserves_exact_formatting(self):
+        raw = '{\n    "helmOwned" : true\n}\n'
+        p = self._write(os.path.join(self.home, "settings.json"), raw)
+        with mock.patch.object(configs, "write_file") as write:
+            out = configs.transform_json_file(
+                p, self._owned_transform, verify=self._owned_verify)
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["wrote"])
+        self.assertEqual(out["before"], raw)
+        self.assertEqual(out["after"], raw)
+        self.assertFalse(write.called)
 
     # -- backups: list_backups reads sidecars, restore re-validates ---------
     def test_list_backups_shape_and_orig_from_sidecar(self):

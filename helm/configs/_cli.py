@@ -20,10 +20,12 @@ def _print_files(files, indent="    "):
 
 
 def cmd_configs(args):
-    """configs [list|show <path>|cascade <cwd> [--harness claude|codex] [--home DIR]]
-    — read-only surface over the config model. list = every discovered config file
-    grouped by scope; show = one recognized file's content; cascade = what a seat
-    at <cwd> loads (via physics)."""
+    """configs [list|show <path>|cascade <cwd> [--harness claude|codex|pi]
+    [--home DIR]|edit <path>|backups|restore <backup>] — the config-estate
+    surface. list = every discovered config file grouped by scope; show = one
+    recognized file's content; cascade = what a seat at <cwd> loads (via
+    physics). edit is the one write: new content on stdin, backup -> validate
+    -> atomic; backups lists the snapshots that makes, restore returns one."""
     import sys
     args = list(args or [])
     verb = args.pop(0) if args else "list"
@@ -34,7 +36,9 @@ def cmd_configs(args):
         if not homes:
             print("  (none)")
         for h in homes:
-            print("  %s  [%s]" % (h["path"], h["provider"]))
+            # provider is None for a root helm cannot place — say so, rather
+            # than rendering the word "None" as if it were a harness name.
+            print("  %s  [%s]" % (h["path"], h["provider"] or "unknown"))
             _print_files(h["files"])
         t = tree()
         print("project scope (roots: %s):" % ", ".join(t["config_roots"]))
@@ -73,14 +77,15 @@ def cmd_configs(args):
             elif not a.startswith("-") and cwd is None:
                 cwd = a
             else:
-                print("usage: helm configs cascade <cwd> [--harness claude|codex] "
+                print("usage: helm configs cascade <cwd> [--harness claude|codex|pi] "
                       "[--home DIR]", file=sys.stderr)
                 return 2
-        if not cwd or harness not in ("claude", "codex"):
-            print("usage: helm configs cascade <cwd> [--harness claude|codex] "
+        if not cwd or harness not in ("claude", "codex", "pi"):
+            print("usage: helm configs cascade <cwd> [--harness claude|codex|pi] "
                   "[--home DIR]", file=sys.stderr)
             return 2
-        home_p = home_p or os.path.join(HOME, ".codex" if harness == "codex" else ".claude")
+        default_home = os.path.join(HOME, ".pi/agent" if harness == "pi" else ".codex" if harness == "codex" else ".claude")
+        home_p = home_p or default_home
         res = resolve(home_p, cwd, harness)
         if res.get("error"):
             print("helm configs cascade: %s" % res["error"], file=sys.stderr)

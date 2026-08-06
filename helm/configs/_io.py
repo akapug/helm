@@ -426,6 +426,128 @@ def write_file(path, content, expected_revision=None):
     return _write_file_impl(path, content, expected_revision=expected_revision)
 
 
+def _transform_error(code, message, attempts, before="", after="", metadata=None):
+    return {"ok": False, "code": code, "error": message, "action": "fail",
+            "attempts": attempts, "before": before, "after": after,
+            "metadata": metadata or {}, "revision": None, "backup": None}
+
+
+def _verify_transform(verify, candidate, before, metadata):
+    if verify is None:
+        return True, None
+    try:
+        verdict = verify(candidate, before, metadata)
+    except (TypeError, ValueError) as exc:
+        return False, str(exc)
+    if isinstance(verdict, tuple):
+        ok, reason = verdict
+        return bool(ok), reason
+    return bool(verdict), None if verdict else "candidate verification failed"
+
+
+def transform_json_file(path, transform, verify=None, max_attempts=3, dry_run=False):
+    """Bounded exact-revision transform for a JSON-object config file.
+
+    Every retry re-reads and re-runs the domain merge. A post-commit foreign
+    write is preserved and becomes the next attempt's input; no backup is ever
+    restored over a revision Helm did not read. Semantic no-ops preserve the
+    file's exact formatting.
+    """
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) \
+            or max_attempts < 1:
+        return _transform_error("attempts", "max_attempts must be a positive integer", 0)
+    last = _transform_error("conflict", "config file changed concurrently", 0)
+    initial_metadata = None
+    committed_once, last_backup = False, None
+    for attempt in range(1, max_attempts + 1):
+        got = read_file(path)
+        if got.get("error"):
+            return _transform_error(got.get("code") or "read", got["error"], attempt)
+        raw = got["content"]
+        try:
+            before = json.loads(raw) if got["exists"] else {}
+        except ValueError as exc:
+            return _transform_error(
+                "validation", "cannot parse config JSON: %s — refusing to touch it" % exc,
+                attempt, before=raw)
+        if not isinstance(before, dict):
+            return _transform_error("shape", "config root is not a JSON object",
+                                    attempt, before=raw)
+        source = json.loads(json.dumps(before))
+        try:
+            made = transform(source)
+        except (TypeError, ValueError) as exc:
+            return _transform_error("transform", str(exc), attempt, before=raw)
+        if isinstance(made, tuple) and len(made) == 2:
+            candidate, metadata = made
+        else:
+            candidate, metadata = made, {}
+        if initial_metadata is None:
+            initial_metadata = metadata
+        if not isinstance(candidate, dict):
+            return _transform_error("shape", "JSON transform did not return an object",
+                                    attempt, before=raw, metadata=metadata)
+        after = json.dumps(candidate, indent=2) + "\n"
+        ok, reason = _verify_transform(verify, candidate, before, metadata)
+        if not ok:
+            return _transform_error("verification", reason or "candidate verification failed",
+                                    attempt, before=raw, after=after, metadata=metadata)
+        if candidate == before:
+            return {"ok": True,
+                    "action": "updated" if committed_once else "ok",
+                    "attempts": attempt, "before": raw, "after": raw,
+                    "metadata": metadata, "initial_metadata": initial_metadata,
+                    "revision": got["revision"], "backup": last_backup,
+                    "path": got["path"], "wrote": committed_once}
+        if dry_run:
+            return {"ok": True, "action": "dry", "attempts": attempt,
+                    "before": raw, "after": after, "metadata": metadata,
+                    "initial_metadata": initial_metadata,
+                    "revision": got["revision"], "backup": None,
+                    "path": got["path"], "wrote": False}
+        saved = write_file(path, after, expected_revision=got["revision"])
+        if saved.get("error"):
+            if saved.get("code") != "conflict":
+                return _transform_error(saved.get("code") or "write", saved["error"],
+                                        attempt, before=raw, after=after,
+                                        metadata=metadata)
+            last = _transform_error("conflict", saved["error"], attempt,
+                                    before=raw, after=after, metadata=metadata)
+            continue
+        committed_once = True
+        last_backup = saved.get("backup") or last_backup
+        committed = read_file(path)
+        if committed.get("error"):
+            return _transform_error(committed.get("code") or "read", committed["error"],
+                                    attempt, before=raw, after=after, metadata=metadata)
+        if committed["revision"] != saved.get("revision"):
+            last = _transform_error(
+                "conflict", "config file changed after Helm committed; newer revision preserved",
+                attempt, before=committed.get("content", ""), after=after,
+                metadata=metadata)
+            continue
+        try:
+            exact = json.loads(committed["content"])
+        except ValueError as exc:
+            return _transform_error("verification", "committed JSON is unreadable: %s" % exc,
+                                    attempt, before=raw, after=committed["content"],
+                                    metadata=metadata)
+        exact_ok, exact_reason = _verify_transform(verify, exact, before, metadata)
+        if exact != candidate or not exact_ok:
+            return _transform_error(
+                "verification", exact_reason or "exact committed revision failed verification",
+                attempt, before=raw, after=committed["content"], metadata=metadata)
+        return {"ok": True, "action": "created" if not got["exists"] else "updated",
+                "attempts": attempt, "before": raw, "after": committed["content"],
+                "metadata": metadata, "initial_metadata": initial_metadata,
+                "revision": saved["revision"],
+                "backup": saved.get("backup"), "path": saved.get("path"),
+                "wrote": True}
+    last["error"] = ("config file changed during all %d attempts; refusing to overwrite "
+                     "or restore a foreign revision" % max_attempts)
+    return last
+
+
 # ── structured entry ops (safer than raw-file editing for common toggles) ─────
 
 def entry_op(action, path, kind, name, value=None):

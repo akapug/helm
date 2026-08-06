@@ -2,7 +2,7 @@ import os
 import hashlib
 
 from ._common import (
-    physics, HOME, CWD_ROOTS, HOME_ROOTS,
+    physics, HOME, CWD_ROOTS, HOME_ROOTS, harness_for,
     _SKIP_DIRS, _PROJECT_FILES, _HOME_FILES, _HOME_SUBDIRS,
 )
 from ._classify import (
@@ -175,9 +175,10 @@ def homes_configs():
             sib = os.path.join(os.path.dirname(h), ".claude.json")
             add("../.claude.json", sib, "json", "claude", "state")
         if files:
+            provider = harness_for(h)
             out.append({"id": hashlib.sha256(os.fsencode(h)).hexdigest()[:16],
                         "home": os.path.basename(h), "path": h,
-                        "provider": "codex" if "codex" in h else "claude",
+                        "provider": provider,
                         "precedence": precedence, "files": files})
     return out
 
@@ -233,7 +234,8 @@ def _allowed_home(path):
     if any(rp == _real(h) for h in HOME_ROOTS):
         return True
     return os.path.dirname(rp) in (_real(f"{HOME}/.claude-homes"),
-                                   _real(f"{HOME}/.codex-homes"))
+                                   _real(f"{HOME}/.codex-homes"),
+                                   _real(f"{HOME}/.pi-homes"))
 
 
 def resolve(home_path, cwd, harness):
