@@ -8,3 +8,12 @@ __pycache__/
 *.png
 .env
 .env.*
+
+# never-track estates (see helm/nevertrack.py for each reason) — the ignore
+# entry is the braces beside the index-pin belt: a careless `git add -A`
+# cannot re-add them
+agents/claudecode/skills/i-have-audhd/
+agents/claudecode/skills/fleet-usage/
+agents/claudecode/skills/vendor-as-public/
+agents/claudecode/skills/x/
+evals/

@@ -16,9 +16,10 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-envtidy-home-"))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-envtidy-home-", var="HELM_HOME")
 
-from helm import envtidy, hooks as hooks_mod, skillsync, work  # noqa: E402
+from helm import configs, envtidy, hooks as hooks_mod, skillsync, work  # noqa: E402
 
 
 def _cmd(tup):
@@ -55,6 +56,16 @@ class EstateBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-envtidy-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # The scratch reaper (scratch.auto_gc) DELETES dead-session scratch under
+        # the REAL /tmp/claude-* harness estate, and test_scratch.py's tripwire
+        # pins this setting for any module that touches the Stop hook. This
+        # module reconciles hook estates including the Stop guard, so it is off
+        # here — matching tests/test_seats.py SeatsBase.
+        _prior = os.environ.get("HELM_SCRATCH_GC")
+        os.environ["HELM_SCRATCH_GC"] = "0"
+        self.addCleanup(lambda: os.environ.__setitem__("HELM_SCRATCH_GC", _prior)
+                        if _prior is not None
+                        else os.environ.pop("HELM_SCRATCH_GC", None))
         j = os.path.join
         self.backup = j(self.tmp, "premerge-backup")
         self.croot = j(self.tmp, "claude-homes")
@@ -95,6 +106,11 @@ class EstateBase(unittest.TestCase):
         self.dirs = skillsync.config_dirs(
             claude_root=self.croot, default_claude=self.default,
             seats_root=self.seats)
+        prior_roots, prior_backups = configs.HOME_ROOTS, configs.BACKUP_DIR
+        configs.HOME_ROOTS = [cdir for _label, cdir in self.dirs]
+        configs.BACKUP_DIR = os.path.join(self.backup, "configs-cas")
+        self.addCleanup(setattr, configs, "HOME_ROOTS", prior_roots)
+        self.addCleanup(setattr, configs, "BACKUP_DIR", prior_backups)
 
     def _bytes(self, cdir):
         with open(os.path.join(cdir, "settings.json"), "rb") as f:
@@ -127,6 +143,25 @@ class EstateBase(unittest.TestCase):
         self.assertFalse(os.path.exists(self.backup))       # dry: no backup dir
         self.assertTrue(any(p["label"] == "partial-com" for p in r["changed"]))
 
+    def test_hooks_apply_rederives_stale_plan_and_preserves_new_foreign_hook(self):
+        plan = envtidy.plan_hooks_home("partial-com", self.partial)
+        with open(os.path.join(self.partial, "settings.json"), encoding="utf-8") as f:
+            changed = json.load(f)
+        changed.setdefault("hooks", {}).setdefault("Stop", []).append(
+            {"hooks": [{"type": "command", "command": "external-after-plan"}]})
+        changed["externalKey"] = {"revision": 2}
+        with open(os.path.join(self.partial, "settings.json"), "w", encoding="utf-8") as f:
+            json.dump(changed, f, indent=2)
+        verdict, detail = envtidy.apply_hooks_home(plan, self.backup)
+        self.assertEqual(verdict, "applied", detail)
+        with open(os.path.join(self.partial, "settings.json"), encoding="utf-8") as f:
+            got = json.load(f)
+        cmds = [c for _e, _m, c in envtidy._all_hooks(got)]
+        self.assertIn("external-after-plan", cmds)
+        self.assertEqual(got["externalKey"], {"revision": 2})
+        for tup in envtidy.CANONICAL_HOOKS:
+            self.assertIn(_cmd(tup), cmds)
+
     def test_hooks_apply_adds_missing_and_preserves_strays(self):
         r = envtidy.hooks_sync(dirs=self.dirs, backup_root=self.backup, apply=True)
         self.assertEqual([p["label"] for p in r["failed"]], ["broken-com"])
@@ -140,24 +175,17 @@ class EstateBase(unittest.TestCase):
         # the broken home was NEVER written (fail-closed)
         with open(os.path.join(self.broken, "settings.json")) as f:
             self.assertEqual(f.read(), "{ this is not json ]")
-        # backup-integrity: the partial home's pre-image is on the shelf
-        shelf = os.path.join(self.backup, "partial-com")
-        self.assertTrue(os.path.isdir(shelf) and os.listdir(shelf))
+        # backup-integrity: the CAS writer captured the exact displaced file.
+        self.assertTrue(any(b["orig"] == os.path.realpath(
+            os.path.join(self.partial, "settings.json")) for b in configs.list_backups()))
 
-    def test_hooks_mid_write_failure_restores_original_or_absence(self):
-        """A writer can fail after changing bytes. Both kinds of pre-image —
-        an existing file and no file — must be restored exactly."""
+    def test_hooks_non_conflict_write_failure_preserves_original_or_absence(self):  # noqa: VACUOUS_ASSERTION — existing-file control precedes missing-file absence arm
+        """The atomic config writer owns rollback; the domain layer never restores."""
         partial_path = os.path.join(self.partial, "settings.json")
         with open(partial_path, "rb") as f:
             original = f.read()
-
-        def mutate_then_fail(path, _text):
-            with open(path, "w") as f:
-                f.write('{"failed-after-mutation": true}\n')
-            raise OSError("injected after mutation")
-
-        with mock.patch.object(envtidy.pk, "atomic_write",
-                               side_effect=mutate_then_fail):
+        failure = {"error": "injected stage failure", "code": "stage"}
+        with mock.patch.object(configs, "write_file", return_value=failure):
             verdict, _detail = envtidy.apply_hooks_home(
                 envtidy.plan_hooks_home("partial-com", self.partial), self.backup)
         self.assertEqual(verdict, "FAIL")
@@ -166,8 +194,7 @@ class EstateBase(unittest.TestCase):
 
         bare_path = os.path.join(self.croot, "bare-com", "settings.json")
         self.assertFalse(os.path.exists(bare_path))
-        with mock.patch.object(envtidy.pk, "atomic_write",
-                               side_effect=mutate_then_fail):
+        with mock.patch.object(configs, "write_file", return_value=failure):
             verdict, _detail = envtidy.apply_hooks_home(
                 envtidy.plan_hooks_home("bare-com", os.path.dirname(bare_path)),
                 self.backup)
@@ -180,6 +207,61 @@ class EstateBase(unittest.TestCase):
         # only the broken home remains (unfixable); every other home is steady
         self.assertEqual([p["label"] for p in r["changed"]], [])
         self.assertEqual([p["label"] for p in r["failed"]], ["broken-com"])
+
+    def test_spec_inherits_the_gate_flag_so_sync_cannot_disarm_the_stop_guard(self):
+        """A canonical tuple carries four fields; a real spec carries more, and
+        one of them is `gate` — what makes the stop guard's exit-2 refusal reach
+        the harness. `_spec` used to REBUILD from the tuple and drop it, so sync
+        computed the fail-open `|| true` as canonical and `--apply` re-disarmed
+        the gate in every home where it had just been fixed (measured live:
+        10 of 12 homes reported as drifted from a CORRECT estate).
+
+        Asserted against hooks.SPECS rather than against `_spec`'s own output.
+        The pre-existing `_cmd` helper is spec_command(_spec(tup)), so every
+        other test in this file derived its expected command from the very
+        builder that was broken and stayed green — a self-consistent oracle
+        cannot see this class, only an independent source can."""
+        canon = {(sp["event"], sp["args"]): sp for sp in hooks_mod.SPECS}
+        gated = [k for k, sp in canon.items() if sp.get("gate")]
+        self.assertTrue(gated, "hooks.SPECS declares no gated spec — this test "
+                               "would be vacuous; a gate was removed upstream")
+        for tup in envtidy.CANONICAL_HOOKS:
+            key = (tup[0], tup[2])
+            if key not in canon:
+                continue                      # tuple-only (record, or override)
+            spec = envtidy._spec(tup)
+            for field, want in canon[key].items():
+                if field in ("timeout", "matcher"):
+                    continue                  # the tuple owns cadence/placement
+                self.assertEqual(spec.get(field), want,
+                                 "_spec dropped %r for %s" % (field, key))
+            cmd = hooks_mod.spec_command(spec)
+            if canon[key].get("gate"):
+                self.assertIn("exit 2", cmd,
+                              "gated spec lost its refusal: %s" % (key,))
+                self.assertNotIn("|| true", cmd,
+                                 "sync would REWRITE the gate's refusal to "
+                                 "success for %s" % (key,))
+
+    def test_helm_args_discards_the_gate_tail_not_just_or_true(self):
+        """A hook's identity is the helm subcommand it runs; how its exit code is
+        handled afterwards is mechanism. `_helm_args` stripped `|| true` only, so
+        a GATED command (`...; rc=$?; [ "$rc" = 2 ] && exit 2; exit 0`) carried
+        its whole shell tail into the identity and the census reported the
+        stop-guard hook MISSING from every home where the gate was correctly
+        installed — a third surface misreporting the same fix."""
+        bin_ = os.path.join(self.tmp, "bin", "helm")   # never a real home path
+        want = "chat stop-guard --hook-json"
+        gated = 'timeout 5 %s %s; rc=$?; [ "$rc" = 2 ] && exit 2; exit 0' % (bin_, want)
+        self.assertEqual(envtidy._helm_args(gated), want)
+        # the fail-open form must keep parsing identically — same identity
+        self.assertEqual(envtidy._helm_args("timeout 5 %s %s || true" % (bin_, want)), want)
+        # and a real gated spec, built by the shipped builder, round-trips
+        for tup in envtidy.CANONICAL_HOOKS:
+            self.assertEqual(envtidy._helm_args(_cmd(tup)), tup[2],
+                             "identity lost for %s" % (tup,))
+        # non-helm commands are still not helm
+        self.assertIsNone(envtidy._helm_args("/usr/local/bin/repo-hygiene --quick"))
 
     def test_hooks_env_override_replaces_canonical(self):
         ov = os.path.join(self.tmp, "canon.json")
@@ -357,6 +439,110 @@ class WorktreeGcTest(WorktreeBase):
     def _worktree_paths(self):
         return {w["path"] for w in envtidy._worktree_rows(self.root, "main")}
 
+    def test_registry_failure_is_UNAVAILABLE_not_empty_success(self):  # noqa: VACUOUS_ASSERTION — the explicit registry error and nonzero status prove the mocked failure path fired before the no-post assertion
+        from helm import chat, vcs
+        backend = vcs.backend(self.root)
+        with mock.patch.object(backend, "worktrees",
+                               return_value=([], "simulated registry failure")), \
+                mock.patch.object(chat, "post") as post, \
+                mock.patch.object(envtidy, "_print_worktree") as render:
+            rc = envtidy.cmd_worktree(["gc", "--apply", "--repo", self.root])
+        self.assertEqual(rc, 1)
+        report = render.call_args.args[0]
+        self.assertIn("registry unavailable", report["error"])
+        post.assert_not_called()
+
+    def test_linked_repo_target_uses_main_root_and_is_never_reaped(self):  # noqa: VACUOUS_ASSERTION — real Git additions prove both records exist before apply; the post-pass registry and explicit keep row are positive controls
+        from helm import work
+        driver = self.root + "-wt/driver"
+        peek = os.path.join(self.root + "-wt", "peeks", "deadbeef0000")
+        os.makedirs(os.path.dirname(driver), exist_ok=True)
+        os.makedirs(os.path.dirname(peek), exist_ok=True)
+        self.assertEqual(_sh(self.root, "git", "worktree", "add", "-q", "-b",
+                             "lane/driver", driver, "main").returncode, 0)
+        self.assertEqual(_sh(self.root, "git", "worktree", "add", "-q",
+                             "--detach", peek, "main").returncode, 0)
+        shutil.rmtree(peek)
+        alias = os.path.join(self.tmp, "driver-link")
+        os.symlink(driver, alias)
+
+        result = envtidy.worktree_gc(root=alias, apply=True)
+        self.assertEqual(result["root"], self.root)
+        registered = {w["path"] for w in work.worktrees(self.root)}
+        self.assertIn(driver, registered,
+                      "the linked checkout named by --repo was reaped")
+        self.assertIn(peek, registered,
+                      "canonical ownership was not applied to the peek record")
+        row = next(r for r in result["lane_rows"] if r["path"] == driver)
+        self.assertEqual(row["verdict"], "keep")
+        self.assertIn("TARGET named by --repo", row["why"])
+
+    def test_phantom_records_have_exactly_one_cleanup_owner(self):  # noqa: VACUOUS_ASSERTION — real Git records are positively classified and reported removed before the complementary registry-absence assertions
+        from helm import work
+        paths = {
+            "lane": self.root + "-wt/ghost-lane",
+            "harness": os.path.join(self.root, ".claude", "worktrees",
+                                    "agent-ghost"),
+            "estate": os.path.join(self.tmp, "estate-ghost"),
+            "peek": os.path.join(self.root + "-wt", "peeks", "peek-ghost"),
+        }
+        for path in paths.values():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            r = _sh(self.root, "git", "worktree", "add", "-q", "--detach",
+                    path, "main")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            shutil.rmtree(path)
+
+        self.assertEqual(set(work.phantom_records(self.root)),
+                         {paths["lane"], paths["harness"]})
+        self.assertEqual(work.estate_phantom_records(self.root),
+                         [paths["estate"]])
+        result = envtidy.worktree_gc(root=self.root, apply=True)
+        self.assertEqual(set(result["managed_phantom_removed"]),
+                         {paths["lane"], paths["harness"]})
+        self.assertEqual(result["estate_phantom_removed"], [paths["estate"]])
+        registered = {w["path"] for w in work.worktrees(self.root)}
+        self.assertIn(paths["peek"], registered,
+                      "peek records belong only to `helm work peek --drop`")
+        self.assertNotIn(paths["lane"], registered)
+        self.assertNotIn(paths["harness"], registered)
+        self.assertNotIn(paths["estate"], registered)
+        self.assertEqual(result["lane_rows"], [],
+                         "managed phantoms also entered ordinary room accounting")
+        from helm import chat
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(chat, "post"):
+            self.assertIsNone(envtidy._post_worktree_summary(result))
+        self.assertIn("removed=3 kept=0 triage=0", out.getvalue())
+
+    def test_harness_room_has_one_gc_owner(self):
+        """`.claude/worktrees/*` is delegated to lease-aware work.gc; the
+        estate sweep must not classify the same room a second time."""
+        from helm import work
+        path = os.path.join(self.root, ".claude", "worktrees", "agent-clean")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        r = _sh(self.root, "git", "worktree", "add", "-q", "-b",
+                "agent-clean", path, "main")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(path, {row["path"] for row in
+                                envtidy._worktree_rows(self.root, "main")})
+        lane = next(row for row in work.gc_scan(self.root) if row["path"] == path)
+        self.assertEqual(lane["verdict"], "remove")
+        result = envtidy.worktree_gc(root=self.root, apply=True)
+        self.assertNotIn(path, {row["path"] for row in result["worktree_rows"]})
+        self.assertFalse(os.path.exists(path))
+
+    def test_apply_cli_posts_one_owner_summary(self):
+        from helm import chat
+        self._seed()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(chat, "post") as post:
+            rc = envtidy.cmd_worktree(["gc", "--apply", "--repo", self.root])
+        self.assertEqual(rc, 0)
+        post.assert_called_once_with(
+            "worktree gc proj: removed=2 kept=4 triage=3")
+        self.assertIn("removed=2 kept=4 triage=3", out.getvalue())
+
     def test_dry_run_touches_nothing(self):
         self._seed()
         branches, wts = self._branches(), self._worktree_paths()
@@ -374,6 +560,17 @@ class WorktreeGcTest(WorktreeBase):
         b = self._branches()
         self.assertNotIn("worktree-merged", b)               # merged stub deleted
         self.assertIn("worktree-unmerged", b)                # unmerged stub kept
+
+    def test_apply_retires_merged_lane_stub_keeps_unlanded_lane(self):
+        self._branch_at_main("lane/merged-old")
+        self.assertEqual(_sh(self.root, "git", "checkout", "-q", "-b",
+                             "lane/unlanded-old").returncode, 0)
+        self._commit("lane.txt", "still needs integration")
+        self.assertEqual(_sh(self.root, "git", "checkout", "-q", "main").returncode, 0)
+        envtidy.worktree_gc(root=self.root, apply=True)
+        branches = self._branches()
+        self.assertNotIn("lane/merged-old", branches)
+        self.assertIn("lane/unlanded-old", branches)
 
     def test_apply_removes_merged_worktree_keeps_ahead(self):
         self._seed()
@@ -521,7 +718,13 @@ class CliSafetyTest(unittest.TestCase):
         run.assert_called_once_with(apply=False)
 
         worktrees = {"root": "/repo", "base": "main", "apply": False,
-                     "lane_rows": [], "lane_lines": {}, "worktree_rows": [],
+                     "lane_rows": [], "lane_lines": {},
+                     "managed_phantoms": [], "managed_phantom_removed": [],
+                     "managed_phantom_error": None,
+                     "managed_phantom_unknown": False,
+                     "estate_phantoms": [], "estate_phantom_removed": [],
+                     "estate_phantom_error": None,
+                     "estate_phantom_unknown": False, "worktree_rows": [],
                      "worktree_lines": {}, "orphans": [], "orphan_lines": {}}
         with mock.patch.object(envtidy, "worktree_gc", return_value=worktrees) as run, \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -540,6 +743,85 @@ class CliSafetyTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(envtidy.cmd_tidy([]), 0)
         run.assert_called_once_with(root=None, apply=False)
+
+    def test_UNKNOWN_phantom_result_posts_no_known_summary(self):  # noqa: VACUOUS_ASSERTION — UNKNOWN diagnostics, rc=1, and the exact one-failure report prove both suppressor paths fired before asserting no post
+        from helm import chat
+        report = {"root": "/repo", "base": "main", "apply": True,
+                  "lane_rows": [], "lane_lines": {},
+                  "managed_phantoms": ["/repo-wt/ghost"],
+                  "managed_phantom_removed": [],
+                  "managed_phantom_error": "removal is UNKNOWN",
+                  "managed_phantom_unknown": True,
+                  "estate_phantoms": [], "estate_phantom_removed": [],
+                  "estate_phantom_error": None,
+                  "estate_phantom_unknown": False, "worktree_rows": [],
+                  "worktree_lines": {}, "orphans": [], "orphan_lines": {}}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.object(chat, "post") as post:
+            error = envtidy._post_worktree_summary(report)
+        self.assertIn("UNKNOWN", error)
+        self.assertIn("summary not posted", err.getvalue())
+        post.assert_not_called()
+
+        hooks = {"changed": [], "failed": [], "steady": 0,
+                 "backup_root": "/backup"}
+        mcp = {"changed": [], "failed": [], "steady": 0,
+               "backup_root": "/backup"}
+        tidy_report = {
+            "apply": True, "backup_root": "/backup",
+            "census": {"homes": [], "hooks_variance": {
+                "missing_by_hook": {}, "strays_by_home": {}},
+                "mcp_variance": {"universal_effective": [],
+                                 "canonical_names": [],
+                                 "missing_by_home": {}},
+                "worktrees": {"note": "ok"}},
+            "hooks": hooks, "mcp": mcp, "worktree": report}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(envtidy, "tidy", return_value=tidy_report), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err), \
+                mock.patch.object(chat, "post") as post:
+            rc = envtidy.cmd_tidy(["--apply"])
+        self.assertEqual(rc, 1)
+        self.assertIn("1 FAILED", out.getvalue())
+        self.assertNotIn("2 FAILED", out.getvalue())
+        self.assertIn("summary not posted", err.getvalue())
+        post.assert_not_called()
+
+    def test_tidy_apply_propagates_phantom_failure(self):
+        hooks = {"changed": [], "failed": [], "steady": 0,
+                 "backup_root": "/backup"}
+        mcp = {"changed": [], "failed": [], "steady": 0,
+               "backup_root": "/backup"}
+        worktrees = {"root": "/repo", "base": "main", "apply": True,
+                     "lane_rows": [], "lane_lines": {},
+                     "managed_phantoms": ["/repo-wt/ghost"],
+                     "managed_phantom_removed": [],
+                     "managed_phantom_error": "simulated removal failure",
+                     "managed_phantom_unknown": False,
+                     "estate_phantoms": [], "estate_phantom_removed": [],
+                     "estate_phantom_error": None,
+                     "estate_phantom_unknown": False, "worktree_rows": [],
+                     "worktree_lines": {}, "orphans": [], "orphan_lines": {}}
+        report = {"apply": True, "backup_root": "/backup",
+                  "census": {"homes": [], "hooks_variance": {
+                      "missing_by_hook": {}, "strays_by_home": {}},
+                      "mcp_variance": {"universal_effective": [],
+                                       "canonical_names": [],
+                                       "missing_by_home": {}},
+                      "worktrees": {"note": "ok"}},
+                  "hooks": hooks, "mcp": mcp, "worktree": worktrees}
+        rendered = io.StringIO()
+        envtidy._print_worktree(worktrees, out=rendered)
+        self.assertIn("KEPT", rendered.getvalue())
+        out = io.StringIO()
+        with mock.patch.object(envtidy, "tidy", return_value=report), \
+                mock.patch.object(envtidy, "_post_worktree_summary",
+                                  return_value=None), \
+                contextlib.redirect_stdout(out):
+            rc = envtidy.cmd_tidy(["--apply"])
+        self.assertEqual(rc, 1)
+        self.assertIn("1 FAILED", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ skillsync.canonical(): HELM_HOOKS_CANONICAL, HELM_MCPS_CANONICAL.
 
 Worktree gc COMPOSES `helm work gc` for the lease-aware lane rooms (never
 re-implements its rescue logic) and adds the estate-wide sweep the lane gc
-does not cover: orphan `worktree-*` branch stubs and stray registered
+does not cover: orphan `worktree-*` / `lane/*` branch stubs and stray registered
 worktrees (wf_*, agent-*). RESCUE-DIRTY-FIRST (commit --no-verify onto the
 worktree's own branch before any removal), NEVER touch a LOCKED or OCCUPIED
 (any live process cwd) worktree, and NEVER remove work that is ahead of the
@@ -47,7 +47,9 @@ import time
 from . import home as _home
 from . import hooks as _hooks
 from . import pk
+from . import registry
 from . import skillsync
+from . import vcs
 
 BACKUP_ROOT = os.path.join(os.path.expanduser("~"), ".env-premerge-backup")
 
@@ -72,7 +74,10 @@ CANONICAL_HOOKS = (
 )
 
 # The seat subset: a launched codex/kimi/… seat receives fleet chat and cannot
-# idle past it, but never ground-injects, records tool outcomes, or writes
+# idle past a NEW row of it — bounded by the pending-fingerprint latch and by
+# the stop-active continuation that skips the rung entirely (the complete
+# escape set: tests/test_delivery_promise_escapes) — but never ground-injects,
+# records tool outcomes, or writes
 # handoffs (survey: the 4 seats deliberately carry only 3 of the 8). Derived by
 # arg-set so a HELM_HOOKS_CANONICAL override still yields the right lean subset.
 _LEAN_ARGS = frozenset((
@@ -116,28 +121,33 @@ def hooks_for(label):
 # ---------------------------------------------------------------------------
 # the canonical MCP set
 # ---------------------------------------------------------------------------
-# name -> server config (or None = report-only). The default set is EMPTY: a
-# public helm assumes no specific canonical MCP. When one IS expected on every
-# home, supply it via HELM_MCPS_CANONICAL (a JSON file {name: config|null}).
-# mcp sync then only ADDS a raw server when (a) the name is missing from the
-# home's EFFECTIVE set (not provided by any plugin or raw entry) AND (b) a
-# concrete config is in hand. For a name a plugin already provides, minting a
-# RAW mcpServers entry would create the exact duplicate-shadow the survey warns
-# about, so anything else is surfaced to the owner, never guessed (fail-closed).
-CANONICAL_MCPS = {}
+# name -> server config (or None = report-only). EMPTY by default: the public
+# tree names no host-specific MCPs. On a live host the canonical set is whatever
+# that deployment's agents already reach via ENABLED PLUGINS (survey
+# mcp_variance) — minting a RAW mcpServers entry for one would create the exact
+# duplicate-shadow the survey warns about. mcp sync therefore only ADDS a raw
+# server when (a) the name is missing from the home's EFFECTIVE set (not provided
+# by any plugin or raw entry) AND (b) a concrete config is in hand. The canonical
+# names are supplied HOST-LOCAL, never shipped (see canonical_mcps). Anything
+# else is surfaced to the owner, never guessed (fail-closed).
 
 
 def canonical_mcps():
-    """The canonical MCP names every home should reach (HELM_MCPS_CANONICAL, a
-    JSON file {name: config|null}, overrides). Mirrors skillsync.canonical()."""
+    """The canonical MCP names every home should reach — EMPTY by default (no
+    host-specific MCP ships in code). Resolution: HELM_MCPS_CANONICAL (a JSON
+    file {name: config|null}), else the host's authored `canonical_mcps`
+    (registry-authored.json `host` block). Mirrors skillsync.canonical(); like
+    it, REFUSES (propagates registry.AuthoredUnreadable) rather than returning
+    empty when the authored layer exists but is unreadable."""
     p = _home.env("MCPS_CANONICAL")
-    if not p:
-        return dict(CANONICAL_MCPS)
-    with open(os.path.expanduser(p), encoding="utf-8") as f:
-        d = json.load(f)
-    if not isinstance(d, dict):
-        raise ValueError("HELM_MCPS_CANONICAL must be a JSON object {name: config|null}")
-    return d
+    if p:
+        with open(os.path.expanduser(p), encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            raise ValueError("HELM_MCPS_CANONICAL must be a JSON object {name: config|null}")
+        return d
+    h = registry.authored_host().get("canonical_mcps")
+    return dict(h) if isinstance(h, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -179,28 +189,51 @@ def _all_hooks(settings):
 def _helm_args(command):
     """The helm subcommand a hook command runs ('inject --hook-json',
     'chat deliver --hook-json'), or None if the command does not call helm.
-    Strips the `timeout N <bin>` prefix and the `|| true` tail so the identity
-    is mechanism-independent (a hand-wired `helm inject` matches an installer
-    one)."""
+    Strips the `timeout N <bin>` prefix and ANY shell tail so the identity is
+    mechanism-independent (a hand-wired `helm inject` matches an installer one).
+
+    The tail is cut at the first `;` or `||`, not at `|| true` alone. A GATED
+    spec's command ends `; rc=$?; [ "$rc" = 2 ] && exit 2; exit 0`, and the
+    old `||`-only strip left all of that inside the identity — so every home
+    whose stop guard was correctly gated read as MISSING the stop-guard hook in
+    the census, for as long as the gate has existed. A hook's identity is the
+    helm subcommand it runs; how its exit code is handled afterwards is
+    mechanism, which is exactly what this function exists to discard."""
+    import re
     import shlex
     try:
-        toks = shlex.split(command)
+        toks = shlex.split(re.split(r";|\|\|", str(command), maxsplit=1)[0])
     except ValueError:
         return None
     for i, t in enumerate(toks):
         if os.path.basename(t) == "helm" and i + 1 < len(toks):
             rest = toks[i + 1:]
-            if "||" in rest:
-                rest = rest[:rest.index("||")]
             return " ".join(rest) if rest else None
     return None
 
 
 def _spec(tup):
-    """A hooks.py-shaped spec dict from a canonical tuple — so envtidy reuses
-    hooks._merge_event (the merge-preserving, matcher-aware primitive) and
-    hooks.spec_command (the fail-open command builder) verbatim."""
+    """A hooks.py-shaped spec dict for a canonical tuple — RESOLVED from
+    hooks.SPECS by (event, args), and rebuilt from the tuple ONLY for a tuple
+    that names no real spec (a HELM_HOOKS_CANONICAL entry, or `record`, which
+    lives in the tuple list alone).
+
+    It used to rebuild unconditionally, and that silently dropped every spec
+    field the tuple does not carry. One of those fields is `gate`, which is what
+    makes the stop guard's exit-2 refusal reach the harness instead of being
+    rewritten to success. So `hooks sync` computed the FAIL-OPEN `|| true`
+    command as canonical, reported 10 of 12 homes as drifted from a correct
+    estate, and `--apply` would have re-disarmed the gate in every home where it
+    had just been fixed — a repair verb as the regression vector.
+
+    The tuple list and SPECS are two representations of ONE fact. The tuple owns
+    cadence (timeout) and placement (matcher) because an override must be able
+    to set them; everything else, including any safety flag added later, comes
+    from the richer representation and can no longer be lost in this mapping."""
     event, matcher, args, timeout = tup
+    for sp in _hooks.SPECS:
+        if sp["event"] == event and sp["args"] == args:
+            return dict(sp, timeout=timeout, matcher=matcher)
     return {"name": "%s/%s" % (event, args), "event": event, "args": args,
             "timeout": timeout, "matcher": matcher, "own": (args,)}
 
@@ -362,6 +395,16 @@ def _log(backup_root, line):
 # 2. hooks sync — reconcile every home to the canonical hook set (additive)
 # ---------------------------------------------------------------------------
 
+def _derive_hooks(label, cur):
+    _kindname, want = hooks_for(label)
+    out = json.loads(json.dumps(cur))
+    actions = {}
+    for tup in want:
+        spec = _spec(tup)
+        actions[tup[2]] = _hooks._merge_event(out, spec)
+    return out, actions, want
+
+
 def plan_hooks_home(label, cdir):
     """Read-only plan for ONE config dir -> dict. actions per canonical hook
     (ok|add|update), the strays we would PRESERVE, and the after-image + diff.
@@ -383,12 +426,8 @@ def plan_hooks_home(label, cdir):
         return {"label": label, "kind": kind, "path": cdir, "verdict": "FAIL",
                 "detail": "settings.json root is not an object", "actions": {}, "strays": []}
     strays = [c for _e, _m, c in _all_hooks(cur) if _helm_args(c) is None]
-    out = json.loads(json.dumps(cur))
-    actions = {}
     try:
-        for tup in want:
-            spec = _spec(tup)
-            actions[tup[2]] = _hooks._merge_event(out, spec)
+        out, actions, _want = _derive_hooks(label, cur)
     except ValueError as e:
         return {"label": label, "kind": kind, "path": cdir, "verdict": "FAIL",
                 "detail": str(e), "actions": {}, "strays": strays}
@@ -412,30 +451,30 @@ def _readraw(path):
 
 
 def apply_hooks_home(plan, backup_root):
-    """Enact ONE plan (verdict 'change'): backup -> atomic write -> re-read and
-    prove the SUPERSET (every canonical hook present AND every foreign stray
-    preserved) or restore. -> (verdict, detail)."""
+    """Re-read and re-derive ONE hook plan through bounded exact-revision CAS."""
+    from . import configs
     sp = os.path.join(plan["path"], "settings.json")
-    _kindname, want = hooks_for(plan["label"])
-    foreign_before = set(plan["strays"])       # the non-helm hooks to preserve
-    backup = _backup(backup_root, plan["label"], sp)
-    try:
-        pk.atomic_write(sp, plan["new_raw"])
-    except OSError as e:
-        _restore(backup, sp)
-        return "FAIL", "write failed: %s — pre-image restored" % e
-    got, err = _read_json(sp)
-    ok = err is None and isinstance(got, dict)
-    if ok:
-        cmds = [c for _e, _m, c in _all_hooks(got)]
-        canon_ok = all(_hooks.spec_command(_spec(tup)) in cmds for tup in want)
-        foreign_after = {c for c in cmds if _helm_args(c) is None}
-        ok = canon_ok and foreign_before <= foreign_after
-    if not ok:
-        _restore(backup, sp)
-        return "FAIL", "post-write superset check failed — backup restored (%s)" % (backup or "none")
-    _log(backup_root, "%s hooks sync (backup: %s)" % (plan["label"], backup))
-    return "applied", "backup: %s" % (backup or "none — new file")
+    label = plan["label"]
+
+    def transform(cur):
+        out, actions, want = _derive_hooks(label, cur)
+        return out, {"actions": actions, "want": want}
+
+    def verify(candidate, before, _metadata):
+        expected, _actions, want = _derive_hooks(label, before)
+        cmds = [c for _e, _m, c in _all_hooks(candidate)]
+        return candidate == expected and all(
+            _hooks.spec_command(_spec(tup)) in cmds for tup in want)
+
+    res = configs.transform_json_file(sp, transform, verify=verify)
+    if not res.get("ok"):
+        return "FAIL", res["error"]
+    if not res.get("wrote"):
+        return "ok", "already current after CAS re-read"
+    backup = res.get("backup")
+    _log(backup_root, "%s hooks sync (backup: %s)" % (label, backup))
+    return "applied", "backup: %s; CAS attempts: %d" % (
+        backup or "none — new file", res["attempts"])
 
 
 def hooks_sync(dirs=None, backup_root=None, apply=False):
@@ -457,7 +496,12 @@ def hooks_sync(dirs=None, backup_root=None, apply=False):
             if apply:
                 v, detail = apply_hooks_home(p, backup_root)
                 p["verdict"], p["detail"] = v, detail
-                (failed if v == "FAIL" else changed).append(p)
+                if v == "FAIL":
+                    failed.append(p)
+                elif v == "ok":
+                    steady += 1
+                else:
+                    changed.append(p)
             else:
                 changed.append(p)
     return {"backup_root": backup_root, "apply": apply, "plans": plans,
@@ -556,20 +600,31 @@ def mcp_sync(dirs=None, backup_root=None, apply=False):
 # 4. worktree gc — compose `helm work gc`, sweep orphan stubs + stray worktrees
 # ---------------------------------------------------------------------------
 
-def _worktree_rows(root, base):
-    """Registered worktrees (minus the main checkout and the lease-aware lane
-    rooms, which `helm work gc` owns), each classified. rescue/remove are the
-    two enact flags; a LOCKED or OCCUPIED worktree is immune; ahead>0 (unmerged)
-    is blocked, never removed."""
+def _worktree_rows(root, base, phantoms=None, registered=None, protected=()):
+    """Live remaining-estate worktrees, each classified.
+
+    Lane/harness rooms belong to `helm work gc`, peeks belong to `work peek`,
+    and unmanaged missing records ride the explicit phantom pass. Keeping those
+    out here prevents a nonexistent checkout from being misread as DIRTY work."""
     from . import work
-    wts = work.worktrees(root)
+    wts = registered if registered is not None else work.worktrees(root)
     main = wts[0]["path"] if wts else None
-    lane_box = root.rstrip(os.sep) + "-wt" + os.sep
+    phantoms = set(phantoms or ())
+    protected = set(protected or ())
     rows = []
     for w in wts:
-        if w["path"] == main or w["path"].startswith(lane_box):
+        if w["path"] == main or work.managed_room_kind(root, w["path"]) \
+                or w["path"] in phantoms:
             continue
         branch = (w["branch"] or "")[len("refs/heads/"):] or None
+        if w["path"] in protected:
+            rows.append({"path": w["path"], "branch": branch,
+                         "locked": w["locked"], "occupied": [],
+                         "dirty": False, "merged": False,
+                         "rescue": False, "remove": False,
+                         "verdict": "keep",
+                         "why": "TARGET named by --repo — never remove"})
+            continue
         dirty = work._dirty(w["path"])
         merged = bool(branch) and work._merged(root, branch)
         occupied = work._occupants(w["path"])
@@ -599,27 +654,47 @@ def _worktree_rows(root, base):
 
 
 def _orphan_branches(root, base, pattern=None):
-    """`worktree-*` branches with NO registered worktree — the commit IS the
-    work. Merged -> `git branch -d` (safe, refuses unmerged); unmerged -> KEEP
-    (never -D without land/owner review). HELM_WORKTREE_PRUNE_GLOB overrides."""
+    """Cleanup-owned branches with NO registered worktree — the commit IS the
+    work. Landed (by ancestry OR by patch identity) -> delete; anything else,
+    including every unreadable case -> KEEP.
+
+    THE SURFACE THE OWNER IS ACTUALLY LOOKING AT. Rooms are reaped by
+    `work.gc_scan`; branches OUTLIVE their rooms — a live box once carried 107
+    `lane/*` branches against 24 branch-holding worktrees — so most of what a
+    sidebar shows has no room left to reap. This row asked ancestry alone,
+    which is sha identity, while lands here are REBASED; it therefore answered
+    "not merged" truthfully and kept them all.
+
+    Each row carries its `state` and the audit phrase for it. A KEEP now says
+    WHICH failure it was: content genuinely absent from the trunk, versus a
+    landedness read that could not be completed. Those are different facts and
+    only the first one is about the work.
+
+    Defaults cover legacy `worktree-*` rooms and current `lane/*` rooms;
+    HELM_WORKTREE_PRUNE_GLOB narrows to an operator-supplied single pattern."""
     from . import work
-    pattern = pattern or _home.env("WORKTREE_PRUNE_GLOB") or "worktree-*"
-    rc, out, _err = work._git(root, "for-each-ref", "--format=%(refname:short)",
-                              "refs/heads/" + pattern)
-    if rc != 0:
-        return []
+    override = pattern or _home.env("WORKTREE_PRUNE_GLOB")
+    patterns = (override,) if override else ("worktree-*", "lane/*")
+    found = []
+    for glob in patterns:
+        rc, out, _err = work._git(
+            root, "for-each-ref", "--format=%(refname:short)",
+            "refs/heads/" + glob)
+        if rc != 0:
+            return []
+        found.extend(out.splitlines())
     wt_branches = {(w["branch"] or "")[len("refs/heads/"):]
                    for w in work.worktrees(root)}
     rows = []
-    for b in out.splitlines():
+    for b in dict.fromkeys(found):
         b = b.strip()
         if not b or b in wt_branches:
             continue
-        merged = work._merged(root, b)
-        rows.append({"branch": b, "merged": merged,
+        state = work._merge_state(root, b)
+        merged = state in work.RETIRABLE
+        rows.append({"branch": b, "merged": merged, "state": state,
                      "verdict": "delete" if merged else "keep",
-                     "why": "merged — git branch -d (safe)" if merged
-                     else "unmerged (ahead>0) — needs land/review; never -D"})
+                     "why": work._proof_word(state)})
     return rows
 
 
@@ -654,11 +729,14 @@ def _enact_worktree(root, r, apply):
                 return lines + ["SKIPPED %s (%s)" % (r["path"], err)]
             lines.append("removed " + r["path"])
             if r["merged"] and r["branch"]:
-                work._git(root, "branch", "-d", r["branch"])
-                lines.append("deleted merged branch " + r["branch"])
+                # Through the ONE branch-retirement actuator: it re-reads the
+                # proof, picks -d vs the patch-identity -D, and prints the
+                # restore line. The old inline `branch -d` also swallowed its
+                # rc, so a refusal here was silent AND mislabelled "deleted".
+                lines += work._delete_lane_branch(root, r["branch"])
         else:
             lines.append("would remove " + r["path"]
-                         + ("; branch -d " + r["branch"] if r["merged"] and r["branch"] else ""))
+                         + ("; delete branch " + r["branch"] if r["merged"] and r["branch"] else ""))
     return lines
 
 
@@ -667,20 +745,48 @@ def worktree_gc(root=None, apply=False):
     the orphan-stub + stray-worktree sweep the lane gc does not cover. Dry-run
     by default; rescue-dirty-first; locked/occupied-immune; unmerged-blocked."""
     from . import work
-    root = root or work.find_root()
+    requested = os.path.realpath(os.path.abspath(root)) if root else None
+    root = work.find_root(root)
     if not root:
         return {"error": "not inside a git repo (--repo PATH names one)"}
+    registered, registry_error = vcs.backend(root).worktrees(root)
+    if registry_error:
+        return {"error": "worktree registry unavailable: %s" % registry_error}
+    protected = {w["path"] for w in registered if requested and
+                 (requested == os.path.realpath(w["path"]) or
+                  requested.startswith(os.path.realpath(w["path"]) + os.sep))}
     base = work._base(root)
-    # (a) lane rooms — DELEGATE to work.gc (its lease-aware rescue logic, reused)
-    lane_rows = work.gc_scan(root)
+    # (a) managed rooms — DELEGATE to work.gc (its lease-aware rescue logic,
+    # plus lane/harness phantom ownership, reused exactly once).
+    lane_rows = work.gc_scan(root, registered=registered)
+    for row in lane_rows:
+        if row["path"] in protected:
+            row.update(verdict="keep", why="TARGET named by --repo — never remove")
     lane_lines = {}
     if apply:
         for lr in lane_rows:
             out = work.gc_enact(root, lr)
             if out:
                 lane_lines[lr["lane"]] = out
-    # (b) stray registered worktrees (wf_*, agent-*, …)
-    wt_rows = _worktree_rows(root, base)
+    managed_phantoms, managed_excluded, _ = work.phantom_scan(
+        root, registered=registered)
+    managed_removed, managed_error, managed_unknown = ([], None, False)
+    if apply:
+        managed_removed, managed_error, managed_unknown = \
+            work.prune_phantom_records(
+                root, managed_phantoms, excluded=managed_excluded)
+
+    # (b) remaining unmanaged estate. Missing records are their own class: a
+    # nonexistent checkout cannot be classified by dirty/merged/occupied reads.
+    estate_phantoms, estate_excluded, _ = work.phantom_scan(
+        root, owner="estate", registered=registered)
+    estate_removed, estate_error, estate_unknown = ([], None, False)
+    if apply:
+        estate_removed, estate_error, estate_unknown = \
+            work.prune_phantom_records(
+                root, estate_phantoms, excluded=estate_excluded, owner="estate")
+    wt_rows = _worktree_rows(root, base, estate_phantoms,
+                             registered=registered, protected=protected)
     wt_lines = {}
     for r in wt_rows:
         out = _enact_worktree(root, r, apply)
@@ -692,13 +798,23 @@ def worktree_gc(root=None, apply=False):
     for o in orphans:
         if o["verdict"] == "delete":
             if apply:
-                rc, _o, err = work._git(root, "branch", "-d", o["branch"])
-                orphan_lines[o["branch"]] = ["deleted " + o["branch"]] if rc == 0 \
-                    else ["SKIPPED %s (%s)" % (o["branch"], err)]
+                # NO state handed in: the scan's verdict is re-proven here, one
+                # call, because the branch can advance between the two and a
+                # scan verdict is not a permission slip.
+                orphan_lines[o["branch"]] = work._delete_lane_branch(
+                    root, o["branch"])
             else:
-                orphan_lines[o["branch"]] = ["would delete (merged)"]
+                orphan_lines[o["branch"]] = ["would delete — " + o["why"]]
     return {"root": root, "base": base, "apply": apply,
             "lane_rows": lane_rows, "lane_lines": lane_lines,
+            "managed_phantoms": managed_phantoms,
+            "managed_phantom_removed": managed_removed,
+            "managed_phantom_error": managed_error,
+            "managed_phantom_unknown": managed_unknown,
+            "estate_phantoms": estate_phantoms,
+            "estate_phantom_removed": estate_removed,
+            "estate_phantom_error": estate_error,
+            "estate_phantom_unknown": estate_unknown,
             "worktree_rows": wt_rows, "worktree_lines": wt_lines,
             "orphans": orphans, "orphan_lines": orphan_lines}
 
@@ -833,10 +949,18 @@ def cmd_mcp(args):
     if rc is not None:
         return rc
     apply = "--apply" in args
-    r = mcp_sync(apply=apply)
+    try:
+        r = mcp_sync(apply=apply)
+        canon_names = sorted(canonical_mcps())
+    except registry.AuthoredUnreadable as e:
+        print("helm mcp sync: authored layer unreadable (%s) — refusing; the "
+              "canonical MCP set is unknown and a partial sync could shadow real "
+              "servers. Config is recoverable from its .corrupt backup." % e,
+              file=sys.stderr)
+        return 2
     mode = "APPLIED" if apply else "dry-run (--apply to execute)"
     print("helm mcp sync [%s] — canonical names: %s (HELM_MCPS_CANONICAL overrides)"
-          % (mode, ", ".join(sorted(canonical_mcps()))))
+          % (mode, ", ".join(canon_names)))
     for p in r["changed"]:
         bits = []
         if p["adds"]:
@@ -865,6 +989,25 @@ def _print_worktree(r, out=sys.stdout):
         p("    %-8s %-20s %s" % (lr["verdict"].upper(), lr["lane"], lr["why"]))
         for ln in r["lane_lines"].get(lr["lane"], []):
             p("        " + ln)
+    p("  managed phantom records (lane/harness): %d" %
+      len(r["managed_phantoms"]))
+    managed_removed = set(r["managed_phantom_removed"])
+    for path in r["managed_phantoms"]:
+        state = "removed" if path in managed_removed else \
+            ("unknown" if r["managed_phantom_unknown"] and r["apply"] else
+             "kept" if r["apply"] else "would remove")
+        p("    %-12s %s" % (state.upper(), path))
+    if r["managed_phantom_error"]:
+        p("    ERROR " + r["managed_phantom_error"])
+    p("  remaining-estate phantom records: %d" % len(r["estate_phantoms"]))
+    estate_removed = set(r["estate_phantom_removed"])
+    for path in r["estate_phantoms"]:
+        state = "removed" if path in estate_removed else \
+            ("unknown" if r["estate_phantom_unknown"] and r["apply"] else
+             "kept" if r["apply"] else "would remove")
+        p("    %-12s %s" % (state.upper(), path))
+    if r["estate_phantom_error"]:
+        p("    ERROR " + r["estate_phantom_error"])
     p("  stray worktrees: %d" % len(r["worktree_rows"]))
     for wr in r["worktree_rows"]:
         p("    %-14s %-36s %s" % (wr["verdict"], wr.get("branch") or "-", wr["why"]))
@@ -877,8 +1020,41 @@ def _print_worktree(r, out=sys.stdout):
             p("        " + ln)
 
 
+def _post_worktree_summary(r):
+    from . import work
+    if r["managed_phantom_unknown"] or r["estate_phantom_unknown"]:
+        error = "worktree gc: phantom removal UNKNOWN — summary not posted"
+        print(error, file=sys.stderr)
+        return error
+    paths = [row["path"] for row in r["lane_rows"] + r["worktree_rows"]]
+    room_removed = sum(not os.path.exists(path) for path in paths)
+    branch_removed = sum(row["verdict"] == "delete" and
+                         not work._has_branch(r["root"], row["branch"])
+                         for row in r["orphans"])
+    phantom_removed = (len(r["managed_phantom_removed"])
+                       + len(r["estate_phantom_removed"]))
+    removed = room_removed + branch_removed + phantom_removed
+    phantom_kept = (len(r["managed_phantoms"]) + len(r["estate_phantoms"])
+                    - phantom_removed)
+    triage = (sum(row["verdict"] in ("triage", "rescue")
+                   for row in r["lane_rows"])
+              + sum(row["verdict"] in ("keep", "rescue+keep") and
+                    (not row.get("merged") or row.get("dirty"))
+                    for row in r["worktree_rows"])
+              + sum(row["verdict"] == "keep" for row in r["orphans"])
+              + phantom_kept)
+    total = (len(paths) + len(r["orphans"]) + len(r["managed_phantoms"])
+             + len(r["estate_phantoms"]))
+    line = work.format_gc_summary(r["root"], removed, total - removed, triage)
+    print(line)
+    error = work.post_gc_summary(line)
+    if error:
+        print("helm " + error, file=sys.stderr)
+    return error
+
+
 def cmd_worktree(args):
-    """worktree gc [--apply] — prune orphan worktree-* branches + landed
+    """worktree gc [--apply] — prune orphan worktree-*/lane/* branches + landed
     worktrees (dry-run default; rescue-dirty-first, locked/occupied-immune,
     unmerged-blocked; composes `helm work gc` for lane rooms)."""
     args = list(args or [])
@@ -891,15 +1067,21 @@ def cmd_worktree(args):
     if rc is not None:
         return rc
     from . import seats
-    r = worktree_gc(root=seats._flag(args, "--repo"), apply="--apply" in args)
+    apply = "--apply" in args
+    r = worktree_gc(root=seats._flag(args, "--repo"), apply=apply)
     _print_worktree(r)
-    return 1 if "error" in r else 0
+    if "error" in r:
+        return 1
+    failed = r["managed_phantom_error"] or r["estate_phantom_error"]
+    summary_error = _post_worktree_summary(r) if apply else None
+    return 1 if failed or summary_error else 0
 
 
 def cmd_tidy(args):
-    """tidy [--apply] — the umbrella: census + hooks sync + mcp sync + worktree
-    gc, all dry-run by default. One consolidated 'here is everything that would
-    change' report; --apply runs them all backup-first."""
+    """tidy [--apply] [--repo PATH] — the umbrella: census + hooks sync + mcp
+    sync + worktree gc, all dry-run by default. One consolidated 'here is
+    everything that would change' report; --apply runs them all backup-first;
+    --repo points the census + worktree-gc legs at another repo root."""
     args = list(args or [])
     # guard_tail owns the whole parse contract: unknown junk, a MISSING or
     # flag-shaped --repo value (`tidy --repo --apply` once APPLIED against
@@ -945,6 +1127,16 @@ def cmd_tidy(args):
     _print_worktree(r["worktree"])
     print("\n" + "=" * 72)
     fails = len(h["failed"]) + len(m["failed"])
+    w = r["worktree"]
+    if "error" in w:
+        fails += 1
+    else:
+        fails += bool(w["managed_phantom_error"])
+        fails += bool(w["estate_phantom_error"])
+        summary_error = _post_worktree_summary(w) if apply else None
+        if summary_error and not (
+                w["managed_phantom_unknown"] or w["estate_phantom_unknown"]):
+            fails += 1
     print("helm tidy: %s%s" % (
         "APPLIED (backups: %s)" % r["backup_root"] if apply
         else "dry-run complete — `helm tidy --apply` executes",
