@@ -6,6 +6,113 @@ _Nothing yet._
 
 ## 0.2.0 — 2026-08-06
 
+- The seat estate is split into focused modules — identity, roster, claims,
+  delegation, delivery, join, report, stop-guard, stop-signals, work-offer,
+  gate-queue, room advice — plus a seat_* lifecycle family (catalog, paths,
+  ports, provisioning, credentials, proxy, launch assets, health, runtime and
+  session lifecycle) behind unchanged `helm.seats` / `helm.seat` facades. The
+  split carries its own contract tests: setattr fan-out across siblings,
+  split-boundary parity, and an honest-presence suite that keeps a seat's
+  roster row, its process, and its transcript from ever disagreeing silently.
+- `helm gate` — the receipted verification gate. `gate run` executes the
+  suite and MINTS a receipt (id, tree, verdict, host) into a receipt ledger;
+  a green report with no receipt is not a pass. Concurrency is governed
+  per-host by a pane predicate (does this box carry live agent panes), never
+  a hostname allowlist; suites route to an external build host when one is
+  configured, wrapped in a user-delegated cgroup scope with a fail-closed
+  resource guard. Child gates, import receipts and a routing layer
+  (`gateroute`) keep probing consent, execution consent and host identity
+  separate — an eligibility reading is never a capability.
+- The land-request ledger (`helm lr`) grows chain identity end-to-end:
+  v3 rows carry a chain root, edges are proven per-endpoint (an absent root
+  is unknown identity, not a pass), landing proof falls back from ancestry to
+  patch identity, a vanished object scores `absent` only when no reachable
+  source holds it, and the close ladder gains the `resolved` door with
+  confirmation rounds — approve/supersede polarity only, the door's own
+  sentence parsed by the door's own parser. Superseded parents are annotated
+  and swept rather than left looking actionable.
+- The dispatch ledger learns chains and honest signals: `add` notifies (an
+  obligation that tells nobody is a silent net), replay cannot skip
+  retroactive policy, spiral detection reads the LAST round's polarity
+  rather than counting rounds, cross-family fan-out is measured on distinct
+  reviewed tips, and room fences rebind when a walled recipient rebinds.
+- `helm beacons` + `helm wiring` — attendance/wake edges as data, installed
+  and revalidated by a wiring registry instead of scattered call sites; a
+  concurrent pass delivering the same edge twice is the tested-for defect.
+- A chat-native council: convened quorums with an epoch-fenced protocol, a
+  locked read-modify-write signal registry (two concurrent signals must both
+  count), and verdict basis recorded beside every reviewer verdict.
+- Chat v2 hardening: an argv guard on every read verb (unknown tokens refuse
+  instead of returning scrollback), catch-up and restore journals, DM
+  channels, boundary-aware owner-mention resolution shared with delivery,
+  and signing identity that refuses a profile/seat disagreement rather than
+  signing with someone else's key.
+- The hook estate: `resume-turn` (SessionStart re-briefing with adopted-pane
+  support), tool whisper (per-toolcall context injection — the layer beneath
+  per-turn), a JIT injection ledger whose cooldown measures turns rather
+  than context, and a stop-guard that blocks a stop on undelivered mentions
+  or held leases.
+- `helm proxywatch` — proxy liveness as a tri-state (on/off/unknown, and
+  UNKNOWN never authorizes), self-labeling canary probes, a fork watch for
+  the proxy binary, and silent-drop detection with cross-family fan-out.
+- `helm orca adopt` — adopting externally-launched panes safely: process
+  identity is (pid, birth-stamp) typed, never a bare int; the addressing
+  ladder refuses on stale, historical or ambiguous evidence instead of
+  falling through to a neighbouring pane; an authoritative census with a
+  hole in it authorizes nothing.
+- Work lanes mature: claims with lease recovery, a stash, lane discipline,
+  and a gc that reads renames and facade splits (a 3805-line file shrinking
+  to a 156-line facade is not a delete) before proposing anything.
+- Owner-surface subsystems: typed task rows (`helm tasks`, numeric ids with
+  an origin field — owner vs agent — and resurrection refused without
+  witness), the seat todo mirror bridged into the task ledger, a
+  writer-per-key board (any seat may APPEND to any key; REPLACING a
+  narrative key is the owner's), and fleet notes with headline,
+  click-to-detail and a validated goto pointer.
+- `helm vcs` — one backend seam for every git spawn, and `landed_state`:
+  ancestry asks the wrong question about rebased work, so lane retirement is
+  proven by patch identity (`git cherry`) with an independent count
+  cross-check; UNKNOWN is never spendable as a verdict. Beside it, shaguard
+  documents and trips on sha fabrication — a padded short sha or an invented
+  middle is caught before it becomes an announcement.
+- The docref citation registry: hex citations in docstrings and comments are
+  validated by CATEGORY — a commit sha must resolve from a fresh clone, a
+  ledger row id must be vouched by a live ledger, a patch identity must
+  recompute from its recorded diff, and a runtime token needs a reasoned
+  SKIP entry — enforced by a fast pre-commit rung and the suite both.
+- The scanner rungs grow: never-track (files that must never be tracked,
+  with reasons that do not restate what they protect), vacuous-assertion,
+  hardcode, conflict-marker, foldcheck, clearspan, a deletion rung, and
+  hostpath-guard v2 — the push guard now scans the git the push DESCRIBES,
+  not the remote it guessed.
+- `helm clarity` — the controlled-language advisor over a curated lexicon,
+  and the promote gauntlet: three deterministic layers (provenance,
+  structure, speech act) deciding which owner messages become durable canon,
+  regression-tested against a labelled corpus whose positive controls are
+  asserted individually.
+- Boxes and storage: a box inventory chain with an optional runtime-discovered
+  external CLI (absent is silent, this box alone is a complete inventory), a
+  cross-box storage matrix, and scratch shelves.
+- Eval instruments: `evalpin`/`evalrun` (premise-checked eval atoms — a
+  refuted premise writes stale-and-skipped with evidence instead of burning
+  a run), and a mutation matrix script that proves the suite kills
+  line-moving mutations, with pycache and committed-state discipline
+  baked in.
+- The web cockpit is decomposed: `web.py` is now a facade over web_* modules
+  and `web_ui/` assembled parts (manifest-ordered shell/views/styles/scripts)
+  with per-tab views — home, quota, boxes, sessions, configs, work, chat,
+  roster, ledger — SSE, the land board, DM channels and a storage-matrix
+  panel; runtime harnesses exercise the client JS against the real server.
+- CI and packaging: a GitHub Actions workflow tuned to batch at slice ends,
+  `AGENTS.md` (the agent-facing repo contract), `.gitattributes`, and
+  `install.sh` relocated to `scripts/` with the README install section
+  pointing at it.
+- Docs: `VERBS.md` rewritten as the complete verb reference; new design docs
+  (ledger-is-index, subsystem serializer, design philosophy, controlled
+  language + lanes, dispatch-add contract, orca operations and seam audit)
+  and methodology notes (council eval, model-family failover, STE clarity);
+  `DEPENDENCIES.md` supersedes `ATTRIBUTION.md`.
+
 - Proxy-seat autocompaction is now operational rather than alert-only. The
   actuator resolves the authoritative `spawn.json` pane identity; mutable Claude
   Code titles, copied launch text, and visible content never authorize input.
