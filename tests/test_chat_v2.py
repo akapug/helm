@@ -17,7 +17,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import cell as cellmod  # noqa: E402
-from helm import chat, chatnode, home, human, pk  # noqa: E402
+from helm import chat, chatnode, home, human, meld, pk  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
@@ -25,7 +25,15 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_ROOM_SOURCE", "MELD_CHAT_ROOM_SOURCE",
             "HELM_CHAT_LOG", "MELD_CHAT_LOG",
             "HELM_CHAT_NODE_BIN", "MELD_CHAT_NODE_BIN",
-            "HELM_CELL_BIN", "MELD_CELL_BIN")
+            "HELM_CELL_BIN", "MELD_CELL_BIN",
+            # this file SETS HELM_CELL_PROFILE (to "p1", twice) and omitted it
+            # here, so it leaked into every later test in the process. It is
+            # what `_chat_profile()` reads to LABEL the owner row that
+            # `_api_chat_roster` prepends at index [0] — so the leak renamed a
+            # stranger's roster row to "p1" and failed an unrelated assertion
+            # in tests/test_seats.py. A set-it key missing from the restore
+            # list is invisible in this file and only ever fails elsewhere.
+            "HELM_CELL_PROFILE")
 
 SENT = {"sent": True, "turn_hash": "a" * 64, "receipt_hash": "b" * 64,
         "chain_index": 7}
@@ -42,6 +50,13 @@ class V2Base(unittest.TestCase):
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""  # off unless a test opts in
+        # DETERMINISTIC, never the developer's ambient profile. Adding this key
+        # to ENV_KEYS (so it stops leaking) also makes setUp POP it, and tests
+        # here that expect signed transport need SOME profile — they had been
+        # silently inheriting whoever ran them. That is the same class as the
+        # leak: a test whose result depends on the ambient environment passes
+        # for one operator and fails for another.
+        os.environ["HELM_CELL_PROFILE"] = "test-profile"
         # cwd hermeticity: the default room derives from a git cwd
         # (seats.resolve_homing) — run from tmp so defaults stay 'main'
         self.cwd_prior = os.getcwd()
@@ -57,6 +72,38 @@ class V2Base(unittest.TestCase):
                 os.environ[k] = v
         shutil.rmtree(failure_dir, ignore_errors=True)
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class DefaultRoomDerivesTest(V2Base):
+    """room=None means DERIVE — the class fix for 2026-07-29's partition
+    symptoms, where eleven call sites relied on a room="main" parameter
+    default and posted fleet traffic into the room the fleet does not use."""
+
+    def test_none_derives_the_callers_project_room(self):
+        with mock.patch.object(chat, "_default_post_room", return_value="projx") as d:
+            row = chat.post("derived-room probe", who="t")
+        d.assert_called_once()
+        self.assertTrue(os.path.exists(chat.room_path("projx")))
+
+    def test_explicit_main_is_untouched_deliberate_centralization(self):
+        with mock.patch.object(chat, "_default_post_room") as d:
+            chat.post("explicit main probe", room="main", who="t")
+        d.assert_not_called()
+        self.assertTrue(os.path.exists(chat.room_path("main")))
+
+    def test_derivation_failure_fails_open_to_main(self):
+        """Homing must never break a post: seats exploding -> #main, not a
+        raise and not a lost row."""
+        import helm.seats as seats
+        with mock.patch.object(seats, "resolve_homing",
+                               side_effect=RuntimeError("boom")):
+            self.assertEqual(chat._default_post_room(), "main")
+
+    def test_a_dm_ignores_the_derived_default_entirely(self):
+        with mock.patch.object(chat, "_default_post_room", return_value="projx"):
+            row = chat.post("dm probe", who="t", dm="other")
+        self.assertFalse(os.path.exists(chat.room_path("projx")),
+                         "a DM must never land in a derived room file")
 
 
 class TransportTest(V2Base):
@@ -497,6 +544,12 @@ class TransportTest(V2Base):
         self.assertFalse(chat.sign_failures_path().startswith(
             os.environ["HELM_CHAT_DIR"] + os.sep))  # override cannot move state to disk
         self.assertFalse(os.path.exists(chat.journal_dir()))  # log-after stays separate
+        # DECLARE the profile this test asserts on. It reads st["profile"] ==
+        # "p1" and resolves per-profile failure state, and it had been
+        # INHERITING that value from a sibling test's leak — green only because
+        # another test forgot to clean up. Closing the leak exposed it, which
+        # is the leak doing its final piece of damage on the way out.
+        os.environ["HELM_CELL_PROFILE"] = "p1"
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
         with mock.patch.object(chat.time, "time", return_value=220), \
              mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
@@ -557,7 +610,7 @@ class TransportTest(V2Base):
                          ("join_failed", "newer", 2))
 
     def test_no_signer_short_circuits_the_signing_leg(self):
-        """With HELM_CELL_BIN unset a signed turn is
+        """Day-review #1: with HELM_CELL_BIN unset a signed turn is
         impossible — the leg must decline instantly: no join, no revive
         (the live unlock POST that burned the node's 5/60s budget on every
         fleet post), and _signed_row's sign=None probe must not even touch
@@ -772,6 +825,117 @@ class TransportTest(V2Base):
         # 3-tuple contract: (cell_hex, err, launched) — cache hit is success
         self.assertEqual(chat._room_cell("me", ""), ("d" * 64, None, True))
 
+    def test_a_FLEET_surface_reports_the_FLEET_not_its_own_process(self):
+        """OWNER-CAUGHT ON THE OWNER'S SURFACE, 2026-07-29: "hm does the webui
+        need retarting or something?" The web ledger read "signing ready
+        (unproven)" while codex, ds4pro, gemini and opus-integrator all carried
+        committed receipts and rows were anchoring with real turn hashes.
+
+        Nothing was stale. The panel asked `_signed_success_epoch(profile_name())`
+        — about the WEB PROCESS's own profile, which is helm-agent, and no seat
+        ever signs as helm-agent. An exact-profile question on a fleet panel can
+        only ever answer "unproven", however well the fleet signs.
+
+        A status panel describes the SYSTEM, not the process rendering it."""
+        from helm import cell as cellmod
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with mock.patch.object(cellmod, "bin_status", return_value=READY_SIGNER), \
+             mock.patch.object(chat, "node_head", return_value={"chain_index": 7}), \
+             mock.patch.object(chat, "sign_failures", return_value=[]), \
+             mock.patch.object(chat, "fleet_signed",
+                               return_value=("ds4pro", 1785348086.0)), \
+             mock.patch.object(chat, "_signed_success_epoch", return_value=0.0):
+            fleet = chat.transport_status(fleet=True)
+        self.assertEqual(fleet.get("fleet_signer"), "ds4pro",
+                         "fleet view must name the profile it borrowed")
+        self.assertIn("fleet", (fleet.get("label") or ""))
+
+    def test_a_seat_asking_about_ITSELF_is_never_told_the_fleet_is_fine(self):
+        """The counterfactual, and the reason `fleet` is opt-in rather than the
+        default. Being told signing works when YOU cannot sign is precisely the
+        failure this projection exists to prevent — a seat would stop reporting
+        a real local outage."""
+        with mock.patch.object(chat, "fleet_signed",
+                               return_value=("ds4pro", 1785348086.0)), \
+             mock.patch.object(chat, "_signed_success_epoch", return_value=0.0):
+            own = chat.transport_status()
+        self.assertNotIn("fleet", (own.get("label") or ""),
+                         "the per-profile answer must stay per-profile")
+        self.assertIsNone(own.get("fleet_signer"))
+
+    def test_fleet_signed_picks_the_NEWEST_receipt(self):
+        with mock.patch.object(chat, "_read_sign_failure_state", return_value={
+                "old": {"_success_epoch": 100.0},
+                "new": {"_success_epoch": 900.0},
+                "never": {"_success_epoch": 0},
+                "junk": "not-a-dict"}):
+            self.assertEqual(chat.fleet_signed(), ("new", 900.0))
+
+    def test_fleet_signed_is_None_when_nobody_has_ever_signed(self):
+        with mock.patch.object(chat, "_read_sign_failure_state", return_value={
+                "a": {"_success_epoch": 0}}):
+            self.assertIsNone(chat.fleet_signed())
+
+    def test_the_room_join_is_COORDINATION_EXEMPT_and_asks_for_no_funding(self):
+        """--fund 0 or the transport wedges. THE TWENTY-HOUR BUG, 2026-07-29.
+
+        Joining with no --fund makes the signer default to asking the faucet
+        for 5000 computrons, and the faucet rate-limits to ONE REQUEST PER CELL
+        PER MINUTE while the client waits TEN SECONDS. The client's patience is
+        shorter than the server's minimum retry interval, so a contended faucet
+        can NEVER be satisfied — the join is not slow, it cannot complete. One
+        such failure then latched the transport DEGRADED for a day, long after
+        the rate limit expired sixty seconds later.
+
+        A room cell never needs a balance: every turn it emits is coordination
+        (EmitEvent only, no balance_change), which helm already declares at fee
+        0. Funding it was requesting money to pay a bill of zero.
+
+        MEASURED after the fix: join returns rc 0 / joined true / materialized
+        false without touching the faucet, and a posted row carried chain 3,
+        a real turn hash and a receipt where an unsigned row carries None."""
+        seen = {}
+
+        def fake_run_bin(args, timeout=None, env_extra=None):
+            seen["args"] = list(args)
+            return 0, json.dumps({"cell": "a" * 64}), ""
+
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        chat._ensure_dir()
+        with open(chat.cells_path(), "w") as f:
+            json.dump({}, f)
+        from helm import cell as cellmod
+        with mock.patch.object(cellmod, "run_bin", fake_run_bin):
+            chat._room_cell("fresh-profile", "")
+        self.assertIn("--fund", seen["args"],
+                      "a room join that omits --fund defaults to 5000 and "
+                      "walks into the faucet rate-limit trap")
+        self.assertEqual(seen["args"][seen["args"].index("--fund") + 1], "0")
+
+    def test_the_join_funding_stays_overridable_for_a_non_exempt_node(self):
+        """A node that has NOT opted into the coordination-exempt class still
+        needs a funded cell. Same leash and same escape hatch as
+        HELM_NODE_COORD_FEE on the anchor path."""
+        seen = {}
+
+        def fake_run_bin(args, timeout=None, env_extra=None):
+            seen["args"] = list(args)
+            return 0, json.dumps({"cell": "b" * 64}), ""
+
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        os.environ["HELM_CHAT_JOIN_FUND"] = "5000"
+        try:
+            chat._ensure_dir()
+            with open(chat.cells_path(), "w") as f:
+                json.dump({}, f)
+            from helm import cell as cellmod
+            with mock.patch.object(cellmod, "run_bin", fake_run_bin):
+                chat._room_cell("other-profile", "")
+            self.assertEqual(
+                seen["args"][seen["args"].index("--fund") + 1], "5000")
+        finally:
+            os.environ.pop("HELM_CHAT_JOIN_FUND", None)
+
 
 class DreggSignerBinTest(V2Base):
     """The dregg-native signer (dregg-client-sign) as HELM_CELL_BIN: the
@@ -895,7 +1059,7 @@ class ReactTest(V2Base):
 
 
 class ReadReactIndexAlignmentTest(V2Base):
-    """The read/react index-space split (a 🫡 could land on the wrong
+    """The read/react index-space split (a 🫡 landed on the wrong
     post). `read` prints reaction LINES that `react n` silently skips, so a
     human counting printed lines targets off-by-(reactions-above). The fix
     surfaces react's own ordinal as `[n]` beside each targetable row; reaction
@@ -1013,7 +1177,7 @@ class ReactToggleTest(V2Base):
         self.assertIn("[unsigned]", chat._fmt(row2))
 
     def test_cli_react_and_post_honor_seat(self):
-        # CONTRACT (post-actor-binding): `--seat` is an ASSERTION of
+        # CONTRACT (post-actor-binding, 2026-07-23): `--seat` is an ASSERTION of
         # the ambient session identity, NOT a cross-seat selector. This test
         # used to prove `--seat codex-a` posts/reacts AS codex-a from ANY
         # session; now the acting session IS codex-a (ambient) and `--seat
@@ -1086,10 +1250,15 @@ class LogFlushTest(V2Base):
     def test_rotation_gap_is_loud(self):
         chat.post("only", who="a1")
         chat.log_flush()
-        # the whole room turned over — mark's fingerprint is gone
+        # the whole room turned over — mark's fingerprint is gone. The
+        # auto-restore latch would legitimately re-fill the room from the
+        # journal here (that is its job on a real wipe); this arm measures
+        # the FLUSH's own gap note, so the latch is pinned off to keep the
+        # room turned over.
         os.remove(chat.room_path("main"))
-        chat.post("after-wipe", who="a1")
-        chat.log_flush()
+        with mock.patch.object(chat, "_auto_restore_once", lambda: None):
+            chat.post("after-wipe", who="a1")
+            chat.log_flush()
         body = self._body()
         self.assertIn("rotation gap", body)
         self.assertIn("after-wipe", body)
@@ -1099,6 +1268,31 @@ class LogFlushTest(V2Base):
         chat.post("hidden", who="a1")
         self.assertEqual(chat.log_flush(), -1)
         self.assertTrue(chat.log_disabled())
+        self.assertEqual(self._log_files(), [])
+
+    def test_disable_suppresses_meld_lifecycle_flush_too(self):
+        control, _ = meld.invite("seat-b", "enabled control", seat="seat-a")
+        self.assertGreaterEqual(chat.log_flush(rooms=[control]), 0)
+        self.assertTrue(os.path.exists(meld.lifecycle_path(control, durable=True)))
+        room, _ = meld.invite("seat-b", "disabled subject", seat="seat-a")
+        os.environ["HELM_CHAT_LOG"] = "0"
+        self.assertEqual(chat.log_flush(rooms=[room]), -1)
+        self.assertFalse(os.path.exists(meld.lifecycle_path(room, durable=True)))
+
+    def test_lifecycle_failure_precedes_rendered_rows_and_cli_is_loud(self):  # noqa: VACUOUS_ASSERTION — normal flush control precedes planted failure
+        chat.post("control renders", who="a1")
+        self.assertEqual(chat.log_flush(), 1)
+        self.assertTrue(self._log_files())
+        shutil.rmtree(chat.journal_dir())
+        chat.post("must not render", who="a1")
+        with mock.patch.object(meld, "flush_lifecycle",
+                               side_effect=meld.LifecycleError("planted")):
+            with self.assertRaises(meld.LifecycleError):
+                chat.log_flush()
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(chat.cmd_chat(["log-flush"]), 1)
+        self.assertIn("FAILED before rendered rows", err.getvalue())
         self.assertEqual(self._log_files(), [])
 
     def test_cli_log_flush(self):
@@ -1119,6 +1313,44 @@ class NodeSupervisorTest(V2Base):
         self.assertIn("--enable-faucet", t)                      # never die on balance
         self.assertIn("/x/dregg-cave-node run", t)
         self.assertIn("WantedBy=default.target", t)
+
+    def test_unit_inits_the_tmpfs_dir_and_can_actually_fail(self):
+        """THE REBOOT BUG. /dev/shm is wiped on every boot, and `run` REFUSES to
+        create its data dir — the binary exits 1 with "data directory does not
+        exist ... Run `dregg-node init` first". The generator never emitted an
+        init step, so after any reboot this unit could only ever fail. Measured
+        2026-07-28: NRestarts=47 on this host, ~1827 fleet-wide, and every
+        node_unreachable DEGRADED line in the chat log traced here.
+
+        tmpfs is NOT the bug and must stay — one-cave-per-team makes the cave
+        RAM-hot with disk only as the after-log. What tmpfs REQUIRES is that
+        recreation be automatic, which is what was missing.
+
+        SUPERSEDED IN PART, same day: the first fix was `test -d <dir> || init`
+        inline, which restarted the node and silently RE-KEYED it every boot —
+        the team's node returned as a stranger. The prepare step is a helm verb
+        now (restore the snapshotted identity, mint only when there is nothing
+        to restore); this test keeps the reboot and rate-limiter invariants and
+        hands the identity half to tests/test_chatnode_identity.py."""
+        t = chatnode.unit_text("/x/dregg-cave-node")
+        self.assertIn("ExecStartPre=", t)
+        self.assertIn("chat node prepare --data-dir /dev/shm/helm-chat-node", t)
+        # the prepare must PRECEDE run, or it prepares after the failure it prevents
+        self.assertLess(t.index("ExecStartPre="), t.index("ExecStart="))
+        # and it must be FATAL: a node that cannot prove its identity must not start
+        self.assertNotIn("ExecStartPre=-", t)
+        # THE RATE LIMITER MUST BE REACHABLE. systemd's default interval is 10s
+        # and RestartSec is 3, so ~3 starts fit per window and burst=5 could
+        # NEVER trip — the unit looped forever instead of entering `failed`,
+        # which is why 1827 restarts were SILENT. Assert the arithmetic, not the
+        # literal: burst restarts, spaced RestartSec apart, must fit the window.
+        import re
+        interval = int(re.search(r"StartLimitIntervalSec=(\d+)", t).group(1))
+        burst = int(re.search(r"StartLimitBurst=(\d+)", t).group(1))
+        sec = int(re.search(r"RestartSec=(\d+)", t).group(1))
+        self.assertLess(burst * sec, interval,
+                        "burst*RestartSec must fit inside the window or the "
+                        "limit never fires and a crash loop stays silent")
 
     def test_bin_path_env_override(self):
         os.environ["HELM_CHAT_NODE_BIN"] = "/custom/node-bin"

@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -69,11 +70,11 @@ class LiveNodeTest(unittest.TestCase):
             stdout=cls.log, stderr=cls.log,
             env=dict(os.environ, RUST_LOG="warn"))
         if not chatnode.wait_api(cls.url, seconds=45):
-            cls._teardown_node()
+            cls._teardown_class()
             raise unittest.SkipTest("node binary present but never served its API")
         st, err = chatnode.provision(cls.url)
         if err:
-            cls._teardown_node()
+            cls._teardown_class()
             raise AssertionError("provisioning the live node failed: " + err)
 
     @classmethod
@@ -87,7 +88,7 @@ class LiveNodeTest(unittest.TestCase):
         cls.log.close()
 
     @classmethod
-    def tearDownClass(cls):
+    def _teardown_class(cls):
         failure_dir = chat.sign_failures_dir()
         cls._teardown_node()
         os.chdir(cls.cwd_prior)
@@ -98,6 +99,10 @@ class LiveNodeTest(unittest.TestCase):
                 os.environ[k] = v
         shutil.rmtree(failure_dir, ignore_errors=True)
         shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._teardown_class()
 
     _seq = 0
 
@@ -182,6 +187,33 @@ class LiveNodeTest(unittest.TestCase):
         self.assertIn("no committed signing receipt", st["detail"])
         self.assertEqual(st["url"], self.url)
         self.assertIsInstance(st["head"], int)
+
+
+class LiveNodeLifecycleTest(unittest.TestCase):
+    def test_failed_class_setup_restores_cwd_and_environment(self):  # noqa: VACUOUS_ASSERTION — the mocked node is asserted terminated and waited, its log closed, and its tmp tree removed after the injected skip
+        cwd = os.getcwd()
+        prior = {k: os.environ.get(k) for k in ENV_KEYS}
+        node = mock.Mock()
+        try:
+            with mock.patch(__name__ + ".NODE_BIN", "/fake/node"), \
+                    mock.patch(__name__ + ".MELD_BIN", "/fake/meld"), \
+                    mock.patch.object(subprocess, "Popen", return_value=node), \
+                    mock.patch.object(chatnode, "wait_api", return_value=False):
+                with self.assertRaises(unittest.SkipTest):
+                    LiveNodeTest.setUpClass()
+            self.assertEqual(os.getcwd(), cwd)
+            self.assertEqual({k: os.environ.get(k) for k in ENV_KEYS}, prior)
+            self.assertFalse(os.path.exists(LiveNodeTest.tmp))
+            self.assertTrue(LiveNodeTest.log.closed)
+            node.terminate.assert_called_once_with()
+            node.wait.assert_called_once_with(timeout=10)
+        finally:
+            os.chdir(cwd)
+            for k, v in prior.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":

@@ -76,6 +76,32 @@ class ReplyRowTest(ReplyBase):
         self.assertTrue(chat.is_reply(on_disk))
         self.assertFalse(chat.is_reply(self.rows()[0]))
 
+    def test_post_prints_the_id_other_verbs_require(self):
+        """`helm asks report <ask> <post-id>`, `chat reply <id>` and `react <id>`
+        all REQUIRE a row id, and `post` printed none — so the only way to obtain
+        the id of the row you just wrote was to scrape `chat read`. A verb that
+        requires an id must be reachable from the verb that mints one.
+
+        In a live incident, that scrape returned SCROLLBACK rather than the new row
+        (a `--limit 1` read is not "the newest row"), and 16 owner-ask reports
+        were recorded against an unrelated post from a previous day. The asks
+        ledger is append-only and refuses to re-report, so those refs are
+        permanently wrong.
+
+        Asserted against the row ACTUALLY WRITTEN rather than against the format:
+        a printed id that does not match the newest row is the failure that
+        matters, and printing a plausible-but-wrong id is precisely what the
+        scrape did."""
+        body = "a body long enough that the echo scrolls the top away " * 6
+        rc, out, err = self.cli("post", body)   # ambient identity: no --seat,
+        self.assertEqual(rc, 0, err)            # which the actor guard refuses
+        written = self.rows()[-1]["id"]
+        self.assertTrue(written, "the row carries no id — nothing to report with")
+        self.assertIn("helm chat: id %s" % written, out)
+        # LAST line: a long body scrolls the echo, which is how the id got lost
+        self.assertTrue(out.rstrip().endswith("helm chat: id %s" % written),
+                        "the id must be the final line, after the body echo")
+
     def test_plain_post_row_is_untouched(self):
         """ADDITIVE: a non-reply row gains no key at all (old readers, old
         cursors, old fingerprints all see exactly the v2 row)."""
@@ -323,10 +349,13 @@ class ReplyRenderTest(ReplyBase):
 
     def test_reply_counts_never_leak_onto_a_same_second_sibling(self):
         """ts|from is NOT a row identity — one seat posting twice inside a
-        second shares it. Threading keys on the row id."""
-        a = chat.post("first", who="alice")
-        b = dict(chat.post("second", who="alice"))
-        self.assertEqual(a["ts"], b["ts"])   # same second, same author
+        second shares it. Threading keys on the row id. (Clock is pinned so
+        this test is never wall-clock-flaky across a second boundary.)"""
+        with mock.patch("helm.pk.now_ts") as now:
+            now.return_value = "2025-01-01T00:00:00Z"
+            a = chat.post("first", who="alice")
+            b = dict(chat.post("second", who="alice"))
+            self.assertEqual(a["ts"], b["ts"])   # same second, same author
         chat.post("re first", who="bob", reply_to=a["id"])
         idx = chat.index_rows(self.rows())
         self.assertEqual(idx["replies"].get(chat.tkey(a)), 1)
@@ -446,11 +475,21 @@ class ReplyRenderTest(ReplyBase):
             body = f.read()
         self.assertIn("bob ↳alice@%s: child" % p["ts"], body)
 
-    def test_fmt_without_an_index_is_unchanged(self):
-        """Every existing caller (single-row echoes) renders byte-identically."""
+    def test_fmt_without_an_index_carries_NO_THREAD_DECORATION(self):
+        """A single-row echo gets no parent quote and no reply count.
+
+        This asserted a byte-identical string until the
+        stamp gained its UTC zone marker (a bare HH:MM on a surface whose
+        neighbours all print LOCAL time cost a seat a false public
+        correction). That is orthogonal to threading, so the test now pins
+        what it was actually FOR — the absence of thread decoration — rather
+        than every byte of a line it does not own. The stamp has its own
+        tests in test_chat.TimestampCarriesItsZoneTest."""
         m = chat.post("hi", who="alice")
-        self.assertEqual(chat._fmt(m),
-                         "%s alice: hi [unsigned]" % m["ts"][11:16])
+        out = chat._fmt(m)
+        self.assertEqual(out, "%sZ alice: hi [unsigned]" % m["ts"][11:16])
+        self.assertNotIn("↳", out)          # no parent quote
+        self.assertNotIn("↩", out)          # no reply count
 
 
 # ---------------------------------------------------------------------------
@@ -644,3 +683,96 @@ class ReplyDocsContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerdictDigestTest(unittest.TestCase):
+    """chat:verdict:b2b: — the dispatch-verdict claim space.
+    Same laws as replies: disjoint tag, injective fields, shape-dispatched."""
+
+    def test_verdict_digest_is_disjoint_from_plain_and_reply(self):
+        d = chat.verdict_digest("lane-x", "a" * 40, "r1", "PASS", "VERDICT PASS")
+        self.assertTrue(d.startswith(chat.VERDICT_TAG))
+        self.assertNotEqual(d, chat.digest_payload("VERDICT PASS"))
+        # prose that LOOKS like a verdict stays in the plain space
+        forged = chat.digest_payload("lane-x\x1e" + "a" * 40 + "\x1er1\x1ePASS\x1eVERDICT PASS")
+        self.assertNotEqual(d, forged)
+
+    def test_payload_for_dispatches_on_verdict_shape(self):
+        row = {"ts": "t", "from": "integrator", "text": "VERDICT PASS",
+               "vlane": "lane-x", "vtip": "a" * 40, "vrid": "r1", "vref": "PASS"}
+        self.assertEqual(chat.payload_for(row),
+                         chat.verdict_digest("lane-x", "a" * 40, "r1", "PASS",
+                                             "VERDICT PASS"))
+        # a stored row recomputes identically with text read off the row
+        self.assertEqual(chat.payload_for(row), chat.payload_for(dict(row)))
+
+    def test_fields_cannot_slide_into_one_another(self):
+        a = chat.verdict_digest("x", "t1", "r", "ab", "c")
+        b = chat.verdict_digest("x", "t1", "r", "a", "bc")
+        self.assertNotEqual(a, b)
+
+    def test_plain_rows_are_byte_identical_to_before(self):
+        row = {"ts": "t", "from": "seat", "text": "hello"}
+        self.assertEqual(chat.payload_for(row), chat.digest_payload("hello"))
+
+
+class VerdictShapeAttackTest(unittest.TestCase):
+    """A cross-family review found the downgrade and shape-overlap attacks."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-vshape-")
+        self.prior = {k: os.environ.get(k) for k in
+                      ("HELM_CHAT_DIR", "HELM_CHAT_NODE_URL", "HELM_CHAT_NAME")}
+        os.environ["HELM_CHAT_DIR"] = self.tmp
+        os.environ["HELM_CHAT_NODE_URL"] = ""
+        os.environ["HELM_CHAT_NAME"] = "tester"
+
+    def tearDown(self):
+        for k, v in self.prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _signed_verdict(self):
+        # room pinned EXPLICITLY: _rewrite edits main.jsonl by name, so the
+        # row must land there whatever the ambient env/cwd would derive —
+        # these tests are about verdict shape, not room routing.
+        with mock.patch.object(chat, "_sign_send", return_value=(SENT, None)):
+            return chat.post("VERDICT PASS", who="rev", profile="rev", sign=True,
+                             room="main",
+                             verdict={"lane": "l", "tip": "c" * 40,
+                                      "rid": "r1", "ref": "PASS"})
+
+    def _rewrite(self, mutate):
+        raw = os.path.join(chat.chat_dir(), "main.jsonl")
+        with open(raw, encoding="utf-8") as f:
+            lines = [l for l in f.read().split("\n") if l.strip()]
+        row = json.loads(lines[-1])
+        mutate(row)
+        lines[-1] = json.dumps(row)
+        with open(raw, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def test_stripping_the_payload_off_a_signed_verdict_is_a_MISMATCH(self):
+        self._signed_verdict()
+        self.assertEqual(chat.verify()[-1]["state"], "ok")
+        self._rewrite(lambda r: (r.pop("payload"), r.update(vtip="d" * 40)))
+        self.assertEqual(chat.verify()[-1]["state"], "MISMATCH")  # never legacy
+
+    def test_post_refuses_a_verdict_that_is_also_a_reply_or_ack(self):
+        parent = chat.post("parent", who="a")
+        with self.assertRaises(ValueError):
+            chat.post("x", verdict={"tip": "c" * 40, "rid": "r"},
+                      reply_to=parent["id"])
+        with self.assertRaises(ValueError):
+            chat.post("x", verdict={"tip": "c" * 40, "rid": "r"}, ack="1")
+
+    def test_a_forged_both_shapes_row_is_a_MISMATCH_even_with_valid_payload(self):
+        self._signed_verdict()
+        parent = {"id": "p1", "ts": "t", "from": "a"}
+        # graft reply semantics OUTSIDE the signed verdict claim
+        self._rewrite(lambda r: r.update(reply_to=parent["id"],
+                                         rts=parent["ts"], rfrom=parent["from"]))
+        self.assertEqual(chat.verify()[-1]["state"], "MISMATCH")

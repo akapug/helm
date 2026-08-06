@@ -20,10 +20,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from helm import chat, home, reflex  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
+            "HELM_CHAT_EVENT_DIR", "MELD_CHAT_EVENT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
             "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG",
             "HELM_CHAT_ROOM", "MELD_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
-            "MELD_CHAT_ROOM_SOURCE")
+            "MELD_CHAT_ROOM_SOURCE", "HELM_SCRATCH_GC", "HELM_CACHE_DIR")
 
 
 class ChatBase(unittest.TestCase):
@@ -34,9 +35,15 @@ class ChatBase(unittest.TestCase):
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
+        os.environ["HELM_CHAT_EVENT_DIR"] = os.path.join(self.tmp, "chat-events")
         # SET-BUT-EMPTY disables the signed transport — v1 behavior, hermetic
         # even when a real room node is live on this machine
         os.environ["HELM_CHAT_NODE_URL"] = ""
+        # this module drives the stop-guard hook, whose silent-mechanical lane
+        # runs the scratch reaper — a real DELETE under /tmp/claude-*. A test
+        # never mutates a harness store (tests/test_scratch.py pins this).
+        os.environ["HELM_SCRATCH_GC"] = "0"
+        os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
         # cwd hermeticity: the default room resolves through seats.
         # resolve_homing, which derives a project room from a git cwd — run
         # from tmp (not the helm checkout) so defaults stay 'main'
@@ -73,11 +80,253 @@ class RoomTest(ChatBase):
         self.assertEqual([m["text"] for m in msgs], ["first", "second"])
         for m in msgs:
             self.assertEqual(sorted(m), ["from", "id", "text", "ts"])
-            self.assertEqual(len(m["id"]), 12)   # the stable per-row id
+            self.assertEqual(len(m["id"]), 12)   # the stable per-row id (H5)
         tail, total = chat.read(since=1)
         self.assertEqual(total, 2)
         self.assertEqual([m["text"] for m in tail], ["second"])
         self.assertEqual(chat.read(since=2), ([], 2))  # caught up
+
+    def test_post_event_id_is_idempotent(self):
+        first = chat.post("first rendering", who="a1", sign=False,
+                          event_id="refusal-event-123")
+        retried = chat.post("retry rendering changed", who="a1", sign=False,
+                            event_id="refusal-event-123")
+        rows, total = chat.read()
+        self.assertEqual(total, 1)
+        self.assertEqual(rows, [first])
+        self.assertEqual(retried, first)
+        self.assertEqual(first["text"], "first rendering")
+
+    def test_event_id_uses_the_canonical_room_destination(self):
+        first = chat.post("one event", room="Team Alpha", who="a1",
+                          sign=False, event_id="refusal-event-room")
+        retried = chat.post("retry", room="team.alpha", who="a1",
+                            sign=False, event_id="refusal-event-room")
+        rows, total = chat.read("team-alpha")
+        self.assertEqual(total, 1)
+        self.assertEqual(rows, [first])
+        self.assertEqual(retried, first)
+
+    def test_event_receipts_are_scoped_to_the_chat_bus(self):
+        bus_one = os.path.join(self.tmp, "bus-one")
+        bus_two = os.path.join(self.tmp, "bus-two")
+        os.environ["HELM_CHAT_DIR"] = bus_one
+        first = chat.post("first bus", who="a1", sign=False,
+                          event_id="refusal-event-bus")
+        first_receipt = chat._event_receipt_path("main")
+
+        os.environ["HELM_CHAT_DIR"] = bus_two
+        second = chat.post("second bus", who="a1", sign=False,
+                           event_id="refusal-event-bus")
+        second_receipt = chat._event_receipt_path("main")
+        self.assertNotEqual(first_receipt, second_receipt)
+        self.assertEqual(chat.read("main")[0], [second])
+
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "other-home")
+        os.environ["HELM_CHAT_DIR"] = bus_one
+        self.assertEqual(chat._event_receipt_path("main"), first_receipt)
+        self.assertEqual(chat.post("retry", who="a1", sign=False,
+                                   event_id="refusal-event-bus"), first)
+
+    def test_empty_event_root_override_uses_host_durable_root(self):
+        os.environ["HELM_CHAT_EVENT_DIR"] = ""
+        os.environ["HELM_CHAT_DIR"] = ""
+        durable = os.path.join(self.tmp, "durable-home")
+        with mock.patch.object(home, "default_home", return_value=durable):
+            path = chat._event_receipt_path("main")
+        self.assertTrue(path.startswith(os.path.join(
+            durable, home.GLOBAL, ".state", "chat-event-receipts") + os.sep))
+
+    def test_same_bus_mixed_provenance_shares_one_receipt_root(self):
+        os.environ["HELM_CHAT_DIR"] = ""
+        bus = chat.chat_dir()
+        first = chat.post("first rendering", who="a1", sign=False,
+                          event_id="refusal-event-mixed-provenance")
+        first_receipt = chat._event_receipt_path("main")
+        with mock.patch.object(chat, "SIZE_CAP", 400):
+            for i in range(20):
+                chat.post("ordinary-%02d" % i, who="a2", sign=False)
+        self.assertNotIn(first["id"], {row.get("id")
+                                      for row in chat.read()[0]})
+        shutil.rmtree(bus)
+
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "other-home")
+        os.environ["HELM_CHAT_DIR"] = bus
+        self.assertEqual(chat._event_receipt_path("main"), first_receipt)
+        retried = chat.post("retry rendering", who="a1", sign=False,
+                            event_id="refusal-event-mixed-provenance")
+        self.assertEqual(retried, first)
+        self.assertEqual(chat.read(), ([], 0))
+
+    def test_explicit_derived_bus_owner_is_not_state_dependent(self):
+        os.environ.pop("HELM_CHAT_EVENT_DIR")
+        estate = os.path.join(self.tmp, "fresh-estate")
+        durable = os.path.join(self.tmp, "durable-home")
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "other-home")
+        os.environ["HELM_CHAT_DIR"] = os.path.join(estate, "helm-chat")
+        with mock.patch.object(home, "default_home", return_value=durable):
+            before = chat._event_receipt_path("main")
+            self.assertFalse(os.path.exists(os.path.join(estate, home.GLOBAL)))
+            os.makedirs(os.path.join(estate, home.GLOBAL))
+            after = chat._event_receipt_path("main")
+        self.assertEqual(after, before)
+        self.assertTrue(after.startswith(os.path.join(
+            durable, home.GLOBAL, ".state", "chat-event-receipts") + os.sep))
+
+    def test_explicit_chat_surface_uses_a_durable_bus_keyed_root(self):
+        os.environ.pop("HELM_CHAT_EVENT_DIR")
+        durable = os.path.join(self.tmp, "durable-home")
+        os.environ["HELM_CHAT_DIR"] = os.path.join("/volatile", "chat-bus")
+        with mock.patch.object(home, "default_home", return_value=durable):
+            path = chat._event_receipt_path("main")
+        self.assertTrue(path.startswith(os.path.join(
+            durable, home.GLOBAL, ".state", "chat-event-receipts") + os.sep))
+        self.assertFalse(path.startswith(os.environ["HELM_CHAT_DIR"]))
+
+    def test_explicit_tmpfs_helm_chat_uses_durable_default_root(self):
+        os.environ.pop("HELM_CHAT_EVENT_DIR")
+        os.environ["HELM_CHAT_DIR"] = "/dev/shm/team/helm-chat"
+        durable = os.path.join(self.tmp, "durable-home")
+        with mock.patch.object(home, "default_home", return_value=durable):
+            path = chat._event_receipt_path("main")
+        self.assertTrue(path.startswith(os.path.join(
+            durable, home.GLOBAL, ".state", "chat-event-receipts") + os.sep))
+        self.assertFalse(path.startswith("/dev/shm/"))
+
+    def test_event_receipt_files_are_private(self):
+        configured = os.environ["HELM_CHAT_EVENT_DIR"]
+        os.makedirs(configured, mode=0o755)
+        os.chmod(configured, 0o755)
+        chat.post("private event", who="a1", sign=False,
+                  event_id="refusal-event-private")
+        path = chat._event_receipt_path("main")
+        self.assertEqual(stat.S_IMODE(os.stat(configured).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode),
+                         0o700)
+
+    def test_event_receipt_commit_fsyncs_file_and_directory(self):
+        with mock.patch.object(os, "fsync", wraps=os.fsync) as fsync:
+            chat.post("durable event", who="a1", sign=False,
+                      event_id="refusal-event-fsync")
+        self.assertGreaterEqual(fsync.call_count, 2)
+
+    def test_post_replace_fsync_failure_keeps_row_and_receipt(self):
+        os.makedirs(chat._event_receipts_dir(), mode=0o700)
+        with mock.patch.object(os, "fsync",
+                               side_effect=(None, OSError("dir fsync"))), \
+                self.assertRaisesRegex(chat._EventReceiptPublishedError,
+                                       "durability is unproven"):
+            chat.post("first rendering", who="a1", sign=False,
+                      event_id="refusal-event-post-replace")
+        rows, total = chat.read()
+        self.assertEqual(total, 1)
+        self.assertTrue(os.path.exists(chat._event_receipt_path("main")))
+        retried = chat.post("retry rendering", who="a1", sign=False,
+                            event_id="refusal-event-post-replace")
+        self.assertEqual(retried, rows[0])
+        self.assertEqual(chat.read(), (rows, 1))
+
+    def test_event_receipt_write_failure_rolls_back_row(self):
+        ordinary = chat.post("kept", who="a2", sign=False)
+        with mock.patch.object(chat, "_write_event_receipts",
+                               side_effect=OSError("read-only")), \
+                self.assertRaisesRegex(OSError, "read-only"):
+            chat.post("must retry", who="a1", sign=False,
+                      event_id="refusal-event-write-failed")
+        self.assertEqual(chat.read(), ([ordinary], 1))
+
+    def test_receipt_failure_never_truncates_fail_open_append(self):
+        concurrent = {"ts": "2026-08-05T00:00:00Z", "from": "a2",
+                      "text": "concurrent", "id": "222222222222"}
+
+        def fail_after_concurrent_append(_path, _receipts):
+            with open(chat.room_path("main"), "ab") as f:
+                f.write((json.dumps(concurrent) + "\n").encode("utf-8"))
+            raise OSError("read-only")
+
+        with mock.patch.object(chat, "_write_event_receipts",
+                               side_effect=fail_after_concurrent_append), \
+                self.assertRaisesRegex(OSError, "could not be rolled back"):
+            chat.post("keyed", who="a1", sign=False,
+                      event_id="refusal-event-fail-open-race")
+        rows, total = chat.read()
+        self.assertEqual(total, 2)
+        self.assertEqual([row["text"] for row in rows], ["keyed", "concurrent"])
+
+        retried = chat.post("retry", who="a1", sign=False,
+                            event_id="refusal-event-fail-open-race")
+        self.assertEqual(retried, rows[0])
+        self.assertEqual(chat.read(), (rows, 2))
+
+    def test_event_receipt_migrates_released_ram_path(self):
+        first = chat.post("before upgrade", who="a1", sign=False,
+                          event_id="refusal-event-upgrade")
+        durable = chat._event_receipt_path("main")
+        legacy = chat._legacy_event_receipt_path("main")
+        os.replace(durable, legacy)
+        with mock.patch.object(chat, "SIZE_CAP", 400):
+            for i in range(20):
+                chat.post("ordinary-%02d" % i, who="a2", sign=False)
+        self.assertNotIn(first["id"], {row.get("id")
+                                      for row in chat.read()[0]})
+
+        retried = chat.post("retry after upgrade", who="a1", sign=False,
+                            event_id="refusal-event-upgrade")
+        self.assertEqual(retried, first)
+        self.assertTrue(os.path.exists(durable))
+        self.assertFalse(os.path.exists(legacy))
+        self.assertNotIn("retry after upgrade",
+                         [row.get("text") for row in chat.read()[0]])
+
+    def test_event_receipt_corruption_fails_closed(self):
+        path = chat._event_receipt_path("main")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("not-json\n")
+        with self.assertRaisesRegex(ValueError, "duplicate status is unknown"):
+            chat.post("must retry", who="a1", sign=False,
+                      event_id="refusal-event-corrupt-receipt")
+        self.assertEqual(chat.read(), ([], 0))
+
+    def test_event_receipt_survives_room_rotation(self):  # noqa: VACUOUS_ASSERTION — the fixture proves the first row existed and was actually rotated before asserting the retry appended nothing
+        with mock.patch.object(chat, "SIZE_CAP", 400):
+            first = chat.post("event before rotation", who="a1", sign=False,
+                              event_id="refusal-event-rotation")
+            for i in range(20):
+                chat.post("ordinary-%02d" % i, who="a2", sign=False)
+        rows, before = chat.read()
+        self.assertNotIn(first["id"], {row.get("id") for row in rows},
+                         "fixture did not rotate the event row out")
+        retried = chat.post("retry after rotation", who="a1", sign=False,
+                            event_id="refusal-event-rotation")
+        rows, after = chat.read()
+        self.assertEqual(after, before)
+        self.assertEqual(retried, first)
+        self.assertNotIn("retry after rotation",
+                         [row.get("text") for row in rows])
+
+    def test_event_post_refuses_when_room_lock_cannot_prove_uniqueness(self):  # noqa: VACUOUS_ASSERTION — the exact raised refusal positively proves the keyed append path executed before the untouched-room assertion
+        @contextlib.contextmanager
+        def unlocked(_room):
+            yield False
+
+        with mock.patch.object(chat, "_room_lock", unlocked), \
+                self.assertRaisesRegex(OSError, "unproven idempotent append"):
+            chat.post("must retry", who="a1", sign=False,
+                      event_id="refusal-event-locked")
+        self.assertEqual(chat.read(), ([], 0))
+
+    def test_event_post_refuses_when_room_cannot_prove_absence(self):  # noqa: VACUOUS_ASSERTION — planted malformed bytes and the exact refusal positively control the assertion that no replacement row was written
+        path = chat.room_path("main")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("not-json\n")
+        with self.assertRaisesRegex(ValueError, "duplicate status is unknown"):
+            chat.post("must retry", who="a1", sign=False,
+                      event_id="refusal-event-corrupt")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "not-json\n")
 
     def test_since_past_the_end_resets(self):
         # a rotation shrank the room under a poller — it re-syncs, never starves
@@ -118,6 +367,67 @@ class RoomTest(ChatBase):
         self.assertEqual(msgs[-1]["text"], "msg-19")     # newest kept
         self.assertNotIn("msg-00", [m["text"] for m in msgs])
         self.assertLessEqual(os.path.getsize(chat.room_path("main")), 400)
+
+
+class ReadFlagGuardTest(ChatBase):
+    """guard_tail on `chat read` (the 9ce7b8c precedent) + a real --limit.
+    An unknown flag used to be silently ignored: `--limit 1` meant 'the
+    newest row' and returned scrollback (16 owner-asks misreported off it,
+    2026-07-26; OI misread the room thrice in one session). Effect
+    assertions only — an unknown flag produces rc 2; --limit N returns the
+    NEWEST N; a react [n] tag stays whole-room so a quote still resolves."""
+
+    def _rows(self, n):
+        for i in range(n):
+            self.run_cmd(["post", "row-%02d" % i])
+
+    def test_an_unknown_flag_REFUSES_rc2_naming_the_flag(self):
+        rc, _o, err = self.run_cmd(["read", "--bogus"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--bogus", err)
+
+    def test_pre_fix_limit_was_ignored_now_it_is_known(self):
+        self._rows(5)
+        rc, out, _e = self.run_cmd(["read", "--limit", "2"])
+        self.assertEqual(rc, 0)
+        self.assertIn("row-03", out)
+        self.assertIn("row-04", out)
+        self.assertNotIn("row-00", out)   # the newest 2, not scrollback
+
+    def test_limit_1_returns_the_newest_row_not_the_oldest(self):
+        self._rows(3)
+        rc, out, _e = self.run_cmd(["read", "--limit", "1"])
+        self.assertEqual(rc, 0)
+        self.assertIn("row-02", out)
+        self.assertNotIn("row-00", out)
+
+    def test_limit_tags_stay_whole_room_so_a_react_resolves(self):
+        self._rows(4)
+        rc, out, _e = self.run_cmd(["read", "--limit", "1"])
+        self.assertEqual(rc, 0)
+        # the [n] beside the newest row is its whole-room index (4), not 1
+        self.assertIn("[4]", out)
+
+    def test_a_non_numeric_limit_refuses_with_the_since_route(self):
+        rc, _o, err = self.run_cmd(["read", "--limit", "abc"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--since", err)
+
+    def test_since_still_works_and_composes_with_limit(self):
+        self._rows(6)
+        rc, out, _e = self.run_cmd(["read", "--since", "2", "--limit", "2"])
+        self.assertEqual(rc, 0)
+        self.assertIn("row-04", out)
+        self.assertIn("row-05", out)
+        self.assertNotIn("row-01", out)
+
+    def test_apply_readers_still_see_the_read_branch(self):
+        """The 9ce7b8c trap: a guard placed in the dispatcher would retire
+        ApplyReadersAreGuarded's view of the read verb. Placed in the read
+        branch, a read with --help still prints usage through the guard."""
+        rc, out, _e = self.run_cmd(["read", "--help"])
+        self.assertEqual(rc, 0)
+        self.assertIn("helm chat read", out)
 
 
 class MarkerTest(ChatBase):
@@ -278,7 +588,7 @@ class CmdTest(ChatBase):
     def test_roster_aliases_seats(self):
         """`helm chat roster` is a friendlier spelling of `seats` — it must
         reach the same dispatch (rc 0), never the unknown-subcommand path
-        (owner-requested alias)."""
+        (owner asked for the alias 2026-07-21)."""
         rc, _, err = self.run_cmd(["roster"])
         self.assertEqual(rc, 0)
         self.assertNotIn("unknown subcommand", err)
@@ -288,7 +598,7 @@ class RowIntegrityTest(ChatBase):
     def test_unicode_line_separator_never_tears_the_row(self):
         """U+2028/U+2029 inside a message (a voice paste can carry them) must
         not split the JSON row for readers — read() splits on exactly \\n,
-        never str.splitlines() (found in delivery testing)."""
+        never str.splitlines() (found by the delivery lane 2026-07-20)."""
         chat.post("voice paste second visual line third", who="bob")
         rows, total = chat.read("main")
         self.assertEqual(total, 1)
@@ -304,7 +614,7 @@ class RowIntegrityTest(ChatBase):
 class PostUnknownFlagTest(ChatBase):
     """post REFUSES an unrecognised LEADING flag instead of publishing it —
     and ONLY leading flags: the body is prose and may talk about flags freely.
-    All three findings on the first cut are pinned here: whole-body
+    All three xrev findings on the first cut are pinned here: whole-body
     scanning made flag-prose unsendable, single-dash flags still broadcast,
     and the tests sat after the __main__ guard where direct unittest
     execution never discovered them (this class now precedes it)."""
@@ -334,7 +644,7 @@ class PostUnknownFlagTest(ChatBase):
         self.assertEqual(self._rows(), [])
 
     def test_single_dash_flags_are_refused_too(self):
-        # Review note: startswith("--") left `-x` broadcasting (-h is now a help
+        # xrev: startswith("--") left `-x` broadcasting (-h is now a help
         # ask, answered rc 0 by the dispatcher gate — see HelpBeforeWorkTest)
         rc, _ = self._post("-x")
         self.assertEqual(rc, 2)
@@ -352,7 +662,7 @@ class PostUnknownFlagTest(ChatBase):
         self.assertEqual(self._rows(), [])
 
     def test_prose_about_flags_is_sendable(self):
-        # Review note: the first cut scanned the WHOLE body, so ordinary dev chat
+        # xrev: the first cut scanned the WHOLE body, so ordinary dev chat
         # about CLI flags was unsendable outside stdin
         rc, _ = self._post("--seat", "tester", "please", "use", "--force", "carefully")
         self.assertEqual(rc, 0)
@@ -383,7 +693,8 @@ class DeletedCwdTest(ChatBase):
     """A session whose process cwd was DELETED (a pruned lane worktree — a
     ROUTINE lifecycle state here) must keep chatting. The homing prologue's
     eager os.getcwd() crashed every default chat verb AND all three delivery
-    hooks BEFORE their fail-open guards could catch it (a composition review found this; main handled it, the lane regressed it). seats.safe_cwd
+    hooks BEFORE their fail-open guards could catch it (fable composition
+    HIGH @ 8313d9f; main handled this, the lane regressed it). seats.safe_cwd
     fails open to None -> un-homed -> #main; the session lives."""
 
     def _delete_cwd(self):
@@ -451,7 +762,7 @@ class DeletedCwdTest(ChatBase):
 
 class HelpBeforeWorkTest(ChatBase):
     """--help is answered at the dispatcher, BEFORE any verb runs (the
-    block-before-help class, live-probed): `wait --help` entered
+    block-before-help class, live-probed 2026-07-22): `wait --help` entered
     the wait loop and blocked forever — the mandatory-first-action verb every
     new seat probes — and join/deliver/claim/log-flush DID WORK under --help
     (`claim --help` leased a resource named "--help"). The seats/node/meld
@@ -492,8 +803,8 @@ class HelpBeforeWorkTest(ChatBase):
             self.assertEqual(err, "")
 
     def test_every_seat_verb_answers_help_without_running(self):
-        for verb in ("join", "deliver", "stop-guard", "seats", "seat", "dm",
-                     "claim", "release", "claims"):
+        for verb in ("join", "deliver", "delegation-stop", "stop-guard",
+                     "seats", "seat", "dm", "claim", "release", "claims"):
             rc, out, _ = self._no_dispatch([verb, "--help"])
             self.assertEqual(rc, 0, verb)
             self.assertIn("usage: helm chat %s" % verb, out)
@@ -506,6 +817,13 @@ class HelpBeforeWorkTest(ChatBase):
             self.assertEqual(rc, 0, verb)
             self.assertIn("usage: helm chat %s" % verb, out)
 
+    def test_chat_help_names_meld_verb_in_usage_line(self):
+        """#169: `helm chat` usage line must explicitly name `meld|council|standup`."""
+        from helm import cli
+        usage = cli._VERB_HELP["chat"]
+        self.assertIn("meld", usage)
+        self.assertIn("meld|council|standup", usage)
+
     def test_read_follow_help_returns(self):
         # read --follow --help blocked forever too (same class, chat-local);
         # _no_dispatch traps _follow so a regression fails, never hangs
@@ -513,14 +831,18 @@ class HelpBeforeWorkTest(ChatBase):
         self.assertEqual(rc, 0)
         self.assertIn("usage: helm chat read", out)
 
-    def test_verdict_and_reveal_answer_help_with_the_deferral(self):
-        # the only dispatchable chat verbs deferred to 0.3: --help answers
-        # honestly (rc 0 + the deferral) instead of the verb's bare rc 2
-        for verb in ("verdict", "reveal"):
+    def test_council_verbs_answer_help_with_what_they_now_DO(self):
+        # These four answered "DEFERRED to 0.3" — and kept answering it for a
+        # full release AFTER the council shipped (56bd498), until a reviewer
+        # grepping chat.py read the stale help as proof the feature had never
+        # landed and started rebuilding it (live 2026-07-24). --help must
+        # describe the SHIPPED behaviour; a deferral notice that outlives its
+        # deferral is a surface that lies.
+        for verb in ("verdict", "reveal", "council-status", "council-abort"):
             rc, out, _ = self._no_dispatch([verb, "--help"])
             self.assertEqual(rc, 0, verb)
             self.assertIn("usage: helm chat %s" % verb, out)
-            self.assertIn("0.3", out)
+            self.assertNotIn("DEFERRED", out.upper(), verb)
 
     def test_room_flag_refuses_a_flag_shaped_value(self):
         # THE residual: the --room pop ran BEFORE the help gate and consumed
@@ -621,7 +943,7 @@ class HelpBeforeWorkTest(ChatBase):
 
 
 class SeatActorBindingTest(ChatBase):
-    """Outcome controls (cross-family review): --seat is an ASSERTION, not
+    """codex-3 xrev 2026-07-23 outcome controls: --seat is an ASSERTION, not
     a signer selector. An actor (ambient HELM_CHAT_NAME) that ASSERTS a
     DIFFERENT --seat produces NO effect at all — no row, no DM spool change,
     no ACK transition, no signer call — refused BEFORE any of them. Actor
@@ -649,7 +971,7 @@ class SeatActorBindingTest(ChatBase):
         called on ANY path — which alone makes a mismatch's assert_not_called
         VACUOUS (it passes whether or not the refusal fired). Under this, the
         equal/omitted path DOES call _sign_send, so a mismatch's no-call is a
-        real, discriminating control (cross-family review note)."""
+        real, discriminating control (codex-3 xrev note 2026-07-23)."""
         from helm import cell as cellmod
         os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
         ready = {"configured": True, "usable": True, "state": "ready",
@@ -715,7 +1037,7 @@ class SeatActorBindingTest(ChatBase):
         self.assertEqual(code, 2)
         self.assertIn("cannot act as another seat", err.getvalue())
         self.ss.assert_not_called()                 # no DM signed as seat-b
-        # DIRECT spool control (cross-family review): the recipient's private lane
+        # DIRECT spool control (codex-3 xrev): the recipient's private lane
         # never grew — the refused DM produced no row anywhere, not just no sig
         self.assertEqual(chat.read(chat.dm_room("codex"))[1], 0)
 
@@ -741,7 +1063,7 @@ class SeatActorBindingTest(ChatBase):
         self.assertFalse(any(r.get("ack") == rid for r in self._rows()))
 
     # ---- NON-VACUOUS controls: prove the no-signer assertions discriminate --
-    # cross-family review note: the mismatch tests above run transport-off,
+    # codex-3 xrev note 2026-07-23: the mismatch tests above run transport-off,
     # where _sign_send is never called on ANY path, so their assert_not_called
     # alone is vacuous. These run with the signer GENUINELY configured, so the
     # signer IS reached on success and the refusal's no-call is a real control.
@@ -784,3 +1106,149 @@ class SeatActorBindingTest(ChatBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PostStdinIsTheShellSafePathTest(ChatBase):
+    """`helm chat post` has always read stdin when given no body argument —
+    and its usage never said so, so the whole fleet composed a2a text as
+    double-quoted shell arguments instead.
+
+    That is not a cosmetic gap. In double quotes, backticks are COMMAND
+    SUBSTITUTION: bash runs the quoted content and splices its stdout into
+    the message before helm is ever invoked, so the payload arrives with a
+    hole in it and delivery reports OK. It ate an opus-integrator gate
+    request on 2026-07-25 at the exact token the sentence was about.
+
+    helm cannot guard that — the substitution happens before argv exists,
+    and a hole is indistinguishable from typed text. The only real remedy is
+    a path where the body never becomes a shell word, which already shipped.
+    So these tests hold the DOCUMENTATION down, because an undiscoverable
+    safe path is the same as no safe path.
+    """
+
+    def setUp(self):
+        super().setUp()
+        os.environ["HELM_CHAT_NAME"] = "tester"
+
+    def test_the_help_surface_NAMES_stdin_and_why(self):
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = chat.cmd_chat(["post", "--help"])
+        self.assertEqual(rc, 0)
+        text = out.getvalue() + err.getvalue()
+        self.assertIn("stdin", text.lower())
+        self.assertIn("backtick", text.lower())   # the hazard, not just the flag
+
+    def test_a_body_on_stdin_actually_POSTS(self):
+        """The doc is only true if the path works — pin both, or the help
+        surface becomes the lie."""
+        body = "gate at `git cherry main lane` with 100% | pipes | and $HOME"
+        with mock.patch.object(sys, "stdin", io.StringIO(body)):
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                rc = chat.cmd_chat(["post", "--room", "main"])
+        self.assertEqual(rc, 0)
+        rows = chat.read("main")[0]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["text"], body)   # byte-identical, nothing eaten
+
+    def test_an_EMPTY_stdin_still_refuses_rather_than_posting_blank(self):
+        with mock.patch.object(sys, "stdin", io.StringIO("   \n")):
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                rc = chat.cmd_chat(["post", "--room", "main"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(chat.read("main")[0], [])
+
+
+class TimestampCarriesItsZoneTest(ChatBase):
+    """A bare HH:MM on a coordination surface is a seven-hour trap.
+
+    Rows are stamped UTC (`pk.now_ts` uses gmtime), but the render sliced
+    [11:16] and dropped the Z — so chat printed "09:27" while `stat`, `ps`
+    and `date` on the same box all printed 02:27. Every timestamp an agent
+    compares a chat row against is in the OTHER clock.
+
+    Measured 2026-07-25: a seat read a config mtime of 02:25 against a chat
+    row at 09:27, concluded the file had been untouched for hours when it had
+    been written ninety seconds earlier, and publicly told the integrator to
+    stop doing the correct thing. The marker costs one character and makes
+    the two clocks distinguishable on sight.
+    """
+
+    def test_the_stamp_names_its_clock(self):
+        import time
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        row = {"ts": "%sT09:27:31Z" % today, "from": "someone", "text": "hi"}
+        self.assertTrue(chat._fmt(row).startswith("09:27Z "))
+
+    def test_it_is_the_UTC_slice_and_NOT_local_time(self):
+        """The binding assertion. If someone later renders local time and
+        leaves the Z, this fails — which is the point: a marker that lies is
+        worse than no marker, because it ends the argument."""
+        import time
+        from helm import pk
+        stamp = pk.now_ts()
+        rendered = chat._fmt({"ts": stamp, "from": "s", "text": "t"}).split()[0]
+        self.assertEqual(rendered, time.strftime("%H:%M", time.gmtime()) + "Z")
+
+    def test_an_unknown_time_reads_unknown_not_a_bare_Z(self):
+        """Missing is not midnight and not a zone with no time in it."""
+        for bad in ("", None, "garbage"):
+            out = chat._fmt({"ts": bad, "from": "s", "text": "t"})
+            self.assertTrue(out.startswith("--:-- "), repr(bad))
+            self.assertNotIn("Z ", out.split("s")[0])
+
+    def test_a_reaction_and_its_parent_agree_on_the_clock(self):
+        """Both sides of the comparison go through one helper, because the
+        bug this pins WAS a comparison between two differently-read stamps."""
+        out = chat._fmt({"ts": "2026-07-25T09:27:00Z", "from": "a",
+                         "react": "heart", "tfrom": "b",
+                         "tts": "2026-07-25T08:15:00Z"})
+        self.assertIn("09:27Z", out)
+        self.assertIn("08:15Z", out)
+
+    def test_the_helper_is_total(self):
+        """It runs in front of every rendered row, so it may never raise —
+        and it must never emit a bare zone with no time behind it. Written
+        without restating the implementation, which would assert nothing."""
+        for bad in (None, "", "x", 12345, "2026-07-25", "T::Z", object()):
+            out = chat._hhmmz(bad)
+            self.assertIsInstance(out, str)
+            self.assertTrue(out == "--:--" or out.endswith("Z"), repr(bad))
+            self.assertNotEqual(out, "Z")
+
+    def test_a_row_from_another_day_carries_its_date(self):
+        """A row from a non-today UTC day renders month and day before the
+        time, so a room spanning days is never blind."""
+        row = {"ts": "2020-01-15T03:45:00Z", "from": "s", "text": "t"}
+        self.assertTrue(chat._fmt(row).startswith("Jan 15 03:45Z "))
+
+    def test_reaction_target_from_another_day_carries_its_date(self):
+        """The target timestamp in a reaction row obeys the same day rule,
+        so the comparison the row invites stays consistent."""
+        import time
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        out = chat._fmt({"ts": "%sT10:00:00Z" % today, "from": "a",
+                         "react": "heart", "tfrom": "b",
+                         "tts": "2020-02-20T08:30:00Z"})
+        self.assertIn("Feb 20 08:30Z", out)
+        self.assertIn("10:00Z", out)       # today's row stays compact
+
+    def test_a_today_row_is_byte_identical_to_the_current_format(self):
+        """No regression: a freshly-minted row renders the same compact form."""
+        import time
+        from helm import pk
+        stamp = pk.now_ts()
+        hhmm = time.strftime("%H:%M", time.gmtime()) + "Z"
+        rendered = chat._fmt({"ts": stamp, "from": "s", "text": "t"})
+        self.assertTrue(rendered.startswith(hhmm + " "))
+
+    def test_the_day_aware_helper_never_raises(self):
+        """Same contract as _hhmmz: runs on every rendered row, must never
+        crash, must never emit a bare Z with no time behind it."""
+        for bad in (None, "", "x", 12345, "2026-07-25", "T::Z", object()):
+            out = chat._day_stamp(bad)
+            self.assertIsInstance(out, str)
+            self.assertTrue(out == "--:--" or out.endswith("Z"), repr(bad))
+            self.assertNotEqual(out, "Z")
