@@ -23,7 +23,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import configs, doctor, homes, hooks, pk, record  # noqa: E402
 
@@ -405,6 +406,32 @@ class WiringTest(WiringBase):
         row = next(r for r in record.status_rows() if r["path"] == a)
         self.assertTrue(row["hook"])
 
+    def test_install_rederives_both_legs_after_foreign_conflict(self):
+        a = self.mk_home("a-user-dev", settings={"foreign": {"before": True}})
+        real = configs.write_file
+        calls = []
+
+        def conflict_once(path, content, expected_revision=None):
+            calls.append(expected_revision)
+            if len(calls) == 1:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                data["foreignAfterPlan"] = [1, 2, 3]
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                return {"error": "conflict", "code": "conflict"}
+            return real(path, content, expected_revision=expected_revision)
+
+        with mock.patch.object(configs, "write_file", side_effect=conflict_once):
+            action, detail = record.install_home(a)
+        self.assertEqual(action, "add")
+        self.assertIn("CAS attempts: 2", detail)
+        got = self.read_settings(a)
+        self.assertEqual(got["foreign"], {"before": True})
+        self.assertEqual(got["foreignAfterPlan"], [1, 2, 3])
+        for ev in record.HOOK_EVENTS:
+            self.assertIn(record.hook_command(), record._event_cmds(got, ev))
+
     def test_install_dry_writes_nothing(self):
         self.mk_home("a-user-dev")
         rc, out, _ = self.run_cmd(["install", "--dry"])
@@ -444,3 +471,60 @@ class WiringTest(WiringBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EditPathsCarryTheDirectoryTest(RecordBase):
+    """A basename cannot say WHERE a write went, and that is the only question
+    a tool-boundary whisper needs. Live 2026-07-26: five durable lessons went
+    into a private memory dir instead of `helm store`, the same lesson was
+    taught to a teammate twice because the fleet never saw them, and nothing
+    could notice — every write had been reduced to a filename before any
+    watcher saw it."""
+
+    def _write(self, path, failed=False):
+        e = self.ev(tool="Write", tin={"file_path": path},
+                    resp={} if not failed else None)
+        if failed:
+            e["hook_event_name"] = record.FAIL_EVENT
+            e["error"] = "Exit code 1"
+        rc, _o, _r = self.run_cmd(["--hook-json"], json.dumps(e))
+        self.assertEqual(rc, 0)
+
+    def _lines(self, name, sid="sess-1"):
+        fp = os.path.join(record.session_dir(sid), name)
+        if not os.path.exists(fp):
+            return []
+        return [l for l in open(fp).read().splitlines() if l.strip()]
+
+    def test_the_directory_survives_into_edit_paths(self):
+        p = os.path.join(self.tmp, "sub", "deep", "lesson.md")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        self._write(p)
+        got = self._lines("edit-paths.log")
+        self.assertTrue(got, "edit-paths.log was not written")
+        self.assertIn("deep", got[-1], "the directory was discarded")
+        self.assertIn("lesson.md", got[-1])
+
+    def test_edit_targets_is_UNCHANGED_basenames_only(self):
+        """Two live readers (seats.py's verify rung, handoff.py's snapshot)
+        expect bare basenames; widening that file would break both."""
+        p = os.path.join(self.tmp, "sub", "deep", "lesson.md")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        self._write(p)
+        got = self._lines("edit-targets.log")
+        self.assertEqual(got[-1], "lesson.md")
+        self.assertNotIn("/", got[-1])
+
+    def test_a_home_path_records_tilde_relative(self):
+        self.assertTrue(
+            record._home_relative(os.path.join(os.path.expanduser("~"), "x.md"))
+            .startswith("~/"),
+            "a home path must record tilde-relative, never absolute")
+
+    def test_a_FAILED_edit_records_neither(self):
+        """A failed edit landed nowhere and must not ground anything."""
+        p = os.path.join(self.tmp, "sub", "nope.md")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        self._write(p, failed=True)
+        self.assertEqual(self._lines("edit-paths.log"), [])
+        self.assertEqual(self._lines("edit-targets.log"), [])

@@ -686,6 +686,7 @@ def cmd_homes(args):
             return _fail(res)
         print("helm homes: " + (res.get("note") or "ok"))
         return 0
-    print("helm homes: unknown subverb '%s' (%s)" % (verb, cmd_homes.__doc__.split("\n")[0]),
-          file=sys.stderr)
+    print("helm homes: unknown subverb '%s' (prepare <provider> <email>|"
+          "verify [<name>]|archive <name>|restore <name>|migrate <name>|"
+          "archives)" % verb, file=sys.stderr)
     return 2

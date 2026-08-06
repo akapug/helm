@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from helm import automap, harnesses, home, pk, registry
+from helm import autocompact, automap, harnesses, home, pk, registry
 
 EDGE = {"rel": "forked-from", "to": "beta", "note": "", "confirmed": True}
 
@@ -225,6 +225,40 @@ class TestProjections(RegistryBase):
                 self.assertTrue(r["sources"], r["name"])
                 self.assertTrue(r["source"], r["name"])
 
+    def test_manifest_scan_roots_match_the_producer(self):
+        fresh = os.path.join(self.tmp, "fresh-home")
+        cases = (
+            ("", (os.path.join(fresh, "dev"),)),
+            ("~/src::/srv/repos", (os.path.join(fresh, "src"), "/srv/repos")),
+        )
+        for raw, want in cases:
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {
+                    "HOME": fresh,
+                    "HELM_SCAN_ROOTS": raw,
+                    "MELD_SCAN_ROOTS": "",
+            }):
+                self.assertEqual(tuple(automap._scan_roots()), want)
+                row = next(r for r in registry.projections()
+                           if r["name"] == "registry")
+                self.assertTrue(all(root in row["sources"] for root in want))
+
+    def test_manifest_declares_json_serializable_genesis(self):
+        import json
+        rows = registry.projections()
+        by = {r["name"]: r for r in rows}
+        self.assertEqual(by["registry"]["genesis"], {
+            "json": {"version": 1, "projects": {}},
+            "volatile_strings": ("generated_ts",),
+        })
+        self.assertEqual(by["codex-cwd-cache"]["genesis"], {
+            "json": {}, "volatile_strings": (),
+        })
+        self.assertEqual(
+            [r["name"] for r in rows if r.get("genesis")],
+            ["registry", "codex-cwd-cache"],
+        )
+        json.dumps(rows)
+
     def test_survey_classifies_synced_estate_with_zero_squatters(self):
         repo = self._repo("src", "alpha")
         registry.sync(observations=[_obs(repo)])
@@ -247,6 +281,56 @@ class TestProjections(RegistryBase):
         _rows, squat = registry.projection_survey()
         self.assertEqual(squat["home"], ["_global/.state/mystery.bin"])
         self.assertEqual(squat["cache"], ["stray.json"])
+
+    def test_storage_matrix_artifact_lock_and_writer_are_declared_state(self):
+        home.scaffold_global()
+        state = os.path.join(home.global_dir(), ".state")
+        os.makedirs(state, exist_ok=True)
+        for name in ("storage-matrix.json", "storage-matrix.json.lock",
+                     "storage-matrix.json.123.abc.tmp"):
+            pk.atomic_write(os.path.join(state, name), "{}")
+        rows, squat = registry.projection_survey()
+        row = next(r for r in rows if r["name"] == "storage-matrix")
+        self.assertEqual(row["kind"], "state")
+        self.assertEqual(sorted(row["files"]), [
+            "_global/.state/storage-matrix.json",
+            "_global/.state/storage-matrix.json.123.abc.tmp",
+            "_global/.state/storage-matrix.json.lock",
+        ])
+        self.assertEqual(squat, {"home": [], "cache": []})
+
+    def test_autocompact_state_and_fixed_delivery_lock_are_declared(self):
+        home.scaffold_global()
+        state = os.path.join(home.global_dir(), ".state")
+        os.makedirs(state, exist_ok=True)
+        for name in ("autocompact.json", "autocompact.json.lock"):
+            pk.atomic_write(os.path.join(state, name), "{}")
+        delivery_lock = autocompact._refusal_delivery_lock()
+        delivery_lock.close()
+        rows, squat = registry.projection_survey()
+        row = next(r for r in rows if r["name"] == "autocompact")
+        self.assertEqual(row["kind"], "state")
+        self.assertEqual(sorted(row["files"]), [
+            "_global/.state/autocompact.json",
+            "_global/.state/autocompact.json.delivery.lock",
+            "_global/.state/autocompact.json.lock",
+        ])
+        self.assertEqual(squat, {"home": [], "cache": []})
+
+    def test_chat_event_receipts_are_declared_state(self):
+        home.scaffold_global()
+        path = os.path.join(home.global_dir(), ".state",
+                            "chat-event-receipts", "0123456789abcdef",
+                            "main.jsonl.events.json")
+        pk.atomic_write(path, "{}")
+        rows, squat = registry.projection_survey()
+        row = next(r for r in rows if r["name"] == "chat-event-receipts")
+        self.assertEqual(row["kind"], "events")
+        self.assertEqual(row["files"], [
+            "_global/.state/chat-event-receipts/0123456789abcdef/"
+            "main.jsonl.events.json",
+        ])
+        self.assertEqual(squat, {"home": [], "cache": []})
 
     def test_symlinks_never_crossed_or_flagged(self):
         # an adopted (symlinked) home is someone else's estate — its contents

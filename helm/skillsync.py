@@ -8,13 +8,13 @@ hand) exists only where it landed. Proven live: a personal skill sat in one
 credhome, invisible to the owner's other session, because only some homes were
 whole-dir symlinks to the shared hub.
 
-Canonical = a shared skills hub (default `~/.helm/skills-canonical`;
-HELM_SKILLS_CANONICAL overrides — e.g. to point at an external physics-owner's
-hub whose entries are per-skill symlinks into that source repo, so upstream
-skill edits propagate via git with no re-sync). It lives outside every
-credhome (survives archive/recreate), and a per-home second copy would just
-mint a two-writer drift problem. Lean-configs: canonical holds the one
-approved set; a home symlinked to it CANNOT grow private bloat.
+Canonical = an external skills hub (HELM_SKILLS_CANONICAL env, else the host's
+authored `skills_canonical`; empty by default): its entries are per-skill
+symlinks into a source repo, so skill edits propagate via git with no re-sync —
+the source repo stays the physics owner, helm owns DISTRIBUTION. It lives
+outside every credhome (survives archive/recreate), and a helm-owned second
+copy would just mint a two-writer drift problem. Lean-configs: canonical holds
+the one approved set; a home symlinked to it CANNOT grow private bloat.
 
 Sync is two phases, dry-run by default (the sweep/drain/gc law):
   1. MERGE — union every stray (an entry in a REAL skills dir that canonical
@@ -45,29 +45,33 @@ import sys
 import time
 
 from . import home as _home
-
-# The default hub (see module docstring; HELM_SKILLS_CANONICAL overrides).
-DEFAULT_CANONICAL = os.path.join(
-    os.path.expanduser("~"), ".helm", "skills-canonical")
+from . import registry
 
 BACKUP_ROOT = os.path.join(os.path.expanduser("~"), ".skills-premerge-backup")
 
 
 def canonical():
-    """The canonical skills source: HELM_SKILLS_CANONICAL env else the default
-    hub. Deliberately NOT HELM_SKILL_DECK (home_create's content-source knob):
-    a deck may point at a git-tracked skills dir — merging strays (personal/
-    local skills) into a tracked as-public repo dir is exactly the leak sync
-    must never make. A well-formed hub is a gitignored dir whose entries can
-    symlink INTO a source repo: repo skills stay repo-owned, local strays stay
-    local, one distribution point."""
+    """The canonical skills source, or None when none is configured — the public
+    default, which makes skill sync OPT-IN. Resolution: HELM_SKILLS_CANONICAL
+    env, else the host's authored `skills_canonical` (registry-authored.json
+    `host` block). No site-specific path ships in code. The source should be a
+    gitignored hub whose entries symlink INTO their repo (repo skills stay
+    repo-owned, local strays stay local, one distribution point) — deliberately
+    NOT a repo's own tracked skills dir, since merging strays into a tracked
+    as-public dir is exactly the leak sync must never make.
+
+    REFUSES (propagates registry.AuthoredUnreadable) rather than returning None
+    when the authored layer EXISTS but is unreadable — a corrupt file must not
+    read as 'no hub configured' and silently no-op the sync."""
     c = _home.env("SKILLS_CANONICAL")
-    if c:
-        return os.path.realpath(os.path.expanduser(c))
-    # Realpath the default too: a hub may itself be a symlink to a physical
-    # store, and mint (canonical()) vs sync (which realpaths) must agree on the
-    # path STRING or a wired home relinks off the raw path on the next sync.
-    return os.path.realpath(DEFAULT_CANONICAL)
+    if not c:
+        c = registry.authored_host().get("skills_canonical")
+    if not c:
+        return None
+    # Realpath the source: a symlinked hub resolves to its physical store, and
+    # mint (canonical()) vs sync (which realpaths) must agree on the path STRING
+    # or a wired home relinks off the raw path on the next sync.
+    return os.path.realpath(os.path.expanduser(c))
 
 
 def config_dirs(claude_root=None, default_claude=None, seats_root=None):
@@ -259,21 +263,19 @@ def _log(backup_root, line):
 def sync(canon=None, dirs=None, backup_root=None, apply=False):
     """The whole cycle: merge strays into canonical, then wire every config
     dir. Idempotent — a fully-wired estate reports zero changes. -> report."""
-    canon = os.path.realpath(canon or canonical())
+    try:
+        canon = canon or canonical()
+    except registry.AuthoredUnreadable as e:
+        return {"error": "authored layer unreadable (%s) — refusing sync; the "
+                         "config is recoverable from its .corrupt backup" % e}
+    if not canon:
+        return {"error": "no canonical skills source configured (set "
+                         "HELM_SKILLS_CANONICAL or the host `skills_canonical` "
+                         "authored field) — skill sync is opt-in"}
+    canon = os.path.realpath(canon)
     backup_root = backup_root or BACKUP_ROOT
     if not os.path.isdir(canon):
-        # a missing CUSTOM hub is a loud error; a missing DEFAULT hub = fresh install
-        if canon != os.path.realpath(DEFAULT_CANONICAL):
-            return {"error": "canonical skills dir missing: %s (set "
-                             "HELM_SKILLS_CANONICAL or restore the canonical hub)" % canon}
-        if not apply:  # a dry-run must NOT mutate a fresh HOME; return the FULL
-            # result shape (empty) so cmd_sync renders it, + a note that guides
-            # the fresh install to `--apply`
-            return {"canonical": canon, "backup_root": backup_root, "apply": False,
-                    "merged": [], "wired": [], "failed": [],
-                    "note": "fresh install - run `helm skills sync --apply` to "
-                            "seed the canonical hub at %s" % canon}
-        os.makedirs(canon, exist_ok=True)  # fresh install: seed the hub on apply
+        return {"error": "canonical skills dir missing: %s" % canon}
     if dirs is None:
         dirs = config_dirs()
     strays = plan_merge(canon, dirs)
@@ -306,8 +308,6 @@ def cmd_sync(args):
         return 1
     mode = "APPLIED" if apply else "dry-run (--apply to execute)"
     print("helm skills sync [%s] — canonical: %s" % (mode, r["canonical"]))
-    if r.get("note"):
-        print("  " + r["note"])
     for name, action in r["merged"]:
         print("  merge  %-24s %s" % (name, action))
     changed = 0

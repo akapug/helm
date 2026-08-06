@@ -23,7 +23,36 @@ import time
 
 from . import pk, registry
 
-SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lineage_seed.json")
+# THE SEED IS OWNER DATA, SO IT LIVES IN THE OWNER'S HOME — not in the repo.
+#
+# A real lineage_seed.json maps the operator's whole portfolio: which projects
+# descend from which, what composes what, and the decisions behind each edge.
+# Shipped in the tree, that map would publish the operator's private estate —
+# and it would contradict helm's own first principle, which the README states
+# as "helm references authoritative homes — it never copies them". Every other
+# piece of owner truth already lives under ~/.helm; the seed is no different.
+#
+# So: prefer the owner's home, fall back to a repo copy for anyone who ships an
+# EXAMPLE, and rely on the caller's existing empty default when neither exists.
+# Absent seed was already a supported state — read_json defaults to
+# {"edges": [], "external": []} — so this needs no new failure path.
+_REPO_SEED = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "lineage_seed.json")
+
+
+def seed_path():
+    """The owner's seed if present, else a repo-shipped example, else the repo
+    path (which read_json turns into the empty default when missing)."""
+    from . import home
+    try:
+        owned = os.path.join(home.helm_home(), home.GLOBAL, "lineage_seed.json")
+    except Exception:
+        return _REPO_SEED
+    return owned if os.path.exists(owned) else _REPO_SEED
+
+
+# Back-compat for any caller that imported the constant directly.
+SEED_PATH = _REPO_SEED
 
 # Rels that place a node UNDER its parent in the tree (edge src = child,
 # edge dst = parent). checkout-of is ancestry for rendering — a checkout hangs
@@ -46,7 +75,7 @@ def apply_seed(seed=None):
     endpoints exist. Returns {"externals", "externals_skipped", "edges",
     "edges_skipped"} — skipped edges carry their missing endpoints."""
     if seed is None:
-        seed = pk.read_json(SEED_PATH, {"edges": [], "external": []})
+        seed = pk.read_json(seed_path(), {"edges": [], "external": []})
     report = {"externals": [], "externals_skipped": [], "edges": [], "edges_skipped": []}
 
     known = registry.load().get("projects", {})
@@ -298,7 +327,7 @@ def cmd_lineage(args):
         for s in rep["externals_skipped"]:
             print("  ~ external '%s' skipped: %s" % (s["name"], s["reason"]))
         for s in rep["edges_skipped"]:
-            print("  ! edge %s -%s-> %s skipped: missing %s (helm sync, or `helm lineage external`)"
+            print("  ! edge %s -%s-> %s skipped: missing %s (helm sync, or `helm lineage external <name> <path>`)"
                   % (s["src"], s["rel"], s["dst"], ", ".join(s["missing"])))
         return 0
     if verb == "add":

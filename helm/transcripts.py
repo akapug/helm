@@ -531,7 +531,7 @@ def _native_cmd(row, model=None):
     subprocess child (transcript persistence silently OFF —
     child-stamp-kills-seat-persistence), so the line unsets the stamp trio."""
     from . import seat
-    unset = "env -u " + " -u ".join(seat.CHILD_STAMP_VARS) + " "
+    unset = seat.paste_unset_prefix()
     sid = shlex.quote(row["i"])
     if row["h"] == "claude":
         return unset + "claude" + (f" --model {shlex.quote(model)}" if model else "") + f" --resume {sid}"

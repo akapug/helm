@@ -86,21 +86,77 @@ class TestApplySeed(LineageBase):
         self.assertEqual(len(reg["beta"]["edges"]), 2)
         self.assertEqual(len([n for n in reg if n == "vendor"]), 1)
 
-    def test_packaged_seed_shape(self):
-        # The shipped seed is illustrative (no real estate); this pins the
-        # SHAPE the loader relies on, not any specific ancestry.
-        with open(lineage.SEED_PATH, encoding="utf-8") as f:
-            seed = json.load(f)
-        self.assertTrue(seed["edges"])
-        for e in seed["edges"]:
-            for k in ("src", "rel", "dst", "note"):
-                self.assertIn(k, e)
-            self.assertIsInstance(e["confirmed"], bool)
-        for x in seed["external"]:
-            self.assertIn("name", x)
-            self.assertIn("path", x)
-        # the read-only prior-art root is the one illustrative external
-        self.assertIn("references", [x["name"] for x in seed["external"]])
+    def test_seed_prefers_the_owner_home_over_the_repo(self):
+        """The seed is OWNER DATA and lives in ~/.helm, not in the tree.
+
+        This test used to open lineage.SEED_PATH and assert the owner's REAL
+        graph — several private project names and their edges — as literals in
+        tracked test code. So untracking the data file alone would have left the
+        same private map sitting in the test suite: the leak one layer over from
+        the one an independent review found in the as-public adjudication.
+
+        The guard below caught this docstring too, on its first run, because my
+        first draft explained the fix BY NAMING the projects it removes. An
+        exemption for the author's own prose is how the rule dies.
+
+        What is worth pinning is the CONTRACT, and a synthetic seed pins it
+        without publishing anybody's portfolio."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            prior = os.environ.get("HELM_HOME")
+            os.environ["HELM_HOME"] = tmp
+            try:
+                from helm import home
+                owned = os.path.join(home.helm_home(), home.GLOBAL,
+                                     "lineage_seed.json")
+                os.makedirs(os.path.dirname(owned), exist_ok=True)
+                with open(owned, "w", encoding="utf-8") as f:
+                    json.dump({"edges": [{"src": "alpha", "rel": "descends-from",
+                                          "dst": "beta", "note": "synthetic",
+                                          "confirmed": True}],
+                               "external": [{"name": "gamma"}]}, f)
+                self.assertEqual(lineage.seed_path(), owned)
+                seed = json.load(open(owned, encoding="utf-8"))
+                for e in seed["edges"]:
+                    for k in ("src", "rel", "dst", "note"):
+                        self.assertIn(k, e)
+                    self.assertTrue(e["confirmed"])
+            finally:
+                if prior is None:
+                    os.environ.pop("HELM_HOME", None)
+                else:
+                    os.environ["HELM_HOME"] = prior
+
+    def test_an_absent_seed_is_a_supported_state_not_a_crash(self):
+        """No owner seed and no repo copy must degrade to the empty default —
+        which is what a fresh clone by anyone other than the owner looks like."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            prior = os.environ.get("HELM_HOME")
+            os.environ["HELM_HOME"] = tmp
+            try:
+                p = lineage.seed_path()
+                from helm import pk
+                self.assertEqual(pk.read_json(p, {"edges": [], "external": []}),
+                                 {"edges": [], "external": []})
+            finally:
+                if prior is None:
+                    os.environ.pop("HELM_HOME", None)
+                else:
+                    os.environ["HELM_HOME"] = prior
+
+    def test_no_private_project_name_is_hardcoded_in_this_suite(self):
+        """The regression guard for the leak this commit closes: the test file
+        must not carry the owner's private project graph as literals."""
+        with open(__file__, encoding="utf-8") as f:
+            body = f.read()
+        # names the as-public adjudication flagged; checked as whole words
+        for name in ("internal-tool-beta", "sample-project", "sample-provider"):
+            hits = [ln for ln in body.splitlines()
+                    if name in ln and "adjudication" not in ln
+                    and not ln.strip().startswith("#")
+                    and "for name in" not in ln]
+            self.assertEqual(hits, [], "private name %r is back in the suite" % name)
 
 
 class TestRender(LineageBase):

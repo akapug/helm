@@ -338,6 +338,64 @@ def _announce_text(head_sha, seats, web_restart):
                                             rearm))
 
 
+def _spare_last_wake_path(all_waiters, kill_set):
+    """[waiter] that MUST NOT be signaled: each is the last wake path its seat
+    has left once `kill_set` is removed.
+
+    A SEAT'S BEACON IS ITS WAKE PATH. Nothing external can re-invoke a PTY
+    agent, so a seat re-arms only ON A TURN, and it only gets a turn if
+    something wakes it. Signal every waiter a seat owns and it cannot re-arm —
+    not "until its next turn", but ever, because the thing that would have
+    carried that turn is exactly what was just killed. The report's own line,
+    "-> SIGTERM sent (re-arms at its owner's next turn)", is true precisely
+    when a turn can still reach the seat; this is what keeps that true.
+
+    WHY THE PREDICATE IS THIS ONE. The obvious guard — "is this seat idle /
+    will it get a turn anyway" — is not knowable from here, and an earlier
+    attempt keyed on pending rows neutered the verb and was reverted. This asks
+    a question that is pure arithmetic on the plan scan() already returns: does
+    MY OWN kill set remove this seat's last waiter? Nothing about the seat's
+    future is guessed.
+
+    IT DOES NOT DEPEND ON THE OPEN QUESTION, which is why it can land while
+    that question is still open: whether a Monitor's SIGTERM-exit notification
+    re-invokes an IDLE agent's turn loop is unverified (rearm.py's own comment
+    asserts "the owners still re-arm via the independent Monitor-exit path").
+    If it does, sparing one already-stale beacon costs almost nothing. If it
+    does not, this is the difference between a live fleet and a deaf one.
+    Measured on a live fleet: 12 stale waiters, and an unguarded
+    --apply would have left SEVEN of nine seats holding zero — including the
+    integrator. Staleness tracks TRUNK VELOCITY, not seat health: one land
+    twelve minutes earlier is what made a fifteen-minute-old beacon stale, so
+    on a night that lands often the kill set converges on the whole fleet minus
+    whoever just took a turn — i.e. exactly the quiet seats.
+
+    THE VERB KEEPS ITS TEETH. A seat with six stale waiters still loses five.
+    Only the last one is held back, and the caller reports it LOUDLY by name so
+    a seat left on pre-HEAD beacon code is visible rather than quietly wrong.
+
+    Waiters whose status is UNKNOWN are never signalable, so they already count
+    as survivors here — a seat this pass cannot classify is not a seat this
+    pass may leave deaf."""
+    kill_ids = {id(w) for w in kill_set}
+    by_seat = {}
+    for w in all_waiters:
+        if w.get("seat"):
+            by_seat.setdefault(w["seat"], []).append(w)
+    spared = []
+    for _seat, group in sorted(by_seat.items()):
+        if any(id(w) not in kill_ids for w in group):
+            continue                      # a survivor remains — signal freely
+        doomed = [w for w in group if id(w) in kill_ids]
+        if not doomed:
+            continue
+        # THE NEWEST of them: closest to HEAD, least stale, likeliest to speak
+        # the current delivery protocol. pid breaks a start-time tie so the
+        # choice is deterministic and a test can pin it.
+        spared.append(max(doomed, key=lambda w: (w.get("start") or 0, w["pid"])))
+    return spared
+
+
 def apply(plan):
     """Execute the owned pass over `plan`. ORDER IS LOAD-BEARING: announce
     FIRST (ambient — wakes nobody), THEN SIGTERM only signalable-stale waiters,
@@ -348,12 +406,20 @@ def apply(plan):
     verb exists to replace, so signal/restart NOTHING and surface the reason
     loudly; (b) each pid is re-validated (starttime + argv shape) right before
     os.kill, so a waiter that exited into a recycled pid during the announce
-    round-trip is skipped, not killed."""
+    round-trip is skipped, not killed.
+
+    THIRD FAIL-SAFE, and it is the one that keeps the fleet alive: NEVER SIGNAL
+    A SEAT'S LAST REMAINING WAITER (see `_spare_last_wake_path`)."""
     stale_waiters = [w for w in plan["waiters"] if w["signalable"]]
+    spared = _spare_last_wake_path(plan["waiters"], stale_waiters)
+    if spared:
+        keep = {id(w) for w in spared}
+        stale_waiters = [w for w in stale_waiters if id(w) not in keep]
     web = plan.get("web")
     web_restart = bool(web and web["stale"])
     actions = {"announced": False, "signaled": [], "failed": [], "skipped": [],
-               "web_restarted": False, "web_msg": None}
+               "web_restarted": False, "web_msg": None,
+               "spared": [[w["pid"], w["seat"]] for w in spared]}
     if not stale_waiters and not web_restart:
         return actions
     txt = _announce_text(plan.get("head_sha"),
@@ -381,10 +447,16 @@ def apply(plan):
     if web_restart:
         ok, msg = _systemctl_restart(web["unit"])
         actions["web_restarted"], actions["web_msg"] = ok, msg
-    summary = "signaled %d stale waiter%s%s%s" % (
+    summary = "signaled %d stale waiter%s%s%s%s" % (
         len(actions["signaled"]), "s"[:len(actions["signaled"]) != 1],
         "; %d skipped (pid reuse/exit)" % len(actions["skipped"])
         if actions["skipped"] else "",
+        # NAMED, never a bare count: a spared waiter means a seat is still on
+        # pre-HEAD beacon code and needs a hand re-arm. A number alone would
+        # make that invisible in exactly the log someone greps afterwards.
+        "; SPARED %s (last wake path — re-arm by hand)"
+        % ", ".join(sorted(s for _pid, s in actions["spared"]))
+        if actions["spared"] else "",
         "; web restarted" if actions["web_restarted"] else "")
     pk.event("rearm", "waiters", summary)
     return actions
@@ -430,6 +502,14 @@ def _print_report(plan, actions, applying):
     signaled = set(actions["signaled"]) if actions else set()
     skipped = set(actions.get("skipped", [])) if actions else set()
     aborted = bool(actions and actions.get("announce_error"))
+    # RE-DERIVED FROM THE PLAN, not read out of `actions`, so the DRY RUN shows
+    # exactly what an --apply would spare. A dry run that hid the sparing would
+    # be the one report where "what will this do" is answered wrong, and it is
+    # the report people read before deciding to run the real thing. apply()
+    # computes this from the same plan by the same function, so the two agree
+    # by construction rather than by two lists being kept in step.
+    spared = {w["pid"] for w in _spare_last_wake_path(
+        waiters, [w for w in waiters if w["signalable"]])}
     print("  waiters (helm chat wait): %s"
           % ("" if waiters else "none live"))
     for w in waiters:
@@ -438,6 +518,10 @@ def _print_report(plan, actions, applying):
             note = "  (no --seat — SKIPPED, never signaled)"
         elif w["status"] == "UNKNOWN":
             note = "  (start/HEAD unreadable — SKIPPED)"
+        elif w["pid"] in spared:
+            note = ("  -> SPARED, its seat's LAST wake path (stale, and killing "
+                    "it removes the only thing that can give this seat the turn "
+                    "it would re-arm on) — re-arm this seat by hand")
         elif w["pid"] in signaled:
             note = "  -> SIGTERM sent (re-arms at its owner's next turn)"
         elif w["pid"] in skipped:
@@ -471,9 +555,18 @@ def _print_report(plan, actions, applying):
         # a land never self-propagates to a running proxy — each carries
         # pre-HEAD config until respawned by its owner (per-instance + family
         # cli-proxies too).
-        print("    respawn recipe: `helm seat down <seat> && helm seat up "
-              "<seat>` (or the daemon's own restart) — a land never "
-              "self-propagates to a running proxy")
+        # NAMES THE PID, because a pid is what these rows actually carry.
+        # The old recipe asked the reader to substitute a seat name twice,
+        # and no advisory row has a `seat` key at all (only the waiters
+        # branch does) — these are ANY pre-HEAD long-lived helm process
+        # (`helm web`, `helm keepalive`, a proxy), and `helm seat up/down`
+        # takes a proxy FAMILY or family-instance, not a pid and not a seat
+        # every row can supply. So it asked for a substitution the reader
+        # could not make.
+        print("    respawn: each row above names its PID — restart it from "
+              "whatever owns it (a proxy: `helm seat down <family[-N]> && "
+              "helm seat up <family[-N]>`; a daemon: its own restart). "
+              "A land never self-propagates to a running proxy")
     n_stale = sum(1 for w in waiters if w["status"] == "STALE")
     tail = "%d waiter%s stale, web %s, %d advisory" % (
         n_stale, "s"[:n_stale != 1], _web_word(web), len(adv))

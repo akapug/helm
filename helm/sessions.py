@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""helm sessions — every local session, all harnesses, keyed to your projects.
+"""helm sessions — every local claude + codex session, keyed to your projects.
+
+NOT all harnesses. The catalog indexes exactly two transcript formats —
+catalog._files() globs the claude and codex roots, and _row()/_session_id()
+decode only those two shapes — so opencode and pi sessions, though scanned by
+harnesses.all_observations() and therefore present in `helm projects`, have no
+row source here. Say claude + codex when describing this verb; "all harnesses"
+is true of the auto-map, not of the catalog.
+
+Do NOT explain that scope by what helm can RESUME: helm mints pi resume
+commands too (`helm pi resume --session|--continue`, pi.py). The boundary is
+which transcript formats the catalog can read, nothing else.
 
 The catalog is the row source; the registry is the lens:
 sessions group under the helm-known project whose tree their cwd lives in, so
@@ -13,6 +24,7 @@ import stat
 import sys
 import time
 
+from . import procid
 from . import registry
 
 
@@ -160,7 +172,7 @@ def proc_home(pid):
     how a live pane whose account is stated outright got attributed by guesswork
     instead."""
     try:
-        with open("/proc/%d/environ" % pid, "rb") as f:
+        with open(os.path.join(procid.proc_root(), str(pid), "environ"), "rb") as f:
             env = f.read().decode("utf-8", "replace").split("\0")
     except OSError:
         return None
@@ -209,18 +221,38 @@ def _pid_is_claude(pid, want_start=None):
     a `sleep` with a hostile CLAUDE_CONFIG_DIR in its environ was claimed as a
     live session, its unrelated home was then read as rung-0 environ TRUTH and
     latched — a silent wrong-account resume, the exact failure this lane
-    exists to prevent). comm answers WHAT the pid is; procStart (stat field
-    22, position 19 after the comm split) answers WHICH incarnation."""
+    exists to prevent). procid answers WHAT the pid is; procStart (stat field
+    22, position 19 after the comm split) answers WHICH incarnation.
+
+    WHAT-IT-IS IS NO LONGER COMM ALONE. comm is the exec'd binary's BASENAME,
+    so a pane that execs `.../claude/versions/<semver>` directly is named for
+    the semver and was rejected here — measured on a live pane whose
+    own valid sessions/<pid>.json was then read as holding nothing, and whose
+    seat was reported DEAD mid-turn. `procid.is_claude` adds the kernel's own
+    `/proc/<pid>/exe` as a SECOND ACCEPT PATH.
+
+    THAT IS A WIDENING AND NOT A HARDENING: is_claude ORs, so the hostile
+    `sleep` of the repro above is still accepted on the comm rung it can set
+    for itself. The spoof surface is UNCHANGED. This paragraph previously said
+    the opposite, attached to the very repro it does not defend.
+
+    is_claude may also answer None (cannot tell). Folded to False HERE
+    DELIBERATELY: the pids reaching this function come from OUR OWN cred-home
+    session records, so their exe is readable and the None case is not
+    reachable by that route. The honest tri-state matters where the /proc WALK
+    meets other users' pids, and it is spent there — orcaadopt maps None to
+    BLIND rather than to "not a claude process"."""
     try:
-        with open("/proc/%d/comm" % pid, "rb") as f:
-            if f.read().strip() != b"claude":
-                return False
+        with open(os.path.join(procid.proc_root(), str(pid), "comm"), "rb") as f:
+            comm_raw = f.read()
     except OSError:
+        comm_raw = None
+    if procid.is_claude(pid, comm_raw) is not True:
         return False
     if not want_start:
         return True
     try:
-        with open("/proc/%d/stat" % pid, "rb") as f:
+        with open(os.path.join(procid.proc_root(), str(pid), "stat"), "rb") as f:
             fields = f.read().decode("utf-8", "replace").rpartition(")")[2].split()
         return fields[19] == str(want_start)
     except (OSError, IndexError):
@@ -257,22 +289,32 @@ def live_sids():
     # A guard whose only rung is the record is therefore blindest exactly where
     # a double-open is most likely. argv carries `--resume <sid>` for any pane
     # started that way, so it covers the gap without depending on the same file.
-    for entry in glob.glob("/proc/[0-9]*/cmdline"):
+    for entry in glob.glob(os.path.join(procid.proc_root(), "[0-9]*", "cmdline")):
+        # THE PID COMES FROM THE PATH'S OWN SHAPE, not from a fixed component
+        # index: `entry.split("/")[2]` only ever meant "pid" while the root was
+        # literally "/proc", so it silently addressed the wrong component the
+        # moment the root became injectable.
+        try:
+            pid = int(os.path.basename(os.path.dirname(entry)))
+        except ValueError:
+            continue
         try:
             with open(entry, "rb") as f:
                 argv = f.read().decode("utf-8", "replace").split("\0")
         except OSError:
             continue
-        if not argv or not argv[0].endswith("claude"):
+        # argv[0] IS THE WEAKEST OF THE THREE and stays only as a fast accept:
+        # a versioned-launch pane's argv[0] is the binary PATH, which does not
+        # end in "claude", and `/tmp/bash-claude` does. The kernel's exe link
+        # settles both cases.
+        if not argv or not (argv[0].endswith("claude")
+                            or procid.exe_is_claude(pid)):
             continue
         for flag in ("--resume", "-r"):
             if flag in argv:
                 i = argv.index(flag)
                 if i + 1 < len(argv) and argv[i + 1] and argv[i + 1] not in out:
-                    try:
-                        out[argv[i + 1]] = int(entry.split("/")[2])
-                    except (ValueError, IndexError):
-                        pass
+                    out[argv[i + 1]] = pid
                 break
     return out
 
@@ -288,7 +330,7 @@ def credhome_for(sid, latch=True):
 
     session-env/<sid> is the per-home artifact that does NOT follow that
     symlink, so it carries the mapping. But it DECAYS — claude prunes it, and
-    in practice, resolution falls from ~91% for sessions touched in
+    measured on this machine resolution falls from ~91% for sessions touched in
     the last 2 days to ~18% past 30 days. A signal that erodes cannot answer
     "resume ANY session on ANY cred", so every successful lookup is LATCHED
     into a helm-owned index that never prunes. Coverage then freezes at what we
@@ -387,7 +429,7 @@ def resume_exec(row, home=None, skip_permissions=False):
     dies immediately, and the spawn still returns a handle — a resume that
     reports success and delivers nothing."""
     from . import seat
-    unset = "env -u " + " -u ".join(seat.CHILD_STAMP_VARS) + " "
+    unset = seat.paste_unset_prefix()
     if row["h"] != "claude":
         return "%scodex resume %s" % (unset, row["i"])
     if home is None:
@@ -420,7 +462,7 @@ def is_pinnable(home):
 RESUME_DIR = os.path.expanduser("~/.helm/_global/resumes")
 
 
-def mint_resume_script(row, home=None, skip_permissions=False):
+def mint_resume_script(row, home=None, skip_permissions=False, env=None):
     """Write the resume as an executable SCRIPT and return its path.
 
     TOKEN LAW (borrowed intact from seat.py's resume): what crosses the
@@ -429,10 +471,21 @@ def mint_resume_script(row, home=None, skip_permissions=False):
     listings, window titles and logs — so the secret must stay in a file the
     adapter only ever names. Native OAuth resumes carry no token, but they go
     through the same door: one rule, no per-caller judgement about whether
-    today's line happens to be safe."""
+    today's line happens to be safe.
+
+    `env` EXPORTS identity vars into the resumed pane (HELM_CHAT_NAME for an
+    adopted seat, so it comes back AS that seat rather than as an anonymous
+    pane). It rides the script rather than the adapter because only orca's
+    daemon RPC can set pane env at all — its own CLI has no env flag and
+    herdr's spawn happens in a daemon helm cannot reach — so the script is the
+    one vehicle that behaves identically on all three metaharness cases.
+    Values are shell-quoted; NOTHING SECRET may be passed here, same as every
+    other consumer of this seam."""
     os.makedirs(RESUME_DIR, exist_ok=True)
     path = os.path.join(RESUME_DIR, "%s.sh" % row["i"])
     cwd = os.path.expanduser(row.get("cwd") or "") or "."
+    exports = "".join("export %s=%s\n" % (k, shlex.quote(str(v)))
+                      for k, v in sorted((env or {}).items()))
     # cd on its own line, and FAIL LOUD if it cannot: resuming claude from the
     # wrong directory does not error, it forks a fresh session — so a silent
     # fallback to $PWD would look like a resume and lose the history.
@@ -441,14 +494,31 @@ def mint_resume_script(row, home=None, skip_permissions=False):
                 "# helm sessions resume — regenerated on every run;\n"
                 "# edit nothing here, it is derived state.\n"
                 "cd %s || { echo \"helm resume: cwd is gone: %s\" >&2; exit 1; }\n"
-                "exec %s\n"
-                % (shlex.quote(cwd), cwd,
+                "%sexec %s\n"
+                % (shlex.quote(cwd), cwd, exports,
                    resume_exec(row, home=home, skip_permissions=skip_permissions)))
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
     return path
 
 
-def spawn_resume(row, title=None, home=None, skip_permissions=False):
+def resume_identity_env(sid):
+    """Identity exports for a resumed pane — {HELM_CHAT_NAME: seat} when
+    exactly ONE rostered seat owns `sid`, else None.
+
+    THE HOLE THIS CLOSES: `helm sessions resume --go` passed NO env, so the
+    resumed pane inherited whatever HELM_CHAT_NAME a metaharness ancestor had
+    exported — the root vector of a prior identity-hijack incident (an
+    exported name OUTLIVES the pane it named; see home.chat_name). Every
+    helm-owned launch path must SET the name per-seat instead of inheriting.
+    Ambiguous (multi-row) or unknown sids pass nothing: a nameless pane is
+    honest (orcaadopt: nameless declares no seat) and the join derives it a
+    name; a guessed name is the same incident again."""
+    from . import seats
+    hits = seats.seats_for_session(sid)
+    return {"HELM_CHAT_NAME": hits[0]} if len(hits) == 1 else None
+
+
+def spawn_resume(row, title=None, home=None, skip_permissions=False, env=None):
     """Actually resume the session in a pane. (path, handle, adapter) on
     success; raises harness.HarnessError when no metaharness is reachable.
 
@@ -463,24 +533,16 @@ def spawn_resume(row, title=None, home=None, skip_permissions=False):
     ad = harness.detect()
     if ad is None:
         raise harness.HarnessError(harness.RECOMMENDATION)
-    path = mint_resume_script(row, home=home, skip_permissions=skip_permissions)
+    path = mint_resume_script(row, home=home,
+                              skip_permissions=skip_permissions, env=env)
     cwd = os.path.expanduser(row.get("cwd") or "") or os.path.expanduser("~")
     if not os.path.isdir(cwd):
         cwd = os.path.expanduser("~")
     title = title or ("resume-" + row["i"][:8])
-    try:
-        return path, ad.spawn(path, title=title, cwd=cwd), ad.name
-    except harness.HarnessError as e:
-        # orca resolves its cwd argument as `--worktree path:<cwd>` against its
-        # OWN worktree registry, which is commonly empty — so any directory it
-        # has not been told about is selector_not_found, and "resume in any cwd"
-        # would mean "resume in the handful of cwds orca happens to know".
-        # Dropping the selector is safe because the MINTED SCRIPT already cds
-        # (and exits non-zero if it cannot): the pane's start directory is
-        # cosmetic, the script owns where the session actually resumes.
-        if "selector_not_found" not in str(e):
-            raise
-        return path, ad.spawn(path, title=title), ad.name
+    # Provider-specific recovery belongs to the adapter. Orca can retry a
+    # selector miss while preserving cwd in the command; every caller then gets
+    # the same narrow behavior instead of sessions owning a second fallback.
+    return path, ad.spawn(path, title=title, cwd=cwd), ad.name
 
 
 RESUME_KICK = (
@@ -642,7 +704,8 @@ def cmd_sessions(args):
         try:
             path, handle, adapter = spawn_resume(
                 row, title=title, home=home,
-                skip_permissions="--skip-permissions" in rest)
+                skip_permissions="--skip-permissions" in rest,
+                env=resume_identity_env(row["i"]))
         except harness.HarnessError as e:
             print("helm sessions: cannot spawn a pane: %s" % e, file=sys.stderr)
             print("  paste instead: " + resume_command(row, home=home), file=sys.stderr)

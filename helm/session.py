@@ -86,13 +86,37 @@ def _stamp_vars():
 
 
 def _unset_prefix():
-    return "env " + " ".join("-u " + v for v in _stamp_vars()) + " "
+    """THE SEAM, never a fourth copy of this literal. `seat.paste_unset_prefix`
+    exists precisely because `sessions.resume_exec` and `transcripts._native_cmd`
+    each built this string inline — and that duplication is why the proxy triple
+    was missing from BOTH. Those two were wired to the seam; THIS module kept its
+    own copy and stayed one register short, which is the prediction in that
+    function's docstring coming true one site later ("a guard that must be
+    re-added per site is a guard that will be absent from the next site").
+
+    Measured on trunk before the fix: this prefix unset all three CHILD_STAMP
+    names and NONE of the three proxy names — the stamp half proving the
+    mechanism worked, so nothing was broken here except coverage."""
+    from . import seat
+    return seat.paste_unset_prefix()
 
 
 def _launch_env():
     """Environment for the one permitted launch path: strip inherited child
-    identity and force transcript persistence on."""
-    env = os.environ.copy()
+    identity AND the proxy triple, then force transcript persistence on.
+
+    THE PROXY TRIPLE NEVER RIDES INTO A LAUNCHED CLAUDE SESSION, the same law
+    `launch.py` states at its own exec seam. Every non-claude family here runs
+    behind CLIProxyAPI but inside Claude Code's harness, so a launch from a
+    PROXIED seat's environment inherits a base URL aimed at a proxy fronting
+    another vendor: the session looks native, is billed native, and routes
+    elsewhere, and nothing downstream reports it.
+
+    Measured before the fix, against a synthetic proxied environment and
+    asserting on the KEY SET: all three proxy names SURVIVED into the child env
+    while the stamp names did not — one register scrubbed, the other not."""
+    from . import seat
+    env = seat.scrub_env(os.environ)
     for v in _stamp_vars():
         env.pop(v, None)
     env[FORCE_VAR] = "1"
@@ -460,7 +484,7 @@ def _own_session_identity(r):
     every younger same-session process to a candidate — so a row that SURVIVES
     with identity=='who' carries the process's own exact attribution, never
     its parent's. Treating who rows as inherited hints hid a proven holder
-    from live-holder/DOUBLE-OPEN arithmetic."""
+    from live-holder/DOUBLE-OPEN arithmetic (a cross-family review finding)."""
     return bool(r.get("declared") or r.get("resume")
                 or r.get("identity") == "who")
 

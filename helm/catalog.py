@@ -301,10 +301,18 @@ def _build_from_cv():
         objs = json.loads(p.stdout)
     except ValueError:
         return None
-    # the catalog covers claude + codex (the harnesses helm mints resume commands for and
-    # tracks quota for) — matching the scanner's scope, so retiring the scanner is a
+    # the catalog covers claude + codex because those are the two transcript
+    # formats it can index: _files() globs only those roots and _row()/
+    # _session_id() decode only those two shapes. Filtering the cv lens to the
+    # same pair matches the scanner's scope, so retiring the scanner is a
     # behavior-preserving swap. cv also lists hermes/grok/gemini/… (and reports a
     # shared state.db size for some, e.g. hermes) — out of the predecessor's catalog scope.
+    #
+    # NOT a statement about what helm can resume: `helm pi resume
+    # --session|--continue` mints pi resume lines (pi.py), and pi sessions are
+    # scanned by harnesses.pi_observations() for the auto-map. An older form of
+    # this comment said "the harnesses helm mints resume commands for", which
+    # was false against pi.py. Keep the reason mechanical.
     rows = [_row_from_cv(o) for o in objs
             if isinstance(o, dict) and o.get("id") and o.get("harness") in ("claude", "codex")]
     _backfill_syn(rows)  # recover synthetic-session detection (cv leaves them untitled)

@@ -16,7 +16,10 @@ import sys
 import tempfile
 import unittest
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import drain, home, pk, store  # noqa: E402
 
@@ -97,7 +100,7 @@ class SeamTest(EventsBase):
         self.addCleanup(lambda: os.path.isdir(state) and os.chmod(state, 0o755))
         self.assertFalse(pk.event("store.add", "x", "s"))  # no raise, ever
         # the write the receipt describes still succeeds end-to-end
-        rc, out, _ = self.run_cli(["add", "prior", "x-law | statement | 0.7"])
+        rc, out, _ = self.run_cli(["add", "prior", "x-law | statement | 0.7 | xkw"])
         self.assertEqual(rc, 0)
         self.assertIn("LIVE 'x-law'", out)
 
@@ -110,7 +113,7 @@ class ChokepointTest(EventsBase):
                      ["add", "premise", "y-truth | certain | ykw"],
                      ["add", "lexicon", "youable | able to be you"],
                      ["add", "heuristic", "swarmify | split it | swarm"],
-                     ["add", "reference", "dregg | crown | https://x.test"],
+                     ["add", "reference", "dregg | crown | https://x.test | dreggkw"],
                      ["evidence", TS, "x-law", "0.1", "held up"],
                      ["supersede", TS, "x-law", "y-truth", "sharper"],
                      ["retire", TS, "y-truth", "over"]):

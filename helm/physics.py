@@ -1,5 +1,5 @@
 """Physics inspector: what a seat launched with (credhome, cwd) WOULD load.
-helm-native (see ATTRIBUTION.md for lineage)
+helm-native
 dissolve-into-helm law.
 
 Read-only. Stdlib-only. Secret-free by construction:
@@ -588,21 +588,120 @@ def _codex_report(home, cwd):
     }
 
 
+# ---------------------------------------------------------------- pi
+
+def _pi_report(home, cwd):
+    home = _expand(home)
+    cwd = _expand(cwd) if cwd else None
+    warnings = []
+    if not os.path.isdir(home):
+        warnings.append("home does not exist: " + home)
+
+    # settings layers: global (~/.pi/agent/settings.json or home/settings.json) -> project (.pi/settings.json)
+    global_cfg_path = os.path.join(home, "settings.json")
+    global_cfg, g_err = _read_json(global_cfg_path)
+    if g_err:
+        warnings.append("malformed settings (global): " + g_err)
+
+    project_cfg_path = os.path.join(cwd, ".pi", "settings.json") if cwd else None
+    project_cfg, p_err = None, None
+    if project_cfg_path and os.path.isfile(project_cfg_path):
+        project_cfg, p_err = _read_json(project_cfg_path)
+        if p_err:
+            warnings.append("malformed settings (project): " + p_err)
+
+    merged = {}
+    if isinstance(global_cfg, dict):
+        merged.update(global_cfg)
+    if isinstance(project_cfg, dict):
+        merged.update(project_cfg)
+
+    # context files (AGENTS.md / CLAUDE.md)
+    agents_chain = {"homeAgentsMd": False}
+    home_context = None
+    for cand in ("AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"):
+        if os.path.isfile(os.path.join(home, cand)):
+            home_context = os.path.join(home, cand)
+            agents_chain["homeAgentsMd"] = True
+            break
+
+    proj_chain = []
+    if cwd:
+        for d in _ancestors(cwd):
+            for cand in ("AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"):
+                p = os.path.join(d, cand)
+                if os.path.isfile(p):
+                    proj_chain.append(p)
+                    break
+    agents_chain["projectAgentsMdChain"] = proj_chain
+
+    # tools / extensions
+    tools_dir = os.path.join(home, "tools")
+    tools_count = len(_list_names(tools_dir)) if os.path.isdir(tools_dir) else 0
+
+    prompts_dir = os.path.join(home, "prompts")
+    prompts_count = len(_list_names(prompts_dir)) if os.path.isdir(prompts_dir) else 0
+
+    return {
+        "harness": "pi",
+        "home": home,
+        "cwd": cwd,
+        "configFile": global_cfg_path if isinstance(global_cfg, dict) else None,
+        "mcpServers": [],
+        "hooks": [],
+        "plugins": {"enabled": [], "installed": 0, "disabled": 0},
+        "skills": {"count": prompts_count, "enabled": _list_names(prompts_dir) if os.path.isdir(prompts_dir) else [], "configured": prompts_count},
+        "commands": {"count": tools_count, "home": _list_names(tools_dir) if os.path.isdir(tools_dir) else []},
+        "agents": agents_chain,
+        "trust": {"cwdKnown": True, "trust_level": merged.get("defaultProjectTrust", "ask"), "via": cwd},
+        "settingsHighlights": {
+            "defaultModel": merged.get("defaultModel"),
+            "defaultProvider": merged.get("defaultProvider"),
+            "defaultProjectTrust": merged.get("defaultProjectTrust"),
+            "enableInstallTelemetry": merged.get("enableInstallTelemetry"),
+            "authPresent": os.path.isfile(os.path.join(home, "auth.json")),
+        },
+        "launchSeams": [
+            "PI_CODING_AGENT_DIR pins the agent home (~/.pi/agent)",
+            "settings.json (global ~/.pi/agent/settings.json, project .pi/settings.json)",
+            "AGENTS.md / CLAUDE.md loaded from global agentDir and ancestor chain",
+        ],
+        "warnings": _dedupe(warnings),
+    }
+
+
 # ---------------------------------------------------------------- API
+
+# The harnesses this module can report on — THE definition, imported by
+# configs so the harness vocabulary has exactly one home. physics_report is
+# what RAISES on an unknown one, so the set belongs beside the raise; a second
+# copy in configs is how the two drift and a caller hands over a value this
+# function rejects.
+HARNESSES = ("claude", "codex", "pi")
+
 
 def physics_report(home_path, cwd, harness):
     """What a seat launched with (home_path, cwd) WOULD load.
 
-    harness: "claude" | "codex". cwd may be None for a cwd-independent view.
+    harness: one of HARNESSES. cwd may be None for a cwd-independent view.
     Returns a JSON-safe dict; never raises on missing/malformed files
     (they become entries in result["warnings"]). Never includes secret
     values: env/header names only, URL scheme+host only.
+
+    RAISES ValueError on an unrecognized harness — deliberately, and callers
+    must treat that as a programming error they screen for, NOT a condition to
+    discover in production. web.py's /api/configs/resolve reached this line on
+    an unauthenticated GET with whatever configs.harness_for returned, so the
+    day harness_for learned to answer "I don't know" honestly, an HTTP 500 was
+    one None away. That caller now screens against HARNESSES first.
     """
     if harness == "claude":
         return _claude_report(home_path, cwd)
     if harness == "codex":
         return _codex_report(home_path, cwd)
-    raise ValueError("unknown harness: %r (want 'claude' or 'codex')" % (harness,))
+    if harness == "pi":
+        return _pi_report(home_path, cwd)
+    raise ValueError("unknown harness: %r (want one of %s)" % (harness, ", ".join(HARNESSES)))
 
 
 def _flatten(obj, prefix=""):

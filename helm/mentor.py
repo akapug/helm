@@ -5,11 +5,13 @@ RSH extended SELF -> PAIR: a recurring failure-mode becomes a REFLEX the
 junior carries instead of a per-dispatch correction re-paid forever. helm has
 no panes — the junior is a PROJECT (v1 same-home; a seat is a project's
 sessions), and a taught reflex in <project>/reflexes/ reaches every future
-session of every harness through the inject hooks already installed: delivery
-is free, teaching is the only new verb.
+CLAUDE-HARNESS session through the inject hooks already installed: delivery
+is free, teaching is the only new verb. (Not every harness — `hooks.install`
+writes claude homes and seat CLAUDE_CONFIG_DIRs only, so a pi session gets no
+inject hook and no taught reflex; pi.py's reflex bridge is deferred.)
 
   observe <project> [--since 7d]   the ranked critique brief, READ-ONLY.
-      Joins the window's sessions (the catalog lens, all harnesses) with the
+      Joins the window's sessions (the catalog lens: claude + codex) with the
       recorder's per-session counters (stuck / loop-thrash / passive / dirty
       streaks), scans their transcript tails for lexicon-seeded BUG-CLASS
       terms (kind: bug-class — LITERAL patterns, never open inference: the
@@ -51,7 +53,7 @@ import re
 import sys
 import time
 
-from . import home, pk, reflex
+from . import delim, home, pk, reflex
 
 SINCE_DEFAULT = "7d"
 SCAN_TAIL = 2 * 1024 * 1024  # transcript tail bytes read per session
@@ -350,7 +352,12 @@ def _cmd_teach(args):
               "reachable junior (helm projects; helm sync discovers)" % project,
               file=sys.stderr)
         return 1
-    parts = [p.strip() for p in " ".join(kept[1:]).split("|")]
+    # arity 2, same shape as reflex add — the taught reflex is id | steer.
+    parts, refused = delim.split(" ".join(kept[1:]), 2,
+                                 "helm mentor <project> <id> | <steer>")
+    if refused:
+        print("helm mentor: " + refused, file=sys.stderr)
+        return 2
     if not parts[0]:
         print(_USAGE, file=sys.stderr)
         return 2

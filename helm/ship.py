@@ -32,10 +32,9 @@ Laws:
 import os
 import re
 import socket
-import subprocess
 import sys
 
-from . import home, pk
+from . import home, pk, vcs
 
 # The derived set, as .gitignore lines (the classifier — the python-side
 # matcher in _derived() must mirror it exactly).
@@ -62,17 +61,21 @@ SECRET_PATTERNS = (
     ("private key", rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     ("jwt", rb"\beyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}"),
     ("bearer header", rb"[Aa]uthorization['\"]?\s*[:=]\s*['\"]?Bearer\s+[A-Za-z0-9_.~+/=-]{16,}"),
-    # runbook fix #6 — defense-in-depth behind the wholesale seats/ ignore:
-    # a seat token mints as 64 hex (secrets.token_hex(32)) and rides INLINE
-    # in launch.sh as ANTHROPIC_AUTH_TOKEN=<hex>; if either ever escapes the
-    # ignore it must still be refused here, never reach git history.
+    # Defense-in-depth behind the wholesale seats/ ignore: a seat token mints
+    # as 64 hex (secrets.token_hex(32)) and rides INLINE in launch.sh as
+    # ANTHROPIC_AUTH_TOKEN=<hex>; if either ever escapes the ignore it must
+    # still be refused here, never reach git history.
     ("seat token env", rb"ANTHROPIC_AUTH_TOKEN\s*=\s*\S{16,}"),
     ("bare seat token", rb"(?m)^\s*[0-9a-f]{64}\s*$"),
 )
 
 
 def _git(hh, *args):
-    return subprocess.run(("git", "-C", hh) + args, capture_output=True, text=True)
+    """The one git call in ship, through the VCS seam (helm/vcs.py `proc`).
+    Returns the CompletedProcess itself — callers read returncode, stdout AND
+    stderr — and a missing git RAISES: ship is an operator verb that fails
+    loudly, never open."""
+    return vcs.backend(hh).proc(hh, *args)
 
 
 def _ident(hh):
@@ -342,7 +345,7 @@ def pull():
 
 def hosts():
     """The cross-host view the observation blocks exist for: who observed
-    what, when — live-on-host-a, dormant-on-host-b."""
+    what, when — host-a active, host-b dormant."""
     d = os.path.join(home.global_dir(), "hosts")
     try:
         names = sorted(n for n in os.listdir(d) if n.endswith(".json"))

@@ -383,7 +383,8 @@ class ResumePinTest(unittest.TestCase):
              mock.patch.object(sessions, "credhome_for", return_value="/h/acct"):
             p = sessions.mint_resume_script(_row("uuid-6", h="claude", cwd="/p"))
         self.assertTrue(os.access(p, os.X_OK))
-        self.assertIn("CLAUDE_CONFIG_DIR=/h/acct", open(p).read())
+        with open(p, encoding="utf-8") as fh:
+            self.assertIn("CLAUDE_CONFIG_DIR=/h/acct", fh.read())
 
 
 class MintedScriptTest(unittest.TestCase):
@@ -407,8 +408,10 @@ class MintedScriptTest(unittest.TestCase):
         # cd — a shell BUILTIN — so the exec fails, the && chain never runs, the
         # pane dies on arrival, and spawn still returns a handle. A resume that
         # reports success and delivers nothing.
-        body = open(sessions.mint_resume_script(
-            _row("uuid-5", h="claude", cwd="/tmp"))).read()
+        path = sessions.mint_resume_script(
+            _row("uuid-5", h="claude", cwd="/tmp"))
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
         self.assertNotIn("exec cd", body)
         execs = [l for l in body.splitlines() if l.startswith("exec ")]
         self.assertEqual(len(execs), 1)
@@ -437,7 +440,8 @@ class MintedScriptTest(unittest.TestCase):
         os.makedirs(d)
         p = sessions.mint_resume_script(_row("uuid-2", h="claude", cwd=d))
         self.assertEqual(subprocess.run(["sh", "-n", p], capture_output=True).returncode, 0)
-        self.assertIn(shlex.quote(d), open(p).read())
+        with open(p, encoding="utf-8") as fh:
+            self.assertIn(shlex.quote(d), fh.read())
 
 
 class PreflightTest(unittest.TestCase):

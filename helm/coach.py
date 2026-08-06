@@ -51,7 +51,8 @@ SUBSUME = 0.5      # a live near match this dense could be retired (simplify)
 _LAYER_TYPE = {"lexicon": "lexicon", "premise": "prior", "prior": "prior",
                "heuristic": "heuristic", "reference": "reference",
                "reflex": None, "skill": None}
-_LAYERS = tuple(_LAYER_TYPE) + ("skill",)
+_LAYERS = tuple(_LAYER_TYPE)
+_SUPERSEDE_LAYERS = ("premise", "prior", "heuristic", "reference")
 
 # --- shape vocabularies (deterministic; no model call) -----------------------
 _HEDGES = (
@@ -335,6 +336,24 @@ def _store_add(t, a, b, project, extra=None):
     return store.cmd_store(args)
 
 
+def _symptom_kw(statement):
+    """A keywords CSV for a coached lesson's store landing: the statement's
+    non-generic content words, first-seen order, capped at 8.
+
+    The store's add-time findability lint refuses an EMPTY keywords field
+    (measured: 9% of the store was empty-keyword near-unfindable, and this
+    landing leg was one of the faucets — it authored NO keywords at all).
+    Coach composes the store's guards rather than re-implementing them (its
+    own charter), so it must hand `add` what the gate demands: derived with
+    the store's own generic-word law, single words only — the gate's stem
+    decomposition owns sub-phrase work."""
+    out = []
+    for w in re.findall(r"[a-z0-9][a-z0-9'-]*", statement.lower()):
+        if w not in store.GENERIC_KEYWORDS and w not in out:
+            out.append(w)
+    return ", ".join(out[:8])
+
+
 def to_intake(r):
     """Lossless fallback: a low-confidence (or skill) route drops into the drain
     intake dir as a feedback entry — drain routes it to a typed home later.
@@ -367,15 +386,31 @@ def to_intake(r):
 
 def apply(r, project=None, supersede_old=None):
     """Land the routed entry. -> (path-or-rc, outcome). A route below APPLY_MIN,
-    or a skill pointer (nothing to store), is preserved in the drain intake."""
+    or a skill pointer (nothing to store), is preserved in the drain intake.
+
+    Landing and lifecycle results are truthful: a failed landing never advances
+    supersession, premise evolution uses its native attested route, and an
+    unsupported lifecycle refuses before minting anything.
+    """
     layer, eid, x = r["layer"], r["id"], r.get("extra", {})
+    if supersede_old and (layer not in _SUPERSEDE_LAYERS
+                          or r["confidence"] < APPLY_MIN):
+        print("helm coach: --supersede is unsupported for a %s route that cannot "
+              "land semantically — use that layer's native evolution path" % layer,
+              file=sys.stderr)
+        return 1, "refused"
     if layer == "skill" or r["confidence"] < APPLY_MIN:
         return to_intake(r), "intake"
     if layer == "premise":
         from . import premise
-        a = [eid + " | " + r["statement"]] + (["--project", project] if project else [])
-        rc = premise.cmd_premise(a)
-    elif layer == "reflex":
+        payload = eid + " | " + r["statement"] + " | " + _symptom_kw(r["statement"])
+        argv = (["--supersede", supersede_old, payload] if supersede_old else [payload])
+        if project:
+            argv += ["--project", project]
+        rc = premise.cmd_premise(argv)
+        return rc, ("superseded" if not rc and supersede_old else
+                    "new" if not rc else "refused")
+    if layer == "reflex":
         from . import reflex
         argv = ["add", eid + " | " + (x.get("steer") or r["statement"]),
                 "--signal", x.get("signal", "prompt")]
@@ -391,18 +426,24 @@ def apply(r, project=None, supersede_old=None):
                         x.get("definition") or r["statement"], project)
     elif layer == "prior":
         rc = _store_add("prior", eid, r["statement"], project,
-                        extra=["%.2f" % x.get("belief_conf", 0.6)])
+                        extra=["%.2f" % x.get("belief_conf", 0.6),
+                               _symptom_kw(r["statement"])])
     else:
-        rc = _store_add(layer, eid, r["statement"], project)
-    outcome = "new"
-    if supersede_old and _LAYER_TYPE.get(layer):
-        sargs = ["supersede", pk.now_ts(), supersede_old, eid,
-                 "coached: upgraded in place"]
-        if project:
-            sargs += ["--project", project]
-        store.cmd_store(sargs)
-        outcome = "superseded"
-    return rc, outcome
+        # heuristic: slot 3 is the trigger CSV; reference: slot 3 is url
+        # (left empty), slot 4 the keywords CSV
+        kw = _symptom_kw(r["statement"])
+        rc = _store_add(layer, eid, r["statement"], project,
+                        extra=[kw] if layer == "heuristic" else ["", kw])
+    if rc:
+        return rc, "refused"
+    if not supersede_old:
+        return rc, "new"
+    sargs = ["supersede", pk.now_ts(), supersede_old, eid,
+             "coached: upgraded in place"]
+    if project:
+        sargs += ["--project", project]
+    src = store.cmd_store(sargs)
+    return (src, "superseded") if not src else (src, "supersede-refused")
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -504,14 +545,14 @@ def cmd_coach(args):
         _print_propose(r, project)
         return 0
 
-    _rc, outcome = apply(r, project=project, supersede_old=supersede_old)
+    rc, outcome = apply(r, project=project, supersede_old=supersede_old)
     if outcome == "intake":
         print("helm coach: low-confidence route (%s) - preserved in the drain "
               "intake, lossless" % r["why"])
-        print("  intake: " + _rc)
+        print("  intake: " + rc)
         print("  route later: helm drain")
     print("coached -> %s (%s) | %s" % (r["layer"], r["id"], outcome))
-    return 0
+    return rc if isinstance(rc, int) else 0
 
 
 def _pop(args, flag):

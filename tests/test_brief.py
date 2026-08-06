@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """brief tests — hermetic: tmp HELM_HOME + HELM_ADOPTED_DIR, catalog roots and
 caches repointed at tmp dirs (scanner path forced, cv never invoked), the
-usage-history read repointed at a tmp file. The real ~/.helm, ~/.claude and
-~/.cache are never read or written."""
+usage-history read repointed at a tmp file, the cwd moved into the tmp dir so
+the WHAT WE BUILT gauge never reads the real checkout. The real ~/.helm,
+~/.claude and ~/.cache are never read or written."""
 import contextlib
 import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -43,8 +45,14 @@ class BriefBase(unittest.TestCase):
             "HELM_HOME": j("helm"),
             "HELM_ADOPTED_DIR": self.adopted,
             "HELM_CATALOG": "scanner",  # never shell out to cv for the catalog
+            "GIT_CONFIG_GLOBAL": "/dev/null",  # fixture repos, hermetic config
+            "GIT_CONFIG_SYSTEM": "/dev/null",
         })
         self.envp.start()
+        # The built gauge reads the cwd repo by default — park the cwd in the
+        # tmp dir so no test (cmd_brief included) ever gauges the real checkout.
+        self._cwd = os.getcwd()
+        os.chdir(self.tmp)
         for k in ("MELD_HOME", "MELD_ADOPTED_DIR"):
             os.environ.pop(k, None)
         self._cat = {k: getattr(catalog, k) for k in
@@ -67,6 +75,7 @@ class BriefBase(unittest.TestCase):
         self.now = time.time()
 
     def tearDown(self):
+        os.chdir(self._cwd)
         for k, v in self._cat.items():
             setattr(catalog, k, v)
         transcripts.OVERRIDES_PATH = self._overrides
@@ -111,9 +120,9 @@ class BriefBase(unittest.TestCase):
             for r in rows:
                 f.write((r if isinstance(r, str) else json.dumps(r)) + "\n")
 
-    def compose(self, hours=12.0):
+    def compose(self, hours=12.0, repo=None):
         transcripts._state.clear()  # fixtures planted after a cached build must count
-        return brief.compose(hours=hours)
+        return brief.compose(hours=hours, repo=repo)
 
 
 class SinceYouLeftTest(BriefBase):
@@ -229,11 +238,62 @@ class InjectLedgerTest(BriefBase):
         out = brief.render(self.compose())
         self.assertIn("pinned starvation: 1 of 2 never fired: p-cold", out)
         self.assertIn("helm store pinned --stats", out)
+        # p-cold FITS — it has simply never landed yet. That is the innocent
+        # case and must not be reported as unable to fire.
+        self.assertEqual(inj["cannot_fire"], [])
+        self.assertEqual(inj["never_fired"], ["p-cold"])
         # feed the cold one -> the line disappears
         self.plant_ledger([{"v": 1, "ts": fresh,
                             "fired": {"pinned": ["p-cold"], "jit": [], "reflex": []}}])
         out = brief.render(self.compose())
         self.assertNotIn("pinned starvation", out)
+
+    def test_an_entry_the_budget_never_reaches_is_starved_even_when_it_has_fired(self):
+        """THE CASE THE OLD PREDICATE COULD NOT SEE, and the reason it exists.
+
+        `starved` asked `made[id] == 0` — never fired across the whole ledger
+        window. An always-entry that fired ONCE, long ago, and can no longer
+        fit under the budget scores 1, not 0, and vanishes from the surface
+        built to catch exactly it.
+
+        MEASURED on the live store 2026-07-30: 5 always-entries, each rendered
+        line capped to LINE_CAP=400, budget PINNED_BUDGET=1200. 3 x 400 == 1200
+        exactly, so the 4th and 5th could not fire on ANY turn — and the brief
+        reported NOTHING, because all five had non-zero lifetime counts. Two of
+        the dead ones were the owner's rules about how to sequence work.
+
+        NOTE ON THE FIXTURE, learned by getting it wrong first: ONE oversized
+        entry cannot starve the lane, because LINE_CAP truncates every entry to
+        400 bytes before the walk sees it. It takes enough entries to exhaust
+        the budget — PINNED_BUDGET // LINE_CAP of them — and the next one is
+        the one that can never fire. That is precisely the live shape."""
+        from helm import inject, store
+        fill = inject.PINNED_BUDGET // inject.LINE_CAP      # 3 at today's values
+        big = "X" * (inject.LINE_CAP * 2)                   # each truncated to LINE_CAP
+        planted = []
+        for n in range(fill):
+            i = "p-fill-%d" % n
+            store.write_prior({"id": i, "statement": big,
+                               "confidence": "1.0", "pin": "true"})
+            planted.append(i)
+        store.write_prior({"id": "p-late", "statement": big,
+                           "confidence": "1.0", "pin": "true"})
+        planted.append("p-late")
+        fresh = _iso(self.now - 600)
+        # EVERY entry fired in the past: lifetime counts are 1, never 0, so the
+        # old `== 0` predicate scores the whole lane healthy.
+        self.plant_ledger([{"v": 1, "ts": fresh,
+                            "fired": {"pinned": planted, "jit": [], "reflex": []}}])
+        inj = self.compose()["inject"]
+        self.assertTrue(inj["cannot_fire"],
+                        "the budget is exhausted before the last entry, so at "
+                        "least one always-entry cannot fire — and a lifetime "
+                        "count of 1 must not hide that")
+        self.assertEqual(inj["never_fired"], [],
+                         "every entry has fired, so the never-fired bucket is "
+                         "empty — the two cases must not be conflated")
+        out = brief.render(self.compose())
+        self.assertIn("CANNOT FIRE", out)
 
 
 class SeatsTest(BriefBase):
@@ -291,7 +351,7 @@ class WaitingOnYouTest(BriefBase):
 
 
 class StoreReviewQueueTest(BriefBase):
-    """The provisional queue must ROUTINELY reach
+    """The owner steer 2026-07-23: the provisional queue must ROUTINELY reach
     the owner. helm brief gains a store-review-queue section — provisional
     (firing, awaiting ratify) listed newest-first as `[type] id - statement`
     (clipped 80), candidate count only, omitted entirely when both are zero
@@ -356,6 +416,157 @@ class StoreReviewQueueTest(BriefBase):
         self.assertNotIn("STORE REVIEW QUEUE", brief.render(b))
 
 
+class WhatWeBuiltTest(BriefBase):
+    """The gauge (owner directive: the brief answers 'what did we build?').
+    Fixture repos are REAL git: init -b main, empty commits with pinned
+    committer dates, and origin/main planted as an actual remote-tracking ref
+    so the gauge reads the landedness ref, never local main."""
+
+    def _repo(self):
+        r = self.j("repo")
+        os.makedirs(r)
+        for cmd in (("git", "init", "-q", "-b", "main"),
+                    ("git", "config", "user.email", "t@t"),
+                    ("git", "config", "user.name", "t")):
+            subprocess.run(cmd, cwd=r, check=True, capture_output=True)
+        return r
+
+    def _land(self, repo, subject, when):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S +0000", time.gmtime(when))
+        env = dict(os.environ, GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp)
+        subprocess.run(("git", "commit", "-q", "--allow-empty", "-m", subject),
+                       cwd=repo, env=env, check=True, capture_output=True)
+
+    def _publish(self, repo):
+        subprocess.run(("git", "update-ref", "refs/remotes/origin/main", "main"),
+                       cwd=repo, check=True, capture_output=True)
+
+    def test_a_local_only_ref_renders_commits_never_lands(self):
+        """kimi's review finding (the landed-means-origin-main class): with no
+        remote-tracking ref, trunk_ref degrades to LOCAL main — and a local
+        merge is exactly the claim this gauge must never launder into a
+        "land". The header must name the weaker claim; the word "land" for
+        the count is reserved for a published ref. The sibling tests publish
+        via _publish; this one deliberately does not."""
+        r = self._repo()
+        self._land(r, "local: committed but never pushed", self.now - 600)
+        b = self.compose(repo=r)
+        built = b["built"]
+        self.assertFalse(built["published"],
+                         "a remoteless repo read as published")
+        self.assertEqual(built["total"], 1)
+        text = brief.render(b)
+        self.assertIn("LOCAL commit", text)
+        self.assertIn("not proof of publication", text)
+        self.assertNotIn("1 land on", text,
+                         "a local-only commit rendered as a land")
+
+    def test_lands_listed_grouped_by_day_window_enforced(self):
+        r = self._repo()
+        self._land(r, "land: ancient — before the gauge window",
+                   self.now - 100 * 3600)
+        t_old, t_mid, t_new = (self.now - 26 * 3600, self.now - 3600,
+                               self.now - 600)
+        self._land(r, "land: yesterday — the fleet got X", t_old)
+        self._land(r, "land: earlier — the fleet got Y", t_mid)
+        self._land(r, "land: just now — the fleet got Z", t_new)
+        self._publish(r)
+        b = self.compose(repo=r)
+        built = b["built"]
+        self.assertIsNone(built["git_error"])
+        self.assertIsNone(built["board"]["unavailable"])
+        self.assertEqual(built["ref"], "origin/main")
+        self.assertEqual(built["total"], 3)  # the ancient land stays out
+        # expected grouping derived from the SAME stamps the fixture planted,
+        # so a midnight boundary between t_new and t_mid cannot flake the test
+        day = lambda t: time.strftime("%Y-%m-%d", time.gmtime(t))
+        expect = []
+        for t, subj in ((t_new, "land: just now — the fleet got Z"),
+                        (t_mid, "land: earlier — the fleet got Y"),
+                        (t_old, "land: yesterday — the fleet got X")):
+            if not expect or expect[-1][0] != day(t):
+                expect.append([day(t), []])
+            expect[-1][1].append(subj)
+        self.assertEqual([[d["day"], [l["subject"] for l in d["lands"]]]
+                          for d in built["days"]], expect)
+        # shas come from git itself, never typed
+        shas = subprocess.run(
+            ("git", "log", "origin/main", "--first-parent", "-3", "--pretty=%h"),
+            cwd=r, capture_output=True, text=True, check=True).stdout.split()
+        self.assertEqual([l["sha"] for d in built["days"] for l in d["lands"]],
+                         shas)
+        text = brief.render(b)
+        self.assertIn("WHAT WE BUILT — 3 lands on origin/main (last 48h) · "
+                      "no open land loops", text)
+        self.assertIn("    %s  land: just now — the fleet got Z" % shas[0], text)
+        self.assertIn("  " + day(t_new), text)
+        self.assertNotIn("ancient", text)
+
+    def test_empty_window_is_an_honest_line_never_an_absent_section(self):
+        r = self._repo()
+        self._land(r, "land: ancient — before the gauge window",
+                   self.now - 100 * 3600)
+        self._publish(r)
+        b = self.compose(repo=r)
+        self.assertEqual(b["built"]["total"], 0)
+        self.assertIsNone(b["built"]["git_error"])
+        self.assertIn("WHAT WE BUILT — nothing landed on origin/main in the "
+                      "last 48h", brief.render(b))
+
+    def test_unreadable_git_says_so(self):
+        b = self.compose(repo=self.j("norepo"))  # never created, no repo above
+        built = b["built"]
+        self.assertTrue(built["git_error"])
+        self.assertEqual((built["total"], built["days"]), (0, []))
+        text = brief.render(b)
+        self.assertIn("WHAT WE BUILT — trunk unreadable", text)
+        self.assertIn(built["git_error"], text)  # the reason reaches the owner
+
+    def test_board_unavailable_is_named_even_when_it_raises(self):  # noqa: VACUOUS_ASSERTION — positive controls bind the named reason into board dict AND render; mutation #3 (passthrough->None) reddens exactly this arm
+        r = self._repo()
+        self._land(r, "land: one real change", self.now - 600)
+        self._publish(r)
+        reason = "the dispatch ledger is unreadable at row 3"
+        with mock.patch("helm.landreq.board_section",
+                        return_value={"title": "LAND LOOPS",
+                                      "unavailable": reason,
+                                      "loops": [], "stalled": []}):
+            b = self.compose(repo=r)
+        self.assertEqual(b["built"]["board"]["unavailable"], reason)
+        text = brief.render(b)
+        self.assertIn("board unavailable — " + reason, text)
+        self.assertIn("land: one real change", text)  # git leg still renders
+        with mock.patch("helm.landreq.board_section",
+                        side_effect=RuntimeError("boom")):
+            b = self.compose(repo=r)
+        self.assertIn("board projection raised: boom",
+                      b["built"]["board"]["unavailable"])
+
+    def test_board_counts_ride_the_headline(self):
+        r = self._repo()
+        self._land(r, "land: one real change", self.now - 600)
+        self._publish(r)
+        with mock.patch("helm.landreq.board_section",
+                        return_value={"title": "LAND LOOPS", "unavailable": None,
+                                      "loops": [{"id": "a"}, {"id": "b"}],
+                                      "stalled": [{"id": "b"}]}):
+            b = self.compose(repo=r)
+        self.assertEqual(b["built"]["board"], {"loops": 2, "stalled": 1,
+                                               "unavailable": None})
+        self.assertIn("2 open land loops, 1 stalled", brief.render(b))
+
+    def test_more_lands_fold_honestly(self):
+        r = self._repo()
+        for i in range(brief.MAX_BUILT + 3):
+            self._land(r, "land: change %02d" % i, self.now - 600)
+        self._publish(r)
+        b = self.compose(repo=r)
+        self.assertEqual(b["built"]["total"], brief.MAX_BUILT + 3)
+        text = brief.render(b)
+        self.assertEqual(text.count("land: change"), brief.MAX_BUILT)
+        self.assertIn("(+3 more lands)", text)
+
+
 class CmdBriefTest(BriefBase):
     def _run(self, args):
         out = io.StringIO()
@@ -370,8 +581,9 @@ class CmdBriefTest(BriefBase):
         rc, out = self._run(["--json"])
         self.assertEqual(rc, 0)
         b = json.loads(out)
-        self.assertEqual(sorted(b), ["generated_at", "hours", "inject", "knowledge",
-                                     "review", "seats", "sessions", "waiting"])
+        self.assertEqual(sorted(b), ["built", "generated_at", "hours", "inject",
+                                     "knowledge", "review", "seats", "sessions",
+                                     "waiting"])
         self.assertEqual(b["hours"], 12.0)
         self.assertEqual(b["sessions"]["total"], 1)
         self.assertIsNone(b["inject"])

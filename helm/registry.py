@@ -14,8 +14,9 @@ out. A mixed-era registry.json migrates its authored fields out ONCE, at load,
 losslessly. Sync law: additive and idempotent — a re-sync refreshes
 observations, never deletes a known project, never touches authored fields.
 
-Adoption law: where a project already has an existing knowledge home,
-~/.helm/<name> becomes a SYMLINK to it — one chain, never a second copy.
+Adoption law: where a project already has an external knowledge home (declared
+host-local as its authored `adopt` path), ~/.helm/<name> becomes a SYMLINK to
+it — one chain, never a second copy.
 
 Also home of the PROJECTION REGISTRY (projections() + projection_survey()):
 constitution laws 2+3 as an executable manifest — every on-disk store helm
@@ -24,24 +25,39 @@ reads or writes declares its class, and every projection its source + rebuild.
 enforces it.
 """
 import fnmatch
+import json
 import os
 import shutil
+import sys
 import time
 
 from . import automap, home, pk
 
 # Authored fields on a project record that a re-sync must never clobber.
-AUTHORED_FIELDS = ("edges", "notes", "aliases", "external", "retired")
+AUTHORED_FIELDS = ("edges", "notes", "aliases", "external", "retired", "adopt")
 
-# Existing knowledge homes helm adopts by symlink instead of scaffolding.
-# Populated by deployments that point a project at an external chain.
-ADOPTED_HOMES = {}
+# Knowledge homes helm adopts by symlink instead of scaffolding. EMPTY in the
+# shipped tree — no site-specific home path lives in code. A deployment declares
+# each adoption host-local as the project's authored `adopt` path
+# (registry-authored.json), read back by adopted_homes(); this mirrors how a
+# project's authored `aliases` config-drive the drain routing.
+def adopted_homes():
+    """{project -> external home dir} to adopt by symlink, sourced from each
+    project's authored `adopt` path. Empty when none is authored (the public
+    default). Paths are ~-expanded; a blank or non-string entry is skipped."""
+    out = {}
+    for name, e in _authored_load().get("projects", {}).items():
+        p = e.get("adopt") if isinstance(e, dict) else None
+        if isinstance(p, str) and p.strip():
+            out[name] = os.path.expanduser(p.strip())
+    return out
 
 
 def _authored_load():
     """The authored layer, with a corruption net: an unparseable file is backed
     up beside itself BEFORE any caller can save over it — authored content is
-    unrebuildable, so a garbled byte must never cascade into an empty rewrite."""
+    unrebuildable, so a garbled byte must never cascade into an empty rewrite
+    (a cross-family review finding)."""
     path = home.authored_path()
     val = pk.read_json(path)
     if isinstance(val, dict):
@@ -49,8 +65,47 @@ def _authored_load():
     if os.path.exists(path):
         bak = path + ".corrupt-" + pk.now_ts().replace(":", "")
         if not os.path.exists(bak):
-            shutil.copy2(path, bak)
+            try:
+                shutil.copy2(path, bak)
+            except OSError as e:
+                # the net covers UNPARSEABLE bytes; a file that cannot even be
+                # READ (permission, I/O) cannot be netted — report it instead
+                # of crashing every load(). Readers that must not silently
+                # degrade to the empty layer (drain's alias routing) probe the
+                # file themselves and refuse.
+                print("[helm registry] authored layer %s unreadable — corrupt "
+                      "backup impossible (%s)" % (path, e), file=sys.stderr)
     return {"version": 1, "projects": {}}
+
+
+class AuthoredUnreadable(Exception):
+    """The authored layer EXISTS but cannot be read/parsed. Raised by
+    authored_host() so a host-config reader REFUSES rather than degrading to the
+    empty layer — an unreadable source is indistinguishable from 'unconfigured'
+    and would silently drop the host's config (skills hub, canonical MCPs,
+    private powerpacks) exactly as if nothing had been set. Same discipline as
+    drain's unreadable-alias refusal (see _authored_load's note)."""
+
+
+def authored_host():
+    """The host-wide authored config block — registry-authored.json's top-level
+    `host` object — read DIRECTLY, because it never surfaces through load()'s
+    projects-merge. Returns {} when the authored file is ABSENT (a legitimately
+    empty layer) or carries no `host` key. RAISES AuthoredUnreadable when the
+    file EXISTS but cannot be parsed: a host-config reader MUST refuse rather
+    than silently degrade to empty (a garbled byte would drop the operator's
+    config the same shape as never having set it — a cross-family review
+    finding). Absent-vs-unreadable is exactly the distinction drain draws for
+    its alias layer."""
+    path = home.authored_path()
+    if not os.path.exists(path):
+        return {}
+    val = pk.read_json(path)
+    if not isinstance(val, dict):
+        _authored_load()  # trigger the corruption-backup net before refusing,
+        raise AuthoredUnreadable(path)  # so the .corrupt-* backup is guaranteed
+    host = val.get("host")
+    return host if isinstance(host, dict) else {}
 
 
 def _qualified(name, path):
@@ -126,7 +181,7 @@ def save(reg):
                 # a same-name entry authored against a DIFFERENT path: never
                 # clobber it (unrebuildable) — the newcomer's authored fields
                 # land under the path-qualified key; both survive, load()
-                # resolves by path stamp
+                # resolves by path stamp (cross-family review finding)
                 entries[_qualified(name, keep["path"])] = keep
             else:
                 entries[name] = keep
@@ -221,7 +276,7 @@ def sync(observations=None):
 
 def _adopt_or_scaffold(name):
     p = home.project_dir(name)
-    adopted = ADOPTED_HOMES.get(name)
+    adopted = adopted_homes().get(name)
     if adopted and os.path.isdir(adopted):
         if os.path.islink(p):
             return
@@ -306,19 +361,21 @@ def cache_root():
 
 def projections():
     """The executable manifest: one row per declared on-disk store —
-    {name, kind, root, globs, source, sources, rebuild, fresh_days,
+    {name, kind, root, globs, source, sources, rebuild, fresh_days, genesis,
     mutable: False}. globs are root-relative, fnmatch semantics (* crosses
     /); `sources` are the authoritative paths a projection re-derives from
     (at least one must exist while the projection does); `fresh_days` is the
     declared staleness horizon (None = self-invalidating: sig-keyed or TTL).
-    Any file under either root that NO row names is an unclassified
-    squatter — the ~/.remember rot class, flagged by doctor."""
+    `genesis` optionally declares the exact empty JSON a producer writes before
+    any source exists. Any file under either root that NO row names is an
+    unclassified squatter — the ~/.remember rot class, flagged by doctor."""
     from . import store
     u = os.path.expanduser("~")
-    scans = tuple(r for r in (home.env("SCAN_ROOTS") or "").split(":") if r)
+    scans = tuple(automap._scan_roots())
     harness_roots = (os.path.join(u, ".claude", "projects"),
                      os.path.join(u, ".codex", "sessions"),
-                     os.path.join(u, ".local", "share", "opencode")) + scans
+                     os.path.join(u, ".local", "share", "opencode"),
+                     os.path.join(u, ".pi", "agent", "sessions")) + scans
     store_roots = (store.adopted_dir(), home.global_dir())
     master = home.registry_path()
     g_cats = sorted(set(home.GLOBAL_CATEGORIES) | set(store.TYPE_SUBDIR.values()))
@@ -326,15 +383,18 @@ def projections():
     p_cats = sorted(set(home.PROJECT_CATEGORIES) | set(store.TYPE_SUBDIR.values())
                     | {"reflexes"})
 
-    def row(name, kind, root, globs, source="", sources=(), rebuild=None, fresh_days=None):
+    def row(name, kind, root, globs, source="", sources=(), rebuild=None,
+            fresh_days=None, genesis=None):
         return {"name": name, "kind": kind, "root": root, "globs": tuple(globs),
                 "source": source, "sources": tuple(sources), "rebuild": rebuild,
-                "fresh_days": fresh_days, "mutable": False}
+                "fresh_days": fresh_days, "genesis": genesis, "mutable": False}
 
     return (
         row("registry", "projection", "home", ("_global/registry.json",),
             source="harness session stores + disk repo scan",
-            sources=harness_roots, rebuild="helm sync", fresh_days=30),
+            sources=harness_roots, rebuild="helm sync", fresh_days=30,
+            genesis={"json": {"version": 1, "projects": {}},
+                     "volatile_strings": ("generated_ts",)}),
         row("project-registry", "projection", "home", ("*/registry.json",),
             source="_global/registry.json (+ authored layer), re-mirrored per project",
             sources=(master,), rebuild="helm sync", fresh_days=30),
@@ -347,11 +407,23 @@ def projections():
             source="this host's registry.json observations",
             sources=(master,), rebuild="helm ship --apply"),
         row("gitignore", "authored", "home", (".gitignore",)),
+        # The fleet task ledger classifies itself from birth. Every other
+        # durable _global ledger (owner-asks, owner-decisions, dispatches) is
+        # currently an unclassified squatter, which is how 2,761 files came to
+        # sit in a root that has a manifest — a new store that does not declare
+        # itself inherits exactly that rot.
+        row("task-ledger", "events", "home", ("_global/tasks.jsonl*",)),
         row("events-journal", "events", "home", ("_global/.state/events.jsonl*",)),
+        row("chat-event-receipts", "events", "home",
+            ("_global/.state/chat-event-receipts/*",)),
         row("inject-ledger", "events", "home", ("_global/.state/inject-ledger.jsonl*",)),
         row("attest-queue", "state", "home", ("_global/.state/attest-queue.jsonl",)),
         row("inject-seen", "state", "home", ("_global/.state/inject-seen/*",)),
         row("coinages", "state", "home", ("_global/.state/coinages.json",)),
+        row("storage-matrix", "state", "home",
+            ("_global/.state/storage-matrix.json*",)),
+        row("autocompact", "state", "home",
+            ("_global/.state/autocompact.json*",)),
         row("drift-snapshot", "projection", "home",
             ("_global/.state/drift-snapshot*.json",),
             source="the typed store's prior confidences",
@@ -360,6 +432,7 @@ def projections():
         row("chat-node", "state", "home", ("_global/.state/chat-node.json",)),
         row("cells", "state", "home", ("_global/.state/cells.json",)),
         row("reflex-state", "state", "home", ("_global/.state/reflex-state/*",)),
+        row("beacons", "state", "home", ("_global/.state/beacons/*",)),
         row("seats", "state", "home", ("_global/seats/*",)),
         row("catalog-cache", "projection", "cache", ("catalog-cache.json",),
             source="local claude/codex transcripts (cv ls, or the scanner)",
@@ -369,7 +442,8 @@ def projections():
             sources=harness_roots, rebuild="helm sessions"),
         row("codex-cwd-cache", "projection", "cache", ("codex-cwd-cache.json",),
             source="codex rollout session_meta cwd (stat-signature keyed sniff)",
-            sources=harness_roots, rebuild="helm sync"),
+            sources=harness_roots, rebuild="helm sync",
+            genesis={"json": {}, "volatile_strings": ()}),
         row("store-cache", "projection", "cache", ("store-cache-*.json",),
             source="the typed store roots (stat-signature keyed)",
             sources=store_roots, rebuild="helm inject"),
@@ -382,6 +456,30 @@ def projections():
              "skills-trash/*")),
         row("scratch", "state", "cache", ("*.lock", "*.tmp")),
     )
+
+
+def projection_is_genesis(row):
+    """Whether one surveyed projection is its exact declared empty JSON."""
+    spec = row.get("genesis")
+    files = row.get("files") or ()
+    if not spec or len(files) != 1:
+        return False
+    root = {"home": home.helm_home(), "cache": cache_root()}.get(row.get("root"))
+    if not root:
+        return False
+    try:
+        with open(os.path.join(root, files[0]), encoding="utf-8") as f:
+            body = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(body, dict):
+        return False
+    body = dict(body)
+    for key in spec.get("volatile_strings", ()):
+        if not isinstance(body.get(key), str):
+            return False
+        del body[key]
+    return body == spec.get("json")
 
 
 def _walk_root(root_dir):

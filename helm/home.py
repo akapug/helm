@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The ~/.helm home resolver. HOME-anchored, never cwd-derived — a helm command
-invoked from any worktree resolves the same root every time (the
+invoked from any worktree resolves the same root every time (the Q132/Q133
 cwd-independence class).
 
 Env transition law: HELM_* preferred, legacy MELD_* accepted as fallback (the
@@ -10,7 +10,7 @@ corpus; engine runtime state (any tool's ~/.config/<tool>) stays out of it.
 import os
 import re
 
-# A legitimate seat name is an IDENTIFIER: codex-2, reviewer-1, ds4pro —
+# A legitimate seat name is an IDENTIFIER: codex-2, opus-integrator, ds4pro —
 # [A-Za-z0-9._-], bounded. HELM_CHAT_NAME is the one unvalidated join seam every
 # chat surface trusts (roster keys, chat from/tfrom/rfrom, hook pane names,
 # todos, codex capacity, …); it is validated HERE, at the source, exactly once,
@@ -42,13 +42,27 @@ def chat_name():
     enforces that with a source grep).
 
     Returns the name when it is a legitimate seat identifier ([A-Za-z0-9._-],
-    like codex-2 / reviewer-1 / ds4pro); None when unset OR empty (callers
+    like codex-2 / opus-integrator / ds4pro); None when unset OR empty (callers
     fall through to their auto-name floor, preserving the old `if name:` /
-    `or "owner"` semantics); and RAISES SeatNameError when the name carries ESC
+    `or <derived-owner>` semantics); and RAISES SeatNameError when the name carries ESC
     / C0-C1 controls / Unicode bidi overrides (U+202A-E, U+2066-9) / any other
     format-Cf. A control-char seat name is never legitimate, so it is REJECTED
     at the source — it never becomes a roster key, a chat from-field, a hook
-    pane name, a todo row, or any future sink."""
+    pane name, a todo row, or any future sink.
+
+    PANE-ENV CONTAGION HAZARD (owner-declared P0, 2026-08-02): an exported
+    HELM_CHAT_NAME on a shell ANCESTOR OUTLIVES the pane it named. A crashed
+    pane restarted under that ancestor inherits the dead seat's name for
+    free, and every resolver then agrees the new process IS that seat — the
+    measured incident armed opus-integrator's beacon from a stranger's pane
+    and drained ~60 of OI's DMs. helm cannot stop a metaharness (orca)
+    ancestor from exporting this var. What helm owns: (1) every helm-owned
+    launch/resume path SETS the name explicitly per-seat instead of
+    inheriting it (launch.build_env, seat.launch_line, pi, orcaadopt,
+    sessions.resume_identity_env), and (2) the disagreement law
+    (seats.identity_disagreement) — a declared name that contradicts the
+    session's roster binding REFUSES at every acting/delivery/registration
+    boundary — is the backstop when the free env name lies."""
     raw = env("CHAT_NAME")
     if not raw:                     # unset or explicitly empty -> fall through
         return None
@@ -77,8 +91,8 @@ def validate_seat_arg(raw):
     return raw
 
 
-# Per-project concept-category chain (a .local product-namespace family, lifted
-# to a user-level home). Order is the organic dev cycle:
+# Per-project concept-category chain (the prior harness's .local family, lifted to a
+# user-level product-namespace home). Order is the organic dev cycle:
 # priors art feeds prd, build happens in the repo, evals then journal then archive.
 PROJECT_CATEGORIES = (
     "premises", "heuristics", "lexicon", "prd", "journal", "evals", "archive",
@@ -115,8 +129,8 @@ def env_pair(name, companion):
 # The harness session-id vars, in resolution order. CLAUDE_CODE_SESSION_ID is
 # the REAL var Claude Code exports; CLAUDE_SESSION_ID is the legacy/hook-injected
 # alias (the SessionStart join hook passes session_id explicitly, so it worked
-# even while a bare CLI post fell through to the anon floor: a manual
-# `helm chat post` posted as 'agent', and the a2a per-session
+# even while a bare CLI post fell through to the anon floor —
+# 2026-07-21: a manual `helm chat post` posted as 'agent', and the a2a per-session
 # cursor silently no-op'd for every claude-code session). CODEX_SESSION_ID is the
 # codex seat. One resolver so no call site misses the real var again.
 _SESSION_ENV = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID")
@@ -138,6 +152,38 @@ def helm_home():
     if override:
         return os.path.abspath(os.path.expanduser(override))
     return os.path.join(os.path.expanduser("~"), ".helm")
+
+
+def default_home():
+    """What helm_home() answers when NO env speaks — the live root."""
+    return os.path.join(os.path.expanduser("~"), ".helm")
+
+
+def surface_dir(env_name, name, default):
+    """One boot-scoped (tmpfs) surface directory, honouring isolation (#117).
+
+    Three arms, in trust order:
+      explicit HELM_<env_name> (legacy MELD_ via env()) — the operator chose.
+      a REDIRECTED root — HELM_HOME points off ~/.helm, so the caller asked
+        for an isolated estate; the surface follows it as <root>/<name>.
+        Before this arm existed, an isolated-looking probe (HELM_HOME=tmp)
+        still resolved the LIVE fleet bus: the roster — the identity index —
+        plus claims, rooms and DMs sat one careless write from fleet
+        corruption (tests/test_gc.py setUp records the measured near-miss:
+        a 24,001-victim reap of live cursors from inside the suite).
+      the default root — the shared machine bus stays on tmpfs (RAM law).
+
+    realpath on BOTH sides of the comparison: HELM_HOME spelled as the
+    default through a symlink or trailing slash is the same root, not an
+    isolation request — a false "redirected" here would silently move a
+    live seat's bus off /dev/shm."""
+    explicit = env(env_name)
+    if explicit:
+        return explicit
+    root = helm_home()
+    if os.path.realpath(root) != os.path.realpath(default_home()):
+        return os.path.join(root, name)
+    return default
 
 
 def global_dir():
@@ -233,7 +279,8 @@ def scaffold_global():
 def scaffold_project(name):
     """Ensure one project's chain exists. Idempotent, additive — never deletes.
     Returns the project dir. A symlinked project home (adoption of an existing
-    external chain via symlink) is honored and never re-scaffolded inside."""
+    external chain, e.g. project -> ~/.tool/project) is honored
+    and never re-scaffolded inside."""
     p = project_dir(name)
     if os.path.islink(p):
         return p

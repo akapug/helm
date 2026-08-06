@@ -13,6 +13,7 @@ import os
 import stat
 
 MAX_EVENT_BYTES = 64 * 1024
+CORRUPT_PREFIX = "corrupt ledger line "
 
 
 def _flags(base):
@@ -102,11 +103,17 @@ def locked(path):
         os.close(fd)
 
 
-def checked_events(path):
+def checked_events(path, strict=False, skip_blank=False):
     """Return (complete dict events, unavailable reason).
 
     A missing file or parent is a known empty ledger. Unsafe paths, permission
-    failures, and other I/O errors are UNKNOWN, not zero obligations.
+    failures, and other I/O errors are UNKNOWN, not zero obligations. The default
+    reader preserves the historical projection contract and skips malformed rows.
+    ``strict=True`` instead poisons the whole read on any malformed COMPLETE row;
+    an unterminated final tail remains outside the durability boundary and is
+    ignored in both modes. ``skip_blank`` preserves ledgers whose historical
+    grammar explicitly admitted blank separator lines; it is opt-in so blank
+    rows remain corruption everywhere else.
     """
     out, fd = [], None
     try:
@@ -117,15 +124,27 @@ def checked_events(path):
             raise OSError("ledger is not a private regular file")
         with os.fdopen(fd, "rb") as f:
             fd = None
-            for raw in f:
-                if not raw.endswith(b"\n") or len(raw) > MAX_EVENT_BYTES:
+            for line, raw in enumerate(f, 1):
+                if not raw.endswith(b"\n"):
                     continue
-                try:
-                    row = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, ValueError):
+                if skip_blank and not raw.strip():
                     continue
-                if isinstance(row, dict) and row.get("id"):
-                    out.append(row)
+                reason = None
+                if len(raw) > MAX_EVENT_BYTES:
+                    reason = "exceeds %d bytes" % MAX_EVENT_BYTES
+                else:
+                    try:
+                        row = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError):
+                        row, reason = None, "is not valid UTF-8 JSON"
+                    if reason is None and not (
+                            isinstance(row, dict) and row.get("id")):
+                        reason = "is not an object with a non-empty id"
+                if reason is not None:
+                    if strict:
+                        return [], CORRUPT_PREFIX + "%d %s" % (line, reason)
+                    continue
+                out.append(row)
         return out, None
     except FileNotFoundError:
         return [], None

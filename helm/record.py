@@ -19,6 +19,12 @@ State, under <helm home>/_global/.state/reflex-state/<session_id>/:
                       codes (token + digest, never the raw command line)
   edit-targets.log    verify-grounding: basenames actually edited (a real edit
                       vs prose that merely mentioned a filename)
+  edit-paths.log      the SAME edits, home-relative and DIRECTORY-BEARING —
+                      what a per-toolcall whisper needs to answer "where did
+                      this write go" (a lesson into a private memory dir vs
+                      `helm store`; a doc vs the shared checkout). A basename
+                      cannot answer it, and every write was reduced to one
+                      before any watcher saw it.
   todos.json          the seat todo mirror (todos.py): the CURRENT todo list
                       off TodoWrite/Task*, pull-read by `helm todos` and the
                       roster — digest+pull, never a firehose
@@ -150,6 +156,24 @@ def _event_exit(event, resp, failed):
     return 0 if isinstance(resp, dict) else -1
 
 
+def _home_relative(path):
+    """`~/x/y.md` for a path under $HOME, else the path unchanged.
+
+    Home-relative rather than absolute so the log stays short and carries no
+    account name — the DIRECTORY is the decision-relevant part, the homedir
+    spelling never is. Falls back to the input on any resolution failure: a
+    watcher reading a slightly-odd path is strictly better than a watcher
+    reading nothing, and this must never raise inside a hook."""
+    try:
+        ap = os.path.abspath(os.path.expanduser(path))
+        hm = os.path.abspath(os.path.expanduser("~"))
+        if ap == hm or ap.startswith(hm + os.sep):
+            return "~" + ap[len(hm):]
+        return ap
+    except Exception:
+        return str(path)
+
+
 def _append(path, line):
     """O(1): one stat (rotation, fire-ledger pattern) + one append."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -247,11 +271,28 @@ def _record(event):
 
     # edit-targets: the file a real edit landed on (basename only) — a
     # FAILED edit landed nowhere and must not ground verify.
+    #
+    # AND edit-paths: the same edit's DIRECTORY-BEARING path, home-relative.
+    # The basename alone cannot answer the question that matters at a tool
+    # boundary — WHERE did this write go. In a live incident an integrator wrote
+    # five durable lessons into its own private memory dir instead of `helm
+    # store`, taught a teammate the same lesson twice because the fleet never
+    # saw them, and NOTHING could notice, because every write had been reduced
+    # to a filename before any watcher saw it. A per-toolcall whisper can only
+    # be as specific as the data it reads.
+    #
+    # A SEPARATE FILE on purpose: edit-targets.log is read by the verify rung
+    # (seats.py) and the handoff snapshot (handoff.py), both of which expect
+    # bare basenames. Widening it in place would have made this a
+    # format-breaking change to two surfaces for no reason; the sibling costs
+    # one line and breaks nothing.
     if tool in EDITS and not failed:
         fp = tin.get("file_path") or tin.get("path") or tin.get("notebook_path")
         if fp:
             _append(os.path.join(sd, "edit-targets.log"),
                     os.path.basename(str(fp)) + "\n")
+            _append(os.path.join(sd, "edit-paths.log"),
+                    _home_relative(str(fp)) + "\n")
 
     c.update(v=1, ts=pk.now_ts())
     c["last-tool"] = tool
@@ -320,7 +361,13 @@ def _resolvable(cmd):
 def _merge_hook(settings, cmd, event=HOOK_EVENT):
     """-> (merged_copy, ok|add|update). MERGE-preserving (hooks.py law): only
     OUR <event> entry is written; foreign hooks — the UserPromptSubmit
-    inject entry included — and every other key survive byte-identical."""
+    inject entry included — and every other key survive byte-identical.
+
+    EVERY entry of ours in the event is visited, not the first. This carried
+    the same return-on-first defect hooks._merge_event did (see its docstring
+    for the incident): a second recorder entry in one event was repaired by
+    nobody while the harness ran it, so re-installing — the standard cure for a
+    stale path — could never reach it."""
     out = json.loads(json.dumps(settings))
     hks = out.setdefault("hooks", {})
     if not isinstance(hks, dict):
@@ -328,73 +375,81 @@ def _merge_hook(settings, cmd, event=HOOK_EVENT):
     groups = hks.setdefault(event, [])
     if not isinstance(groups, list):
         raise ValueError("existing hooks.%s is not a list — fix it by hand" % event)
-    for g in groups:
-        if not isinstance(g, dict):
-            continue
-        for h in g.get("hooks") or []:
-            if isinstance(h, dict) and _ours(str(h.get("command") or "")):
-                if h.get("command") == cmd:
-                    return out, "ok"
-                h["command"] = cmd
-                h["type"] = "command"
-                return out, "update"
-    # no matcher: the recorder wants EVERY tool event
-    groups.append({"hooks": [{"type": "command", "command": cmd}]})
-    return out, "add"
+    mine = [h for g in groups if isinstance(g, dict)
+            for h in (g.get("hooks") or [])
+            if isinstance(h, dict) and _ours(str(h.get("command") or ""))]
+    if not mine:
+        # no matcher: the recorder wants EVERY tool event
+        groups.append({"hooks": [{"type": "command", "command": cmd}]})
+        return out, "add"
+    action = "ok"
+    for h in mine:
+        if h.get("command") != cmd or h.get("type") != "command":
+            h["command"] = cmd
+            h["type"] = "command"
+            action = "update"
+    return out, action
 
 
 def install_home(path, dry=False):
-    """Install/refresh the recorder hook in <path>/settings.json on the
-    configs rails (backup -> validate -> atomic write, restore on failure).
-    -> (action, detail): ok|add|update|dry-add|dry-update|fail."""
+    """Install/refresh both recorder legs through bounded content-revision CAS."""
     import difflib
     from . import configs
     sp = os.path.join(path, "settings.json")
-    raw, cur = "", {}
-    if os.path.isfile(sp):
-        try:
-            with open(sp, encoding="utf-8") as f:
-                raw = f.read()
-            cur = json.loads(raw)
-        except (OSError, ValueError) as e:
-            return "fail", "settings.json unreadable (%s) — refusing to touch it" % e
-        if not isinstance(cur, dict):
-            return "fail", "settings.json root is not an object — refusing to touch it"
     cmd = hook_command()
-    merged = cur
-    actions = []
-    try:  # BOTH legs — a success-only recorder is blind to every failed tool
+
+    def merge(cur):
+        """The WHOLE merge, used by transform AND verify. The room repair
+        mutates the candidate, so a step applied in only one of them would make
+        every write fail its own verification."""
+        from . import hooks
+        out, actions = cur, []
         for ev in HOOK_EVENTS:
-            merged, act = _merge_hook(merged, cmd, ev)
-            actions.append(act)
-    except ValueError as e:
-        return "fail", str(e)
-    action = "add" if "add" in actions else \
-        "update" if "update" in actions else "ok"
-    if action == "ok":
-        return "ok", "hook up to date"
-    new_raw = json.dumps(merged, indent=2) + "\n"
-    if dry:
-        diff = difflib.unified_diff(raw.splitlines(), new_raw.splitlines(),
-                                    sp, sp + " (after install)", lineterm="")
-        return "dry-" + action, "\n".join(diff)
-    res = configs.write_file(sp, new_raw)
-    if res.get("error"):
+            out, action = _merge_hook(out, cmd, ev)
+            actions.append(action)
+        # The recorder composes its OWN command text (hook_command above) and
+        # never goes through hooks.spec_command, so it needs the persistence
+        # rail by name — precisely the "a new caller bypasses the derivation"
+        # case it exists for. `_ours` is the recorder's, so the repair is
+        # scoped to the entries this installer is responsible for and a foreign
+        # hook living in a worktree is reported, never touched.
+        return out, actions, hooks.repair_lane_room_commands(out, sp, owns=_ours)
+
+    def transform(cur):
+        merged, actions, notes = merge(cur)
+        return merged, {"actions": actions, "rooms_notes": tuple(notes)}
+
+    def verify(candidate, before, _metadata):
+        from . import hooks
+        expected, _actions, _notes = merge(before)
+        return candidate == expected and all(
+            cmd in _event_cmds(candidate, ev) for ev in HOOK_EVENTS) \
+            and hooks._rooms_clean(candidate, owns=_ours)
+
+    res = configs.transform_json_file(sp, transform, verify=verify, dry_run=dry)
+    if not res.get("ok"):
         return "fail", res["error"]
-    try:  # validate AFTER the write; anything torn restores the backup
-        with open(sp, encoding="utf-8") as f:
-            got = json.load(f)
-        ok = all(cmd in _event_cmds(got, ev) for ev in HOOK_EVENTS)
-    except (OSError, ValueError):
-        ok = False
-    if not ok:
-        note = "no pre-write backup existed"
-        if res.get("backup"):
-            r = configs.restore(res["backup"])
-            note = "backup restored" if r.get("ok") else \
-                "restore ALSO failed: %s" % r.get("error")
-        return "fail", "post-write validation failed — " + note
-    return action, "backup: %s" % (res.get("backup") or "none — new file")
+    from . import hooks
+    meta = res.get("initial_metadata") or res.get("metadata") or {}
+    actions = meta.get("actions") or []
+    rooms = hooks.lane_room_report(meta.get("rooms_notes") or ())
+    # `ok` IS RESERVED FOR "I WROTE NOTHING" — the same law as hooks.install_home
+    # (see the incident in its return site). A room repair rewrites bytes with
+    # every recorder leg already current, so it must NOT report `ok`; the third
+    # arm below exists for exactly that case and is not a spurious update.
+    action = "add" if "add" in actions else \
+        "update" if "update" in actions else \
+        "update" if rooms and "repointed" in rooms else "ok"
+    if action == "ok":
+        return "ok", "hook up to date" + ("; " + rooms if rooms else "")
+    if dry:
+        diff = difflib.unified_diff(
+            res["before"].splitlines(), res["after"].splitlines(),
+            sp, sp + " (after install)", lineterm="")
+        return "dry-" + action, "\n".join(diff) + (("\n" + rooms) if rooms else "")
+    return action, "backup: %s; CAS attempts: %d%s" % (
+        res.get("backup") or "none — new file", res["attempts"],
+        "; " + rooms if rooms else "")
 
 
 def status_rows():
@@ -527,7 +582,7 @@ def _cmd_install(rest):
         print("helm record: " + err, file=sys.stderr)
         return 1
     if not targets:
-        print("helm record: no claude homes found — `helm homes prepare` starts one")
+        print("helm record: no claude homes found — `helm homes prepare claude <email>` starts one")
         return 0
     print("helm record: command: " + hook_command())
     failed = 0

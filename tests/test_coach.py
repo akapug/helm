@@ -13,20 +13,26 @@ import tempfile
 import unittest
 from unittest import mock
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-coach-home-"))
-os.environ.setdefault("HELM_ADOPTED_DIR", tempfile.mkdtemp(prefix="helm-coach-adopt-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-coach-home-", var="HELM_HOME")
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-coach-adopt-", var="HELM_ADOPTED_DIR")
 
-from helm import coach, home, pk, store  # noqa: E402
+from helm import coach, home, pk, premise, store  # noqa: E402
 
 
 class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-coach-")
         self.prev = {k: os.environ.get(k)
-                     for k in ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_NODE_URL")}
+                     for k in ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_NODE_URL",
+                               "HELM_STORE_FORCE_NEW")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
         os.environ["HELM_NODE_URL"] = "http://127.0.0.1:1"  # dead: anchor fails open
+        os.environ.pop("HELM_STORE_FORCE_NEW", None)
         os.makedirs(os.environ["HELM_ADOPTED_DIR"])
         home.scaffold_global()
 
@@ -122,9 +128,11 @@ class SearchTest(_Base):
 
     def _seed(self):
         store.cmd_store(["add", "prior",
-                         "scrub-before-push | scrub internal planning docs before push | 0.8"])
+                         "scrub-before-push | scrub internal planning docs before push "
+                         "| 0.8 | scrub planning"])
         store.cmd_store(["add", "prior",
-                         "old-scrub | scrub the planning docs before any git push | 0.7"])
+                         "old-scrub | scrub the planning docs before any git push "
+                         "| 0.7 | docs push"])
         e, _ = store.retire("old-scrub", pk.now_ts(), "coach-test")
         self.assertEqual(e["status"], store.STATUS_RETIRED)
 
@@ -195,11 +203,50 @@ class ApplyTest(_Base):
         r = coach.plan("never commit secrets to any remote, no exceptions")
         self.assertEqual(r["layer"], "premise")
         with mock.patch("helm.cell.anchor_submit", return_value=(None, "hermetic")):
-            _rc, outcome = coach.apply(r)
-        self.assertEqual(outcome, "new")
+            rc, outcome = coach.apply(r)
+        self.assertEqual((rc, outcome), (0, "new"))
         got = store._find(r["id"], types=("prior",))
         self.assertEqual(got["class"], "certain")
         self.assertEqual(got["confidence"], 1.0)
+        self.assertTrue(got["keywords"])
+
+    def test_apply_premise_refusal_never_supersedes(self):  # noqa: VACUOUS_ASSERTION — seeded old and sibling rows positively control the no-write check
+        ts = pk.now_ts()
+        store.write_prior({
+            "id": "old-law", "statement": "the old production law",
+            "confidence": 1.0, "keywords": "production law, old guard",
+            "status": store.STATUS_LIVE, "source": "test", "stated_ts": ts,
+            "last_updated": ts})
+        store.write_prior({
+            "id": "secret-sibling", "statement": "secrets stay local",
+            "confidence": 1.0, "keywords": "commit, secrets, remote, registry, nightly, rotation",
+            "status": store.STATUS_LIVE, "source": "test", "stated_ts": ts,
+            "last_updated": ts})
+        r = coach.plan("always commit secrets to a remote registry during nightly rotation",
+                       id_override="new-secret-law")
+        rc, outcome = coach.apply(r, supersede_old="old-law")
+        self.assertEqual((rc, outcome), (1, "refused"))
+        self.assertIsNone(store._find("new-secret-law"))
+        self.assertEqual(store._find("old-law")["status"], store.STATUS_LIVE)
+        self.assertEqual(premise.chain_records(), [])
+
+    def test_apply_premise_supersede_uses_native_attested_route(self):  # noqa: VACUOUS_ASSERTION — old and new native records positively control linkage
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = premise.cmd_premise(
+                ["old-law | the old production law | production law, old guard"])
+        self.assertEqual(rc, 0)
+        old_record = store._find("old-law")["attest_record"]
+        r = coach.plan("always require a reviewed production deploy",
+                       id_override="reviewed-production-law")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc, outcome = coach.apply(r, supersede_old="old-law")
+        self.assertEqual((rc, outcome), (0, "superseded"))
+        new = store._find("reviewed-production-law")
+        self.assertEqual(store._find("old-law")["status"],
+                         store.STATUS_DELETE_ELIGIBLE)
+        self.assertEqual(new["attest_supersedes_record"], old_record)
+        self.assertEqual(premise.chain_records()[-1]["op"], "supersede")
 
     def test_low_confidence_drops_to_intake_lossless(self):
         r = coach.plan("meld send deposits into the profile whisper slots")
@@ -223,7 +270,7 @@ class ApplyTest(_Base):
 
     def test_apply_supersede_upgrades_in_place(self):
         store.cmd_store(["add", "prior",
-                         "old-belief | the scan is fast enough for now | 0.6"])
+                         "old-belief | the scan is fast enough for now | 0.6 | scanspeed"])
         r = coach.plan("the scan is probably too slow at scale",
                        id_override="scan-too-slow")
         _rc, outcome = coach.apply(r, supersede_old="old-belief")
@@ -232,14 +279,51 @@ class ApplyTest(_Base):
         self.assertEqual(old["status"], store.STATUS_DELETE_ELIGIBLE)
         self.assertIsNotNone(store._find("scan-too-slow", types=("prior",)))
 
-    def test_apply_composes_store_dup_guard(self):
-        # coach delegates to the store's OWN add, so the supersede-not-duplicate
-        # guard fires on a live same-id — coach does not re-implement it
-        store.cmd_store(["add", "prior", "taken-id | some existing belief | 0.6"])
-        r = coach.plan("another belief entirely", id_override="taken-id")
-        _rc, outcome = coach.apply(r)
-        # the store refused the overwrite; the live entry is untouched
-        self.assertEqual(store._find("taken-id")["statement"], "some existing belief")
+    def test_apply_composes_store_dup_guard_exactly_once(self):  # noqa: VACUOUS_ASSERTION — positive guard count and stored row prove the delegated path ran
+        # Non-premise typed routes still delegate to store add: no coach pre-guard
+        # and no second guard around the store's one semantic mint gate.
+        r = coach.plan("another belief might be true", id_override="new-belief")
+        from helm.store import cli as store_cli
+        with mock.patch.object(store_cli, "guard_entry_keywords",
+                               wraps=store_cli.guard_entry_keywords) as guard:
+            rc, outcome = coach.apply(r)
+        self.assertEqual(guard.call_count, 1)
+        self.assertEqual((rc, outcome), (0, "new"))
+        self.assertIsNotNone(store._find("new-belief"))
+
+    def test_generic_supersede_failure_propagates_without_false_receipt(self):  # noqa: VACUOUS_ASSERTION — replacement existence positively controls the partial-state outcome
+        r = coach.plan("the resolver might need a wider probe",
+                       id_override="wider-probe")
+        rc, outcome = coach.apply(r, supersede_old="missing-old")
+        self.assertEqual((rc, outcome), (1, "supersede-refused"))
+        self.assertIsNotNone(store._find("wider-probe"))
+
+    def test_unsupported_lexicon_supersede_refuses_before_landing(self):  # noqa: VACUOUS_ASSERTION — explicit refusal text controls the intentional pre-mint absence
+        r = coach.plan("quorumward = the load-bearing word")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, outcome = coach.apply(r, supersede_old="old-term")
+        self.assertEqual((rc, outcome), (1, "refused"))
+        self.assertIn("native evolution path", err.getvalue())
+        self.assertIsNone(store._find("quorumward", types=("lexicon",)))
+
+    def test_supersede_that_cannot_semantically_land_refuses_before_intake(self):  # noqa: VACUOUS_ASSERTION — adopted-dir and event-ledger equality prove both mutation channels stayed untouched
+        cases = (
+            "how to prepare a home: prepare then verify then archive",
+            "meld send deposits into the profile whisper slots",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                r = coach.plan(text)
+                before_files = sorted(os.listdir(store.adopted_dir()))
+                before_events = pk.read_events(50)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc, outcome = coach.apply(r, supersede_old="old-entry")
+                self.assertEqual((rc, outcome), (1, "refused"))
+                self.assertIn("cannot land semantically", err.getvalue())
+                self.assertEqual(sorted(os.listdir(store.adopted_dir())), before_files)
+                self.assertEqual(pk.read_events(50), before_events)
 
 
 class CmdTest(_Base):
@@ -258,6 +342,23 @@ class CmdTest(_Base):
         self.assertEqual(rc, 0)
         self.assertIn("coached -> prior (", out)
         self.assertIn("| new", out)
+
+    def test_apply_refusal_rc_and_receipt_are_truthful(self):
+        ts = pk.now_ts()
+        store.write_prior({
+            "id": "secret-sibling", "statement": "secrets stay local",
+            "confidence": 1.0, "keywords": "commit, secrets, remote, registry, nightly, rotation",
+            "status": store.STATUS_LIVE, "source": "test", "stated_ts": ts,
+            "last_updated": ts})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, out = self._capture([
+                "--apply", "--id", "new-secret-law",
+                "always commit secrets to a remote registry during nightly rotation"])
+        self.assertEqual(rc, 1)
+        self.assertIn("| refused", out)
+        self.assertNotIn("| new", out)
+        self.assertIn("secret-sibling", err.getvalue())
 
     def test_apply_intake_receipt(self):
         rc, out = self._capture(["--apply", "meld routes whispers through slots"])
@@ -287,8 +388,13 @@ class CmdTest(_Base):
         self.assertEqual(rc, 2)
 
     def test_unknown_as_layer_errors(self):
-        rc = coach.cmd_coach(["--as", "bogus", "some text"])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = coach.cmd_coach(["--as", "bogus", "some text"])
         self.assertEqual(rc, 2)
+        self.assertIn("lexicon|premise|prior|heuristic|reference|reflex|skill)",
+                      err.getvalue())
+        self.assertNotIn("skill|skill", err.getvalue())
 
 
 if __name__ == "__main__":

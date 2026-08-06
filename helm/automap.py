@@ -19,10 +19,9 @@ is an attribute — the slug dir is a jail we decode out of, never trust.
 """
 import os
 import re
-import subprocess
 import time
 
-from . import harnesses
+from . import harnesses, vcs
 
 # cwd prefixes that are scratch/isolation, never projects.
 NOISE_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/")
@@ -48,19 +47,15 @@ def _is_noise(cwd):
 
 def _git_root(path):
     """The MAIN repo root for a path inside a repo or linked worktree, else None.
-    --git-common-dir points at the main repo's .git even from a worktree."""
-    try:
-        out = subprocess.run(
-            ["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            capture_output=True, text=True, timeout=10)
-    except Exception:
-        return None
-    if out.returncode != 0:
-        return None
-    common = out.stdout.strip()
-    if os.path.basename(common) == ".git":
+    --git-common-dir points at the main repo's .git even from a worktree.
+
+    Through the VCS seam (helm/vcs.py `common_dir`). Selection cannot cycle back
+    through here: `vcs.detect` reads `.jj`/`.git` markers off the filesystem and
+    calls nothing in this module."""
+    common = vcs.backend(path).common_dir(path)
+    if common and os.path.basename(common) == ".git":
         return os.path.dirname(common)
-    return None  # bare or odd layout — not a project checkout
+    return None  # unreadable, bare, or odd layout — not a project checkout
 
 
 def _strip_worktree(path):
@@ -118,9 +113,12 @@ def _name_for(root, taken, home):
 # nodes serve lineage + the archive report; they never scaffold a home and the
 # default project list hides them (signal first).
 def _scan_roots():
+    """The repo-scan roots: HELM_SCAN_ROOTS env (colon-separated), else `~/dev`.
+    No org-specific path ships — the two-tier walk finds both `~/dev/<repo>` and
+    `~/dev/<org>/<repo>`, so a bare `~/dev` covers an org checkout without naming
+    it. Matches HELM_CONFIG_ROOTS' convention (both default to `~/dev`)."""
     raw = os.environ.get("HELM_SCAN_ROOTS")
-    home = os.path.expanduser("~")
-    roots = raw.split(":") if raw else [os.path.join(home, "dev")]
+    roots = raw.split(":") if raw else [os.path.join(os.path.expanduser("~"), "dev")]
     return [os.path.expanduser(r) for r in roots if r]
 
 
@@ -128,7 +126,10 @@ _SHELF_SKIP = re.compile(r"(worktrees?$|-wt$|RETIRED|^references$|^archive$|^\.)
 
 
 def scan_repos(roots=None):
-    """{path: name} of git repos (depth 1) under the scan roots."""
+    """{path: name} of git repos under the scan roots — immediate children
+    AND one level deeper (so both `<root>/<repo>` and `<root>/<org>/<repo>`
+    are found). Deeper nesting is not walked; the project registry can still
+    register those repos explicitly."""
     out = {}
     for root in roots if roots is not None else _scan_roots():
         if not os.path.isdir(root):
@@ -139,6 +140,15 @@ def scan_repos(roots=None):
             p = os.path.join(root, n)
             if os.path.isdir(os.path.join(p, ".git")):
                 out[p] = n
+            elif n not in (".", "..") and not n.startswith(".") \
+                    and os.path.isdir(p):
+                # depth-2: <root>/<org>/<repo>
+                for n2 in sorted(os.listdir(p)):
+                    if _SHELF_SKIP.search(n2):
+                        continue
+                    p2 = os.path.join(p, n2)
+                    if os.path.isdir(os.path.join(p2, ".git")):
+                        out[p2] = n2
     return out
 
 

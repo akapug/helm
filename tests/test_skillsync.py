@@ -4,7 +4,10 @@ import tempfile
 import time
 import unittest
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import skillsync  # noqa: E402
 
@@ -37,18 +40,18 @@ class FakeEstate(unittest.TestCase):
         self.backup = j(self.tmp, "premerge-backup")
         self.croot = j(self.tmp, "claude-homes")
 
-        # team: symlink-farm home + STRANDED real skills (the stranding class)
-        team = j(self.croot, "team-example-com", "skills")
-        os.makedirs(team)
-        os.symlink(j(self.canon, "build"), j(team, "build"))
-        _mk_skill(team, "personal-skill", "stranded", age=100)
-        _mk_skill(team, "orca-cli", "orca newest", age=50)
-        os.symlink(j(self.croot, "team-example-com"), j(self.croot, "team-example"))
+        # alias: symlink-farm home + STRANDED real skills (the stranded-personal-skill class)
+        alias = j(self.croot, "member-example-com", "skills")
+        os.makedirs(alias)
+        os.symlink(j(self.canon, "build"), j(alias, "build"))
+        _mk_skill(alias, "personal-skill", "stranded", age=100)
+        _mk_skill(alias, "orca-cli", "orca newest", age=50)
+        os.symlink(j(self.croot, "member-example-com"), j(self.croot, "member-example"))
 
-        # cto: already a whole-dir symlink to canonical (idempotent no-op)
-        cto = j(self.croot, "admin-example-com")
-        os.makedirs(cto)
-        os.symlink(self.canon, j(cto, "skills"))
+        # ops: already a whole-dir symlink to canonical (idempotent no-op)
+        ops = j(self.croot, "admin-example-com")
+        os.makedirs(ops)
+        os.symlink(self.canon, j(ops, "skills"))
 
         # fresh: a credhome with no skills dir at all
         os.makedirs(j(self.croot, "fresh-com"))
@@ -69,7 +72,7 @@ class FakeEstate(unittest.TestCase):
         self.seats = j(self.tmp, "seats")
         cdx = j(self.seats, "codex", "claude")
         os.makedirs(cdx)
-        os.symlink(team, j(cdx, "skills"))
+        os.symlink(alias, j(cdx, "skills"))
         os.makedirs(j(self.seats, "codex", "instances", "codex-2", "claude"))
         os.makedirs(j(self.seats, "codex", "smoke-claude"))  # must be skipped
 
@@ -83,8 +86,8 @@ class FakeEstate(unittest.TestCase):
 
     def test_discovery_dedupes_aliases_and_skips_smoke(self):
         labels = [l for l, _ in self.dirs]
-        self.assertEqual(labels.count("team-example-com"), 1)
-        self.assertNotIn("team-example", labels)          # alias folded
+        self.assertEqual(labels.count("member-example-com"), 1)
+        self.assertNotIn("member-example", labels)          # alias folded
         self.assertIn("default-claude", labels)
         self.assertIn("seat:codex", labels)
         self.assertTrue(any("codex-2" in l for l in labels))
@@ -97,7 +100,7 @@ class FakeEstate(unittest.TestCase):
         self.assertEqual(names, {"personal-skill", "orca-cli", "team-metrics", "build"})
         self.assertFalse(os.path.exists(os.path.join(self.canon, "personal-skill")))
         self.assertFalse(os.path.islink(
-            os.path.join(self.croot, "team-example-com", "skills")))
+            os.path.join(self.croot, "member-example-com", "skills")))
         self.assertFalse(os.path.exists(self.backup))
 
     def test_apply_unions_and_wires_everything(self):
@@ -106,7 +109,7 @@ class FakeEstate(unittest.TestCase):
         # union: the stranded skill is canonical now
         self.assertTrue(os.path.isfile(
             os.path.join(self.canon, "personal-skill", "SKILL.md")))
-        # newest-wins: team's orca-cli (newer) beat the default home's symlink
+        # newest-wins: alias's orca-cli (newer) beat the default home's symlink
         with open(os.path.join(self.canon, "orca-cli", "SKILL.md")) as f:
             self.assertEqual(f.read(), "orca newest")
         # newest-wins vs canonical itself: the newer 'build' replaced it,
@@ -122,11 +125,11 @@ class FakeEstate(unittest.TestCase):
             s = os.path.join(cdir, "skills")
             self.assertTrue(os.path.islink(s), s)
             self.assertEqual(os.path.realpath(s), os.path.realpath(self.canon), s)
-        # superset: every skill visible in team before is visible after
-        view = set(os.listdir(os.path.join(self.croot, "team-example-com", "skills")))
+        # superset: every skill visible in alias before is visible after
+        view = set(os.listdir(os.path.join(self.croot, "member-example-com", "skills")))
         self.assertLessEqual({"build", "personal-skill", "orca-cli"}, view)
         # the original real dirs survive whole in the backup root
-        saved = os.path.join(self.backup, "team-example-com")
+        saved = os.path.join(self.backup, "member-example-com")
         snap = os.listdir(saved)
         self.assertEqual(len(snap), 1)
         self.assertTrue(os.path.isfile(os.path.join(
@@ -163,13 +166,13 @@ class FakeEstate(unittest.TestCase):
         self.assertIn("error", r)
         # and nothing moved
         self.assertFalse(os.path.islink(
-            os.path.join(self.croot, "team-example-com", "skills")))
+            os.path.join(self.croot, "member-example-com", "skills")))
 
     def test_wire_refuses_to_shadow_an_unmerged_skill(self):
         """wire() alone (no merge) must refuse a swap that would hide a
         skill canonical lacks — the never-lose-a-skill floor."""
-        cdir = os.path.join(self.croot, "team-example-com")
-        action, detail = skillsync.wire("team-example-com", cdir, self.canon,
+        cdir = os.path.join(self.croot, "member-example-com")
+        action, detail = skillsync.wire("member-example-com", cdir, self.canon,
                                         self.backup, apply=True)
         self.assertEqual(action, "FAIL")
         self.assertIn("personal-skill", detail)
@@ -200,21 +203,26 @@ class CanonicalResolutionTest(unittest.TestCase):
     def test_deck_env_never_steers_sync(self):
         """HELM_SKILL_DECK (home_create's content-source knob) points at a
         git-tracked repo dir on the live host — sync must NOT merge local
-        strays there. Only HELM_SKILLS_CANONICAL steers the hub."""
+        strays there. Only HELM_SKILLS_CANONICAL (or the authored host) steers
+        the hub; the deck never does."""
         deck_old = os.environ.get("HELM_SKILL_DECK")
         os.environ["HELM_SKILL_DECK"] = "/somewhere/tracked/repo/skills"
         old = os.environ.pop("HELM_SKILLS_CANONICAL", None)
         try:
-            # canonical() realpaths the default (mint vs sync must agree on the
-            # path string); the deck still never steers it.
-            self.assertEqual(
-                skillsync.canonical(),
-                os.path.realpath(skillsync.DEFAULT_CANONICAL))
+            # No canonical configured (env unset; the hermetic HELM_HOME carries
+            # no authored `host.skills_canonical`) and a deck IS set: canonical()
+            # is None — the deck is NEVER a fallback. If it wrongly steered the
+            # hub, this would return the deck path instead of None.
+            self.assertIsNone(skillsync.canonical())
+            # and when a hub IS configured, THAT wins — still never the deck:
+            os.environ["HELM_SKILLS_CANONICAL"] = "/x/real-hub"
+            self.assertEqual(skillsync.canonical(), os.path.realpath("/x/real-hub"))
         finally:
             if deck_old is None:
-                del os.environ["HELM_SKILL_DECK"]
+                os.environ.pop("HELM_SKILL_DECK", None)
             else:
                 os.environ["HELM_SKILL_DECK"] = deck_old
+            os.environ.pop("HELM_SKILLS_CANONICAL", None)
             if old is not None:
                 os.environ["HELM_SKILLS_CANONICAL"] = old
 

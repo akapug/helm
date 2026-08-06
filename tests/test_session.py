@@ -302,12 +302,12 @@ class LawTest(SessionBase):
         self.assertIn("no recorded cwd", err)
 
     def test_port_refuses_live_and_prints_when_clear(self):
-        cred = os.path.join(self.tmp, "cto mv")
+        cred = os.path.join(self.tmp, "ops example")
         os.makedirs(cred)
         cwd = "/work/project with spaces"
         with open(os.path.join(cred, ".claude.json"), "w") as f:
             json.dump({"projects": {cwd: {"hasTrustDialogAccepted": True}}}, f)
-        home_rows = [{"name": "admin", "path": cred, "aliases": [],
+        home_rows = [{"name": "ops-example", "path": cred, "aliases": [],
                       "projects_link_ok": True}]
         import helm.homes as homes_mod
         with self._sid("aaaa1111-integrator"), \
@@ -316,14 +316,14 @@ class LawTest(SessionBase):
             # live copy -> refuse (no incantation line printed)
             with mock.patch.object(session, "open_pids", return_value=[57699]):
                 rc, out, _ = run(session.cmd_port,
-                                 ["--cred", "admin", "aaaa1111"])
+                                 ["--cred", "ops-example", "aaaa1111"])
             self.assertEqual(rc, 1)
             self.assertIn("LAW 1", out)
             self.assertNotIn("claude --resume", out)
             # clear -> print with quoted credhome/cwd + FORCE
             with mock.patch.object(session, "open_pids", return_value=[]):
                 rc, out, _ = run(session.cmd_port,
-                                 ["--cred", "admin", "aaaa1111"])
+                                 ["--cred", "ops-example", "aaaa1111"])
             self.assertEqual(rc, 0)
             self.assertIn("CLAUDE_CONFIG_DIR='" + cred + "'", out)
             self.assertIn("cd '" + cwd + "'", out)
@@ -1107,7 +1107,7 @@ class HeadlessCensusTest(unittest.TestCase):
         # verbatim argv measured 2026-07-22 — the call that flipped a CERTIFIED
         # estate to a memory-only FAIL twenty minutes later. It is excluded on
         # its EXPLICIT nonpersistence evidence, not on -p alone.
-        argv = ["/home/u/.local/bin/claude", "-p", "--output-format", "json",
+        argv = ["/home/tester/.local/bin/claude", "-p", "--output-format", "json",
                 "--no-session-persistence", "--exclude-dynamic-system-prompt"]
         self.assertTrue(session._is_headless(argv))
         self.assertTrue(session._is_nonpersistent(argv))
@@ -1284,7 +1284,8 @@ class HeadlessCensusTest(unittest.TestCase):
         # --resume BAD -p hi` errors 'not a UUID'), yet the one-consumption
         # presumption read the resume as -d's debug filter — returning
         # resume=None, certifying sessionless green, and dropping the holder
-        # from DOUBLE-OPEN arithmetic. Base 690b669 found this holder.
+        # from DOUBLE-OPEN arithmetic. The pre-regression base found this
+        # holder.
         argv = ["claude", "-d", "--resume", self.SID_A, "-p",
                 "--no-session-persistence", "hi"]
         self.assertEqual(session._resume_sid(argv), self.SID_A)
@@ -1659,6 +1660,105 @@ class HeadlessCensusTest(unittest.TestCase):
         rc, out, err = self.ls([self.row(3, None, False)], {}, certify=True)
         self.assertEqual(rc, 1)
         self.assertIn("UNKNOWN", out)
+
+
+class ProxyScrubOnLaunchAndPasteTest(unittest.TestCase):
+    """A known bug class in this module: a scrub that covers the child-stamp
+    register and not the proxy one.
+
+    THE HAZARD, in the words of the seam that exists for it: every non-claude
+    family here runs behind CLIProxyAPI but INSIDE Claude Code's harness, so a
+    launch or a pasted resume line inheriting the proxy triple starts a Claude
+    session aimed at a proxy fronting another vendor — it looks native, it is
+    billed native, and it routes elsewhere.
+
+    SYNTHETIC PLACEHOLDERS ONLY, and every assertion is on the KEY SET rather
+    than on a value: these tests are public-bound, and `assertIn(wanted, env)`
+    is the shape that passes while the thing under test is wrong."""
+
+    PLACEHOLDER = "synthetic-not-a-real-value"
+
+    def setUp(self):
+        from helm import seat
+        self.seat = seat
+        self.prior = {}
+        for v in seat.SCRUB_VARS + seat.CHILD_STAMP_VARS:
+            self.prior[v] = os.environ.get(v)
+            os.environ[v] = self.PLACEHOLDER
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for v, was in self.prior.items():
+            if was is None:
+                os.environ.pop(v, None)
+            else:
+                os.environ[v] = was
+
+    def test_a_launch_from_a_PROXIED_seat_carries_no_proxy_key(self):
+        env = session._launch_env()
+        self.assertEqual([v for v in self.seat.SCRUB_VARS if v in env], [])
+        # CONTROL on the same observable: the stamp register is scrubbed by the
+        # same call, so an empty proxy list is coverage and not a dead probe.
+        self.assertEqual([v for v in self.seat.CHILD_STAMP_VARS if v in env], [])
+        # ...and the function still does its original job.
+        self.assertEqual(env[session.FORCE_VAR], "1")
+
+    def test_a_launch_from_a_CLEAN_shell_is_unchanged(self):
+        self._restore()
+        for v in self.seat.SCRUB_VARS + self.seat.CHILD_STAMP_VARS:
+            os.environ.pop(v, None)
+        env = session._launch_env()
+        self.assertEqual([v for v in self.seat.SCRUB_VARS if v in env], [])
+        self.assertEqual(env[session.FORCE_VAR], "1")
+        # a clean shell must not lose anything else it was carrying.
+        # patch.dict rather than addCleanup(os.environ.pop, ...): the env-hygiene
+        # guard reads the module STATICALLY and counts a key as restored when it
+        # is del'd, popped by a CALL, named in a tuple, or in a patch.dict — a
+        # bare `os.environ.pop` handed to addCleanup is an Attribute, never a
+        # Call, so it restores at runtime and reads as a leak. Recognised beats
+        # clever when the reader is a parser.
+        with mock.patch.dict(os.environ,
+                             {"HELM_TEST_UNRELATED": self.PLACEHOLDER}):
+            self.assertIn("HELM_TEST_UNRELATED", session._launch_env())
+
+    def test_the_scrub_does_not_depend_on_the_proxy_being_UP(self):
+        """A seat whose proxy is DOWN still has the triple in its environment —
+        the variables are configuration, not a liveness signal — so the scrub
+        must key on the NAMES and never on reachability."""
+        env = session._launch_env()
+        # positive control FIRST: the env is real and populated, so the empty
+        # list below is a scrub and not an empty dict.
+        self.assertEqual(env[session.FORCE_VAR], "1")
+        self.assertIn("PATH", env)
+        self.assertEqual([v for v in self.seat.SCRUB_VARS if v in env], [])
+
+    def test_the_PASTEABLE_resume_line_unsets_both_registers(self):
+        """The register this module was short. `_print_incantation` mints a line
+        a human pastes into whatever shell they have — which is exactly the
+        proxied shell the triple lives in."""
+        line = session._print_incantation("s" * 8, cwd="/tmp")
+        for v in self.seat.SCRUB_VARS:
+            self.assertIn("-u " + v, line, "%s not unset in a pasted resume" % v)
+        for v in self.seat.CHILD_STAMP_VARS:
+            self.assertIn("-u " + v, line, "%s regressed (control)" % v)
+        self.assertIn("claude --resume", line)
+
+    def test_the_prefix_IS_the_shared_seam_not_a_local_copy(self):
+        """The class fix, pinned. Three sites built this literal inline and the
+        proxy triple was missing from every one; a fourth copy would go the same
+        way. If this ever stops being the seam's output, the drift has already
+        started."""
+        from helm import seat
+        shared = seat.paste_unset_prefix()
+        # unconditional control: an empty var tuple would make the loop below
+        # run zero times and pass, so pin that there is something to check.
+        self.assertEqual(len(seat.PASTE_UNSET_VARS), 6)
+        self.assertTrue(shared.startswith("env -u "))
+        # positive control: two functions that both returned "" would satisfy
+        # an equality and prove nothing, so pin what the shared value CONTAINS.
+        for v in seat.SCRUB_VARS + seat.CHILD_STAMP_VARS:
+            self.assertIn("-u " + v, shared)
+        self.assertEqual(session._unset_prefix(), shared)
 
 
 if __name__ == "__main__":

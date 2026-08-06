@@ -7,6 +7,12 @@ no probe, no mutation, no LLM.
 
 Sections (headline-first; an empty section is omitted entirely):
   SINCE YOU LEFT  — sessions active in the window, bucketed by project
+  WHAT WE BUILT   — the gauge: trunk lands from git (first-parent of the
+                    landedness ref, last 48h, grouped by day) + the land-loop
+                    board counts. NEVER omitted — tri-state instead: an
+                    unreadable repo or an unavailable board is said out loud,
+                    because a gauge that goes quiet when the instrument breaks
+                    reads as "nothing shipped"
   KNOWLEDGE DELTA — store entries added/updated/retired + drain receipts,
                     plus inject-ledger turn stats (top-firing, silent-rate)
   STORE REVIEW QUEUE — provisional entries (xrev-cleared, FIRING but awaiting
@@ -35,6 +41,10 @@ MAX_PROJECTS = 6  # session buckets shown (the ~40-line render cap)
 MAX_SEATS = 6
 MAX_WAITING = 6
 MAX_REVIEW = 6   # provisional entries listed before the "+N more" fold
+BUILT_HOURS = 48.0  # the gauge window — fixed, NOT the brief's --hours: the
+                    # owner compares mornings, and a window that moves with the
+                    # flag makes two briefs incomparable
+MAX_BUILT = 12   # land lines before the "+N more" fold (~15 with day heads)
 
 
 def _ts_epoch(s):
@@ -70,6 +80,62 @@ def _sessions_delta(cutoff):
             b["latest_title"] = r.get("t") or ""
     projects = sorted(buckets.values(), key=lambda b: (-b["n"], -b["latest_mt"]))
     return {"total": total, "projects": projects}
+
+
+# --------------------------------------------------------------- what we built
+
+def _built(repo=None):
+    """The gauge: what actually reached trunk in the last BUILT_HOURS, read
+    straight from git — every first-parent commit of the landedness ref IS one
+    land (a merge or a direct trunk commit), so the subjects are the fleet's
+    own outcome lines — plus the land-loop counts `landreq.board_section`
+    already projects (reused, never re-derived). Still NETWORK-NEVER: the
+    remote-tracking ref is a local snapshot and `git log` never fetches.
+
+    TRI-STATE ON BOTH LEGS, and the section is never omitted: a repo git
+    cannot read and a board the projection refuses are each SAID, because this
+    gauge going silent is indistinguishable from "nothing shipped" — the one
+    lie it exists to prevent. An empty window is its own honest state."""
+    from . import landreq, vcs
+    repo = repo or os.getcwd()
+    v = vcs.backend(repo)
+    ref = v.trunk_ref(repo)  # origin/<base> when a remote publishes one
+    # LOCAL FALLBACK IS NOT LANDEDNESS. trunk_ref degrades to the local
+    # branch when no remote exists, and a local merge is exactly the claim
+    # this gauge must never launder into a "land" (a cross-family review
+    # finding — the landed-means-origin-main class). Ask git, never parse the
+    # name.
+    rp_rc, _, _ = v.text(repo, "rev-parse", "--verify", "--quiet",
+                         "refs/remotes/" + ref)
+    published = rp_rc == 0
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                          time.gmtime(time.time() - BUILT_HOURS * 3600))
+    rc, out, err = v.text(repo, "log", ref, "--first-parent",
+                          "--since=" + since, "--date=format:%Y-%m-%d",
+                          "--pretty=%h%x09%cd%x09%s")
+    days, total, git_error = [], 0, None
+    if rc != 0:
+        git_error = ((err or "git log failed").splitlines() or ["?"])[0][:120]
+    else:
+        for line in out.splitlines():
+            sha, _, rest = line.partition("\t")
+            day, _, subject = rest.partition("\t")
+            if not (sha and day):
+                continue
+            if not days or days[-1]["day"] != day:
+                days.append({"day": day, "lands": []})
+            days[-1]["lands"].append({"sha": sha, "subject": subject})
+            total += 1
+    try:
+        b = landreq.board_section()
+    except Exception as exc:  # noqa: BLE001 — the brief never dies on the board
+        b = {"unavailable": "board projection raised: %s" % exc,
+             "loops": [], "stalled": []}
+    return {"repo": repo, "ref": ref, "published": published,
+            "window_h": BUILT_HOURS,
+            "git_error": git_error, "days": days, "total": total,
+            "board": {"loops": len(b["loops"]), "stalled": len(b["stalled"]),
+                      "unavailable": b["unavailable"]}}
 
 
 # ------------------------------------------------------------ knowledge delta
@@ -150,20 +216,52 @@ def _inject_stats(cutoff):
                         fired[str(i)] = fired.get(str(i), 0) + 1
     top = sorted(fired.items(), key=lambda kv: (-kv[1], kv[0]))[:TOP_FIRING]
     starved, always_n = [], 0
+    cannot, never = [], []
     try:
-        # pinned starvation, surfaced where the owner actually looks (the
-        # 6/11-never-fired class): store.pinned_stats walks the same ledger
-        # generations; ids that never made a single injection are the tail.
+        # pinned starvation, surfaced where the owner actually looks.
+        #
+        # STARVED IS A PRESENT-TENSE FACT, NOT A HISTORICAL ZERO. This asked
+        # `made[id] == 0` — never fired in the whole ledger window — and that
+        # predicate cannot see the case it exists for. MEASURED on a live
+        # store: 5 always-entries, budget 1200 fully consumed by the
+        # first 3 (each capped to exactly LINE_CAP=400, so 3 x 400 == 1200 and
+        # a 4th can NEVER fit). Two entries could not fire on any turn, three
+        # more had fired 118-121 times in 8345 rows (1.4%) — and `starved` was
+        # EMPTY, because none had a lifetime zero. The surface built to catch
+        # starvation reported healthy while 2 of 5 owner rules were structurally
+        # dead, including the two about how to sequence work.
+        #
+        # A RATE THRESHOLD would be the obvious fix and is the wrong one: an
+        # entry pinned an hour ago legitimately has a near-zero count, so any
+        # rate predicate either flags every new entry or needs an age carve-out
+        # that re-creates the same blind spot at a different boundary.
+        #
+        # `fits` is already the deterministic answer. pinned_stats runs inject's
+        # own greedy budget walk, so an always-entry ABSENT FROM `fits` cannot
+        # fire on the NEXT turn — no window, no rate, no new-entry false
+        # positive. That is exactly the question the owner is asking when they
+        # pin something: will this reach me? Lifetime-zero stays in the report
+        # as a weaker second signal for entries that fit today but never landed.
+        # The two cases are kept APART because the owner's action differs: an
+        # entry that cannot fit needs something ahead of it shortened, while
+        # one that fits but has never landed is usually just newly pinned.
+        # Folding them into one number would tell the owner a rule is broken
+        # when it is merely new, which is how a real signal gets ignored.
         from . import store
         s = store.pinned_stats()
-        if s["rows"]:
-            always_n = len(s["made"])
-            starved = sorted(i for i, c in s["made"].items() if c == 0)
+        if s["rows"] or s["always"]:
+            always_n = len(s["always"])
+            cannot = sorted(str(e["id"]) for e in s["always"]
+                            if str(e["id"]) not in s["fits"])
+            never = sorted(i for i, c in s["made"].items()
+                           if c == 0 and i in s["fits"]) if s["rows"] else []
+            starved = cannot + [i for i in never if i not in cannot]
     except Exception:
         pass  # fail-open: the brief never dies on a stats walk
     return {"turns": turns, "silent": silent,
             "silent_rate": round(silent / turns, 2) if turns else 0.0,
-            "top": top, "starved": starved, "always_n": always_n}
+            "top": top, "starved": starved, "always_n": always_n,
+            "cannot_fire": cannot, "never_fired": never}
 
 
 # --------------------------------------------------------- store review queue
@@ -272,11 +370,14 @@ def _waiting():
 
 # --------------------------------------------------------------- compose/render
 
-def compose(hours=12.0):
-    """The raw brief dict (`--json` prints exactly this)."""
+def compose(hours=12.0, repo=None):
+    """The raw brief dict (`--json` prints exactly this). `repo` is the
+    checkout the WHAT WE BUILT gauge reads (default: the cwd the brief was
+    asked from — the repo the operator is standing in)."""
     cutoff = time.time() - hours * 3600
     return {"generated_at": pk.now_ts(), "hours": hours,
             "sessions": _sessions_delta(cutoff),
+            "built": _built(repo),
             "knowledge": _knowledge_delta(cutoff),
             "inject": _inject_stats(cutoff),
             "review": _review_queue(),
@@ -311,6 +412,48 @@ def render(b):
         more = len(s["projects"]) - MAX_PROJECTS
         if more > 0:
             lines.append("  (+%d more project%s)" % (more, "s"[:more != 1]))
+    bl, bd = b["built"], b["built"]["board"]
+    if bd["unavailable"]:
+        board = "board unavailable — " + str(bd["unavailable"])[:60]
+    elif bd["loops"]:
+        board = "%d open land loop%s, %d stalled" % (
+            bd["loops"], "s"[:bd["loops"] != 1], bd["stalled"])
+    else:
+        board = "no open land loops"
+    if bl["git_error"]:
+        lines += ["", "WHAT WE BUILT — trunk unreadable · " + board,
+                  "  git unreadable at %s: %s" % (bl["repo"], bl["git_error"])]
+    elif not bl["total"]:
+        lines += ["", "WHAT WE BUILT — nothing landed on %s in the last %gh · %s"
+                  % (bl["ref"], bl["window_h"], board)]
+    else:
+        if bl.get("published", True):
+            head = "WHAT WE BUILT — %d land%s on %s (last %gh) · %s" % (
+                bl["total"], "s"[:bl["total"] != 1], bl["ref"],
+                bl["window_h"], board)
+        else:
+            # A local-only ref proves COMMITS, never publication — name the
+            # claim instead of rendering local merges as lands (a cross-family
+            # review finding, the landed-means-origin-main class).
+            head = ("WHAT WE BUILT — %d LOCAL commit%s on %s (last %gh; no "
+                    "remote-tracking ref — local history is not proof of "
+                    "publication) · %s" % (
+                        bl["total"], "s"[:bl["total"] != 1], bl["ref"],
+                        bl["window_h"], board))
+        lines += ["", head]
+        shown = 0
+        for d in bl["days"]:
+            if shown >= MAX_BUILT:
+                break
+            lines.append("  " + d["day"])
+            for land in d["lands"]:
+                if shown >= MAX_BUILT:
+                    break
+                lines.append("    %s  %s" % (land["sha"], land["subject"][:66]))
+                shown += 1
+        more = bl["total"] - shown
+        if more > 0:
+            lines.append("  (+%d more land%s)" % (more, "s"[:more != 1]))
     k, inj = b["knowledge"], b["inject"]
     segs = [fmt % len(k[key]) for fmt, key in
             (("+%d added", "added"), ("%d updated", "updated"), ("%d retired", "retired"))
@@ -330,9 +473,21 @@ def render(b):
             if inj.get("starved"):
                 ids = ", ".join(inj["starved"][:4])
                 more = len(inj["starved"]) - 4
-                lines.append("  pinned starvation: %d of %d never fired%s — "
-                             "`helm store pinned --stats` (demote or reword)" % (
-                                 len(inj["starved"]), inj["always_n"],
+                # CANNOT-FIRE leads: it is the actionable half and the half
+                # that was invisible. "never fired" is appended only as a
+                # count, because a newly-pinned entry lands there innocently
+                # and giving it equal billing is how the real signal gets
+                # trained away.
+                head = ("%d of %d CANNOT FIRE (budget spent before the walk "
+                        "reaches them)" % (len(inj["cannot_fire"]), inj["always_n"])
+                        if inj["cannot_fire"] else
+                        "%d of %d never fired" % (len(inj["starved"]), inj["always_n"]))
+                tail = (", %d fit but never fired" % len(inj["never_fired"])
+                        if inj["cannot_fire"] and inj["never_fired"] else "")
+                lines.append("  pinned starvation: %s%s%s — "
+                             "`helm store pinned --stats` (shorten one ahead of "
+                             "them, or demote)" % (
+                                 head, tail,
                                  ": " + ids + (" +%d" % more if more > 0 else "")))
     rq = b["review"]
     rq_active = bool(rq["provisional"] or rq["candidate"])
@@ -359,15 +514,17 @@ def render(b):
     if b["waiting"]:
         lines += ["", "WAITING ON YOU"]
         lines += ["  - " + it for it in b["waiting"][:MAX_WAITING]]
-    if not (s["total"] or segs or live_inject or rq_active or b["waiting"]):
+    if not (s["total"] or segs or live_inject or rq_active or b["waiting"]
+            or bl["total"]):
         lines.insert(1, "quiet — nothing new in the window.")
     return "\n".join(lines)
 
 
 def cmd_brief(args):
     """brief [--hours N] [--json] — the operator's morning brief: session
-    activity, knowledge delta, cached seat reality, owner gates. Read-only,
-    never probes the network."""
+    activity, trunk lands (the WHAT WE BUILT gauge, read from the repo the
+    brief is asked from), knowledge delta, cached seat reality, owner gates.
+    Read-only, never probes the network."""
     # flags-only membership reader — guard the tail before compose():
     # `brief --bogus` silently rendered the brief and exited 0.
     from .cli import guard_tail
