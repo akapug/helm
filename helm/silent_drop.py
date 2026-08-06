@@ -7,9 +7,21 @@ generated TEXT is DROPPED at that boundary — the transcript records an
 assistant turn with stop_reason=end_turn, NO text, NO tool_use, NO real
 thinking, yet usage.output_tokens > 0 (codex DID generate; the answer never
 reached the pane). HTTP still logs 200 (a completed request), so status-code
-monitors are blind. claude-code's own "no visible output" recovery nudge fired
-in only a fraction of observed cases — the other silent deaths wedged nothing
-but said nothing and woke nothing. This rung turns that silent class LOUD.
+monitors are blind. This rung turns that silent class LOUD.
+
+A REFUTED EARLIER READING, corrected here because the old sentence misleads:
+an earlier header said CC's "no visible output" nudge fired in only 1 of 75
+observed cases — "the other 74 silent deaths wedged nothing but said
+nothing" — which reads as: the detector keys on a signal present in almost
+no real drop and therefore catches almost none of them. A transcript
+re-investigation refuted the premise: 73 of those 75 candidates were NOT
+drops at all — normal reasoning-prefix rows whose text arrived as a
+continuation — and exactly 2 were genuine, both nudged. So the nudge is not
+a rare accident on a real drop; it is CC noticing the silence, and it is the
+discriminator that separates the real drops from the false ones
+(`_followed_by_nudge_before_text`). A reader who trusted the old sentence
+would conclude this watchdog is near-blind and stop believing its clean
+bills — a stale sentence costs more than a missing one.
 
 THE SIGNATURE (drop-after-generate, NOT a refusal — a refusal is ~0 output
 tokens):
@@ -51,7 +63,8 @@ _USAGE = """usage: helm seat silent-drop [--seat S] [--once] [--dry-run] [--quie
   One read-only pass over every proxy seat: scan the recent transcript tail
   for the empty-completion drop (end_turn + no text/tool + output_tokens>0)
   and post a LOUD a2a alert naming the lost tokens. Latched: one alert per
-  seat per episode. --dry-run reports without posting; --quiet skips the chat
+  seat per episode. --dry-run reports without posting AND without touching
+  the alert latch (a simulation never spends the alert budget); --quiet skips the chat
   post; --once accepted for interface stability.
 """
 
@@ -99,6 +112,38 @@ def _recent(ts):
         return True
 
 
+def _blocks(r):
+    return (r.get("message") or {}).get("content") or []
+
+
+def _has_text(r):
+    return any(isinstance(b, dict) and b.get("type") == "text"
+               and (b.get("text") or "").strip() for b in _blocks(r))
+
+
+def _followed_by_nudge_before_text(lines, i, lookahead=8):
+    """TRUE only when a user 'no visible output' nudge lands BEFORE the next
+    assistant text block. This is THE discriminator between a real drop and a
+    normal turn (the refuted-reading correction above): claude-code records the
+    reasoning-only `end_turn` row FIRST (empty thinking, ot>0), then the text
+    as a continuation — 73 such prefix rows on the founding transcript, all
+    FALSE drops. A REAL drop is when the text does NOT come: CC detects the
+    silence itself and injects a 'no visible output' nudge (only 2 on the
+    same transcript, both genuine). Scanning the row in isolation cannot tell
+    them apart — the signature is identical — so the detector must look
+    FORWARD: nudge-before-text = drop; text-first = normal continuation."""
+    for j in range(i + 1, min(i + 1 + lookahead, len(lines))):
+        if "no visible output" in lines[j]:
+            return True
+        try:
+            r2 = json.loads(lines[j])
+        except ValueError:
+            continue
+        if r2.get("type") == "assistant" and _has_text(r2):
+            return False        # text arrived first — a normal prefix, not a drop
+    return False
+
+
 def scan_seat(seat_name):
     """Read-only scan of one seat's newest transcript tail. Returns a finding
     dict on the most RECENT drop (within the alert window), else None. A stale
@@ -112,13 +157,17 @@ def scan_seat(seat_name):
     tp = autocompact._newest_transcript(d)
     if not tp:
         return None
+    lines = autocompact._tail_lines(tp)[-RECENT_LINES:]
     newest = None
-    for ln in autocompact._tail_lines(tp)[-RECENT_LINES:]:
+    for i, ln in enumerate(lines):
         try:
             r = json.loads(ln)
         except ValueError:
             continue
-        if _is_drop(r):
+        # the isolation signature (a drop CANDIDATE) AND the forward
+        # discriminator (a REAL drop: CC nudged the silence) — a thinking-only
+        # prefix row that text follows directly is a normal turn, never a drop.
+        if _is_drop(r) and _followed_by_nudge_before_text(lines, i):
             usage = (r.get("message") or {}).get("usage") or {}
             newest = {
                 "seat": seat_name,
@@ -130,6 +179,59 @@ def scan_seat(seat_name):
     if newest and not _recent(newest.get("ts")):
         return None   # stale drop (older than the window) — don't cry wolf
     return newest
+
+
+def unscannable(seats=None):
+    """[(seat, why)] for every seat this pass COULD NOT LOOK AT.
+
+    CANNOT-LOOK IS NOT A CLEAN BILL, and this module was violating that law
+    while enforcing it elsewhere. `scan_seat` returns None for three unrelated
+    reasons — an unknown seat family, NO TRANSCRIPT TO READ, and a genuinely
+    quiet seat — and `scan` filtered all three to the same empty list. The
+    watchdog then printed "no drops detected".
+
+    A SILENT SEAT IS THE SECOND, SUBTLER CASE and the one live on this host.
+    `scan_seat` only reports a drop inside RECENT_ALERT_WINDOW_S, deliberately
+    (a stale drop is not actionable — the seat has stopped producing turns to
+    rescue). But a seat whose NEWEST transcript predates that window can never
+    produce a finding at all, so counting it toward a clean bill is counting a
+    seat nobody asked anything. Measured live: one proxy seat's newest
+    transcript was 141 HOURS old while the watchdog reported it clean every
+    ninety seconds — through the very period the owner kept reporting that
+    the seat was still dropping. "Quiet" and "healthy" render identically and
+    mean opposite things.
+
+    HONEST NOTE ON A CLAIM THIS DOCSTRING NEARLY MADE. The first version of
+    this said two proxy seats had NO transcript at all, because the chat
+    ROSTER records no session for them. That was a wrong instrument: the
+    watchdog reads a seat's own instance dir, not the roster, and both seats
+    scan fine. The roster and the instance dir are different sources of truth
+    and only one of them is the one this module uses.
+    """
+    from . import seat
+    if seats is None:
+        seats = autocompact.proxy_seats()
+    out, now = [], time.time()
+    for s in seats:
+        family, err = seat._seat_family(s)
+        if err:
+            out.append((s, "not a known seat family"))
+            continue
+        tp = autocompact._newest_transcript(seat._instance_dir(family, s))
+        if not tp:
+            out.append((s, "no transcript to read (no session bound to this "
+                           "seat) — a drop here cannot be seen"))
+            continue
+        try:
+            age = now - os.path.getmtime(tp)
+        except OSError:
+            out.append((s, "transcript vanished mid-pass"))
+            continue
+        if age > RECENT_ALERT_WINDOW_S:
+            out.append((s, "silent for %.1fh — older than the %d-minute alert "
+                           "window, so no finding is possible; quiet, not clean"
+                        % (age / 3600.0, RECENT_ALERT_WINDOW_S // 60)))
+    return out
 
 
 def scan(seats=None):
@@ -172,10 +274,20 @@ def _alert_text(f):
             })
 
 
-def check(seats=None, post=True, quiet=False):
-    """One read-only pass: scan -> dedup-latch -> alert. Returns
+def check(seats=None, post=True, quiet=False, dry=False):
+    """One pass: scan -> dedup-latch -> alert. Returns
     {"findings": [...], "alerted": [...]}. The fcntl lock covers the
-    scan/latch/write transaction so overlapping passes never double-alert."""
+    scan/latch/write transaction so overlapping passes never double-alert.
+
+    dry=True is GENUINELY read-only and wins over post: findings are
+    classified against the current latch state (latched / would-alert) but
+    nothing is written and nothing is posted. The alert budget — the
+    LATCH_TTL_S window a real alert opens — is spent only by a pass that
+    can actually deliver; before this contract a --dry-run stamped
+    alerted_at and silently suppressed the next REAL drop for 15 minutes
+    (an independent review found it). post=False
+    without dry still latches: those callers (tests, --quiet machine
+    consumers) DO consume the alert through the returned structure."""
     from . import pk
     p = _state_path()
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -197,22 +309,30 @@ def check(seats=None, post=True, quiet=False):
             # message conveys the storm size.
             if entry and now - (entry.get("alerted_at") or 0) < LATCH_TTL_S:
                 f["latched"] = True
-                entry["suppressed"] = (entry.get("suppressed") or 0) + 1
-                st[f["seat"]] = entry
+                if not dry:
+                    entry["suppressed"] = (entry.get("suppressed") or 0) + 1
+                    st[f["seat"]] = entry
                 continue
             f["latched"] = False
             f["suppressed_since_last"] = (entry.get("suppressed") or 0) if entry else 0
-            st[f["seat"]] = {"alerted_at": now, "ts": f.get("ts"), "suppressed": 0}
+            if not dry:
+                st[f["seat"]] = {"alerted_at": now, "ts": f.get("ts"), "suppressed": 0}
             alerted.append(f)
-        pk.write_json(p, st)
+        if not dry:
+            pk.write_json(p, st)
 
-    if post and not quiet:
+    if post and not quiet and not dry:
         for f in alerted:
             try:
                 from . import chat
-                chat.post(_alert_text(f), who="silent-drop")
+                # post to #helm (fleet ops), NOT the default #main: every seat
+                # homed to #main was woken by rule-(b) home-room surface on a
+                # row addressed to the affected seats (owner mandate: silent-
+                # drop posts don't belong in main). The @mentions in the alert
+                # still wake the addressees from any room (rule a).
+                chat.post(_alert_text(f), who="silent-drop", room="helm")
             except Exception as e:   # a down chat node never blocks detection
-                print("helm silent-drop: chat post failed (%s): %s"
+                print("helm seat silent-drop: chat post failed (%s): %s"
                       % (f["seat"], e), file=sys.stderr)
     return {"findings": findings, "alerted": alerted}
 
@@ -230,18 +350,30 @@ def cmd_silent_drop(argv=None):
     if "--seat" in args:
         i = args.index("--seat")
         seat_name = args[i + 1] if i + 1 < len(args) else None
-    res = check(seats=[seat_name] if seat_name else None,
-                post="--dry-run" not in args,
-                quiet="--quiet" in args)
+    want = [seat_name] if seat_name else None
+    dry = "--dry-run" in args
+    res = check(seats=want, post=not dry, quiet="--quiet" in args, dry=dry)
+    blind = unscannable(want)
+    res["blind"] = [{"seat": s, "why": w} for s, w in blind]
     if "--json" in args:
         print(json.dumps(res))
     else:
         for f in res["findings"]:
             print("%s: drop output_tokens=%s ts=%s%s"
                   % (f["seat"], f.get("output_tokens"), f.get("ts"),
-                     " (latched)" if f.get("latched") else " ALERTED"))
+                     " (latched)" if f.get("latched")
+                     else (" WOULD ALERT" if dry else " ALERTED")))
         if not res["findings"]:
-            print("no drops detected")
+            # NEVER a bare "no drops detected" while a seat went unread. The
+            # count is the honest qualifier: a clean bill is only as wide as
+            # what the pass could actually see.
+            print("no drops detected" if not blind
+                  else "no drops detected in %d seat(s) — %d COULD NOT BE "
+                       "SCANNED, so this is not a clean bill"
+                       % (len(autocompact.proxy_seats() if want is None
+                                else want) - len(blind), len(blind)))
+        for s, why in blind:
+            print("  UNSCANNED %-9s %s" % (s, why))
     return 0
 
 
