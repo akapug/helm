@@ -30,7 +30,14 @@ from helm import configs, transcripts, web  # noqa: E402
 class TestWebConfigs(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.mkdtemp(prefix="helm-test-webcfg-")
+        # The prefix DELIBERATELY contains "pi" and "codex". mkdtemp's random
+        # suffix used to supply those letters by chance (~0.5% of runs), and a
+        # naked `"pi" in home_path` then resolved this claude home as "pi" and
+        # RED THE WHOLE SUITE — intermittent, so it never got pinned. Baking
+        # the spoof into the fixture makes that bug fail 100% of runs instead
+        # of 1 in 200: reintroduce a substring sniff and test_resolve_cascade
+        # goes red immediately. Nothing else here depends on the prefix text.
+        cls.tmp = tempfile.mkdtemp(prefix="helm-test-webcfg-pi-codex-")
         j = lambda *p: os.path.join(cls.tmp, *p)
         cls.root = j("dev")
         cls.proj = j("dev", "proj")
@@ -54,9 +61,17 @@ class TestWebConfigs(unittest.TestCase):
             f.write("# owner command\n")
         # repoint the frozen module roots (import-order-proof) + backups
         cls._cfg = {k: getattr(configs, k) for k in
-                    ("CWD_ROOTS", "HOME_ROOTS", "BACKUP_DIR")}
+                    ("CWD_ROOTS", "HOME_ROOTS", "HOME_ROOT_HARNESS", "BACKUP_DIR")}
         configs.CWD_ROOTS = [cls.root]
         configs.HOME_ROOTS = [cls.homedir]
+        # The fixture now DECLARES its harness instead of spelling it into a
+        # tmpdir name and letting harness_for guess. That inversion is the
+        # point of this lane: a synthetic home is claude because the test says
+        # so, not because "claude-home" pattern-matched. A fixture that proved
+        # the guesser worked was proving the wrong thing — and proved it
+        # WRONGLY 0.497% of the time, when mkdtemp happened to emit a suffix
+        # containing "pi" or "codex".
+        configs.HOME_ROOT_HARNESS = {os.path.realpath(cls.homedir): "claude"}
         configs.BACKUP_DIR = j("config-backups")
         # the tree endpoint folds catalog cwds in — stub the seam, never scan
         cls._get_catalog = transcripts.get_catalog
@@ -143,6 +158,25 @@ class TestWebConfigs(unittest.TestCase):
         rels = {f["rel"] for f in hm["files"]}
         self.assertIn("settings.json", rels)
         self.assertIn("commands/owner.md", rels)
+
+    def test_resolve_REFUSES_an_unplaceable_harness_instead_of_500ing(self):
+        """physics_report RAISES on an unknown harness, and this endpoint fed
+        it two unvalidated values on an UNAUTHENTICATED GET.
+
+        `harness=` was a raw query param nobody checked — ?harness=bogus was
+        already a 500 before this lane existed. And harness_for used to answer
+        "claude" for anything, so the None it now returns for an unplaceable
+        home would have been a second route to the same crash. One screen
+        against configs.HARNESSES closes both; both directions are pinned here
+        because only the first was a pre-existing bug.
+        """
+        for qs, why in ((
+                {"home": self.homedir, "harness": "bogus"}, "bogus harness="),
+                ({"home": self.root}, "a home no tagged root places")):
+            status, d = self.req("/api/configs/resolve?" + urllib.parse.urlencode(qs))
+            self.assertEqual(status, 400, why)
+            self.assertEqual(d.get("code"), "refused", why)
+            self.assertIn("harness", d.get("error", ""), why)
 
     # -- GET /api/configs/file ---------------------------------------------
     def test_file_get_content_and_refusals(self):
@@ -276,6 +310,83 @@ class TestWebConfigs(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("error", d)
 
+    # -- the FOURTH copy of the substring guess (cross-family review) --------
+    def _tag_home(self, rel, harness):
+        """Plant a home under the class tmp and TAG it, restoring on teardown.
+
+        The roots are CLASS-level fixture state here, so a test that appends
+        without restoring leaks extra homes into every sibling test in this
+        class — homes_configs would scan them and list-shape assertions would
+        drift for reasons no one could see from the failing test.
+        """
+        if not hasattr(self, "_roots_saved"):
+            self._roots_saved = True
+            roots, table = configs.HOME_ROOTS, configs.HOME_ROOT_HARNESS
+            self.addCleanup(setattr, configs, "HOME_ROOTS", roots)
+            self.addCleanup(setattr, configs, "HOME_ROOT_HARNESS", table)
+        home = os.path.join(self.tmp, "phys-est", rel)
+        os.makedirs(home, exist_ok=True)
+        configs.HOME_ROOT_HARNESS = dict(
+            configs.HOME_ROOT_HARNESS, **{os.path.realpath(home): harness})
+        configs.HOME_ROOTS = configs.HOME_ROOTS + [home]
+        return home
+
+    def test_physics_route_uses_the_LOOKUP_not_a_substring_guess(self):
+        """/api/physics kept the ORIGINAL bug after three rounds fixed it elsewhere.
+
+        The line was `"codex" if "/codex" in hp or "codex-homes" in hp else
+        "claude"`, and web_ui.html calls this route with NO harness=, so the
+        guess always decided — on the owner's own physics button. It had only
+        TWO outcomes, so a pi home could never be answered at all.
+
+        These are the review's exact repros. They are pinned against the
+        ENDPOINT rather than harness_for, because harness_for was already
+        correct at that tip and the endpoint was still wrong — a unit test on
+        the helper would have stayed green through the whole bug.
+        """
+        for rel, harness, want in ((".claude", "claude", "claude"),
+                                   (".codex", "codex", "codex"),
+                                   (".pi/agent", "pi", "pi")):
+            home = self._tag_home(rel, harness)
+            status, d = self.req("/api/physics?home=" + urllib.parse.quote(home))
+            self.assertEqual(status, 200, rel)
+            self.assertEqual(d["harness"], want,
+                             "%s must resolve %s, not a substring guess" % (rel, want))
+
+    def test_physics_routes_REFUSE_a_bogus_harness_instead_of_500ing(self):
+        """Both routes fed physics unvalidated values on an unauthenticated GET.
+
+        physics_report and physics_diff RAISE on an unknown harness, so
+        ?harness=bogus was an HTTP 500 on each — a pre-existing hole this lane
+        closes with the same configs.HARNESSES screen used everywhere else.
+        """
+        for path, extra in (("/api/physics", {"home": self.homedir}),
+                            ("/api/physics-diff",
+                             {"a": self.homedir, "b": self.homedir})):
+            qs = dict(extra, harness="bogus")
+            status, d = self.req(path + "?" + urllib.parse.urlencode(qs))
+            self.assertEqual(status, 400, path)
+            self.assertEqual(d.get("code"), "refused", path)
+
+    def test_physics_diff_REFUSES_a_pair_it_cannot_derive_ONE_harness_for(self):
+        """`or "claude"` was not a default — it was a silent claim about BOTH homes.
+
+        A diff takes one harness for two homes, so a codex/pi pair was answered
+        as confidently as a matched one. Deriving is honest only when both
+        agree; a mismatch is a question for the caller, not this layer.
+        """
+        cx = self._tag_home("diff-codex/.codex", "codex")
+        pi = self._tag_home("diff-pi/.pi/agent", "pi")
+        status, d = self.req("/api/physics-diff?" +
+                             urllib.parse.urlencode({"a": cx, "b": pi}))
+        self.assertEqual(status, 400, "a codex/pi pair has no single harness")
+        self.assertEqual(d.get("code"), "refused")
+        # …and a MATCHED pair still derives without the caller saying so.
+        status, d = self.req("/api/physics-diff?" +
+                             urllib.parse.urlencode({"a": cx, "b": cx}))
+        self.assertEqual(status, 200)
+        self.assertEqual(d["harness"], "codex")
+
     # -- uniform mutation hardening ----------------------------------------
     def test_every_post_endpoint_403s_without_token(self):
         for ep in sorted(web.POST_API):
@@ -310,6 +421,211 @@ class TestWebConfigs(unittest.TestCase):
                          "the token marker must be substituted at serve time")
         self.assertIn(web.MUTATION_TOKEN, body)
         self.assertNotIn("slice C", body, "the placeholder is gone")
+
+
+class TestHarnessForTaggedLookup(unittest.TestCase):
+    """harness_for is a LOOKUP against tagged roots — these tests changed with it.
+
+    THE OLD TESTS ASSERTED A SPELLING RULE and that is why there were three
+    rounds of them. Each round pinned the cases the author had thought of, went
+    green, and a reviewer then produced a shape outside the enumeration:
+
+      1. `"pi" in hp` over the whole path — a mkdtemp suffix decided the
+         answer, reddening the FULL SUITE at a measured 0.497% of runs.
+      2. a dotted-component rule that borrowed the leaf matcher — an unrelated
+         dotted ANCESTOR captured it (`/tmp/.pi-cache/u/.claude` -> pi).
+      3. the leaf matcher stripping a leading dot — whatever the exact dotted
+         pass REFUSED walked back in through the fallback.
+
+    A green suite certified all three (4916 passed, 0 failed on rule 2). It had
+    to: every case tested was a shape the author chose, and the bug was always
+    a shape they had not. So the fix was not a fourth rule — it was deleting
+    the guess. HOME_ROOTS is built by globs that each KNOW their harness, and
+    the harness is now carried from there instead of re-derived from spelling.
+
+    What these tests assert therefore inverts. The adversarial paths above no
+    longer resolve CORRECTLY — they resolve to None, an honest refusal, which
+    is the only answer a lookup can give for a path nobody tagged. The class
+    of bug is gone because the wrong answers became UNREPRESENTABLE, not
+    because a cleverer matcher finally covered them.
+    """
+
+    def setUp(self):
+        # the mkdtemp prefix still carries "pi" and "codex" on purpose: under
+        # the old rules that suffix was load-bearing, and it must now be inert.
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-harness-pi-codex-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        for rel in (".claude", ".codex", ".pi/agent",
+                    ".claude-homes/acct", ".codex-homes/acct", ".pi-homes/acct",
+                    ".codex-homes/claude", ".claude-homes/codex",
+                    ".helm/_global/seats/gemini/claude",
+                    ".helm/_global/seats/grok/pi"):
+            os.makedirs(os.path.join(self.tmp, rel))
+        for k in ("HOME", "_HELM_HOME", "HOME_ROOTS", "HOME_ROOT_HARNESS"):
+            self.addCleanup(setattr, configs, k, getattr(configs, k))
+        configs.HOME = self.tmp
+        configs._HELM_HOME = os.path.join(self.tmp, ".helm")
+        self.rebuild()
+
+    def rebuild(self):
+        """Repoint the tables THROUGH THE REAL BUILDER, never a hand-rolled dict.
+
+        The first version of this fixture assembled an equivalent
+        {realpath: harness} comprehension itself, and a mutation replacing the
+        module's realpath keying with raw paths SURVIVED — the test had quietly
+        substituted its own correct code for the code under test. Calling the
+        builder is what puts _typed_home_roots AND its keying under test.
+        """
+        configs.HOME_ROOTS, configs.HOME_ROOT_HARNESS = \
+            configs._common._home_root_tables()
+
+    def j(self, *rel):
+        return os.path.join(self.tmp, *rel)
+
+    # -- MUST-HIT: the glob that minted a root is the one that answers for it --
+    def test_every_tagged_root_resolves_to_the_glob_that_minted_it(self):
+        for rel, want in ((".claude", "claude"), (".codex", "codex"),
+                          (".pi/agent", "pi"),
+                          (".claude-homes/acct", "claude"),
+                          (".codex-homes/acct", "codex"),
+                          (".pi-homes/acct", "pi"),
+                          (".helm/_global/seats/gemini/claude", "claude"),
+                          (".helm/_global/seats/grok/pi", "pi")):
+            self.assertEqual(configs.harness_for(self.j(rel)), want, rel)
+
+    def test_an_account_named_after_another_harness_takes_its_ROOTS_harness(self):
+        """The property every previous round had to fight for, now free.
+
+        An account directory may be named for a different harness than the home
+        containing it. Under a spelling rule this needed an outranking pass and
+        a scan direction; under a lookup the account name is never consulted at
+        all, because ~/.codex-homes/claude was tagged `codex` by the glob.
+        """
+        self.assertEqual(configs.harness_for(self.j(".codex-homes/claude")), "codex")
+        self.assertEqual(configs.harness_for(self.j(".claude-homes/codex")), "claude")
+
+    def test_a_SYMLINKED_home_resolves_through_to_its_real_root(self):
+        """The table is keyed by REALPATH, matching every gate that compares
+        against HOME_ROOTS — a symlinked home must not read as unknown."""
+        link = self.j("alias-home")
+        os.symlink(self.j(".codex"), link)
+        self.assertEqual(configs.harness_for(link), "codex")
+
+    def test_a_root_that_IS_a_symlink_resolves_by_the_path_callers_ask_with(self):
+        """The direction the previous test cannot reach, and the one that bites.
+
+        Above, the LOOKUP argument is a symlink and the table entry is real, so
+        raw-vs-realpath keying makes no difference. Here the ROOT ITSELF is the
+        symlink — which is what homes_configs hands over, because it resolves
+        `h = _real(raw)` before every call. A raw-keyed table holds the link
+        path and is asked for the real one, so it misses, and the home silently
+        loses its provider. Caught by a mutation that survived the test above.
+        """
+        real = os.path.join(self.tmp, "outside-the-estate")
+        os.makedirs(real)
+        link = self.j(".codex-homes", "linked-acct")
+        os.symlink(real, link)
+        self.rebuild()
+        self.assertIn(link, configs.HOME_ROOTS, "the glob yields the SYMLINK path")
+        self.assertEqual(configs.harness_for(os.path.realpath(link)), "codex")
+
+    # -- the two shapes minted AFTER import (HOME_ROOTS globs exactly once) ----
+    def test_an_account_home_minted_AFTER_import_still_resolves(self):
+        """`helm homes prepare claude <email>` mints a home in the same process that then reads
+        configs, so the import-time table cannot contain it. This is the same
+        dynamic shape _resolve._allowed_home admits, computed per call."""
+        fresh = self.j(".codex-homes", "minted-later")
+        os.makedirs(fresh)
+        self.assertNotIn(os.path.realpath(fresh), configs.HOME_ROOT_HARNESS)
+        self.assertEqual(configs.harness_for(fresh), "codex")
+
+    def test_a_seat_home_minted_AFTER_import_still_resolves(self):
+        for rel, want in (("newfam/claude", "claude"), ("newfam/pi", "pi"),
+                          ("codex/instances/codex-2/claude", "claude")):
+            fresh = self.j(".helm/_global/seats", rel)
+            os.makedirs(fresh)
+            self.assertNotIn(os.path.realpath(fresh), configs.HOME_ROOT_HARNESS)
+            self.assertEqual(configs.harness_for(fresh), want, rel)
+
+    def test_only_a_DIRECT_child_of_an_account_root_resolves(self):
+        """Why a generic nearest-enclosing lookup was refused in review.
+
+        Nearest-enclosing would answer `codex` for anything under
+        ~/.codex-homes at any depth. _allowed_home admits a DIRECT child and
+        nothing deeper, so provenance must refuse exactly where authorization
+        refuses — otherwise the two gates disagree about the same path.
+        """
+        deep = self.j(".codex-homes", "acct", "nested")
+        os.makedirs(deep)
+        self.assertIsNone(configs.harness_for(deep))
+
+    def test_a_dir_merely_NAMED_claude_is_not_a_seat_home(self):
+        """The seat rule reads a TAGGED root, not a terminal component.
+
+        The leaf only answers when the WHOLE enclosing shape is the layout
+        `helm seat add` writes. Drop that check and a directory called `claude`
+        anywhere on the box becomes a claude home.
+        """
+        for rel in ("notseats/gemini/claude", ".helm/_global/claude",
+                    ".helm/_global/seats/claude",
+                    ".helm/_global/seats/fam/wrong/claude",
+                    ".helm/_global/seats/fam/instances/s/deep/claude"):
+            p = self.j(rel)
+            os.makedirs(p, exist_ok=True)
+            self.assertIsNone(configs.harness_for(p), rel)
+
+    # -- MUST-NOT-HIT: every adversary of the three dead rules now REFUSES ----
+    def test_the_three_dead_rules_adversaries_now_REFUSE_instead_of_guessing(self):
+        """Each of these produced a CONFIDENT WRONG ANSWER under some round.
+
+        None of them is a home. The old code answered "claude" for anything it
+        could not place, which is precisely why the wrong answers hid: a
+        default that is right most of the time makes the cases where it is
+        wrong indistinguishable from the cases where it is right.
+        """
+        for path in (
+                # round 1 — a mkdtemp suffix decided it
+                "/tmp/helm-test-webcfg-a1pi9z0q/claude-home",
+                "/tmp/helm-test-webcfg-codexy77/claude-home",
+                "/var/pipeline/claude-home",
+                # round 2 — an unrelated dotted ANCESTOR captured it
+                "/tmp/.pi-cache/u/.claude",
+                "/tmp/.claude-scratch/x/.pi/agent",
+                "/tmp/.codex-tmp/u/.claude",
+                # round 3 — the leaf matcher stripped the dot pass 1 refused
+                "/tmp/x/.pi-cache",
+                "/tmp/x/.codex-tmp",
+                "/tmp/x/.claude-backup",
+                # never homes under any rule
+                "/tmp/x/codex-home", "/tmp/nothing/here", "/etc", ""):
+            self.assertIsNone(configs.harness_for(path), path)
+
+    def test_an_empty_path_refuses_even_when_the_PROCESS_CWD_is_a_home(self):
+        """realpath("") is the PROCESS CWD, so the guard is not decoration.
+
+        Without it, `home=` with no value resolves to whatever directory the
+        server happens to be running in — and helm's own web server can be
+        started from anywhere, including inside a config home. The empty case
+        only LOOKED covered before: a mutation removing the guard survived,
+        because the test process's cwd was the repo, which is not a home. The
+        chdir is what makes the mutation bite.
+        """
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.j(".codex"))
+        self.assertIsNone(configs.harness_for(""))
+        self.assertIsNone(configs.harness_for(None))
+
+    def test_a_REAL_home_shape_outside_the_patched_estate_still_refuses(self):
+        """The lookup is against THIS estate's tagged roots, not a shape family.
+
+        `/home/u/.claude` is spelled exactly like a real claude home and every
+        dead rule answered `claude` for it. It belongs to no estate the table
+        knows, so the honest answer is None — and any reintroduced spelling
+        fallback lights this test up immediately.
+        """
+        for path in ("/home/u/.claude", "/home/u/.codex", "/home/u/.pi/agent",
+                     "/home/u/.claude-homes/acct"):
+            self.assertIsNone(configs.harness_for(path), path)
 
 
 if __name__ == "__main__":

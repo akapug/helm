@@ -1,0 +1,30 @@
+<div class="view" id="view-configs">
+  <div id="storerev">
+    <div id="storerevhead">
+      <b>store review</b>
+      <span class="cfgmut" id="storerevmeta">auto-learned entries awaiting owner review</span>
+      <button class="chip" id="storerevReload" style="margin-left:auto">↻ reload</button>
+    </div>
+    <div id="storerevlist"><div class="empty">open the configs tab to load the review queue…</div></div>
+  </div>
+  <div id="cfgbar">
+    <input id="cfgFilter" placeholder="filter cwd / config…" autocomplete="off">
+    <span class="chip on" data-ch="all">all</span>
+    <span class="chip" data-ch="claude">claude</span>
+    <span class="chip" data-ch="codex">codex</span>
+    <span id="cfgStatus" class="cfgmut"></span>
+    <button class="chip" id="cfgReload" style="margin-left:auto">↻ rescan</button>
+  </div>
+  <div id="cfgsplit">
+    <div id="cfgtree"><div class="empty">open the configs tab to scan…</div></div>
+    <div class="raildrag" id="cfgraildrag" title="drag to resize — double-click resets"></div>
+    <div id="cfgdetail"><div class="empty">pick a cwd or a home to see what its agents load →</div></div>
+  </div>
+</div>
+
+<!-- WORK: the owner⇄fleet surface (owner ruling, live at the
+     console — supersedes both earlier placements): decisions, the task
+     backlog, and store review COMPOSE here as sibling sections. This lane
+     ships only the decisions section; a follow-up adds the siblings into the
+     same #worksections container — a section list, never a page hard-coded to
+     one feature. -->

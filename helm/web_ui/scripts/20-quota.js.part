@@ -1,0 +1,582 @@
+/* ================= quota view (ported from the predecessor UI, behavior-preserving) =================
+   Beyond the straight port, the named seams are closed: chart day-bars jump to
+   the sessions view filtered to that day, burn session chips open the
+   transcript drawer, and the
+   account row-select feeds the sessions view's resume-as strip + team tray.
+   One remaining adaptation: the activity histogram joins against /api/sessions
+   (newest 200 work sessions), not the full catalog. */
+let CREDS = [], HIST = [], ALLOC = {}, SDATA = [], SEL = {anthropic: null, codex: null};
+let QWIN = "7d", AFILTER = "all", EMPH = null, QINIT = false;
+const short = (n, l = 26) => n.length > l ? n.slice(0, l - 1) + "…" : n;
+/* single-unit reset ETA (was "1h05m" compound → ragged quota cells) */
+function fmtIn(ms) {
+  const s = (ms - Date.now()) / 1e3;
+  if (s <= 0) return "now";
+  const h = s / 3600;
+  if (h > 48) return Math.round(h / 24) + "d";
+  if (h >= 1) return Math.round(h) + "h";
+  return Math.round(s / 60) + "m";
+}
+const PALETTE = ["#c9772e", "#3f7d54", "#5470c6", "#b4442e", "#8a5fc0", "#2f8f8f", "#b58a2e", "#c05f8c", "#6b8e23", "#7a5c3e"];
+const ROSTER = () => new Set(CREDS.map(c => c.name));
+const acol = a => { const i = CREDS.findIndex(c => c.name === a); return i >= 0 ? PALETTE[i % PALETTE.length] : "#999"; };
+
+function initQuota() {
+  if (QINIT) return;
+  QINIT = true;
+  loadCreds().then(() => { loadHist(); loadAlloc(); });
+  loadSData();
+  loadStatus();
+  setInterval(() => { loadCreds(true).then(() => { loadHist(); loadAlloc(); }); }, 120e3);
+}
+
+/* ================= data ================= */
+async function loadCreds(refresh) {
+  let d;
+  try { d = await j("/api/creds" + (refresh ? "?refresh=1" : "")); } catch (e) { d = []; }
+  CREDS = Array.isArray(d) ? d : [];
+  for (const p of ["anthropic", "codex"]) {
+    if (!SEL[p] || !CREDS.find(c => c.name === SEL[p])) {
+      const best = CREDS.filter(c => c.provider === p && c.state === "ok").sort((a, b) => (b.headroom ?? 0) - (a.headroom ?? 0))[0];
+      SEL[p] = best ? best.name : null;
+    }
+  }
+  NAV_ACC = CREDS.length ? statCell(CREDS.length, "accounts") : "";
+  renderNav();
+  renderAttn(); renderAccts(); renderResumeAs();
+}
+let NAV_ACC = "", NAV_SESS = "", NAV_CHAT = 0, NAV_CHAT_MENTION = false;
+/* one nav stat = a value over an uppercase label, right-aligned; they line up
+   as a fixed row of columns rather than a wrapping run of words. */
+function statCell(val, label, title) {
+  return `<span class="stat"${title ? ` title="${esc(title)}"` : ""}><b>${typeof val === "number" ? val.toLocaleString() : esc(val)}</b><span>${esc(label)}</span></span>`;
+}
+/* one tab's badge. `n` falsy removes it; a NON-NUMERIC n (the land pipeline's
+   "?") is rendered verbatim, because an unreadable pipeline must not be able
+   to present itself as a count of zero. */
+function navBadge(view, n, mention, title) {
+  const tab = $('.navtab[data-v="' + view + '"]');
+  if (!tab) return;
+  let b = tab.querySelector(".navbadge");
+  if (!n) { if (b) b.remove(); return; }
+  if (!b) { b = document.createElement("span"); b.className = "navbadge"; tab.appendChild(b); }
+  b.textContent = (typeof n === "number" && n > 99) ? "99+" : n;
+  b.classList.toggle("mention", !!mention);
+  b.title = title;
+  // A BADGE CHANGES THE TAB'S WIDTH AFTER showView ALREADY SCROLLED. Measured
+  // at 390px: the reveal ran, then "?" and "99+" arrived on the ledger and chat
+  // tabs and pushed the selected one back out of the strip by ~41px. Only the
+  // ACTIVE tab's geometry can invalidate the reveal, so only that re-reveals.
+  if (tab.classList.contains("on")) revealActiveTab();
+}
+function renderNav() {
+  $("#navstats").innerHTML = NAV_ACC + NAV_SESS;
+  // the chat tab's unread badge — the owner must see an @mention from ANY tab
+  navBadge("chat", NAV_CHAT, NAV_CHAT_MENTION,
+    NAV_CHAT_MENTION ? "unread @mentions for you in chat" : "unread chat messages");
+  // the LEDGER tab's ALARM badge — a lane contradicting its verdict, a
+  // stalled one, or a pipeline that could not be read. It badges the tab
+  // that holds the pipeline wall (the detail surface moved there), fed by
+  // the always-on pollLr so it reaches him from ANY tab. Routine motion
+  // never badges: good news waits for a glance, contradictions come find him.
+  navBadge("ledger", NAV_LR, true, NAV_LR_TITLE);
+}
+async function loadHist() {
+  let d;
+  try { d = await j("/api/history?hours=168"); } catch (e) { d = []; }
+  HIST = Array.isArray(d) ? d : [];
+  const labels = gaugeLabels();
+  if (labels.length) {
+    if (!labels.includes(QWIN)) QWIN = labels[0];
+    $("#qtabs").innerHTML = labels.map(l => `<span class="qtab ${l === QWIN ? "on" : ""}" data-w="${esc(l)}">${esc(LBL_NICE[l] || l)}</span>`).join("");
+    $$(".qtab").forEach(tb => tb.onclick = () => { QWIN = tb.dataset.w; $$(".qtab").forEach(x => x.classList.toggle("on", x === tb)); renderChart(); });
+  }
+  let newest = 0;
+  for (const r of HIST) { const t = Date.parse(r.probed_at); if (t > newest) newest = t; }
+  if (newest) {
+    const m = Math.round((Date.now() - newest) / 60e3);
+    $("#qsub").textContent = `remaining % · history + projection to reset · server-truth ${m < 1 ? "just now" : m + "m ago"}`;
+  }
+  renderChart(); renderAccts(); renderAttn();
+}
+async function loadAlloc() {
+  try {
+    const d = await j("/api/allocate");
+    ALLOC = (d && typeof d === "object" && !d.unavailable) ? d : {};
+  } catch (e) { ALLOC = {}; }
+  renderAttn();
+}
+async function loadSData() {
+  // the activity histogram feeds the FULL catalog (parity ruling): every
+  // session's last-activity lands in the buckets, not a newest-N slice.
+  try {
+    await ensureCatalog();
+    SDATA = DATA.filter(r => !r.syn);
+  } catch (e) { SDATA = []; }
+  if (!SDATA.length) {
+    try {
+      const d = await j("/api/sessions");
+      SDATA = (d && Array.isArray(d.sessions)) ? d.sessions : [];
+    } catch (e) { SDATA = []; }
+  }
+  if (HIST.length) renderChart();
+}
+async function loadStatus() {
+  try {
+    const s = await j("/api/status");
+    if (s && s.provider && s.provider.degraded)
+      $("#qsub").textContent = "no quota provider reporting on this machine — resume still works under the default account";
+  } catch (e) {}
+}
+
+/* ================= attention ================= */
+function strandAtReset(acct) {
+  const S = seriesFor("7d")[acct];
+  if (!S || !S.reset || S.reset < Date.now()) return null;
+  const now = Date.now(), pts = S.pts, fit = pts.filter(p => p[0] > now - 6 * 3600e3);
+  if (fit.length < 3) return pts.length ? Math.round(pts[pts.length - 1][1]) : null;
+  const mx = fit.reduce((a, p) => a + p[0], 0) / fit.length, my = fit.reduce((a, p) => a + p[1], 0) / fit.length;
+  const den = fit.reduce((a, p) => a + (p[0] - mx) ** 2, 0);
+  let slope = den ? fit.reduce((a, p) => a + (p[0] - mx) * (p[1] - my), 0) / den : 0;
+  if (slope > 0) slope = 0;
+  return Math.max(0, Math.round(pts[pts.length - 1][1] + slope * (S.reset - now)));
+}
+/* One pill per signal class, uniform shape; the leading dot carries the colour.
+   Detail rides both the hover title (desktop) AND data-detail (tap-to-reveal on
+   touch — Orca mobile has no hover), surfaced in #attndetail below the row. */
+function attnPill(cls, label, title) {
+  const t = title ? ` title="${esc(title)}" data-detail="${esc(title)}"` : "";
+  return `<span class="attn ${cls}"${t}>${esc(label)}</span>`;
+}
+function renderAttn() {
+  const bits = [];
+  // REAL quota problems only: an account with auth that is exhausted or erroring.
+  const bad = CREDS.filter(c => c.state === "exhausted" || c.state === "api-error" || c.state === "approaching");
+  if (bad.length) bits.push(attnPill("bad", `${bad.length} need attention`, bad.map(c => c.name + ": " + c.state).join(" · ")));
+  // expired-token is its OWN pill: a reauth-needed account is not a
+  // broken one, and lumping an expired login into "need attention" reported
+  // healthy accounts as erroring. The word is the whole fix.
+  const stale = CREDS.filter(c => c.state === "expired-token");
+  if (stale.length) bits.push(attnPill("warn", `${stale.length} need re-login`, stale.map(c => c.name + ": " + c.status).join(" · ")));
+  const hyg = CREDS.filter(c => c.name_lies || c.duplicate_homes);
+  if (hyg.length) bits.push(attnPill("warn", `${hyg.length} home ${hyg.length > 1 ? "issues" : "issue"}`, hyg.map(c => c.name + (c.name_lies ? " dir-name-lies" : "") + (c.duplicate_homes ? " " + c.duplicate_homes.length + "-homes" : "")).join(" · ")));
+  const waste = CREDS.filter(c => c.windows_verdict && c.windows_verdict !== "ok" && c.windows_verdict !== "no-weekly");
+  if (waste.length) {
+    const det = waste.map(c => { const st = HIST.length ? strandAtReset(c.name) : null; return short(c.name, 18) + (st != null ? ` strands ~${st}%` : ""); }).join(", ");
+    bits.push(attnPill("warn", `${waste.length} at waste-risk`, "capacity that expires unused at the weekly reset — " + det));
+  }
+  const nore = CREDS.filter(c => c.state === "unknown");
+  if (nore.length) bits.push(attnPill("", `${nore.length} not reporting`, nore.map(c => c.name).join(", ") + " — no auth or usage endpoint; manage on the homes card"));
+  // steady state: say so plainly rather than an empty row
+  if (!bits.length && CREDS.length) bits.push(attnPill("ok", "all accounts healthy"));
+  const next = Object.entries(ALLOC).filter(([m, v]) => v && v.pick).map(([m, v]) => `${m} → ${short(v.pick.account, 18)} (${v.pick.headroom_pct}%)`);
+  if (next.length) bits.push(attnPill("next", "next: " + short(next[0], 26), "recommended account per model — " + next.join(" · ")));
+  $("#attn").innerHTML = bits.join("");
+  $("#attndetail").classList.remove("show");  // collapse stale detail on re-render
+}
+/* tap a pill (touch has no hover) → reveal its detail below the row; tap again
+   or tap another pill to swap. Delegated so it survives every re-render. */
+$("#attn").addEventListener("click", e => {
+  const pill = e.target.closest(".attn"); const box = $("#attndetail");
+  if (!pill || !pill.dataset.detail) { box.classList.remove("show"); return; }
+  const same = box.classList.contains("show") && box.dataset.for === pill.dataset.detail;
+  box.textContent = pill.dataset.detail; box.dataset.for = pill.dataset.detail;
+  box.classList.toggle("show", !same);
+});
+
+/* ================= chart ================= */
+const LBL_NICE = {"5h": "session", "7d": "weekly"};
+function gaugeLabels() {
+  const seen = new Set(), roster = ROSTER();
+  for (const r of HIST) { if (!roster.has(r.account)) continue; for (const g of r.gauges || []) if (g.utilization != null) seen.add(g.label); }
+  const pref = ["5h", "7d"], rest = [...seen].filter(l => !pref.includes(l)).sort();
+  return pref.filter(l => seen.has(l)).concat(rest);
+}
+function seriesFor(win) {
+  const by = {}, roster = ROSTER();
+  for (const r of HIST) {
+    if (!roster.has(r.account)) continue;
+    const g = (r.gauges || []).find(g => g.label === win);
+    if (!g || g.utilization == null) continue;
+    const t = Date.parse(r.probed_at);
+    if (!t) continue;
+    (by[r.account] = by[r.account] || {provider: r.provider, pts: [], reset: null}).pts.push([t, (1 - Math.min(1, g.utilization)) * 100]);
+    if (g.reset) by[r.account].reset = g.reset * 1000;
+  }
+  for (const k in by) by[k].pts.sort((a, b) => a[0] - b[0]);
+  return by;
+}
+let ZOOMW = null; // {t0,t1} when the user zoomed/panned; null = auto window
+function updateZoomHint() {
+  const z = $("#zoomhint");
+  if (!z) return;
+  z.textContent = ZOOMW ? "zoomed — double-click to reset · scroll = zoom · drag = pan" : "scroll = zoom · drag = pan · double-click = reset";
+  z.style.color = ZOOMW ? "var(--accent)" : "var(--sub)";
+}
+function renderChart() {
+  const svgEl = $("#chart");
+  if (!HIST.length) { svgEl.innerHTML = ""; return; }
+  const win = QWIN, S = seriesFor(win), now = Date.now();
+  const histSpan = win === "5h" ? 24 * 3600e3 : 7 * 24 * 3600e3, projSpan = win === "5h" ? 6 * 3600e3 : 20 * 3600e3;
+  let t0 = now - histSpan, t1 = now + projSpan;
+  if (ZOOMW) { t0 = ZOOMW.t0; t1 = ZOOMW.t1; }
+  const W = 1400, H = 430, PL = 30, PR = 196, PT = 14, PB = 26, IW = W - PL - PR, IH = H - PT - PB;
+  const LEG_LH = 19; // legend line height — one row per account, no overlap
+  const x = t => PL + ((t - t0) / (t1 - t0)) * IW, y = p => PT + (1 - p / 100) * IH;
+  let s = `<line x1="${PL}" y1="${y(0)}" x2="${PL + IW}" y2="${y(0)}" stroke="var(--line)"/>`
+    + `<line x1="${PL}" y1="${y(50)}" x2="${PL + IW}" y2="${y(50)}" stroke="var(--line)" stroke-dasharray="2,5"/>`
+    + `<line x1="${PL}" y1="${y(100)}" x2="${PL + IW}" y2="${y(100)}" stroke="var(--line)"/>`
+    + `<text x="2" y="${y(100) + 4}" font-size="12" fill="var(--mut)">100%</text>`
+    + `<text x="2" y="${y(50) + 4}" font-size="12" fill="var(--mut)">50%</text>`
+    + `<text x="2" y="${y(0) + 4}" font-size="12" fill="var(--mut)">0%</text>`
+    // one mark for "now": the line + label (the shaded future-rect was a third redundant mark)
+    + (now >= t0 && now <= t1 ? `<line x1="${x(now)}" y1="${PT}" x2="${x(now)}" y2="${PT + IH}" stroke="var(--mut)" stroke-width="1"/>`
+    + `<text x="${x(now)}" y="${H - 8}" font-size="11" fill="var(--mut)" text-anchor="middle">now</text>` : "");
+  const span = t1 - t0;
+  const tickStep = span <= 10 * 3600e3 ? 3600e3 : span <= 36 * 3600e3 ? 3 * 3600e3 : span <= 5 * 24 * 3600e3 ? 12 * 3600e3 : 24 * 3600e3;
+  for (let t = Math.ceil(t0 / tickStep) * tickStep; t < Math.min(now, t1); t += tickStep) {
+    if (now >= t0 && now <= t1 && Math.abs(x(now) - x(t)) < 30) continue;
+    const d = new Date(t), lbl = tickStep < 24 * 3600e3 ? (d.getHours() === 0 ? (d.getMonth() + 1) + "/" + d.getDate() : d.getHours() + ":00") : (d.getMonth() + 1) + "/" + d.getDate();
+    // a short axis tick, not a full-height gridline — the horizontal % refs carry
+    // the lookup value; vertical rules per time-tick were chartjunk
+    s += `<line x1="${x(t)}" y1="${PT + IH}" x2="${x(t)}" y2="${PT + IH - 5}" stroke="var(--line2)"/>`
+      + `<text x="${x(t)}" y="${H - 8}" font-size="11" fill="var(--mut)" text-anchor="middle">${lbl}</text>`;
+  }
+  if (SDATA.length) {
+    const bh = 3600e3, nb = Math.ceil((now - t0) / bh), buckets = new Array(nb).fill(0);
+    for (const r of SDATA) { const mt = (r.mt || 0) * 1000; if (mt >= t0 && mt < now) buckets[Math.floor((mt - t0) / bh)]++; }
+    const bmax = Math.max(1, ...buckets);
+    for (let i = 0; i < nb; i++) {
+      if (!buckets[i]) continue;
+      const bx = x(t0 + i * bh), bw = Math.max(1, IW / nb - 0.5), h2 = 2 + (buckets[i] / bmax) * 15;
+      const dd = new Date(t0 + i * bh); // LOCAL date — must match the catalog's local "updated" day
+      const day = dd.getFullYear() + "-" + String(dd.getMonth() + 1).padStart(2, "0") + "-" + String(dd.getDate()).padStart(2, "0");
+      s += `<rect class="actb" data-day="${day}" x="${bx.toFixed(1)}" y="${(PT + IH - h2).toFixed(1)}" width="${bw.toFixed(1)}" height="${h2.toFixed(1)}" fill="var(--accent)" opacity="0.35" style="cursor:pointer"><title>${buckets[i]} session${buckets[i] > 1 ? "s" : ""} last-active here — click to list that day</title></rect>`;
+    }
+  }
+  const labels = [];
+  for (const [acct, S1] of Object.entries(S)) {
+    if (AFILTER !== "all" && S1.provider !== AFILTER) continue;
+    const col = acol(acct), pts = S1.pts.filter(p => p[0] >= t0 && p[0] <= t1);
+    if (pts.length < 2) continue;
+    const dim = EMPH && EMPH !== acct, wgt = EMPH === acct ? 3.4 : 2, op = dim ? 0.18 : 1;
+    s += `<polyline data-a="${esc(acct)}" fill="none" stroke="${col}" stroke-width="${wgt}" opacity="${op}" points="${pts.map(p => x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1)).join(" ")}"/>`;
+    const [lt, lv] = pts[pts.length - 1];
+    s += `<circle cx="${x(lt)}" cy="${y(lv)}" r="3.5" fill="${col}" opacity="${op}"/>`;
+    const fitSpan = win === "5h" ? 90 * 60e3 : 6 * 3600e3, fit = pts.filter(p => p[0] > now - fitSpan);
+    let slope = 0;
+    if (fit.length >= 3) {
+      const mx = fit.reduce((a, p) => a + p[0], 0) / fit.length, my = fit.reduce((a, p) => a + p[1], 0) / fit.length;
+      const den = fit.reduce((a, p) => a + (p[0] - mx) ** 2, 0);
+      slope = den ? fit.reduce((a, p) => a + (p[0] - mx) * (p[1] - my), 0) / den : 0;
+      if (slope > 0) slope = 0;
+    }
+    if (now >= t0 && now < t1) {
+      const rt = S1.reset && S1.reset > now && S1.reset < t1 ? S1.reset : t1;
+      const pv = Math.max(0, lv + slope * (rt - now));
+      s += `<line x1="${x(now)}" y1="${y(lv)}" x2="${x(rt)}" y2="${y(pv)}" stroke="${col}" stroke-width="1.4" stroke-dasharray="5,5" opacity="${dim ? 0.12 : 0.7}"/>`;
+      if (S1.reset && S1.reset > now && S1.reset < t1) {
+        s += `<line x1="${x(S1.reset)}" y1="${y(pv)}" x2="${x(S1.reset)}" y2="${y(100)}" stroke="${col}" stroke-width="1" stroke-dasharray="1,3" opacity="${dim ? 0.12 : 0.55}"/>`
+          + `<circle cx="${x(S1.reset)}" cy="${y(100)}" r="2.8" fill="none" stroke="${col}" opacity="${op}"/>`;
+      }
+    }
+    labels.push({acct, col, v: lv, yy: y(lv), dy: y(lv), op});
+  }
+  /* Direct labels in the right gutter, de-collided to one row each and, when
+     packed tight, spread evenly across the plot height. Name is left-aligned;
+     the % is right-aligned at a fixed x so the values form a tabular column
+     (Tufte: put the number where the eye can compare it). A short leader tie
+     joins each label to its line's endpoint. */
+  labels.sort((a, b) => a.yy - b.yy);
+  for (let i = 1; i < labels.length; i++) if (labels[i].yy - labels[i - 1].yy < LEG_LH) labels[i].yy = labels[i - 1].yy + LEG_LH;
+  const overflow = labels.length && labels[labels.length - 1].yy > PT + IH;
+  if (overflow) labels.forEach((l, i) => l.yy = PT + 6 + i * ((IH - 12) / Math.max(1, labels.length - 1)));
+  const nameX = PL + IW + 12, valX = W - 6;
+  for (const l of labels) {
+    s += `<line x1="${(PL + IW + 2).toFixed(1)}" y1="${l.dy.toFixed(1)}" x2="${(nameX - 3).toFixed(1)}" y2="${l.yy.toFixed(1)}" stroke="${l.col}" stroke-width="1" opacity="${l.op * 0.4}"/>`;
+    s += `<text data-a="${esc(l.acct)}" x="${nameX}" y="${l.yy + 4}" font-size="12" fill="${l.col}" opacity="${l.op}" style="cursor:pointer">${esc(short(l.acct, 20))}</text>`;
+    s += `<text data-a="${esc(l.acct)}" x="${valX}" y="${l.yy + 4}" font-size="12" font-weight="600" text-anchor="end" fill="${l.col}" opacity="${l.op}" style="cursor:pointer;font-variant-numeric:tabular-nums">${l.v.toFixed(0)}%</text>`;
+  }
+  svgEl.innerHTML = s;
+  svgEl._geo = {t0, t1, x, y, S, PL, IW, PT, IH, now};
+}
+$("#chart").addEventListener("mousemove", e => {
+  const svgEl = $("#chart"), g = svgEl._geo;
+  if (!g) return;
+  const r = svgEl.getBoundingClientRect();
+  const t = g.t0 + ((e.clientX - r.left) / r.width) * (g.t1 - g.t0);
+  const rows = [];
+  for (const [acct, S1] of Object.entries(g.S)) {
+    if (AFILTER !== "all" && S1.provider !== AFILTER) continue;
+    let best = null;
+    for (const p of S1.pts) if (!best || Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
+    if (best && Math.abs(best[0] - t) < 3 * 3600e3) rows.push([acct, best[1]]);
+  }
+  rows.sort((a, b) => b[1] - a[1]);
+  const tip = $("#tip");
+  if (!rows.length) { tip.style.display = "none"; return; }
+  tip.innerHTML = `<div class="tt">${new Date(t).toLocaleString([], {month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"})}</div>`
+    + rows.slice(0, 10).map(([a, v]) => `<div><span class="adot" style="background:${acol(a)}"></span>${esc(short(a, 22))} ${v.toFixed(0)}%</div>`).join("");
+  tip.style.display = "block";
+  const bx = $("#chartcard").getBoundingClientRect();
+  tip.style.left = Math.min(e.clientX - bx.left + 16, bx.width - 200) + "px";
+  tip.style.top = (e.clientY - bx.top + 10) + "px";
+});
+$("#chart").addEventListener("mouseleave", () => { $("#tip").style.display = "none"; });
+/* interactive time axis: scroll = zoom, drag = pan, double-click = reset */
+let PANST = null, PANMOVED = false;
+$("#chart").addEventListener("wheel", e => {
+  const g = $("#chart")._geo;
+  if (!g) return;
+  e.preventDefault();
+  const r = $("#chart").getBoundingClientRect();
+  const t = g.t0 + ((e.clientX - r.left) / r.width) * (g.t1 - g.t0);
+  const f = e.deltaY > 0 ? 1.2 : 1 / 1.2;
+  const nt0 = t - (t - g.t0) * f, nt1 = t + (g.t1 - t) * f, span = nt1 - nt0;
+  if (span < 20 * 60e3) return;
+  ZOOMW = span > 45 * 24 * 3600e3 ? null : {t0: nt0, t1: nt1};
+  renderChart(); updateZoomHint();
+}, {passive: false});
+$("#chart").addEventListener("pointerdown", e => { const g = $("#chart")._geo; if (!g) return; PANST = {x: e.clientX, t0: g.t0, t1: g.t1}; PANMOVED = false; });
+window.addEventListener("pointermove", e => {
+  if (!PANST) return;
+  const dx = e.clientX - PANST.x;
+  if (Math.abs(dx) > 5) PANMOVED = true;
+  if (!PANMOVED) return;
+  const r = $("#chart").getBoundingClientRect();
+  const dt = -(dx / r.width) * (PANST.t1 - PANST.t0);
+  ZOOMW = {t0: PANST.t0 + dt, t1: PANST.t1 + dt};
+  renderChart(); updateZoomHint();
+});
+window.addEventListener("pointerup", () => { PANST = null; setTimeout(() => PANMOVED = false, 60); });
+$("#chart").addEventListener("dblclick", () => { ZOOMW = null; renderChart(); updateZoomHint(); });
+$("#chart").addEventListener("click", e => {
+  if (PANMOVED) return; // a pan is not a click
+  const d = e.target.dataset || {};
+  if (d.day) { state.q = d.day; $("#sq").value = d.day; CONTENT = null; showView("sessions"); renderSessions(); toast("sessions last active " + d.day); return; }
+  if (d.a) { EMPH = EMPH === d.a ? null : d.a; renderChart(); renderAccts(); }
+});
+updateZoomHint();
+
+/* ================= account table ================= */
+/* the signal colour for a remaining-% (green healthy → amber → red low) */
+function pctCol(pct) { return pct == null ? "var(--mut)" : pct >= 50 ? "var(--ok)" : pct >= 20 ? "var(--warn)" : "var(--bad)"; }
+const LOGIN_CMDS = {anthropic: h => `CLAUDE_CONFIG_DIR=${h} claude /login`, codex: h => `CODEX_HOME=${h} codex login --device-auth`};
+function latestGauges(acct) {
+  const out = {}, when = {};
+  for (const r of HIST) {
+    if (r.account !== acct) continue;
+    for (const g of r.gauges || []) {
+      if (g.utilization == null) continue;
+      if (!(g.label in when) || r.probed_at > when[g.label]) {
+        when[g.label] = r.probed_at;
+        out[g.label] = {rem: (1 - Math.min(1, g.utilization)) * 100, reset: g.reset ? g.reset * 1000 : null};
+      }
+    }
+  }
+  return out;
+}
+/* one quota cell: right-aligned %, a slim proportional bar, and the reset ETA
+   underneath — no chunky battery glyph, colour only on the bar/number. */
+function qcell(g, fallbackReset) {
+  if (!g) return `<td class="qcell rst">—</td>`;
+  const pct = g.rem, col = pctCol(pct);
+  const reset = g.reset && g.reset > Date.now() ? g.reset : (fallbackReset && fallbackReset > Date.now() ? fallbackReset : null);
+  const rl = reset ? `<span class="rst" title="resets ${new Date(reset).toLocaleString([], {weekday: "short", hour: "numeric", minute: "2-digit"})}">↻ ${fmtIn(reset)}</span>` : "";
+  return `<td class="qcell"><span class="qv" style="color:${col}">${pct.toFixed(0)}%</span>`
+    + `<div class="qbar"><i style="width:${Math.max(2, Math.min(100, pct))}%;background:${col}"></i></div>${rl}</td>`;
+}
+let SORTA = {key: null, dir: 1};
+function _sortVal(c, key) {
+  const G = latestGauges(c.name);
+  switch (key) {
+    case "account": return c.name.toLowerCase();
+    case "win": return c.windows_left ?? -1;
+    default: return G[key] ? G[key].rem : -1;
+  }
+}
+function renderAccts() {
+  const tb = $("#atbody");
+  if (!CREDS.length) { tb.innerHTML = ""; return; }
+  const labels = gaugeLabels(), extras = labels.filter(l => l !== "5h" && l !== "7d");
+  const arrow = k => SORTA.key === k ? (SORTA.dir > 0 ? " ↑" : " ↓") : "";
+  $("#athead").innerHTML = `<th data-s="account">account${arrow("account")}</th>`
+    + `<th class="num" data-s="5h">session${arrow("5h")}</th><th class="num" data-s="7d">weekly${arrow("7d")}</th>`
+    + extras.map(l => `<th class="num" data-s="${esc(l)}">${esc(LBL_NICE[l] || l)}${arrow(l)}</th>`).join("")
+    + `<th class="num" data-s="win">windows${arrow("win")}</th>`;
+  $$("#athead th[data-s]").forEach(th => th.onclick = () => {
+    const k = th.dataset.s;
+    SORTA = SORTA.key === k ? {key: k, dir: -SORTA.dir} : {key: k, dir: 1};
+    renderAccts();
+  });
+  // quota table = accounts with quota data; structural no-auth homes (unknown + no
+  // tier/headroom) live on the homes card, summarized as "N not reporting" in the strip.
+  const hasData = c => c.state !== "unknown" || c.tier || c.headroom != null || c.windows_left != null;
+  let show = CREDS.filter(c => (AFILTER === "all" || c.provider === AFILTER) && hasData(c));
+  if (SORTA.key) show = [...show].sort((a, b) => {
+    const va = _sortVal(a, SORTA.key), vb = _sortVal(b, SORTA.key);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * SORTA.dir;
+  });
+  tb.innerHTML = show.map(c => {
+    const G = latestGauges(c.name), sel = SEL[c.provider] === c.name;
+    const flags = [c.name_lies ? "name-lies" : "", c.duplicate_homes ? `${c.duplicate_homes.length} homes` : ""].filter(Boolean).join(", ");
+    const win = c.windows_left != null ? `${c.windows_left.toFixed(1)}/${c.windows_per_week.toFixed(1)}` : "—";
+    const wv = c.windows_verdict && c.windows_verdict !== "ok" ? `<span class="rst" title="projected unused capacity at the reset">${esc(c.windows_verdict)}</span>` : "";
+    const fix = (LOGIN_CMDS[c.provider] || (x => ""))(c.home);
+    const st = c.state === "ok" ? `<span class="st-ok">ok</span>`
+      : `<span class="st-${c.state} stfix" data-fix="${esc(fix)}" title="click to copy the login fix (you run it yourself): ${esc(fix)}">${esc(c.state)}</span>`;
+    // account cell: colour dot + name (+ a quiet live-dot), then a muted meta line
+    const meta = [esc((c.tier || c.provider).replace("Max 20x", "Max 20×")), st, "home: " + esc(c.home_name || "?")]
+      .concat(flags ? [`<span class="flagchip">${flags}</span>`] : []).join('<span class="sep">·</span>');
+    return `<tr data-a="${esc(c.name)}" data-p="${c.provider}" class="${sel ? "sel" : ""}" title="click to select for ${c.provider === "anthropic" ? "claude" : "codex"} resumes">
+      <td><div class="acct-name"><span class="adot" style="background:${acol(c.name)}"></span>${esc(c.name)}${c.active ? '<span class="live" title="a live agent is on this account right now"></span>' : ""}</div>
+        <div class="acct-line2">${meta}</div></td>
+      ${qcell(G["5h"])}${qcell(G["7d"], c.resets_at_ms)}
+      ${extras.map(l => qcell(G[l])).join("")}
+      <td class="qcell"><span class="qv">${win}</span>${wv ? '<div style="margin-top:2px">' + wv + "</div>" : ""}</td></tr>`;
+  }).join("");
+  tb.querySelectorAll("tr").forEach(tr => {
+    tr.onclick = e => {
+      const fx = e.target.closest(".stfix");
+      if (fx) { navigator.clipboard.writeText(fx.dataset.fix); toast("copied login fix (run it yourself — logins are human-only): " + fx.dataset.fix, 5000); return; }
+      SEL[tr.dataset.p] = tr.dataset.a;
+      renderAccts(); renderResumeAs(); renderTray();
+    };
+    tr.onmouseenter = () => { EMPH = tr.dataset.a; renderChart(); };
+    tr.onmouseleave = () => { if (EMPH === tr.dataset.a) { EMPH = null; renderChart(); } };
+  });
+}
+$$(".afilter .chip[data-f]").forEach(ch => ch.onclick = () => {
+  AFILTER = ch.dataset.f;
+  $$(".afilter .chip[data-f]").forEach(x => x.classList.toggle("on", x === ch));
+  renderAccts(); renderChart();
+});
+
+/* ================= burn ↔ sessions ================= */
+async function loadBurn() {
+  const host = $("#burnrows");
+  host.innerHTML = '<div class="empty">joining burn history to sessions…</div>';
+  let d;
+  try { d = await j("/api/burn?hours=48"); } catch (e) { host.innerHTML = '<div class="empty">✗ burn fetch failed</div>'; return; }
+  if (d.error || d.unavailable) { host.innerHTML = `<div class="empty">✗ ${esc(d.error || "burn unavailable on this machine")}</div>`; return; }
+  const roster = ROSTER(); // same convention as the chart: history accounts outside the roster don't render
+  const burnsOf = b => Object.entries(b.byAccount || {}).filter(([a]) => !CREDS.length || roster.has(a));
+  const rows = (d.buckets || []).filter(b => burnsOf(b).length).sort((a, b) => b.t - a.t).slice(0, 40);
+  if (!rows.length) { host.innerHTML = `<div class="empty">${esc(d.note || "no burn in the last 48h")}</div>`; return; }
+  host.innerHTML = rows.map(b => {
+    const when = new Date(b.t).toLocaleString([], {month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"});
+    const chips = burnsOf(b).sort((x, y) => y[1] - x[1]).map(([a, p]) =>
+      `<span class="burnchip" title="${esc(a)} burned ${p}% of its 5h window this hour"><span class="adot" style="background:${acol(a)}"></span>${esc(short(a, 18))} −${p}%</span>`).join("");
+    const sess = (b.sessions || []).map(s =>
+      `<span class="burnsess" data-open="${esc(s.i)}" title="${esc(s.c)} · ${s.h} — click to read the transcript">${esc(s.t || "(untitled)")}</span>`).join("");
+    return `<div class="burnrow"><span class="burnt">${when}</span><span class="burnchips">${chips}</span><span class="burnsesss">${sess || '<span class="rst">no sessions last-active this hour</span>'}</span></div>`;
+  }).join("") + (d.note ? `<div class="burnnote">${esc(d.note)}</div>` : "");
+  host.querySelectorAll(".burnsess").forEach(el => el.onclick = () => openSession(el.dataset.open));
+}
+$("#burncard").addEventListener("toggle", () => { if ($("#burncard").open) loadBurn(); });
+
+/* ================= credential homes =================
+   helm prepares/verifies/moves home DIRECTORIES; every login is human-run and
+   credentials are never read, written, copied, or moved (one home = one login). */
+let HOMES = [];
+// rides post() so home actions share the stale-bearer retry; callers keep the
+// {error: ...}-object contract they were written against (never a throw).
+const homePost = body => post("/api/homes", body).catch(e => ({error: e.message}));
+async function loadHomes() {
+  const host = $("#homerows");
+  host.innerHTML = '<div class="empty">scanning homes…</div>';
+  try { HOMES = await j("/api/homes"); } catch (e) { host.innerHTML = '<div class="empty">✗ homes fetch failed</div>'; return; }
+  if (!Array.isArray(HOMES)) { host.innerHTML = `<div class="empty">✗ ${esc(HOMES.error || "homes unavailable on this machine")}</div>`; HOMES = []; return; }
+  renderHomes();
+}
+function homeRowHTML(h) {
+  const chips = [];
+  chips.push(h.authed ? `<span class="st-ok" title="credential file present (contents never read)">authed</span>`
+    : `<span class="st-unknown" title="no credential file — this home does not appear in quota providers">no-auth</span>`);
+  chips.push(h.identity ? `<span title="identity metadata (claude: oauthAccount · codex: id_token email claim)">${esc(h.identity)}</span>`
+    : `<span class="rst">identity —</span>`);
+  if (h.canonical === false) chips.push(`<span class="flagchip" title="dir name should be the identity email folded to dashes — migrate fixes this">⚠ name-lies</span>`);
+  if (h.provider === "claude" && !h.archived) chips.push(h.projects_link_ok
+    ? `<span class="st-ok" title="projects → ~/.claude/projects (one shared session store)">link ✓</span>`
+    : `<span class="st-exhausted" title="projects must SYMLINK to ~/.claude/projects — a real dir silently strands sessions (verify shows the fix)">link ✗</span>`);
+  if (h.duplicate_identity && h.duplicate_identity.length)
+    chips.push(`<span class="flagchip" title="same identity also holds: ${esc(h.duplicate_identity.join(", "))} — one identity, one home; archive the loser (never copy creds)">⚠ dup-identity</span>`);
+  if (h.default) chips.push(`<span class="rst" title="the harness's fallback home — not archivable">default</span>`);
+  if (h.aliases && h.aliases.length) chips.push(`<span class="rst" title="alias symlinks pointing here">⤷ ${esc(h.aliases.join(", "))}</span>`);
+  const live = h.live_pids && h.live_pids.length ? ` <span title="live agent pid(s): ${h.live_pids.join(", ")}" style="color:var(--ok)">▶ ${h.live_pids.length}</span>` : "";
+  const nk = esc(h.name), pk = esc(h.provider || "?");
+  const acts = h.archived
+    ? `<button data-ha="unarchive" data-hn="${nk}">unarchive</button>`
+    : [`<button data-ha="verify" data-hn="${nk}" data-hp="${pk}" title="post-login check: identity, canonical name, projects link, duplicates">verify</button>`,
+       h.authed ? `<button data-ha="physics" data-hn="${nk}" data-hp="${pk}" title="what a seat on this home would load: MCPs, hooks, plugins, model">physics</button>` : "",
+       h.canonical === false ? `<button data-ha="migrate" data-hn="${nk}" data-hp="${pk}" title="rename to the canonical name; alias symlink left behind">migrate</button>` : "",
+       h.default ? "" : `<button data-ha="archive" data-hn="${nk}" data-hp="${pk}" title="${h.live_pids && h.live_pids.length ? "will REFUSE: live agents on this home" : "move into ~/.helm-home-archive (reversible)"}">archive</button>`
+      ].join("");
+  return `<div class="homerow"><span class="hbadge h-${pk === "claude" || pk === "codex" ? pk : "other"}">${pk.slice(0, 2)}</span>
+    <span class="hn">${nk}${live}${h.archived ? ` <span class="rst">→ ${esc(h.path)}</span>` : ""}</span>
+    <span class="hchips">${chips.join("")}</span>
+    <span class="hacts">${acts}</span><div class="homefix"></div></div>`;
+}
+function renderHomes() {
+  const active = HOMES.filter(h => !h.archived && !h.broken_alias), arch = HOMES.filter(h => h.archived), broken = HOMES.filter(h => h.broken_alias);
+  $("#homerows").innerHTML = active.map(homeRowHTML).join("")
+    + broken.map(h => `<div class="homerow"><span class="hn">${esc(h.name)}</span><span class="hchips"><span class="st-exhausted">broken alias → ${esc(h.target)}</span></span></div>`).join("")
+    + (arch.length ? `<div class="homehdr">archived (reversible — ~/.helm-home-archive)</div>` + arch.map(homeRowHTML).join("") : "")
+    || '<div class="empty">no credential homes found</div>';
+  $("#homerows").querySelectorAll("button[data-ha]").forEach(b => b.onclick = () => homeAction(b));
+}
+async function homeAction(btn) {
+  const act = btn.dataset.ha, name = btn.dataset.hn, provider = btn.dataset.hp;
+  const fixEl = btn.closest(".homerow").querySelector(".homefix");
+  if (act === "physics") {
+    if (fixEl.dataset.phys) { fixEl.innerHTML = ""; delete fixEl.dataset.phys; return; }
+    btn.disabled = true;
+    const r = await (await fetch(`/api/physics?home=${encodeURIComponent(name)}`)).json();
+    btn.disabled = false;
+    if (r.error) { fixEl.textContent = "✗ " + r.error; return; }
+    fixEl.dataset.phys = "1";
+    // shape-tolerant: mcpServers/hooks are lists; plugins may be {enabled:[...]}
+    const names = v => Array.isArray(v) ? v.map(x => (x && x.name) || x) : (v && Array.isArray(v.enabled)) ? v.enabled.map(x => String(x).split("@")[0]) : [];
+    const m = names(r.mcpServers), pl = names(r.plugins);
+    const hk = Array.isArray(r.hooks) ? r.hooks.reduce((n, h) => n + (h.count || 1), 0) : 0;
+    const hi = r.settingsHighlights || {};
+    fixEl.innerHTML = `<span class="rst">physics (home-scope): </span>`
+      + `MCPs: <b>${m.length ? esc(m.join(", ")) : "none"}</b> · hooks: <b>${hk}</b> · plugins: <b>${pl.length ? esc(pl.join(", ")) : "none"}</b>`
+      + (hi.model ? ` · model: <b>${esc(String(hi.model))}</b>` : "")
+      + (r.warnings && r.warnings.length ? `<br><span class="flagchip">⚠ ${esc(r.warnings.slice(0, 3).join(" · "))}</span>` : "");
+    return;
+  }
+  if (act === "verify") {
+    btn.disabled = true;
+    const r = await homePost({action: "verify", name, provider});
+    btn.disabled = false;
+    if (r.error) { fixEl.textContent = "✗ " + r.error; return; }
+    fixEl.innerHTML = `verdict: <b class="${r.verdict === "ok" ? "st-ok" : "st-approaching"}">${esc(r.verdict)}</b>`
+      + (r.fixes.length ? "<br>" + r.fixes.map(f => "fix: " + esc(f)).join("<br>") : " — all checks pass");
+    return;
+  }
+  if (act === "archive" && !confirm(`Archive home ${name} (${provider})?\n\nMoves the whole directory into ~/.helm-home-archive — reversible via unarchive. Refuses if a live agent is on it.`)) return;
+  if (act === "migrate" && !confirm(`Migrate home ${name} (${provider}) to its canonical name?\n\nRenames the directory and leaves an alias symlink at the old path. Refuses if a live agent is on it.`)) return;
+  btn.disabled = true;
+  const r = await homePost(act === "unarchive" ? {action: act, name} : {action: act, name, provider});
+  btn.disabled = false;
+  if (r.error) { fixEl ? fixEl.textContent = "✗ " + r.error : 0; toast("✗ " + r.error, 6000); return; }
+  toast("✓ " + (r.archived_to ? ("archived → " + r.archived_to) : r.restored_to ? ("restored → " + r.restored_to) : r.note || "done"), 6000);
+  loadHomes(); loadCreds(true);
+}
+$("#hCreate").onclick = async () => {
+  const email = $("#hEmail").value.trim(), provider = $("#hProv").value;
+  if (!email) { toast("enter the account email — the home name derives from it"); return; }
+  const r = await homePost({action: "create", provider, email});
+  const slot = $("#hCmd");
+  if (r.error) { slot.innerHTML = `<div class="dupwarn">✗ ${esc(r.error)}</div>`; return; }
+  slot.innerHTML = `<div class="cmdbox">${esc(r.login_cmd)}<div class="hintline">click to copy — run it in YOUR terminal, approve in the browser, then hit verify on the new row (logins are human-only)</div></div>`;
+  slot.querySelector(".cmdbox").onclick = async () => {
+    await navigator.clipboard.writeText(r.login_cmd);
+    toast("login command copied ✓ — run it yourself, then verify");
+  };
+  toast(`home ${r.existing ? "already prepared" : "created"}: ${r.home}`, 5000);
+  loadHomes();
+};
+$("#homescard").addEventListener("toggle", () => { if ($("#homescard").open) loadHomes(); });
+

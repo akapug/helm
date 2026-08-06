@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""helm.web multiplayer cave surface — hermetic contract tests. GET
-/api/multiplayer/state is the poll read (open on loopback, like every GET);
+"""helm.web multiplayer HTTP seam — hermetic contract tests. GET
+/api/multiplayer/state is the relay read (open on loopback, like every GET);
 POST publish/presence are owner mutations (bearer-gated, 403 without). The blind
-relay stays blind — the endpoint passes opaque envelopes through and the CLIENT
-folds the demo CRDT. Tmp HELM_MULTIPLAYER_DIR; /dev/shm/helm-multiplayer and the
-real ~/.helm are never touched."""
+relay stays blind — the endpoint passes opaque envelopes through and a CLIENT
+folds the demo CRDT.
+
+The cockpit tab that used to be that client was retired on 2026-07-30 (its one
+owner-facing payload, the fleet's notes, moved to `helm note` + the home tab).
+These endpoints deliberately OUTLIVED it as the adapter contract's HTTP face,
+which is exactly why this file still exists.
+
+Tmp HELM_MULTIPLAYER_DIR; /dev/shm/helm-multiplayer and the real ~/.helm are
+never touched."""
 import json
 import os
 import shutil
@@ -19,7 +26,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import multiplayer, multiplayer_demo, web  # noqa: E402
+from helm import multiplayer, multiplayer_demo, seats, web  # noqa: E402
 
 ENV_KEYS = ("HELM_MULTIPLAYER_DIR", "HELM_MULTIPLAYER_CAVE",
             "HELM_MULTIPLAYER_ACTOR", "HELM_MULTIPLAYER_CONNECTION",
@@ -32,6 +39,8 @@ class TestWebMultiplayer(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="helm-test-webmp-")
         cls.prior = {k: os.environ.get(k) for k in ENV_KEYS}
+        cls.owner_prior = seats._OWNER_NAME
+        seats._OWNER_NAME = "owner"
         for k in ENV_KEYS:
             os.environ.pop(k, None)
         os.environ["HELM_MULTIPLAYER_DIR"] = os.path.join(cls.tmp, "mp")
@@ -50,6 +59,7 @@ class TestWebMultiplayer(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        seats._OWNER_NAME = cls.owner_prior
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
@@ -173,33 +183,46 @@ class TestWebMultiplayer(unittest.TestCase):
         for v in (p["actor"], p["connection"], p["state"],
                   d["updates"][0]["actor"], *d["caves"]):
             self.assertNotIn(BIDI, v)
-        # BUT the opaque update rides through RAW — the relay stays blind, and the
-        # browser launders the decoded cell at its render seam (see the page test).
+        # BUT the opaque update rides through RAW — the relay stays blind, and
+        # whichever client DECODES it launders at its own render seam (the CLI
+        # fold: tests/test_multiplayer.py::test_cli_status_launders_relay_supplied_values).
         self.assertIn(BIDI, d["updates"][0]["update"])
 
-    def test_served_page_launders_the_client_decoded_board(self):
-        # the board cell key/value/actor are decoded BROWSER-side from the opaque
-        # update (blind relay — the server cannot launder what it never decodes),
-        # so the shipped client must launder at its render seam. This pins the
-        # web-side equivalent of the CLI's launder test, closing that coverage gap.
-        with urllib.request.urlopen("http://127.0.0.1:%d/" % self.port,
-                                    timeout=10) as resp:
-            html = resp.read().decode("utf-8")
-        self.assertIn("const mpLaunder", html)
-        self.assertIn("\\p{Cf}", html)                       # strips bidi overrides
-        self.assertIn("esc(mpLaunder(c.value))", html)       # the board value sink
-        self.assertIn("esc(mpLaunder(c.actor))", html)       # the board actor sink
-        self.assertIn("esc(mpLaunder(p.actor))", html)       # the peer actor sink
+    def test_the_served_page_no_longer_folds_an_opaque_update(self):
+        """The cave tab was retired on 2026-07-30, and with it the ONE reason a
+        browser-side launder existed: the page folded the blind relay's opaque
+        updates itself, so the server structurally could not launder a decoded
+        cell and the client had to. Nothing on this page reads these endpoints
+        now, so the client fold and its launder went WITH the panel instead of
+        sitting unused and drifting out of step with the encoder.
 
-    def test_served_page_carries_the_cave_tab_and_client_fold(self):
+        This is not a coverage loss, it is a move — the decode seams that
+        remain are both covered above/elsewhere:
+          • the SERVER wire (peer + envelope actor + cave names) launders in
+            _mp_pub and is pinned by test_state_launders_relay_supplied_identities;
+          • the TERMINAL fold launders in multiplayer._display and is pinned by
+            tests/test_multiplayer.py::test_cli_status_launders_relay_supplied_values.
+        """
         with urllib.request.urlopen("http://127.0.0.1:%d/" % self.port,
                                     timeout=10) as resp:
             html = resp.read().decode("utf-8")
-        self.assertIn('data-v="cave"', html)
-        self.assertIn('id="view-cave"', html)
-        self.assertIn("function materializeCave", html)     # the client-side CRDT
-        self.assertIn("/api/multiplayer/state", html)
-        self.assertIn('"helm.demo.lww"', html)              # mirrors the encoder kind
+        for gone in ('data-v="cave"', 'id="view-cave"', "function materializeCave",
+                     "function pollCave", "mpLaunder(", "/api/multiplayer/"):
+            self.assertNotIn(gone, html, "%s survived the cave tab" % gone)
+        # the demo CRDT kind is the CLIENT's word, and the only client left is
+        # the CLI — the browser must not carry a second, drifting copy of it
+        self.assertNotIn(multiplayer_demo.KIND, html)
+
+    def test_the_endpoints_outlive_the_tab(self):
+        """No tab reads them; they are still SERVED. They are the HTTP face of
+        the adapter contract for a bridge or a script, and retiring an owner
+        surface is not a reason to break a protocol seam."""
+        self.assertIn("/api/multiplayer/state", web.QUERY_API)
+        self.assertIn("/api/multiplayer/publish", web.POST_API)
+        self.assertIn("/api/multiplayer/presence", web.POST_API)
+        s, d = self.req("/api/multiplayer/state?cave=demo&doc=board")
+        self.assertEqual(s, 200)
+        self.assertEqual(d["cave"], "demo")
 
 
 if __name__ == "__main__":

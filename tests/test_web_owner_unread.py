@@ -25,7 +25,7 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
             "HELM_CELL_BIN", "MELD_CELL_BIN",
             "HELM_CHAT_OWNER_NAMES", "MELD_CHAT_OWNER_NAMES",
-            "HELM_CHAT_NAME", "MELD_CHAT_NAME")
+            "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_ROOM")
 
 
 class TestOwnerUnread(unittest.TestCase):
@@ -33,8 +33,16 @@ class TestOwnerUnread(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="helm-test-ownerunread-")
         cls.env_prior = {k: os.environ.get(k) for k in ENV_KEYS}
+        cls.owner_prior = seats._OWNER_NAME
+        seats._OWNER_NAME = "owner"
         for k in ENV_KEYS:
             os.environ.pop(k, None)
+        # The fixture homes its posts EXPLICITLY through the same env seam
+        # launched seats use — the old accidental "main" default, now stated
+        # (chat.post's room default now derives from env/cwd;
+        # this fixture previously neither popped nor set the room seam, so
+        # alone it inherited whatever the shell or cwd implied).
+        os.environ["HELM_CHAT_ROOM"] = "main"
         os.environ["HELM_HOME"] = os.path.join(cls.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(cls.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""  # transport off — hermetic v1
@@ -53,6 +61,7 @@ class TestOwnerUnread(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        seats._OWNER_NAME = cls.owner_prior
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
@@ -187,6 +196,25 @@ class TestOwnerUnread(unittest.TestCase):
         # the poll still answers: rows + total intact, the signal zeroed
         self.assertEqual(d["total"], 1)
         self.assertEqual((d["owner_unread"], d["owner_mentions"]), (0, 0))
+
+
+    def test_a_padded_sha_post_is_a_400_never_a_500(self):
+        """shaguard refuses a padded short sha and chat.post RAISES. That is a
+        fact about the REQUEST, and this handler already answers bad payloads
+        with 400 — letting the raise escape would turn a precise, actionable
+        refusal into a server fault the owner's panel cannot read."""
+        import subprocess
+        real = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+        if len(real) != 40:
+            self.skipTest("not a git checkout")
+        # CONTROL: an ordinary post really works through this handler, so the
+        # 400 below is the guard and not a broken endpoint.
+        ok_status, _ok = self.req("/api/chat", {"text": "plain message"})
+        self.assertEqual(ok_status, 200)
+        status, body = self.req("/api/chat", {"text": "tip " + real[:12] + "9" * 28})
+        self.assertEqual(status, 400, "a refusal is a bad REQUEST, not a fault")
+        self.assertIn("padded short sha", str(body.get("error")))
 
 
 if __name__ == "__main__":

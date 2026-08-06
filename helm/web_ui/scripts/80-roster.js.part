@@ -1,0 +1,433 @@
+/* ---------- roster tab: the whole fleet, one dense Tuftian table ----------
+   Consolidates the three old surfaces (chat presence strip, ledger seat-
+   activity + fleet-todos, message-a-seat) into ONE sortable table + the
+   preserved seat popup. Own 2s poll, gated on the tab being open + visible,
+   with an in-flight guard (the CHAT_POLLING pattern). web.py / seats.py are
+   unchanged: /api/chat/roster already ships every column; /api/todos feeds the
+   TASK column + the orphans fold. */
+let ROSTER_TIMER = null, ROSTER_POLLING = false;
+let ROSTER_SORT = {key: "presence", dir: 1};
+let ROSTER_SHOW = {absent: false, sas: false};
+let ROSTER_TODOS = {};                                   // seat -> /api/todos digest
+let ROSTER_GIT = {}, ROSTER_GIT_TIMER = null;            // cwd -> {ts, subject} (60s git side-channel)
+// UNVERIFIED sorts right under fresh: it is the row that NEEDS the owner's eye
+// (its beat may be another process's \u2014 seats.unverified_seats), so it must not
+// sink below the quiet ones.
+const rrank = p => p === "fresh" ? 0 : p === "unverified" ? 1 : p === "quiet" ? 2 : 3;
+const rdotGlyph = p => p === "fresh" ? '<span class="rdot fresh">\u25cf</span>'
+  : p === "unverified" ? '<span class="rdot unverified" title="presence UNVERIFIED \u2014 this row shares a session id with another seat, so its beat may be another process\u2019s">\u25c6</span>'
+  : p === "quiet" ? '<span class="rdot quiet">\u25d0</span>'
+  : '<span class="rdot absent">\u25cb</span>';
+const RCOLS = [
+  {k: "presence", l: "", c: ""}, {k: "seat", l: "seat", c: ""},
+  {k: "last_seen", l: "last", c: "num"}, {k: "doing", l: "doing", c: ""},
+  {k: "task", l: "task", c: ""}, {k: "pending", l: "pend", c: "num"},
+  {k: "preview", l: "last msg", c: ""}, {k: "project", l: "project", c: ""},
+  {k: "session", l: "sess", c: ""},
+];
+// DOING = one line, server precedence in s.source: explicit status > live claim
+// > home room. status carries its age + (by X); a >4h status dims (a live claim
+// outranks it server-side anyway).
+function rosterDoing(s) {
+  // the OWNER row (server-side _owner_row): a human at an open cockpit, not a
+  // seat — it has no lane, no claim and no home room to fall through to.
+  if (s.owner) return {cls: "status", text: "◉ " + (s.line || "watching the cockpit"),
+                       title: "you, at the " + (s.connection || "cockpit") + " — while a browser cockpit is polling"};
+  if (s.source === "status") {
+    const age = s.status_age != null ? " (" + chatAgo(s.status_age) + ")" : "";
+    const by = s.status_by ? " (by " + s.status_by + ")" : "";
+    const stale = s.status_age != null && s.status_age > 4 * 3600;
+    return {cls: "status" + (stale ? " stale" : ""), text: (s.line || "") + age + by};
+  }
+  if (s.source === "claim" && s.line) return {cls: "claim", text: "\u25b8 " + s.line};
+  // lane-less: show the repo's LAST COMMIT (merged from the 60s git side-channel)
+  // if we have it, else the home room. The commit subject rides the cell title.
+  const g = s.cwd && ROSTER_GIT[s.cwd];
+  if (g && g.ts) return {cls: "home", text: "last commit " + chatAgo(Date.now() / 1e3 - g.ts) + " ago", title: g.subject};
+  return {cls: "home", text: "in " + (s.home_room ? "#" + s.home_room : "all rooms")};
+}
+// TASK = the todo digest (2/7 . active) from /api/todos when present, else the
+// roster row's own todo.active. Never a subprocess on the 2s poll path.
+function rosterTask(s) {
+  const t = ROSTER_TODOS[s.seat];
+  if (t && t.total) return t.done + "/" + t.total + (t.active ? " \u00b7 " + t.active : "");
+  return (s.todo && s.todo.active) || "";
+}
+// UPSTREAM = the seat is alive and TRYING and its provider is refusing it.
+// Empty for every seat that cannot carry the condition (no proxy family) and
+// for HEALTHY, so the badge means exactly one thing wherever it appears.
+// UNKNOWN is shown, not hidden: "proxywatch stopped writing" is a fact the
+// owner should see, and hiding it would restore the silence this fixes.
+//
+// A named non-healthy state is a WALL \u2014 proxywatch composed that verdict into
+// the record's own `dark` bit at write time, and #163's language holds on this
+// surface too: a wall is a FACT, not unreadiness. So a walled row names the
+// CAUSE and shows HOW LONG (the record's `since`, rendered in the roster's
+// relative idiom with the full ISO on hover) \u2014 the owner learned about the
+// gemini 429 wall from pane errors while this row read exactly like idle.
+// The reset horizon (upstream_resets_at_ms, epoch ms \u2014 fed by the kimi
+// standing-config, #45, when it lands) rides as "\u21bb Nh" when the record
+// carries one and is HONESTLY ABSENT when it does not: the hover then says
+// "no recorded reset horizon" instead of implying one either way.
+function upstreamBadge(s) {
+  const u = s.upstream, paused = s.beacon_paused === true;
+  if ((!u || u === "HEALTHY") && !paused) return "";
+  const iso = s.upstream_since || "";
+  const why = s.upstream_why ? " \u2014 " + esc(s.upstream_why) : "";
+  const label = paused ? "PAUSED \u00b7 " + (u || "UNKNOWN") : u;
+  if (!u || u === "UNKNOWN") {
+    const last = s.upstream_stale_state
+      ? " \u2014 last saw " + esc(s.upstream_stale_state) + (iso ? " since " + esc(iso) : "")
+      : s.upstream_last_dark
+        ? " \u2014 last named cause " + esc(s.upstream_last_dark) + (iso ? " since " + esc(iso) : "")
+        : (s.upstream_dark && iso ? " \u2014 dark since " + esc(iso) : "");
+    const t = paused
+      ? "beacon delivery PAUSED while upstream evidence is UNKNOWN" + why + last +
+        " \u2014 messages stay pending; a proxywatch HEALTHY result resumes delivery automatically"
+      : "upstream state UNKNOWN" + why + last;
+    return '<span class="rup ' + (paused ? "dark" : "unknown") + '" title="' + t + '">' + esc(label || "UNKNOWN") + '</span>';
+  }
+  // The record's verdict drives the styling. Exact true \u2014 or a MISSING field
+  // from an old import-once server \u2014 wears the wall's red. An authoritative
+  // exact false renders CALM; an unreadable verdict withholds wall styling.
+  const walled = s.upstream_dark === true || s.upstream_dark === undefined;
+  const ago = iso ? lagoIso(iso) : "\u2014";
+  const rst = Number.isFinite(s.upstream_resets_at_ms) ? s.upstream_resets_at_ms : null;
+  // Whose number this is, named: an owner-entered vendor reset and a measured
+  // proxy bench horizon share the field, and rendering them identically would
+  // mint certainty from unlike evidence (task/45).
+  const src = s.upstream_reset_source === "owner" ? "owner-entered vendor reset"
+    : s.upstream_reset_kind ? esc(String(s.upstream_reset_kind)) + " reset" : null;
+  const horizon = rst != null
+    ? (src ? "resets in " + fmtIn(rst) + " (" + src + ")" : "resets in " + fmtIn(rst))
+    : "no recorded reset horizon";
+  const verdict = walled
+    ? " \u2014 a wall is a fact, not unreadiness: the seat is alive and trying; its provider is refusing it"
+    : s.upstream_dark === false ? " \u2014 the recorded verdict: not a wall"
+    : " \u2014 the record's wall verdict is unreadable; wall styling withheld";
+  const retained = paused
+    ? " \u2014 beacon delivery PAUSED; messages stay pending; a proxywatch HEALTHY result resumes delivery automatically"
+    : "";
+  const t = (walled ? "WALLED \u2014 upstream " : "upstream ") + esc(u) +
+    (iso ? " since " + esc(iso) : "") + " \u2014 " + horizon + why + verdict + retained;
+  return '<span class="rup ' + (paused || walled ? "dark" : "calm") + '" title="' + t + '">' + esc(label) +
+    (ago !== "\u2014" ? '<span class="rupd">\u00b7 ' + esc(ago) + '</span>' : '') +
+    (rst != null ? '<span class="rupd">\u00b7 \u21bb ' + esc(fmtIn(rst)) + '</span>' : '') +
+    '</span>';
+}
+function renderRoster(rep) {
+  LAST_ROSTER = rep;                                     // seatPop reads facts here
+  const all = (rep && rep.seats) || [], claims = (rep && rep.claims) || [];
+  const q = (($("#rosterq") && $("#rosterq").value) || "").trim().toLowerCase();
+  const setc = (id, n) => { const e = $(id); if (e) e.textContent = n; };
+  setc("#cntAbsent", all.filter(s => s.presence === "absent" && !s.ephemeral).length);
+  setc("#cntSAs", all.filter(s => s.ephemeral).length);
+  // visibility: live non-ephemeral by default; a seat with pending (stranded)
+  // deliveries is ALWAYS a visible object (ack-ladder law); the chips reveal
+  // the absent + ephemeral rest.
+  let rows = all.filter(s => {
+    if (s.owner) return true;              // the human is never filtered away
+    if (s.pending) return true;
+    if (s.ephemeral) return ROSTER_SHOW.sas;
+    if (s.presence === "absent") return ROSTER_SHOW.absent;
+    return true;
+  });
+  if (q) rows = rows.filter(s =>
+    [s.seat, seatRuntime(s), s.project, rosterDoing(s).text, rosterTask(s)].join(" ").toLowerCase().includes(q));
+  const sk = ROSTER_SORT.key, dir = ROSTER_SORT.dir;
+  const val = s => sk === "seat" ? (s.seat || "")
+    : sk === "last_seen" ? -(s.last_seen || 0)
+    : sk === "pending" ? -(s.pending || 0)
+    : sk === "doing" ? rosterDoing(s).text.toLowerCase()
+    : sk === "task" ? rosterTask(s).toLowerCase()
+    : sk === "preview" ? (s.preview || "").toLowerCase()
+    : sk === "project" ? (s.project || "").toLowerCase()
+    : sk === "session" ? (s.session || "").toLowerCase() : 0;
+  const cmp = sk === "presence"
+    ? (a, b) => rrank(a.presence) - rrank(b.presence) || (b.pending || 0) - (a.pending || 0) || (b.last_seen || 0) - (a.last_seen || 0)
+    : (a, b) => { const x = val(a), y = val(b); return x < y ? -1 : x > y ? 1 : 0; };
+  // the owner pins to the top under EVERY sort — he is not one of the seats
+  // being ranked, he is the person reading the ranking.
+  rows.sort((a, b) => (b.owner ? 1 : 0) - (a.owner ? 1 : 0) || cmp(a, b) * dir);
+  $("#rthead").innerHTML = "<tr>" + RCOLS.map(c =>
+    '<th class="' + c.c + '" data-k="' + c.k + '">' + esc(c.l) +
+    (sk === c.k ? ' <span class="sar">' + (dir > 0 ? "\u25b2" : "\u25bc") + '</span>' : '') + "</th>").join("") + "</tr>";
+  $("#rthead").querySelectorAll("th").forEach(th => th.onclick = () => {
+    const k = th.dataset.k;
+    if (ROSTER_SORT.key === k) ROSTER_SORT.dir *= -1; else { ROSTER_SORT.key = k; ROSTER_SORT.dir = 1; }
+    if (LAST_ROSTER) renderRoster(LAST_ROSTER);
+  });
+  if (!rows.length) {
+    $("#rtbody").innerHTML = '<tr><td colspan="9" class="empty">no seats match \u2014 toggle the chips or clear the filter</td></tr>';
+  } else {
+    $("#rtbody").innerHTML = rows.map(s => {
+      const d = rosterDoing(s), task = rosterTask(s), rt = seatRuntime(s);
+      const cls = s.owner ? "ownerrow" : s.ephemeral ? "eph" : s.presence === "absent" ? "absent" : "";
+      // the human's name is NOT a seat handle: no transcript to open, no
+      // session to pop, and no click target that would imply either.
+      const namecell = s.owner
+        ? '<span class="rowner">' + esc(s.seat) + '</span><span class="rhuman">you · human</span>'
+        : '<span class="rseat" data-seat="' + esc(s.seat) + '" data-sess="' + esc(s.session || '') + '" title="facts + transcript">' + esc(chatShort(s.seat)) + '</span>' +
+          upstreamBadge(s) +
+          (rt ? '<span class="rruntime">' + esc(rt) + '</span>' : '');
+      return '<tr' + (cls ? ' class="' + cls + '"' : '') + '>' +
+        '<td>' + rdotGlyph(s.presence) + '</td>' +
+        '<td>' + namecell + '</td>' +
+        '<td class="num">' + (s.last_seen ? esc(lago(s.last_seen)) : "\u2014") + '</td>' +
+        '<td class="rdoing ' + d.cls + '" title="' + esc(d.title || d.text) + '">' + esc(d.text) + '</td>' +
+        '<td>' + (task ? esc(task) : '<span style="opacity:.4">\u2014</span>') + '</td>' +
+        '<td class="num">' + (s.pending ? '<span class="rpend">' + s.pending + '</span>' : '') + '</td>' +
+        '<td>' + (s.preview ? '<span class="rmsg" title="' + esc(s.preview) + '">\u201c' + esc(s.preview) + '\u201d</span>' : '') + '</td>' +
+        '<td>' + esc(s.project || "") + '</td>' +
+        '<td><span class="rsess">' + esc((s.session || "").slice(0, 8)) + '</span></td></tr>';
+    }).join("");
+    $("#rtbody").querySelectorAll(".rseat").forEach(el =>
+      el.onclick = ev => { ev.stopPropagation(); seatPop(el, el.dataset.seat, el.dataset.sess); });
+  }
+  // the counts stay SEAT counts \u2014 the owner's row is a person, not capacity
+  const seatsOnly = all.filter(s => !s.owner);
+  const live = seatsOnly.filter(s => s.presence !== "absent" && !s.ephemeral).length;
+  $("#rostercount").innerHTML = '<b>' + live + ' live</b> \u00b7 ' + seatsOnly.length + ' total' +
+    (all.some(s => s.owner) ? ' \u00b7 <span class="rhere">you\u2019re here</span>' : '');
+  // A DEAD HOLDER'S LOCK MUST NOT READ AS A WORKING SEAT HERE EITHER. The
+  // roster JSON carries `stale` per claim; the footer used to drop it, so the
+  // owner's own dashboard showed a dead hold exactly like a live one. Fourth
+  // surface for the same field \u2014 the CLI claims verb, the roster claim lines,
+  // the seat doing-line, and now this.
+  $("#rosterclaims").innerHTML = claims.length
+    ? 'claims: ' + claims.map(c => esc(c.resource) + ' \u2192 <b>' + esc(c.holder || "?") + '</b> (' + c.remaining + 's)'
+        + (c.liveness === "stale" ? ' <b class="rstale">STALE</b>'
+           : c.liveness === "unknown" ? ' <b class="rstale">UNKNOWN</b>' : '')).join(" \u00b7 ")
+    : "";
+}
+function rosterOrphans(rep) {
+  const box = $("#rosterorphans"); if (!box) return;
+  const orph = ((rep && rep.orphans) || []).filter(r => r.total);
+  if (!orph.length) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  orph.sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0) || (b.ts || 0) - (a.ts || 0));
+  box.innerHTML = '<summary style="cursor:pointer;color:var(--sub)">' + orph.length +
+    ' unclaimed session' + (orph.length === 1 ? '' : 's') + ' with todos' +
+    ((rep && rep.orphans_hidden) ? ' \u00b7 ' + rep.orphans_hidden + ' more hidden' : '') + '</summary>' +
+    orph.map(r => '<div style="padding:3px 0 3px 14px">' +
+      '<span class="rsess">' + esc(r.seat || (r.session || "").slice(0, 8) || "session") + '</span> ' +
+      '<span class="num" style="color:var(--mut)">' + r.done + '/' + r.total + '</span> ' +
+      (r.active ? esc(r.active) : '<i>idle</i>') +
+      (r.project ? ' \u00b7 ' + esc(r.project) : '') + '</div>').join("");
+}
+async function pollRoster() {
+  if (!$("#view-roster").classList.contains("on") || document.hidden) return;
+  if (ROSTER_POLLING) return;
+  ROSTER_POLLING = true;
+  try {
+    try {
+      const t = await j("/api/todos");
+      ROSTER_TODOS = {};
+      ((t && t.seats) || []).forEach(r => { if (r.seat) ROSTER_TODOS[r.seat] = r; });
+      rosterOrphans(t);
+    } catch (e) { /* todos fail quiet -- TASK falls back to the roster's own active */ }
+    try { const rep = await j("/api/chat/roster"); renderRoster(rep); seatPicker(rep); }
+    catch (e) { /* roster fails quiet -- the tab stays usable */ }
+  } finally { ROSTER_POLLING = false; }
+}
+// The last-commit side-channel rides its OWN 60s timer (git is a subprocess,
+// kept off the 2s presence poll) + a server-side 60s cache. Each fetch re-
+// renders so lane-less rows pick up "last commit N ago" in their DOING cell.
+async function pollRosterGit() {
+  if (!$("#view-roster").classList.contains("on") || document.hidden) return;
+  try {
+    const d = await j("/api/roster/git");
+    ROSTER_GIT = (d && d.commits) || {};
+    if (LAST_ROSTER) renderRoster(LAST_ROSTER);
+  } catch (e) { /* git side-channel fails quiet -- DOING falls back to the home room */ }
+}
+function initRoster() {
+  if (!ROSTER_TIMER) {
+    ROSTER_TIMER = setInterval(esStretch(pollRoster), 2000);   // stretched while SSE live
+    ROSTER_GIT_TIMER = setInterval(pollRosterGit, 60000);
+    // the message-a-seat composer moved here from the ledger -- wire it once
+    $("#seatform").addEventListener("submit", sendSeatMsg);
+    const key = $("#seatkey");
+    key.addEventListener("focus", renderSeatPicker);
+    key.addEventListener("input", renderSeatPicker);
+    key.addEventListener("keydown", seatPickerKeydown);
+    key.addEventListener("blur", () => setTimeout(closeSeatPicker, 0));
+    $("#rosterq").addEventListener("input", () => { if (LAST_ROSTER) renderRoster(LAST_ROSTER); });
+    const chip = (id, f) => { const b = $(id); if (b) b.onclick = () => { f(); b.classList.toggle("on"); if (LAST_ROSTER) renderRoster(LAST_ROSTER); }; };
+    chip("#togAbsent", () => ROSTER_SHOW.absent = !ROSTER_SHOW.absent);
+    chip("#togSAs", () => ROSTER_SHOW.sas = !ROSTER_SHOW.sas);
+  }
+  pollRoster();
+  pollRosterGit();
+}
+
+
+// The "message a seat" picker is a real anchored popup rather than a browser
+// <datalist>: Chromium can place native datalist chrome against the page instead
+// of this narrow card. The popup lives inside .seatpick, so left/right/top are
+// always relative to the control. Free-typing @all / a future seat still works.
+let SEAT_CHOICES = [], SEAT_ACTIVE = -1;
+const seatGlyph = p => p === "fresh" ? "● " : p === "quiet" ? "◐ " : "○ ";
+function closeSeatPicker() {
+  const list = $("#seatlist"), key = $("#seatkey");
+  list.classList.remove("show");
+  key.setAttribute("aria-expanded", "false");
+  key.removeAttribute("aria-activedescendant");
+  SEAT_ACTIVE = -1;
+}
+function renderSeatPicker() {
+  const list = $("#seatlist"), key = $("#seatkey");
+  const q = key.value.trim().replace(/^@/, "").toLowerCase();
+  const shown = SEAT_CHOICES.filter(s => !q || [s.seat, seatRuntime(s), s.project, presenceLabel(s.presence)].join(" ").toLowerCase().includes(q));
+  list.innerHTML = shown.map((s, i) => {
+    const rt = seatRuntime(s);
+    return '<button type="button" class="seatopt" id="seatopt-' + i + '" role="option" data-seat="' + esc(s.seat) + '"><b>' +
+      esc(seatGlyph(s.presence) + s.seat) + '</b><span class="someta">' +
+      esc(presenceLabel(s.presence) + (rt ? " · " + rt : "") +
+        (s.project ? " · " + s.project : "") +
+        (s.pending ? " · " + s.pending + " pending" : "")) + '</span></button>';
+  }).join("");
+  list.classList.toggle("show", shown.length > 0);
+  key.setAttribute("aria-expanded", shown.length ? "true" : "false");
+  SEAT_ACTIVE = -1;
+  list.querySelectorAll(".seatopt").forEach(b => b.onmousedown = ev => {
+    ev.preventDefault();
+    key.value = b.dataset.seat;
+    closeSeatPicker();
+    key.focus();
+  });
+}
+function seatPicker(rep) {
+  // Hide ephemeral review-SAs (agent-<hex>, tmp home, done) from the live
+  // picker — they are transient fan-out subagents, not messaging targets. Still
+  // reachable by free-typing the exact name; still queryable in the activity +
+  // sessions views. One less cluttered picker (owner steer 2026-07-23).
+  // the owner's own row rides the same list; he is not a message TARGET.
+  const all = ((rep && rep.seats) || []).filter(s => !s.owner);
+  const hidden = all.filter(s => s.ephemeral).length;
+  SEAT_CHOICES = all.filter(s => !s.ephemeral);
+  const rank = p => p === "fresh" ? 0 : p === "quiet" ? 1 : 2;
+  SEAT_CHOICES.sort((a, b) => rank(a.presence) - rank(b.presence) || (b.last_seen || 0) - (a.last_seen || 0));
+  if ($("#seatlist").classList.contains("show")) renderSeatPicker();
+  const c = $("#seatpickcount");
+  if (c) c.textContent = SEAT_CHOICES.length
+    ? SEAT_CHOICES.length + (SEAT_CHOICES.length === 1 ? " live seat" : " live seats") +
+      (hidden ? " · " + hidden + " done SA" + (hidden === 1 ? "" : "s") + " hidden" : "") +
+      " · pick or type @all"
+    : "no seats joined yet · type @all or a seat";
+}
+function seatPickerKeydown(ev) {
+  if (ev.key === "Escape") { closeSeatPicker(); return; }
+  if (!["ArrowDown", "ArrowUp", "Enter"].includes(ev.key)) return;
+  const list = $("#seatlist"), key = $("#seatkey");
+  if (!list.classList.contains("show")) renderSeatPicker();
+  const opts = [...list.querySelectorAll(".seatopt")];
+  if (!opts.length) return;
+  if (ev.key === "Enter" && SEAT_ACTIVE < 0) return;
+  ev.preventDefault();
+  if (ev.key === "Enter") {
+    key.value = opts[SEAT_ACTIVE].dataset.seat;
+    closeSeatPicker();
+    return;
+  }
+  SEAT_ACTIVE = (SEAT_ACTIVE + (ev.key === "ArrowDown" ? 1 : -1) + opts.length) % opts.length;
+  opts.forEach((o, i) => o.classList.toggle("on", i === SEAT_ACTIVE));
+  key.setAttribute("aria-activedescendant", opts[SEAT_ACTIVE].id);
+  opts[SEAT_ACTIVE].scrollIntoView({block: "nearest"});
+}
+
+let LEDGER_POLLING = false;
+
+async function pollLedgerTick() {
+  if (!$("#view-ledger").classList.contains("on")) return; // poll only while open
+  // AND ONLY WHILE SOMEBODY IS ACTUALLY LOOKING. The view being "on" says which
+  // TAB is selected, not whether the window is on screen — an orca pane parked
+  // on the ledger tab behind another pane is "on" and invisible, forever. That
+  // is task/281's own title, and this is the poll it was about: measured
+  // 2026-08-06, /api/ledger costs 1160ms of server CPU per request and
+  // /api/ledger/native rides the same tick, on a 3000ms timer, from three open
+  // sockets. pollDregg, pollRoster and the chat poll all already take this
+  // guard; the most expensive poll in the console was the one without it.
+  //
+  // LEDGER_POLLING is the second half and it is not belt-and-braces: a request
+  // that costs more than a second on a three-second timer STACKS, so a slow
+  // ledger makes itself slower. Same shape as DREGG_POLLING, same reason.
+  if (document.hidden || LEDGER_POLLING) return;
+  LEDGER_POLLING = true;
+  try {
+    await pollLedger();
+  } finally {
+    LEDGER_POLLING = false;
+  }
+}
+
+async function pollLedger() {
+  // The activity feed is LOCAL — it renders even when the cave node is down.
+  try {
+    const n = await j("/api/ledger/native");
+    // the strip's record comparison rides this read; a count that is not a
+    // number stays null, which the strip prints as UNKNOWN — never 0
+    NATIVE_COUNT = n.chain && typeof n.chain.count === "number" ? n.chain.count : null;
+    nativeHead(n.chain || {}); nativeChat(n.chat); nativeRows(n);
+  } catch (e) {
+    NATIVE_COUNT = null; // unreadable is UNKNOWN, not the last count held over
+    /* activity card fails quiet — the cave projection still renders */
+  }
+  let d;
+  try { d = await j("/api/ledger"); }
+  catch (e) { $("#ledgerstrip").innerHTML = '<span class="offline">helm isn’t answering — retrying quietly…</span>'; return; }
+  ledgerStrip(d);
+  ledgerMode(d.transport); // offline carries no transport → honest fallback framing
+  if (d.offline) {
+    $("#ledgerturns").innerHTML = '<div class="empty">the signing service isn’t answering — the local log keeps flowing; signed entries reappear when it returns</div>';
+    $("#ledgercells").innerHTML = '<div class="empty">signing service offline</div>';
+    $("#cavepulse").textContent = "signing pulse: the signing service isn’t answering — pulse UNKNOWN, not quiet";
+    return;
+  }
+  LEDGER_NAMES = {};
+  for (const c of d.cells || []) if (c.seat) LEDGER_NAMES[c.id] = c.seat;
+  ledgerTurns(d.turns);
+  // LEDGER_HEAD is fresh here (ledgerMode above), so the pulse's behind-check
+  // and the empty-state classifier read the same head truth
+  $("#cavepulse").innerHTML = cavePulse(d.turns, LEDGER_HEAD, Date.now() / 1e3);
+  ledgerCells(d.cells);
+}
+
+async function sendSeatMsg(ev) {
+  ev.preventDefault();
+  const key = $("#seatkey").value.trim(), line = $("#seatline").value.trim(), m = $("#seatmsg");
+  if (!line) return;
+  const name = localStorage.getItem("helm.chatname") || "owner";
+  const target = key && (key.startsWith("@") ? key : "@" + key);
+  closeSeatPicker();
+  m.className = ""; m.textContent = "sending…";
+  // one named seat = a TRUE DM (private lane, exactly one recipient — never a
+  // room post); @all/@fleet/@everyone or no target = the #main broadcast.
+  const isDM = target && !/^@(all|fleet|everyone)$/i.test(target);
+  try {
+    if (isDM) await post("/api/chat/dm", {to: target.slice(1), text: line, name});
+    else await post("/api/chat", {room: "main", text: target ? target + " " + line : line, name});
+  }
+  catch (e) { m.className = "bad"; m.textContent = "✗ " + e.message; return; }
+  m.className = "ok";
+  m.textContent = isDM ? "✓ DM sent to " + target + " — only that seat's beacon surfaces it"
+    : "✓ posted to chat" + (target ? " for " + target : "") + " — surfaced to agents next turn";
+  $("#seatline").value = "";
+}
+
+function initLedger() {
+  if (!LEDGER_TIMER) LEDGER_TIMER = setInterval(pollLedgerTick, 3000);
+  // THE OTHER HALF OF THE HIDDEN GUARD, and without it the guard would be a
+  // regression rather than a fix: skipping polls while hidden means the first
+  // thing the owner sees on returning is however stale the tab went. He gets a
+  // refresh the instant the window comes back, so the LOOKING case is never
+  // worse than before — which is the two-sided bar this row is held to.
+  if (!LEDGER_VIS_WIRED) {
+    LEDGER_VIS_WIRED = true;
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) pollLedgerTick();
+    });
+  }
+  pollLedgerTick();
+}
+

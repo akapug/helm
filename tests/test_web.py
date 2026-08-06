@@ -9,20 +9,22 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import home, pk, web  # noqa: E402
+from helm import home, pk, web, web_ui_loader  # noqa: E402
 
 PROJECTS = {
     "alpha": {
         "name": "alpha", "path": "/fake/dev/alpha", "kind": "git", "status": "active",
         "last_seen": 1900000000.0, "active_days": 4,
-        "sessions": {"claude": 5, "codex": 2}, "harness_refs": {"claude": ["-fake-dev-alpha"]},
+        "sessions": {"claude": 5, "codex": 2, "pi": 1},
+        "harness_refs": {"claude": ["-fake-dev-alpha"], "pi": ["pi-session"]},
         "cwds": ["/fake/dev/alpha", "/fake/dev/alpha/worktrees/x"],
-        "edges": [{"rel": "forked-from", "to": "project-b", "note": "", "confirmed": True}],
+        "edges": [{"rel": "forked-from", "to": "upstream-project", "note": "", "confirmed": True}],
     },
     "beta": {
         "name": "beta", "path": "/fake/dev/beta", "kind": "dir", "status": "dormant",
@@ -99,11 +101,40 @@ class TestWeb(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"alpha", body)
 
-    def test_root_serves_ui(self):
+    def test_root_serves_the_exact_assembled_ui(self):
         status, ctype, body = self.get("/")
         self.assertEqual(status, 200)
         self.assertIn("text/html", ctype)
-        self.assertIn(b"helm", body)
+        expected = web_ui_loader.read_bytes()
+        expected = expected.replace(b"__HELM_TOKEN__",
+                                    web.MUTATION_TOKEN.encode())
+        expected = expected.replace(b"__HELM_ROOM__",
+                                    web.default_room().encode())
+        self.assertEqual(body, expected)
+
+    def test_ui_assembly_failures_keep_the_error_shape_and_name_the_cause(self):
+        failures = (
+            ValueError("web UI manifest repeats a.part"),
+            FileNotFoundError("missing.part"),
+        )
+        for failure in failures:
+            with self.subTest(failure=failure), mock.patch.object(
+                    web.web_ui_loader, "read_bytes", side_effect=failure):
+                status, ctype, body = self.get("/")
+                self.assertEqual(status, 500)
+                self.assertIn("application/json", ctype)
+                self.assertEqual(json.loads(body), {
+                    "error": "web UI assembly failed: %s" % failure,
+                })
+
+    def test_ui_labels_pi_harness_and_runtime_route(self):
+        _, _, body = self.get("/")
+        ui = body.decode()
+        self.assertIn('const KNOWN_H = ["claude", "codex", "opencode", "pi"]', ui)
+        self.assertIn(".h-pi{", ui)
+        self.assertIn("const seatRuntime = s =>", ui)
+        self.assertIn('fact("runtime", seatRuntime(s))', ui)
+        self.assertIn('class="rruntime"', ui)
 
     def test_seat_picker_popup_is_anchored_to_its_control(self):
         _, _, body = self.get("/")
@@ -121,8 +152,9 @@ class TestWeb(unittest.TestCase):
         reg = json.loads(body)
         self.assertEqual(set(reg["projects"]), {"alpha", "beta"})
         alpha = reg["projects"]["alpha"]
-        self.assertEqual(alpha["sessions"], {"claude": 5, "codex": 2})
-        self.assertEqual(alpha["edges"][0]["to"], "project-b")
+        self.assertEqual(alpha["sessions"],
+                         {"claude": 5, "codex": 2, "pi": 1})
+        self.assertEqual(alpha["edges"][0]["to"], "upstream-project")
 
     def test_store_degrades_or_summarizes(self):
         status, _, body = self.get("/api/store")
@@ -155,6 +187,86 @@ class TestWeb(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(web.cmd_web(["--port"]), 2)   # missing value
             self.assertEqual(web.cmd_web(["--bogus"]), 2)  # unknown flag
+
+    def test_the_console_opens_on_a_DERIVED_room_never_the_main_literal(self):
+        """The owner's console opened on #main while the whole fleet talked in
+        #helm — he had to be TOLD where a council was. The default is now the
+        same derivation every seat uses, and it must survive a cwd that
+        derives nothing (a systemd unit with no WorkingDirectory starts in
+        $HOME), because that is the shape that put it on #main."""
+        from helm import seats
+        web._DEFAULT_ROOM[:] = []                     # drop the lazy cache
+        self.addCleanup(lambda: web._DEFAULT_ROOM.clear())
+        with mock.patch.object(seats, "safe_cwd", return_value="/"):
+            room = web.default_room()
+        # the PROPERTY is "derived from the code's own location", not the
+        # literal "helm" — pinning the string would test the harness rather
+        # than the package location that owns the assembled page.
+        self.assertEqual(room,
+                         seats.derive_home_room(web_ui_loader.PACKAGE_DIR),
+                         "no-project cwd must fall back to the CODE's own "
+                         "project")
+        self.assertNotEqual(room, "main", "fell back to the #main literal")
+
+    def test_a_project_less_helm_still_gets_an_honest_main(self):
+        """The fallback chain must END somewhere true: a helm that genuinely
+        has no project has #main, and saying so is not the bug — silently
+        preferring it over a real project was."""
+        from helm import seats
+        web._DEFAULT_ROOM[:] = []
+        self.addCleanup(lambda: web._DEFAULT_ROOM.clear())
+        with mock.patch.object(seats, "derive_home_room", return_value=None):
+            self.assertEqual(web.default_room(), "main")
+
+    def test_the_served_page_carries_the_room_not_the_placeholder(self):
+        """The wiring leg: a correct default_room() behind a page that never
+        receives it is the built-not-wired shape this fleet keeps finding."""
+        status, ctype, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"__HELM_ROOM__", body, "placeholder reached the browser")
+        self.assertIn(b'HELM_DEFAULT_ROOM = chatSlug("', body)
+
+
+class RoomTypeTest(unittest.TestCase):
+    """The sidebar's room TYPING is read from the name, so it is testable
+    without a browser — the classifier is the load-bearing half of 'melds
+    should just be separate still' (owner 2026-07-29)."""
+
+    def _classify(self, name):
+        """Mirror of the assembled web UI's roomType() — kept honest by the
+        source check below, which fails if the JS regex changes without this test."""
+        import re as _re
+        if _re.match(r"^(meld|council)-", name):
+            return "meld"
+        if _re.match(r"^dm-", name):
+            return "dm"
+        return "project"
+
+    def test_the_live_room_inventory_types_correctly(self):
+        for name, want in (
+                ("meld-1785274962-mute-backlog-asymmetry", "meld"),
+                ("council-forge-model", "meld"),   # a council IS a meld
+                ("dm-codex", "dm"),
+                ("helm", "project"), ("main", "project"),
+                # a HYPHENATED project name must not read as a meld. Synthetic
+                # on purpose: tests/ is tracked and helm is meant to go public,
+                # so a real private project name here is owner data in a public
+                # artifact — caught by test_never_track's fixture-label guard.
+                ("example-platform", "project"),
+                ("meldrooms", "project"),          # prefix, not substring
+        ):
+            self.assertEqual(self._classify(name), want, name)
+
+    def test_the_JS_classifier_matches_this_test(self):
+        """A python mirror of JS logic rots silently. This pins the actual
+        regex text in the assembled web UI, so a change there fails HERE."""
+        src = web_ui_loader.read_text()
+        self.assertIn('/^(meld|council)-/.test(name)', src)
+        self.assertIn('/^dm-/.test(name)', src)
+        # melds still render as their own labeled, collapsible section, with
+        # the quiet-fold group rows beneath each section (owner 2026-08-01)
+        self.assertIn('id="crmeldhead"', src)
+        self.assertIn('data-qgroup', src)
 
 
 if __name__ == "__main__":

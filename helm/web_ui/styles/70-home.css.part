@@ -1,0 +1,102 @@
+/* ---------- SYSTEM DASHBOARD (home, above the fold) ----------
+   Tufte, applied: no box, no badges — hairline rules between rows, direct
+   labels beside data, tabular numerals, colour only as CLASS (the lr card's
+   own law: --ok is a verified fact, --warn/--bad are alarms, everything
+   unproven is neutral). Each row is the same shape — label · data · numbers —
+   so the eye COMPARES components instead of parsing 90 rows of equal weight
+   (the wall this band replaced; the wall itself lives on, collapsed, below).
+   Every cell distinguishes ZERO from UNREAD: "not read yet" / UNKNOWN are
+   words, never a blank or a fabricated 0 — the console's governing finding
+   ("helm's claims about itself are not checked") applies to the dashboard
+   FIRST, because it is the first thing the owner reads. */
+#dash{margin:16px 0 0;font-size:var(--f1)}
+#dash .dhead{display:flex;align-items:baseline;gap:10px;padding-bottom:3px}
+#dash .dlabel{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+#dash .dhow{margin-left:auto;color:var(--mut);font-size:var(--f0);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#dash .drow{display:flex;align-items:baseline;gap:10px;padding:5px 0;border-top:1px solid var(--line)}
+#dash .dlab{flex:0 0 52px;font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+#dash .dval{flex:1 1 auto;min-width:0;display:flex;flex-wrap:wrap;gap:2px 10px;align-items:baseline;color:var(--fg)}
+#dash .dnum{font-variant-numeric:tabular-nums;font-weight:var(--w-med);color:var(--fg)}
+#dash .dmut{color:var(--mut)}
+#dash .dsub{color:var(--sub);font-size:var(--f0)}
+#dash .dok{color:var(--ok);font-weight:var(--w-med)}
+#dash .dwarn{color:var(--warn);font-weight:var(--w-med)}
+#dash .dbad{color:var(--bad);font-weight:var(--w-med)}
+/* UNKNOWN is a STATE, not styling noise: always the word, always --warn, so
+   an unread tile can never be skimmed past as a quiet zero. */
+#dash .dunk{color:var(--warn);font-weight:700}
+/* CORRELATED is its own colour and deliberately NOT the ok-green: a
+   receipt's own evidence must never look like a Git verdict. */
+#dash .dcorr{color:var(--sub);font-weight:700}
+/* the pipeline's proportional bar: one strip, four buckets, widths = counts.
+   flex-grow carries the proportion so no math happens at render time. */
+#dash .dbar{display:flex;height:7px;border-radius:2px;overflow:hidden;flex:1 1 160px;min-width:120px;align-self:center;background:color-mix(in srgb,var(--fg) 6%,transparent)}
+#dash .dbar i{display:block;height:100%;min-width:2px}
+#dash .dbar .dmov{background:var(--accent)}
+#dash .dbar .dstl{background:var(--warn)}
+#dash .dbar .dctr{background:var(--bad)}
+#dash .dbar .dhon{background:var(--ok)}
+#dash .dbar .dunm{background:var(--sub)}
+/* recent lands: small multiples — lane · commit · verdict-glyph · age, the
+   same four columns every row, so six rows read as one comparison. */
+#dash .dlands{flex:1 1 100%;display:flex;flex-direction:column}
+#dash .dland{display:flex;gap:8px;align-items:baseline;padding:1px 0;min-width:0}
+#dash .dland .dllane{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#dash .dland code{background:none;color:var(--sub);padding:0;font-size:var(--f0)}
+#dash .dland .dlwit{flex:0 0 auto;font-size:var(--f0)}
+#dash .dland .dlver{flex:0 0 auto;font-size:var(--f0);font-weight:700}
+#dash .dland .dlage{flex:0 0 auto;color:var(--mut);font-size:var(--f0);font-variant-numeric:tabular-nums;min-width:7ch;text-align:right}
+/* a LAND with its earlier rounds folded under it. The summary is deliberately
+   quiet — data-ink goes to the land, not to the disclosure control — and the
+   rounds indent so the eye reads them as evidence FOR the row above rather
+   than as more lands. */
+#dash .dlgroup>details>summary{color:var(--mut);font-size:var(--f0);cursor:pointer;list-style:none;padding-left:2px}
+#dash .dlgroup>details>summary::-webkit-details-marker{display:none}
+#dash .dlgroup>details>summary::before{content:"▸ ";color:var(--mut)}
+#dash .dlgroup>details[open]>summary::before{content:"▾ "}
+#dash .dlgroup>details>.dland{padding-left:12px;opacity:.72}
+/* DISAGREEMENT IS NOT DECORATION. When a land's receipts contradict each other
+   the group opens itself and says so; the border exists so a reader skimming
+   collapsed rows cannot mistake the conflict for a tidy fold. */
+#dash .dlsplit{border-left:2px solid var(--bad,#c33);padding-left:4px}
+#dash .dlsplit>details>summary{color:var(--bad,#c33);font-weight:700}
+/* the fleet's seat dots reuse the roster's .rdot colour classes verbatim —
+   one presence vocabulary across the whole console, learned once. */
+#dash .dseat{white-space:nowrap;color:var(--fg)}
+#dash .dseat .rdot{margin-right:2px}
+/* phone (390px is the design floor): the label rides ABOVE its data — which
+   needs the row to WRAP; without flex-wrap a 100%-basis label just shoves the
+   whole data cell off the right edge (caught on a real 390px render, not by
+   any string test — screenshots are part of this band's definition of done). */
+@media (max-width:680px){#dash .drow{flex-wrap:wrap;row-gap:1px}#dash .dlab{flex-basis:100%;padding-bottom:0}#dash .dhow{display:none}}
+
+/* the home band's jump to the pipeline wall (which lives on the ledger tab
+   now — the collapsed home copy WAS the duplication the owner objected to) */
+#dash .dslink{color:var(--accent);cursor:pointer;white-space:nowrap}
+#dash .dslink:hover{text-decoration:underline}
+/* in-flight is the compact inverse roster: one loop per line, with the exact
+   state-selected actor who can move it next. The row is a native anchor for
+   keyboard focus and URL semantics; JS switches the existing ledger tab. */
+#dash .difrows{flex:1 1 100%;display:flex;flex-direction:column;gap:1px;min-width:0}
+#dash .difrow{display:grid;grid-template-columns:minmax(90px,1fr) auto minmax(130px,auto) auto minmax(0,18ch);gap:8px;align-items:baseline;padding:2px 4px;border-left:2px solid transparent;color:var(--fg);text-decoration:none;min-width:0}
+#dash .difrow:hover{background:color-mix(in srgb,var(--accent) 6%,transparent)}
+#dash .difrow:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+#dash .difrow.alarm{border-left-color:var(--warn)}
+#dash .difrow.honored{border-left-color:var(--ok)}
+#dash .diflane{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:var(--w-med)}
+#dash .difstate,#dash .difball,#dash .difdwell,#dash .difmarks{font-size:var(--f0);white-space:nowrap}
+#dash .difstate,#dash .difdwell{color:var(--sub);font-variant-numeric:tabular-nums}
+#dash .difball{overflow:hidden;text-overflow:ellipsis}
+#dash .difmarks{overflow:hidden;text-overflow:ellipsis;color:var(--mut)}
+#dash .difmark.bad{color:var(--bad);font-weight:700}
+#dash .difmark.warn{color:var(--warn);font-weight:700}
+#dash .difmark+.difmark::before{content:" · ";color:var(--mut)}
+@media (min-width:681px){#dash .dinflightrow .dlab{font-size:9px;letter-spacing:.03em}}
+@media (max-width:680px){#dash .difrow{grid-template-columns:minmax(0,1fr) auto auto}#dash .difball{grid-column:1/3}#dash .difmarks{grid-column:1/4;max-width:none}}
+/* the wall, as the ledger's first tier: the card keeps its own chrome, the
+   tier supplies the spacing */
+#tierpipeline #lrsec{margin:0}
+/* who-signed share meters: one bar per signer, widths COMPARE against the
+   busiest signer in the list — data-ink, no legend (the number is beside it) */
+.lmeter{display:inline-block;width:64px;height:5px;border-radius:2px;background:color-mix(in srgb,var(--fg) 8%,transparent);vertical-align:2px}
+.lmeter i{display:block;height:100%;border-radius:2px;background:var(--accent)}

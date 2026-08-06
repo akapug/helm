@@ -1,0 +1,551 @@
+/* ================= owner decision queue (the WORK tab) =================
+   The store-review idiom generalized (owner mandate): any seat files a
+   decision card (`helm decide file`), the owner answers on the work tab —
+   the owner⇄fleet surface — and the verdict DMs the FILING SEAT through the
+   same one-writer-path law: every POST below routes through the exact
+   ownerasks functions the CLI calls. The home deck holds only the count
+   badge (odqBadge). */
+let ODQ_GEN = 0; // monotonic render generation — a slow older response must never replace a newer render
+async function odqInit() {
+  const gen = ++ODQ_GEN;
+  try {
+    const d = await j("/api/decisions", 8000);
+    if (gen !== ODQ_GEN) return; // stale response — a newer call owns the surface
+    odqRender(d);
+  } catch (e) {
+    if (gen !== ODQ_GEN) return;
+    if (odqTyping()) { $("#odqmeta").textContent = "refresh held — you are typing"; return; }
+    odqComposerState(); // park blurred drafts in the ledger — the error card replaces the body
+    $("#odqlist").innerHTML = '<div class="empty">✗ decision queue unreadable: ' + esc(e.message) + "</div>"; $("#odqmeta").textContent = "UNKNOWN";
+  }
+}
+/* the owner is in a card's composer — NO render may replace the list body
+   under them (the 45s poll once erased an in-progress comment). FOCUS alone
+   holds it: a focused-but-EMPTY box is owner intent too — a redraw would
+   destroy focus before the first keystroke/IME commit lands. The next quiet
+   tick catches the queue up; headline meta/badge stay live. */
+function odqTyping() {
+  const a = document.activeElement, host = $("#odqlist");
+  return !!(a && host && host.contains(a) && a.classList && a.classList.contains("odqcomment"));
+}
+/* typed-but-undelivered text outlives EVERY #odqlist replacement — fetch
+   error, unavailable, empty queue, and renders that omit the card alike:
+   drafts live in a ledger keyed by card id, merged from the live DOM before
+   each replacement (an emptied box retracts its entry) and restored into
+   whichever later render shows the card again. A SENT comment leaves the
+   ledger at send time (odqAct), so a redraw never resurrects delivered text. */
+const ODQ_DRAFTS = {};
+function odqComposerState() {
+  document.querySelectorAll("#odqlist .odqcard").forEach(el => {
+    const c = el.querySelector(".odqcomment");
+    if (!c) return;
+    if (c.value) ODQ_DRAFTS[el.dataset.id] = c.value;
+    else delete ODQ_DRAFTS[el.dataset.id];
+  });
+  return ODQ_DRAFTS;
+}
+/* the card's LIVE comment box, scanned from the current DOM — never a
+   captured element, which a mid-flight poll may have detached. */
+function odqBox(id) {
+  let box = null;
+  document.querySelectorAll("#odqlist .odqcard").forEach(el => {
+    if (el.dataset.id === id) box = el.querySelector(".odqcomment");
+  });
+  return box;
+}
+function odqRender(d) {
+  const host = $("#odqlist"), meta = $("#odqmeta");
+  odqBadge(d);
+  if (odqTyping()) { meta.textContent = "refresh held — you are typing"; return; }
+  const saved = odqComposerState(); // parks drafts in the persistent ledger — held across EVERY branch below
+  if (!d || d.unavailable) { host.innerHTML = '<div class="empty">decision queue unavailable' + (d && d.why ? " — " + esc(d.why) : "") + "</div>"; meta.textContent = "UNKNOWN"; return; }
+  const rows = Array.isArray(d.entries) ? d.entries : [], c = d.counts || {};
+  meta.textContent = rows.length
+    ? `${c.open || 0} waiting on you` + (c.undelivered ? ` · ${c.undelivered} decided, delivery pending` : "") + " — pick an option; the verdict DMs the asker"
+    : "queue clear — nothing waiting on you";
+  if (!rows.length) { host.innerHTML = '<div class="empty">no open decision cards — agents file them with <code>helm decide file</code></div>'; return; }
+  host.innerHTML = rows.map(odqCard).join("");
+  host.querySelectorAll(".odqcard").forEach(el => {
+    const c = el.querySelector(".odqcomment");
+    if (c && saved[el.dataset.id]) c.value = saved[el.dataset.id];
+  });
+  host.querySelectorAll(".odqcard").forEach(el => {
+    const id = el.dataset.id;
+    const cbox = el.querySelector(".odqcomment");
+    el.querySelectorAll(".odqchoice").forEach(b => b.onclick = () => odqAct("/api/decisions/verdict",
+      {id, choice: b.dataset.key, comment: cbox ? cbox.value.trim() : ""}, el, "decided " + b.dataset.key));
+    const cbtn = el.querySelector(".odqsay");
+    if (cbtn) cbtn.onclick = () => {
+      const t = cbox.value.trim();
+      if (!t) { toast("type the comment first"); return; }
+      odqAct("/api/decisions/comment", {id, text: t}, el, "commented on");
+    };
+    const rbtn = el.querySelector(".odqretry");
+    if (rbtn) rbtn.onclick = () => odqAct("/api/decisions/deliver", {id}, el, "delivered");
+  });
+}
+function odqCard(r) {
+  const v = r.verdict || null;
+  const opts = (r.options || []).map(o =>
+    `<div class="odqopt"><button class="chip odqchoice${o.recommended ? " rec" : ""}" data-key="${esc(o.key)}" title="${esc(o.consequence)}">${esc(o.label)}${o.recommended ? " ★" : ""}</button>`
+    + `<span class="odqcons">${esc(o.consequence)}</span></div>`).join("");
+  const undeliv = r.status === "decided"
+    ? `<div class="odqundeliv">verdict recorded (${esc(v && v.label || "?")}) but NOT yet delivered to ${esc(r.asker)} — <button class="chip odqretry">retry delivery</button></div>`
+    : r.dm_lost
+      ? `<div class="odqundeliv">verdict (${esc(v && v.label || "?")}) was delivered, but the DM evidence is GONE from ${esc(r.asker)}'s lane (reboot/rotation) — <button class="chip odqretry">re-send from the ledger</button></div>`
+      : "";
+  return `<div class="odqcard" data-id="${esc(r.id)}">`
+    + `<div class="odqtop"><span class="odqtitle">${esc(r.title)}</span><span class="odqid">${esc(r.id)}</span></div>`
+    + `<div class="odqctx">${esc(r.context)}</div>`
+    + `<div class="odqmeta"><span>asked by ${esc(r.asker)}</span><span>${esc(String(r.ts).slice(0, 16))}</span>`
+    + (r.refs && r.refs.length ? `<span>refs: ${esc(r.refs.join(" "))}</span>` : "")
+    + (r.comments ? `<span>${r.comments} comment${r.comments > 1 ? "s" : ""}</span>` : "") + `</div>`
+    + (r.status === "open" ? `<div class="odqopts">${opts}</div>`
+      + `<div class="odqacts"><input class="odqcomment" placeholder="comment (rides the verdict, or send alone)…" autocomplete="off">`
+      + `<button class="chip odqsay">comment only</button></div>` : "")
+    + undeliv + `</div>`;
+}
+/* the home deck's HEADLINE: a count that links to the work tab, nothing
+   more (owner-surface-headlines) — the full queue renders in #odq above.
+   Unavailable stays VISIBLE as unknown: a hidden badge claims zero. */
+function odqBadge(d) {
+  const b = $("#odqbadge");
+  if (!b) return;
+  if (!d || d.unavailable) { b.hidden = false; b.querySelector("a").textContent = "⚖ decisions UNKNOWN — queue unreadable"; return; }
+  const n = (d.counts || {}).open || 0, u = (d.counts || {}).undelivered || 0;
+  b.hidden = !n && !u;
+  b.querySelector("a").textContent =
+    `⚖ ${n} decision${n === 1 ? "" : "s"} waiting on you` + (u ? ` · ${u} delivery pending` : "") + " — work tab";
+}
+/* the submitted value is captured + CLEARED before the await: the 45s poll
+   can fire mid-flight, replace the card, and a still-parked draft would
+   resurrect delivered text into the fresh composer. A follow-up typed while
+   the POST is in flight is the OWNER'S — completion never touches the box.
+   A FAILED send restores the text — into the live box if still empty, else
+   the draft ledger — a failed send must not eat the comment. */
+async function odqAct(url, body, el, verb) {
+  el.style.opacity = ".5";
+  const id = el.dataset.id, box = el.querySelector(".odqcomment"), sent = box ? box.value : "";
+  if (box) box.value = "";
+  delete ODQ_DRAFTS[id];
+  try {
+    const d = await post(url, body);
+    toast(d.delivery_error ? "✗ " + d.delivery_error : verb + " " + body.id, d.delivery_error ? 5000 : 2600);
+    odqInit(true);
+  } catch (e) {
+    el.style.opacity = "1";
+    const live = odqBox(id);
+    if (sent && live && !live.value) live.value = sent;
+    else if (sent && !live && !(id in ODQ_DRAFTS)) ODQ_DRAFTS[id] = sent;
+    toast("✗ " + e.message, 4000);
+  }
+}
+
+async function cfgInit(force) {
+  if (CFG.loaded && !force) return;
+  $("#cfgtree").innerHTML = '<div class="empty">scanning config tree…</div>';
+  try {
+    const [tree, homes2] = await Promise.all([j("/api/configs/tree"), j("/api/configs/homes")]);
+    CFG.tree = tree; CFG.homes = Array.isArray(homes2) ? homes2 : []; CFG.loaded = true;
+    CFG.home = CFG.home || "(default-claude)";
+    cfgRenderTree();
+    $("#cfgStatus").textContent = `${tree.count} cwds · ${CFG.homes.length} homes`;
+  } catch (e) { $("#cfgtree").innerHTML = '<div class="empty">✗ config scan failed: ' + esc(e.message) + '</div>'; }
+}
+function cfgFileBadges(files) {
+  const seen = {};
+  for (const f of files) seen[f.kind] = (seen[f.kind] || 0) + 1;
+  return Object.keys(seen).map(k => `<span class="cfgbadge ${esc(k)}">${esc(k)}${seen[k] > 1 ? " " + seen[k] : ""}</span>`).join("");
+}
+function cfgMatch(node) {
+  const q = ($("#cfgFilter").value || "").toLowerCase();
+  const chOk = f => CFG.ch === "all" || f.harness === CFG.ch;
+  const selfFiles = node.files.filter(chOk);
+  const selfHit = (!q || node.path.toLowerCase().includes(q)) && selfFiles.length > 0;
+  const kids = node.children.map(cfgMatch).filter(Boolean);
+  if (selfHit || kids.length) return {...node, files: selfFiles, children: kids, _hit: selfHit};
+  return null;
+}
+function cfgTreeNode(node, depth) {
+  const id = node.path;
+  const filtering = !!(($("#cfgFilter").value || "").trim()) || CFG.ch !== "all";
+  const open = filtering || CFG.openDirs.has(id) || depth < 1;
+  const hasKids = node.children.length > 0;
+  const tw = hasKids ? (open ? "▾" : "▸") : "·";
+  const sel = CFG.sel && CFG.sel.type === "cwd" && CFG.sel.path === id ? " sel" : "";
+  let h = `<div class="cfgnode"><div class="cfgrow${sel}" data-cwd="${esc(id)}">`
+    + `<span class="cfgtw" data-tw="${esc(id)}">${tw}</span>`
+    + `<span class="cfgname">${esc(node.name)}</span> ${cfgFileBadges(node.files)}</div>`;
+  if (hasKids && open) h += `<div class="cfgkids">` + node.children.map(c => cfgTreeNode(c, depth + 1)).join("") + `</div>`;
+  return h + `</div>`;
+}
+function cfgRenderTree() {
+  const host = $("#cfgtree");
+  // cwd tree first (the primary axis), homes collapsible below
+  let h = `<div class="cfgsec"><h4>cwd tree · project-scope</h4>`;
+  const roots = (CFG.tree ? CFG.tree.roots : []).map(cfgMatch).filter(Boolean);
+  h += roots.length ? roots.map(r => cfgTreeNode(r, 0)).join("") : '<div class="empty">no configs match</div>';
+  h += `</div>`;
+  const homes2 = (CFG.homes || []).filter(hm => CFG.ch === "all" || hm.provider === CFG.ch);
+  h += `<details class="cfgsec" id="cfgHomesDet"${CFG.homesOpen ? " open" : ""}><summary><b>homes · user-scope</b> <span class="cfgmut">${homes2.length} · top of the cascade</span></summary>`;
+  for (const hm of homes2) {
+    const sel = CFG.sel && CFG.sel.type === "home" && CFG.sel.path === hm.path ? " sel" : "";
+    h += `<div class="cfgrow${sel}" data-home="${esc(hm.path)}"><span class="cfgtw">⌂</span>`
+      + `<span class="cfgname">${esc(hm.home)}</span> <span class="cfgbadge">${esc(hm.provider)}</span> ${cfgFileBadges(hm.files)}</div>`;
+  }
+  h += `</details>`;
+  host.innerHTML = h;
+  const det = $("#cfgHomesDet");
+  if (det) det.addEventListener("toggle", () => { CFG.homesOpen = det.open; });
+  host.querySelectorAll(".cfgtw[data-tw]").forEach(el => el.onclick = ev => {
+    ev.stopPropagation();
+    const p = el.dataset.tw;
+    CFG.openDirs.has(p) ? CFG.openDirs.delete(p) : CFG.openDirs.add(p);
+    cfgRenderTree();
+  });
+  host.querySelectorAll(".cfgrow[data-cwd]").forEach(el => el.onclick = () => cfgSelectCwd(el.dataset.cwd));
+  host.querySelectorAll(".cfgrow[data-home]").forEach(el => el.onclick = () => cfgSelectHome(el.dataset.home));
+}
+function cfgNodeByPath(node, path) {
+  if (node.path === path) return node;
+  for (const c of node.children) { const r = cfgNodeByPath(c, path); if (r) return r; }
+  return null;
+}
+async function cfgSelectCwd(path) {
+  CFG.sel = {type: "cwd", path};
+  cfgRenderTree();
+  const detail = $("#cfgdetail");
+  let node = null;
+  for (const r of (CFG.tree.roots || [])) { node = cfgNodeByPath(r, path); if (node) break; }
+  const homeOpts = (CFG.homes || []).filter(h => h.provider === CFG.harness).map(h => h.home);
+  const defHome = CFG.harness === "codex" ? "(default-codex)" : "(default-claude)";
+  detail.innerHTML = `<div class="cfgedbar">
+    <b>${esc(path)}</b>
+    <span class="cfgpick" style="margin-left:auto">seat:</span>
+    <select class="cfgpick" id="cfgHarness"><option${CFG.harness === "claude" ? " selected" : ""}>claude</option><option${CFG.harness === "codex" ? " selected" : ""}>codex</option></select>
+    <select class="cfgpick" id="cfgHome"><option value="${defHome}">${defHome}</option>${homeOpts.map(h => `<option value="${esc(h)}">${esc(h)}</option>`).join("")}</select>
+  </div>
+  <div class="cfgsec"><h4>files at this cwd</h4>${(node ? node.files : []).map(f => cfgFileRow(f)).join("") || '<div class="cfgmut">none directly here</div>'}</div>
+  <div id="cfgResolved"><div class="empty">resolving what this seat loads…</div></div>`;
+  $("#cfgHarness").onchange = e => { CFG.harness = e.target.value; cfgSelectCwd(path); };
+  $("#cfgHome").onchange = e => { CFG.home = e.target.value; cfgResolve(path); };
+  CFG.home = $("#cfgHome").value;
+  detail.querySelectorAll(".cfgfile").forEach(el => el.onclick = () => cfgEdit(el.dataset.path));
+  cfgResolve(path);
+}
+function cfgFileRow(f) {
+  const ed = f.editable ? '<span class="cfgfile" data-path="' + esc(f.path) + '">✎ edit</span>'
+    : f.entries ? '<span class="cfgmut">' + f.entries.length + ' entries</span>'
+    : '<span class="cfgro" title="' + esc(f.reason) + '">🔒</span>';
+  return `<div class="cfgitem"><span class="cfgbadge ${esc(f.kind)}">${esc(f.kind)}</span> <span>${esc(f.rel)}</span> <span class="src">${esc(f.harness)} · ${esc(f.type)}</span> ${ed}</div>`;
+}
+async function cfgResolve(cwd) {
+  const host = $("#cfgResolved");
+  if (!host) return;
+  try {
+    const r = await j(`/api/configs/resolve?home=${encodeURIComponent(CFG.home)}&cwd=${encodeURIComponent(cwd)}&harness=${CFG.harness}`);
+    if (r.error) { host.innerHTML = '<div class="cfgwarn">' + esc(r.error) + '</div>'; return; }
+    host.innerHTML = cfgRenderResolved(r);
+    host.querySelectorAll(".cfgfile").forEach(el => el.onclick = () => cfgEdit(el.dataset.path));
+  } catch (e) { host.innerHTML = '<div class="cfgwarn">resolve failed: ' + esc(e.message) + '</div>'; }
+}
+function cfgFileLink(p) { return p ? `<span class="cfgfile" data-path="${esc(p)}">${esc(p.replace(/^.*\//, ""))}</span>` : ""; }
+function cfgRenderResolved(r) {
+  let h = "";
+  // the cascade — memory chain root→cwd (the "passes down through cwds" view)
+  const chain = (r.memory && r.memory.projectClaudeMdChain) || (r.agents && r.agents.projectAgentsMdChain) || [];
+  const homeMd = r.memory ? r.memory.homeClaudeMd : (r.agents && r.agents.homeAgentsMd);
+  h += `<div class="cfgsec"><h4>memory cascade (root → cwd)</h4><ul class="cfgcascade">`;
+  if (homeMd) h += `<li>home ${r.harness === "codex" ? "AGENTS.md" : "CLAUDE.md"} <span class="src">home-scope</span></li>`;
+  h += chain.length ? chain.slice().reverse().map(p => `<li>${cfgFileLink(p)}</li>`).join("") : (homeMd ? "" : `<li class="cfgmut">no project memory files in the chain</li>`);
+  h += `</ul></div>`;
+  // MCP servers — winners first, shadowed (overridden) ones grayed below
+  const servers = r.mcpServers || [];
+  const live = servers.filter(m => !m.shadowed), shadowed = servers.filter(m => m.shadowed);
+  h += `<div class="cfgsec"><h4>MCP servers (${live.length}${shadowed.length ? ` · ${shadowed.length} shadowed` : ""})</h4>`;
+  const mcpRow = m => `<div class="cfgitem${m.shadowed ? " cfgshadow" : ""}"><span class="cfgbadge mcp">mcp</span> <b>${esc(m.name)}</b> <span class="cfgmut">${esc(m.transport || "")}${m.detail ? " · " + esc(m.detail) : ""}</span> <span class="src">${esc(m.source)}${m.file ? " · " + cfgFileLink(m.file) : ""}${m.approval ? " · " + esc(m.approval) : ""}${m.shadowed ? ` · ⤺ shadowed by ${esc(m.shadowed_by || "?")}` : ""}</span></div>`;
+  h += live.map(mcpRow).join("") || '<div class="cfgmut">none</div>';
+  h += shadowed.map(mcpRow).join("");
+  h += `</div>`;
+  // hooks
+  h += `<div class="cfgsec"><h4>hooks (${(r.hooks || []).length})</h4>`;
+  h += (r.hooks || []).map(x => `<div class="cfgitem"><span class="cfgbadge hooks">hook</span> <b>${esc(x.event)}</b> <span class="cfgmut">×${x.count}</span> <span class="src">${esc(x.source || "")}</span></div>`).join("") || '<div class="cfgmut">none</div>';
+  h += `</div>`;
+  // skills / commands / agents
+  const cnt = o => o && typeof o.count === "number" ? o.count : 0;
+  h += `<div class="cfgsec"><h4>skills / commands / agents</h4><div class="cfgitem">skills <b>${cnt(r.skills)}</b> · commands <b>${cnt(r.commands)}</b> · agents <b>${cnt(r.agents)}</b> · plugins <b>${(r.plugins && r.plugins.enabled && r.plugins.enabled.length) || 0}</b></div></div>`;
+  // settings highlights
+  const s = r.settingsHighlights || {};
+  h += `<div class="cfgsec"><h4>settings</h4><div class="cfgitem cfgmut">model: ${esc(s.model || "—")}${s.modelReasoningEffort ? " · effort " + esc(s.modelReasoningEffort) : ""}${s.approvalPolicy ? " · approval " + esc(s.approvalPolicy) : ""}${s.sandboxMode ? " · sandbox " + esc(s.sandboxMode) : ""}</div></div>`;
+  // warnings
+  if ((r.warnings || []).length) h += `<div class="cfgsec"><h4>warnings</h4>` + r.warnings.map(w => `<div class="cfgwarn">⚠ ${esc(w)}</div>`).join("") + `</div>`;
+  return h;
+}
+async function cfgSelectHome(path) {
+  CFG.sel = {type: "home", path};
+  cfgRenderTree();
+  const hm = (CFG.homes || []).find(h => h.path === path);
+  if (!hm) return;
+  const others = (CFG.homes || []).filter(h => h.provider === hm.provider && h.path !== path);
+  $("#cfgdetail").innerHTML = `<div class="cfgedbar"><b>⌂ ${esc(hm.home)}</b> <span class="cfgmut">${esc(hm.provider)} home · user-scope configs</span></div>`
+    + `<div class="cfgsec"><h4>files</h4>${hm.files.map(cfgFileRow).join("")}</div>`
+    + `<div class="cfgmut">these sit at the TOP of the cascade — every cwd under this home inherits them unless a deeper layer overrides.</div>`
+    + (others.length ? `<div class="cfgsec" style="margin-top:16px"><h4>physics diff · cred axis</h4>
+      <div class="cfgedbar"><span class="cfgmut">what a seat here loads vs</span>
+      <select class="cfgpick" id="cfgDiffB">${others.map(o => `<option value="${esc(o.path)}">${esc(o.home)}</option>`).join("")}</select>
+      <button class="chip" id="cfgDiffGo">diff</button></div>
+      <div id="cfgDiffOut"></div></div>` : "");
+  $("#cfgdetail").querySelectorAll(".cfgfile").forEach(el => el.onclick = () => cfgEdit(el.dataset.path));
+  if ($("#cfgDiffGo")) $("#cfgDiffGo").onclick = () => cfgPhysDiff(hm, $("#cfgDiffB").value);
+}
+async function cfgPhysDiff(hm, bPath) {
+  const out = $("#cfgDiffOut");
+  out.innerHTML = '<div class="empty">diffing physics…</div>';
+  let d;
+  try { d = await j(`/api/physics-diff?a=${encodeURIComponent(hm.path)}&b=${encodeURIComponent(bPath)}&harness=${encodeURIComponent(hm.provider)}`); }
+  catch (e) { out.innerHTML = '<div class="cfgwarn">✗ ' + esc(e.message) + '</div>'; return; }
+  if (d.error) { out.innerHTML = '<div class="cfgwarn">✗ ' + esc(d.error) + '</div>'; return; }
+  if (d.identical) { out.innerHTML = '<div class="cfgitem cfgmut">identical physics — a seat loads the same on either home</div>'; return; }
+  const fmt = v => typeof v === "string" ? v : JSON.stringify(v);
+  out.innerHTML =
+    Object.entries(d.added_in_b || {}).map(([k, v]) => `<div class="cfgdiff add">+ ${esc(k)} = ${esc(fmt(v))}</div>`).join("")
+    + Object.entries(d.removed_in_b || {}).map(([k, v]) => `<div class="cfgdiff del">− ${esc(k)} = ${esc(fmt(v))}</div>`).join("")
+    + Object.entries(d.changed || {}).map(([k, v]) => `<div class="cfgdiff chg">± ${esc(k)}: ${esc(fmt(v.a))} → ${esc(fmt(v.b))}</div>`).join("");
+}
+async function cfgEdit(path) {
+  let r;
+  try { r = await j(`/api/configs/file?path=${encodeURIComponent(path)}`); }
+  catch (e) { toast("✗ " + e.message); return; }
+  const host = $("#cfgdetail");
+  const ro = !r.editable;
+  const isMcp = /\.mcp\.json$|\.claude\.json$/.test(path);
+  host.innerHTML = `<div class="cfgedbar"><button class="chip" id="cfgBack">← back</button>
+    <span class="cfgpath">${esc(r.path)}</span> <span class="cfgbadge">${esc(r.type)}</span>
+    ${ro ? '<span class="cfgro">🔒 ' + esc(r.reason || r.error || "") + '</span>' : ''}</div>
+    <div class="cfged"><textarea id="cfgTA" ${ro ? "readonly" : ""} spellcheck="false">${esc(r.content || "")}</textarea>
+      <div class="cfgedbar">
+        ${ro ? "" : '<button class="chip" id="cfgSave">save (backup + validate)</button>'}
+        ${isMcp && !ro ? '<button class="chip" id="cfgAddMcp">+ MCP server</button>' : ''}
+        <span id="cfgSaveMsg" class="cfgmut"></span>
+      </div></div>
+    <div id="cfgBackups"></div>`;
+  $("#cfgBack").onclick = () => { CFG.sel && CFG.sel.type === "home" ? cfgSelectHome(CFG.sel.path) : cfgSelectCwd((CFG.sel && CFG.sel.path) || path.replace(/\/[^/]*$/, "")); };
+  if (!ro) {
+    $("#cfgSave").onclick = async () => {
+      const res = await cfgPost("/api/configs/file", {path: r.path, content: $("#cfgTA").value, revision: r.revision});
+      const m = $("#cfgSaveMsg");
+      if (res.error) { m.innerHTML = '<span class="cfgro">' + esc(res.error) + '</span>'; }
+      else { r.revision = res.revision; m.textContent = `✓ ${res.note}${res.backup ? " · backup: " + res.backup : ""}`; toast("saved " + r.path); cfgLoadBackups(r.path); }
+    };
+    if (isMcp) $("#cfgAddMcp").onclick = () => cfgAddMcp(r.path);
+  }
+  cfgLoadBackups(r.path);
+}
+async function cfgAddMcp(path) {
+  const name = prompt("MCP server name?");
+  if (!name) return;
+  const cmd = prompt("command (stdio) — leave blank for a URL server:", "");
+  let value;
+  if (cmd) { const args = prompt("args (space-separated, optional):", ""); value = {command: cmd, ...(args ? {args: args.split(/\s+/).filter(Boolean)} : {})}; }
+  else { const url = prompt("server url:"); if (!url) return; value = {url}; }
+  const res = await cfgPost("/api/configs/entry", {action: "add", path, kind: "mcp", name, value});
+  if (res.error) toast("✗ " + res.error);
+  else { toast("added MCP " + name); cfgEdit(path); }
+}
+async function cfgLoadBackups(path) {
+  const host = $("#cfgBackups");
+  if (!host) return;
+  let all;
+  try { all = await j("/api/configs/backups"); } catch (e) { return; }
+  const mine = (Array.isArray(all) ? all : []).filter(b => b.orig === path).slice(0, 6);
+  if (!mine.length) { host.innerHTML = ""; return; }
+  host.innerHTML = `<div class="cfgsec"><h4>backups · undo</h4>` + mine.map(b =>
+    `<div class="cfgitem"><span class="cfgmut">${esc(b.at)}</span> <span class="src">${b.size}B</span> <button class="chip" data-bk="${esc(b.backup)}">restore</button></div>`).join("") + `</div>`;
+  host.querySelectorAll("button[data-bk]").forEach(el => el.onclick = async () => {
+    if (!confirm("restore this backup over the current file?")) return;
+    const res = await cfgPost("/api/configs/restore", {backup: el.dataset.bk});
+    if (res.error) toast("✗ " + res.error);
+    else { toast("restored"); cfgEdit(path); }
+  });
+}
+$("#cfgFilter").addEventListener("input", () => { if (CFG.loaded) cfgRenderTree(); });
+$$("#cfgbar .chip[data-ch]").forEach(ch => ch.onclick = () => {
+  CFG.ch = ch.dataset.ch;
+  $$("#cfgbar .chip[data-ch]").forEach(x => x.classList.toggle("on", x === ch));
+  if (CFG.loaded) cfgRenderTree();
+});
+$("#cfgReload").onclick = () => cfgInit(true);
+$("#storerevReload").onclick = () => srevInit(true);
+
+
+/* ================= task backlog (#218 — the socket's second section) ====
+   Same contract as the decision queue above, task-scoped: render
+   generations, typing-hold, and the draft ledger all mirror the odq
+   idioms because the owner reported the same composer wipe ON THIS TAB —
+   the protections are load-bearing, not style. NEVER touches the decisions badge or
+   the home deck: tasks are team work, decisions are owner gates, and the
+   badge counting both is the recorded 19-row collapse. */
+let TQ_GEN = 0;
+async function tqInit() {
+  const gen = ++TQ_GEN;
+  try {
+    const d = await j("/api/tasks", 8000);
+    if (gen !== TQ_GEN) return;
+    tqRender(d);
+  } catch (e) {
+    if (gen !== TQ_GEN) return;
+    if (tqTyping()) { $("#otqmeta").textContent = "refresh held — you are typing"; return; }
+    tqComposerState();
+    $("#otqlist").innerHTML = '<div class="empty">✗ task backlog unreadable: ' + esc(e.message) + "</div>"; $("#otqmeta").textContent = "UNKNOWN";
+  }
+}
+async function tqNotes(det) {
+  const body = det.querySelector(".otqnotebody");
+  if (!body || det.dataset.filled) return;
+  det.dataset.filled = "1";           // one fetch per open card, not per toggle
+  try {
+    const d = await j("/api/task/notes?id=" + encodeURIComponent(det.dataset.id), 8000);
+    /* CANNOT SEE IS NOT "NO NOTES" — the same state triad the backlog uses.
+       Drawing an unreadable ledger as an empty comment list would tell the
+       owner nobody wrote anything at the moment we lost the ability to say. */
+    if (!d || d.unavailable) {
+      body.innerHTML = '<div class="empty">✗ CANNOT SEE these comments'
+        + (d && d.why ? " — " + esc(d.why) : "") + "</div>";
+      det.dataset.filled = "";        // a failure may be retried
+      return;
+    }
+    if (d.error) { body.innerHTML = '<div class="empty">' + esc(d.error) + "</div>"; return; }
+    const rows = Array.isArray(d.comments) ? d.comments : [];
+    body.innerHTML = rows.length
+      ? rows.map(c => '<div class="otqnote"><span class="otqnoteby">'
+          + esc(c.by || "unattributed") + '</span> <span class="odqid">'
+          + esc(tqWhen(c.ts)) + '</span><div class="otqnotetext">'
+          + esc(c.text || "") + "</div></div>").join("")
+      : '<div class="empty">no comments</div>';
+  } catch (e) {
+    body.innerHTML = '<div class="empty">✗ ' + esc(e.message) + "</div>";
+    det.dataset.filled = "";
+  }
+}
+$("#otqlist").addEventListener("toggle", ev => {
+  const det = ev.target;
+  if (det && det.classList && det.classList.contains("otqnotes") && det.open)
+    tqNotes(det);
+}, true);   /* capture: `toggle` does not bubble */
+
+function tqNotesOpen() {
+  /* A REFRESH MUST NOT YANK THE PAGE OUT FROM UNDER A READER, which is the
+     rule tqTyping already encodes for a composer — this is the same rule for
+     the other thing a person does here for more than a moment.
+     REPRODUCED live AT THE EXACT TIP: a card open with 8,148 chars and
+     scrolled near the bottom, tqInit fires on its 45s timer, and the list is
+     replaced wholesale via innerHTML — the disclosure closes, the fetched
+     body is discarded, the placeholder returns and the card lands 1,671px
+     ABOVE the viewport. Reading a long ruling is exactly the use case this
+     feature exists for, so a 45-second guillotine made it worse than the
+     counter it replaced. */
+  return !!document.querySelector("#otqlist .otqnotes[open]");
+}
+function tqTyping() {
+  const a = document.activeElement, host = $("#otqlist");
+  return !!(a && host && host.contains(a) && a.classList && a.classList.contains("otqcomment"));
+}
+const TQ_DRAFTS = {};
+function tqComposerState() {
+  document.querySelectorAll("#otqlist .otqcard").forEach(el => {
+    const c = el.querySelector(".otqcomment");
+    if (!c) return;
+    if (c.value) TQ_DRAFTS[el.dataset.id] = c.value;
+    else delete TQ_DRAFTS[el.dataset.id];
+  });
+  return TQ_DRAFTS;
+}
+function tqRender(d) {
+  const host = $("#otqlist"), meta = $("#otqmeta");
+  if (tqTyping()) { meta.textContent = "refresh held — you are typing"; return; }
+  if (tqNotesOpen()) { meta.textContent = "refresh held — a comment is open"; return; }
+  const saved = tqComposerState();
+  /* THE STATE TRIAD: unavailable is NOT empty. An unreadable ledger drawn
+     as a clear backlog tells the owner the fleet is idle at the exact
+     moment it lost the ability to answer. */
+  if (!d || d.unavailable) { host.innerHTML = '<div class="empty">✗ CANNOT SEE the task backlog' + (d && d.why ? " — " + esc(d.why) : "") + "</div>"; meta.textContent = "UNKNOWN"; return; }
+  const rows = Array.isArray(d.entries) ? d.entries : [], c = d.counts || {};
+  const live = rows.filter(r => r.status !== "closed");
+  const closed = rows.filter(r => r.status === "closed");
+  /* "you asked" counts only LIVE rows, and only the strictly-equal "owner"
+     stamp: an UNKNOWN legacy row (origin null) is not evidence the owner did
+     NOT ask, so it is never drawn as either answer. Absent means absent. */
+  const asked = live.filter(r => r.origin === "owner").length;
+  meta.textContent = (c.open || 0) + " open" + (c.in_progress ? ` · ${c.in_progress} in progress` : "") + (c.closed ? ` · ${c.closed} closed` : "") + (asked ? ` · ${asked} you asked for` : "");
+  if (!rows.length) { host.innerHTML = '<div class="empty">no tasks — the backlog is genuinely clear</div>'; return; }
+  host.innerHTML = live.map(tqCard).join("")
+    + (closed.length
+      ? `<details class="otqclosed"><summary>${closed.length} closed — cited ids resolve here</summary>`
+        + closed.map(r => `<div class="otqtomb"><span class="odqid">${esc(r.id)}</span> ${esc(r.title)}`
+          + (r.closed_reason ? ` <span class="cfgmut">— ${esc(r.closed_reason)}</span>` : "") + `</div>`).join("")
+        + `</details>`
+      : "");
+  host.querySelectorAll(".otqcard").forEach(el => {
+    const box = el.querySelector(".otqcomment");
+    if (box && saved[el.dataset.id]) box.value = saved[el.dataset.id];
+    const cbtn = el.querySelector(".otqsay");
+    if (cbtn) cbtn.onclick = () => {
+      const t = box.value.trim();
+      if (!t) { toast("type the comment first"); return; }
+      tqAct({id: el.dataset.id, text: t}, el);
+    };
+  });
+}
+function tqWhen(ts) {
+  /* the store stamps epoch floats; the owner reads dates. A non-numeric ts
+     (older ISO rows) passes through untouched. */
+  const n = Number(ts);
+  return Number.isFinite(n) && n > 1e9
+    ? new Date(n * 1000).toISOString().slice(0, 16).replace("T", " ")
+    : String(ts).slice(0, 16);
+}
+function tqCard(r) {
+  return `<div class="odqcard otqcard" data-id="${esc(r.id)}">`
+    + `<div class="odqtop">`
+    + (r.origin === "owner" ? `<span class="otqasked" title="you asked for this — filed with owner provenance, not an agent's guess">★ you asked</span> ` : "")
+    + `<span class="odqtitle">${esc(r.title)}</span><span class="odqid">${esc(r.id)}</span></div>`
+    + `<div class="odqmeta">`
+    + `<span>${esc(r.status)}</span>`
+    + (r.owner ? `<span>owner: ${esc(r.owner)}</span>` : "")
+    + `<span>${esc(tqWhen(r.ts))}</span>`
+    + (r.refs && r.refs.length ? `<span>refs: ${esc(r.refs.join(" "))}</span>` : "")
+    + `</div>`
+    + (r.note ? `<div class="odqctx">${esc(r.note)}</div>` : "")
+    /* THE COUNT USED TO BE THE WHOLE THING. `/api/tasks` sends len(comments)
+       and this rendered "3 comments" — so a ruling an agent filed onto a row,
+       which is where owner decisions are supposed to live BECAUSE chat lines
+       scroll away, reached this console as a NUMBER. Lazily fetched on open:
+       comments are unbounded prose and this list carries every row. */
+    + (r.comments ? `<details class="otqnotes" data-id="${esc(r.id)}">`
+        + `<summary>${r.comments} comment${r.comments > 1 ? "s" : ""}</summary>`
+        + `<div class="otqnotebody">…</div></details>` : "")
+    + `<div class="odqacts"><input class="otqcomment" placeholder="note for the fleet (annotates the task)…" autocomplete="off">`
+    + `<button class="chip otqsay">comment</button></div>`
+    + `</div>`;
+}
+/* capture + clear BEFORE the await; a failed send restores rather than
+   eats (the same delivered-text-never-resurrects contract as odqAct). */
+async function tqAct(body, el) {
+  el.style.opacity = ".5";
+  const id = el.dataset.id, box = el.querySelector(".otqcomment"), sent = box ? box.value : "";
+  if (box) box.value = "";
+  delete TQ_DRAFTS[id];
+  try {
+    const r = await j("/api/tasks/comment", 8000, {method: "POST", body: JSON.stringify(body)});
+    if (r && r.error) throw new Error(r.error);
+    toast("commented on " + id);
+    tqInit();
+  } catch (e) {
+    const live = el.isConnected && el.querySelector(".otqcomment");
+    if (live && !live.value) live.value = sent; else if (sent) TQ_DRAFTS[id] = sent;
+    toast("✗ " + e.message);
+    el.style.opacity = "";
+  }
+}
+$("#otqReload").onclick = () => tqInit();
+setInterval(tqInit, 45000);

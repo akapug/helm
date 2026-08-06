@@ -19,13 +19,19 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import chat, web  # noqa: E402
+from helm import chat, seats, web  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
             "HELM_CHAT_ROOM", "MELD_CHAT_ROOM", "HELM_CHAT_ROOM_SOURCE",
             "MELD_CHAT_ROOM_SOURCE", "HELM_CELL_BIN", "MELD_CELL_BIN",
-            "HELM_CELL_PROFILE", "MELD_AGENT_PROFILE")
+            "HELM_CELL_PROFILE", "MELD_AGENT_PROFILE",
+            # the AMBIENT IDENTITY must not leak in from whoever runs the
+            # suite: honest presence refuses a cross-seat join, so a test that
+            # joins as 'codex' PASSED for a codex-named runner and FAILED for
+            # everyone else. A test whose result depends on who ran it is not
+            # a test.
+            "HELM_CHAT_NAME", "MELD_CHAT_NAME")
 
 
 class TestWebChat(unittest.TestCase):
@@ -33,6 +39,8 @@ class TestWebChat(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="helm-test-webchat-")
         cls.env_prior = {k: os.environ.get(k) for k in ENV_KEYS}
+        cls.owner_prior = seats._OWNER_NAME
+        seats._OWNER_NAME = "alice"
         for k in ENV_KEYS:
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = os.path.join(cls.tmp, "helm")
@@ -59,6 +67,7 @@ class TestWebChat(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        seats._OWNER_NAME = cls.owner_prior
         shutil.rmtree(failure_dir, ignore_errors=True)
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
@@ -187,7 +196,7 @@ class TestWebChat(unittest.TestCase):
         for the summed badge — the fix for the single-room-invisible hole."""
         from helm import chat
         self.req("/api/chat", {"text": "hello main"})            # owner in main
-        chat.post("@owner urgent", room="team-fe", who="codex")  # agent elsewhere
+        chat.post("@alice urgent", room="team-fe", who="codex")  # agent elsewhere
         status, d = self.req("/api/chat")                        # viewing main
         self.assertEqual(status, 200)
         rooms = {r["room"]: r for r in d["rooms"]}
@@ -202,10 +211,10 @@ class TestWebChat(unittest.TestCase):
         target = d["lines"][0]
         status, d = self.req("/api/chat/react",
                              {"emoji": ":tada:", "tts": target["ts"],
-                              "tfrom": target["from"], "name": "owner"})
+                              "tfrom": target["from"], "name": "alice"})
         self.assertEqual(status, 200)
         self.assertEqual(d["msg"]["react"], "🎉")
-        self.assertEqual(d["msg"]["tfrom"], "owner")
+        self.assertEqual(d["msg"]["tfrom"], "alice")
         status, d = self.req("/api/chat?since=0")
         self.assertEqual(d["total"], 2)  # reaction rows ride the same poll
         self.assertEqual(d["lines"][1]["react"], "🎉")
@@ -228,7 +237,7 @@ class TestWebChat(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(d["ok"])
         self.assertEqual(d["total"], 1)
-        self.assertEqual(d["msg"]["from"], "owner")          # the default name
+        self.assertEqual(d["msg"]["from"], "alice")          # the default name
         self.assertEqual(d["msg"]["text"], "morning, fleet")  # trimmed
         with open(chat.marker_path("main")) as f:
             self.assertEqual(f.read(), "1")  # marker carries the post-time count
@@ -270,7 +279,7 @@ class TestWebChat(unittest.TestCase):
         from helm import seats
         seats.join(session="s-web-dm", seat="codex", cwd="/tmp/p")
         status, d = self.req("/api/chat/dm", {"to": "codex", "text": " go ",
-                                              "name": "owner"})
+                                              "name": "alice"})
         self.assertEqual(status, 200)
         self.assertTrue(d["ok"])
         self.assertEqual(d["msg"]["dm"], "codex")
@@ -299,7 +308,7 @@ class TestWebChat(unittest.TestCase):
         self.assertTrue(os.path.exists(chat.marker_path("main")))
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(chat.cmd_chat(["read"]), 0)
-        self.assertIn("owner: anyone up?", out.getvalue())
+        self.assertIn("alice: anyone up?", out.getvalue())
         self.assertFalse(os.path.exists(chat.marker_path("main")))
 
     # ── threading + the sidebar's activity signal (the owner surface) ──
@@ -376,11 +385,11 @@ class TestWebChat(unittest.TestCase):
 
     def test_poll_carries_the_live_roster_for_mention_completion(self):
         from helm import seats
-        seats.write_roster("example-app-codex", session="s-1")
-        seats.write_roster("helm-integrator", session="s-2")
+        seats.write_roster("example-app-platform-codex", session="s-1")
+        seats.write_roster("helm-opus-integrator", session="s-2")
         d = self.req("/api/chat")[1]
         self.assertEqual(d["roster"],
-                         ["example-app-codex", "helm-integrator"])
+                         ["example-app-platform-codex", "helm-opus-integrator"])
 
     def test_sidebar_rooms_carry_unread_mentions_age_and_seat_presence(self):
         """The badge computation the owner UX rides: a quiet room and a busy
@@ -395,7 +404,7 @@ class TestWebChat(unittest.TestCase):
         seats.write_roster("noisy-seat", session="s-noisy")
         chat.post("quiet corner", room="team-quiet", who="noisy-seat")
         for i in range(8):
-            chat.post("@owner row %d" % i, room="team-busy", who="noisy-seat")
+            chat.post("@alice row %d" % i, room="team-busy", who="noisy-seat")
         rooms = {r["room"]: r for r in self.req("/api/chat")[1]["rooms"]}
         self.assertEqual(rooms["team-quiet"]["owner_unread"], 1)
         self.assertEqual(rooms["team-busy"]["owner_unread"], 8)
@@ -492,7 +501,7 @@ class TestWebChat(unittest.TestCase):
         """The badge is computed from the FULL rows, never the window — 40
         unread land, the window shows 10, owner_unread is still 40."""
         for i in range(40):
-            chat.post("@owner row %d" % i, room="main", who="agent-a")
+            chat.post("@alice row %d" % i, room="main", who="agent-a")
         d = self.req("/api/chat?room=main&since=0&win=10")[1]
         self.assertEqual(len(d["lines"]), 10)                 # windowed body
         self.assertEqual(d["owner_unread"], 40)               # full-rows signal

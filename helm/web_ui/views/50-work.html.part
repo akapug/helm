@@ -1,0 +1,33 @@
+<div class="view" id="view-work">
+  <div id="worksections">
+    <!-- OWNER DECISION QUEUE: the durable "waiting on YOU" surface (the
+         store review queue generalized — owner mandate: "so that I can
+         just go review a durable queue"). Any seat files a card
+         (`helm decide file`); you answer HERE at your leisure; the verdict
+         DMs the filing seat via its beacon. Empty is a real state and
+         says so. -->
+    <section id="odq">
+      <div id="odqhead"><b>owner decisions</b>
+        <span class="cfgmut" id="odqmeta">not read yet</span>
+        <button class="chip" id="odqReload" style="margin-left:auto">↻ reload</button>
+      </div>
+      <div id="odqlist"><div class="empty">not read yet</div></div>
+    </section>
+    <!-- TASK BACKLOG: the section this container was BUILT for
+         (docs/VERBS.md task-backlog intent; the sibling-joins assertion in
+         test_web_decisions). Team tasks the fleet files — read, annotate,
+         never decide-gated: the home badge counts decisions ONLY, so the
+         3 cards that need the owner stay findable above the 79 that do
+         not. Closed rows render as dim one-liners under a fold: a cited
+         task/NNN resolving to a sentence is the point (55% of citations
+         point at closed ids); resolving to nothing is the bug. -->
+    <section id="otq">
+      <div id="otqhead"><b>task backlog</b>
+        <span class="cfgmut" id="otqmeta">not read yet</span>
+        <button class="chip" id="otqReload" style="margin-left:auto">↻ reload</button>
+      </div>
+      <div id="otqlist"><div class="empty">not read yet</div></div>
+    </section>
+  </div>
+</div>
+

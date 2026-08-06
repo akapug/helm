@@ -1,0 +1,89 @@
+<div class="view on" id="view-helm">
+  <header>
+    <div class="brandrow">
+      <span class="mark">⎈</span><h1>helm</h1>
+      <div class="stats" id="stats"></div>
+    </div>
+    <p id="hello">your projects, remembered</p>
+  </header>
+
+  <div id="banner">helm isn’t answering — start it with <code>helm web</code>; retrying quietly…</div>
+
+  <!-- SEPARATE from #banner on purpose: that one is a connectivity ERROR and
+       this one is an advisory about the server's own age. One element would
+       let either clobber the other, and the case that matters most is both
+       being true at once. -->
+  <div id="stalebanner"></div>
+
+  <!-- SYSTEM DASHBOARD first on the page: the whole system in one glance —
+       record, fleet, pipeline, in-flight, recent lands, owner debt — each row the same
+       shape so components COMPARE instead of stacking. It replaced a ~90-row
+       pipeline wall of equal visual weight as the first paint (owner ask:
+       "the homepage should be much more of an above-the-fold
+       dashboard of the system and its components"; an independent review
+       found the same hole: "NO HEALTH AT A GLANCE"). The wall itself
+       lives on the LEDGER tab as its first tier (owner: a
+       collapsed copy here was still "duplication of UI" — "the ledger
+       represents it all"); the pipeline row below links straight to it.
+
+       The skeleton is STATIC and each cell is owned by exactly one poll
+       (record: pollDregg 8s + pollLr 45s · fleet: pollChat 2s · pipeline /
+       lands / owner: pollLr 45s) — no new polling, and a renderer rewriting
+       the whole band would clobber the other polls' cells between beats.
+       Every cell BOOTS saying "not read yet": a dashboard that cannot tell
+       ZERO from UNREAD is the exact defect this console exists to kill. -->
+  <section id="dash">
+    <div class="dhead"><span class="dlabel">system</span>
+      <span class="dhow">the record's own numbers — <code>helm lr list</code> · <code>helm chat roster</code> · <code>helm premise-check &lt;id&gt;</code></span></div>
+    <div class="drow"><span class="dlab" title="the shared signed record: the dregg signing pulse (live, 8s) beside the local attest-chain's verification (with the pipeline read, 45s)">record</span>
+      <div class="dval">
+        <span id="dreggstrip" title="the signing pulse: is activity landing on the shared signed record, and what landed last — click for the full ledger">⛓ signing — not read yet</span>
+        <span id="dchain" class="dmut">chain not read yet</span>
+      </div></div>
+    <div class="drow"><span class="dlab" title="who is on right now — same vocabulary as chat + roster: green active <2m · orange unverified · yellow quiet <15m · gone">fleet</span>
+      <div class="dval" id="dfleet"><span class="dmut">not read yet</span></div></div>
+    <div class="drow"><span class="dlab" title="every open land loop, partitioned once per row: contrary > honored (verdict HONORED through succession) > stalled > unmeasurable > moving — one bar, widths are the counts">pipeline</span>
+      <div class="dval" id="dpipe"><span class="dmut">not read yet</span></div></div>
+    <div class="drow dinflightrow"><span class="dlab" title="one line per open land loop: lane · exact state · who holds the ball now · dwell; moving rows first, every line opens the ledger">in-flight</span>
+      <div class="dval" id="dinflight"><span class="dmut">not read yet</span></div></div>
+    <div class="drow"><span class="dlab" title="recorded landings re-derived against trunk NOW — the one claim on this page the owner can verify end-to-end; ✓/✗ are git's answer, UNKNOWN means git could not answer">landed</span>
+      <div class="dval" id="dlands"><span class="dmut">not read yet</span></div></div>
+    <div class="drow"><span class="dlab" title="what the land record says is waiting on YOU — held approvals only; owner asks have no web endpoint yet, so they are honestly absent here rather than faked">owner</span>
+      <div class="dval" id="downer"><span class="dmut">not read yet</span></div></div>
+  </section>
+
+  <!-- READINESS: `helm ready`'s five signals — may forward work resume after
+       a crash/reboot? ALWAYS visible: a readiness gauge that hides
+       when unread is a gauge nobody checks after the reboot it exists for.
+       It boots saying "not read yet" (the dash law: zero and unread are
+       different facts). Advisory — it renders, it never gates. -->
+  <section id="readysec"></section>
+
+  <!-- The decision queue ITSELF lives on the WORK tab — the owner⇄fleet
+       surface (owner ruling, live at the console); the home deck
+       carries only this headline count (owner-surface-headlines canon).
+       Hidden at zero — an empty badge is noise, and the work tab states
+       emptiness properly. -->
+  <div id="odqbadge" hidden><a class="chip" href="#work">decisions not read yet</a></div>
+
+  <!-- FLEET NOTES: this is the "what happened overnight" answer the fleet
+       leaves for you (`helm note set <key> <text>`). It used to live on a nav
+       tab called "cave", over a tmpfs relay, so a reboot ate it. Durable now,
+       and on the tab you already open. -->
+  <section id="notesec"></section>
+  <section id="store"></section>
+  <section id="sessions"></section>
+  <section id="skillsec"></section>
+
+  <div id="controls">
+    <input id="q" type="search" placeholder="filter projects…  ( / )" autocomplete="off">
+    <button class="tog" id="togRetired">retired</button>
+    <span id="count"></span>
+  </div>
+
+  <main id="grid"></main>
+  <div id="empty"><div class="glyph">⎈</div>no projects yet — run <code>helm sync</code>, then refresh.</div>
+
+  <footer id="foot"></footer>
+</div>
+

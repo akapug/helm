@@ -9,9 +9,9 @@ sent ids.slice(0,100) yet marked ALL pending ids absent, orphaning the 101st
 parent; (3 lives in test_web_chat.py — the server cache TOCTOU/growth).
 
 These tests run the ACTUAL pollChat / chatHydrateParents / chatLoadOlder /
-chatResetLog source lifted verbatim from helm/web_ui.html under a faithful fake
-server + minimal DOM (tests/chat_runtime_harness.js), so they exercise the real
-statement ORDER — a reorder back to the buggy sequence fails them. Requires node;
+chatResetLog source lifted verbatim from the assembled web UI under a faithful
+fake server + minimal DOM (tests/chat_runtime_harness.js), so they exercise the
+real statement ORDER — a reorder back to the buggy sequence fails them. Requires node;
 skipped (not failed) where node is unavailable, like any optional toolchain."""
 import json
 import os
@@ -21,9 +21,9 @@ import subprocess
 import tempfile
 import unittest
 
+from helm import web_ui_loader
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-UI = os.path.join(ROOT, "helm", "web_ui.html")
 HARNESS = os.path.join(HERE, "chat_runtime_harness.js")
 
 # the real functions the harness drives — lifted verbatim so a regression in
@@ -40,7 +40,7 @@ def _extract_fn(src, name):
     read as a string delimiter, and a `{` inside a string/comment must not count)."""
     m = re.search(r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(", src)
     if not m:
-        raise AssertionError("function not found in web_ui.html: " + name)
+        raise AssertionError("function not found in assembled web UI: " + name)
     i = src.index("{", m.end())
     depth, j, n = 0, i, len(src)
     quote, esc = None, False
@@ -77,8 +77,7 @@ class TestChatClientRuntime(unittest.TestCase):
         cls.node = shutil.which("node")
         if not cls.node:
             raise unittest.SkipTest("node not available")
-        with open(UI, encoding="utf-8") as f:
-            src = f.read()
+        src = web_ui_loader.read_text()
         fns = "\n\n".join(_extract_fn(src, name) for name in EXTRACT)
         with open(HARNESS, encoding="utf-8") as f:
             template = f.read()

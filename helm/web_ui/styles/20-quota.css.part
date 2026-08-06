@@ -1,0 +1,113 @@
+/* ================= quota view (CSS ported from the predecessor, on helm's variables) ================= */
+/* ---------- attention row ----------
+   Uniform pills: same height, same weight, one border. Colour is a single
+   signal dot on the left, not a full-pill wash — so the row reads as one
+   scale of items differing only by their signal (Tufte: colour as data).
+   Long detail is truncated with the full text on hover-title. */
+#attn{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0 0;min-height:1.6em}
+.attn{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 12px;border-radius:var(--r-pill);border:1px solid var(--line);background:var(--card);font-size:var(--f1);color:var(--mut);max-width:34ch;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;cursor:pointer}
+.attn b{color:var(--fg);font-weight:var(--w-med)}
+.attn::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--sub);flex:none}
+.attn.ok::before{background:var(--ok)}
+.attn.warn::before{background:var(--warn)}
+.attn.bad::before{background:var(--bad)}
+.attn.next{border-style:dashed}.attn.next::before{background:var(--accent)}
+/* tap-to-reveal detail — the hover title is desktop-only; this works on touch */
+#attndetail{display:none;margin:8px 0 0;padding:8px 12px;background:var(--card);border:1px solid var(--line);border-radius:var(--r);font-size:var(--f1);color:var(--mut)}
+#attndetail.show{display:block}
+
+/* ---------- chart card ---------- */
+#chartcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px 6px;position:relative}
+/* a quiet caption UNDER the chart, not floating over its x-axis */
+#zoomhint{text-align:right;font-size:var(--f0);color:var(--sub);pointer-events:none;padding:2px 2px 0}
+#chartcard .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px}
+#chartcard .chead b{font-size:var(--f4)}
+.qtab{padding:5px 16px;border-radius:16px;border:1px solid var(--line);font-size:var(--f2);cursor:pointer;color:var(--mut);background:none;display:inline-block}
+.qtab.on{border-color:var(--accent);color:var(--accent);font-weight:700}
+#qsub{margin-left:auto;font-size:var(--f1);color:var(--mut)}
+#chart{width:100%;height:auto;min-height:300px;display:block;cursor:crosshair}
+#chart text{font-variant-numeric:tabular-nums}  /* % labels stop jittering as values change */
+#tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:var(--f1) ui-monospace,Menlo,monospace;display:none;z-index:5;box-shadow:0 3px 14px rgba(0,0,0,.18);white-space:nowrap}
+#tip .tt{color:var(--mut)}
+
+/* ---------- account table ---------- */
+#acctcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 14px}
+.afilter{display:flex;gap:6px;margin:2px 0 8px;align-items:center}
+/* ONE chip rule for every view (was copy-pasted 7×) */
+.chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:var(--r);padding:7px 12px;font-size:var(--f2);cursor:pointer;transition:border-color .12s,background .12s}
+.chip:hover{background:var(--hover);border-color:var(--line2)}
+.chip.on{border-color:var(--accent);color:var(--accent);font-weight:var(--w-med);background:var(--accent-soft)}
+/* Account table: one number per window with a slim inline bar for at-a-glance
+   comparison (the redundant leading battery column and the per-cell battery
+   SVGs are gone). Fixed cell padding + one baseline => even row rhythm; the
+   secondary line is muted and quiet. Numbers are tabular and right-aligned. */
+/* THE TABLE SCROLLS IN ITS OWN BOX, never in the document. Measured
+   at 390px: scrollWidth 953 in a 390 viewport, and the same at 680/768/900 —
+   the ONLY view of nine still dragging the whole page sideways. The headers are
+   white-space:nowrap and the layout is auto, so the table simply refuses to go
+   below ~924px and nothing was containing it. Same shape as .smmatrix in boxes,
+   which is why boxes measured clean at 390 with a WIDER (1040px) table. */
+.atscroll{overflow-x:auto;max-width:100%}
+table.accts{width:100%;border-collapse:collapse;font-size:var(--f2);table-layout:auto}
+table.accts th{text-align:left;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);padding:7px 10px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none;white-space:nowrap}
+table.accts th.num{text-align:right}
+table.accts th:hover{color:var(--fg)}
+table.accts td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+table.accts tr:last-child td{border-bottom:none}
+table.accts tr.sel td{background:var(--hl)}
+table.accts tbody tr{cursor:pointer}
+table.accts tbody tr:hover td{background:color-mix(in srgb,var(--hl) 55%,transparent)}
+.adot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;vertical-align:0;flex:none}
+.acct-name{display:flex;align-items:center;font-weight:var(--w-med)}
+.acct-name .live{width:6px;height:6px;border-radius:50%;background:var(--ok);margin-left:7px;box-shadow:0 0 5px var(--ok)}
+.acct-line2{font-size:var(--f0);color:var(--sub);margin-top:2px;white-space:nowrap}
+.acct-line2 .sep{opacity:.5;margin:0 5px}
+/* a quota cell: right-aligned % with a slim bar underneath */
+.qcell{text-align:right;white-space:nowrap;font-variant-numeric:var(--num);min-width:66px}
+.qcell .qv{font-weight:var(--w-med)}
+.qcell .qbar{height:3px;border-radius:2px;background:var(--line);margin-top:3px;overflow:hidden}
+.qcell .qbar>i{display:block;height:100%;border-radius:2px}
+.qcell .rst{display:block;font-size:var(--f0);color:var(--sub);margin-top:2px}
+.rst{color:var(--mut);font-size:var(--f1)}
+.st-ok{color:var(--ok)}.st-approaching,.st-expired-token{color:var(--warn)}.st-exhausted,.st-api-error,.st-unknown{color:var(--bad)}
+.stfix{cursor:pointer;text-decoration:underline dotted}
+.flagchip{font-size:var(--f0);color:var(--warn)}
+
+/* ---------- collapsible group cards (burn / homes) ---------- */
+.grp{margin:14px 0 0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--card)}
+.grp>summary{cursor:pointer;padding:11px 16px;display:flex;align-items:center;gap:10px;font-weight:600;list-style:none}
+.grp>summary::-webkit-details-marker{display:none}
+.grp>summary::before{content:"▸";color:var(--mut);font-size:var(--f1);transition:.15s}
+.grp[open]>summary::before{transform:rotate(90deg)}
+.gmeta{color:var(--mut);font-size:var(--f1);font-weight:400;white-space:nowrap}
+#burncard>summary .gmeta{margin-left:auto}
+#homescard>summary .gmeta{margin-left:auto}
+.burnrow{display:flex;gap:14px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:baseline;flex-wrap:wrap;font-size:var(--f2)}
+.burnrow:last-of-type{border-bottom:none}
+.burnt{color:var(--mut);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:92px}
+.burnchips{display:flex;gap:10px;flex-wrap:wrap}
+.burnchip{white-space:nowrap;font-variant-numeric:tabular-nums;font-weight:600}
+.burnsesss{flex:1;min-width:240px;display:flex;gap:4px 14px;flex-wrap:wrap}
+.burnsess{cursor:pointer;color:var(--accent);text-decoration:underline dotted;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.burnsess:hover{text-decoration:underline solid}
+.burnnote{padding:9px 16px;font-size:var(--f1);color:var(--mut);border-top:1px solid var(--line)}
+
+/* ---------- credential homes ---------- */
+.hbadge{font-size:var(--f0);font-weight:700;text-transform:uppercase;padding:3px 7px;border-radius:5px;text-align:center}
+.homerow{display:flex;gap:12px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap;font-size:var(--f2)}
+.homerow:last-of-type{border-bottom:none}
+.homerow .hn{font:600 var(--f2) ui-monospace,Menlo,monospace;white-space:nowrap}
+.homerow .hn .rst{font-weight:400}
+.homerow .hchips{display:flex;gap:10px;flex-wrap:wrap;flex:1;min-width:220px;align-items:baseline}
+.homerow .hacts{display:flex;gap:6px}
+.homerow .hacts button{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:4px 10px;font-size:var(--f1);cursor:pointer}
+.homerow .hacts button:hover{border-color:var(--accent);color:var(--accent)}
+.homefix{flex-basis:100%;font-size:var(--f1);color:var(--mut);white-space:pre-wrap;word-break:break-word}
+#homeform{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap;align-items:center}
+#homeform input{flex:1;min-width:220px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font-size:var(--f1)}
+#homeform select{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 10px;font-size:var(--f1);cursor:pointer}
+#homeform .cmdbox{flex-basis:100%;background:var(--fg);color:var(--bg);border-radius:8px;padding:9px 12px;font:var(--f1) ui-monospace,Menlo,monospace;word-break:break-all;cursor:pointer}
+#homeform .cmdbox .hintline{font:italic var(--f0) -apple-system,sans-serif;opacity:.7;margin-top:4px}
+.homehdr{padding:8px 16px;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line)}
+.dupwarn{color:var(--bad);font-size:var(--f1);margin:6px 0}
+

@@ -1,0 +1,1042 @@
+/* ================= chat view (the owner's surface — agents live on `helm chat`) =================
+   Polls /api/chat every ~2s on EVERY tab — the poll is the owner's beacon
+   (nav badge + title count + notification when an agent @mentions him), so
+   it must never gate on the chat view being open; rendering into the hidden
+   log is free and keeps CHAT_SINCE one cursor for both. POST rides the
+   mutation bearer and drops the owner-unread marker, so every local agent's
+   next turn surfaces the message through the shipped reflex. Simple DOM
+   only — the panel must work from the Orca mobile app's browser. */
+let CHAT_SINCE = 0, CHAT_WIRED = false, CHAT_REACTS = {}, CHAT_NOTIFY_KEY = "";
+const CHAT_RSET = ["👍", "🎉", "🔥", "❤️", "👀"]; // the tiny click-to-react set
+// mirror pk.slug — the client's room name IS the server's file name, so the
+// sidebar row the user clicked and the row the next poll returns never split
+const chatSlug = s => String(s || "").replace(/[^A-Za-z0-9_-]/g, "-")
+  .replace(/^-+|-+$/g, "").toLowerCase().slice(0, 60);
+/* The opening room is SERVED, not assumed: the page cannot know which project
+   this console is for, and the old "main" literal opened the owner's console
+   in the one room his fleet does not talk in (he had to be told where a
+   council was). A stored choice still wins — this is only the first-visit
+   default. */
+const HELM_DEFAULT_ROOM = chatSlug("__HELM_ROOM__") || "main";
+let CHAT_ROOM = chatSlug(localStorage.getItem("helm.chatroom")) || HELM_DEFAULT_ROOM;
+let CHAT_ROOMS_LAST = []; // last poll's rooms — instant sidebar repaint on switch
+/* Which rooms show their agent list. COLLAPSED IS THE DEFAULT (owner, live
+   2026-07-29: "the chat channels are honestly a total mess"). Thirteen rooms
+   each rendering every member turned a 13-line sidebar into ~40 lines of
+   chrome, and the ACTIVE room's members are already named in the header strip
+   above the log — so expanded-by-default was duplicate ink that buried the one
+   thing the sidebar is for: which room has something new. Lives outside
+   chatRooms() because that function re-renders on every poll. */
+let CHAT_ROOMS_OPEN = new Set();
+
+/* ---- threading + the UX pass state (all reset by chatSwitch / a since=0 repaint) ----
+   CHAT_BY_ID maps stable ids; CHAT_BY_KEY retains EVERY ts|from twin so a
+   pre-id reply can require an exact (ts, from, text) match instead of silently
+   quoting whichever sibling happened to index first. */
+let CHAT_BY_ID = {}, CHAT_BY_KEY = {}, CHAT_REPLYN = {}, CHAT_KIDS = {}, CHAT_REPLY_TO = null;
+let CHAT_ROSTER = [], CHAT_PRESENCE = {};   // @mention completion + seat ages
+let CHAT_DIVIDED = false, CHAT_AWAY = 0;    // the unread divider + jump button
+// ── lazy-load window (the settled chat-surface shape: recent-50 initial paint +
+// scroll-up older pages). CHAT_WIN is the one tunable knob; the server default
+// matches it. CHAT_OLDEST_BASE is the ABSOLUTE index of the topmost rendered
+// row — the cursor the older-page fetch scrolls back from (>0 means more above).
+const CHAT_WIN = 50;
+let CHAT_OLDEST_BASE = 0, CHAT_LOADING_OLDER = false; // single-flight, mirrors CHAT_POLLING
+// rotation cursor: the server stamps `gen` (a fingerprint of the room's HEAD
+// row) on every response. It is STABLE across appends and CHANGES the instant
+// the oldest half rotates out (chat._rotate reindexes the rows) — the one
+// reliable signal that our absolute `since` cursor went meaningless, so a
+// mismatch resets + repaints instead of quietly missing rows. Per-room (cached
+// on switch) so a room that rotated while we were away is caught on return.
+let CHAT_GEN = null;
+// parent ids the server CONFIRMED are gone from the room (a batch-id hydration
+// asked for them and they came back absent) — only these render "rotated out".
+// A parent merely above the loaded window is NOT here; it hydrates instead.
+let CHAT_GONE = new Set();
+// per-room render cache: instant channel-switch (repaint the cached DOM + state,
+// THEN the poll fetches only the delta from the cached cursor). Pure speedup —
+// an absent entry falls back to the fresh reset paint, so it can never wedge.
+const CHAT_CACHE = {};
+const CHAT_CLAMP_CHARS = 1200, CHAT_CLAMP_LINES = 14; // a ledger post must not bury the pane
+const CHAT_DIV_HTML = '<div id="chatdivider">new since you last looked</div>';
+
+function chatKey(m) { return (m.ts || "") + "|" + (m.from || ""); }
+function dayStamp(ts) {
+  const s = String(ts || ""); const t = s.slice(11, 16), d = s.slice(0, 10);
+  if (!t) return "--:--";
+  const today = new Date().toISOString().slice(0, 10);
+  if (d === today) return t + "Z";
+  try {
+    const m = ["???","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][parseInt(s.slice(5, 7))] || "???";
+    return m + " " + s.slice(8, 10) + " " + t + "Z";
+  } catch (_) { return t + "Z"; }
+}
+function chatThreadKey(m) { return m.id || chatKey(m) + "|" + encodeURIComponent(String(m.text || "")); }
+// own age formatter: the ledger's lago() is a const defined LATER in this file
+// and the first pollChat() fires before it initializes (TDZ) — never share it
+const chatAgo = s => !s && s !== 0 ? "" : s < 60 ? Math.max(0, Math.round(s)) + "s"
+  : s < 3600 ? Math.round(s / 60) + "m" : s < 86400 ? Math.round(s / 3600) + "h"
+  : Math.round(s / 86400) + "d";
+const chatIso = t => { const e = Date.parse(t || ""); return isNaN(e) ? null : (Date.now() - e) / 1e3; };
+const chatSnip = s => { const one = String(s || "").replace(/\s+/g, " ").trim();
+  return one.length > 90 ? one.slice(0, 89) + "…" : one; };
+// keep the DISTINGUISHING tail: a seat named '<project>-platform-codex'
+// truncated from the LEFT still says '…platform-codex', which is the part that
+// tells two seats apart; truncating from the right would leave every seat on a
+// project reading the same. The full name rides the title tooltip.
+const chatShort = s => String(s || "").length <= 15 ? String(s || "") : "…" + String(s).slice(-14);
+
+function chatIndex(m) {
+  if (m.id) CHAT_BY_ID[m.id] = m;
+  (CHAT_BY_KEY[chatKey(m)] = CHAT_BY_KEY[chatKey(m)] || []).push(m);
+}
+
+/* mirrors chat.parent_of EXACTLY: a named id that is gone is an ORPHAN —
+   never its ts|from twin. A pre-id reply carries rtext and resolves only when
+   (ts, from, text) identifies exactly one surviving row; ambiguity is an
+   orphan, not permission to put the wrong words under a reply. */
+function chatParent(m) {
+  if (m.react || !(m.reply_to || m.rts)) return null;
+  if (m.reply_to) return CHAT_BY_ID[m.reply_to] || null;
+  if (!("rtext" in m)) return null;
+  const hits = (CHAT_BY_KEY[(m.rts || "") + "|" + (m.rfrom || "")] || [])
+    .filter(p => String(p.text || "") === String(m.rtext || ""));
+  return hits.length === 1 ? hits[0] : null;
+}
+
+/* A reply's PARENT threadKey known from the CHILD alone — no parent row needed.
+   For an id reply (the web post path) reply_to IS the parent's id, which IS the
+   parent's threadKey (chatThreadKey = m.id || …). So a child can be filed under
+   its parent BEFORE the parent is ever loaded — the reply count survives the
+   parent living above the window. Pre-id replies fall back to the resolved row. */
+function chatParentKey(m) {
+  if (m.react) return null;
+  if (m.reply_to) return m.reply_to;
+  const p = chatParent(m);
+  return p ? chatThreadKey(p) : null;
+}
+
+/* the one-level quote (never nested). FOUR states, so a
+   reply to a parent that is merely ABOVE the loaded window is NOT slandered as
+   "rotated out" (the P1 bug): resolved-in-DOM (clickable jump) · resolved-but-
+   above-the-window (author+snippet, click loads older then jumps) · PENDING
+   (an id parent we have not hydrated yet — chatHydrateParents resolves it) ·
+   gone (a pre-id reply with no surviving twin, OR an id the server confirmed is
+   rotated out). data-parent carries the id so chatReconcileQuotes can upgrade
+   the transient states in place as pages/hydrations arrive. */
+function chatQuoteResolved(p) {
+  const inDom = !!chatFind(p);
+  return '<div class="cquote' + (inDom ? "" : " above") +
+    '" data-jump="' + esc(chatThreadKey(p)) + '" data-parent="' + esc(p.id || "") +
+    '" title="' + (inDom ? "jump to the message this replies to"
+      : "the message this replies to is earlier in the room — click to load it") +
+    '">↳ <b>' + esc(String(p.from || "?")) + "</b> <span>" +
+    esc(chatSnip(p.text)) + "</span></div>";
+}
+function chatQuotePending(pid, rfrom) {
+  return '<div class="cquote pending" data-parent="' + esc(pid) +
+    '" data-rfrom="' + esc(rfrom || "?") +
+    '" title="loading the message this replies to…">↳ <span>…</span></div>';
+}
+function chatQuoteGone(rfrom) {
+  return '<div class="cquote orphan" title="the message this replies to is no ' +
+    'longer in the room (rotated out)">↳ <b>' + esc(rfrom || "?") +
+    "</b> <span>— original rotated out</span></div>";
+}
+function chatQuote(m) {
+  if (m.react || !(m.reply_to || m.rts)) return "";
+  const p = chatParent(m);
+  if (p) return chatQuoteResolved(p);
+  // an id reply whose parent we have not loaded is PENDING, never "gone" — only
+  // a batch hydration that comes back WITHOUT the id (CHAT_GONE) proves it out.
+  if (m.reply_to && !CHAT_GONE.has(m.reply_to)) return chatQuotePending(m.reply_to, m.rfrom);
+  return chatQuoteGone(m.rfrom);   // pre-id unresolved, or an id confirmed gone
+}
+
+function chatFind(p) {
+  const log = $("#chatlog");
+  return log.querySelector('.chatmsg[data-thread="' + CSS.escape(chatThreadKey(p)) + '"]');
+}
+
+// file a reply under its PARENT KEY and paint the parent's ↩N. Keyed off the
+// child alone (chatParentKey) so a child whose parent lives ABOVE the window is
+// still COUNTED — when an older page later renders that parent, chatSetReplyCount
+// shows the accrued total (fixes "older pages never repair existing counts").
+// IDEMPOTENT (kids dedup by child key) so replaying a row — an older-page reload,
+// a reconcile pass — can never double-count.
+function chatBumpReply(m) {
+  const k = chatParentKey(m);
+  if (!k) return;
+  const ck = chatThreadKey(m);
+  const kids = (CHAT_KIDS[k] = CHAT_KIDS[k] || []);
+  if (kids.indexOf(ck) === -1) kids.push(ck);
+  CHAT_REPLYN[k] = kids.length;
+  chatSetReplyCount(k);
+}
+function chatSetReplyCount(k) {
+  const el = $("#chatlog").querySelector('.chatmsg[data-thread="' + CSS.escape(k) +
+    '"] .creplies');
+  if (!el) return;                       // parent not on screen (above window) — noop
+  const n = CHAT_REPLYN[k] | 0;
+  el.textContent = n ? "↩" + n : "";
+  el.title = n + (n === 1 ? " reply" : " replies");
+}
+
+/* Repair the transient reply quotes (pending / above) IN PLACE as pages and
+   hydrations arrive — the append-only log never re-renders a row, so a quote
+   that could not resolve at paint time is upgraded here, not by a repaint:
+   pending -> resolved once the parent id lands in the index (or -> "rotated out"
+   once a hydration confirms it gone); above -> in-DOM-clickable once an older
+   page brings the parent onto the screen. Also (re)paints every rendered
+   parent's ↩N from the accrued counts, so a parent loaded AFTER its children
+   shows their total. Idempotent + cheap (windowed DOM, one querySelectorAll). */
+function chatReconcileQuotes() {
+  const log = $("#chatlog");
+  log.querySelectorAll(".cquote.pending, .cquote.above").forEach(q => {
+    const id = q.getAttribute("data-parent");
+    if (!id) return;
+    const p = CHAT_BY_ID[id];
+    let next;
+    if (p) next = chatQuoteResolved(p);           // hydrated or paged in
+    else if (CHAT_GONE.has(id)) next = chatQuoteGone(q.getAttribute("data-rfrom"));
+    else return;                                   // still pending — leave it
+    if (next) q.outerHTML = next;
+  });
+  // repaint counts for every parent currently on screen (older-page parents included)
+  log.querySelectorAll(".chatmsg[data-thread]").forEach(el => {
+    const k = el.getAttribute("data-thread");
+    if (CHAT_REPLYN[k]) chatSetReplyCount(k);
+  });
+}
+
+/* Batch-resolve the parents of PENDING quotes by id (builders' handleMessagesByIds
+   parity, cap 100). The response tells "above the window but still in the room"
+   (id present -> index it, the quote resolves to author+snippet) from "genuinely
+   rotated out" (id absent -> CHAT_GONE, only NOW does the quote read "rotated
+   out"). BODY-ONLY (no transport/signal here — that recomputes live on the poll,
+   DREGGTEGRITY intact). Never re-renders the log; only upgrades the quotes. */
+async function chatHydrateParents() {
+  const log = $("#chatlog");
+  const ids = [];
+  log.querySelectorAll(".cquote.pending[data-parent]").forEach(q => {
+    const id = q.getAttribute("data-parent");
+    if (id && !CHAT_BY_ID[id] && !CHAT_GONE.has(id) && ids.indexOf(id) === -1) ids.push(id);
+  });
+  if (!ids.length) return;
+  const want = CHAT_ROOM;
+  // Hydrate in <=100-id CHUNKS (the server caps ids= at 100) and mark an id GONE
+  // only within the chunk that actually REQUESTED it. The round-1 bug sent
+  // ids.slice(0,100) yet marked EVERY pending id absent, so with 101 pending
+  // parents the 101st — never sent — was falsely branded "rotated out" though its
+  // parent still lives in the room. Never mark absent an id that was never asked.
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    let d;
+    try {
+      d = await j("/api/chat?room=" + encodeURIComponent(want) + "&ids=" +
+        encodeURIComponent(chunk.join(",")));
+    } catch (e) { return; }                        // fail-open: retry next paint
+    if (CHAT_ROOM !== want || !d || !Array.isArray(d.lines)) return;
+    const got = new Set();
+    for (const row of d.lines) {
+      if (row.id) { if (!CHAT_BY_ID[row.id]) CHAT_BY_ID[row.id] = row; got.add(row.id); }
+    }
+    for (const id of chunk) if (!got.has(id)) CHAT_GONE.add(id);  // asked, absent => truly gone
+  }
+  chatReconcileQuotes();
+}
+
+// anchored navigation, both directions: a quote jumps UP to its parent, a
+// parent's ↩N jumps DOWN to its first reply. One level, no nesting, no
+// re-render — the chronological log stays the log.
+async function chatJumpTo(key) {
+  const log = $("#chatlog");
+  const find = () => log.querySelector('.chatmsg[data-thread="' + CSS.escape(key) + '"]');
+  let el = find();
+  // the target may be a parent ABOVE the loaded window (a resolved 'above' quote):
+  // page older history in until it lands (bounded) before giving up.
+  for (let i = 0; !el && i < 40 && CHAT_OLDEST_BASE > 0; i++) {
+    await chatLoadOlder();
+    el = find();
+  }
+  if (!el) { toast("that message is no longer in this room"); return; }
+  el.scrollIntoView({block: "center"});
+  el.classList.add("flash");
+  setTimeout(() => el.classList.remove("flash"), 1200);
+}
+function chatJumpReplies(div) {
+  const kids = CHAT_KIDS[div.dataset.thread] || [];
+  if (kids.length) chatJumpTo(kids[0]);
+}
+
+function chatRow(m) {
+  const who = String(m.from || "?");
+  const owner = who === (($("#chatname").value || "owner").trim() || "owner");
+  // Receipt truth on the row itself: signed tick, or a LOUD attempted-signing
+  // fallback. Configured-off v1 rows stay quietly unsigned; the transport strip
+  // explains that room-wide fact.
+  const tr = m.transport || {}, degraded = tr.state === "DEGRADED";
+  const tick = (m.chain != null)
+    ? '<span class="ctick" title="signed — chain #' + esc(String(m.chain)) + '">✓</span>'
+    : degraded ? '<span class="ctick" style="color:var(--bad)" title="unsigned RAM fallback">⚠ DEGRADED</span>' : "";
+  const diag = degraded
+    ? '<div class="cdiag">' + esc(tr.profile || "?") + '/' + esc(tr.code || "signing") +
+      ': ' + esc(tr.reason || "unknown failure") + '</div>' : "";
+  const rbar = '<span class="rbar">' + CHAT_RSET.map(e =>
+    '<button class="rbtn" data-e="' + e + '">' + e + "</button>").join("") +
+    '<button class="rbtn rbreply" title="reply to this message">↩</button></span>';
+  const txt = String(m.text || "");
+  // long ledger posts collapse: the pane stays scannable, the text stays one click away
+  const long = txt.length > CHAT_CLAMP_CHARS || txt.split("\n").length > CHAT_CLAMP_LINES;
+  chatIndex(m);
+  return '<div class="chatmsg' + (owner ? " owner" : "") + '" data-key="' + esc(chatKey(m)) +
+    '" data-thread="' + esc(chatThreadKey(m)) + '" data-id="' + esc(m.id || "") +
+    '" data-ts="' + esc(m.ts || "") + '" data-from="' + esc(who) +
+    '">' + chatQuote(m) + '<span class="cwho">' + esc(who) +
+    '</span><span class="cts">' + dayStamp(m.ts) + '</span>' + tick +
+    '<span class="creplies"></span>' + rbar +
+    '<div class="ctxt' + (long ? " clamp" : "") + '">' + esc(txt) + "</div>" + diag +
+    (long ? '<button class="cmore">show more ▾</button>' : "") +
+    '<div class="creacts"></div></div>';
+}
+
+function chatApplyReact(m) {
+  // a reaction row: last-row-wins per (reactor, emoji) — mirrors chat.py's
+  // _react_state toggle semantics. Duplicated historical rows collapse to one
+  // and an {un: true} tombstone clears the pair (skip when the target rotated out)
+  const k = (m.tts || "") + "|" + (m.tfrom || "");
+  const by = (CHAT_REACTS[k] = CHAT_REACTS[k] || {});
+  (by[m.react] = by[m.react] || {})[m.from || "?"] = !m.un;
+  const div = $("#chatlog").querySelector('.chatmsg[data-key="' + CSS.escape(k) + '"]');
+  if (!div) return;
+  div.querySelector(".creacts").innerHTML = Object.entries(by)
+    .map(([e, who]) => [e, Object.values(who).filter(Boolean).length])
+    .filter(([, n]) => n > 0)
+    .map(([e, n]) => "<span>" + esc(e) + "×" + n + "</span>").join("");
+}
+
+function chatTransport(t) {
+  if (!t) return;
+  const el = $("#chattransport");
+  if (t.mode === "degraded") {
+    el.textContent = "DEGRADED · " + (t.profile || "?") + " · " +
+      (t.reason || "signing failed") + " · first " + (t.first_failure || "?") +
+      " · last " + (t.last_failure || "?") + " (" + (t.last_age_s || 0) + "s ago)";
+    el.title = "RAM chat still delivers unsigned rows. Remediation: " +
+      (t.remediation || "repair signing, then retry a signed turn");
+    return;
+  }
+  el.textContent = t.mode === "signed"
+    ? "signed ⛓" + (t.head == null ? "" : "#" + t.head)
+    : (t.label || t.mode || "unsigned"); // honest owner wording
+  el.title = "chat transport: " + (t.url || "v1 RAM room only");
+}
+
+let CHAT_POLLING = false; // one poll at a time — two since=0 polls in flight double-render the log
+async function pollChat() {
+  if (CHAT_POLLING) return;
+  CHAT_POLLING = true;
+  try {
+    let d;
+    const want = CHAT_ROOM; // the room this request is FOR — a mid-flight switch drops the render
+    const sentSince = CHAT_SINCE; // the cursor we asked from — 0 => initial/reset (windowed) paint
+    // the initial/reset open asks for only the last CHAT_WIN rows (the
+    // getRecent(N) shape); the incremental poll (since>0) stays exactly since=<n>,
+    // the untouched 22ms/54KB good path.
+    const url = "/api/chat?room=" + encodeURIComponent(want) + "&since=" + sentSince
+              + (sentSince === 0 ? "&win=" + CHAT_WIN : "");
+    try { d = await j(url); } catch (e) { return; } // fail-open: keep the page, keep quiet
+    if (d.unavailable || !Array.isArray(d.lines)) { chatSignal(d); return; }
+    if (Array.isArray(d.roster)) CHAT_ROSTER = d.roster; // @mention completion source
+    chatRooms(d.rooms); // sidebar rides every poll (room-agnostic — render before the staleness bail)
+    chatPresence(d.presence); // fleet presence bar — room-agnostic, every poll
+    if (CHAT_ROOM !== want) return; // switched while in flight — the next tick repolls the new room
+    // ROTATION CURSOR: the head fingerprint changed => the oldest half rotated
+    // out and every absolute index reindexed, so this incremental response's
+    // slice (rows[sentSince:] on the rotated file) is the WRONG rows AND our
+    // rendered log holds dropped rows. Discard it, reset the cursor, and re-poll
+    // for a fresh windowed open. (total<since below only catches a rotation that
+    // ALSO shrank below the cursor; a rotate-then-regrow PAST it — the reported
+    // P1 — slips through, so the gen is the one reliable signal.)
+    if (typeof d.gen === "string" && sentSince > 0 && CHAT_GEN !== null && d.gen !== CHAT_GEN) {
+      CHAT_SINCE = 0; chatResetLog();     // clears CHAT_GEN too; the reset open restamps it
+      setTimeout(pollChat, 0);            // finally clears the lock first, then the windowed repaint
+      return;
+    }
+    chatTransport(d.transport);
+    const log = $("#chatlog");
+    if (d.total < CHAT_SINCE) CHAT_SINCE = 0; // the room rotated — server resent everything
+    // RESET BEFORE STAMPING gen/base: chatResetLog() zeroes CHAT_GEN and
+    // CHAT_OLDEST_BASE, so stamping them FIRST (then resetting) wiped the freshly
+    // stamped generation + older-cursor of this very windowed open — a rotation OR
+    // a lazy-page immediately after ANY reset then silently missed rows (the gen
+    // check no longer fired) / could not page older (base was 0). Reset first,
+    // stamp after, so the post-reset state carries THIS response's gen + base.
+    if (CHAT_SINCE === 0 && d.lines.length) chatResetLog(); // clear the empty-state (or the stale pre-rotation log)
+    if (typeof d.gen === "string") CHAT_GEN = d.gen;
+    // absolute index of d.lines[0]: the windowed initial open stamps `base`
+    // (last-WIN slice starts mid-history); the incremental poll omits it and
+    // d.lines[0] sits exactly at the cursor we sent.
+    const absBase = (typeof d.base === "number") ? d.base : CHAT_SINCE;
+    // `base` rides ONLY the windowed initial/reset response (never the
+    // incremental poll), so its presence is the exact signal "the log was
+    // repainted from absBase" — the topmost rendered row, i.e. the older-page
+    // cursor. An incremental append leaves the topmost row (and CHAT_OLDEST_BASE)
+    // untouched.
+    if (typeof d.base === "number") CHAT_OLDEST_BASE = d.base;
+    if (d.lines.length) {
+      const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
+      const msgs = d.lines.filter(m => !m.react);
+      if (msgs.length) {
+        // the "new since you last looked" divider: placed ONCE, at the owner's
+        // server-side read cursor, and only when he wasn't watching it land —
+        // an initial paint (the since=0 open) or rows that arrived on a hidden tab
+        const away = !$("#view-chat").classList.contains("on") || document.hidden;
+        const cut = d.owner_read | 0;
+        let html = "", abs = absBase;
+        for (const m of d.lines) {
+          if (m.react) { abs++; continue; }
+          if (!CHAT_DIVIDED && cut > 0 && abs >= cut && (sentSince === 0 || away)) {
+            html += CHAT_DIV_HTML; CHAT_DIVIDED = true;
+          }
+          html += chatRow(m); abs++;
+        }
+        log.insertAdjacentHTML("beforeend", html);
+        msgs.forEach(chatBumpReply); // resolved children bump their parent's ↩N
+      }
+      d.lines.filter(m => m.react).forEach(chatApplyReact);
+      if (stick) log.scrollTop = log.scrollHeight;
+      else CHAT_AWAY += msgs.length;
+      chatJumpSync();
+    }
+    CHAT_SINCE = d.total;
+    chatReconcileQuotes();   // upgrade transient quotes + repaint counts as the index grew
+    chatHydrateParents();    // resolve out-of-window reply parents by id (fire-and-forget)
+    chatSignal(d);
+  } finally { CHAT_POLLING = false; }
+}
+
+// the log is the row store: clearing it clears the index, the counts and the
+// divider together — one place, so a room switch and a rotation reset agree
+function chatResetLog() {
+  $("#chatlog").innerHTML = "";
+  CHAT_REACTS = {}; CHAT_BY_ID = {}; CHAT_BY_KEY = {}; CHAT_REPLYN = {}; CHAT_KIDS = {};
+  CHAT_DIVIDED = false; CHAT_AWAY = 0; CHAT_OLDEST_BASE = 0; // no older page until the next paint stamps base
+  CHAT_GEN = null; CHAT_GONE = new Set(); // a reset re-derives the rotation cursor + the gone-set from scratch
+}
+
+/* lazy-load older history (the analog of
+   getRecent(before, N)): the owner scrolled near the top, there is history
+   ABOVE the topmost rendered row (CHAT_OLDEST_BASE>0), so pull the prior page
+   and PREPEND it with the viewport pinned (scroll-anchor) — no re-render of the
+   rows already on screen (the append-only invariant the poll relies on holds in
+   both directions). The prepended rows are fed chatRow (which indexes them) +
+   chatBumpReply so a reply/jump/quote resolves across the newly-loaded window.
+   Single-flight (mirrors CHAT_POLLING) so a fast scroll can't double-fetch a
+   page. This response is BODY-ONLY — no transport/signal here; the signing
+   truth is recomputed live on the poll path, never from this cached slice. */
+async function chatLoadOlder() {
+  if (CHAT_LOADING_OLDER || !(CHAT_OLDEST_BASE > 0)) return;
+  CHAT_LOADING_OLDER = true;
+  try {
+    const want = CHAT_ROOM, before = CHAT_OLDEST_BASE;
+    let d;
+    try {
+      d = await j("/api/chat?room=" + encodeURIComponent(want) + "&before=" + before + "&win=" + CHAT_WIN);
+    } catch (e) { return; } // fail-open: leave the log as-is, retry on the next scroll
+    if (CHAT_ROOM !== want || !d || !Array.isArray(d.lines)) return; // switched mid-flight
+    // rotation guard: if the room rotated since our last paint, this `before`
+    // indexes a REINDEXED file — the slice would not abut our rendered top. Bail
+    // and let the live poll's gen check reset + repaint (which walks the cursor
+    // afresh); prepending a mismatched page would corrupt the log.
+    if (typeof d.gen === "string" && CHAT_GEN !== null && d.gen !== CHAT_GEN) return;
+    if (!d.lines.length) { CHAT_OLDEST_BASE = (typeof d.base === "number") ? d.base : 0; return; }
+    const log = $("#chatlog"), oldH = log.scrollHeight;
+    let html = "";
+    for (const m of d.lines) { if (!m.react) html += chatRow(m); } // chatRow indexes each row
+    log.insertAdjacentHTML("afterbegin", html);
+    d.lines.forEach(chatBumpReply);                 // reply/jump resolve across the loaded window
+    d.lines.filter(m => m.react).forEach(chatApplyReact);
+    CHAT_OLDEST_BASE = (typeof d.base === "number") ? d.base : 0; // walk the cursor further up
+    chatReconcileQuotes();   // a paged-in parent upgrades its children's 'above'/pending quotes + counts
+    chatHydrateParents();    // any still-unresolved parent id resolves by batch
+    log.scrollTop += (log.scrollHeight - oldH);      // scroll-anchor: the viewport does not jump
+  } finally { CHAT_LOADING_OLDER = false; }
+}
+
+/* jump-to-latest: scrolled off the bottom is the ONLY state where an arriving
+   message can go unseen inside an open room — the button says how many. */
+function chatJumpSync() {
+  const log = $("#chatlog"), b = $("#chatjump");
+  if (!b) return;
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
+  if (atBottom) CHAT_AWAY = 0;
+  b.hidden = atBottom;
+  b.textContent = CHAT_AWAY ? "↓ " + CHAT_AWAY + " new" : "↓ latest";
+}
+
+/* the channel sidebar — one row per room from the poll's `rooms` array.
+   Fail-open: absent/empty (older server) degrades to just main + the live
+   room; a just-typed channel (no post yet, so no server row) still shows.
+
+   ACTIVITY IS THE POINT (owner-caught 2026-07-21: he sat on a 4-row room
+   while 88 rows landed in another with no signal): every room shows its
+   unread count, an @ flag when any of it addresses him, and the AGE of its
+   last message — so a quiet room reads quiet (dimmed) and the busy one is
+   impossible to miss. */
+/* ROOM TYPE, read from the name because the name already carries it.
+   A MELD (and a COUNCIL, which is a meld) is ad-hoc, N-participant,
+   topic-scoped and FINITE — it ends. A PROJECT room is permanent and
+   open-ended. The old sidebar treated all thirteen as one flat list, so
+   there was no axis along which to collapse the right ones and the owner
+   called it "a total mess" — then said the fix I shipped lost what he
+   actually used: "melds should just be separate still". Separate, not
+   hidden: grouping answers scale, burying answers nothing. */
+function roomType(name) {
+  if (/^(meld|council)-/.test(name)) return "meld";
+  if (/^dm-/.test(name)) return "dm";
+  return "project";
+}
+/* QUIET-FOLD (owner 2026-08-01: "the meld list needs to be collapsable"): a
+   room nobody has spoken in — >1h for a meld (finite, dies fast), >24h for a
+   channel (permanent, sleeps long) — folds into a "quiet melds/channels (N)"
+   row at its section's bottom. Folded is HIDDEN, never gone: the group row
+   expands in place and every folded room is a normal, clickable, fully live
+   row. Unread always wins — a room with something new for the owner can never
+   fold, and neither can the room he is in, #main, or this console's home.
+   The decisions are PURE functions (tested headless in
+   tests/test_web_sidebar_fold.py); render state lives outside chatRooms()
+   because that function repaints on every poll. */
+let CHAT_MELDS_FOLD = localStorage.getItem("helm.meldsfold") === "1"; // the MELDS header toggle
+let CHAT_DMS_FOLD = localStorage.getItem("helm.dmsfold") === "1";     // the DMS header toggle (task/62)
+const CHAT_QUIET_OPEN = new Set();   // which quiet groups are expanded (session-scoped)
+function chatQuietCut(type) { return type === "meld" ? 3600 : 86400; }
+function chatRoomQuiet(r, nowS, keep) {
+  if (keep && keep.indexOf(r.room) !== -1) return false;  // active/home stay top-level
+  if ((r.owner_unread | 0) > 0) return false;             // unread outranks any age
+  const t = Date.parse(r.last || "") / 1e3;               // no last = nothing ever said
+  return isNaN(t) || nowS - t > chatQuietCut(roomType(r.room));
+}
+function chatSplitQuiet(list, nowS, keep) {
+  const active = [], quiet = [];
+  list.forEach(r => (chatRoomQuiet(r, nowS, keep) ? quiet : active).push(r));
+  return {active: active, quiet: quiet};
+}
+// most recent conversation first — a room's identity is its conversation, and
+// the one you want is almost always the live one. A room with no messages yet
+// sorts last rather than first (no `last` is unknown, not new).
+function chatByRecency(list) {
+  return list.slice().sort((a, b) => (b.last ? Date.parse(b.last) || 0 : 0) -
+                                     (a.last ? Date.parse(a.last) || 0 : 0));
+}
+
+function chatRooms(rooms) {
+  CHAT_ROOMS_LAST = Array.isArray(rooms) ? rooms.filter(r => r && r.room) : [];
+  const list = CHAT_ROOMS_LAST.slice();
+  if (!list.some(r => r.room === "main")) list.push({room: "main"});
+  if (!list.some(r => r.room === CHAT_ROOM)) list.push({room: CHAT_ROOM});
+  CHAT_PRESENCE = {};
+  // presence indexes off EVERY room, rendered or folded — @completion and the
+  // composer's seat ages must not depend on what the sidebar chose to draw
+  list.forEach(r => (Array.isArray(r.seats) ? r.seats : []).forEach(s => {
+    if (s && s.seat) CHAT_PRESENCE[s.seat] = s;
+  }));
+  const nowS = Date.now() / 1e3;
+  const keep = [CHAT_ROOM, "main", HELM_DEFAULT_ROOM];
+  const melds = chatByRecency(list.filter(r => roomType(r.room) === "meld"));
+  const dms = chatByRecency(list.filter(r => roomType(r.room) === "dm"));
+  const rest = chatByRecency(list.filter(r => roomType(r.room) === "project"));
+  rest.sort((a, b) => (b.room === "main") - (a.room === "main")); // stable: main pinned, recency holds
+  const rowsFor = r => {
+    const n = r.owner_unread | 0, men = (r.owner_mentions | 0) > 0;
+    const seats = Array.isArray(r.seats) ? r.seats : [];
+    const age = chatIso(r.last);
+    const cold = !n && age != null && age > 1800;   // quiet: nothing new, nothing recent
+    const open = CHAT_ROOMS_OPEN.has(r.room);
+    const live = seats.filter(s => s && s.presence === "fresh").length;
+    const meld = roomType(r.room) === "meld";
+    const tip = "#" + r.room + " — " + (r.total | 0) + " message(s)" +
+      (age == null ? ", none yet" : ", last " + chatAgo(age) + " ago") +
+      (n ? "; " + n + " unread" + (men ? ", " + (r.owner_mentions | 0) + " @you" : "") : "; all read");
+    // HOVER PEEKS, CLICK EXPANDS. The names are on the chip's own tooltip, so
+    // the answer to "who is in there" costs a hover — no click, no room switch,
+    // no permanent ink. Withholding by default must never mean unreachable.
+    const who = seats.length
+      ? seats.map(s => chatShort(s.seat) + (s.presence ? " (" + s.presence +
+          (s.last_seen ? ", " + chatAgo(Date.now() / 1e3 - s.last_seen) : "") + ")" : "")).join(", ")
+      : "";
+    // MELD MEMBERS LIVE *IN* THE ROW: one presence dot per member, detail on
+    // the chip's tooltip — 19 melds cost 19 rows, not 38 (owner screenshot
+    // 2026-08-01, "…mbi-inc-claude 1s" sub-rows). The chip still click-expands
+    // to the full per-seat lines: inline is the default, nothing is lost.
+    // Project rooms keep the count chip — their membership is the whole fleet.
+    const chip = meld
+      ? seats.slice(0, 5).map(s => '<i class="' + esc(s.presence || "") + '"></i>').join("") +
+        (seats.length > 5 ? "+" + (seats.length - 5) : "")
+      : (open ? "&#9662;" : "&#9656;") + seats.length;
+    return '<div class="crm' + (r.room === CHAT_ROOM ? " on" : "") + (n ? " hot" : "") +
+      (cold ? " cold" : "") + (open ? " open" : "") +
+      '" data-room="' + esc(r.room) + '" title="' + esc(tip) +
+      // a DM channel is labeled by WHO, not by its lane filename: @seat from
+      // the summary's resolved label, else the stem minus its key hash
+      '"><span class="crname">' + esc(roomType(r.room) === "dm"
+        ? "@" + (r.seat || r.room.replace(/^dm-/, "").replace(/-[0-9a-f]{8}$/, ""))
+        : r.room) + "</span>" +
+      (n ? '<span class="crn' + (men ? " mention" : "") + '">' + (men ? "@" : "") + n + "</span>" : "") +
+      (age == null ? "" : '<span class="crage">' + esc(chatAgo(age)) + "</span>") +
+      (seats.length ? '<span class="crsn' + (live ? " live" : "") + '" data-seats="' +
+        esc(r.room) + '" title="' + esc(seats.length + " agent(s)" +
+          (live ? ", " + live + " active" : "") + ": " + who +
+          " — click to " + (open ? "collapse" : "expand")) + '">' +
+        chip + "</span>" : "") +
+      (open && seats.length ? '<span class="crseats">' + seats.map(s => {
+        const sa = s.last_seen ? chatAgo(Date.now() / 1e3 - s.last_seen) : "";
+        const rt = seatRuntime(s);
+        return '<span class="crseat ' + esc(s.presence || "") + '" title="' + esc(s.seat) +
+          " — " + esc(s.presence || "?") + (rt ? ", " + esc(rt) : "") +
+          (sa ? ", last seen " + esc(sa) + " ago" : "") +
+          '"><i></i><span>' + esc(chatShort(s.seat)) + "</span>" +
+          (rt ? '<span class="crrt">' + esc(rt) + "</span>" : "") +
+          (sa ? "<b>" + esc(sa) + "</b>" : "") + "</span>";
+      }).join("") + "</span>" : "") +
+      "</div>";
+  };
+  const mq = chatSplitQuiet(melds, nowS, keep), pq = chatSplitQuiet(rest, nowS, keep);
+  const dq = chatSplitQuiet(dms, nowS, keep);
+  const qrow = (key, label, rs) => {
+    if (!rs.length) return "";
+    const qo = CHAT_QUIET_OPEN.has(key);
+    return '<div class="crquiet' + (qo ? " open" : "") + '" data-qgroup="' + key +
+      '" title="no activity for over ' + (key === "meld" ? "an hour" : "a day") +
+      " — click to " + (qo ? "fold" : "expand") + '; every room in here is still fully live">' +
+      (qo ? "&#9662;" : "&#9656;") + " quiet " + label + " (" + rs.length + ")</div>" +
+      (qo ? rs.map(rowsFor).join("") : "");
+  };
+  // the MELDS header is itself the collapse toggle (state survives reload);
+  // folded, it still carries the section's unread so nothing new can hide
+  const mn = melds.reduce((s, r) => s + (r.owner_unread | 0), 0);
+  const mm = melds.some(r => (r.owner_mentions | 0) > 0);
+  const meldHead = !melds.length ? "" :
+    '<div class="crsec crfold" id="crmeldhead" title="' + melds.length +
+    " meld(s) — click to " + (CHAT_MELDS_FOLD ? "expand" : "fold") + '">' +
+    (CHAT_MELDS_FOLD ? "&#9656;" : "&#9662;") + ' melds<span class="crsecn">' + melds.length + "</span>" +
+    (CHAT_MELDS_FOLD && mn ? '<span class="crn' + (mm ? " mention" : "") + '">' + (mm ? "@" : "") + mn + "</span>" : "") +
+    "</div>";
+  // the DMS header mirrors melds: its own fold (survives reload) that still
+  // carries the section's unread when folded — a DM can never hide (task/62)
+  const dn = dms.reduce((s, r) => s + (r.owner_unread | 0), 0);
+  const dm2 = dms.some(r => (r.owner_mentions | 0) > 0);
+  const dmHead = !dms.length ? "" :
+    '<div class="crsec crfold" id="crdmhead" title="' + dms.length +
+    " DM lane(s) — click to " + (CHAT_DMS_FOLD ? "expand" : "fold") + '">' +
+    (CHAT_DMS_FOLD ? "&#9656;" : "&#9662;") + ' dms<span class="crsecn">' + dms.length + "</span>" +
+    (CHAT_DMS_FOLD && dn ? '<span class="crn' + (dm2 ? " mention" : "") + '">' + (dm2 ? "@" : "") + dn + "</span>" : "") +
+    "</div>";
+  $("#chatroomlist").innerHTML =
+    pq.active.map(rowsFor).join("") + qrow("project", "channels", pq.quiet) +
+    dmHead +
+    (CHAT_DMS_FOLD ? "" : dq.active.map(rowsFor).join("") + qrow("dm", "dms", dq.quiet)) +
+    meldHead +
+    (CHAT_MELDS_FOLD ? "" : mq.active.map(rowsFor).join("") + qrow("meld", "melds", mq.quiet));
+}
+
+/* the fleet-wide presence bar — the owner's (and any agent-driven browser's)
+   one-glance answer to "who is on what RIGHT NOW", visible from every room.
+   One row per roster seat off the poll's `presence` array: dot (🟢 fresh /
+   🟡 quiet / ⚫ gone — the shared .seen beat) + seat + ONE status line
+   (explicit `helm chat status` > live claim > home room; `source` names the
+   winning tier so an explicit status reads brighter). Fail-open: an older
+   server (no `presence`) keeps the bar hidden. */
+function chatPresence(list) {
+  // the home dashboard's FLEET row eats the same presence array FIRST — the
+  // strip below is chat-tab-local, the band is the owner's first paint, and
+  // both must speak off one poll or they will disagree by a beat.
+  dashFleet(list);
+  const bar = $("#chatpresence");
+  if (!bar) return;
+  // A one-line STRIP: who is actually on right now (active + idle real agents),
+  // then a link into the roster tab — the full dense table is the one home for
+  // the whole fleet now, so this stays a glance, not a scroll. Absent +
+  // ephemeral review-SAs dropped. Click anywhere on the strip → the roster tab.
+  const rows = (Array.isArray(list) ? list : [])
+    .filter(s => s && s.seat && s.presence !== "absent" && !s.ephemeral)
+    .sort((a, b) => (a.presence === "fresh" ? 0 : 1) - (b.presence === "fresh" ? 0 : 1) || (b.last_seen || 0) - (a.last_seen || 0));
+  bar.hidden = !rows.length;
+  bar.onclick = () => showView("roster");
+  if (!rows.length) { bar.innerHTML = ""; return; }
+  const quiet = rows.filter(s => s.presence === "quiet").length;
+  const NAMES = 7;
+  const shown = rows.slice(0, NAMES).map(s => {
+    const rt = seatRuntime(s);
+    return '<span class="psseat">' + esc(chatShort(s.seat)) + '</span>' +
+      (rt ? ' <span class="psrt">' + esc(rt) + '</span>' : '');
+  }).join(" · ");
+  const extra = rows.length - Math.min(rows.length, NAMES);
+  bar.innerHTML = '<span style="color:var(--ok)">●</span> ' + shown +
+    (extra > 0 ? ' <span class="psmore">+' + extra + '</span>' : '') +
+    (quiet ? ' <span class="psmore">◐ ' + quiet + ' idle</span>' : '') +
+    ' <span class="pslink">roster →</span>';
+  bar.title = rows.length + ' online — click for the full roster';
+}
+
+/* snapshot / restore a room's whole render state — the log DOM plus every
+   per-room index (ids, keys, reply counts, kids, reactions, divider, away
+   count, the window cursors + scroll). Switching AWAY caches it; switching
+   BACK repaints it instantly and lets the very next poll fetch only the delta
+   from the cached cursor (since=cached total). Pure speedup, so it holds only
+   the immutable BODY — the transport/signing truth is never cached here; it is
+   recomputed live on the first poll after the switch. */
+function chatSnapshot() {
+  if (!CHAT_ROOM) return;
+  CHAT_CACHE[CHAT_ROOM] = {
+    html: $("#chatlog").innerHTML, scrollTop: $("#chatlog").scrollTop,
+    since: CHAT_SINCE, oldest: CHAT_OLDEST_BASE, divided: CHAT_DIVIDED, away: CHAT_AWAY,
+    byId: CHAT_BY_ID, byKey: CHAT_BY_KEY, replyn: CHAT_REPLYN, kids: CHAT_KIDS, reacts: CHAT_REACTS,
+    gen: CHAT_GEN, gone: CHAT_GONE,   // cache the rotation cursor so a room that rotated while away is caught on return
+  };
+}
+
+function chatRestore(room) {
+  const c = CHAT_CACHE[room];
+  if (!c) return false;
+  const log = $("#chatlog");
+  log.innerHTML = c.html;
+  CHAT_SINCE = c.since; CHAT_OLDEST_BASE = c.oldest; CHAT_DIVIDED = c.divided; CHAT_AWAY = c.away;
+  CHAT_BY_ID = c.byId; CHAT_BY_KEY = c.byKey; CHAT_REPLYN = c.replyn; CHAT_KIDS = c.kids; CHAT_REACTS = c.reacts;
+  // restore the cached gen: the very next poll compares it, so a room rotated
+  // while we were away resets on return instead of restoring a stale since cursor.
+  CHAT_GEN = ("gen" in c) ? c.gen : null; CHAT_GONE = c.gone || new Set();
+  log.scrollTop = c.scrollTop;   // restore the viewport where the owner left it
+  return true;
+}
+
+function chatSwitch(room) {
+  room = chatSlug(room);
+  if (!room || room === CHAT_ROOM) return;
+  chatSnapshot();                 // cache the room we are leaving for an instant return
+  CHAT_ROOM = room;
+  localStorage.setItem("helm.chatroom", room); // survive reload, like helm.chatname
+  chatClearReply();               // a reply target never survives its room
+  if (chatRestore(room)) {
+    // instant repaint from cache; the poll below fetches only the delta from
+    // the cached cursor (since>0 => the untouched incremental path)
+    chatRooms(CHAT_ROOMS_LAST);   // active row flips NOW; the poll refreshes counts
+    pollChat();
+    return;
+  }
+  CHAT_SINCE = 0; chatResetLog(); // fresh room: the reset path repaints from the windowed open
+  $("#chatlog").innerHTML = '<div class="empty">#' + esc(room) +
+    " — no messages yet. the first post creates the channel.</div>";
+  chatRooms(CHAT_ROOMS_LAST); // active row flips NOW; the poll refreshes counts
+  pollChat();
+}
+
+/* the agent→owner beacon, off every poll: badge + title + favicon are the
+   passive (permissionless, phone-visible) signal; a Notification fires once
+   per NEW mention (dedup key = the newest unseen mention's identity, i.e.
+   keyed on the decision, never the render). Missing fields read as 0 —
+   endpoint degraded ⇒ no badge, never an error. */
+function chatSignal(d) {
+  d = d || {};
+  let mentions = d.owner_mentions | 0, unread = d.owner_unread | 0;
+  if (Array.isArray(d.rooms) && d.rooms.length) { // SUM every channel — a post in any room reaches the owner
+    mentions = d.rooms.reduce((n, r) => n + (r.owner_mentions | 0), 0);
+    unread = d.rooms.reduce((n, r) => n + (r.owner_unread | 0), 0);
+  }
+  NAV_CHAT = mentions || unread;
+  NAV_CHAT_MENTION = mentions > 0;
+  renderNav();
+  document.title = NAV_CHAT ? "(" + NAV_CHAT + ") helm" : "helm";
+  faviconDot(NAV_CHAT_MENTION);
+  if (mentions && d.owner_mention_last && d.owner_mention_last !== CHAT_NOTIFY_KEY) {
+    CHAT_NOTIFY_KEY = d.owner_mention_last;
+    notifyOwner(mentions, d.owner_mention_preview || "");
+  }
+  if (!mentions) CHAT_NOTIFY_KEY = ""; // read — the next mention is a fresh decision
+  // read-ack: chat view open + page visible = the owner has SEEN the room
+  if ((d.total | 0) > (d.owner_read | 0) && $("#view-chat").classList.contains("on") && !document.hidden) {
+    post("/api/chat/read", {room: CHAT_ROOM}).catch(() => {});
+  }
+}
+
+const FAVICON = document.querySelector("link[rel=icon]");
+const FAVICON_BASE = FAVICON ? FAVICON.href : "";
+function faviconDot(on) {
+  if (!FAVICON) return;
+  const dotted = FAVICON_BASE.replace("%3C/svg%3E",
+    "%3Ccircle cx='25' cy='7' r='7' fill='%23e8594f'/%3E%3C/svg%3E");
+  const want = on ? dotted : FAVICON_BASE;
+  if (FAVICON.href !== want) FAVICON.href = want;
+}
+
+function notifyOwner(n, preview) {
+  try {
+    if (!("Notification" in window)) return; // orca webview etc. — the title/badge already carry it
+    const fire = () => { try {
+      new Notification("helm chat — @you", {
+        body: preview || (n + " unread mention" + (n === 1 ? "" : "s")),
+        tag: "helm-chat-mention"});  // tag: replace, never stack
+    } catch (e) {} };
+    if (Notification.permission === "granted") fire();
+    else if (Notification.permission === "default")
+      Notification.requestPermission().then(p => { if (p === "granted") fire(); });
+  } catch (e) {}
+}
+
+async function sendReact(div, e) {
+  const name = $("#chatname").value.trim() || "owner";
+  try {
+    await post("/api/chat/react", {room: CHAT_ROOM, emoji: e, name,
+                                   tts: div.dataset.ts, tfrom: div.dataset.from});
+  } catch (err) { toast("react failed: " + err.message); return; }
+  pollChat();
+}
+
+/* ---- reply target: the composer's parent pointer (the row's stable id) ---- */
+let CHAT_REPLY_SEED = "";   // the auto-@ this panel prepended (swap/strip target)
+/* clicking reply seeds the composer with "@author " (slack/discord shape —
+   removable text, the visible face of the reply-wakes-parent delivery).
+   Never duplicates an @author the body already carries; retarget or cancel
+   swaps/strips ONLY the untouched seed, never the owner's own words. */
+function chatSeedMention(author) {
+  const el = $("#chattext");
+  if (CHAT_REPLY_SEED && el.value.startsWith(CHAT_REPLY_SEED))
+    el.value = el.value.slice(CHAT_REPLY_SEED.length);
+  CHAT_REPLY_SEED = "";
+  if (!author) return;
+  const re = new RegExp("(^|\\s)@" + author.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+                        "(?=\\s|$)", "i");
+  if (re.test(el.value)) return;   // already mentioned — never duplicate
+  CHAT_REPLY_SEED = "@" + author + " ";
+  el.value = CHAT_REPLY_SEED + el.value;
+  el.setSelectionRange(el.value.length, el.value.length);
+}
+function chatSetReply(div) {
+  const id = div.dataset.id || "";
+  if (!id) { toast("that message predates row ids — reply by posting normally"); return; }
+  const p = CHAT_BY_ID[id] || {};
+  CHAT_REPLY_TO = id;
+  const strip = $("#chatreply");
+  strip.hidden = false;
+  strip.innerHTML = "replying to <b>" + esc(String(p.from || div.dataset.from || "?")) +
+    '</b><span class="rqt">' + esc(chatSnip(p.text)) +
+    '</span><button id="chatreplyx" title="cancel (Esc)">✕</button>';
+  $("#chatreplyx").onclick = chatClearReply;
+  chatSeedMention(String(p.from || div.dataset.from || "").trim());
+  $("#chattext").focus();
+}
+function chatClearReply() {
+  CHAT_REPLY_TO = null;
+  chatSeedMention("");            // cancel strips the untouched auto-@ too
+  const strip = $("#chatreply");
+  strip.hidden = true; strip.innerHTML = "";
+}
+
+/* ---- @mention completion from the LIVE roster ----
+   Exact tokens only: the owner picks a name that exists, so the mention is one
+   seats.deliverable() will actually match (the miss-class that had a seat
+   answering '--help' to a mention it never got). */
+let CHAT_AC = [], CHAT_ACI = 0;
+function chatAcToken() {
+  const el = $("#chattext"), pos = el.selectionStart == null ? el.value.length : el.selectionStart;
+  const m = /(^|\s)@([A-Za-z0-9._-]*)$/.exec(el.value.slice(0, pos));
+  return m ? {frag: m[2], start: pos - m[2].length - 1, end: pos} : null;
+}
+function chatAcRender() {
+  const t = chatAcToken(), box = $("#chatac");
+  const f = t ? t.frag.toLowerCase() : null;
+  CHAT_AC = t ? CHAT_ROSTER.filter(s => s.toLowerCase().startsWith(f)).slice(0, 8) : [];
+  if (!CHAT_AC.length) { box.hidden = true; box.innerHTML = ""; return; }
+  if (CHAT_ACI >= CHAT_AC.length) CHAT_ACI = 0;
+  box.hidden = false;
+  box.innerHTML = CHAT_AC.map((s, i) => {
+    const p = CHAT_PRESENCE[s] || {};
+    const age = p.last_seen ? chatAgo(Date.now() / 1e3 - p.last_seen) : "";
+    return '<div class="acr ' + esc(p.presence || "") + (i === CHAT_ACI ? " on" : "") +
+      '" data-i="' + i + '"><i></i><span>@' + esc(s) + '</span><span class="acage">' +
+      esc(age) + "</span></div>";
+  }).join("");
+}
+function chatAcPick(i) {
+  const t = chatAcToken(), pick = CHAT_AC[i];
+  if (!t || !pick) return;
+  const el = $("#chattext"), v = el.value;
+  el.value = v.slice(0, t.start) + "@" + pick + " " + v.slice(t.end);
+  const c = t.start + pick.length + 2;
+  el.focus(); el.setSelectionRange(c, c);
+  CHAT_AC = []; $("#chatac").hidden = true; $("#chatac").innerHTML = "";
+}
+
+async function sendChat() {
+  const text = $("#chattext").value.trim();
+  if (!text) return;
+  const name = $("#chatname").value.trim() || "owner";
+  const reply_to = CHAT_REPLY_TO;   // captured before the strip clears
+  localStorage.setItem("helm.chatname", name);
+  $("#chattext").value = "";
+  chatClearReply();
+  try { await post("/api/chat", reply_to ? {room: CHAT_ROOM, text, name, reply_to}
+                                         : {room: CHAT_ROOM, text, name}); }
+  catch (e) { toast("chat post failed: " + e.message); $("#chattext").value = text; return; }
+  pollChat();
+}
+
+function initChat() {
+  $("#chatname").value = localStorage.getItem("helm.chatname") || "owner";
+  if (!CHAT_WIRED) {
+    CHAT_WIRED = true;
+    $("#chatsend").onclick = sendChat;
+    $("#chattext").addEventListener("input", () => { CHAT_ACI = 0; chatAcRender(); });
+    $("#chattext").addEventListener("keydown", ev => {
+      if (CHAT_AC.length) {          // the completion menu owns these keys first
+        if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+          CHAT_ACI = (CHAT_ACI + (ev.key === "ArrowDown" ? 1 : CHAT_AC.length - 1)) % CHAT_AC.length;
+          chatAcRender(); ev.preventDefault(); return;
+        }
+        if (ev.key === "Enter" || ev.key === "Tab") { chatAcPick(CHAT_ACI); ev.preventDefault(); return; }
+        if (ev.key === "Escape") { CHAT_AC = []; $("#chatac").hidden = true; ev.preventDefault(); return; }
+      }
+      if (ev.key === "Escape") { chatClearReply(); return; }
+      if (ev.key === "Enter") sendChat();
+    });
+    $("#chatac").addEventListener("click", ev => {
+      const r = ev.target.closest(".acr");
+      if (r) chatAcPick(+r.dataset.i);
+    });
+    $("#chatjump").onclick = () => {
+      const log = $("#chatlog");
+      log.scrollTop = log.scrollHeight; CHAT_AWAY = 0; chatJumpSync();
+    };
+    $("#chatlog").addEventListener("scroll", () => {
+      chatJumpSync();
+      // near the top with history above -> pull the prior page (builders'
+      // SCROLL_THRESHOLD parity; single-flight guarded inside chatLoadOlder)
+      if ($("#chatlog").scrollTop < 80) chatLoadOlder();
+    });
+    $("#chatlog").addEventListener("click", ev => {   // react / reply / expand / jump (delegated)
+      const q = ev.target.closest(".cquote[data-jump]");
+      if (q) { chatJumpTo(q.dataset.jump); return; }
+      const n = ev.target.closest(".creplies");
+      if (n && n.textContent) { chatJumpReplies(n.closest(".chatmsg")); return; }
+      const more = ev.target.closest(".cmore");
+      if (more) {
+        const t = more.previousElementSibling;
+        const open = t.classList.toggle("clamp");
+        more.textContent = open ? "show more ▾" : "show less ▴";
+        return;
+      }
+      const b = ev.target.closest(".rbtn");
+      if (!b) return;
+      if (b.classList.contains("rbreply")) chatSetReply(b.closest(".chatmsg"));
+      else sendReact(b.closest(".chatmsg"), b.dataset.e);
+    });
+    $("#chatroomlist").addEventListener("click", ev => { // channel switch (delegated)
+      const mh = ev.target.closest("#crmeldhead");  // the MELDS header IS the toggle
+      if (mh) {
+        CHAT_MELDS_FOLD = !CHAT_MELDS_FOLD;
+        if (CHAT_MELDS_FOLD) localStorage.setItem("helm.meldsfold", "1");
+        else localStorage.removeItem("helm.meldsfold");
+        chatRooms(CHAT_ROOMS_LAST);   // repaint from the last poll, no refetch
+        return;
+      }
+      const dh = ev.target.closest("#crdmhead");    // the DMS header IS the toggle
+      if (dh) {
+        CHAT_DMS_FOLD = !CHAT_DMS_FOLD;
+        if (CHAT_DMS_FOLD) localStorage.setItem("helm.dmsfold", "1");
+        else localStorage.removeItem("helm.dmsfold");
+        chatRooms(CHAT_ROOMS_LAST);
+        return;
+      }
+      const qh = ev.target.closest(".crquiet");     // quiet group: expand/fold in place
+      if (qh) {
+        const k = qh.dataset.qgroup;
+        if (CHAT_QUIET_OPEN.has(k)) CHAT_QUIET_OPEN.delete(k);
+        else CHAT_QUIET_OPEN.add(k);
+        chatRooms(CHAT_ROOMS_LAST);
+        return;
+      }
+      // The seat-count chip EXPANDS IN PLACE and must not navigate: peeking at
+      // who is in another room is not a request to leave the one you are
+      // reading. Checked before .crm because the chip lives inside it.
+      const chip = ev.target.closest(".crsn");
+      if (chip) {
+        const room = chip.dataset.seats;
+        if (CHAT_ROOMS_OPEN.has(room)) CHAT_ROOMS_OPEN.delete(room);
+        else CHAT_ROOMS_OPEN.add(room);
+        chatRooms(CHAT_ROOMS_LAST);   // repaint from the last poll, no refetch
+        ev.stopPropagation();
+        return;
+      }
+      const r = ev.target.closest(".crm");
+      if (r) chatSwitch(r.dataset.room);
+    });
+    $("#chatnewroom").addEventListener("keydown", ev => {
+      if (ev.key !== "Enter") return;
+      chatSwitch($("#chatnewroom").value); // first post auto-creates it server-side
+      $("#chatnewroom").value = "";
+    });
+  }
+  // rows kept landing while the view was hidden (the always-on poll) — jump
+  // to the newest on open, then let the ack (chatSignal) clear the badge.
+  pollChat().then(() => { const log = $("#chatlog"); log.scrollTop = log.scrollHeight; });
+}
+// the poll never gates on the chat view: the badge/notify beacon runs on
+// EVERY tab from page load (owner-notify law — a GUI-first owner on the
+// sessions tab must still see an @mention land).
+/* ---------- SSE doorbell (poll -> push, REARCH leg 2) ----------
+   The push leg: /api/events emits a `chat` doorbell whenever ANY room file
+   changes; the handlers just run the EXISTING cursor reads (pollChat's
+   ?since= catch-up), so the read endpoints stay the one render truth. While
+   the stream is healthy the 2s timers stretch to a 10s fallback heartbeat
+   (ES_LIVE gate below); on stream error EventSource auto-reconnects and the
+   timers snap back to 2s — belt and braces, never a dead UI. NOTE: this block
+   sits ABOVE the first esStretch() call site (the chat timer right below) —
+   a const is TDZ-dead until its line runs (caught live: the timer executed
+   first and killed the whole script). pollDregg/pollRoster are hoisted
+   function declarations referenced only inside closures, so their later
+   definition is fine. */
+let ES = null, ES_LIVE = false, ES_TICKS = 0;
+function esCatchUp() {
+  pollChat();                                      // instant cursor catch-up
+  pollDregg();                                     // a signed post = a turn
+  if ($("#view-roster").classList.contains("on")) pollRoster();
+}
+function esConnect() {
+  if (!window.EventSource) return;                 // no ES -> timers carry it
+  try { ES = new EventSource("/api/events"); } catch (e) { return; }
+  // onopen catches up EVERY connect — initial AND each auto-reconnect: any
+  // doorbell that rang while disconnected is covered by one cursor read
+  // (the server also rings immediately on a stale Last-Event-ID; belt+braces)
+  ES.onopen = () => { ES_LIVE = true; esCatchUp(); };
+  ES.onerror = () => { ES_LIVE = false; };         // ES reconnects by itself
+  ES.addEventListener("chat", esCatchUp);
+}
+// while the doorbell is live, a 2s timer only ACTS every 5th tick (10s
+// heartbeat); the moment the stream drops it acts every tick again
+const esStretch = fn => () => { if (ES_LIVE && (++ES_TICKS % 5)) return; fn(); };
+
+/* THE CARD BOOTS HERE, NOT BESIDE ITS OWN DEFINITION. @codex measured the
+   outage in a browser: the synchronous first paint ran as a top-level
+   statement ~50 lines ABOVE `let NAV_ACC`, so renderNav read a binding still
+   in its temporal dead zone. Chrome raised ReferenceError, ABORTED THE WHOLE
+   SCRIPT, and pollLr never ran — /api/lr served healthy data the entire time
+   while the owner's 390px card sat on NOT READ YET past 30s. A dead page is
+   the most confident wrong answer available.
+
+   "After every declaration" is the only position that stays true without
+   re-deriving the dependency graph each time someone adds a `let`. */
+lrShow({pending: true});
+setInterval(pollLr, LR_POLL_MS);
+pollLr();
+readyShow({pending: true});
+setInterval(pollReady, READY_POLL_MS);
+pollReady();
+setInterval(esStretch(pollChat), 2000);   // 10s heartbeat while the SSE doorbell is live
+pollChat();
+// the owner decision queue: first paint now (feeds the home badge AND the
+// review-tab section — hidden DOM renders fine), then a slow refresh (cards
+// arrive at human cadence — 45s matches pollLr) + the manual reload button
+$("#odqReload").onclick = odqInit;
+setInterval(odqInit, 45000);
+odqInit();
+

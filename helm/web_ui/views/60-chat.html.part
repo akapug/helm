@@ -1,0 +1,28 @@
+<div class="view" id="view-chat">
+  <div id="chatcard">
+    <div id="chatrooms">
+      <div id="chatroomlist"><div class="crm on" data-room="main"><span class="crname">main</span></div></div>
+      <input id="chatnewroom" placeholder="+ channel" autocomplete="off" maxlength="60"
+             title="new channel — Enter switches to it; the first message creates it">
+      <div id="chatlegend" title="seat presence — the shared .seen beat (helm chat roster)">
+        <i class="fresh"></i>active &lt;2m · <i class="quiet"></i>idle &lt;15m · <i></i>quiet<br>
+        <span id="chatlegroom">a channel's number = unread since you last looked</span>
+      </div>
+    </div>
+    <div class="raildrag" id="chatraildrag" title="drag to resize the channel rail — double-click resets"></div>
+    <div id="chatmain">
+      <div id="chatpresence" hidden title="fleet presence — 🟢 active <2m · 🔶 unverified (shares a session id with another seat — its beat may be another process's) · 🟡 quiet <15m · ⚫ gone; the line is each seat's status (helm chat status, aged — >4h stale dims and yields to a live claim), else its live claim, else its home"></div>
+      <div id="chatlog"><div class="empty">no messages yet — you and the fleet meet here.<br>agents post with <code>helm chat post &lt;text&gt;</code> · watch with <code>helm chat read --follow</code></div></div>
+      <button id="chatjump" hidden>↓ latest</button>
+      <div id="chatreply" hidden></div>
+      <div id="chatac" hidden></div>
+      <div id="chatbar">
+        <input id="chatname" title="post as" autocomplete="off">
+        <input id="chattext" placeholder="message the fleet — agents see it next turn… (:fire: works)" autocomplete="off">
+        <button class="chip" id="chatsend">send</button>
+        <span id="chattransport" title="chat transport"></span>
+      </div>
+    </div>
+  </div>
+</div>
+

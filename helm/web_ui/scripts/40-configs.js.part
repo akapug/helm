@@ -1,0 +1,62 @@
+/* ================= configs view (ported from the predecessor UI, behavior-preserving) =================
+   The cwd tree + homes (top of the cascade) on the left; the detail pane on the
+   right: files at the selection, the resolved cascade (what a seat here loads),
+   the safety-first editor (backup → validate → atomic via POST /api/configs/file),
+   MCP entry quick-ops, backups + one-click restore. Mutations ride post() (bearer
+   TOKEN). helm addition beyond the predecessor: a physics-diff panel on home selection. */
+const CFG = {tree: null, homes: null, harness: "claude", home: null, ch: "all", loaded: false, openDirs: new Set(), sel: null};
+const cfgPost = (url, body) => post(url, body).catch(e => ({error: String(e.message || e)}));
+/* ---------- store review: candidate + provisional owner queue ----------
+   Owner canon: technical auto-learns may go PROVISIONALLY LIVE once a
+   cross-family /x review clears them; the owner still browses/approves/rejects
+   here in the web UI. Approve -> confirm, Reject -> reject — both route through
+   the SAME store functions the CLI calls (one writer path). */
+const SREV = {loaded: false};
+async function srevInit(force) {
+  if (SREV.loaded && !force) return;
+  $("#storerevlist").innerHTML = '<div class="empty">loading review queue…</div>';
+  try {
+    srevRender(await j("/api/store/review"));
+    SREV.loaded = true;
+  } catch (e) { $("#storerevlist").innerHTML = '<div class="empty">✗ review load failed: ' + esc(e.message) + '</div>'; }
+}
+function srevRender(d) {
+  const host = $("#storerevlist"), meta = $("#storerevmeta");
+  if (!d || d.unavailable) { host.innerHTML = '<div class="empty">store review unavailable</div>'; meta.textContent = "unavailable"; return; }
+  const rows = Array.isArray(d.entries) ? d.entries : [], c = d.counts || {};
+  meta.textContent = rows.length
+    ? `${c.candidate || 0} candidate (fires nothing) · ${c.provisional || 0} provisional (fires tagged) — approve to ratify, reject to retire`
+    : "queue clear — every entry is owner-ratified";
+  if (!rows.length) { host.innerHTML = '<div class="empty">nothing awaiting review — no candidate or provisional entries</div>'; return; }
+  host.innerHTML = rows.map(srevRow).join("");
+  host.querySelectorAll(".srevrow").forEach(el => {
+    const id = el.dataset.id, type = el.dataset.type;
+    el.querySelector(".srevok").onclick = () => srevAct("/api/store/confirm", {id, type}, el, "approved");
+    el.querySelector(".srevno").onclick = () => srevAct("/api/store/reject",
+      {id, type, reason: el.querySelector(".srevreason").value.trim()}, el, "rejected");
+  });
+}
+function srevRow(r) {
+  const day = s => s ? " · " + esc(String(s).slice(0, 10)) : "";
+  const xrev = r.xrev_by
+    ? `<span title="a cross-family review was attested">xrev ✓ ${esc(r.xrev_by)}${day(r.xrev_ts)}</span>`
+    : `<span title="no cross-family review yet — a candidate fires nothing until xrev-cleared">xrev ✗ not cleared</span>`;
+  return `<div class="srevrow" data-id="${esc(r.id)}" data-type="${esc(r.type)}">`
+    + `<div class="srevtop"><span class="srevbadge ${esc(r.status)}">${esc(r.status)}</span>`
+    + `<span class="srevtype">${esc(r.type)}</span><span class="srevid">${esc(r.id)}</span></div>`
+    + `<div class="srevstmt">${esc(r.statement)}</div>`
+    + `<div class="srevmeta"><span>captured-by ${esc(r.source || "?")}${day(r.captured_ts)}</span>`
+    + (r.scope ? `<span>${esc(r.scope)}</span>` : "") + xrev + `</div>`
+    + `<div class="srevacts"><button class="chip srevok">✓ approve</button>`
+    + `<input class="srevreason" placeholder="reject reason (optional)…" autocomplete="off">`
+    + `<button class="chip srevno">✕ reject</button></div></div>`;
+}
+async function srevAct(url, body, el, verb) {
+  el.style.opacity = ".5";
+  try {
+    await post(url, body);
+    toast(verb + " " + body.id);
+    srevInit(true);
+  } catch (e) { el.style.opacity = "1"; toast("✗ " + e.message, 4000); }
+}
+

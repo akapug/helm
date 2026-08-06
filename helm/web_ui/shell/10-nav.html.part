@@ -1,0 +1,26 @@
+/* ---------- toast (theme + tray toggles now live in the nav) ---------- */
+.hint{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:var(--r);font:var(--f1) var(--mono);opacity:0;transition:.2s;pointer-events:none;z-index:70;max-width:92vw;word-break:break-all}
+.hint.show{opacity:.96}
+</style>
+
+<nav id="nav">
+  <span class="brand"><span class="mark">⎈</span>helm</span>
+  <div class="navtabs">
+  <button class="navtab on" data-v="helm">home</button>
+  <button class="navtab" data-v="quota">quota</button>
+  <button class="navtab" data-v="boxes">boxes</button>
+  <button class="navtab" data-v="sessions">sessions</button>
+  <button class="navtab" data-v="configs">configs</button>
+  <button class="navtab" data-v="work">work</button>
+  <button class="navtab" data-v="chat">chat</button>
+  <button class="navtab" data-v="roster">roster</button>
+  <button class="navtab" data-v="ledger">ledger</button>
+  </div>
+  <span class="spacer"></span>
+  <div class="stats" id="navstats"></div>
+  <button class="icon" id="themetog" title="toggle light / dark">◐</button>
+  <button class="icon" id="trayBtn" title="team tray — collect seats">⊞</button>
+</nav>
+
+<div class="wrap">
+
