@@ -25,12 +25,16 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import home, inject, pk, store  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
             "HELM_CACHE_DIR", "MELD_CACHE_DIR",
+            # the chat dir: popped AND set per-test, so the council-streak
+            # reflex counts this suite's rooms and never the live fleet's
+            "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             # the comparison backend's activation env — popped so the WHOLE suite
             # is hermetic (a stray HELM_CF_ENDPOINT must never let a test reach out)
             "HELM_CF_ENDPOINT", "MELD_CF_ENDPOINT", "HELM_CF_TOKEN", "MELD_CF_TOKEN",
@@ -48,6 +52,15 @@ class InjectBase(unittest.TestCase):
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
         os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
+        # THE CHAT DIR TOO, or these tests read the LIVE fleet's rooms. The
+        # council-streak reflex counts REAL ping-pong, so the moment a real
+        # seat had three async rounds with a peer, gather() began emitting
+        # "REFLEX: 3 async rounds with <seat>..." into tests asserting on empty
+        # output — a suite whose result depends on what the fleet happened to
+        # be doing while it ran. Found when a live review ping-pong turned
+        # three inject tests red; same class as the ambient-identity
+        # leak in test_web_chat, and it had been latent all along.
+        os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.makedirs(os.environ["HELM_ADOPTED_DIR"])
 
     def tearDown(self):
@@ -168,6 +181,102 @@ class SalienceTest(InjectBase):
         rc, out, _ = self.run_inject([], stdin_text="tune the fluxcap")
         self.assertEqual(rc, 0)
         self.assertIn("PRIOR 0.80 jit-a: a flux fact", out)
+
+
+class GlossTest(InjectBase):
+    """A GLOSS FIRES; THE FULL ENTRY STAYS ON DISK.
+
+    LINE_CAP's comment claimed that for as long as it has existed, and there
+    was no gloss — the renderer read `statement` and truncated it. A truncation
+    is not a gloss, it is a severed sentence. MEASURED on a live
+    store: three of the owner's five always-on rules fired at exactly 400 bytes,
+    dropping 46-57% of each and ending mid-clause, while the other two could not
+    fire at all because 3 x LINE_CAP == PINNED_BUDGET. The owner's only way to
+    make a rule fit was to REWRITE THEIR OWN CANON shorter — trading the durable
+    record for the firing line."""
+
+    def test_the_gloss_fires_and_the_full_statement_survives(self):
+        long = "L" * 900
+        store.write_prior({"id": "g1", "statement": long, "confidence": "1.0",
+                           "pin": "true", "gloss": "the short line that fires"})
+        e = next(x for x in store.load_all() if x["id"] == "g1")
+        self.assertEqual(len(e["statement"]), 900,
+                         "the full statement is the durable record and must survive")
+        line = inject._entry_line(e)
+        self.assertEqual(line, "PREMISE g1: the short line that fires")
+        self.assertFalse(line.endswith("…"), "a gloss fires WHOLE, never cut")
+
+    def test_without_a_gloss_nothing_changes(self):
+        """The un-gloss'd path is untouched — a long statement still truncates,
+        so this cannot silently alter every entry that has no gloss."""
+        long = "L" * 900
+        store.write_prior({"id": "g2", "statement": long, "confidence": "1.0",
+                           "pin": "true"})
+        e = next(x for x in store.load_all() if x["id"] == "g2")
+        line = inject._entry_line(e)
+        self.assertEqual(len(line), inject.LINE_CAP)
+        self.assertTrue(line.endswith("…"))
+
+    def test_an_oversized_gloss_never_reaches_the_renderer_but_is_cut_if_it_does(self):
+        """TWO RAILS, and the first one changed on review.
+
+        This test used to assert that an oversized gloss was silently CUT, and
+        a cross-family review refuted the premise: accepting a gloss the injector then truncates
+        mid-clause recreates the exact severed-sentence failure the gloss exists
+        to prevent, one remove away and quietly. So the WRITER now REFUSES it
+        with the limit measured on the real rendered line.
+
+        The renderer still truncates defensively, because a hand-authored file
+        or an entry written before the refusal existed can still carry one, and
+        the budget is the budget."""
+        with self.assertRaises(ValueError) as cm:      # rail 1: never written
+            store.write_prior({"id": "g3", "statement": "short",
+                               "confidence": "1.0", "pin": "true",
+                               "gloss": "G" * 900})
+        self.assertIn("gloss too long", str(cm.exception))
+        e = {"type": "prior", "id": "g3b", "class": "certain",
+             "statement": "short", "gloss": "G" * 900}   # rail 2: got in anyway
+        line = inject._entry_line(e)
+        self.assertEqual(len(line), inject.LINE_CAP)
+        self.assertTrue(line.endswith("…"))
+
+    def test_an_oversized_steer_is_truncated_at_STEER_CAP_with_an_ellipsis(self):
+        """Reflex steers were uncapped: a 943B steer wall reaches the inject
+        verbatim every turn (pack norm 101-137B; reflex.py:44 'steers are
+        terse FACTS'). The renderer caps it at STEER_CAP with an ellipsis —
+        over the cap it is cut, under it it passes through untouched
+        (mutation: over -> truncated, under -> untouched)."""
+        import sys as _sys
+        from helm.inject import _common
+        import helm.inject._whisper as _wi  # noqa: F401 — binds the module in sys.modules
+        _whisper_mod = _sys.modules["helm.inject._whisper"]  # the package's
+        # `from ._whisper import _whisper` shadows the module attr with the fn
+        over = "REFLEX: " + ("a null from a scan is a fact about your query. " * 40)
+        under = "REFLEX: a null from a scan is a fact about your query, not the world."
+        self.assertGreater(len(over), _common.STEER_CAP)
+        self.assertLessEqual(len(under), _common.STEER_CAP)
+        capped_over = _whisper_mod._cap_steer(over)
+        self.assertLessEqual(len(capped_over), _common.STEER_CAP)
+        self.assertTrue(capped_over.endswith("…"))
+        self.assertEqual(_whisper_mod._cap_steer(under), under)
+
+    def test_a_glossed_lane_fits_where_the_truncated_one_could_not(self):
+        """The whole point, end to end: five rules that cannot all fire when
+        each renders at LINE_CAP, all firing once glossed."""
+        for i in range(5):
+            store.write_prior({"id": "p%d" % i, "statement": "S" * 900,
+                               "confidence": "1.0", "pin": "true"})
+        ungloss = [inject._entry_line(e) for e in store.pinned()]
+        self.assertGreater(sum(len(l) for l in ungloss), inject.PINNED_BUDGET,
+                           "un-glossed, the lane cannot hold all five")
+        for i in range(5):
+            e = next(x for x in store.load_all() if x["id"] == "p%d" % i)
+            e["gloss"] = "rule %d in one short line" % i
+            store.write_prior(e)
+        glossed = [inject._entry_line(e) for e in store.pinned()]
+        self.assertEqual(len(glossed), 5)
+        self.assertLessEqual(sum(len(l) for l in glossed), inject.PINNED_BUDGET,
+                             "glossed, every rule reaches the seat")
 
 
 class ShapeTest(InjectBase):
@@ -473,6 +582,107 @@ class HookJsonTest(InjectBase):
         self.assertIsNone(inject.project_for_cwd(outer + "X"))
         self.assertEqual(inject.project_for_cwd(outer), "outer")
 
+    def test_a_LANE_WORKTREE_resolves_to_its_repos_project(self):
+        """`helm work claim` mints rooms at <repo>-wt/<lane>, a SIBLING of the
+        repo path, so no registered prefix matched and the nearest ANCESTOR
+        project won instead.
+
+        Measured live: every helm lane worktree resolved to the
+        UMBRELLA project, which registers the parent directory holding every
+        repo. Four surfaces read this
+        one derivation — turn premises and reflexes, `helm store add` project
+        inference, the handoff journal shelf, and dispatch scoping — so a seat
+        working in the room it is REQUIRED to claim got another project's
+        answer for all four, and `helm handoff check` reported "contract
+        satisfied" against the wrong shelf. It fails toward SILENCE, which is
+        why it survived so long."""
+        repo = os.path.join(self.tmp, "repos", "proj")
+        parent = os.path.join(self.tmp, "repos")
+        self.seed_registry(proj=repo, umbrella=parent)
+        # MUST-HIT CONTROL: the repo itself still resolves, so a None below
+        # would mean "not matched" rather than "registry unreadable".
+        self.assertEqual(inject.project_for_cwd(repo), "proj")
+        for room in (repo + "-wt",
+                     os.path.join(repo + "-wt", "some-lane"),
+                     os.path.join(repo + "-wt", "peeks", "abc123")):
+            with self.subTest(room=room):
+                self.assertEqual(inject.project_for_cwd(room), "proj",
+                                 "a lane worktree fell through to the "
+                                 "ancestor project")
+
+    def test_a_LOOKALIKE_sibling_is_not_captured_by_the_worktree_rule(self):
+        """The suffix is matched with its separator. A sibling repo whose name
+        merely starts the same must not be swallowed, or the fix would trade a
+        silent mis-scope for a louder one."""
+        repo = os.path.join(self.tmp, "repos", "proj")
+        parent = os.path.join(self.tmp, "repos")
+        self.seed_registry(proj=repo, umbrella=parent)
+        self.assertEqual(inject.project_for_cwd(repo + "-wt"), "proj")
+        for stranger in (repo + "-wtx", repo + "ect", repo + "-widget"):
+            with self.subTest(stranger=stranger):
+                self.assertEqual(inject.project_for_cwd(stranger), "umbrella",
+                                 "a lookalike sibling was captured")
+
+    def test_a_REGISTERED_project_outranks_a_derived_worktree_root(self):
+        """A repo genuinely NAMED "<x>-wt" beside "<x>" matches both rules at
+        the same depth, and the row someone actually registered is the one that
+        means it.
+
+        I found this by writing the case down as untested in a review request
+        and then measuring it instead of handing it over: before the rank, the
+        winner depended on registry ITERATION ORDER, which is the kind of
+        answer that is right until someone adds a project."""
+        real = os.path.join(self.tmp, "repos", "proj")
+        twin = real + "-wt"                       # a real repo, really named that
+        self.seed_registry(proj=real, twin=twin)
+        # MUST-HIT CONTROL: both rows resolve at all.
+        self.assertEqual(inject.project_for_cwd(real), "proj")
+        for cwd in (twin, os.path.join(twin, "sub")):
+            with self.subTest(cwd=cwd):
+                self.assertEqual(inject.project_for_cwd(cwd), "twin",
+                                 "a derived worktree root outranked a "
+                                 "registered project at the same depth")
+
+    def test_the_derived_rule_still_applies_where_nothing_is_registered(self):
+        """The other direction: without a twin, the worktree rule must still
+        carry the room to its repo — otherwise the precedence fix would have
+        quietly undone the thing it was added to."""
+        real = os.path.join(self.tmp, "repos", "solo")
+        parent = os.path.join(self.tmp, "repos")
+        self.seed_registry(solo=real, umbrella=parent)
+        self.assertEqual(
+            inject.project_for_cwd(os.path.join(real + "-wt", "lane")), "solo")
+
+    def test_a_THREE_DEEP_nest_composes_without_a_special_case(self):
+        """Longest-prefix and the registration rank together, on the shape a
+        real machine has: an umbrella over repos, a repo, and a repo nested
+        inside it — each with its own worktree root.
+
+        Pinned rather than probed. On the sibling lane my mutation matrix
+        killed three of five and TWO SURVIVED, because I had proven those
+        behaviours in a shell probe and never put them in the suite.
+        Correct-but-untested is how a fix gets undone by someone with no way
+        to know it was deliberate."""
+        umbrella = os.path.join(self.tmp, "d")
+        outer = os.path.join(umbrella, "outer")
+        inner = os.path.join(outer, "inner")
+        self.seed_registry(umbrella=umbrella, outer=outer, inner=inner)
+        # MUST-HIT CONTROL: the deepest registered path still wins outright,
+        # so the worktree arms below are additions and not a replacement.
+        self.assertEqual(inject.project_for_cwd(os.path.join(inner, "sub")),
+                         "inner")
+        cases = (
+            (inner + "-wt", "inner"),                       # worktree root
+            (os.path.join(inner + "-wt", "lane"), "inner"),  # deepest project's
+            (os.path.join(outer + "-wt", "lane"), "outer"),  # not the umbrella
+            # a path that merely LOOKS nested, inside outer's worktree
+            (os.path.join(outer + "-wt", "inner", "sub"), "outer"),
+            (os.path.join(umbrella, "elsewhere"), "umbrella"),
+        )
+        for cwd, want in cases:
+            with self.subTest(cwd=cwd):
+                self.assertEqual(inject.project_for_cwd(cwd), want)
+
     def test_unregistered_cwd_falls_back_to_global(self):
         self.seed_registry(p1=os.path.join(self.tmp, "repos", "p1"))
         self.plant_pinned("g-pin", "global truth")
@@ -521,8 +731,9 @@ class HookJsonTest(InjectBase):
 
 class SessionCooldownTest(InjectBase):
     """The habituation guard extended to the JIT lane: per-session suppression
-    at _global/.state/inject-seen/<session>.json, COOLDOWN_TURNS window, 2x
-    score escape, pinned/reflex exempt, freed cap slots, fail-open."""
+    at _global/.state/inject-seen/<session>.json, session-long (NO turn
+    window — a seat forgets at compaction), 2x score escape,
+    pinned/reflex exempt, freed cap slots, fail-open."""
 
     PROMPT = "tune the fluxcap"
 
@@ -544,33 +755,62 @@ class SessionCooldownTest(InjectBase):
         with open(inject._seen_path(session), encoding="utf-8") as f:
             return json.load(f)
 
-    def test_fires_then_cools_then_refires_after_window(self):
+    def test_fires_then_stays_sent_for_the_whole_session(self):
+        """WAS test_fires_then_cools_then_refires_after_window, and the change
+        of name IS the change of contract. The 15-turn window is gone: a fired
+        entry stays suppressed for the life of the session, because a seat
+        forgets at COMPACTION and not on a timer.
+
+        Measured on the fire-ledger before this lane: 6,949 of 7,375 JIT
+        re-deliveries were that window merely expiring (94.2%), against 426
+        real score escapes — 66.9% of the entire JIT lane, ~622k tokens of
+        content the seats already had in context. The old test asserted turn
+        17 re-fires; that re-fire was the defect."""
         self.plant_jit("jit-a", "a flux fact", "fluxcap")
         first = inject.gather(self.PROMPT, session="s1")
         self.assertEqual(first["jit"], ["PRIOR 0.80 jit-a: a flux fact"])
         self.assertEqual(self.seen()["fired"]["jit-a"][0], 1)
-        for i in range(inject.COOLDOWN_TURNS):  # turns 2..16: cooled
+        for i in range(40):  # far past where the old window reopened
             self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"], [],
-                             "turn %d must be cooled" % (i + 2))
+                             "turn %d must stay suppressed" % (i + 2))
         r = self.rows()[-1]  # a suppressed-to-silence turn is still measurable
         self.assertIs(r["silent"], True)
         self.assertEqual(r["suppressed"], ["jit-a"])
         self.assertEqual(r["session"], "s1")
-        again = inject.gather(self.PROMPT, session="s1")  # turn 17: window past
-        self.assertEqual(again["jit"], first["jit"])
-        self.assertNotIn("suppressed", self.rows()[-1])
-        self.assertEqual(self.seen()["fired"]["jit-a"][0], 17)  # re-recorded
+        self.assertEqual(self.seen()["fired"]["jit-a"][0], 1,
+                         "the record names the ORIGINAL fire, not a rolling one")
 
-    def test_cooldown_counts_turns_not_fires(self):
+    def test_the_turn_counter_still_advances_on_suppressed_turns(self):
+        """WAS test_cooldown_counts_turns_not_fires. The turn counter no longer
+        gates suppression, but it still has to COUNT — it dates every record
+        and drives the '--explain: fired Nt ago' line."""
         self.plant_jit("jit-a", "a flux fact", "fluxcap")
-        inject.gather(self.PROMPT, session="s1")  # fires, turn 1
-        for _ in range(inject.COOLDOWN_TURNS - 1):  # turns 2..15: silent, still counted
-            self.assertEqual(inject.gather("unrelated words", session="s1")["jit"], [])
-        self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"], [],
-                         "turn 16 is inside the window")
+        # POSITIVE CONTROL: the entry provably fires here, so the empty lanes
+        # below are suppression and an off-topic prompt — not an unplanted store.
         self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"],
-                         ["PRIOR 0.80 jit-a: a flux fact"], "turn 17 refires")
+                         ["PRIOR 0.80 jit-a: a flux fact"])
+        for _ in range(16):
+            self.assertEqual(inject.gather("unrelated words", session="s1")["jit"], [])
         self.assertEqual(self.seen()["turn"], 17)
+        self.assertEqual(self.seen()["fired"]["jit-a"][0], 1)
+
+    def test_only_compaction_or_a_score_escape_brings_a_jit_entry_back(self):
+        """THE TWO DOORS THAT REMAIN, and the reason removing the window is
+        safe. forget_session is the compaction leg — the seat provably lost
+        the content, so it must get it back. Without this arm a session-long
+        suppression would go permanently silent for a seat that just lost
+        everything it was suppressing, which is strictly worse than the waste
+        it replaces."""
+        from helm.inject import _ledger
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        first = inject.gather(self.PROMPT, session="s1")
+        self.assertEqual(first["jit"], ["PRIOR 0.80 jit-a: a flux fact"])
+        for _ in range(20):
+            self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"], [])
+        _ledger.forget_session("s1")          # what the compact hook calls
+        self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"],
+                         first["jit"],
+                         "a compacted seat lost it and must get it back")
 
     def test_cross_session_independence(self):
         self.plant_jit("jit-a", "a flux fact", "fluxcap")
@@ -589,7 +829,25 @@ class SessionCooldownTest(InjectBase):
         self.assertFalse(os.path.exists(inject._seen_dir()),
                          "plain stdin must write no seen-state")
 
-    def test_2x_score_escape_refires_through_the_window(self):
+    def test_the_fire_map_is_never_evicted(self):
+        """A cross-family review found: every record in this map is ACTIVELY
+        SUPPRESSING content the seat still has, so ANY eviction silently
+        re-enables delivery of whatever it drops. The first version capped it at
+        2000 and its own test asserted the oldest fires were evicted — which is
+        the same defect this lane removes, moved to the Nth distinct id.
+
+        Nothing needs to bound it: the keys are STORE ENTRY IDS, so the map
+        cannot outgrow the store's cardinality, and forget_session drops the
+        whole file at every context boundary."""
+        from helm.inject import _ledger
+        fired = {"id-%05d" % i: [i + 1, 0.5] for i in range(5000)}
+        _ledger._seen_save("s1", {"turn": 5000, "fired": fired, "pinned": None})
+        kept = self.seen()["fired"]
+        self.assertEqual(len(kept), 5000, "a save must never drop a live record")
+        self.assertIn("id-00000", kept, "the OLDEST fire is still suppressing")
+        self.assertIn("id-04999", kept)
+
+    def test_2x_score_escape_refires_through_suppression(self):
         self.plant_jit("jit-a", "a flux fact", "fluxcap,quantum")
         inject.gather(self.PROMPT, session="s1")  # fires: score 0.8 (fluxcap df=1)
         self.assertEqual(inject.gather(self.PROMPT, session="s1")["jit"], [])
@@ -600,7 +858,17 @@ class SessionCooldownTest(InjectBase):
         # and the refreshed record cools it again, even at the higher score
         self.assertEqual(inject.gather("tune the fluxcap quantum", session="s1")["jit"], [])
 
-    def test_pinned_and_reflex_lanes_exempt(self):
+    def test_the_pinned_lane_is_sent_once_and_reflex_stays_exempt(self):
+        """CONTRACT CHANGE, owner-asked: the pinned lane was
+        cooldown-EXEMPT ("so every agent warms from the profile on every
+        turn") and that exemption is what made it 41.0% of helm's injection at
+        1,147 B/turn — 1,157 of those bytes byte-identical every prompt,
+        re-sent 444 times in one measured session.
+
+        It now fires ONCE per session-with-context. REFLEX STAYS EXEMPT: a
+        reflex fires on a signal live THIS turn, so suppressing it would
+        silence the steer at the moment it applies — a different lane with a
+        different contract."""
         from helm import reflex
         self.plant_pinned("pin-a", "always truth")
         self.plant_jit("jit-a", "a flux fact", "fluxcap")
@@ -608,10 +876,211 @@ class SessionCooldownTest(InjectBase):
                       "signal": "prompt", "pattern": "fluxcap"})
         first = inject.gather(self.PROMPT, session="s1")
         second = inject.gather(self.PROMPT, session="s1")
-        self.assertEqual(second["pinned"], first["pinned"])  # exempt
-        self.assertEqual(second["reflex"], ["REFLEX: flux steer"])  # exempt
+        # POSITIVE CONTROL, unconditional: the lane really did fire on turn 1,
+        # so the empty second turn is suppression and not an unplanted store.
+        self.assertTrue(first["pinned"])
+        self.assertEqual(second["pinned"], [], "sent once, not every turn")
+        row = self.rows()[-1]
+        self.assertEqual(row["suppressed_pinned"], ["pin-a"])
+        self.assertEqual(row["suppressed_bytes"]["pinned"],
+                         sum(len(line) for line in first["pinned"]))
+        self.assertEqual(second["reflex"], ["REFLEX: flux steer"],
+                         "a reflex fires on a LIVE signal — still exempt")
         self.assertEqual((first["jit"], second["jit"]),
                          (["PRIOR 0.80 jit-a: a flux fact"], []))
+
+    def test_changed_pinned_content_refires_within_the_same_session(self):
+        self.plant_pinned("pin-a", "first truth")
+        first = inject.gather(self.PROMPT, session="s1")
+        self.assertIn("first truth", first["pinned"][0])
+        self.assertEqual(inject.gather(self.PROMPT, session="s1")["pinned"], [])
+        self.plant_pinned("pin-a", "changed truth")
+        changed = inject.gather(self.PROMPT, session="s1")
+        self.assertTrue(any("changed truth" in line for line in changed["pinned"]),
+                        "new rendered guidance must re-fire without compaction")
+        self.assertEqual(inject.gather(self.PROMPT, session="s1")["pinned"], [],
+                         "the changed content warms exactly once")
+
+    def test_pinned_identity_outlives_the_JIT_cooldown_window(self):
+        self.plant_pinned("pin-a", "always truth")
+        self.assertTrue(inject.gather(self.PROMPT, session="s1")["pinned"])
+        for turn in range(17):  # far past where the old JIT window reopened
+            self.assertEqual(
+                inject.gather(self.PROMPT, session="s1")["pinned"], [],
+                "pinned content re-fired on cooldown turn %d" % turn)
+
+    def test_explain_reports_the_suppressed_pinned_lane(self):
+        """--explain is the ONE surface whose job is to say what reaches the
+        seat, and it was blind to the pinned dedup: it printed "+" for every
+        pinned line on every turn while gather was sending none of them. An
+        operator asking "why is my premise not in context" read "+" and
+        concluded it HAD been delivered. Measured identically at the landed tip
+        and at its parent, so the misreport predates the content-identity
+        marker — the dedup only made a standing lie load-bearing.
+
+        THE FIRST ASSERTION IS THE CONTROL: an explain that rendered no pinned
+        lane at all would satisfy the "no +" check below vacuously."""
+        self.plant_pinned("pin-a", "always truth")
+        rc, before, _ = self.run_inject(
+            ["--hook-json", "--explain"], stdin_text=self.hook_stdin(self.PROMPT))
+        self.assertEqual(rc, 0)
+        self.assertIn("+ PREMISE pin-a: always truth", before)  # CONTROL
+        self.assertTrue(inject.gather(self.PROMPT, session="sid-1")["pinned"])
+        self.assertEqual(inject.gather(self.PROMPT, session="sid-1")["pinned"], [])
+        rc, after, _ = self.run_inject(
+            ["--hook-json", "--explain"], stdin_text=self.hook_stdin(self.PROMPT))
+        self.assertEqual(rc, 0)
+        self.assertIn("- PREMISE pin-a: always truth "
+                      "(already delivered this session)", after)
+        self.assertNotIn("+ PREMISE pin-a", after)
+
+    def test_explain_follows_content_identity_not_a_warmed_flag(self):
+        """The explain rung must mirror gather's SEMANTICS, not just its
+        boolean: changed guidance re-fires, so the diagnostic must show it
+        firing again — otherwise the surface tells a seat its stale premise is
+        still current."""
+        self.plant_pinned("pin-a", "first truth")
+        inject.gather(self.PROMPT, session="sid-1")
+        rc, out, _ = self.run_inject(
+            ["--hook-json", "--explain"], stdin_text=self.hook_stdin(self.PROMPT))
+        self.assertIn("(already delivered this session)", out)
+        self.plant_pinned("pin-a", "changed truth")
+        rc, out, _ = self.run_inject(
+            ["--hook-json", "--explain"], stdin_text=self.hook_stdin(self.PROMPT))
+        self.assertIn("+ PREMISE pin-a: changed truth", out)
+        self.assertNotIn("(already delivered this session)", out)
+
+    def test_explain_never_stamps_the_pinned_marker(self):
+        """READ-ONLY, exactly like the cooldown rung beside it. An explain that
+        stamped the marker it reports on would silence the seat's real next
+        turn — strictly worse than the misreport this fixes, because the seat
+        would lose guidance to a DIAGNOSTIC it ran to check that guidance."""
+        self.plant_pinned("pin-a", "always truth")
+        for _ in range(3):
+            self.run_inject(["--hook-json", "--explain"],
+                            stdin_text=self.hook_stdin(self.PROMPT))
+        self.assertTrue(inject.gather(self.PROMPT, session="sid-1")["pinned"],
+                        "an explain burned the pinned lane's first delivery")
+
+    def test_explain_returns_the_budget_when_the_lane_is_suppressed(self):
+        """A cross-family review's finding, on the exact arm it was asked to
+        attack. gather's suppression does TWO things — it empties the pinned
+        lane AND resets used=0 — so a suppressed turn hands the whole budget
+        to the codex nudges walking last. An explain that reported the lane
+        suppressed while STILL charging its bytes against the tail called
+        those nudges over-budget on the very turns gather was sending them.
+        Half-modelling a suppression is its own kind of lie."""
+        os.environ["HELM_CHAT_NAME"] = "codex"
+        self.addCleanup(os.environ.pop, "HELM_CHAT_NAME", None)
+        # A budget where the arithmetic is exact rather than assumed: the base
+        # line renders to 195B, the two nudges are 84B and 127B. At 250B the
+        # base fits and crowds BOTH nudges out; with the base suppressed the
+        # returned budget seats both. (A first attempt sized the statement
+        # against PINNED_BUDGET directly and LINE_CAP truncated it to 195
+        # anyway, so the nudges fit on turn 1 and the control was vacuous —
+        # the test caught its own fixture.)
+        self.plant_pinned("pin-a", "y" * 180)
+        with mock.patch.object(inject, "PINNED_BUDGET", 250):
+            first = inject.gather(self.PROMPT, session="sid-1")["pinned"]
+            # CONTROL: the nudges are ABSENT while the base lane holds the
+            # budget, so their arrival below is the budget returning and not
+            # them fitting all along.
+            self.assertTrue(any("pin-a" in l for l in first),
+                            "base lane must fire on the warming turn")
+            self.assertNotIn(inject.SA_WHISPER, first)
+            second = inject.gather(self.PROMPT, session="sid-1")["pinned"]
+            self.assertNotIn("pin-a", " ".join(second), "base lane suppressed")
+            self.assertIn(inject.SA_WHISPER, second,
+                          "suppression returns the base lane's budget to the nudges")
+            rc, out, _ = self.run_inject(
+                ["--hook-json", "--explain"],
+                stdin_text=self.hook_stdin(self.PROMPT))
+        self.assertEqual(rc, 0)
+        self.assertIn("+ " + inject.SA_WHISPER, out,
+                      "explain must report the nudges gather actually sends")
+        self.assertNotIn("(over budget) ← codex-only nudge", out)
+
+    def test_the_row_says_WHY_each_jit_entry_fired(self):
+        """A fired id that ALREADY had a record cleared the 2x escape; one that
+        did not is a first delivery. Without the distinction the ledger cannot
+        tell a working dedup from a leaking one — measured after landing, the
+        change read 28.5% post-land repeats against an age-matched 12.5%
+        pre-land, and that excess was equally consistent with legitimate
+        escapes, correct post-boundary re-fires, and suppression leaking. Three
+        verdicts on one number, because the row said WHICH ids fired and never
+        WHY."""
+        self.plant_jit("jit-a", "a flux fact", "fluxcap,warpcore")
+        inject.gather(self.PROMPT, session="s1")
+        self.assertEqual(self.rows()[-1]["jit_why"], {"escape": 0, "new": 1},
+                         "a first delivery is NEW, never an escape")
+        # both keywords -> score 1.6 = 2.0x the recorded 0.8 -> escapes
+        inject.gather("tune the fluxcap and the warpcore", session="s1")
+        self.assertEqual(self.rows()[-1]["jit_why"], {"escape": 1, "new": 0},
+                         "a 2x re-fire is an ESCAPE, and must not read as new")
+        # and a suppressed turn carries no why at all — it fired nothing
+        inject.gather(self.PROMPT, session="s1")
+        last = self.rows()[-1]
+        self.assertNotIn("jit_why", last)
+        self.assertEqual(last["suppressed"], ["jit-a"])
+
+    def test_the_row_carries_the_turn_so_a_boundary_reset_is_visible(self):
+        """THE OTHER HALF: after forget_session the counter restarts, so a NEW
+        fire at turn 1 of a long-running session is the compaction/clear leg
+        working, while the same fire at turn 40 is an entry never matched
+        before. One int, and it is the difference between "the dedup reset" and
+        "the dedup leaked" — indistinguishable in every row written before."""
+        from helm.inject import _ledger
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        for _ in range(4):
+            inject.gather(self.PROMPT, session="s1")
+        self.assertEqual(self.rows()[-1]["turn"], 4)      # CONTROL: it counts
+        _ledger.forget_session("s1")
+        inject.gather(self.PROMPT, session="s1")
+        after = self.rows()[-1]
+        self.assertEqual(after["turn"], 1, "a boundary restarts the counter")
+        self.assertEqual(after["jit_why"], {"escape": 0, "new": 1})
+
+    def test_a_sessionless_turn_carries_neither(self):  # noqa: VACUOUS_ASSERTION — a session-bearing gather runs first and asserts BOTH keys present on the same observable, so their absence on the sessionless row is the arm under test rather than a row shape that never carries them
+        """No session means no seen-state to reason from, so claiming a WHY
+        would be inventing one."""
+        self.plant_jit("jit-a", "a flux fact", "fluxcap")
+        # UNCONDITIONAL CONTROL on the SAME observable: with a session both
+        # keys ARE written, so their absence below is the sessionless arm and
+        # not a row shape that never carries them at all.
+        inject.gather(self.PROMPT, session="s1")
+        warm = self.rows()[-1]
+        self.assertIn("jit_why", warm)
+        self.assertIn("turn", warm)
+        got = inject.gather(self.PROMPT)
+        self.assertTrue(got["jit"], "CONTROL: the sessionless turn really fired")
+        last = self.rows()[-1]
+        self.assertNotIn("jit_why", last)
+        self.assertNotIn("turn", last)
+
+    def test_a_compaction_brings_the_pinned_lane_back(self):
+        """THE ARM THE WHOLE DESIGN TURNS ON. The session id SURVIVES a
+        compaction and the context does not, so without this the dedup goes
+        permanently silent for a seat that just lost every premise it was
+        suppressing — strictly worse than the waste it replaces."""
+        from helm.inject import _ledger
+        self.plant_pinned("pin-a", "always truth")
+        first = inject.gather(self.PROMPT, session="s1")
+        self.assertTrue(first["pinned"])
+        self.assertEqual(inject.gather(self.PROMPT, session="s1")["pinned"], [])
+        _ledger.forget_session("s1")          # what the compact hook calls
+        again = inject.gather(self.PROMPT, session="s1")
+        self.assertEqual(again["pinned"], first["pinned"],
+                         "a compacted seat must get its premises back")
+
+    def test_a_sessionless_turn_always_gets_the_pinned_lane(self):
+        """Plain stdin has no session, so there is nothing to remember with —
+        it must never be suppressed by another session's record."""
+        self.plant_pinned("pin-a", "always truth")
+        a = inject.gather(self.PROMPT, session="s1")
+        self.assertTrue(a["pinned"])
+        self.assertEqual(inject.gather(self.PROMPT, session="s1")["pinned"], [])
+        self.assertTrue(inject.gather(self.PROMPT)["pinned"],
+                        "no session = no suppression")
 
     def test_freed_cap_slots_reach_lower_candidates(self):
         for i, conf in enumerate(("0.9", "0.8", "0.7", "0.6", "0.5")):
@@ -671,20 +1140,41 @@ class SessionCooldownTest(InjectBase):
             self.assertIn("jit-a", out)
             self.assertEqual(err, "")
 
-    def test_stale_files_pruned_and_expired_window_refires(self):
+    def test_stale_sibling_files_pruned_and_an_old_fire_still_suppresses(self):
+        """WAS test_stale_files_pruned_and_expired_window_refires. The SIBLING
+        pruning is by wall-clock TTL and is unchanged; what changed is the
+        second half — a fire 39 turns back no longer re-fires, because age in
+        turns was never evidence the seat forgot. The stale-file arm keeps a
+        positive control on the same turn (the pruning must still happen while
+        the entry stays suppressed)."""
         self.plant_jit("jit-a", "a flux fact", "fluxcap")
         os.makedirs(inject._seen_dir())
         stale = os.path.join(inject._seen_dir(), "old-session.json")
         with open(stale, "w") as f:
             f.write("{}")
         os.utime(stale, (1, 1))  # epoch-old: beyond SEEN_TTL
+        # POSITIVE CONTROL on the FILE observable: a FRESH sibling must SURVIVE
+        # the same sweep, or "the stale one is gone" would also be satisfied by
+        # a prune that deleted everything (or by a sweep that never ran and a
+        # file that was never really there).
+        fresh = os.path.join(inject._seen_dir(), "fresh-session.json")
+        with open(fresh, "w") as f:
+            f.write("{}")
         pk.write_json(inject._seen_path("s1"),
                       {"v": 1, "ts": pk.now_ts(), "turn": 40,
                        "fired": {"jit-a": [1, 0.8]}})  # fired 39 turns ago
+        # POSITIVE CONTROL FIRST, on the same observable: a session with NO
+        # seen-record fires this exact line, so the empty result below is the
+        # 39-turn-old record suppressing and not an unplanted store.
+        self.assertEqual(inject.gather(self.PROMPT, session="control")["jit"],
+                         ["PRIOR 0.80 jit-a: a flux fact"])
         got = inject.gather(self.PROMPT, session="s1")["jit"]
-        self.assertEqual(got, ["PRIOR 0.80 jit-a: a flux fact"])
+        self.assertEqual(got, [], "39 turns is not evidence the seat forgot")
         self.assertFalse(os.path.exists(stale), "stale session file must be pruned")
-        self.assertEqual(self.seen()["fired"]["jit-a"][0], 41)
+        self.assertTrue(os.path.exists(fresh),
+                        "the sweep is TTL-scoped: a fresh sibling survives it")
+        self.assertEqual(self.seen()["fired"]["jit-a"][0], 1,
+                         "a suppressed entry keeps its ORIGINAL fire record")
 
     def test_induced_errors_preserve_hook_contract(self):
         self.plant_jit("jit-a", "a flux fact", "fluxcap")
@@ -915,13 +1405,18 @@ class WhoLaneTest(InjectBase):
         self.assertIn("- who:operator (over budget)", out)
         self.assertNotIn("+ WHO", out)
 
-    def test_cooldown_exempt_fires_every_turn(self):
+    def test_the_WHO_digest_warms_the_session_once_not_every_turn(self):
+        """WAS test_cooldown_exempt_fires_every_turn. The WHO digest is the
+        pinned lane's declared FIRST entry and rode the same exemption; it is
+        now the MARKER for whether a session has been warmed at all, so it
+        fires on the warming turn and is silent until a context boundary."""
         self.plant_profile()
         self.plant_jit("jit-a", "a flux fact", "fluxcap")
         first = inject.gather("tune the fluxcap", session="s1")
         second = inject.gather("tune the fluxcap", session="s1")
-        self.assertEqual(second["pinned"], first["pinned"])  # WHO exempt
-        self.assertIn("WHO operator: expert operator", second["pinned"])
+        # POSITIVE CONTROL on the same observable: it really did arrive once.
+        self.assertIn("WHO operator: expert operator", first["pinned"])
+        self.assertEqual(second["pinned"], [], "warmed once per session")
         self.assertEqual((first["jit"], second["jit"]),
                          (["PRIOR 0.80 jit-a: a flux fact"], []))  # jit cools
 
@@ -1115,7 +1610,7 @@ class WhisperTest(InjectBase):
 
 
 class SaWhisperTest(InjectBase):
-    """The codex-only SA whisper: a codex-family seat
+    """The codex-only SA whisper (owner ask): a codex-family seat
     gets ONE terse delegate-to-subagents pinned line, justification left out;
     claude-family seats NEVER see it. Family rides the ONE existing resolver
     (HELM_CHAT_NAME -> seat._seat_family), the line walks LAST in
@@ -1157,7 +1652,7 @@ class SaWhisperTest(InjectBase):
 
     def test_claude_family_seats_never_get_it(self):
         self.plant_pinned("pin-a", "always truth")
-        for name in (None, "helm-fable", "claude", "integrator-1", "fable-2"):
+        for name in (None, "helm-fable", "claude", "opus-integrator", "fable-2"):
             self.seat(name)
             got = inject.gather("anything")["pinned"]
             self.assertNotIn(inject.SA_WHISPER, got,
@@ -1216,7 +1711,7 @@ class SaWhisperTest(InjectBase):
 
 
 class ClaimWhisperTest(InjectBase):
-    """The codex-only claim-start whisper: a codex
+    """The codex-only claim-start whisper (owner ask): a codex
     claimed two lanes then STOPPED without starting the writers — law-5's
     'end turns at bounded milestones' read as 'posted my claim'. The second
     SA_LINES line teaches claim-is-a-start-not-a-stop, terse, justification
@@ -1439,7 +1934,7 @@ class CompareBackendTest(InjectBase):
 
 
 class CouncilReachTest(InjectBase):
-    """The council reach rung: the recorded failure was
+    """The council reach rung: the recorded prior-harness failure was
     SALIENCE — the meld verb existed and agents never reached for it. >= 3
     ping-pong rounds with ONE peer in the home room -> one latched nudge
     naming the exact council invite command; a new streak re-arms."""
@@ -1473,6 +1968,54 @@ class CouncilReachTest(InjectBase):
         for i in range(rounds):
             chat.post("q%d" % i, room=room, who="seat-a")
             chat.post("a%d" % i, room=room, who=peer)
+
+    def _review_pingpong(self, rounds=3, peer="seat-b", room="workroom"):
+        """A streak where BOTH sides speak review vocabulary."""
+        from helm import chat
+        for i in range(rounds):
+            chat.post("gate request %d, please xrev" % i, room=room, who="seat-a")
+            chat.post("FIX %d — one more blocker" % i, room=room, who=peer)
+
+    def test_the_percase_cure_rides_the_streak_on_a_REVIEW(self):
+        """The cure for a 3+-round spiral sat in the store keyed on its own
+        CONCLUSION — per-case, whole-object, enumeration — the words you have
+        AFTER you understand it. Nobody in round four types those. The
+        condition is a MEASURABLE EVENT this reflex already detects, so the
+        lesson rides the detector instead of waiting to be searched for."""
+        self._review_pingpong(3)
+        got = inject._council_reach(None, None)
+        self.assertIsNotNone(got)
+        line, _wid = got
+        self.assertIn("async rounds", line)          # the streak nudge itself
+        self.assertIn("PER-CASE", line)              # and the cure
+        self.assertIn("whole-object", line)
+        self.assertIn("honest refusal", line)
+
+    def test_the_cure_stays_SILENT_on_an_ordinary_streak(self):
+        """Pinned as hard as the firing case. A cure line about per-case
+        handling on ordinary back-and-forth is wallpaper, and wallpaper is how
+        a guard stops being read — the same noise failure the tree warning
+        taught."""
+        self._pingpong(3)                            # plain q/a, no review words
+        got = inject._council_reach(None, None)
+        self.assertIsNotNone(got)                    # the streak STILL nudges
+        line, _wid = got
+        self.assertIn("async rounds", line)
+        self.assertNotIn("PER-CASE", line)           # but carries no cure
+        self.assertNotIn("whole-object", line)
+
+    def test_one_sided_review_vocabulary_is_not_a_review_streak(self):
+        """Both sides must use it: one person saying 'fix' in a design chat is
+        a conversation, not a review."""
+        from helm import chat
+        for i in range(3):
+            chat.post("we should fix the gate design %d" % i,
+                      room="workroom", who="seat-a")
+            chat.post("agreed, thinking about it %d" % i,
+                      room="workroom", who="seat-b")
+        got = inject._council_reach(None, None)
+        self.assertIsNotNone(got)
+        self.assertNotIn("PER-CASE", got[0])
 
     def test_reach_fires_once_per_streak_then_rearms(self):
         from helm import chat

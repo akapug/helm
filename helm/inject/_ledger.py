@@ -10,7 +10,7 @@ import os
 import time
 
 from .. import home, pk
-from ._common import COOLDOWN_TURNS, LEDGER_MAX, SEEN_TTL, WHO_ID
+from ._common import LEDGER_MAX, SEEN_TTL, WHO_ID
 from ._entries import _entry_line, _who_lines, load_entries
 
 
@@ -48,11 +48,38 @@ def project_for_cwd(cwd):
             # global-only, silently dropping project premises + reflexes)
             prefixes = (rec.get("cv_scope") or {}).get("cwd_prefixes") \
                 or [rec.get("path")]
-            for pre in prefixes:
+            for pre in list(prefixes):
                 pre = str(pre or "").rstrip("/")
-                if pre and (want == pre or want.startswith(pre + "/")) \
-                        and len(pre) > len(best[0] if best else ""):
-                    best = (pre, str(rec.get("name") or key))
+                if not pre:
+                    continue
+                # A LANE WORKTREE BELONGS TO ITS REPO'S PROJECT, by
+                # construction rather than by registration. `helm work claim`
+                # mints rooms at <repo>-wt/<lane> and peeks at
+                # <repo>-wt/peeks/<sha> — a SIBLING of the repo path, so no
+                # registered prefix matched and the nearest ancestor project
+                # won instead. Measured 2026-08-05: every helm lane worktree
+                # resolved to the UMBRELLA project, which registers the
+                # parent directory holding every repo. Four surfaces — turn
+                # premises and reflexes, `helm store add` project inference,
+                # the handoff journal shelf, and dispatch scoping — so a seat
+                # in the room it is REQUIRED to work in got another project's
+                # answer for all four, and `helm handoff check` reported
+                # "contract satisfied" against the wrong shelf.
+                #
+                # The suffix is matched with its separator, so a sibling repo
+                # whose name merely starts the same (helmet next to helm-wt)
+                # cannot be captured.
+                # rank 1 = a REGISTERED path; rank 0 = a DERIVED worktree
+                # root. A registration always outranks a convention at the same
+                # depth: a repo genuinely NAMED "<x>-wt" sitting beside "<x>"
+                # matches both, and the row someone actually registered is the
+                # one that means it. Without the rank the winner depended on
+                # registry iteration order.
+                for cand, rank in ((pre, 1), (pre + "-wt", 0)):
+                    if want == cand or want.startswith(cand + "/"):
+                        score = (len(cand), rank)
+                        if best is None or score > best[0]:
+                            best = (score, str(rec.get("name") or key))
         return best[1] if best else None
     except Exception:
         return None
@@ -97,30 +124,98 @@ def _seen_path(session):
     return os.path.join(_seen_dir(), pk.slug(str(session)) + ".json")
 
 
+def forget_session(session):
+    """Drop a session's seen-state so the NEXT turn re-fires everything.
+
+    THE SESSION ID SURVIVES A COMPACTION AND THE CONTEXT DOES NOT. Measured
+    2026-08-04 on the fire-ledger: ONE session carried 306 rows spanning
+    2026-07-30 to 2026-08-04 — five days and several compactions under ONE id.
+    So a suppression keyed on the session outlives the thing it is suppressing
+    against, and without this call a deduped pinned lane would go silent for a
+    seat that had just lost every premise it was suppressing. THAT IS STRICTLY
+    WORSE THAN THE WASTE IT REPLACES, because a seat that lost its premises
+    does not know it lost them.
+
+    Called from the SessionStart legs, which are the only place helm learns
+    that a context boundary happened. Idempotent: a missing file is already the
+    state this wants.
+
+    -> True when the suppression is gone, False when it provably SURVIVED.
+
+    THIS ONE CANNOT FAIL SILENTLY, and it used to. Every OSError from unlink
+    was swallowed, so a readable seen file under a NON-WRITABLE PARENT left the
+    seat suppressed against content it had just lost — measured by @codex-2
+    (dir chmod 0500, SessionStart source=startup: seen_survived=True,
+    remained_suppressed=True). Everywhere else in this module fail-open is
+    correct because the failure direction is a wasted re-delivery; HERE the
+    directions invert, and a swallowed error is a MUTE SEAT.
+
+    So it escalates instead of shrugging. Unlink needs write on the DIRECTORY;
+    truncation needs write on the FILE, which is a different permission and the
+    one that survives exactly this storage class. A truncated file reads as a
+    fresh session (_seen_load fail-opens on empty), so it is not a lesser
+    outcome — it is the same outcome by another syscall. Only when BOTH fail
+    does this report, and the caller must be loud, because nothing downstream
+    can infer that a boundary went unrecorded."""
+    path = _seen_path(session)
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return True           # already the state this wants
+    except OSError:
+        pass                  # unlink refused — the parent, not the file
+    try:
+        with open(path, "w"):
+            pass              # truncate: same meaning, different permission
+        return True
+    except OSError:
+        return False          # neither mutation worked — say so, never assume
+
+
 def _seen_load(session):
-    """Per-session suppression state {turn: N, fired: {id: [turn, score]}}.
+    """Per-session suppression state: JIT cooldown + pinned content identity.
+
     Fail-open: an absent/torn/alien-shaped file reads as a FRESH session (no
-    cooldown) — seen-state trouble must never block or crash the hook."""
+    suppression) — seen-state trouble must never block or crash the hook."""
     d = pk.read_json(_seen_path(session))
-    fresh = {"turn": 0, "fired": {}}
+    fresh = {"turn": 0, "fired": {}, "pinned": None}
     if not isinstance(d, dict) or not isinstance(d.get("turn"), int) \
             or d["turn"] < 0 or not isinstance(d.get("fired"), dict):
         return fresh
     fired = {str(i): r for i, r in d["fired"].items()
              if isinstance(r, list) and len(r) == 2
              and isinstance(r[0], int) and isinstance(r[1], (int, float))}
-    return {"turn": d["turn"], "fired": fired}
+    pinned = d.get("pinned") if isinstance(d.get("pinned"), str) else None
+    return {"turn": d["turn"], "fired": fired, "pinned": pinned}
 
 
 def _seen_save(session, state):
-    """Atomic write of one session's seen-state; records past the cooldown
-    window are dropped (the file stays tiny) and stale SIBLING session files
-    (mtime beyond SEEN_TTL) are pruned opportunistically. Entirely fail-open."""
+    """Atomic write of one session's seen-state; stale SIBLING session files
+    (mtime beyond SEEN_TTL) are pruned opportunistically. Entirely fail-open.
+
+    THE FIRE MAP IS NEVER EVICTED, and that is deliberate. Every record in it
+    is ACTIVELY SUPPRESSING content the seat still has, so ANY eviction policy
+    silently re-enables delivery of whatever it drops — which is the exact
+    defect this lane exists to remove, just at a different threshold. The old
+    code pruned past COOLDOWN_TURNS and that is what made the window
+    unremovable from _cooled alone; a count cap only moves the same hole to the
+    Nth distinct id (@codex, in review: "those records are still
+    suppressing content, so the 2001st distinct JIT id re-enables delivery
+    without compaction").
+
+    Nothing needs to bound it: the keys are STORE ENTRY IDS that actually
+    fired, and forget_session drops the whole file at every context boundary,
+    so its lifetime is one context rather than one session. Precisely (@codex-2,
+    in review): the map can exceed the CURRENT store cardinality during
+    same-context id churn, because an id whose entry was since removed is still
+    retained — the bound is ids-fired-this-context, not entries-in-the-store-now.
+    Operationally identical at helm's scale, and still bounded by construction,
+    which is the only kind of bound that does not trade correctness for size."""
     try:
         turn = state["turn"]
         state = {"v": 1, "ts": pk.now_ts(), "turn": turn,
-                 "fired": {i: r for i, r in state["fired"].items()
-                           if turn - r[0] <= COOLDOWN_TURNS}}
+                 "pinned": state.get("pinned"), "fired": state["fired"]}
         pk.write_json(_seen_path(session), state)
         now = time.time()
         d = _seen_dir()
@@ -136,11 +231,11 @@ def _seen_save(session, state):
 
 
 # ---------------------------------------------------------------------------
-# cohort analyzer — the read-only fire-ledger cohort report (--lane-report)
+# lane-split eval — the read-only cohort analyzer (--lane-report)
 # ---------------------------------------------------------------------------
 
 def _cohort(e):
-    """The facts-vs-judgment cohort razor:
+    """The lane-split-eval razor (ember's-claude vision review, 2026-07-19):
     'facts' = knowledge that makes a capable model fluent — lexicon terms,
     certain priors (premises / decisions-of-record), references; 'judgment' =
     steering that could anchor it — heuristic moves, sub-certain belief
@@ -188,7 +283,7 @@ def lane_report(project=None):
     are not ledgered), session spread, cooldown suppression, and the
     silent-rate first-half vs second-half trend. DELIVERY ONLY: the ledger
     logs fires, not heeds — anchoring is NOT measurable here; the
-    outcome-marker protocol is measured out-of-band."""
+    outcome-marker protocol lives in evals/2026-07-19-lane-split-eval.md."""
     rows = _ledger_rows()
     try:
         by_id = {str(e["id"]): e for e in load_entries(project)}
@@ -268,5 +363,5 @@ def _lane_report(project=None):
         _pct(r["silent"], r["rows"]), _pct(h1[0], h1[1]), _pct(h2[0], h2[1])))
     print("bytes~ = today's rendering x fires (per-entry bytes are not ledgered).")
     print("DELIVERY ONLY: fires are not heeds — the anchoring verdict needs the")
-    print("outcome markers, measured out-of-band.")
+    print("outcome markers in evals/2026-07-19-lane-split-eval.md.")
     return 0

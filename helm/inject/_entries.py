@@ -13,6 +13,24 @@ from ._common import LINE_CAP, SA_FAMILIES, SA_LINES, WHO_CAP, _CACHE_VERSION
 
 
 def _entry_line(e):
+    """The line that FIRES. A gloss fires whole; only an ungloss'd entry is cut.
+
+    LINE_CAP's own comment has said "the gloss fires, the full entry stays on
+    disk" since it was written, and there was no gloss — `_entry_line_full` read
+    `statement` and this truncated it. A truncation is not a gloss. It is a
+    severed sentence: MEASURED 2026-07-30, three of the owner's five always-on
+    rules fired at exactly 400 bytes, dropping 46-57% of each and ending
+    mid-clause ("Reap stale testnet processes…"), while the other two could not
+    fire at all because 3 x LINE_CAP == PINNED_BUDGET.
+
+    So the owner's only way to make a rule fit was to REWRITE HIS OWN CANON
+    shorter — trading the durable record for the firing line. With a gloss he
+    keeps both: the full statement stays the record, the gloss is what reaches
+    a seat every turn.
+
+    An over-long GLOSS is still cut, deliberately: the budget is the budget, and
+    silently honouring an oversized gloss would reintroduce the starvation this
+    exists to end."""
     line = _entry_line_full(e)
     return line if len(line) <= LINE_CAP else line[:LINE_CAP - 1] + "…"
 
@@ -64,6 +82,16 @@ def _sa_whisper():
         return ()
 
 
+def _body(e):
+    """The text that fires: the GLOSS when the entry has one, else the statement.
+
+    One resolution, used by every type branch below, so a new type cannot
+    quietly opt out of glossing — the way a second spelling of a mechanism
+    always drifts from the first."""
+    return (str(e.get("gloss") or "").strip()
+            or e.get("statement") or "")
+
+
 def _entry_line_full(e):
     # a provisional (xrev-cleared) entry FIRES like live but carries a visible
     # [provisional] PREFIX so the agent can weight it as not-yet-owner-ratified.
@@ -73,18 +101,20 @@ def _entry_line_full(e):
     t = e.get("type")
     if t == "prior":
         tag = "PREMISE" if e.get("class") == "certain" else "PRIOR %.2f" % e["confidence"]
-        return "%s%s %s: %s" % (pv, tag, e["id"], e.get("statement") or "")
+        return "%s%s %s: %s" % (pv, tag, e["id"], _body(e))
     if t == "lexicon":
-        return "%sTERM %s: %s" % (pv, e.get("term") or e["id"], e.get("definition") or e.get("statement") or "")
+        return "%sTERM %s: %s" % (pv, e.get("term") or e["id"],
+                                  str(e.get("gloss") or "").strip()
+                                  or e.get("definition") or e.get("statement") or "")
     if t == "heuristic":
-        return "%sMOVE %s: %s" % (pv, e["id"], e.get("statement") or "")
+        return "%sMOVE %s: %s" % (pv, e["id"], _body(e))
     if t == "reference":
-        return "%sREF %s: %s" % (pv, e["id"], e.get("statement") or "")
+        return "%sREF %s: %s" % (pv, e["id"], _body(e))
     if t == "capability":
         # a LEVER, not a fact — the CAP prefix + the owner's exact
         # "you have <verb>: <what> (wired via <hook>, live)" body (e["statement"]).
-        return "%sCAP %s" % (pv, e.get("statement") or "")
-    return "%s%s: %s" % (pv, e["id"], e.get("statement") or "")
+        return "%sCAP %s" % (pv, _body(e))
+    return "%s%s: %s" % (pv, e["id"], _body(e))
 
 
 def _cache_file(project=None):

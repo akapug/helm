@@ -8,6 +8,7 @@ _greeted_today / _today / _seen_load / _coinage) are read through the
 package namespace (_inject.X) at call time — a from-import copy would
 strand those patches at the package boundary.
 """
+import hashlib
 import os
 import re
 import time
@@ -15,7 +16,7 @@ import time
 from .. import home, pk, reflex
 from .. import inject as _inject
 from ._common import (
-    COINAGE_CAP, COINAGE_STRIKES, COOLDOWN_ESCAPE, COOLDOWN_TURNS,
+    COINAGE_CAP, COINAGE_STRIKES, COOLDOWN_ESCAPE,
     COUNCIL_OFFER_CAP, COUNCIL_ROUNDS, COUNCIL_TAIL, COUNCIL_WHISPER_ID,
     JIT_CAP, WHISPER_CAP, WHISPER_ID, WHO_ID,
 )
@@ -36,10 +37,18 @@ def _jit_score(e, low, df):
 
 def _cooled(rec, turn, score):
     """The ONE cooled predicate (gather + --explain): a [turn, score] fire
-    record within COOLDOWN_TURNS suppresses unless the new score clears
-    COOLDOWN_ESCAPE x the score at last fire."""
-    return bool(rec) and turn - rec[0] <= COOLDOWN_TURNS \
-        and score < COOLDOWN_ESCAPE * rec[1]
+    record suppresses FOR THE LIFE OF THE SESSION unless the new score clears
+    COOLDOWN_ESCAPE x the score at last fire.
+
+    There is deliberately no turn window. The question a cooldown answers is
+    "does the seat still have this?", and the answer changes at COMPACTION,
+    not on a timer — _ledger.forget_session drops this whole file at that
+    boundary (compaction AND /clear), so everything re-fires to a seat that actually lost it. A
+    15-turn window instead re-sent every entry about every 16th turn forever:
+    6,949 of 7,375 measured re-deliveries were the window expiring, against
+    426 real escapes. The escape is what preserves the signal — a genuine
+    relevance spike is new information even when the bytes are not."""
+    return bool(rec) and score < COOLDOWN_ESCAPE * rec[1]
 
 
 def _cooldown(jit_all, seen, turn, low, df):
@@ -212,6 +221,24 @@ def _brief_digest():
     return line if len(line) <= WHISPER_CAP else line[:WHISPER_CAP - 1] + "…"
 
 
+def _cap_steer(line):
+    """One steer line, capped at STEER_CAP with an ellipsis.
+
+    The renderer-side rail of the uncapped-steer class: a hand-authored or
+    legacy steer can still carry a wall (the gloss test's rail 2), and the
+    budget is the budget. Cut at a word boundary so the cap never severs a
+    clause mid-word; under the cap the line passes through untouched."""
+    from ._common import STEER_CAP
+    if len(line) <= STEER_CAP:
+        return line
+    cut = line[:STEER_CAP - 1]
+    # never sever mid-word: back off to the last space inside the cap
+    sp = cut.rfind(" ")
+    if sp > STEER_CAP // 2:
+        cut = cut[:sp]
+    return cut.rstrip() + "…"
+
+
 def _whisper(text, session):
     """The first-turn whisper: on the day's FIRST session-bearing, non-empty
     turn, lead with the one-line brief digest. Latched once per day — the
@@ -232,6 +259,31 @@ def _whisper(text, session):
         return []
 
 
+_REVIEW_WORDS = ("fix", "clear", "gate", "xrev", "verdict", "blocker",
+                 "refute", "approve", "re-gate", "regate")
+
+
+def _is_review_streak(rows):
+    """True when this streak is a REVIEW rather than ordinary back-and-forth.
+
+    NOT a search: the streak itself is already detected deterministically by
+    the caller. This only refines WHAT that firing says, over the streak's own
+    rows, so a wrong answer costs one extra sentence on a whisper that was
+    already firing — never a missed lesson, which is what made the same
+    vocabulary the wrong tool for FINDING the premise.
+
+    Both sides must use the vocabulary: one person saying "fix" in a design
+    chat is not a review, and a cure line about per-case handling on ordinary
+    conversation is wallpaper — which is exactly how a guard stops being read
+    (the tree-warning noise lesson, same day)."""
+    speakers = {}
+    for m in rows:
+        text = (m.get("text") or "").lower()
+        if any(w in text for w in _REVIEW_WORDS):
+            speakers[str(m.get("from"))] = True
+    return len(speakers) >= 2
+
+
 def _council_path():
     return os.path.join(home.global_dir(), ".state", "council-reach.json")
 
@@ -239,7 +291,7 @@ def _council_path():
 def _council_reach(session, cwd):
     """The COUNCIL REACH rung — (line, ledger-id) or None. Premise
     council-is-the-number-one-feature + feature-and-rsh-must-both-be-wired:
-    the recorded failure was SALIENCE — the meld verb existed and
+    the recorded prior-harness failure was SALIENCE — the meld verb existed and
     agents never reached for it, because no per-turn surface advertised it.
     Signal: this seat has ping-ponged >= COUNCIL_ROUNDS rounds with exactly
     ONE other seat in its home room — async back-and-forth that a bounded
@@ -323,11 +375,39 @@ def _council_reach(session, cwd):
         "v": 1, "ts": pk.now_ts(),
         "offered": (offered + [fp])[-COUNCIL_OFFER_CAP:]})
     d_peer = chat._dsan(peer)
-    return ("REFLEX: %d async rounds with %s in #%s — this is a council: "
+    line = ("REFLEX: %d async rounds with %s in #%s — this is a council: "
             "converge live instead (helm chat council invite %s <topic> "
             "--wait; bounded blocking beats ping-pong). Fires once per "
-            "streak." % (min(mine, len(names) - mine), d_peer, room, d_peer),
-            COUNCIL_WHISPER_ID)
+            "streak." % (min(mine, len(names) - mine), d_peer, room, d_peer))
+    if _is_review_streak(suffix):
+        # THE CURE RIDES THE DETECTOR (integrator ruling 2026-07-24). The
+        # premise that names this cure was keyed on its own CONCLUSION —
+        # "per-case", "whole-object", "enumeration" — the words you have AFTER
+        # you understand the spiral. Nobody in round four types those; they
+        # type "they found another one". Three rounds of widening its keywords
+        # was itself a per-case handler, so we stopped: the triggering
+        # condition is a MEASURABLE EVENT this function already detects, and a
+        # lesson with a deterministic trigger must ride the trigger rather than
+        # wait to be searched for. Keywords stay right for the long tail; they
+        # are the wrong tool for a condition we can simply observe.
+        line += (" And 3+ rounds on ONE artifact usually means PER-CASE "
+                 "handling — the next case is always outside the set you "
+                 "enumerated, so consider whole-object validation plus an "
+                 "honest refusal instead of a fifth patch.")
+    return line, COUNCIL_WHISPER_ID
+
+
+def _pinned_fingerprint(lines):
+    """The pinned lane's content identity — ONE definition, deliberately.
+
+    gather DECIDES suppression with this hash and --explain REPORTS that
+    decision; a second copy would drift silently and send the diagnostic
+    straight back to lying about the very lane it exists to explain. Hash the
+    rendered, budget-capped lines: exactly the bytes the seat received, not
+    store entries the cap may have dropped. Empty lane -> None (there is no
+    identity for content that was never rendered)."""
+    return hashlib.sha256(
+        "\n".join(lines).encode("utf-8")).hexdigest() if lines else None
 
 
 def gather(text, project=None, session=None, compare=None, cwd=None):
@@ -356,6 +436,17 @@ def gather(text, project=None, session=None, compare=None, cwd=None):
     except Exception:
         pinned_entries, jit_all, entries = [], [], []
     local_jit_ids = [str(e["id"]) for e in jit_all]  # the resolver's full pre-cap opinion — the comparison baseline
+    # THE SEEN-STATE IS LOADED BEFORE THE PINNED LANE IS BUILT, because the
+    # pinned lane is what it now governs. Everything below is unchanged; only
+    # the read moved earlier.
+    seen = None
+    turn = 0
+    if session:
+        try:
+            seen = _inject._seen_load(session)
+            turn = seen["turn"] + 1
+        except Exception:
+            seen, turn = None, 0        # state trouble = no suppression, ever
     who = _who_lines()
     pinned_lines, pinned_ids = [], []
     used = sum(len(l) for l in who)
@@ -371,6 +462,33 @@ def gather(text, project=None, session=None, compare=None, cwd=None):
         pinned_lines.append(line)
         pinned_ids.append(str(e["id"]))
         used += len(line)
+    # ── the pinned dedup ────────────────────────────────────────────────
+    # THE PINNED LANE IS THE SAME BYTES EVERY TURN AND THE SEAT ALREADY HAS
+    # THEM. Measured on the fire-ledger 2026-08-04 across 3,331 turns: pinned
+    # is 41.0% of helm's injection at 1,147 B/turn, and 1,157 of those bytes
+    # were byte-identical on every prompt sampled. Re-delivering them 444
+    # times in one session spent ~128k tokens restating what the seat read on
+    # turn 1.
+    #
+    # SUPPRESSED ONLY WHERE THE SEAT PROVABLY HAS THESE EXACT RENDERED LINES.
+    # Content identity covers lifecycle and mutation without a per-case list:
+    # new/changed guidance has a new fingerprint and fires; fresh, sessionless,
+    # unreadable, and compacted states have no matching marker and fire. The
+    # compaction leg still calls _ledger.forget_session because the session id
+    # survives while the context does not.
+    # CONTENT IDENTITY, not a warmed boolean. Pinned guidance and the WHO
+    # profile can change while the session survives; suppressing solely on
+    # WHO_ID left a seat on stale guidance until its next compaction.
+    # _pinned_fingerprint is shared with --explain ON PURPOSE: this line
+    # DECIDES, that one REPORTS, and a second copy of the hash would drift.
+    pinned_fingerprint = _pinned_fingerprint(pinned_lines)
+    pinned_dropped, pinned_dropped_bytes = [], 0
+    if seen is not None and pinned_fingerprint \
+            and seen.get("pinned") == pinned_fingerprint:
+        pinned_dropped = list(pinned_ids)
+        pinned_dropped_bytes = sum(len(line) for line in pinned_lines)
+        pinned_lines, pinned_ids = [], []
+        used = 0
     sa = _sa_whisper()  # codex-only nudges — LAST in the budget; pressure
     for line, wid in sa:  # drops a nudge, never evicts a premise
         if used + len(line) > _inject.PINNED_BUDGET:
@@ -379,15 +497,12 @@ def gather(text, project=None, session=None, compare=None, cwd=None):
         pinned_ids.append(wid)
         used += len(line)
     n_jit = len(jit_all)      # pre-cap, pre-suppression candidate count
-    seen = df = None
+    df = None
     suppressed = []
-    turn = 0
     low = (text or "").lower()
-    if session:
+    if session and seen is not None:
         try:
             from .. import store
-            seen = _inject._seen_load(session)
-            turn = seen["turn"] + 1
             if jit_all:
                 df = store._df_map(store._jit_candidates(entries))
                 jit_all, cooled = _cooldown(jit_all, seen, turn, low, df)
@@ -396,10 +511,33 @@ def gather(text, project=None, session=None, compare=None, cwd=None):
             seen, suppressed = None, []  # no cooldown, never a blocked turn
     jit_entries = jit_all[:JIT_CAP]
     jit = [_entry_line(e) for e in jit_entries]
+    # WHY EACH ENTRY FIRED, counted BEFORE the loop below overwrites the record
+    # it is derived from. A fired id that ALREADY had a record cleared the 2x
+    # escape; one that did not is a first delivery into this context.
+    #
+    # Without this the ledger cannot tell a working dedup from a leaking one.
+    # Measured 2026-08-04 on the landed JIT change: post-land repeat share read
+    # 28.5% against an age-matched pre-land 12.5%, and the excess was equally
+    # consistent with (a) legitimate escapes, (b) correct post-boundary
+    # re-fires, and (c) suppression leaking — three different verdicts on one
+    # number, unresolvable because the row recorded WHICH ids fired and never
+    # WHY. A feature justified by a measurement shipped without the instrument
+    # to measure it; the pinned lane got suppressed_pinned for exactly this
+    # reason and this lane did not.
+    jit_why = None
+    if seen is not None and jit_entries:
+        prior = sum(1 for e in jit_entries if str(e["id"]) in seen["fired"])
+        jit_why = {"escape": prior, "new": len(jit_entries) - prior}
     if seen is not None:
         try:
             for e in jit_entries:
                 seen["fired"][str(e["id"])] = [turn, round(_jit_score(e, low, df), 4)]
+            # A top-level content marker is not a cooldown record: cooldown
+            # pruning must never make pinned guidance re-fire every N turns.
+            # Changed rendered content replaces it after firing once; an
+            # unchanged fingerprint survives until forget_session.
+            if pinned_fingerprint:
+                seen["pinned"] = pinned_fingerprint
             seen["turn"] = turn
             _seen_save(session, seen)
         except Exception:
@@ -410,7 +548,7 @@ def gather(text, project=None, session=None, compare=None, cwd=None):
         fired_reflex = reflex.fire(text, project=project, session=session)
     except Exception:
         fired_reflex = []
-    steers = ["REFLEX: " + e["steer"] for e in fired_reflex]
+    steers = [_cap_steer("REFLEX: " + e["steer"]) for e in fired_reflex]
     reflex_ids = [str(e["id"]) for e in fired_reflex]
     try:
         nudge = _inject._coinage(text, entries)
@@ -432,8 +570,23 @@ def gather(text, project=None, session=None, compare=None, cwd=None):
            "elapsed_ms": round((time.time() - t0) * 1000, 1)}
     if session:
         row["session"] = session
+        # THE SESSION TURN, which is what separates a post-BOUNDARY re-fire
+        # from a genuine first delivery: forget_session drops the whole file,
+        # so the counter restarts at 1. A "new" fire at turn 1 of a session
+        # that has been running for hours is the compaction/clear leg working;
+        # the same fire at turn 40 is an entry the seat had never matched.
+        # One int, and it is the difference between "the dedup reset" and
+        # "the dedup leaked" — indistinguishable in every row written before.
+        row["turn"] = turn
     if suppressed:
-        row["suppressed"] = suppressed  # the cooldown's own measurability
+        row["suppressed"] = suppressed  # the JIT cooldown's measurability
+    if jit_why:
+        row["jit_why"] = jit_why  # escape vs first-delivery, the dedup's proof
+    if pinned_dropped:
+        # The feature's own proof: absence and suppression are distinct, and
+        # the saved bytes can be summed without re-running historical prompts.
+        row["suppressed_pinned"] = pinned_dropped
+        row["suppressed_bytes"] = {"pinned": pinned_dropped_bytes}
     fired = {"pinned": pinned_ids, "jit": [str(e["id"]) for e in jit_entries],
              "reflex": reflex_ids}
     if whisper:
@@ -496,14 +649,21 @@ def _explain(text, project=None, session=None):
     if n_pin:
         print("pinned (%d candidate%s, budget %dB):" % (
             n_pin, "s"[:n_pin != 1], _inject.PINNED_BUDGET))
+    # THE PINNED WALK IS COLLECTED BEFORE IT IS PRINTED, because whether the
+    # lane fires is a property of the WHOLE rendered content and every line's
+    # marker depends on that one verdict. The budget arithmetic below is
+    # gather's, unchanged; only the printing moved after it.
+    walk = []       # (fits, text, tag) in print order
+    delivered = []  # gather's pinned_lines exactly — what the fingerprint covers
     if who:  # gather's exact atomic walk: the digest leads or drops whole
         w = sum(len(l) for l in who)
         if w > _inject.PINNED_BUDGET:
-            print("  - %s (over budget) ← know-your-user" % WHO_ID)
+            walk.append((False, "%s (over budget)" % WHO_ID, "know-your-user"))
         else:
             used = w
             for i, l in enumerate(who):
-                print("  + " + l + (" ← know-your-user" if i == 0 else ""))
+                delivered.append(l)
+                walk.append((True, l, "know-your-user" if i == 0 else None))
     for e in pinned_entries:
         line = _entry_line(e)
         cut = cut or used + len(line) > _inject.PINNED_BUDGET  # greedy walk: first overflow ends the lane
@@ -511,10 +671,34 @@ def _explain(text, project=None, session=None):
         # from (adopted / helm-global / adopted-project / project) — the tag
         # is explain-only decoration, never part of the budget arithmetic
         if cut:
-            print("  - %s (over budget) ← %s" % (e["id"], e.get("root") or "?"))
+            walk.append((False, "%s (over budget)" % e["id"],
+                         e.get("root") or "?"))
         else:
             used += len(line)
-            print("  + %s ← %s" % (line, e.get("root") or "?"))
+            delivered.append(line)
+            walk.append((True, line, e.get("root") or "?"))
+    # THE LANE'S SUPPRESSION VERDICT — read off the SAME fingerprint gather
+    # decides with, never a second copy of the arithmetic. Without this the
+    # explain printed "+" for every pinned line on every turn while gather
+    # was sending none of them: the one surface whose entire job is to say
+    # what reaches the seat was the surface that could not see the dedup.
+    # Strictly read-only, like the cooldown rung below it — an explain must
+    # never stamp the marker it reports on.
+    fp = _pinned_fingerprint(delivered)
+    lane_suppressed = bool(seen and fp and seen.get("pinned") == fp)
+    if lane_suppressed:
+        # AND THE BUDGET GOES BACK, exactly as gather's suppression arm does
+        # (it empties pinned_lines and resets used=0 BEFORE the nudge walk).
+        # Reporting the lane suppressed while still charging its bytes against
+        # the tail made explain call the codex nudges over-budget on the very
+        # turns gather was sending them — a HALF-modelled suppression, which
+        # is its own kind of lie. Found by @codex in review, on the
+        # exact arm I asked it to attack.
+        used = 0
+    for fits, text, tag in walk:
+        mark = "-" if lane_suppressed or not fits else "+"
+        why = " (already delivered this session)" if fits and lane_suppressed else ""
+        print("  %s %s%s%s" % (mark, text, why, " ← " + tag if tag else ""))
     for line, wid in sa:  # gather's exact tail walk: each nudge fits or drops
         if used + len(line) <= _inject.PINNED_BUDGET:
             used += len(line)

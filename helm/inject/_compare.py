@@ -45,11 +45,10 @@ class LocalBackend:
 
 
 class CFCompareBackend:
-    """A THIN, documented STUB adapter for Cloudflare's agentic-memory (owner
-    decision #21: 'just got accepted to cloudflare's agentic memory private
-    beta'). Zero-dep: stdlib urllib only. A COMPARISON BACKEND — a projection
+    """A THIN, documented STUB adapter for Cloudflare's agentic-memory.
+    Zero-dep: stdlib urllib only. A COMPARISON BACKEND — a projection
     of the typed store queried in parallel and COMPARED, NEVER canonical (the
-    `helm backend push` replica-write leg is the OTHER lane's, not this one's).
+    future replica-write leg is the OTHER lane's, not this one's; no push verb ships).
 
     OFF unless HELM_CF_ENDPOINT is set (=> the default, zero cost — one env
     read). The wire shape (documented; a real endpoint is NEVER called in tests):

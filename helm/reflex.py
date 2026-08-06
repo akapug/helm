@@ -49,7 +49,7 @@ seam is data, not hardcoded Python.
 import os
 import re
 
-from . import home, pk
+from . import delim, home, pk
 
 _DEFAULTS = {
     "id": "", "steer": "", "signal": "prompt", "pattern": "", "marker": "",
@@ -365,16 +365,17 @@ def _sig_desc(e):
 
 
 def cmd_reflex(args):
-    """reflex list|add|retire|smoke — manage the (signal -> steer) set."""
+    """reflex list [--all]|add|retire|smoke — manage the (signal -> steer)
+    set (list --all includes retired entries)."""
     if not args or args[0] == "list":
         es = load_all(include_retired="--all" in args)
         if not es:
-            print("helm reflexes: none. Add one: helm reflex add <id> | <steer> "
+            print("helm reflex list: none. Add one: helm reflex add <id> | <steer> "
                   "[--signal prompt --pattern <re> | --signal every-turn | "
                   "--signal marker-file --marker <path> | "
                   "--signal stuck --threshold 3 --latch]")
             return 0
-        print("helm reflexes (%d):" % len(es))
+        print("helm reflex list (%d):" % len(es))
         for e in es:
             mark = "" if e["status"] == "live" else " [" + e["status"] + "]"
             if e.get("source") == "helm-default":
@@ -412,7 +413,13 @@ def _cmd_add(args):
             continue
         kept.append(args[i])
         i += 1
-    parts = [p.strip() for p in " ".join(kept).split("|")]
+    # arity 2 — everything past the steer is a flag, so ANY unescaped pipe in
+    # a steer is over-arity and the guard is total for this verb.
+    parts, refused = delim.split(" ".join(kept), 2,
+                                 "helm reflex add <id> | <steer>")
+    if refused:
+        print("helm reflex add: " + refused, file=sys.stderr)
+        return 2
     if len(parts) < 2 or not parts[0] or not parts[1]:
         print("usage: helm reflex add <id> | <steer> [--signal S] [--pattern RE] "
               "[--marker PATH] [--counter NAME --threshold N [--latch] "

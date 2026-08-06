@@ -6,8 +6,19 @@ per turn with the prompt text; helm returns the context worth injecting:
      the WHO leg: the operator digest (whoami.load_profile(): technical level
      + top guidance, <=2 terse lines jointly capped at WHO_CAP) rides the
      pinned budget as the lane's FIRST entry (id who:operator) whenever a
-     profile exists, so every agent warms from the profile on every turn.
-     Cooldown-exempt (pinned-class); fail-open (no profile/garbled = absent).
+     profile exists, so every agent warms from the profile when needed.
+     SENT ONCE PER RENDERED CONTENT VERSION per session-with-context, not every
+     turn (changed 2026-08-04, owner-asked): the lane was cooldown-EXEMPT,
+     which made it 41.0% of helm's injection at 1,147 B/turn — 444 re-sends in
+     one measured session. A fingerprint of the rendered, budget-capped lines
+     is the marker, so a changed premise/profile re-fires immediately. It also
+     re-fires wherever the seat provably lost the text: a new session id, a
+     sessionless stdin turn, unreadable state (fail-open), and EVERY CONTEXT
+     LOSS — compaction AND /clear — whose SessionStart leg calls
+     _ledger.forget_session because the session id survives while the context
+     does not. Suppressed ids/bytes ride the fire
+     ledger. Reflex stays exempt: it fires on a signal live THIS turn.
+     fail-open (no profile/garbled = absent).
   2. the JIT lane      (typed-store entries whose specific keywords match)
   3. reflex steers     (signals live this turn)
 
@@ -44,9 +55,13 @@ side — what WOULD fire for stdin text and why (the pinned budget walk, each
 JIT hit's per-probe DF score contributions) — and writes NO ledger row.
 
 SESSION COOLDOWN (the habituation guard, extended to the JIT lane): with a
---hook-json session, a JIT entry that fired is suppressed for COOLDOWN_TURNS
-turns of THAT session unless its score now clears COOLDOWN_ESCAPE x its score
-at last fire (the load-bearing-prior escape). State: one tiny JSON per session
+--hook-json session, a JIT entry that fired is suppressed for the LIFE of that
+session unless its score now clears COOLDOWN_ESCAPE x its score at last fire
+(the load-bearing-prior escape). There is no turn window: a seat forgets at a
+CONTEXT BOUNDARY (compaction or /clear), not on a timer, and forget_session
+clears this state at exactly that boundary. The old 15-turn window re-sent every entry about every 16th
+turn forever — measured, 94.2% of JIT re-deliveries were that window expiring
+rather than the escape firing. State: one tiny JSON per session
 at _global/.state/inject-seen/<session>.json — a turn counter + per-id
 [turn, score] — stale session files pruned opportunistically on write. Pinned
 and reflex lanes are EXEMPT; suppression happens pre-cap, so freed cap-4 slots
@@ -81,9 +96,9 @@ read. Budget-capped (WHISPER_CAP) and fully FAIL-OPEN: brief unavailable -> no
 whisper, never a blocked hook. `--explain` renders it read-only (stamps nothing);
 a quiet window (no sessions/knowledge/gates) whispers nothing but still latches.
 
-CODEX WHISPERS (the codex-only nudges): a turn
+CODEX WHISPERS (the codex-only nudges — owner asks 2026-07-21/23): a turn
 fired inside a codex-family seat appends terse pinned-lane lines, each
-justification-free (terse by design). Two today: the SA-delegation nudge
+justification-free (owner-spec style). Two today: the SA-delegation nudge
 (orchestrate your subagents for reviews/reads/research; whisper:codex-sa) and
 the claim-start nudge (claiming a lane is a START, not a milestone — a codex
 claimed two lanes then idled on turn-discipline law-5, reading 'posted my
@@ -96,14 +111,14 @@ whispers walk LAST in PINNED_BUDGET in SA_LINES order (delegation, then
 claim-start): budget pressure drops the tail nudges, NEVER a premise; each
 fired line is ledgered under its own id. Fail-open.
 
-LANE-REPORT (the cohort-analysis instrument): `helm inject --lane-report` is
+LANE-REPORT (the lane-split eval's instrument): `helm inject --lane-report` is
 a READ-ONLY analyzer over the whole fire-ledger — every fired id classified
 against the current store into the facts cohort (lexicon / certain
 decisions-of-record / references / the operator profile) vs the judgment
 cohort (heuristic moves / sub-certain belief priors), with per-cohort fires,
 byte estimate, session spread, cooldown suppression, and the silent-rate
-trend. Delivery only: fires are not heeds — the outcome-marker protocol is
-measured out-of-band. No ledger row, no state mutation.
+trend. Delivery only: fires are not heeds — the outcome-marker protocol lives
+in evals/2026-07-19-lane-split-eval.md. No ledger row, no state mutation.
 
 COMPARISON BACKEND (the pluggability seam): the local keyword JIT resolver is
 the AUTHORITY; a registered COMPARISON backend (_COMPARE_BACKENDS) runs in
@@ -150,7 +165,7 @@ from .. import home, pk, reflex
 # --- re-exports: every top-level name the pre-split inject.py defined --------
 from ._common import (
     PINNED_BUDGET, JIT_CAP, LINE_CAP, WHO_CAP, WHO_ID, LEDGER_MAX, CF_TIMEOUT,
-    COOLDOWN_TURNS, COOLDOWN_ESCAPE, SEEN_TTL, COINAGE_STRIKES, COINAGE_CAP,
+    COOLDOWN_ESCAPE, SEEN_TTL, COINAGE_STRIKES, COINAGE_CAP,
     WHISPER_ID, WHISPER_CAP, SA_WHISPER_ID, SA_WHISPER, CLAIM_WHISPER_ID,
     CLAIM_WHISPER, SA_FAMILIES, SA_LINES, COUNCIL_WHISPER_ID, COUNCIL_ROUNDS,
     COUNCIL_TAIL, COUNCIL_OFFER_CAP, _CACHE_VERSION,
