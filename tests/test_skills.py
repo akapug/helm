@@ -1,8 +1,12 @@
 import os
+import shutil
 import tempfile
 import unittest
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import skills  # noqa: E402
 
@@ -16,8 +20,13 @@ def _mk_skill(home_dir, name, content):
 
 class SkillsTest(unittest.TestCase):
     def setUp(self):
+        # addCleanup, not tearDown: it runs even when setUp fails partway, and
+        # the un-cleaned version leaked TWO dirs PER TEST — thousands of them,
+        # enough to help exhaust /tmp's inodes across a whole fleet
         self.h1 = tempfile.mkdtemp(prefix="helm-skills1-")
+        self.addCleanup(shutil.rmtree, self.h1, ignore_errors=True)
         self.h2 = tempfile.mkdtemp(prefix="helm-skills2-")
+        self.addCleanup(shutil.rmtree, self.h2, ignore_errors=True)
         _mk_skill(self.h1, "alpha", "same content")
         _mk_skill(self.h2, "alpha", "same content")          # identical shadow
         _mk_skill(self.h1, "beta", "one version")

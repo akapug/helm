@@ -103,7 +103,11 @@ Reload `/build` before a large/new task:
 - **Hooks (H):** the deterministic seam, wired by `helm hooks install|status|sync` - the per-turn
   inject hook (reflex delivery + brief whisper), the tool-outcome recorder (`helm record`, whose
   counters drive the counter/latch reflexes - the loop-guard analog), and the chat delivery lane
-  (SessionStart join, tool-boundary deliver nudge, stop-guard).
+  (SessionStart join, tool-boundary deliver nudge, stop-guard). The stop-guard REFUSES a turn that
+  ends with no armed beacon: a launched seat whose `helm chat wait` Monitor is gone cannot be woken
+  by anything, so arming it is enforced, not advised (`helm scratch` is the same move for scratch
+  placement - the substrate routes small/big/durable and reaps dead-session scratch, so no agent
+  reasons about RAM vs disk).
 - **Skills (S):** `/refine` (converge pre-build), `/learn` (evolve the helm physics), `/xchk`
   (ground a claim/topic across all sources + flag red herrings); deep skills `decision-spirit`,
   `ground-truth-cross-reference-loop`, `reviewer-implements-own-findings`.

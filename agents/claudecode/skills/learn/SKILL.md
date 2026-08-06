@@ -14,8 +14,11 @@ mistake. That means: a typed store entry, symptom-vocabulary keywords, and a
 resolve-test proving it fires. A lesson in prose, a chat message, or a memory
 file is not captured — it is parked.
 
-**This routes to helm's typed store** (`helm store`) — a lesson in prose, a
-chat message, or a memory file is parked, not captured.
+**This routes to HELM's store** (`helm store`), never to another project's
+artifacts. That is a different project with its own physics; helm owns its own.
+If you find yourself editing a different project's dirs or reaching for another
+project's verbs from a helm seat, STOP — that is the cross-project bleed this
+skill was rewritten to end (a live cross-project scope-leak incident).
 
 ## The capture
 
