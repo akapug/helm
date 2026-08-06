@@ -16,7 +16,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import home, pk, registry, store, sweep  # noqa: E402
 
@@ -167,10 +168,10 @@ class WeakSignalTest(SweepBase):
         self.assertNotIn("helm-uses-legacy-bridge", [p["old_id"] for p in props])
 
     def test_checkout_of_is_not_a_succession(self):
-        self._registry(_proj("project-b"),
-                       _proj("project-b-fork", [_edge("checkout-of", "project-b")]))
-        self._prior("project-b-run-loop", "the project-b run loop")
-        self._prior("project-b-fork-run-loop", "the project-b-fork run loop")
+        self._registry(_proj("demo-project"),
+                       _proj("sample-project", [_edge("checkout-of", "demo-project")]))
+        self._prior("demo-run-loop", "the demo run loop")
+        self._prior("sample-project-run-loop", "the sample-project run loop")
         self.assertEqual(sweep.propose(), [])
 
 

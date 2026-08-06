@@ -16,7 +16,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import cell, home, pk, premise  # noqa: E402
 
@@ -168,3 +169,52 @@ class RetryQueueTest(RetryQueueBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetrySaysWhyTest(RetryQueueBase):
+    """A pending count with no cause is an unactionable surface.
+
+    `_replay_anchor` already records the exact failure on each kept row, and the
+    summary used to discard every one — an operator saw "0 anchored, 85 still
+    pending" and could not tell a down node from wrong auth from a bug. Measured
+    live 2026-07-26: all 85 shared one cause and the per-row error named it
+    precisely ("the node is UP and REFUSING this turn — an auth problem, not a
+    reachability one"). The diagnosis existed; the surface threw it away.
+
+    Grouping matters as much as printing: on the live queue it revealed a SECOND
+    distinct cause (one row whose store entry was gone) that a flat count hid
+    behind 84 identical ones.
+    """
+
+    def test_pending_rows_report_their_cause_grouped(self):
+        self.enqueue_two()
+
+        def refuse(rec_hash, memo=None, timeout=8):
+            return None, "node refused: HTTP 401 from /turn/submit"
+
+        with mock.patch.object(cell, "anchor_submit", refuse):
+            rc, out, _ = self.run_verb(["--retry-queue"])
+        self.assertEqual(rc, 1, "nothing anchored -> non-zero")
+        self.assertIn("0 anchored, 2 still pending", out)
+        # the CAUSE must appear, and identical causes collapse to ONE line
+        self.assertIn("node refused: HTTP 401", out)
+        self.assertEqual(out.count("node refused: HTTP 401"), 1,
+                         "identical causes must group, not repeat per row")
+        self.assertIn("2 pending:", out)
+
+    def test_distinct_causes_are_reported_separately(self):
+        """The grouping must not collapse DIFFERENT causes — that is exactly the
+        second cause the live run surfaced behind 84 identical ones."""
+        self.enqueue_two()
+        calls = []
+
+        def alternate(rec_hash, memo=None, timeout=8):
+            calls.append(rec_hash)
+            return None, ("node refused: HTTP 401" if len(calls) == 1
+                          else "cell has insufficient balance")
+
+        with mock.patch.object(cell, "anchor_submit", alternate):
+            _rc, out, _ = self.run_verb(["--retry-queue"])
+        self.assertIn("node refused: HTTP 401", out)
+        self.assertIn("cell has insufficient balance", out)
+        self.assertIn("1 pending:", out)

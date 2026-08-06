@@ -11,7 +11,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import cell, home, pk, premise, store  # noqa: E402
 
@@ -21,7 +24,8 @@ DEAD = "http://127.0.0.1:1"
 
 class PremiseBase(unittest.TestCase):
     ENV_KEYS = ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_NODE_URL",
-                "HELM_CELL_PROFILE", "MELD_NODE_URL", "MELD_AGENT_PROFILE")
+                "HELM_CELL_PROFILE", "HELM_STORE_FORCE_NEW",
+                "MELD_NODE_URL", "MELD_AGENT_PROFILE")
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-premise-")
@@ -54,6 +58,18 @@ class PremiseBase(unittest.TestCase):
     def entry_raw(self, pid="law-x"):
         with open(self.entry_path(pid)) as f:
             return f.read()
+
+    def tree_bytes(self):
+        out = {}
+        for root in (os.environ["HELM_HOME"], os.environ["HELM_ADOPTED_DIR"]):
+            if not os.path.isdir(root):
+                continue
+            for base, _dirs, files in os.walk(root):
+                for name in files:
+                    path = os.path.join(base, name)
+                    with open(path, "rb") as f:
+                        out[path] = f.read()
+        return out
 
 
 class CanonTest(PremiseBase):
@@ -159,11 +175,241 @@ class CaptureTest(PremiseBase):
         self.assertEqual(len(premise.chain_records()), 1)   # never double-records
         self.assertIn("  keywords: fresh-kw", self.entry_raw())
 
+    def test_idempotent_same_id_does_not_self_inflate_keyword_df(self):  # noqa: VACUOUS_ASSERTION — both successful captures positively control the same-id path
+        ts = pk.now_ts()
+        for n in range(2):
+            store.write_prior({
+                "id": "infra-%d" % n, "statement": "seed %d" % n,
+                "confidence": 0.7,
+                "keywords": "infrastructure, seed-%d" % n,
+                "status": store.STATUS_LIVE, "source": "test", "stated_ts": ts,
+                "last_updated": ts})
+        args = ["law-x | the infrastructure truth | infrastructure", "--no-attest"]
+        self.assertEqual(self.run_verb(premise.cmd_premise, args)[0], 0)
+        rc, out, err = self.run_verb(premise.cmd_premise, args)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("LIVE 'law-x'", out)
+
+    def test_mint_guard_refusals_are_byte_and_ledger_side_effect_free(self):  # noqa: VACUOUS_ASSERTION — seeded live sibling and byte snapshots control every absence
+        ts = pk.now_ts()
+        store.write_prior({
+            "id": "seat-freeze-law", "statement": "seats freeze on plan prompts",
+            "confidence": 0.8, "keywords": "pane freeze, seat stall on plan prompt, plan approval prompt",
+            "status": store.STATUS_LIVE, "source": "test", "stated_ts": ts,
+            "last_updated": ts})
+        cases = (
+            (["empty-law | an explicit empty keyword field | ", "--no-attest"],
+             "NO keywords"),
+            (["salad-law | a keyword salad | workforce team fable opus codex kimi "
+              "subagent orchestrator role", "--no-attest"],
+             "comma-less cell"),
+            (["seat-freeze-two | a second seat law | seat stall on plan prompt, plan approval prompt, tmux",
+              "--no-attest"], "seat-freeze-law"),
+        )
+        for args, message in cases:
+            with self.subTest(args=args):
+                before = self.tree_bytes()
+                chain = premise.chain_records()
+                events = pk.read_events(50)
+                rc, out, err = self.run_verb(premise.cmd_premise, args)
+                self.assertEqual((rc, out), (1, ""))
+                self.assertIn(message, err)
+                self.assertEqual(self.tree_bytes(), before)
+                self.assertEqual(premise.chain_records(), chain)
+                self.assertEqual(pk.read_events(50), events)
+
+    def test_force_override_receipts_only_after_a_successful_duplicate_write(self):  # noqa: VACUOUS_ASSERTION — later successful override positively controls the event observable
+        ts = pk.now_ts()
+        store.write_prior({
+            "id": "seat-freeze-law", "statement": "seats freeze on plan prompts",
+            "confidence": 0.8, "keywords": "pane freeze, seat stall on plan prompt, plan approval prompt",
+            "status": store.STATUS_LIVE, "source": "test", "stated_ts": ts,
+            "last_updated": ts})
+        rc, _, _ = self.run_verb(
+            premise.cmd_premise,
+            ["distinct-law | a distinct truth | quota headroom, cred rotation",
+             "--force-new", "--no-attest"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(any(e.get("verb") == "store.dup_override"
+                             for e in pk.read_events(50)))
+
+        with mock.patch.object(store, "write_prior",
+                               side_effect=ValueError("serializer refused")):
+            with self.assertRaisesRegex(ValueError, "serializer refused"):
+                self.run_verb(
+                    premise.cmd_premise,
+                    ["seat-freeze-two | another law | seat stall on plan prompt, plan approval prompt, tmux",
+                     "--force-new", "--no-attest"])
+        self.assertFalse(any(e.get("verb") == "store.dup_override"
+                             and e.get("target") == "seat-freeze-two"
+                             for e in pk.read_events(50)))
+
+        rc, out, _ = self.run_verb(
+            premise.cmd_premise,
+            ["seat-freeze-two | another law | seat stall on plan prompt, plan approval prompt, tmux",
+             "--force-new", "--no-attest"])
+        self.assertEqual(rc, 0)
+        self.assertIn("DUP OVERRIDE recorded", out)
+        receipts = [e for e in pk.read_events(50)
+                    if e.get("verb") == "store.dup_override"
+                    and e.get("target") == "seat-freeze-two"]
+        self.assertEqual(len(receipts), 1)
+
+    def test_guard_derived_keyword_stems_are_persisted(self):
+        rc, out, _ = self.run_verb(
+            premise.cmd_premise,
+            ["stem-law | the seat freeze truth | seat freezes on plan prompt, pane tail",
+             "--no-attest"])
+        self.assertEqual(rc, 0)
+        self.assertIn("stem probes auto-added", out)
+        keywords = store._kw_list(store._find("stem-law")["keywords"])
+        for probe in ("seat freezes on plan prompt", "seat", "freezes",
+                      "prompt", "seat freezes", "plan prompt"):
+            self.assertIn(probe, keywords)
+
     def test_usage(self):
         rc, _, _ = self.run_verb(premise.cmd_premise, [])
         self.assertEqual(rc, 2)
         rc, _, _ = self.run_verb(premise.cmd_premise, ["only-an-id"])
         self.assertEqual(rc, 2)
+
+
+class CaptureGuardParityTest(PremiseBase):
+    """The premise capture path runs the SAME add-time findability
+    guards `helm store add` runs, through the SAME shared functions, and its
+    output carries the same advisory surfaces (near-dup warn wording + the
+    RETEST nudge). Wording is pinned byte-identical modulo each surface's
+    verb prefix, and the SHARING is pinned by mutation: plant a refusal
+    inside the one guard internal (store.write._keyword_lint, resolved at
+    call time in write.py's globals) and BOTH surfaces must fail with the
+    planted text — a surface carrying its own copied guard would sail past
+    the plant, which is exactly the drift this class exists to catch."""
+
+    def seed_sibling(self):
+        ts = pk.now_ts()
+        store.write_prior({
+            "id": "seat-freeze-law", "statement": "seats freeze on plan prompts",
+            "confidence": 0.8, "keywords": "pane freeze, seat stall on plan prompt, plan approval prompt",
+            "status": store.STATUS_LIVE, "source": "test", "stated_ts": ts,
+            "last_updated": ts})
+
+    def test_near_dup_refusal_is_byte_identical_across_surfaces(self):
+        self.seed_sibling()
+        add_argv = ["add", "premise", "seat-freeze-two", "|", "a", "second",
+                    "seat", "law", "|", "seat", "stall", "on", "plan",
+                    "prompt,", "plan", "approval", "prompt,", "tmux"]
+        rc_a, _, err_a = self.run_verb(store.cmd_store, add_argv)
+        rc_p, _, err_p = self.run_verb(
+            premise.cmd_premise,
+            ["seat-freeze-two | a second seat law | seat stall on plan prompt, plan approval prompt, tmux",
+             "--no-attest"])
+        self.assertEqual((rc_a, rc_p), (1, 1))
+        core_a = err_a.split("helm store add: ", 1)[1]
+        core_p = err_p.split("helm premise: ", 1)[1]
+        self.assertEqual(core_a, core_p)          # SAME wording, byte for byte
+        self.assertIn("already resolves to LIVE 'seat-freeze-law'", core_p)
+
+    def test_control_a_novel_capture_passes_and_gains_stems(self):
+        self.seed_sibling()
+        rc, out, err = self.run_verb(
+            premise.cmd_premise,
+            ["quota-law | the quota truth | cred quota runs dry, mid-work",
+             "--no-attest"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("stem probes auto-added", out)
+        kws = store._kw_list(store._find("quota-law")["keywords"])
+        self.assertIn("cred quota runs dry", kws)            # original kept
+        self.assertIn("quota", kws)                          # stem widened
+
+    def test_mutation_pin_both_surfaces_flow_through_the_one_guard(self):
+        from helm.store import write as store_write
+        planted = "MUTATION-PLANT: the one shared guard refused this"
+        with mock.patch.object(store_write, "_keyword_lint",
+                               return_value=planted):
+            rc_a, _, err_a = self.run_verb(
+                store.cmd_store,
+                ["add", "premise", "mut-law", "|", "a", "truth", "|",
+                 "seat", "gates,", "boot", "latch"])
+            rc_p, _, err_p = self.run_verb(
+                premise.cmd_premise,
+                ["mut-law | a truth | seat gates, boot latch", "--no-attest"])
+        self.assertEqual((rc_a, rc_p), (1, 1))
+        self.assertIn(planted, err_a)
+        self.assertIn(planted, err_p)
+        # control: the mutation reverted, the very same capture lands
+        rc, _, err = self.run_verb(
+            premise.cmd_premise,
+            ["mut-law | a truth | seat gates, boot latch", "--no-attest"])
+        self.assertEqual((rc, err), (0, ""))
+
+    def test_capture_prints_the_one_retest_constant(self):
+        from helm.store import cli as store_cli
+        from helm.store._common import RETEST
+        rc, out, _ = self.run_verb(
+            premise.cmd_premise,
+            ["retest-law | a truth | cred rotation, quota headroom",
+             "--no-attest"])
+        self.assertEqual(rc, 0)
+        self.assertIn(RETEST, out)                # THE constant, verbatim
+        # one OBJECT, every emitter — each alias carries the nudge AND is the
+        # shared constant itself (a byte-equal copy would pass assertIn and
+        # fail assertIs; that is the drift this test exists to catch)
+        self.assertIn("now RETEST", store_cli._RETEST)
+        self.assertIs(store_cli._RETEST, RETEST)
+        self.assertIn("now RETEST", store.RETEST)
+        self.assertIs(store.RETEST, RETEST)
+
+    def test_supersede_capture_prints_the_retest_constant_too(self):
+        from helm.store._common import RETEST
+        self.run_verb(premise.cmd_premise,
+                      ["old-law | the old seat truth | pane latch, gate boot",
+                       "--no-attest"])
+        rc, out, _ = self.run_verb(
+            premise.cmd_premise,
+            ["--supersede", "old-law",
+             "new-law | the refined seat truth | quota headroom, cred rotation"])
+        self.assertEqual(rc, 0)
+        self.assertIn(RETEST, out)
+
+    def test_statement_near_dup_warn_is_shared_across_surfaces(self):
+        self.seed_sibling()
+        stmt = "seats freeze on plan prompts always"   # 5/6 tokens = 83% >= 80%
+        rc_p, out_p, err_p = self.run_verb(
+            premise.cmd_premise,
+            ["warn-law | %s | cred rotation, quota headroom" % stmt,
+             "--no-attest"])
+        self.assertEqual((rc_p, err_p), (0, ""))
+        landed = store._find("warn-law")               # a warn NEVER blocks
+        self.assertIn("plan prompts always", landed["statement"])
+        warn_p = [l for l in out_p.splitlines() if "possible duplicate" in l]
+        self.assertEqual(len(warn_p), 1)
+        self.assertIn("helm premise: WARNING possible duplicate of "
+                      "'seat-freeze-law'", warn_p[0])
+        self.assertIn("  helm store supersede", out_p)  # the shared cure line
+        # the add surface, same statement, same sibling (the first capture is
+        # retired so the best overlap stays seat-freeze-law on both surfaces)
+        store.retire("warn-law", pk.now_ts(), "parity control")
+        rc_a, out_a, _ = self.run_verb(
+            store.cmd_store,
+            ["add", "premise", "warn-two", "|"] + stmt.split()
+            + ["|", "gate", "latch,", "boot", "probe"])
+        self.assertEqual(rc_a, 0)
+        warn_a = [l for l in out_a.splitlines() if "possible duplicate" in l]
+        self.assertEqual(len(warn_a), 1)
+        # ONE wording: byte-identical after each surface's verb prefix
+        self.assertEqual(warn_p[0].split(": ", 1)[1],
+                         warn_a[0].split(": ", 1)[1])
+
+    def test_supersede_leg_does_not_warn_against_its_own_predecessor(self):  # noqa: VACUOUS_ASSERTION — the direct-leg warn test above is the positive control on the same wording
+        self.run_verb(premise.cmd_premise,
+                      ["old-law | seats freeze on plan prompts | pane latch, gate boot",
+                       "--no-attest"])
+        rc, out, _ = self.run_verb(
+            premise.cmd_premise,
+            ["--supersede", "old-law",
+             "new-law | seats freeze on plan prompts always | quota headroom, cred rotation"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("possible duplicate", out)
 
 
 class NativeChainTest(PremiseBase):

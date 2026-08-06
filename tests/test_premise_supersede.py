@@ -11,8 +11,12 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import home, pk, premise, store  # noqa: E402
 
@@ -23,7 +27,8 @@ REC_B = "b2" * 32
 
 class SupBase(unittest.TestCase):
     ENV_KEYS = ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_NODE_URL",
-                "HELM_CELL_PROFILE", "MELD_NODE_URL", "MELD_AGENT_PROFILE")
+                "HELM_CELL_PROFILE", "HELM_STORE_FORCE_NEW",
+                "MELD_NODE_URL", "MELD_AGENT_PROFILE")
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-sup-")
@@ -72,6 +77,18 @@ class SupBase(unittest.TestCase):
             os.path.join(home.global_dir(), "premises", "prior-%s.md" % pid),
             {"attest_record": ""})
         return (meta or {}).get("attest_record") or ""
+
+    def tree_bytes(self):
+        out = {}
+        for root in (os.environ["HELM_HOME"], os.environ["HELM_ADOPTED_DIR"]):
+            if not os.path.isdir(root):
+                continue
+            for base, _dirs, files in os.walk(root):
+                for name in files:
+                    path = os.path.join(base, name)
+                    with open(path, "rb") as f:
+                        out[path] = f.read()
+        return out
 
 
 class SupersedeFlowTest(SupBase):
@@ -124,6 +141,72 @@ class SupersedeFlowTest(SupBase):
                                    ["--chain", "law-v2"])
         self.assertNotEqual(rc, 1)   # v1 is unattested (absent=3) — never broken
         self.assertIn("native chain VERIFIED", out)
+
+    def test_selected_predecessor_is_excluded_from_duplicate_corpus(self):  # noqa: VACUOUS_ASSERTION — live old/new rows positively control the exclusion path
+        rc, _, _ = self.run_verb(
+            premise.cmd_premise,
+            ["law-v1 | the first seat law | pane freeze, seat stall, plan prompt"])
+        self.assertEqual(rc, 0)
+        rc, _, err = self.run_verb(
+            premise.cmd_premise,
+            ["--supersede", "law-v1",
+             "law-v2 | the evolved seat law | seat stall, plan prompt, tmux"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(store._find("law-v1")["status"],
+                         store.STATUS_DELETE_ELIGIBLE)
+        self.assertEqual(store._find("law-v2")["status"], store.STATUS_LIVE)
+
+    def test_predecessor_exclusion_does_not_hide_other_siblings(self):  # noqa: VACUOUS_ASSERTION — seeded sibling and byte snapshot control the refused write
+        rc, _, _ = self.run_verb(
+            premise.cmd_premise,
+            ["law-v1 | the first seat law | pane freeze, seat stall, plan prompt"])
+        self.assertEqual(rc, 0)
+        ts = pk.now_ts()
+        store.write_prior({
+            "id": "seat-freeze-sibling", "statement": "another seat law",
+            "confidence": 0.8, "keywords": "seat stall, plan prompt, tmux",
+            "status": store.STATUS_LIVE, "source": "test", "stated_ts": ts,
+            "last_updated": ts})
+        before = self.tree_bytes()
+        chain = premise.chain_records()
+        events = pk.read_events(50)
+        rc, out, err = self.run_verb(
+            premise.cmd_premise,
+            ["--supersede", "law-v1",
+             "law-v2 | the evolved seat law | seat stall, plan prompt, tmux"])
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("seat-freeze-sibling", err)
+        self.assertEqual(self.tree_bytes(), before)
+        self.assertEqual(premise.chain_records(), chain)
+        self.assertEqual(pk.read_events(50), events)
+
+    def test_forced_override_receipts_after_writer_before_lifecycle_failure(self):  # noqa: VACUOUS_ASSERTION — persisted NEW row and override event control the lifecycle failure
+        rc, _, _ = self.run_verb(
+            premise.cmd_premise,
+            ["law-v1 | the first seat law | pane freeze, seat stall, plan prompt"])
+        self.assertEqual(rc, 0)
+        ts = pk.now_ts()
+        store.write_prior({
+            "id": "seat-freeze-sibling", "statement": "another seat law",
+            "confidence": 0.8, "keywords": "seat stall, plan prompt, tmux",
+            "status": store.STATUS_LIVE, "source": "test", "stated_ts": ts,
+            "last_updated": ts})
+        with mock.patch.object(store, "mark_superseded",
+                               return_value=(None, "lifecycle refused")):
+            rc, out, err = self.run_verb(
+                premise.cmd_premise,
+                ["--supersede", "law-v1",
+                 "law-v2 | the evolved seat law | seat stall, plan prompt, tmux",
+                 "--force-new"])
+        self.assertEqual(rc, 1)
+        self.assertIn("DUP OVERRIDE recorded", out)
+        self.assertIn("lifecycle refused", err)
+        self.assertIsNotNone(store._find("law-v2"))
+        self.assertEqual(store._find("law-v1")["status"], store.STATUS_LIVE)
+        receipts = [e for e in pk.read_events(50)
+                    if e.get("verb") == "store.dup_override"
+                    and e.get("target") == "law-v2"]
+        self.assertEqual(len(receipts), 1)
 
     def test_refusals(self):
         self.capture_v1()
@@ -188,6 +271,28 @@ class CaptureGuardTest(SupBase):
             self.assertNotIn(stale, raw)
         self.assertEqual(raw.count("attest_payload:"), 1)
         self.assertIn("  attest_payload: " + premise.digest_payload("resurrected"), raw)
+
+    def test_remint_over_tombstone_drops_the_stale_gloss(self):
+        """A re-minted premise kept firing its OLD gloss beside NEW,
+        contradictory text, because this path carried its own hard-coded
+        stale-field copy and `gloss` was added only to the other one. The
+        scrub now has ONE spelling (store STALE_ON_REMINT), shared with
+        store add."""
+        self.capture_v1()
+        self.run_verb(premise.cmd_premise,
+                      ["--supersede", "law-v1", "law-v2 | truth two"])
+        path = os.path.join(home.global_dir(), "premises", "prior-law-v1.md")
+        e = store._parse_prior(path)
+        e["gloss"] = "the old firing line"
+        store.write_prior(e, path=path)
+        self.assertIn("  gloss: the old firing line", self.entry_raw("law-v1"))
+        rc, _, _ = self.run_verb(premise.cmd_premise, ["law-v1 | resurrected"])
+        self.assertEqual(rc, 0)
+        raw = self.entry_raw("law-v1")
+        self.assertIn("  status: live", raw)
+        self.assertIn("resurrected", raw)
+        self.assertNotIn("gloss:", raw,
+                         "a re-mint must not keep firing the old line")
 
 
 class VerifyLinkTest(SupBase):
@@ -255,7 +360,7 @@ class ChainCheckTest(SupBase):
     def test_store_only_hop_reads_unbacked_but_not_broken(self):
         self.build_chain()
         rc, _, _ = self.run_verb(store.cmd_store,
-                                 ["add", "premise", "law-d | truth four"])
+                                 ["add", "premise", "law-d | truth four | lawdkw"])
         self.assertEqual(rc, 0)
         _e, err = store.mark_superseded("law-c", "law-d", pk.now_ts())
         self.assertIsNone(err)

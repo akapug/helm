@@ -4,7 +4,9 @@ The physical-root set, the per-type fail-open parsers, and load_all() with its
 shadowing law + the status/dedup projections (entries/candidates/reviewable/
 counts/_find). Moved verbatim from the pre-split helm/store.py.
 """
+import copy
 import os
+import threading
 
 from .. import home, pk
 from ._common import (
@@ -92,9 +94,11 @@ def _default_dir(etype, project=None):
 
 _PRIOR_DEFAULTS = {
     "id": "", "statement": "", "confidence": "", "load_class": "",
+    "gloss": "",
     "status": "live", "domain": "", "keywords": "", "stated_ts": "",
     "last_updated": "", "source": "", "pin": "",
     "evidence_log": "", "confidence_history": "",
+    "policy_kind": "", "policy_members": [], "policy_reason": "",
     "supersedes": "", "replaced_by": "", "source_prior": "",
     "retired_ts": "", "retired_why": "",
     # xrev-clear receipt (candidate -> provisional): who attested the
@@ -111,13 +115,31 @@ _PRIOR_DEFAULTS = {
 }
 
 _LEX_DEFAULTS = {"term": "", "scope": "global", "definition": "", "kind": "",
+                 "gloss": "",
                  "keywords": "", "domain": "", "source": "", "examples": [],
                  "updated_ts": "", "hits": "0", "status": "live",
                  "retired_ts": "", "retired_why": "",
-                 "xrev_by": "", "xrev_ts": ""}
+                 "xrev_by": "", "xrev_ts": "",
+                 # canon-as-controlled-language, Lane 1 (the synonym map). One
+                 # canonical entry per concept; synonyms MAP to it rather than
+                 # competing (docs/CANON_CONTROLLED_LANGUAGE.md §2). aliases =
+                 # CSV of synonym TERMS a person/agent might say (linter +
+                 # translator read this). alias_triggers = CSV of the
+                 # word-boundary PROBE forms each alias contributes; the
+                 # resolver folds these into THIS entry's probe set so a concept
+                 # with synonyms keeps its full 1/df weight (resolve._probes).
+                 # canonical = back-pointer on a STUB alias entry only (a
+                 # synonym someone still `get`s by name); a stub does NOT compete
+                 # as a resolve candidate (resolve._jit_candidates). Each field
+                 # ships with a default ON PURPOSE: the parser only keeps keys
+                 # that exist in the defaults, so a field lacking one is silently
+                 # dropped on rewrite (the proven meme:true loss). New field ->
+                 # new default, always.
+                 "aliases": "", "alias_triggers": "", "canonical": ""}
 
 _HEUR_DEFAULTS = {
     "id": "", "move": "", "statement": "", "trigger": "", "keywords": "",
+    "gloss": "",
     "domain": "", "status": "live", "load_class": "jit",
     "stated_ts": "", "last_updated": "", "source": "",
     "supersedes": "", "replaced_by": "", "retired_ts": "", "retired_why": "",
@@ -126,6 +148,7 @@ _HEUR_DEFAULTS = {
 
 _REF_DEFAULTS = {
     "id": "", "statement": "", "summary": "", "url": "", "keywords": "",
+    "gloss": "",
     "domain": "", "status": "live", "load_class": "", "source": "",
     "stated_ts": "", "last_updated": "", "name": "", "description": "",
     "supersedes": "", "replaced_by": "", "retired_ts": "", "retired_why": "",
@@ -136,13 +159,25 @@ _EPISODIC_DEFAULTS = {"name": "", "description": "", "type": "", "load_class": "
 
 
 def _parse_prior(path):
-    e = pk.parse_simple_frontmatter(path, _PRIOR_DEFAULTS)
+    e = pk.parse_simple_frontmatter(
+        path, _PRIOR_DEFAULTS, list_keys=("policy_members",))
     if not (e and e["id"] and e["statement"]):
         return None
     _decode_lists(e)
+    raw_conf = str(e.get("confidence") or "").strip()
+    try:
+        policy_confidence_valid = float(raw_conf) == 1.0
+    except (TypeError, ValueError):
+        policy_confidence_valid = False
+    source = str(e.get("source") or "").strip()
+    source_lower = source.casefold()
+    policy_source_valid = bool(source) and "inferred" not in source_lower \
+        and not source_lower.startswith("agent")
     conf = _coerce_conf(e.get("confidence"))
     pin = _is_pinned(e)
     e.update({"type": "prior", "confidence": conf, "class": derive_class(conf),
+              "_policy_confidence_valid": policy_confidence_valid,
+              "_policy_source_valid": policy_source_valid,
               "load_class": derive_load_class(e, conf, pin), "pinned": pin,
               "status": e.get("status") or STATUS_LIVE})
     return e
@@ -168,7 +203,12 @@ def _parse_lexicon(path):
     e.update({"type": "lexicon", "id": e["term"], "statement": e["definition"],
               "confidence": 1.0, "class": "lexicon", "load_class": "jit",
               "status": status, "keywords": kw, "kind": kind,
-              "domain": (e.get("domain") or "").strip(), "pinned": False})
+              "domain": (e.get("domain") or "").strip(), "pinned": False,
+              # synonym-map fields (Lane 1): normalized to stripped strings so
+              # the resolver's probe fold + the stub-exclusion read a clean CSV
+              "aliases": (e.get("aliases") or "").strip(),
+              "alias_triggers": (e.get("alias_triggers") or "").strip(),
+              "canonical": (e.get("canonical") or "").strip()})
     return e
 
 
@@ -295,10 +335,121 @@ def _load_root(root, scope, d):
     return out
 
 
+_TLS = threading.local()    # per-THREAD .depth + .cache; see _scope_state()
+
+
+def _scope_state():
+    """This thread's scope depth and cache.
+
+    PER-THREAD, NOT PER-PROCESS, and that distinction is the whole correctness
+    of this cache. helm web is a ThreadingHTTPServer: two overlapping requests
+    run in two threads inside one interpreter. A module-level dict and a class
+    attribute are shared by both, so thread A's snapshot answered thread B's
+    read (@codex-2 measured it deterministically: a probe expecting
+    {first, second} returned {first, first}), and A leaving its scope cleared
+    the cache out from under B while B was still inside one.
+
+    Nothing here is shared, so there is no lock and no contention: a thread can
+    only ever see the reads it made itself, which is exactly what "scoped to
+    ONE operation" was always supposed to mean."""
+    tls = _TLS
+    if not hasattr(tls, "depth"):
+        tls.depth = 0
+        tls.cache = {}
+    return tls
+
+
+def _detached(rows):
+    """A caller-owned copy of a cached result. FULLY recursive, on purpose.
+
+    `list(rows)` was NOT enough. It builds a new list around the SAME entry
+    dicts, so a caller that mutates one entry mutates what the next read in the
+    same scope sees (@codex-2's first probe: the following read saw 99). The
+    docstring said "a copy: callers mutate their result" and the code delivered
+    a copy of the wrong thing.
+
+    ONE LEVEL WAS NOT ENOUGH EITHER, and I argued otherwise before @codex-2
+    measured it. I claimed list values were the only mutable ones and that a
+    deepcopy "would spend the win". Both halves were false against the real
+    corpus: 892 of 1,308 entries carry confidence_history / evidence_log lists
+    whose ELEMENTS are dicts, and mutating one of those nested dicts poisoned
+    the next cached read. The cost I was protecting turned out to be noise —
+    deepcopy measured 12.98ms per copy against a 5.75ms one-level copy, inside
+    an 11.5s projection.
+
+    So the rule is now the simple one with no bound to get wrong: a caller owns
+    everything it is handed, all the way down. A stated-but-false isolation
+    bound is worse than an honest cost."""
+    return copy.deepcopy(list(rows))
+
+
+class read_scope:
+    """Memoize whole-store reads for the duration of ONE operation.
+
+    MEASURED 2026-07-31. `helm lr list` / `/api/lr` took 25-41s to project 312
+    land loops, and the owner's console card renders UNKNOWN because its budget
+    is 12s — so the land pipeline was unreadable on the surface built to show
+    it. The profile put 30.7 of 41 seconds in ONE place: `approval_tier` calls
+    `load_certain_policy` per row, which calls `load_all`, which re-walks and
+    re-parses the ENTIRE store. 179 rows produced 716 root loads and 244,335
+    frontmatter parses of the same 1,308 files.
+
+    THE CACHE IS SCOPED TO AN OPERATION, NEVER TO TIME, and that is the whole
+    design. A time-keyed or mtime-keyed cache would serve stale policy — and a
+    long-lived process serving boot-time state is the exact failure class this
+    fix exists inside (helm web served 40h-old code today; the owner console
+    served an 8-day-old render). An in-place edit does not bump a directory
+    mtime, so an mtime key would be silently wrong. Entering this scope starts
+    an empty cache and LEAVING IT DROPS THE CACHE, so no read can ever outlive
+    the operation that asked for it. Outside a scope nothing is cached and
+    behaviour is byte-identical to before.
+
+    Re-entrant on purpose: nested scopes share the outermost cache and only the
+    outermost clears, so a caller need not know whether its callee also scopes.
+    Re-entrancy is per-thread too — a nested scope shares the cache of the
+    outer scope ON ITS OWN THREAD and is invisible to every other thread.
+    """
+
+    def __enter__(self):
+        _scope_state().depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        t = _scope_state()
+        t.depth -= 1
+        if t.depth <= 0:
+            t.depth = 0
+            t.cache.clear()
+        return False
+
+
 def load_all(project=None, include_retired=False, include_dormant=True, types=None):
     """Every entry across the root set, enriched (id/type/statement/confidence/
     class/load_class/status/keywords/domain/scope/root/path/pinned), deduped by
-    (type, slug) with the shadowing law: project > helm-global > adopted."""
+    (type, slug) with the shadowing law: project > helm-global > adopted.
+
+    Inside a `read_scope()` the result is memoized for that operation; outside
+    one it is recomputed every call, exactly as before."""
+    t = _scope_state()
+    if t.depth > 0:
+        key = (project, bool(include_retired), bool(include_dormant),
+               tuple(types) if isinstance(types, (list, tuple)) else types)
+        hit = t.cache.get(key)
+        if hit is not None:
+            return _detached(hit)
+        out = _load_all_uncached(project, include_retired, include_dormant,
+                                 types)
+        t.cache[key] = out
+        # DETACH ON THE MISS PATH TOO. Returning `out` handed the caller the
+        # very list of dicts now sitting in the cache, so the FIRST caller
+        # could poison every later read in the scope — the miss path was the
+        # more dangerous of the two and the one the old code left open.
+        return _detached(out)
+    return _load_all_uncached(project, include_retired, include_dormant, types)
+
+
+def _load_all_uncached(project=None, include_retired=False,
+                       include_dormant=True, types=None):
     if isinstance(types, str):
         types = (types,)
     merged = {}
@@ -369,3 +520,71 @@ def _find(eid, project=None, types=None):
         if t in hits:
             return hits[t]
     return None
+
+
+def _policy_hits(kind, project=None):
+    """Every live prior declaring this policy kind. THE ONE SCAN.
+
+    `policy_declared` and `load_certain_policy` must agree about what "exists"
+    means or a caller can be told both "there is no policy" and "the policy is
+    unusable" about the same store — which is two owners of one fact, the
+    defect this project keeps finding in new places. They share this."""
+    kind = str(kind or "").strip().casefold()
+    if not kind:
+        return []
+    # CASEFOLD BOTH SIDES. Writing canonically is not enough on its own — every
+    # row already on disk keeps whatever case it was written with, and a
+    # read-only fix would let new mixed-case rows keep arriving. @kimi's point:
+    # one place is not enough, in either direction.
+    return [e for e in load_all(project=project, include_retired=True,
+                                types=("prior",))
+            if e.get("status") == STATUS_LIVE
+            and str(e.get("policy_kind") or "").strip().casefold() == kind]
+
+
+def policy_declared(kind, project=None):
+    """Does ANY live prior declare this policy kind at all?
+
+    ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS, and `load_certain_policy`
+    returns a sentence for both — "no live policy declares kind X" reads the
+    same to a caller as "policy X lacks a human source". A land gate built on
+    that string must either parse prose or conflate two states that demand
+    OPPOSITE behaviour: no policy means nothing to enforce, an unreadable one
+    means we cannot say. This answers only the first question."""
+    try:
+        return bool(_policy_hits(kind, project=project))
+    except Exception:                       # noqa: BLE001
+        return True     # unreadable store: assume a policy EXISTS, so the
+                        # caller lands in UNKNOWN rather than in "no tier"
+
+
+def load_certain_policy(kind, project=None):
+    """Return the one live certain prior declaring ``policy_kind == kind``.
+
+    Policy is ordinary typed-store data under the existing root/shadow law, not
+    a second registry. Any competing live declaration or incomplete declaration
+    makes the policy unavailable rather than letting a caller guess authority.
+    """
+    kind = str(kind or "").strip()
+    if not kind:
+        return None, "policy kind is required"
+    hits = _policy_hits(kind, project=project)
+    if not hits:
+        return None, "no live policy declares kind %s" % kind
+    if len(hits) > 1:
+        return None, "ambiguous policy kind %s: %s" % (
+            kind, ", ".join(sorted(str(e["id"]) for e in hits)))
+    policy = hits[0]
+    if policy.get("class") != "certain" \
+            or not policy.get("_policy_confidence_valid"):
+        return None, "policy %s is not explicitly certain" % policy["id"]
+    if not policy.get("_policy_source_valid"):
+        return None, "policy %s lacks a human source" % policy["id"]
+    members = policy.get("policy_members")
+    if not isinstance(members, list) or not members:
+        return None, "policy %s has no policy_members" % policy["id"]
+    values = [kind, policy.get("policy_reason") or ""] + members
+    if any(any(ord(c) < 32 or ord(c) == 127 for c in str(value))
+           for value in values):
+        return None, "policy %s contains control characters" % policy["id"]
+    return policy, None

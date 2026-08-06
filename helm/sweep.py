@@ -49,8 +49,8 @@ MIN_BASE = 4            # a same-slug base shorter than this is a bare type-pref
 
 def _tokens(name):
     """The era tokens for a project name: its full slug plus each distinctive
-    hyphen segment (>= 4 chars, non-generic) — so `project-a-private-beta` tags
-    both `lex-project-a--*` (via `project-a`) and its own full slug."""
+    hyphen segment (>= 4 chars, non-generic) — so `example-private-beta` tags
+    both `lex-example--*` (via `example`) and its own full slug."""
     s = pk.slug(name)
     toks = {s}
     for seg in s.split("-"):

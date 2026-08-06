@@ -1,8 +1,8 @@
 """helm store — MEMORY.md index cap + the add-guard/format leaf helpers.
 
 The index_cap budget actuator + its CLI, plus the near-dup guard (_tokens/
-_near_dup) and the CLI row formatter (_fmt). Moved verbatim from the pre-split
-helm/store.py.
+_near_dup and the shared near_dup_warning wording) and the CLI row formatter
+(_fmt). Moved verbatim from the pre-split helm/store.py.
 """
 import os
 import re
@@ -191,6 +191,28 @@ def _near_dup(etype, eid, statement, project=None):
         if ov >= DUP_OVERLAP and ov > best_ov:
             best, best_ov = e, ov
     return best, best_ov
+
+
+def near_dup_warning(dup, ov, ts, eid, project=None):
+    """The statement-overlap WARNING lines every capture surface prints —
+    the caller prefixes the first line with its own verb name ('helm store
+    add: ' / 'helm premise: ') and prints the rest verbatim.
+
+    ONE spelling, because store add and premise capture each carrying their
+    own copy is the proven drift class (STALE_ON_REMINT; the RETEST
+    constant): the wording that teaches the cure must be the same wherever
+    the same situation arises. The cure command is `helm store supersede`
+    on BOTH surfaces — the warn proceeds, so by the time the operator acts
+    the new entry already exists and the store-level tombstone is the right
+    verb (premise --supersede would capture a THIRD statement)."""
+    pflag = (" --project " + project) if project else ""
+    return [
+        "WARNING possible duplicate of '%s' (%d%% statement overlap) — if "
+        "it IS the same knowledge, supersede instead of accumulating:"
+        % (dup["id"], round(ov * 100)),
+        "  helm store supersede %s %s %s <reason...>%s"
+        % (ts, dup["id"], eid, pflag),
+    ]
 
 
 def _fmt(e):

@@ -4,9 +4,10 @@ The `helm store <verb>` surface + its add-time guard constants. Moved verbatim
 from the pre-split helm/store.py; the top of the one-way dep graph.
 """
 import os
+import re
 import sys
 
-from .. import pk
+from .. import delim, pk
 from ._common import (
     _slug, CERTAIN, BELIEF_CLAMP, STATUS_LIVE, STATUS_CANDIDATE, PRIOR_PREFIX,
     _coerce_conf, derive_class,
@@ -19,9 +20,15 @@ from .resolve import resolve_prompt, pinned
 from .write import (
     xrev_clear, confirm, reject, write_prior, _lexicon_path, write_lexicon,
     write_heuristic, write_reference, apply_evidence, mark_superseded, retire,
-    demote, pinned_stats,
+    demote, pinned_stats, retag, _kw_list, _KEYWORD_TYPES,
+    guard_entry_keywords, record_mint_events,
 )
-from .index import _near_dup, _fmt
+from .index import _near_dup, near_dup_warning, _fmt
+
+# THE one retest line (the resolve-test nudge) — a capture is done at FIRES,
+# never at stored:. The constant lives in _common (premise/_capture.py emits
+# it too); this module's emitters are `add` and `keywords --add`.
+from ._common import RETEST as _RETEST
 
 
 # add's <type> arg -> the store type the guard checks (premise IS a prior).
@@ -35,8 +42,19 @@ _GUARD_TYPE = {"prior": "prior", "premise": "prior",
 # replaced_by X" / "live but retired_ts Y" corrupts provenance — codex-seat
 # review). Every parse-then-update add branch scrubs these; reject makes
 # rejected -> re-add a routine agent lane, so the scrub is load-bearing.
-_STALE_ON_REMINT = ("replaced_by", "supersedes", "retired_ts", "retired_why",
-                    "xrev_by", "xrev_ts")
+from ._common import STALE_ON_REMINT as _STALE_ON_REMINT
+
+# how many `|` fields each type's grammar accepts. A surplus field does not
+# append — it CASCADES (statement tail -> keywords -> domain -> off the end),
+# so it is refused rather than absorbed. See helm/delim.py for the parse and
+# for the case this still cannot catch.
+_ARITY = {
+    "prior":     (5, "prior: <id> | <statement> [| conf [| keywords [| domain]]]"),
+    "premise":   (4, "premise: <id> | <statement> [| keywords [| domain]]"),
+    "lexicon":   (5, "lexicon: <term> | <definition> [| kind [| keywords [| domain]]]"),
+    "heuristic": (4, "heuristic: <id> | <move> [| trigger-csv [| domain]]"),
+    "reference": (5, "reference: <id> | <summary> [| url [| keywords [| domain]]]"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -54,20 +72,31 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
       lexicon:   <term> | <definition> [| kind [| keywords [| domain]]]  (kind: ONE slug, e.g. phrase|coinage|bug-class)
       heuristic: <id> | <move> [| trigger-csv [| domain]]
       reference: <id> | <summary> [| url [| keywords [| domain]]]
-      flags: [--source S] [--rationale <text...>] [--candidate]
+      flags: [--source S] [--rationale <text...>] [--candidate] [--force-new]
              --candidate (prior|lexicon|heuristic|reference): safe inferred
              capture — writes a non-live candidate EXCLUDED from inject until
              confirmed (premise refused: certainty is the human-only lane)
       a LIVE same-id add is REFUSED (supersede/evidence instead, printed);
       a near-identical statement warns and proceeds (lexicon redefines freely
       EXCEPT --candidate over a live term — capture never de-canonizes)
-  xrev-clear <id> --by <who> [--type T]       candidate -> PROVISIONAL: a
+      keywords are LINTED at add: empty / lone-word / comma-less >=4-word
+      salad refuse (symptom phrases of 1-3 words are what resolve matches);
+      >=3-word phrases get 1-2-word stems auto-added; keywords that already
+      resolve to a live sibling refuse toward `keywords <id> --add`
+      (--force-new or HELM_STORE_FORCE_NEW=1 overrides, recorded)
+  keywords <id> [--add CSV] [--remove CSV] [--set CSV] [--type T]
+                                              retrieval keys: no flags = print
+                                              them (the widen loop's look step);
+                                              mutations linted like add
+  xrev-clear <id> --by <who> [--type T] [--force-new]
+                                              candidate -> PROVISIONAL: a
                                               cross-family /x review cleared it
                                               (the reviewer attests; the verb
                                               never runs the review). Provisional
                                               FIRES with a [provisional] tag,
                                               awaiting owner ratify
-  confirm <id> [--type T] [--edit <stmt...>]  owner ratify -> live (candidate OR
+  confirm <id> [--type T] [--edit <stmt...>] [--force-new]
+                                              owner ratify -> live (candidate OR
                                               provisional)
   reject <id> [--type T] [why...]             reject a candidate/provisional —
                                               retired in place (file kept)
@@ -81,8 +110,76 @@ _USAGE = """usage: helm store <verb> [args] [--project P]
   counts                                      per-root type inventory"""
 
 
+# The READ verbs that answer "what applies HERE" — these infer the project from
+# cwd when --project is absent. Writes are deliberately excluded: see cmd_store.
+_CWD_SCOPED_READS = ("resolve", "list", "get", "pinned", "counts")
+
+
+_ADD_FLAGS = {
+    "--source": ("source", "one"),
+    "--rationale": ("rationale", "many"),
+    "--candidate": ("candidate", "switch"),
+    "--force-new": ("force_new", "switch"),
+}
+
+
+def _add_args(tail):
+    """Parse add's flags while leaving its unquoted pipe grammar untouched.
+
+    Like fleetnotes._set_args, known flags change the active field, duplicate
+    and unknown flags refuse, and prose joins only after the complete argv has
+    been validated. Rationale is the one multi-token option: it consumes until
+    the next known add flag, then the scanner resumes there.
+    """
+    out = {"kept": [], "source": None, "rationale": "",
+           "candidate": False, "force_new": False}
+    seen = set()
+    i = 0
+    while i < len(tail):
+        token = tail[i]
+        spec = _ADD_FLAGS.get(token)
+        if not spec:
+            if token.startswith("--"):
+                raise ValueError("unknown store add option %s" % token)
+            out["kept"].append(token)
+            i += 1
+            continue
+        if token in seen:
+            raise ValueError("%s may appear only once" % token)
+        seen.add(token)
+        field, shape = spec
+        if shape == "switch":
+            out[field] = True
+            i += 1
+            continue
+        if shape == "one":
+            if i + 1 >= len(tail):
+                raise ValueError("%s needs a value" % token)
+            value = tail[i + 1]
+            if value.startswith("--"):
+                raise ValueError("%s needs a value before %s" % (token, value))
+            if not value.strip():
+                raise ValueError("%s needs a value" % token)
+            out[field] = value
+            i += 2
+            continue
+        words = []
+        i += 1
+        while i < len(tail) and tail[i] not in _ADD_FLAGS:
+            if tail[i].startswith("--"):
+                raise ValueError("unknown store add option %s" % tail[i])
+            words.append(tail[i])
+            i += 1
+        value = " ".join(words).strip()
+        if not value:
+            before = " before %s" % tail[i] if i < len(tail) else ""
+            raise ValueError("%s needs text%s" % (token, before))
+        out[field] = value
+    return out
+
+
 def cmd_store(args):
-    """store <list|get|add|resolve|pinned|xrev-clear|confirm|reject|evidence|supersede|retire|demote|events|counts> — the ONE typed personal-knowledge store."""
+    """store <list|get|add|resolve|pinned|keywords|xrev-clear|confirm|reject|evidence|supersede|retire|demote|events|counts> — the ONE typed personal-knowledge store."""
     args = list(args)
     project = None
     if "--project" in args:
@@ -92,6 +189,39 @@ def cmd_store(args):
             return 2
         project = args[i + 1]
         del args[i:i + 2]
+    elif args and args[0] in _CWD_SCOPED_READS:
+        # INFER THE PROJECT FROM cwd ON READS, and SAY SO.
+        #
+        # The hook path already does this: `helm inject --hook-json` reads the
+        # cwd out of the hook JSON and derives the project, so a seat working in
+        # a project DOES get that project's entries. The interactive CLI never
+        # looked at os.getcwd(), so the same query typed by a human — or by an
+        # agent checking its own work — returned NOTHING and made a working
+        # feature look unimplemented.
+        #
+        # LIVE 2026-07-28, during a production incident on a sibling project: a
+        # seat wrote an incident runbook with `--project sibling-inc`, could not
+        # resolve it from that project's cwd, concluded "project-scoped resolve
+        # is unfinished",
+        # and moved the entry back to _global where it "provably works". The
+        # entry was fine and project resolve was fine — the READ PATH IT TESTED
+        # WITH could not see it. An inconsistency between the path that runs and
+        # the path you debug with is worse than either being broken, because it
+        # manufactures false architectural conclusions under time pressure.
+        #
+        # READS ONLY. A write still homes to _global without an explicit
+        # --project, because where knowledge LIVES is a decision, and silently
+        # homing an entry by whatever directory you happened to be in is the
+        # surprise this fix exists to remove, not add.
+        try:
+            from ..inject._ledger import project_for_cwd
+            inferred = project_for_cwd(os.getcwd())
+        except Exception:
+            inferred = None            # fail open: global-only, never a crash
+        if inferred:
+            project = inferred
+            print("helm store: scoping to project '%s' (from cwd; pass "
+                  "--project to override)" % inferred, file=sys.stderr)
     if not args:
         print(_USAGE, file=sys.stderr)
         return 2
@@ -112,7 +242,7 @@ def cmd_store(args):
             for e in cs:
                 k = _slug(str(e["id"]))
                 byslug[k] = byslug.get(k, 0) + 1
-            print("helm store candidates (%d — excluded from inject until confirmed):"
+            print("helm store list --candidates (%d — excluded from inject until confirmed):"
                   % len(cs))
             for e in cs:
                 # a slug shared across types needs the qualifier — the bare
@@ -158,6 +288,8 @@ def cmd_store(args):
     if cmd == "xrev-clear":
         by = None
         ctype = None
+        force_new = "--force-new" in rest
+        rest = [a for a in rest if a != "--force-new"]
         if "--by" in rest:
             i = rest.index("--by")
             if i + 1 >= len(rest):
@@ -174,20 +306,26 @@ def cmd_store(args):
             del rest[i:i + 2]
         eid = " ".join(a for a in rest if not a.startswith("--")).strip()
         if not eid or not by:
-            print("usage: helm store xrev-clear <id> --by <reviewer> [--type T]",
-                  file=sys.stderr)
+            print("usage: helm store xrev-clear <id> --by <reviewer> [--type T] "
+                  "[--force-new]", file=sys.stderr)
             return 2
-        e, err = xrev_clear(eid, pk.now_ts(), by, project=project, ctype=ctype)
+        guard_notes = []
+        e, err = xrev_clear(eid, pk.now_ts(), by, project=project, ctype=ctype,
+                            force=force_new, guard_notes=guard_notes)
         if err:
             print("helm store xrev-clear: " + err, file=sys.stderr)
             return 1
         print("helm store: XREV-CLEARED '" + eid + "' candidate -> provisional "
               "(cleared by " + by + ") — now FIRES with a [provisional] tag; "
               "owner ratifies via: helm store confirm " + eid)
+        for note in guard_notes:
+            print(note)
         return 0
 
     if cmd == "confirm":
         ctype = None
+        force_new = "--force-new" in rest
+        rest = [a for a in rest if a != "--force-new"]
         if "--type" in rest:
             i = rest.index("--type")
             if i + 1 >= len(rest):
@@ -204,16 +342,19 @@ def cmd_store(args):
             eid = " ".join(a for a in rest if not a.startswith("--")).strip()
         if not eid:
             print("usage: helm store confirm <id> [--type T] "
-                  "[--edit <new definition...>]", file=sys.stderr)
+                  "[--edit <new definition...>] [--force-new]", file=sys.stderr)
             return 2
+        guard_notes = []
         e, err = confirm(eid, pk.now_ts(), new_statement=new_stmt, project=project,
-                         ctype=ctype)
+                         ctype=ctype, force=force_new, guard_notes=guard_notes)
         if err:
             print("helm store confirm: " + err, file=sys.stderr)
             return 1
         print("helm store: CONFIRMED '" + eid + "' -> live (owner-ratified)"
               + (" (definition edited)" if new_stmt else "")
               + " - now fires in the JIT lane untagged")
+        for note in guard_notes:
+            print(note)
         return 0
 
     if cmd == "reject":
@@ -246,26 +387,16 @@ def cmd_store(args):
             print("helm store: unknown type '" + etype
                   + "' (prior|premise|lexicon|heuristic|reference)", file=sys.stderr)
             return 2
-        tail = rest[1:]
-        source = None
-        rationale = ""
-        candidate = False
-        kept = []
-        i = 0
-        while i < len(tail):
-            if tail[i] == "--source" and i + 1 < len(tail):
-                source = tail[i + 1]
-                i += 2
-                continue
-            if tail[i] == "--candidate":
-                candidate = True
-                i += 1
-                continue
-            if tail[i] == "--rationale":
-                rationale = " ".join(tail[i + 1:]).strip()
-                break
-            kept.append(tail[i])
-            i += 1
+        try:
+            opts = _add_args(rest[1:])
+        except ValueError as e:
+            print("helm store add: " + str(e), file=sys.stderr)
+            return 2
+        kept = opts["kept"]
+        source = opts["source"]
+        rationale = opts["rationale"]
+        candidate = opts["candidate"]
+        force_new = opts["force_new"]
         if candidate and etype == "premise":
             # an inference may not claim certainty even in escrow — confirm
             # ratifies the CAPTURE, it must not be the door to an auto-1.0
@@ -275,7 +406,11 @@ def cmd_store(args):
             print("  helm store add prior <id> | <statement> [| conf] --candidate",
                   file=sys.stderr)
             return 2
-        parts = [p.strip() for p in " ".join(kept).split("|")]
+        arity, grammar = _ARITY.get(etype, (5, _USAGE))
+        parts, refused = delim.split(" ".join(kept), arity, grammar)
+        if refused:
+            print("helm store add: " + refused, file=sys.stderr)
+            return 2
         if len(parts) < 2 or not parts[0] or not parts[1]:
             print(_USAGE, file=sys.stderr)
             return 2
@@ -305,12 +440,11 @@ def cmd_store(args):
                 return 1
             dup, ov = _near_dup(gt, parts[0], parts[1], project=project)
             if dup:
-                pflag = (" --project " + project) if project else ""
-                print("helm store add: WARNING possible duplicate of '%s' (%d%% "
-                      "statement overlap) — if it IS the same knowledge, supersede "
-                      "instead of accumulating:" % (dup["id"], round(ov * 100)))
-                print("  helm store supersede %s %s %s <reason...>%s"
-                      % (ts, dup["id"], parts[0], pflag))
+                # ONE wording — near_dup_warning is shared with premise capture
+                warn = near_dup_warning(dup, ov, ts, parts[0], project=project)
+                print("helm store add: " + warn[0])
+                for line in warn[1:]:
+                    print(line)
 
         # lexicon is _GUARD_TYPE-exempt (redefinition is its one update lane) —
         # but a CANDIDATE add must never ride that exemption over a LIVE term:
@@ -336,10 +470,23 @@ def cmd_store(args):
                                 PRIOR_PREFIX + _slug(parts[0]) + ".md")
             e = _parse_prior(path) or {}
             if etype == "prior":
-                try:
-                    conf = float(parts[2]) if len(parts) > 2 and parts[2] else 0.6
-                except ValueError:
-                    conf = 0.6
+                # a non-number in the confidence slot is the delimiter cascade
+                # arriving WITHIN arity — the old `except ValueError: 0.6`
+                # swallowed the text whole and stored a belief nobody stated.
+                # This is the one slot with a type, so it is the one place the
+                # mis-split can be caught exactly rather than guessed at.
+                conf = 0.6
+                if len(parts) > 2 and parts[2]:
+                    try:
+                        conf = float(parts[2])
+                    except ValueError:
+                        print("helm store add: confidence is '%s', which is not "
+                              "a number — refusing rather than storing 0.6 and "
+                              "dropping the text.\n  grammar: %s\n  if that "
+                              "belongs in the statement, escape the pipe before "
+                              "it as `\\|`." % (delim.echo(parts[2]), grammar),
+                              file=sys.stderr)
+                        return 2
                 kw = parts[3] if len(parts) > 3 else e.get("keywords", "")
                 dom = parts[4] if len(parts) > 4 else e.get("domain", "")
                 src = source or ("inferred" if candidate else "agent-inferred")
@@ -353,6 +500,14 @@ def cmd_store(args):
                 # the prior verb mints BELIEFS; certainty (1.0) is the premise
                 # verb's human-only lane — an add-prior 0.999/1.0 clamps to 0.99
                 conf = min(conf, BELIEF_CLAMP[1])
+            # add-time findability gate (lint / duplicate probe / stem
+            # decomposition) on the EFFECTIVE keywords — the re-mint fallback
+            # included, because what LOADS is what resolves.
+            kw, gerr, gnotes, gevents = guard_entry_keywords(
+                "prior", parts[0], kw, project=project, force=force_new)
+            if gerr:
+                print("helm store add: " + gerr, file=sys.stderr)
+                return 1
             # fresh lifecycle on re-mint (see _STALE_ON_REMINT); a prior also
             # sheds the old belief's audit trail — the new statement's
             # confidence is not evidence-continuous with the retired one's
@@ -371,6 +526,7 @@ def cmd_store(args):
                 e["confidence_history"] = [{"ts": ts, "value": round(conf, 4),
                                             "reason": rationale}]
             p = write_prior(e, path=path)
+            record_mint_events(gevents)
             pk.event("store.add", parts[0],
                      etype + (" candidate — " if candidate else " — ") + parts[1])
             if candidate:
@@ -381,14 +537,26 @@ def cmd_store(args):
                 print("helm store: LIVE '" + parts[0] + "' [" + derive_class(conf) + " "
                       + ("%.2f" % conf) + "] - " + parts[1])
             print("  stored: " + p)
+            for note in gnotes:
+                print(note)
+            if not candidate:  # a candidate cannot fire yet — retest at confirm
+                print(_RETEST)
             return 0
 
         if etype == "lexicon":
             # the pipe contract is closed: a field the store will not keep is
             # REFUSED, never silently filed under the wrong key (the live
-            # incident: a keywords CSV in field 3 died as kind:)
+            # incident: a keywords CSV in field 3 died as kind:). The
+            # over-arity half of this guard (`len(parts) > 5`) MOVED to the
+            # shared delim check above, which now refuses a sixth field for
+            # every type rather than only this one — leaving the disjunct here
+            # would be a branch that can no longer be reached. What stays is
+            # the part only lexicon can know: kind is a single taxonomy slug,
+            # so a CSV in it is a WITHIN-arity cascade, caught by TYPE the way
+            # a non-numeric confidence is caught for prior. Those two typed
+            # fields are the only exact within-arity detections helm has.
             kind = parts[2] if len(parts) > 2 and parts[2] else ""
-            if "," in kind or len(parts) > 5:
+            if "," in kind:
                 print("helm store add: lexicon is <term> | <definition> "
                       "[| kind [| keywords,csv [| domain]]] — kind is ONE "
                       "taxonomy slug (phrase|coinage|bug-class), field 4 "
@@ -407,11 +575,39 @@ def cmd_store(args):
                  "keywords": parts[3] if len(parts) > 3 and parts[3] else prev.get("keywords", ""),
                  "domain": parts[4] if len(parts) > 4 and parts[4] else prev.get("domain", ""),
                  "examples": prev.get("examples") or [],
+                 # MERGE, per this block's own contract two comments up. The
+                 # reconstruction listed every optional field EXCEPT the gloss,
+                 # so a keyword-only redefine silently dropped the short line
+                 # the term fires with (codex round 3). A gloss is DERIVED FROM
+                 # THE DEFINITION, so it survives only while the definition is
+                 # unchanged — a redefine that changes the meaning invalidates
+                 # it exactly as `confirm --edit` does, and it is dropped rather
+                 # than guessed at.
+                 # COMPARE IN THE STORED REPRESENTATION. write_lexicon
+                 # whitespace-normalizes the definition before it ever reaches
+                 # disk, so prev holds the normalized form — comparing it to
+                 # RAW parts[1] read a retyped-but-identical definition as a
+                 # semantic change and silently dropped the gloss (codex,
+                 # gloss-round blocker). Normalize the candidate the same way.
+                 "gloss": (prev.get("gloss") or "")
+                          if str(prev.get("definition") or "")
+                          == re.sub(r"\s+", " ", parts[1]).strip() else "",
                  "term_scope": scope, "status": status,
                  "source": source or prev.get("source")
                  or ("inferred" if candidate else "define"),
                  "updated_ts": ts, "hits": prev.get("hits") or "0"}
+            # findability gate on the MERGED keywords (lexicon: exempt from
+            # the empty case — the term is a probe by construction — and from
+            # the duplicate probe, per its redefine/alias-fold law; provided
+            # keywords are linted + stemmed like everyone else's)
+            e["keywords"], gerr, gnotes, gevents = guard_entry_keywords(
+                "lexicon", parts[0], e["keywords"], project=project,
+                force=force_new)
+            if gerr:
+                print("helm store add: " + gerr, file=sys.stderr)
+                return 1
             p = write_lexicon(e, path=path)
+            record_mint_events(gevents)
             pk.event("store.add", parts[0],
                      ("lexicon candidate — " if candidate else "lexicon — ") + parts[1])
             if candidate:
@@ -421,6 +617,10 @@ def cmd_store(args):
             else:
                 print("helm store: LIVE '" + parts[0] + "' [lexicon " + scope + "] - " + parts[1])
             print("  stored: " + p)
+            for note in gnotes:
+                print(note)
+            if not candidate:
+                print(_RETEST)
             return 0
 
         if etype == "heuristic":
@@ -431,6 +631,13 @@ def cmd_store(args):
                 e.pop(stale, None)
             trig = parts[2] if len(parts) > 2 and parts[2] else (e.get("trigger") or "")
             dom = parts[3] if len(parts) > 3 and parts[3] else e.get("domain", "")
+            # findability gate on the trigger CSV — a heuristic's probes ARE
+            # its trigger (write_heuristic serializes trigger-first)
+            trig, gerr, gnotes, gevents = guard_entry_keywords(
+                "heuristic", parts[0], trig, project=project, force=force_new)
+            if gerr:
+                print("helm store add: " + gerr, file=sys.stderr)
+                return 1
             e.update({"id": parts[0], "move": parts[1], "statement": parts[1],
                       "trigger": trig, "domain": dom,
                       "status": STATUS_CANDIDATE if candidate else STATUS_LIVE,
@@ -438,6 +645,7 @@ def cmd_store(args):
                       "source": source or ("inferred" if candidate
                                            else (e.get("source") or "human"))})
             p = write_heuristic(e, path=path)
+            record_mint_events(gevents)
             pk.event("store.add", parts[0],
                      ("heuristic candidate — " if candidate else "heuristic — ") + parts[1])
             if candidate:
@@ -449,6 +657,10 @@ def cmd_store(args):
             if trig:
                 print("  trigger: " + trig)
             print("  stored: " + p)
+            for note in gnotes:
+                print(note)
+            if not candidate:
+                print(_RETEST)
             return 0
 
         # reference: <id> | <summary> [| url [| keywords [| domain]]]
@@ -457,15 +669,23 @@ def cmd_store(args):
         e = _parse_reference(path, os.path.basename(path)) or {}
         for stale in _STALE_ON_REMINT:  # fresh lifecycle on re-mint
             e.pop(stale, None)
+        # findability gate on the effective keywords (re-mint fallback included)
+        kw = parts[3] if len(parts) > 3 and parts[3] else e.get("keywords", "")
+        kw, gerr, gnotes, gevents = guard_entry_keywords(
+            "reference", parts[0], kw, project=project, force=force_new)
+        if gerr:
+            print("helm store add: " + gerr, file=sys.stderr)
+            return 1
         e.update({"id": parts[0], "statement": parts[1], "summary": parts[1],
                   "url": parts[2] if len(parts) > 2 and parts[2] else e.get("url", ""),
-                  "keywords": parts[3] if len(parts) > 3 and parts[3] else e.get("keywords", ""),
+                  "keywords": kw,
                   "domain": parts[4] if len(parts) > 4 and parts[4] else e.get("domain", ""),
                   "status": STATUS_CANDIDATE if candidate else STATUS_LIVE,
                   "stated_ts": e.get("stated_ts") or ts, "last_updated": ts,
                   "source": source or ("inferred" if candidate
                                        else (e.get("source") or "harvest"))})
         p = write_reference(e, path=path)
+        record_mint_events(gevents)
         pk.event("store.add", parts[0],
                  ("reference candidate — " if candidate else "reference — ") + parts[1])
         if candidate:
@@ -475,6 +695,10 @@ def cmd_store(args):
         else:
             print("helm store: LIVE '" + parts[0] + "' [reference jit] - " + parts[1])
         print("  stored: " + p)
+        for note in gnotes:
+            print(note)
+        if not candidate:
+            print(_RETEST)
         return 0
 
     if cmd == "resolve":
@@ -518,19 +742,34 @@ def cmd_store(args):
             win = ("made %d/%d" % (s["made"][eid], s["rows"])) if s["rows"] \
                 else "no ledger rows"
             print("  %s %-*s  %s" % ("+" if eid in s["fits"] else "-", w, eid, win))
+        # PRESENT TENSE FIRST. A lifetime-zero count answers "has this ever
+        # landed", which is not the question an owner pinning a rule is asking;
+        # they are asking "will this reach me". `fits` is inject's own budget
+        # walk, so an always-entry absent from it CANNOT fire on the next turn
+        # regardless of its history — and a 400-byte entry in a 1200-byte
+        # budget with two ahead of it will never fit, no matter how long you
+        # wait. Reporting only lifetime-zeros hid exactly that: 2 entries that
+        # could not fire at all, while `starved` printed nothing.
+        cannot = [str(e["id"]) for e in s["always"] if str(e["id"]) not in s["fits"]]
+        if cannot:
+            print("%d of %d always-entries CANNOT FIRE — the budget is spent "
+                  "before the walk reaches them (%d/%d bytes used):"
+                  % (len(cannot), len(s["always"]), s["used"], s["budget"]))
+            print("  " + ", ".join(cannot))
+            print("  shorten an entry ahead of them, or: helm store demote <id> <reason...>")
         if not s["rows"]:
             print("no fire-ledger rows with a pinned lane yet — historical "
                   "counts arrive as turns run")
             return 0
         print("ledger window: %d pinned-lane rows (%s .. %s)"
               % (s["rows"], s["first"], s["last"]))
-        starved = [str(e["id"]) for e in s["always"]
-                   if s["made"][str(e["id"])] == 0]
-        if starved:
-            print("%d of %d always-entries NEVER made the budget over this window:"
-                  % (len(starved), len(s["always"])))
-            print("  " + ", ".join(starved))
-            print("  demote one: helm store demote <id> <reason...>")
+        never = [str(e["id"]) for e in s["always"]
+                 if s["made"][str(e["id"])] == 0 and str(e["id"]) in s["fits"]]
+        if never:
+            print("%d of %d fit TODAY but never made the budget over this window "
+                  "(recently pinned, or recently unblocked):"
+                  % (len(never), len(s["always"])))
+            print("  " + ", ".join(never))
         return 0
 
     if cmd == "evidence":
@@ -561,6 +800,50 @@ def cmd_store(args):
             return 1
         print("helm store: TOMBSTONED '" + rest[1] + "' (delete_eligible, replaced_by '"
               + rest[2] + "') - file KEPT until the sweep verifies no dangling ref")
+        return 0
+
+    if cmd == "keywords":
+        # NO ARGS IS A READ, and that is deliberate: the widen loop is
+        # resolve -> look -> widen -> RETEST, and making the "look" step cost a
+        # separate verb is how people skip it and guess at the delta instead.
+        if len(rest) < 1:
+            print("usage: helm store keywords <id> [--add CSV] [--remove CSV] "
+                  "[--set CSV] [--type T]   (no flags = print them)",
+                  file=sys.stderr)
+            return 2
+        eid = rest[0]
+        opt = {k: rest[rest.index(k) + 1] if rest.index(k) + 1 < len(rest)
+               else "" for k in ("--add", "--remove", "--set", "--type")
+               if k in rest}
+        ctype = opt.get("--type")
+        if not any(k in opt for k in ("--add", "--remove", "--set")):
+            e = _find(eid, project=project,
+                      types=(ctype,) if ctype else _KEYWORD_TYPES)
+            if not e:
+                print("helm store keywords: '%s' not found" % eid,
+                      file=sys.stderr)
+                return 1
+            kws = _kw_list(e.get("keywords"))
+            print("%s [%s] — %d keyword%s"
+                  % (e["id"], e["type"], len(kws), "" if len(kws) == 1 else "s"))
+            for k in kws:
+                print("  " + k)
+            return 0
+        e, err = retag(eid, pk.now_ts(), add=opt.get("--add"),
+                       remove=opt.get("--remove"), replace=opt.get("--set"),
+                       project=project, ctype=ctype)
+        if err:
+            print("helm store keywords: " + err, file=sys.stderr)
+            return 1
+        kws = _kw_list(e.get("keywords"))
+        print("helm store: '%s' [%s] now carries %d keyword%s"
+              % (e["id"], e["type"], len(kws), "" if len(kws) == 1 else "s"))
+        print("  " + ", ".join(kws))
+        # THE LOOP IS NOT DONE AT THE WRITE. /learn's own law: a capture is
+        # done at FIRES, never at stored — so the verb that widens is the right
+        # place to say what remains, rather than leaving the author to
+        # remember it. (_RETEST — the same constant `add` prints.)
+        print(_RETEST)
         return 0
 
     if cmd == "retire":

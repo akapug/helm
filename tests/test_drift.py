@@ -6,7 +6,10 @@ import shutil
 import tempfile
 import unittest
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import drift, home, premise, store  # noqa: E402
 
@@ -55,7 +58,7 @@ class TierCrossingTest(DriftBase):
 
 
 class ScopeKeyedSnapshotTest(DriftBase):
-    """Audit finding: one scope-blind snapshot let a --project run poison the
+    """Audit HIGH: one scope-blind snapshot let a --project run poison the
     global baseline and mint tier-crossings that never happened."""
 
     def _shadowed_pair(self):

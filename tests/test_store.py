@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """store tests — hermetic: every root (adopted + helm-global + project) points
-at a tempdir via HELM_HOME + HELM_ADOPTED_DIR. The real ~/.claude and ~/.helm
-are never read or written."""
+at a tempdir via HELM_HOME + HELM_ADOPTED_DIR. The real ~/.claude, ~/.helm and
+legacy stores are never read or written."""
 import contextlib
 import io
 import json
@@ -13,7 +13,10 @@ import threading
 import unittest
 from unittest import mock
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import home, pk, store  # noqa: E402
 
@@ -184,6 +187,505 @@ PRIOR: Always do X.
         self.assertEqual((e["status"], e["retired_why"]), ("retired", "no longer holds"))
 
 
+class TimestampArgumentGuardTest(StoreBase):
+    """`retire|evidence|supersede` take the timestamp POSITIONALLY and wrote it
+    into the durable record unchecked. REPRODUCED before the fix: an agent
+    passed the literal string "NOW" and helm wrote `retired_ts: NOW` AND
+    `last_updated: NOW` onto a live entry; the live store also holds six
+    records whose retired_ts is a bare epoch int or a date with no time.
+    A record whose timestamp cannot be ordered cannot be replayed, and no
+    reader downstream can tell it from a real one."""
+
+    def test_retire_refuses_a_non_iso_timestamp_and_writes_nothing(self):
+        self.seed_prior("guarded", "still true", conf=0.9)
+        e, err = store.retire("guarded", "NOW", "probe")
+        self.assertIsNone(e)
+        self.assertIn("refusing the write", err)
+        # the entry is UNTOUCHED — a refused verb must not half-write
+        live = self.one(store.load_all(), "guarded")
+        self.assertEqual(live["status"], "live")
+        self.assertEqual(live["retired_ts"], "")
+
+    def test_retire_still_accepts_a_real_timestamp(self):
+        self.seed_prior("retirable", "was true once", conf=0.9)
+        e, err = store.retire("retirable", TS, "done")
+        self.assertIsNone(err)
+        self.assertEqual(e["retired_ts"], TS)
+        self.assertEqual(e["status"], "retired")
+
+    def test_evidence_and_supersede_share_the_guard(self):
+        self.seed_prior("moving", "a belief", conf=0.6)
+        self.seed_prior("replacement", "the new one", conf=0.9)
+        e, err = store.apply_evidence("moving", "NOW", 0.1, "probe")
+        self.assertIsNone(e)
+        self.assertIn("refusing the write", err)
+        e, err = store.mark_superseded("moving", "replacement", "yesterday")
+        self.assertIsNone(e)
+        self.assertIn("refusing the write", err)
+        # and both still work on a real instant
+        e, err = store.apply_evidence("moving", TS, 0.1, "probe")
+        self.assertIsNone(err)
+        self.assertGreater(e["confidence"], 0.6)
+
+    def test_valid_ts_shapes(self):
+        # The boundary is #145's single parser: whatever the sort key can
+        # ORDER may be written (epoch, date-only, tz-less all order), and only
+        # an unorderable word is refused. A second stricter validator here
+        # would reintroduce the two-parser drift #145 removed.
+        from helm.store import write as store_write
+        for ok in ("2026-08-03T09:44:23Z", "2026-08-03T09:44:23.501Z",
+                   "2026-08-03T09:44:23+00:00", "2026-08-03T09:44:23-0700",
+                   "2026-08-03", "1781658848", "2026-08-03 09:44:23Z",
+                   "2026-08-03T09:44:23", pk.now_ts()):
+            self.assertIsNone(store_write._valid_write_ts(ok), ok)
+        for bad in ("NOW", "", None, "yesterday", "2026-13-45T99:99:99Z"):
+            self.assertTrue(store_write._valid_write_ts(bad), repr(bad))
+
+
+class GlossLifecycleMatrixTest(StoreBase):
+    """A GLOSS MUST SURVIVE EVERY LIFECYCLE PATH, and be DROPPED by exactly one.
+
+    Requested by codex on review 2026-07-30, and the review found why it was
+    needed: the load schemas accepted `gloss` for prior/heuristic/reference and
+    only ONE writer emitted it. So a hand-authored heuristic gloss vanished on
+    retire, a reference gloss vanished on demote, and every _WRITERS lifecycle
+    path (supersede, confirm, reject, xrev-clear) shared the loss — silently
+    re-truncating the owner's rules at the next rewrite.
+
+    Four writers each carrying their own optional-key loop is what allowed it,
+    which is the per-case spiral the store's own premise names. The cure is one
+    shared emit plus an honest refusal, and this matrix is what holds it: a new
+    type or a new verb that forgets the gloss fails HERE."""
+
+    TS = "2026-07-30T00:00:00Z"
+
+    def _plant(self, kind, eid, gloss="a short firing line", status="live"):
+        # STATUS MATTERS TO THE FIXTURE: load_all() excludes candidates by
+        # design, so a candidate planted here is invisible to _gloss_of. Only
+        # the confirm cases need one; everything else plants live.
+        base = {"id": eid, "gloss": gloss, "status": status}
+        if status == "candidate":
+            # #204 activates candidates through the mint guard; this fixture is
+            # testing gloss lifecycle, so give its candidate a valid probe.
+            base["keywords"] = "glossprobe"
+        if kind == "prior":
+            store.write_prior(dict(base, statement="S" * 500, confidence="0.8"))
+        elif kind == "heuristic":
+            store.write_heuristic(dict(base, statement="S" * 500, move="do the thing"))
+        elif kind == "reference":
+            store.write_reference(dict(base, statement="S" * 500, url="http://x"))
+        else:
+            store.write_lexicon(dict(base, term=eid, definition="D" * 500))
+        if status != "live":
+            return None          # a candidate is not in load_all by design
+        return self.one(store.load_all(), eid)
+
+    def _gloss_of(self, eid):
+        """Read the gloss OFF THE FILE, every status.
+
+        load_all() excludes candidates AND retired entries by design, so the
+        obvious reader cannot see the very rows this matrix is about — a
+        retired heuristic is exactly where the gloss used to disappear. Reading
+        the artifact keeps the test's oracle independent of the loader's
+        filtering, which is the same reason the byte-shape test reads bytes."""
+        import glob as _g, re as _re
+        for f in _g.glob(os.path.join(self.tmp, "**", "*.md"), recursive=True):
+            with open(f, encoding="utf-8") as fh:
+                txt = fh.read()
+            if _re.search(r"^\s+id: %s\s*$" % _re.escape(eid), txt, _re.M) or \
+               _re.search(r"^\s+term: %s\s*$" % _re.escape(eid), txt, _re.M):
+                m = _re.search(r"^\s+gloss: (.*)$", txt, _re.M)
+                return m.group(1).strip() if m else ""
+        return None
+
+    def test_every_type_keeps_its_gloss_through_a_plain_rewrite(self):
+        """The rewrite every lifecycle verb performs. Before the shared emit,
+        three of these four lost it."""
+        for kind in ("prior", "heuristic", "reference", "lexicon"):
+            eid = "rw-" + kind
+            e = self._plant(kind, eid)
+            self.assertEqual(e.get("gloss"), "a short firing line", kind)
+            store._WRITERS[e["type"]](e, path=e["path"])      # the round-trip
+            self.assertEqual(self._gloss_of(eid), "a short firing line",
+                             "%s lost its gloss on a lifecycle rewrite" % kind)
+
+    def test_retire_and_demote_keep_the_gloss(self):
+        """codex named these two by name: heuristic gloss lost on retire,
+        reference gloss lost on demote."""
+        self._plant("heuristic", "lc-retire")
+        store.retire("lc-retire", self.TS, why="done")
+        self.assertEqual(self._gloss_of("lc-retire"), "a short firing line")
+        # A REFERENCE, not a prior: codex reproduced the demote loss on a
+        # REFERENCE, and my first fixture planted a prior — a regression test
+        # for a bug on a type the bug was never reported on. It would have
+        # passed against the broken code for three of the four writers.
+        self._plant("reference", "lc-demote")
+        store.demote("lc-demote", self.TS, "too noisy")
+        self.assertEqual(self._gloss_of("lc-demote"), "a short firing line")
+
+    def test_confirm_without_an_edit_keeps_it_and_an_edit_drops_it(self):
+        """THE ONE PATH THAT MUST DROP IT, and the worst of the four findings.
+
+        A gloss is DERIVED from the statement. `confirm --edit` replaces the
+        statement with new, possibly contradictory text; a preserved gloss then
+        FIRES A LINE THE ENTRY NO LONGER SAYS. That is worse than the truncation
+        the gloss exists to prevent — a severed sentence is visibly incomplete,
+        a stale gloss is confidently wrong. Dropped, never regenerated: only the
+        author knows what the new statement means."""
+        self._plant("prior", "cf-keep", status="candidate")
+        store.confirm("cf-keep", self.TS)
+        self.assertEqual(self._gloss_of("cf-keep"), "a short firing line",
+                         "an unedited confirm must not disturb the gloss")
+        self._plant("prior", "cf-edit", status="candidate")
+        store.confirm("cf-edit", self.TS, new_statement="a CONTRADICTORY claim")
+        self.assertEqual(self._gloss_of("cf-edit"), "",
+                         "an edited statement invalidates its gloss")
+
+    def test_an_oversized_gloss_is_refused_with_the_real_number(self):
+        """REFUSED, not silently cut. Accepting a gloss the injector will then
+        truncate mid-clause recreates the exact failure the field exists to
+        prevent, one remove away and quietly. The limit is measured on the REAL
+        rendered line, so the number in the error is the number that matters."""
+        with self.assertRaises(ValueError) as cm:
+            store.write_prior({"id": "too-big", "statement": "s",
+                               "confidence": "1.0", "gloss": "G" * 900})
+        msg = str(cm.exception)
+        self.assertIn("gloss too long", msg)
+        self.assertIn("limit", msg)
+        self.assertRegex(msg, r"shorten the gloss by \d+")
+
+
+class GlossVerdictDebtTest(StoreBase):
+    """The four contrary verdicts of lane gloss-fires-full-entry-stays (codex
+    2026-07-30: b7ac0070517d, 79553cbbbfe5, d59c552c3ff6, ea3b086bc687), each
+    pinned to the EFFECT it demanded. The cures landed across the lane's own
+    rounds and survived the store-package split; these pins are what keeps
+    trunk evolution from quietly re-opening any of them."""
+
+    def prior_path(self, pid):
+        return os.path.join(self.global_dir("premises"), "prior-%s.md" % pid)
+
+    def raw(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def add(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(["add", *args])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_the_budget_counts_utf8_bytes_never_chars(self):  # noqa: VACUOUS_ASSERTION — the not-exists has its positive control in-test: a fitting gloss lands at the same path
+        """codex round 3: '114 chars/414 UTF-8 bytes passes'. A four-byte code
+        point is one char to len() and four to the injector's byte budget, so
+        a char-counting check waves the line through and the budget then
+        severs it mid-clause. The refusal must measure and SPEAK bytes."""
+        from helm import inject
+        gloss = "\U0001f4a5" * (inject.LINE_CAP // 4)     # bytes == LINE_CAP
+        rendered = "PREMISE byte-law: " + gloss           # the real render shape
+        self.assertLess(len(rendered), inject.LINE_CAP,
+                        "chars fit — that is the trap this test exists for")
+        n = len(rendered.encode("utf-8"))
+        self.assertGreater(n, inject.LINE_CAP)
+        target = self.prior_path("byte-law")
+        with self.assertRaises(ValueError) as cm:
+            store.write_prior({"id": "byte-law", "statement": "s",
+                               "confidence": "1.0", "gloss": gloss},
+                              path=target)
+        msg = str(cm.exception)
+        self.assertIn("%d UTF-8 bytes" % n, msg)
+        self.assertIn("shorten the gloss by %d" % (n - inject.LINE_CAP), msg)
+        self.assertFalse(os.path.exists(target), "a refused row must not land")
+        # positive control on the SAME observable: only the byte overage was
+        # refused — a fitting gloss lands at this exact path
+        store.write_prior({"id": "byte-law", "statement": "s",
+                           "confidence": "1.0", "gloss": "fits"}, path=target)
+        self.assertTrue(os.path.exists(target))
+
+    def test_caller_type_cannot_divert_the_oracle_from_the_real_render(self):
+        """codex rounds 2+3: an untyped probe measured the generic branch, and
+        a caller-supplied `type` overrode write_prior's authority — either way
+        the wrong line was measured and the real PREMISE line truncated. The
+        gloss below is sized so the generic render (id: gloss) is 5 bytes
+        UNDER cap and the caller-claimed TERM render is AT cap — only the true
+        PREMISE render is over. The oracle parses the artifact, so the
+        contaminating keys change nothing."""
+        from helm import inject
+        gloss = "G" * (inject.LINE_CAP - 20)   # "TERM authority-law: " == 20
+        target = self.prior_path("authority-law")
+        with self.assertRaises(ValueError) as cm:
+            store.write_prior({"id": "authority-law", "statement": "s",
+                               "confidence": "1.0", "type": "lexicon",
+                               "term": "authority-law", "gloss": gloss},
+                              path=target)
+        self.assertIn("%d UTF-8 bytes" % (inject.LINE_CAP + 3), str(cm.exception))
+        self.assertFalse(os.path.exists(target))
+        # positive control: three bytes shorter clears the true PREMISE render
+        store.write_prior({"id": "authority-law", "statement": "s",
+                           "confidence": "1.0", "type": "lexicon",
+                           "gloss": "G" * (inject.LINE_CAP - 23)}, path=target)
+        self.assertTrue(os.path.exists(target))
+
+    def test_store_add_remint_over_a_retired_id_drops_the_stale_gloss(self):
+        """codex rounds 1-3, three spellings of one loss: a re-mint under a
+        retired slug carries NEW, often contradictory text — a kept gloss
+        fires a line the entry no longer says. STALE_ON_REMINT owns the scrub
+        (one spelling, shared with premise/_capture — the second hard-coded
+        copy is exactly how round 3 happened)."""
+        rc, _, _ = self.add("prior", "remint-law | the OLD belief | 0.6 | remintkw")
+        self.assertEqual(rc, 0)
+        e = self.one(store.load_all(), "remint-law")
+        e["gloss"] = "the old firing line"
+        store.write_prior(e, path=e["path"])
+        store.retire("remint-law", TS, "superseded by events")
+        rc, _, _ = self.add("prior", "remint-law | a NEW contradictory belief | 0.6")
+        self.assertEqual(rc, 0)
+        raw = self.raw(e["path"])
+        self.assertIn("a NEW contradictory belief", raw)
+        self.assertNotIn("gloss:", raw,
+                         "a re-mint must not keep firing the old line")
+
+    def test_lexicon_same_definition_sharpen_keeps_the_gloss_a_redefine_drops_it(self):
+        """codex round 3 named BOTH directions: a keyword-only sharpen (same
+        definition) must MERGE-KEEP the gloss — dropping it re-truncates the
+        term's firing line — while a redefine that changes the meaning
+        invalidates it exactly as `confirm --edit` does."""
+        store.write_lexicon({"id": "gterm", "term": "gterm",
+                             "definition": "the settled meaning",
+                             "gloss": "the short firing line"})
+        rc, _, err = self.add("lexicon",
+                              "gterm | the settled meaning | coinage | fleetword")
+        self.assertEqual((rc, err), (0, ""))
+        path = store._lexicon_path("gterm", "global")
+        self.assertIn("  gloss: the short firing line", self.raw(path))
+        rc, _, _ = self.add("lexicon", "gterm | a changed meaning")
+        self.assertEqual(rc, 0)
+        raw = self.raw(path)
+        self.assertIn("a changed meaning", raw)
+        self.assertNotIn("gloss:", raw)
+
+    def test_a_whitespace_equivalent_redefine_still_keeps_the_gloss(self):
+        """codex's r2 blocker on this lane: write_lexicon whitespace-normalizes
+        definitions before disk, and the retention check compared the STORED
+        (normalized) form to the RAW candidate — so retyping the identical
+        definition with different spacing read as a semantic change and
+        silently dropped the gloss. The property pinned here is retention
+        under NORMALIZED equivalence, not any particular comparison code:
+        same meaning keeps the firing line, changed meaning drops it (the
+        sibling above pins that direction)."""
+        store.write_lexicon({"id": "wsterm", "term": "wsterm",
+                             "definition": "the settled meaning",
+                             "gloss": "the short firing line"})
+        rc, _, err = self.add(
+            "lexicon", "wsterm |  the   settled\tmeaning  | coinage | fleetword")
+        self.assertEqual((rc, err), (0, ""))
+        path = store._lexicon_path("wsterm", "global")
+        raw = self.raw(path)
+        self.assertIn("  definition: the settled meaning", raw)
+        self.assertIn("  gloss: the short firing line", raw)
+
+    def test_a_concurrent_same_id_writer_cannot_feed_the_oracle_its_row(self):
+        """codex round 4's repro, replayed deterministically: writer B lands a
+        small VALID body on the old shared check-temp name inside the window
+        between A's temp-write and A's parse. With the mkstemp temp the oracle
+        still reads A's own bytes and refuses A's oversized gloss; with the
+        shared deterministic name it validated B's row and landed A's 900-byte
+        gloss — a validator handed someone else's artifact is not measuring
+        the artifact."""
+        import helm.store.load as store_load
+        target = self.prior_path("same-law")
+        scratch = os.path.join(self.tmp, "scratch", "prior-same-law.md")
+        store.write_prior({"id": "same-law", "statement": "small truth",
+                           "confidence": "1.0", "gloss": "tiny line"},
+                          path=scratch)
+        small = self.raw(scratch)
+        real = store_load._parse_entry
+
+        def writer_b_then_parse(tmp, name):
+            with open(target + ".commit-check.tmp", "w", encoding="utf-8") as f:
+                f.write(small)                 # B stomps the old shared name
+            return real(tmp, name)
+
+        with mock.patch.object(store_load, "_parse_entry", writer_b_then_parse):
+            with self.assertRaises(ValueError) as cm:
+                store.write_prior({"id": "same-law", "statement": "s",
+                                   "confidence": "1.0", "gloss": "G" * 900},
+                                  path=target)
+        self.assertIn("gloss too long", str(cm.exception))
+        self.assertFalse(os.path.exists(target),
+                         "the contaminated row must never land")
+        # positive control on the same observable: an honest small write —
+        # writer B still stomping — lands at this exact path
+        with mock.patch.object(store_load, "_parse_entry", writer_b_then_parse):
+            store.write_prior({"id": "same-law", "statement": "small truth",
+                               "confidence": "1.0", "gloss": "tiny line"},
+                              path=target)
+        self.assertTrue(os.path.exists(target))
+
+    def test_a_refused_write_leaves_no_body_behind(self):  # noqa: VACUOUS_ASSERTION — both absences are controlled in-test: the glob first hits a planted probe, and a valid write lands at the same path
+        """codex round 4's second leg: a rejected oversized write once left
+        its temp body on disk beside a MISSING entry. Refusal must leave the
+        directory exactly as it found it."""
+        import glob as g
+        target = self.prior_path("clean-law")
+        pattern = os.path.join(os.path.dirname(target), "*commit-check*")
+        # positive control for BOTH absence observables below: the glob CAN
+        # hit in this directory, and a valid write DOES land at this path
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        probe = target + ".probe.commit-check.tmp"
+        open(probe, "w").close()
+        self.assertEqual(g.glob(pattern), [probe])
+        os.remove(probe)
+        with self.assertRaises(ValueError):
+            store.write_prior({"id": "clean-law", "statement": "s",
+                               "confidence": "1.0", "gloss": "G" * 900},
+                              path=target)
+        self.assertFalse(os.path.exists(target))
+        self.assertEqual(g.glob(pattern), [])
+        store.write_prior({"id": "clean-law", "statement": "s",
+                           "confidence": "1.0", "gloss": "fits"}, path=target)
+        self.assertTrue(os.path.exists(target))
+        self.assertEqual(g.glob(pattern), [], "a clean commit leaves no temp")
+
+    def test_a_failed_temp_cleanup_is_surfaced_and_the_write_still_lands(self):
+        """The cleanup can fail (EPERM, EIO) — what it may never do is pass
+        SILENTLY. The transaction still commits (a stray temp must not veto a
+        valid write), and the operator hears about the leaked file by name."""
+        import glob as g
+        target = self.prior_path("noisy-law")
+        real_remove = os.remove
+
+        def deaf_remove(p, *a, **kw):
+            if "commit-check" in str(p):
+                raise OSError("simulated EPERM")
+            return real_remove(p, *a, **kw)
+
+        err = io.StringIO()
+        with mock.patch("os.remove", side_effect=deaf_remove), \
+                contextlib.redirect_stderr(err):
+            store.write_prior({"id": "noisy-law", "statement": "s",
+                               "confidence": "1.0", "gloss": "a small line"},
+                              path=target)
+        self.assertIn("  gloss: a small line", self.raw(target))
+        msg = err.getvalue()
+        self.assertIn("could not remove commit-check temp", msg)
+        leaked = g.glob(os.path.join(os.path.dirname(target), "*commit-check*"))
+        self.assertEqual(len(leaked), 1, "the warned-about file really exists")
+        self.assertIn(os.path.basename(leaked[0]), msg)
+
+
+class PolicyPriorTest(StoreBase):
+    def policy(self, pid="approval-canon", **kw):
+        conf = kw.pop("conf", 1.0)
+        fields = {
+            "policy_kind": "approval-tier",
+            "policy_members": ["seat:lead", "family:codex"],
+            "policy_reason": "final approval requires an independent tier",
+        }
+        fields.update(kw)
+        return self.seed_prior(pid, "The final approval tier is explicit.",
+                               conf=conf, **fields)
+
+    def test_policy_fields_round_trip_and_survive_lifecycle_rewrite(self):
+        path = self.policy(evidence_log=[{"type": "support", "detail": "owner"}],
+                           confidence_history=[{"value": 1.0}],
+                           xrev_by="kimi", xrev_ts=TS)
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+        self.assertIn("  policy_kind: approval-tier", raw)
+        self.assertIn("  policy_members: seat:lead || family:codex", raw)
+        self.assertIn("  policy_reason: final approval requires an independent tier", raw)
+        policy, err = store.load_certain_policy("approval-tier")
+        self.assertIsNone(err)
+        self.assertEqual(policy["policy_members"], ["seat:lead", "family:codex"])
+        self.assertEqual(policy["policy_reason"],
+                         "final approval requires an independent tier")
+        retired, err = store.retire(policy["id"], TS, "superseded policy")
+        self.assertIsNone(err)
+        self.assertEqual(retired["policy_kind"], "approval-tier")
+        reread = self.one(store.load_all(include_retired=True), policy["id"])
+        self.assertEqual(reread["policy_members"], ["seat:lead", "family:codex"])
+        self.assertEqual(reread["policy_reason"], policy["policy_reason"])
+        self.assertEqual(reread["evidence_log"], policy["evidence_log"])
+        self.assertEqual(reread["confidence_history"], policy["confidence_history"])
+        self.assertEqual((reread["xrev_by"], reread["xrev_ts"]), ("kimi", TS))
+
+    def test_policy_lookup_refuses_zero_ambiguous_and_incomplete(self):
+        policy, err = store.load_certain_policy("approval-tier")
+        self.assertIsNone(policy)
+        self.assertIn("no live policy", err)
+        path = self.policy()
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+        pk.atomic_write(path, raw.replace(
+            "  policy_members: seat:lead || family:codex",
+            "  policy_members: "))
+        policy, err = store.load_certain_policy("approval-tier")
+        self.assertIsNone(policy)
+        self.assertIn("no policy_members", err)
+        self.policy(pid="approval-canon-2", policy_members=["family:kimi"])
+        policy, err = store.load_certain_policy("approval-tier")
+        self.assertIsNone(policy)
+        self.assertIn("ambiguous policy kind", err)
+
+    def test_policy_lookup_requires_explicit_human_certainty(self):
+        path = self.policy()
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+        pk.atomic_write(path, raw.replace("  confidence: 1.00",
+                                          "  confidence: garbage"))
+        policy, err = store.load_certain_policy("approval-tier")
+        self.assertIsNone(policy)
+        self.assertIn("explicitly certain", err)
+        self.policy()
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+        pk.atomic_write(path, raw.replace("  source: human",
+                                          "  source: inferred"))
+        policy, err = store.load_certain_policy("approval-tier")
+        self.assertIsNone(policy)
+        self.assertIn("human source", err)
+
+    def test_policy_writer_rejects_laundering_and_terminal_controls(self):
+        for kw in ({"policy_members": ["seat:lead||family:codex"]},
+                   {"policy_reason": "safe\x1b]2;spoof\x07"},
+                   {"conf": 0.8}, {"source": "agent-inferred"}):
+            with self.assertRaises(ValueError):
+                self.policy(**kw)
+
+    def test_project_policy_uses_the_existing_shadowing_law(self):
+        self.policy(policy_members=["family:codex"])
+        self.seed_prior(
+            "approval-canon", "Project-specific final approval tier.", conf=1.0,
+            source="human", policy_kind="approval-tier",
+            policy_members=["family:kimi"],
+            policy_reason="project tier",
+            root_dir=self.project_dir("p1", "premises"))
+        global_policy, err = store.load_certain_policy("approval-tier")
+        self.assertIsNone(err)
+        project_policy, err = store.load_certain_policy("approval-tier", project="p1")
+        self.assertIsNone(err)
+        self.assertEqual(global_policy["policy_members"], ["family:codex"])
+        self.assertEqual(project_policy["policy_members"], ["family:kimi"])
+
+    def test_re_mint_does_not_reactivate_retired_policy_metadata(self):
+        self.policy()
+        _retired, err = store.retire("approval-canon", TS, "tier ended")
+        self.assertIsNone(err)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = store.cmd_store([
+                "add", "premise", "approval-canon | unrelated new premise | canonkw"])
+        self.assertEqual(rc, 0)
+        entry = self.one(store.load_all(), "approval-canon")
+        self.assertEqual(entry["policy_kind"], "")
+        self.assertEqual(entry["policy_members"], [])
+        self.assertEqual(entry["policy_reason"], "")
+        policy, err = store.load_certain_policy("approval-tier")
+        self.assertIsNone(policy)
+        self.assertIn("no live policy", err)
+
+
 class EvidenceTest(StoreBase):
     def test_belief_move_appends_receipts(self):
         self.seed_prior("belief", "probably true", conf=0.6, keywords="zork")
@@ -304,10 +806,287 @@ class ResolveTest(StoreBase):
         self.assertEqual([e["id"] for e in store.resolve_prompt("out of ram again")],
                          ["zeta-law"])
 
+    def test_the_jit_cap_moves_the_selected_set_by_parsed_recency(self):
+        """#145: five candidates for four slots, so the control CAN evict.
+
+        The old raw-string walk selected `garbage-now` and dropped `real-d`;
+        the parsed walk must change the selected SET, not merely move one row to
+        a different position inside an unchanged cap."""
+        rows = (("real-a", "2026-08-04T00:00:00Z"),
+                ("real-b", "2026-08-03T00:00:00Z"),
+                ("real-c", "2026-08-02T00:00:00Z"),
+                ("real-d", "2026-08-01T00:00:00Z"),
+                ("garbage-now", "NOW"))
+        for eid, stamp in rows:
+            path = self.seed_prior(
+                eid, "specific", conf=0.9, keywords="glorp",
+                last_updated=TS if stamp == "NOW" else stamp)
+            if stamp == "NOW":
+                with open(path) as f:
+                    body = f.read()
+                pk.atomic_write(path, body.replace(
+                    "  last_updated: %s\n" % TS,
+                    "  last_updated: NOW\n"))
+        loaded = [e for e in store.load_all()
+                  if e["id"] in {eid for eid, _stamp in rows}]
+        raw_winners = [e["id"] for e in sorted(
+            loaded, key=lambda e: e.get("last_updated") or "", reverse=True)[:4]]
+        winners = [e["id"] for e in store.resolve_prompt("glorp", cap=4)]
+        self.assertEqual(raw_winners,
+                         ["garbage-now", "real-a", "real-b", "real-c"])
+        self.assertEqual(winners, ["real-a", "real-b", "real-c", "real-d"])
+        self.assertNotEqual(set(raw_winners), set(winners))
+
+    def test_write_validation_and_recency_share_one_timestamp_grammar(self):  # noqa: VACUOUS_ASSERTION — each data arm proves a positive scalar or explicit refusal before checking the paired absence
+        from helm.store import _common as store_common
+        from helm.store import write as store_write
+        for bad in ("NOW", "9999-99-99", "2026-08-03T99:99:99Z",
+                    "ram-demon", "not a date", "178313434393609190", ""):
+            self.assertIsNotNone(store_write._valid_write_ts(bad),
+                                 "an invalid timestamp was accepted: %r" % bad)
+            self.assertEqual(store_common._recency({"last_updated": bad}), 0.0)
+        for good in ("2026-08-03T23:00:00Z", "2026-08-03",
+                     "2026-08-03T23:59Z", "2026-08-03T23:00:00+05:00",
+                     "1783884443", "1783884443000", "1783884443000000",
+                     "1783884443000000000"):
+            value, err = store_common._timestamp_scalar(good)
+            self.assertGreater(value, 0.0,
+                               "a valid timestamp produced no recency: %r" % good)
+            self.assertIsNone(err,
+                              "a parseable timestamp was refused: %r" % good)
+        recency = lambda stamp: store_common._recency({"last_updated": stamp})
+        self.assertEqual(recency("2026-08-03T23:59Z"),
+                         recency("2026-08-03T23:59:00Z"))
+        self.assertEqual(recency("2026-08-03T23:00:00+05:00"),
+                         recency("2026-08-03T18:00:00Z"))
+        for epoch in ("1783884443000", "1783884443000000",
+                      "1783884443000000000"):
+            self.assertEqual(recency(epoch), recency("1783884443"))
+
+    def test_every_typed_writer_refuses_bad_recency_without_changing_the_file(self):  # noqa: VACUOUS_ASSERTION — every arm first writes and reads a nonempty artifact, then proves refusal leaves those exact bytes intact
+        cases = (
+            (store.write_prior,
+             {"id": "ts-prior", "statement": "p", "confidence": 0.9,
+              "stated_ts": TS, "last_updated": TS}, "last_updated"),
+            (store.write_lexicon,
+             {"term": "ts-lex", "definition": "l", "updated_ts": TS},
+             "updated_ts"),
+            (store.write_heuristic,
+             {"id": "ts-heur", "move": "h", "trigger": "h",
+              "stated_ts": TS, "last_updated": TS}, "last_updated"),
+            (store.write_reference,
+             {"id": "ts-ref", "statement": "r", "stated_ts": TS,
+              "last_updated": TS}, "last_updated"),
+        )
+        for writer, row, field in cases:
+            with self.subTest(writer=writer.__name__):
+                root = os.path.join(self.tmp, writer.__name__)
+                path = writer(row, root_dir=root)
+                with open(path, "rb") as f:
+                    before = f.read()
+                self.assertGreater(len(before), 0,
+                                   "the positive-control artifact was empty")
+                bad = dict(row)
+                bad[field] = "NOW"
+                with self.assertRaisesRegex(ValueError, "refusing the write"):
+                    writer(bad, path=path)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
+    def test_every_timestamp_lifecycle_refuses_without_changing_an_artifact(self):
+        from helm.store import write as store_write
+        paths = []
+        for eid, status in (("ts-evidence", "live"), ("ts-old", "live"),
+                            ("ts-new", "live"), ("ts-retire", "live"),
+                            ("ts-confirm", "candidate"),
+                            ("ts-reject", "candidate"),
+                            ("ts-xrev", "candidate")):
+            paths.append(self.seed_prior(
+                eid, "specific", conf=0.9, keywords="glorp", status=status,
+                source="inferred" if status == "candidate" else "human"))
+        paths.append(self.seed_prior(
+            "ts-demote", "specific", conf=1.0, keywords="glorp", pin=True))
+        operations = (
+            ("evidence", lambda: store_write.apply_evidence(
+                "ts-evidence", "NOW", 0.1, "reason", "test")),
+            ("supersede", lambda: store_write.mark_superseded(
+                "ts-old", "ts-new", "NOW", "reason")),
+            ("retire", lambda: store_write.retire("ts-retire", "NOW")),
+            ("confirm", lambda: store_write.confirm("ts-confirm", "NOW")),
+            ("reject", lambda: store_write.reject("ts-reject", "NOW")),
+            ("xrev", lambda: store_write.xrev_clear(
+                "ts-xrev", "NOW", "reviewer")),
+            ("demote", lambda: store_write.demote(
+                "ts-demote", "NOW", "reason")),
+        )
+        before = {}
+        for path in paths:
+            with open(path, "rb") as f:
+                before[path] = f.read()
+        self.assertEqual(len(before), 8)
+        self.assertTrue(all(before.values()),
+                        "one positive-control artifact was empty")
+        for name, operation in operations:
+            with self.subTest(operation=name):
+                try:
+                    _row, err = operation()
+                except ValueError as exc:
+                    err = str(exc)
+                self.assertIn("refusing the write", err)
+                for path in paths:
+                    with open(path, "rb") as f:
+                        self.assertEqual(f.read(), before[path])
+
+    def test_an_inflected_form_resolves_the_stem(self):
+        """A plural or -ing form is the SAME concept, and the exact matcher
+        silently missed it — the entry just never resolved and nothing reported
+        a near-miss. Evidence it was already hurting: the live lexicon is
+        hand-padded with variants (`account` AND `accounts`, `adapt` AND
+        `adapted`) to work around this, which only ever covers the inflections
+        whoever wrote that entry thought of."""
+        self.seed_prior("infl-law", "specific", conf=0.9, keywords="glorpwidget")
+        for text in ("one glorpwidget", "two glorpwidgets", "glorpwidgeting along",
+                     "glorpwidgeted yesterday"):
+            self.assertEqual([e["id"] for e in store.resolve_prompt(text)],
+                             ["infl-law"], text)
+
+    def test_inflection_never_reaches_a_different_word(self):
+        """The safety is the >= 4-char floor plus a suffix WHITELIST, not a
+        stemmer. Short stems form unrelated words under suffixing (`ban` + `d`
+        is `band`), so `d` is excluded outright and 3-char probes stay exact —
+        which is also why test_word_boundary's `ram`/`program` case is
+        untouched. And the allowance is a suffix set, never a prefix match:
+        `cap` must not reach `capability`, nor `card` reach `cardiac`."""
+        self.seed_prior("short-stem", "specific", conf=0.9, keywords="cap")
+        self.assertEqual(store.resolve_prompt("the capability lane"), [])
+        self.assertEqual(store.resolve_prompt("caps on injection"), [])
+        self.seed_prior("long-stem", "specific", conf=0.9, keywords="glorp")
+        self.assertEqual(store.resolve_prompt("glorpless and glorpiform"), [])
+
+    def test_a_bare_d_suffix_is_excluded_even_above_the_floor(self):
+        """CAUGHT BY MUTATION, NOT BY REVIEW. Adding `d` to the suffix set left
+        all 126 tests green — the exclusion was documented and unenforced, which
+        is a claim laundered as a guarantee.
+
+        The >= 4 floor does NOT make `d` safe, because 4-char stems form
+        unrelated words under it too: `boar` + `d` is `board`. Bare `d` is
+        excluded for every probe length, and only `-ed` (which carries a vowel
+        of its own) is accepted."""
+        self.seed_prior("boar-law", "specific", conf=0.9, keywords="boar")
+        self.assertEqual(store.resolve_prompt("post it to the board"), [])
+        self.assertEqual([e["id"] for e in store.resolve_prompt("a wild boar")],
+                         ["boar-law"])
+
+    def test_an_id_is_matched_exactly_not_inflected(self):
+        """Ids are kebab-case slugs, not English words. `_probe_re` only relaxes
+        purely alphabetic probes, so an id keeps the exact law."""
+        self.seed_prior("glorp-law", "specific", conf=0.9, keywords="zzunused")
+        self.assertEqual([e["id"] for e in store.resolve_prompt("apply glorp-law")],
+                         ["glorp-law"])
+        self.assertEqual(store.resolve_prompt("apply glorp-laws here"), [])
+
+    def test_inflected_hit_reports_the_probe_not_the_surface_form(self):
+        """`matched` feeds the DF map, so it must carry the PROBE. Returning
+        `glorpwidgets` here would KeyError the 1/df lookup in resolve_prompt —
+        this asserts the contract that keeps that from happening."""
+        self.seed_prior("infl-law", "specific", conf=0.9, keywords="glorpwidget")
+        e = self.one(store.load_all(), "infl-law")
+        from helm.store import resolve as _resolve
+        hits, specific, matched = _resolve._probe_hits(e, "two glorpwidgets")
+        self.assertEqual(hits, 1)
+        self.assertTrue(specific)
+        self.assertEqual(matched, ["glorpwidget"])
+
+    def test_a_read_infers_the_project_from_cwd_and_says_so(self):
+        """THE SEAM THAT COST A PRODUCTION INCIDENT AN HOUR. The hook path
+        (`helm inject --hook-json`) derives the project from the hook JSON's cwd,
+        so a seat working in a project DOES get that project's entries. The
+        interactive CLI never looked at os.getcwd(), so the same query typed to
+        CHECK that behaviour returned nothing.
+
+        Live 2026-07-28: a seat wrote an incident runbook with
+        `--project sibling-inc`, could not resolve it from that project's cwd, concluded
+        "project-scoped resolve is unfinished", and moved the entry back to
+        _global. The entry was fine and project resolve was fine — the read path
+        it debugged with could not see it. An inconsistency between the path that
+        RUNS and the path you DEBUG WITH manufactures false architectural
+        conclusions, which is worse than either path being broken."""
+        from helm.store import cli as _cli
+        self.assertIn("resolve", _cli._CWD_SCOPED_READS)
+        self.assertIn("list", _cli._CWD_SCOPED_READS)
+        # A WRITE must never be cwd-scoped: where knowledge LIVES is a decision,
+        # and silently homing an entry by the directory you stood in is the
+        # surprise this fix removes rather than adds.
+        for w in ("add", "confirm", "reject", "supersede", "retire", "demote"):
+            self.assertNotIn(w, _cli._CWD_SCOPED_READS, w)
+
     def test_dormant_and_pinned_not_in_jit(self):
         self.seed_prior("weak", "weak", conf=0.3, keywords="glorp")
         self.seed_prior("pinned-one", "always on", conf=0.9, keywords="glorp", pin="true")
         self.assertEqual(store.resolve_prompt("glorp time"), [])
+
+    def test_a_rare_function_word_never_outranks_the_topical_term(self):
+        """THE LIVE 2026-07-25 REGRESSION, reduced.
+
+        DF weighting makes a RARE probe strong. A modal like "should" is rare
+        across the corpus yet meaningless, so it scored 0.250 while the topical
+        "dispatch" scored 0.062 — and all four jit slots went to entries that
+        matched nothing but the modal, pushing the genuinely relevant entry (and
+        helm's own dispatch capability index) over cap. Function words are
+        exactly the population that is rare-yet-meaningless, which is why the
+        generic set has to cover the whole closed class rather than a handful of
+        words that felt generic."""
+        self.seed_prior("modal-noise", "irrelevant", conf=0.9,
+                        keywords="should,whenever")
+        for i in range(6):                       # make the topical term COMMON
+            self.seed_prior("topical-%d" % i, "t%d" % i, conf=0.9,
+                            keywords="dispatchx")
+        got = [e["id"] for e in
+               store.resolve_prompt("should I cancel the dispatchx")]
+        self.assertNotIn("modal-noise", got)
+        self.assertTrue(got, "the topical entries must still resolve")
+        self.assertTrue(all(g.startswith("topical-") for g in got), got)
+
+    def test_the_whole_closed_class_is_generic_not_a_sampling(self):
+        """The boundary is grammatical, so it is checkable: English mints no new
+        modals or pronouns. A case-by-case list is always one token short — that
+        is the per-case-handler shape this repo has a premise about."""
+        from helm.store._common import GENERIC_KEYWORDS
+        closed_class = (
+            "should could would might must can will shall may "      # modals
+            "be been am are was were has have had does did "          # auxiliaries
+            "not no never none "                                      # negation
+            "i me my you your we us our they them their he she it "   # pronouns
+            "what why how when where which who "                      # question words
+            "if then else but so because while until than "           # subordinators
+            "at by from into over under about after before through "  # prepositions
+            "all any some each every both more most less "            # quantifiers
+        ).split()
+        missing = [w for w in closed_class if w not in GENERIC_KEYWORDS]
+        self.assertEqual(missing, [], "closed-class words left scoreable: %s"
+                         % missing)
+
+    def test_content_words_are_never_swept_into_the_generic_set(self):
+        """The other half of the boundary, and the one that keeps this fix from
+        becoming a retrieval outage: an over-broad stopword set silently deletes
+        recall, and a corpus that returns nothing looks exactly like a corpus
+        with nothing relevant in it."""
+        from helm.store._common import GENERIC_KEYWORDS
+        for word in ("dispatch", "worktree", "verdict", "polarity", "seat",
+                     "proxy", "premise", "ledger", "stall", "reviewer",
+                     "codex", "family", "beacon", "signing"):
+            self.assertNotIn(word, GENERIC_KEYWORDS, word)
+
+    def test_a_function_word_only_entry_still_resolves_by_its_id(self):
+        """Making a keyword generic must not orphan the entry: the id remains a
+        specific probe, so an entry whose keywords are all function words is
+        reachable rather than lost."""
+        self.seed_prior("zorkish-law", "reachable", conf=0.9,
+                        keywords="should,would")
+        self.assertEqual(store.resolve_prompt("should we"), [])
+        self.assertEqual([e["id"] for e in
+                          store.resolve_prompt("apply zorkish-law now")],
+                         ["zorkish-law"])
 
 
 class DFRankTest(StoreBase):
@@ -375,7 +1154,7 @@ class LexiconTest(StoreBase):
         self.assertEqual(store.resolve_prompt("unyouable is not the term"), [])
 
     def test_keywords_resolve_symptom_phrasing(self):
-        # the live incident: symptom vocabulary must fire WITHOUT the term
+        # the invariant: symptom vocabulary must fire WITHOUT the term
         store.write_lexicon({"term": "fleet-truth",
                              "definition": "census-derived ground truth",
                              "keywords": "fleet state, stale, still up, seats",
@@ -420,6 +1199,126 @@ class LexiconTest(StoreBase):
         self.assertTrue(p.endswith("lex-project-p1--youable.md"))
         e = self.one(store.load_all(project="p1", types=("lexicon",)), "youable")
         self.assertEqual(e["definition"], "project sense")
+
+
+class CanonSynonymMapTest(StoreBase):
+    """Lane 1 of the canon-as-controlled-language design
+    (docs/CANON_CONTROLLED_LANGUAGE.md §2, docs/CANON_CONTROLLED_LANGUAGE_LANES.md
+    Lane 1): the lexicon synonym-map + probe-fold that removes CD's measured
+    DF-split — a concept split across synonym entries halved its own 1/df
+    retrieval weight, costing ~5 keyword re-tunes in one session."""
+
+    def test_new_fields_round_trip_preserved(self):
+        # The field-default-class bug: parse_simple_frontmatter keeps ONLY keys
+        # present in _LEX_DEFAULTS, so a field lacking a default is silently
+        # dropped on rewrite (the proven meme:true loss). Every new field ships
+        # with a default -> all three survive write -> read -> write.
+        p = store.write_lexicon({
+            "term": "board-key-drift",
+            "definition": "console renders an ad-hoc board key nobody sees",
+            "keywords": "boardkey",
+            "aliases": "stale-console, unrendered-key",
+            "alias_triggers": "staleconsole, unrendered",
+            "updated_ts": TS})
+        with open(p) as f:
+            raw = f.read()
+        self.assertIn("  aliases: stale-console, unrendered-key", raw)
+        self.assertIn("  alias_triggers: staleconsole, unrendered", raw)
+        e = self.one(store.load_all(types=("lexicon",)), "board-key-drift")
+        self.assertEqual(e["aliases"], "stale-console, unrendered-key")
+        self.assertEqual(e["alias_triggers"], "staleconsole, unrendered")
+        # rewrite FROM the parsed entry — the dropped-field failure mode — and
+        # confirm nothing is lost the second time either
+        store.write_lexicon(e, path=e["path"])
+        e2 = self.one(store.load_all(types=("lexicon",)), "board-key-drift")
+        self.assertEqual(e2["aliases"], "stale-console, unrendered-key")
+        self.assertEqual(e2["alias_triggers"], "staleconsole, unrendered")
+        # the stub back-pointer (canonical:) round-trips too
+        store.write_lexicon({"term": "stale-console", "definition": "see canonical",
+                             "canonical": "board-key-drift", "updated_ts": TS})
+        stub = store._find("stale-console", types=("lexicon",))
+        self.assertEqual(stub["canonical"], "board-key-drift")
+
+    def test_alias_trigger_folds_into_canonical_resolve(self):
+        # The fold (resolve._probes): an alias's probe form, carried in
+        # alias_triggers on the CANONICAL entry, fires the canonical — the
+        # "index on read" direction. The alias words are NOT in the canonical's
+        # keywords, so ONLY the fold can resolve them.
+        store.write_lexicon({
+            "term": "board-key-drift",
+            "definition": "the console renders an ad-hoc board key nobody sees",
+            "keywords": "boardkey",
+            "aliases": "stale-console, unrendered-key",
+            "alias_triggers": "staleconsole, unrendered",
+            "updated_ts": TS})
+        # the alias_triggers land in the canonical entry's probe set
+        e = self.one(store.load_all(types=("lexicon",)), "board-key-drift")
+        probes = {p for p, _g in store._probes(e)}
+        self.assertIn("staleconsole", probes)
+        self.assertIn("unrendered", probes)
+        # an alias word in the turn resolves to the canonical entry
+        for text in ("the staleconsole is back", "an unrendered value here"):
+            self.assertEqual(
+                [x["id"] for x in store.resolve_prompt(text)],
+                ["board-key-drift"], text)
+        # and its own keyword + term still resolve
+        self.assertEqual([x["id"] for x in store.resolve_prompt("a boardkey issue")],
+                         ["board-key-drift"])
+
+    def test_canonical_keeps_full_df_weight_no_split(self):
+        # CD's DF-split reproduced and fixed. The concept lives in ONE canonical
+        # entry; the synonym persists as a get-redirect STUB (canonical:
+        # back-pointer) sharing the probe. Before Lane 1 both entries carried
+        # `consolekey` so df[consolekey]=2 and each scored conf x 1/2 -> the
+        # synonyms crowded the cap-4 and one was dropped. Now the stub leaves the
+        # denominator: df drops to 1 and the canonical scores at full 1/1 weight.
+        store.write_lexicon({
+            "term": "board-key-drift",
+            "definition": "console renders an ad-hoc board key",
+            "keywords": "consolekey",
+            "aliases": "stale-console",
+            "updated_ts": TS})
+        store.write_lexicon({
+            "term": "stale-console",
+            "definition": "synonym; see board-key-drift",
+            "keywords": "consolekey",
+            "canonical": "board-key-drift",
+            "updated_ts": TS})
+        cand = store._jit_candidates(store.load_all())
+        df = store._df_map(cand)
+        # the shared probe's df is 1, not 2 — the stub does not dilute the weight
+        self.assertEqual(df["consolekey"], 1)
+        # the stub stays loadable (get-redirect) but is NOT a resolve candidate
+        self.assertIn("stale-console",
+                      [e["id"] for e in store.load_all(types=("lexicon",))])
+        self.assertNotIn("stale-console", [e["id"] for e in cand])
+        # a "consolekey" turn resolves to the canonical at full weight, no stub
+        got = [e["id"] for e in store.resolve_prompt("a consolekey went stale")]
+        self.assertEqual(got, ["board-key-drift"])
+
+    def test_canonical_outranks_a_generic_rival_only_via_full_weight(self):
+        # The effect, asserted as a rank (not the absence of a complaint): a
+        # canonical entry that shares probe `consolekey` with a legit-DISTINCT
+        # rival must still beat it on a turn carrying the shared probe + one rare
+        # canonical probe, BECAUSE the alias stub no longer inflates df. With the
+        # stub competing (df 3) the arithmetic that seats the canonical erodes.
+        store.write_lexicon({
+            "term": "board-key-drift", "definition": "canonical concept",
+            "keywords": "consolekey, driftrare", "aliases": "stale-console",
+            "updated_ts": TS})
+        store.write_lexicon({
+            "term": "stale-console", "definition": "synonym stub",
+            "keywords": "consolekey", "canonical": "board-key-drift",
+            "updated_ts": TS})
+        store.write_lexicon({
+            "term": "render-budget", "definition": "a genuinely distinct concept",
+            "keywords": "consolekey", "updated_ts": TS})
+        # df[consolekey] = 2 (canonical + the distinct rival); the stub is out
+        cand = store._jit_candidates(store.load_all())
+        self.assertEqual(store._df_map(cand)["consolekey"], 2)
+        got = [e["id"] for e in store.resolve_prompt("the consolekey driftrare case")]
+        self.assertEqual(got[0], "board-key-drift")
+        self.assertNotIn("stale-console", got)
 
 
 class HeuristicTest(StoreBase):
@@ -503,8 +1402,8 @@ class EpisodicTest(StoreBase):
 class TypedFallbackTest(StoreBase):
     def test_typed_prefix_without_typed_fields_reads_as_episodic(self):
         # the live store carries prem-/lex- named files that are really bulk
-        # memory (name+description, type: project, no id/statement) — the legacy
-        # store drops them; helm keeps them visible as episodic, never injected
+        # memory (name+description, type: project, no id/statement) — the resolver drops
+        # them; helm keeps them visible as episodic, never injected
         pk.atomic_write(os.path.join(self.adopted, "prem-bulk-note.md"),
                         '---\nname: prem-bulk-note\ndescription: "canon paragraph"\n'
                         'metadata:\n  node_type: memory\n  type: project\n---\nbody\n')
@@ -532,7 +1431,7 @@ class ScopeTest(StoreBase):
         self.assertEqual(e["root"], "helm-global")
 
     def test_retiring_shadow_winner_never_resurrects_the_shadowed(self):
-        # audit finding: a stale wide-scope belief shadowed by a narrow-scope
+        # audit HIGH: a stale wide-scope belief shadowed by a narrow-scope
         # override must STAY buried when the override is retired/superseded —
         # per-root status filtering resurrected it as live.
         store.write_prior({"id": "shipfast", "statement": "old stale belief",
@@ -693,6 +1592,38 @@ class PinnedStatsTest(StoreBase):
             f.write("\n".join(rows) + "\n")
         return path
 
+    def test_the_walk_is_seeded_by_the_who_digest_like_gather(self):
+        """THE MODEL MUST BE THE WALK, NOT A LIKENESS OF IT.
+
+        gather (inject/_whisper.py) emits the WHO digest FIRST and only then
+        walks the pinned entries, so an entry competes for PINNED_BUDGET minus
+        the digest. This started at used=0 and was therefore optimistic: on the
+        live store 2026-07-30 the digest was 350 bytes (its whole WHO_CAP),
+        leaving 850 of 1200, and the model reported 3 entries fitting where the
+        live walk fits 2. A starvation predicate that silently clears an entry
+        is the same failure as having no predicate.
+
+        The first cut of the seed ALSO failed silently: `from ..inject import
+        _whisper` yields the FUNCTION of that name (the package re-exports a
+        `_whisper` symbol that shadows the submodule), the call raised
+        AttributeError, and the fail-open except returned the optimistic answer
+        with nothing to show for it. Hence a test on the OBSERVABLE, not on the
+        import."""
+        from helm import inject, store as st
+        base = st.pinned_stats()
+        self.assertEqual(len(base["fits"]), 3, "no digest -> 3 x 400 fills 1200")
+        with mock.patch.object(inject, "_who_lines", return_value=["W" * 400]):
+            with_who = st.pinned_stats()
+        self.assertEqual(len(with_who["fits"]), 2,
+                         "a 400B digest leaves 800B -> only 2 entries can fit; "
+                         "a walk that ignores it clears one entry that cannot "
+                         "actually fire")
+        self.assertGreaterEqual(with_who["used"], 400,
+                                "used must account for the digest gather emits")
+        # fail-open contract: a digest that cannot be built costs nothing
+        with mock.patch.object(inject, "_who_lines", side_effect=RuntimeError):
+            self.assertEqual(len(st.pinned_stats()["fits"]), 3)
+
     def run_cli(self, args):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -714,8 +1645,20 @@ class PinnedStatsTest(StoreBase):
         self.assertIn("+ pin-1  made 1/4", out)  # ghost-id ignored, row counted
         self.assertIn("+ pin-2  made 0/4", out)
         self.assertIn("- pin-3  made 0/4", out)  # over budget NOW and starved
-        self.assertIn("2 of 4 always-entries NEVER made the budget", out)
-        self.assertIn("pin-2, pin-3", out)
+        # THE TWO CASES ARE REPORTED APART, because the owner's action differs.
+        # This used to read "2 of 4 NEVER made the budget: pin-2, pin-3", which
+        # lumped a structurally-dead entry together with a merely-new one and
+        # offered `demote` for both. pin-3 cannot fit and needs something ahead
+        # of it shortened; pin-2 fits today and has simply not landed yet.
+        self.assertIn("1 of 4 always-entries CANNOT FIRE", out)
+        self.assertIn("1200/1200 bytes used", out)   # names WHY it cannot fire
+        self.assertIn("shorten an entry ahead of them", out)
+        self.assertIn("1 of 4 fit TODAY but never made the budget", out)
+        for line in out.splitlines():
+            if "CANNOT FIRE" in line or "shorten an entry" in line:
+                self.assertNotIn("pin-2", line,
+                                 "an entry that FITS must never be reported as "
+                                 "unable to fire")
         self.assertIn("helm store demote <id>", out)
         with open(path, "rb") as f:
             self.assertEqual(f.read(), before)  # stats never writes the ledger
@@ -818,7 +1761,8 @@ class CliTest(StoreBase):
         # become a certain premise through the agent-facing lane
         for i, raw_conf in enumerate(("0.999", "1.0")):
             rc, out = self.run_cli(["add", "prior",
-                                    "clamp-%d | nearly sure | %s" % (i, raw_conf)])
+                                    "clamp-%d | nearly sure | %s | clampkw%d"
+                                    % (i, raw_conf, i)])
             self.assertEqual(rc, 0)
             self.assertIn("[prior 0.99]", out)
             e = self.one(store.load_all(), "clamp-%d" % i)
@@ -840,7 +1784,8 @@ class CliTest(StoreBase):
         self.assertEqual(c, {"prior": 1, "lexicon": 1, "heuristic": 1, "reference": 1})
 
     def test_add_project_targets_project_root(self):
-        rc, _ = self.run_cli(["add", "prior", "proj-x | scoped", "--project", "p1"])
+        rc, _ = self.run_cli(["add", "prior", "proj-x | scoped | 0.6 | projkw",
+                              "--project", "p1"])
         self.assertEqual(rc, 0)
         e = self.one(store.load_all(project="p1"), "proj-x")
         self.assertEqual((e["root"], e["scope"]), ("project", "project:p1"))
@@ -928,8 +1873,10 @@ class AddGuardTest(StoreBase):
         self.assertIn("helm store evidence", err)
 
     def test_retired_or_superseded_id_may_be_re_minted(self):
-        self.add("prior", "gone | old sense | 0.7")
+        self.add("prior", "gone | old sense | 0.7 | gonekw")
         store.retire("gone", TS, "over")
+        # the keyword-less re-mint passes the lint through the re-mint
+        # fallback: the retired file's own keywords are the effective field
         rc, out, _ = self.add("prior", "gone | new sense | 0.7")
         self.assertEqual(rc, 0)
         self.assertEqual(self.one(store.load_all(), "gone")["statement"], "new sense")
@@ -937,7 +1884,8 @@ class AddGuardTest(StoreBase):
     def test_near_duplicate_warns_and_proceeds(self):
         self.add("premise", "small-prs | small reviewable prs land faster and cleaner | prkw")
         rc, out, err = self.add(
-            "prior", "tiny-prs | small reviewable prs land faster and cleaner today | 0.7")
+            "prior", "tiny-prs | small reviewable prs land faster and cleaner today "
+            "| 0.7 | tiny reviews")
         self.assertEqual(rc, 0)
         self.assertEqual(err, "")
         self.assertIn("possible duplicate of 'small-prs'", out)
@@ -947,9 +1895,10 @@ class AddGuardTest(StoreBase):
         self.assertEqual(len(store.load_all(types=("prior",))), 2)
 
     def test_distinct_adds_stay_silent(self):
-        self.add("prior", "one-law | ship small slices deliberately | 0.7")
+        self.add("prior", "one-law | ship small slices deliberately | 0.7 | small slices")
         rc, out, _ = self.add(
-            "prior", "other-law | measure quota before dispatching agents | 0.7")
+            "prior", "other-law | measure quota before dispatching agents "
+            "| 0.7 | quota headroom")
         self.assertEqual(rc, 0)
         self.assertNotIn("WARNING", out)
 
@@ -962,8 +1911,9 @@ class AddGuardTest(StoreBase):
         self.assertEqual(rc, 1)
         self.assertIn("[prior adopted]", err)
         # a PROJECT-scoped entry is outside the global lens: global add proceeds
-        self.add("prior", "proj-law | project sense | 0.6", "--project", "p1")
-        rc, _, err = self.add("prior", "proj-law | global sense | 0.6")
+        self.add("prior", "proj-law | project sense | 0.6 | projlawkw",
+                 "--project", "p1")
+        rc, _, err = self.add("prior", "proj-law | global sense | 0.6 | globlawkw")
         self.assertEqual(rc, 0)
         # but through the project lens the (narrower) live entry refuses it
         rc, _, err = self.add("prior", "proj-law | another try | 0.6",
@@ -1019,9 +1969,17 @@ class LexiconPipeContractTest(StoreBase):
         self.assertEqual(store.load_all(types=("lexicon",)), [])
 
     def test_sixth_field_is_refused(self):
+        """Still refused, still nothing stored — but by the SHARED arity guard
+        (helm/delim.py) rather than this type's own check. The lexicon
+        incident that motivated this class was fixed for lexicon only; the
+        same cascade was live in prior/premise/heuristic/reference and in the
+        premise, reflex and mentor verbs until 2026-07-25. The message now
+        shows the parse, which is what the operator actually needs."""
         rc, _, err = self.add("lexicon", "t | d | phrase | kw | dom | extra")
         self.assertEqual(rc, 2)
-        self.assertIn("keywords,csv", err)
+        self.assertIn("6 fields", err)
+        self.assertIn("at most 5", err)
+        self.assertIn("[5] extra", err)          # names the field that did not fit
         self.assertEqual(store.load_all(types=("lexicon",)), [])
 
     def test_redefine_preserves_keywords_domain_kind(self):
@@ -1152,7 +2110,7 @@ class AdoptProjectMemdirsTest(StoreBase):
         self.projmem = os.path.join(self.tmp, "projmem")
         os.makedirs(self.projmem)
         pk.write_json(home.registry_path(), {"version": 1, "projects": {
-            "example-app": {"name": "example-app", "path": "/dev/example-app", "kind": "git",
+            "demo-project": {"name": "demo-project", "path": "/dev/demo-project", "kind": "git",
                         "sessions": {}, "cwds": []}}})
 
     def tearDown(self):
@@ -1162,20 +2120,20 @@ class AdoptProjectMemdirsTest(StoreBase):
     def _patch(self):
         return mock.patch.object(
             home, "claude_memory_dir_for",
-            side_effect=lambda p: self.projmem if p == "/dev/example-app" else "/nonexistent-xyz")
+            side_effect=lambda p: self.projmem if p == "/dev/demo-project" else "/nonexistent-xyz")
 
     def test_project_adopted_root_fires_its_own_priors(self):
-        store.write_prior({"id": "example-app-law", "statement": "example-app's own prior",
-                           "confidence": 0.9, "keywords": "exampleword"},
+        store.write_prior({"id": "demo-law", "statement": "demo-project's own prior",
+                           "confidence": 0.9, "keywords": "demoword"},
                           root_dir=self.projmem)
         with self._patch():
             store._ADOPTED_PROJECT_CACHE.clear()
-            self.assertIn("adopted-project", [t[0] for t in store.roots(project="example-app")])
-            e = self.one(store.load_all(project="example-app"), "example-app-law")
-            self.assertEqual((e["root"], e["scope"]), ("adopted-project", "project:example-app"))
+            self.assertIn("adopted-project", [t[0] for t in store.roots(project="demo-project")])
+            e = self.one(store.load_all(project="demo-project"), "demo-law")
+            self.assertEqual((e["root"], e["scope"]), ("adopted-project", "project:demo-project"))
             self.assertEqual([x["id"] for x in
-                              store.resolve_prompt("exampleword now", project="example-app")],
-                             ["example-app-law"])
+                              store.resolve_prompt("demoword now", project="demo-project")],
+                             ["demo-law"])
         # without the project lens the adopted-project root is NOT in play
         self.assertEqual(store.load_all(), [])
 
@@ -1185,14 +2143,14 @@ class AdoptProjectMemdirsTest(StoreBase):
                            "confidence": 0.9}, root_dir=self.projmem)
         with self._patch():
             store._ADOPTED_PROJECT_CACHE.clear()
-            e = self.one(store.load_all(project="example-app"), "foo")
+            e = self.one(store.load_all(project="demo-project"), "foo")
             self.assertEqual((e["statement"], e["root"]),
                              ("adopted-project sense", "adopted-project"))
         self.seed_prior("foo", "authored project sense", conf=0.9,
-                        root_dir=self.project_dir("example-app", "premises"))
+                        root_dir=self.project_dir("demo-project", "premises"))
         with self._patch():
             store._ADOPTED_PROJECT_CACHE.clear()
-            e = self.one(store.load_all(project="example-app"), "foo")
+            e = self.one(store.load_all(project="demo-project"), "foo")
             self.assertEqual((e["statement"], e["root"]),
                              ("authored project sense", "project"))
 
@@ -1200,7 +2158,7 @@ class AdoptProjectMemdirsTest(StoreBase):
         # a project lens with no registry file adds no adopted-project root
         os.remove(home.registry_path())
         store._ADOPTED_PROJECT_CACHE.clear()
-        self.assertEqual([t[0] for t in store.roots(project="example-app")],
+        self.assertEqual([t[0] for t in store.roots(project="demo-project")],
                          ["adopted", "helm-global", "project"])
 
 
@@ -1342,7 +2300,8 @@ class CandidateTierTest(StoreBase):
         # non-live files with inferred source, invisible to every inject lane
         for args in (("prior", "x-law | inferred belief | 0.7 | glorpwork"),
                      ("heuristic", "x-move | try the glorp first | glorpwork"),
-                     ("reference", "x-ref | the glorp paper | https://x.example")):
+                     ("reference", "x-ref | the glorp paper | https://x.example "
+                                   "| glorppaper")):
             rc, out, _ = self.add(*args, "--candidate")
             self.assertEqual(rc, 0, args[0])
             self.assertIn("CANDIDATE", out)
@@ -1422,7 +2381,7 @@ class CandidateTierTest(StoreBase):
         self.assertIn("not a candidate", err)
 
     def test_reject_cli(self):
-        self.add("prior", "x-law | wrong inference | 0.6", "--candidate")
+        self.add("prior", "x-law | wrong inference | 0.6 | xkw", "--candidate")
         rc, out, _ = self.run_cli(["reject", "x-law", "misread", "the", "log"])
         self.assertEqual(rc, 0)
         self.assertIn("REJECTED 'x-law'", out)
@@ -1519,7 +2478,7 @@ class CandidateTierTest(StoreBase):
     def test_confirm_reject_ambiguous_cross_type_refused(self):
         # candidates mint in all four types now — a bare id shared across
         # types must never silently ratify/retire _find's typed-first winner
-        self.add("prior", "dupx | a belief guess | 0.6", "--candidate")
+        self.add("prior", "dupx | a belief guess | 0.6 | dupxkw", "--candidate")
         self.add("lexicon", "dupx | a term guess", "--candidate")
         for verb in (store.confirm, store.reject):
             e, err = verb("dupx", TS)
@@ -1544,7 +2503,7 @@ class CandidateTierTest(StoreBase):
         self.assertIn("unknown --type", err)
 
     def test_ambiguous_candidates_cli_type_flag_and_hints(self):
-        self.add("prior", "dupx | a belief guess | 0.6", "--candidate")
+        self.add("prior", "dupx | a belief guess | 0.6 | dupxkw", "--candidate")
         self.add("lexicon", "dupx | a term guess", "--candidate")
         self.add("heuristic", "solo | lone move | glorpwork", "--candidate")
         # list hints carry the qualifier ONLY where the slug is shared
@@ -1577,8 +2536,8 @@ class CandidateTierTest(StoreBase):
         for typ, first, again in (
                 ("heuristic", "h1 | bad move | glorpwork",
                  "h1 | good move | glorpwork"),
-                ("reference", "r1 | wrong paper | https://x.example",
-                 "r1 | right paper | https://x.example")):
+                ("reference", "r1 | wrong paper | https://x.example | glorppaper",
+                 "r1 | right paper | https://x.example | glorppaper")):
             eid = typ[0] + "1"
             rc, _, _ = self.add(typ, first, "--candidate")
             self.assertEqual(rc, 0, typ)
@@ -1594,7 +2553,7 @@ class CandidateTierTest(StoreBase):
 
 
 class ProvisionalTierTest(StoreBase):
-    """Provisional tier: a candidate a cross-family /x
+    """Provisional tier (owner canon 2026-07-22): a candidate a cross-family /x
     review has cleared goes PROVISIONALLY LIVE — it FIRES through the resolver
     like live but stays visibly [provisional]-tagged until the owner ratifies
     (confirm) or rejects it. xrev-clear is the graduation gate; an un-cleared
@@ -1653,7 +2612,8 @@ class ProvisionalTierTest(StoreBase):
         # xrev_by/xrev_ts file fields (what the web panel/CLI display reads)
         for args in (("lexicon", "glorpterm | a cleared coinage"),
                      ("heuristic", "x-move | try glorp first | glorpwork"),
-                     ("reference", "x-ref | the glorp paper | https://x.example")):
+                     ("reference", "x-ref | the glorp paper | https://x.example "
+                                   "| glorppaper")):
             self.add(*args, "--candidate")
         for eid in ("glorpterm", "x-move", "x-ref"):
             e, err = store.xrev_clear(eid, TS, by="opus-seat")
@@ -1665,7 +2625,7 @@ class ProvisionalTierTest(StoreBase):
                 self.assertIn("xrev_by: opus-seat", f.read(), eid)
 
     def test_xrev_clear_guards(self):
-        self.add("prior", "x-law | guess | 0.6", "--candidate")
+        self.add("prior", "x-law | guess | 0.6 | glorpwork", "--candidate")
         # a reviewer is mandatory — the verb attests a review happened
         e, err = store.xrev_clear("x-law", TS, by="")
         self.assertIsNone(e)
@@ -1687,7 +2647,7 @@ class ProvisionalTierTest(StoreBase):
         self.assertIn("provisional", err)
 
     def test_xrev_clear_ambiguous_cross_type_refused(self):
-        self.add("prior", "dupx | belief guess | 0.6", "--candidate")
+        self.add("prior", "dupx | belief guess | 0.6 | dupxkw", "--candidate")
         self.add("lexicon", "dupx | a term guess", "--candidate")
         e, err = store.xrev_clear("dupx", TS, by="r")
         self.assertIsNone(e)
@@ -1749,7 +2709,7 @@ class ProvisionalTierTest(StoreBase):
         self.assertIn("provisional", out)
         self.assertEqual(self.one(store.load_all(), "x-law")["status"], "provisional")
         # missing --by is a usage error (rc 2), not a silent clear
-        self.add("prior", "y-law | guess | 0.7", "--candidate")
+        self.add("prior", "y-law | guess | 0.7 | ylawkw", "--candidate")
         rc, _, err = self.run_cli(["xrev-clear", "y-law"])
         self.assertEqual(rc, 2)
         self.assertIn("--by", err)
@@ -1770,7 +2730,7 @@ class ProvisionalTierTest(StoreBase):
 
 
 class NotifyOnGraduationTest(StoreBase):
-    """Push-on-graduation (the provisional queue must
+    """Push-on-graduation (owner steer 2026-07-23: the provisional queue must
     ROUTINELY reach the owner). xrev_clear fires ONE optional ntfy push when
     HELM_NTFY_TOPIC is set. Hermetic: urllib.request.urlopen is mocked — no test
     ever touches the network. Laws under test: bare-topic -> ntfy.sh URL, full
@@ -1784,7 +2744,7 @@ class NotifyOnGraduationTest(StoreBase):
             store.cmd_store(["add", *args, "--candidate"])
 
     def test_graduation_pushes_ntfy_on_a_bare_topic(self):
-        self._candidate("prior", "x-law | cleared belief | 0.7")
+        self._candidate("prior", "x-law | cleared belief | 0.7 | glorpwork")
         with mock.patch.dict(os.environ, {"HELM_NTFY_TOPIC": "helmqueue"}), \
                 mock.patch("urllib.request.urlopen") as uo:
             e, err = store.xrev_clear("x-law", TS, by="codex-seat")
@@ -1811,7 +2771,7 @@ class NotifyOnGraduationTest(StoreBase):
                                    b"- review when convenient")
 
     def test_unset_topic_makes_no_network_call(self):
-        self._candidate("prior", "x-law | cleared belief | 0.7")
+        self._candidate("prior", "x-law | cleared belief | 0.7 | glorpwork")
         with mock.patch.dict(os.environ), \
                 mock.patch("urllib.request.urlopen",
                            side_effect=AssertionError("no network call when unset")) as uo:
@@ -1844,10 +2804,1055 @@ class NotifyOnGraduationTest(StoreBase):
         # candidates are agent-noise — only graduation to provisional pushes
         with mock.patch.dict(os.environ, {"HELM_NTFY_TOPIC": "helmqueue"}), \
                 mock.patch("urllib.request.urlopen") as uo:
-            self._candidate("prior", "x-law | just captured | 0.7")
+            self._candidate("prior", "x-law | just captured | 0.7 | glorpwork")
         self.assertEqual(uo.call_count, 0)
         self.assertEqual(self.one(store.candidates(), "x-law")["status"], "candidate")
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadScopeTest(unittest.TestCase):
+    """`store.load.read_scope` — one store read per OPERATION, never per row.
+
+    MEASURED 2026-07-31. `helm lr list` / `/api/lr` took 25-41s to project 312
+    land loops while the owner's console card budgets 12s, so the land pipeline
+    rendered "DISPATCH LEDGER UNREADABLE" on the one surface built to show it —
+    and the ledger was fine. The profile put 30.7 of 41 seconds in a single
+    chain: `_lr` -> `approval_tier` -> `load_certain_policy` -> `load_all`,
+    re-walking the ENTIRE typed store PER ROW. 179 rows produced 716 root loads
+    and 244,335 frontmatter parses of the same 1,308 files. After the fix: 11.5s
+    for the same 312 rows.
+    """
+
+    def test_inside_a_scope_the_store_is_read_ONCE(self):
+        from helm.store import load as L
+        calls = []
+        real = L._load_all_uncached
+        try:
+            L._load_all_uncached = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+            with L.read_scope():
+                for _ in range(5):
+                    L.load_all()
+        finally:
+            L._load_all_uncached = real
+        self.assertEqual(len(calls), 1,
+                         "the store was read %d times inside one scope" % len(calls))
+
+    def test_OUTSIDE_a_scope_nothing_is_cached(self):
+        """THE CONTROL THAT BOUNDS THE RISK. A cache that outlives its operation
+        would serve stale policy — the exact failure class this fix exists
+        inside (a web server served 40h-old code today; the owner console served
+        an 8-day-old render). Outside a scope behaviour must be byte-identical
+        to before: every call re-reads."""
+        from helm.store import load as L
+        calls = []
+        real = L._load_all_uncached
+        try:
+            L._load_all_uncached = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+            for _ in range(3):
+                L.load_all()
+        finally:
+            L._load_all_uncached = real
+        self.assertEqual(len(calls), 3, "a read was cached outside any scope")
+
+    def test_the_cache_DROPS_when_the_scope_exits(self):
+        """A scope must not leak into the next operation."""
+        from helm.store import load as L
+        with L.read_scope():
+            L.load_all()
+            self.assertTrue(L._scope_state().cache,
+                            "nothing was cached inside a scope")
+        self.assertFalse(L._scope_state().cache, "the cache survived its scope")
+
+    def test_nested_scopes_share_and_only_the_OUTERMOST_clears(self):
+        """Re-entrant on purpose: a caller must not need to know whether its
+        callee also scopes. If an inner exit cleared, the outer operation would
+        silently go back to per-row reads and the fix would evaporate under
+        composition."""
+        from helm.store import load as L
+        with L.read_scope():
+            L.load_all()
+            with L.read_scope():
+                L.load_all()
+            self.assertTrue(L._scope_state().cache,
+                            "an inner scope exit cleared the outer cache")
+        self.assertFalse(L._scope_state().cache)
+
+    def test_two_THREADS_never_share_a_scope(self):
+        """@codex-2's finding, and the one that made this cache unsafe in
+        production: helm web is a ThreadingHTTPServer, so two requests overlap
+        inside ONE interpreter. With a module-level dict and a class-attribute
+        depth, thread A's snapshot answered thread B's read and A's exit cleared
+        the cache while B was still inside its scope.
+
+        The probe is deterministic, not timing-hopeful: B is released only once
+        A is provably INSIDE its scope with a cached read, which is exactly the
+        interleaving that used to fail. A must see its OWN project and B must
+        see B's."""
+        from helm.store import load as L
+        a_inside, b_done = threading.Event(), threading.Event()
+        seen = {}
+
+        def watcher(name, gate_set, gate_wait):
+            def run():
+                with L.read_scope():
+                    L.load_all(project=name)
+                    seen[name] = dict(L._scope_state().cache)
+                    if gate_set:
+                        gate_set.set()
+                    if gate_wait:
+                        gate_wait.wait(timeout=5)
+            return run
+
+        ta = threading.Thread(target=watcher("proj-a", a_inside, b_done))
+        ta.start()
+        self.assertTrue(a_inside.wait(timeout=5), "thread A never entered")
+        tb = threading.Thread(target=watcher("proj-b", None, None))
+        tb.start()
+        tb.join(timeout=10)
+        b_done.set()
+        ta.join(timeout=10)
+
+        a_keys = [k[0] for k in seen.get("proj-a", {})]
+        b_keys = [k[0] for k in seen.get("proj-b", {})]
+        self.assertEqual(a_keys, ["proj-a"],
+                         "thread A's cache saw another thread's read: %r" % a_keys)
+        self.assertEqual(b_keys, ["proj-b"],
+                         "thread B's cache saw another thread's read: %r" % b_keys)
+
+    def test_a_caller_MUTATING_a_result_cannot_poison_the_next_read(self):
+        """@codex-2's second finding. `list(hit)` built a new LIST around the
+        SAME entry dicts, so mutating one entry changed what every later read in
+        the scope returned — and the miss path was worse still, handing the
+        caller the very list now sitting in the cache.
+
+        Both reads below are inside ONE scope, so the second is served from the
+        cache. It must not carry the first caller's edit."""
+        from helm.store import load as L
+        with L.read_scope():
+            first = L.load_all()
+            if not first:
+                self.skipTest("no store entries to mutate")
+            first[0]["statement"] = "POISONED"
+            first[0]["nested"] = [{"deep": "clean"}]
+            second = L.load_all()
+            self.assertNotEqual(second[0].get("statement"), "POISONED",
+                                "a caller's edit reached the next read")
+            self.assertNotIn("nested", second[0],
+                             "a caller's added key reached the next read")
+
+    def test_a_NESTED_dict_inside_a_list_is_also_caller_owned(self):
+        """@codex-2's R2 finding, and it killed a bound I had ARGUED for.
+
+        My first fix copied one level down and its docstring claimed list values
+        were the only mutable ones a store entry carries. On the real 1,308-row
+        corpus that is false: 892 entries have confidence_history / evidence_log
+        lists whose ELEMENTS ARE DICTS, and mutating one of those nested dicts
+        poisoned the next cached read.
+
+        It also caught the arm that was supposed to test this being VACUOUS —
+        my probe searched the first entry for any list field and skipped when it
+        found none, which on this corpus is exactly what happened. So the
+        fixture here is SYNTHETIC and guaranteed nested: no search, no guard, no
+        way for the assertion to pass by not running."""
+        from helm.store import load as L
+        planted = [{"id": "x", "type": "premise",
+                    "confidence_history": [{"conf": 1.0, "by": "clean"}]}]
+        real = L._load_all_uncached
+        try:
+            L._load_all_uncached = lambda *a, **k: [dict(e) for e in planted]
+            with L.read_scope():
+                first = L.load_all()
+                first[0]["confidence_history"][0]["by"] = "POISONED"
+                second = L.load_all()
+                self.assertEqual(second[0]["confidence_history"][0]["by"],
+                                 "clean",
+                                 "a mutation two levels down reached the "
+                                 "next cached read")
+        finally:
+            L._load_all_uncached = real
+
+    def test_each_return_site_hands_out_its_OWN_copy(self):  # noqa: VACUOUS_ASSERTION — the arms sit inside try/finally only to restore the patched loader; mutation-proven non-vacuous (hit-site neutered -> 1 red, miss-site -> 3 red, restored -> green, 2026-08-01)
+        """@codex-2's reissue finding, closed as TWO NAMED ARMS on one
+        guaranteed fixture. The miss path (`_detached(out)`) and the hit path
+        (`_detached(hit)`) are SEPARATE return sites, and a verifier that only
+        ever mutates the miss result stays green while the hit site degrades
+        to `list(hit)` — measured: all 7 ReadScopeTest green, warm cache ->
+        mutate hit's nested dict -> third read POISONED. Mutation contract,
+        each site separately: neuter the MISS site (`list(out)`) and the MISS
+        arm goes red; neuter the HIT site (`list(hit)`) and the HIT arm goes
+        red. The corpus-backed sibling above stays as supplementary coverage
+        only — this fixture is planted, so neither arm can pass by not
+        running."""
+        from helm.store import load as L
+        planted = [{"id": "x", "type": "premise",
+                    "confidence_history": [{"conf": 1.0, "by": "clean"}]}]
+        real = L._load_all_uncached
+        try:
+            L._load_all_uncached = lambda *a, **k: [dict(e) for e in planted]
+            with L.read_scope():
+                # MISS arm: the first read is the miss-site copy; its
+                # mutation must not reach the first cache hit.
+                miss = L.load_all()
+                miss[0]["confidence_history"][0]["by"] = "POISONED-MISS"
+                hit1 = L.load_all()
+                self.assertEqual(hit1[0]["confidence_history"][0]["by"],
+                                 "clean", "the MISS-site copy shares dicts "
+                                 "with the cache")
+                # HIT arm: hit1 is a hit-site copy; mutating it must not
+                # reach a LATER hit.
+                hit1[0]["confidence_history"][0]["by"] = "POISONED-HIT"
+                hit2 = L.load_all()
+                self.assertEqual(hit2[0]["confidence_history"][0]["by"],
+                                 "clean", "the HIT-site copy shares dicts "
+                                 "with the cache")
+        finally:
+            L._load_all_uncached = real
+
+
+class RetagWidensTheRetrievalKeywords(StoreBase):
+    """#188 — `/learn` mandates a resolve-widen-RETEST loop and the store had no
+    verb for the widen step.
+
+    MEASURED 2026-08-04, two seats in one night, both following the skill
+    correctly and both landing wrong: one hand-edited frontmatter (silent — the
+    mutation-receipt trail bypassed), the other minted `-r2` ids and superseded
+    twice (loud but FALSE — a supersession that did not happen, and the DF
+    weight of shared keywords split so BOTH files rank lower than either alone).
+    """
+
+    def _heuristic(self, hid="hmove", trigger="alpha,beta"):
+        return store.write_heuristic(
+            {"id": hid, "move": "do the thing", "trigger": trigger},
+            root_dir=self.global_dir("heuristics"))
+
+    def _ondisk(self, path, key):
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("  %s:" % key):
+                    return line.split(":", 1)[1].strip()
+        return None
+
+    def test_a_heuristic_edit_actually_REACHES_DISK(self):
+        """THE TRAP, and the reason this verb could have shipped as a no-op.
+        `write_heuristic` reads `trigger` BEFORE `keywords`, so setting only
+        `keywords` writes the OLD trigger back and reports success — the author
+        then resolve-tests, still misses, and concludes the store cannot be
+        widened."""
+        path = self._heuristic()
+        self.assertEqual(self._ondisk(path, "trigger"), "alpha,beta")  # control
+        e, err = store.retag("hmove", TS, add="gamma")
+        self.assertIsNone(err)
+        # POSITIVE CONTROL ON THE SAME CALL'S OTHER CHANNEL — `e` and `err`
+        # are two channels of one result. A second retag() would NOT do:
+        # every call mints a fresh producer, so it could not vouch for this
+        # one. Asserting the returned entry also states the stronger thing:
+        # the call gave back the right row, not merely that it kept quiet.
+        self.assertEqual(e["keywords"], "alpha,beta,gamma")
+        self.assertEqual(self._ondisk(path, "trigger"), "alpha,beta,gamma")
+
+    def test_a_prior_edit_reaches_disk_too(self):
+        path = self.seed_prior("plaw", "Always do X.", keywords="one,two")
+        self.assertEqual(self._ondisk(path, "keywords"), "one,two")   # control
+        e, err = store.retag("plaw", TS, add="three")
+        self.assertIsNone(err)
+        self.assertEqual(e["keywords"], "one,two,three")   # same call, other channel
+        self.assertEqual(self._ondisk(path, "keywords"), "one,two,three")
+
+    def test_duplicates_are_dropped_case_insensitively(self):
+        """The resolver lowercases, so `Alpha` and `alpha` are ONE probe
+        wearing two spellings."""
+        self.seed_prior("plaw", "S", keywords="alpha,beta")
+        e, err = store.retag("plaw", TS, add="ALPHA,Beta,gamma")
+        self.assertIsNone(err)
+        self.assertEqual(store._kw_list(e["keywords"]),
+                         ["alpha", "beta", "gamma"])
+
+    def test_set_dedups_case_variants_within_its_own_argument(self):
+        """A MUTATION FOUND THIS HOLE. Making `_kw_list`'s dedup
+        case-SENSITIVE left the suite green, because the add path dedups again
+        in `retag` against a lowercased set — so the test above proved retag's
+        logic, never `_kw_list`'s. The REPLACE path has no second dedup, so
+        this is where that function is load-bearing and where a case pair would
+        otherwise land two spellings of one probe in the file."""
+        self.seed_prior("plaw", "S", keywords="old")
+        e, err = store.retag("plaw", TS, replace="Alpha,alpha,ALPHA,beta")
+        self.assertIsNone(err)
+        self.assertEqual(store._kw_list(e["keywords"]), ["Alpha", "beta"])
+
+    def test_author_order_is_preserved(self):
+        self.seed_prior("plaw", "S", keywords="zeta,alpha")
+        e, _ = store.retag("plaw", TS, add="mid")
+        self.assertEqual(store._kw_list(e["keywords"]), ["zeta", "alpha", "mid"])
+
+    def test_remove_narrows_a_spammer(self):
+        self.seed_prior("plaw", "S", keywords="alpha,beta,gamma")
+        e, err = store.retag("plaw", TS, remove="BETA")
+        self.assertIsNone(err)
+        self.assertEqual(store._kw_list(e["keywords"]), ["alpha", "gamma"])
+
+    def test_set_replaces_the_whole_list(self):
+        self.seed_prior("plaw", "S", keywords="alpha,beta")
+        e, err = store.retag("plaw", TS, replace="only")
+        self.assertIsNone(err)
+        self.assertEqual(store._kw_list(e["keywords"]), ["only"])
+
+    def test_set_combined_with_add_is_refused_not_guessed(self):
+        self.seed_prior("plaw", "S", keywords="alpha")
+        e, err = store.retag("plaw", TS, add="beta", replace="only")
+        self.assertIsNone(e)
+        self.assertIn("do not combine", err)
+        # CONTROL, same call shape: either flag ALONE works, so the refusal is
+        # about the combination and not a verb that refuses everything.
+        self.assertIsNone(store.retag("plaw", TS, add="beta")[1])
+        self.assertIsNone(store.retag("plaw", TS, replace="only")[1])
+
+    def test_emptying_an_entry_is_refused_and_points_at_retire(self):
+        """An entry no probe reaches is retired WITHOUT a retirement receipt,
+        and it looks live on every listing."""
+        self.seed_prior("plaw", "S", keywords="alpha,beta")
+        e, err = store.retag("plaw", TS, remove="alpha,beta")
+        self.assertIsNone(e)
+        self.assertIn("NO keywords", err)
+        self.assertIn("store retire", err)
+        # CONTROL: removing all-but-one is fine, so the refusal is the EMPTY
+        # result and not a verb that cannot remove.
+        e2, err2 = store.retag("plaw", TS, remove="alpha")
+        self.assertIsNone(err2)
+        self.assertEqual(store._kw_list(e2["keywords"]), ["beta"])
+
+    def test_set_to_nothing_is_refused_too(self):
+        self.seed_prior("plaw", "S", keywords="alpha")
+        self.assertIn("NO keywords", store.retag("plaw", TS, replace=" , ")[1])
+        self.assertIsNone(store.retag("plaw", TS, replace="x")[1])   # control
+
+    def test_a_change_leaves_a_receipt_and_a_no_op_does_not(self):
+        """The whole point: the widen step stops bypassing the mutation trail
+        this store keeps."""
+        self.seed_prior("plaw", "S", keywords="alpha")
+        with mock.patch.object(pk, "event") as ev:
+            store.retag("plaw", TS, add="beta")
+            self.assertEqual(ev.call_count, 1)                # the receipt
+            self.assertEqual(ev.call_args[0][0], "store.retag")
+            ev.reset_mock()
+            e, err = store.retag("plaw", TS, add="ALPHA,beta")  # already there
+            self.assertIsNone(err)
+            self.assertEqual(e["keywords"], "alpha,beta")   # same call, other channel
+            self.assertEqual(ev.call_count, 0)                # idempotent
+
+    def test_an_unknown_id_is_a_refusal_not_a_new_entry(self):
+        e, err = store.retag("no-such-entry", TS, add="alpha")
+        self.assertIsNone(e)
+        self.assertIn("not found", err)
+        self.seed_prior("plaw", "S", keywords="alpha")        # control
+        self.assertIsNone(store.retag("plaw", TS, add="beta")[1])
+
+    def test_an_unknown_type_is_refused_with_the_valid_set(self):
+        self.seed_prior("plaw", "S", keywords="alpha")
+        _e, err = store.retag("plaw", TS, add="beta", ctype="nonsense")
+        self.assertIn("unknown --type", err)
+        self.assertIn("heuristic", err)
+        # premise is an ALIAS for prior — the CLI's own word must work.
+        self.assertIsNone(store.retag("plaw", TS, add="beta",
+                                      ctype="premise")[1])
+
+
+class TheKeywordsVerbClosesTheLoopItOpens(StoreBase):
+    """CLI arms. The verb exists so the widen step stops bypassing the store's
+    own mutation trail — so its SURFACE has to make the remaining step
+    (retest) unmissable, or it just relocates the place people stop early."""
+
+    def _run(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_no_flags_prints_the_current_set_and_changes_nothing(self):
+        """A READ, deliberately: the loop is resolve -> LOOK -> widen -> retest,
+        and charging a separate verb for the look is how people skip it."""
+        path = self.seed_prior("plaw", "S", keywords="alpha,beta")
+        rc, out, _ = self._run("keywords", "plaw")
+        self.assertEqual(rc, 0)
+        # NO SPY HERE. A spy list is its own observable, so asserting only
+        # "the recorder never fired" proves nothing about what the verb
+        # WROTE. The file itself is the observable that matters, and
+        # test_a_change_leaves_a_receipt_and_a_no_op_does_not owns the
+        # receipt contract.
+        with open(path, encoding="utf-8") as fh:
+            self.assertIn("keywords: alpha,beta", fh.read())
+        # A MUTATION FOUND THIS HOLE. Deleting the read branch entirely left
+        # this test green: with no flags the call fell through to `retag`,
+        # which is a NO-OP for an unchanged list and printed a widen summary
+        # carrying the same words. So asserting "alpha appears" proved nothing
+        # about read mode at all. These two assertions separate them —
+        # ONE KEYWORD PER LINE, and NO retest instruction, because a read is
+        # not a widen and telling someone to retest a change they did not make
+        # is how a surface teaches people to ignore it.
+        self.assertIn("\n  alpha\n", out)
+        self.assertIn("\n  beta\n", out)
+        self.assertNotIn("RETEST", out)
+        self.assertIn("2 keywords", out)
+        # ...and the SAME surface DOES print it for a real widen, so its
+        # absence above is read mode and not a string this verb never emits.
+        self.assertIn("RETEST", self._run("keywords", "plaw", "--add", "g")[1])
+
+    def test_a_widen_tells_the_author_the_capture_is_not_done_yet(self):
+        """`/learn`: a capture is done at FIRES, never at `stored:`. The verb
+        that widens is the right place to say so."""
+        self.seed_prior("plaw", "S", keywords="alpha")
+        rc, out, _ = self._run("keywords", "plaw", "--add", "beta")
+        self.assertEqual(rc, 0)
+        self.assertIn("now carries 2 keywords", out)
+        self.assertIn("RETEST", out)
+        self.assertIn("store resolve", out)
+        self.assertIn("must-MISS control", out)   # widening can make a spammer
+
+    def test_an_unknown_id_exits_nonzero_and_names_itself(self):
+        rc, _out, err = self._run("keywords", "nope", "--add", "x")
+        self.assertEqual(rc, 1)
+        self.assertIn("not found", err)
+        self.seed_prior("plaw", "S", keywords="alpha")      # control
+        ok_rc, ok_out, ok_err = self._run("keywords", "plaw", "--add", "b")
+        self.assertEqual(ok_rc, 0)
+        self.assertIn("now carries", ok_out)   # same call, other channel
+        self.assertEqual(ok_err, "")           # ...so an empty stderr means worked
+
+    def test_bare_verb_prints_usage_and_does_not_guess_an_id(self):
+        rc, _out, err = self._run("keywords")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage: helm store keywords", err)
+        self.assertIn("--add", err)
+
+
+# The duplicate guard weighs shared WORD MASS, not a count of shared probes
+# (#271). A genuine sibling therefore has to share real symptom PHRASES, which
+# is what a genuine duplicate looks like anyway — the pre-#271 fixture shared
+# two bare 2-word cells (mass 4), and that strength of evidence is exactly the
+# false-positive population the guard now releases. These two constants are the
+# refusing pair every override/scanner test leans on; keeping them as named
+# constants stops a future edit from silently weakening the collision and
+# turning those tests vacuously green.
+DUP_SIBLING_KEYWORDS = ("pane freeze, seat stall on plan prompt, "
+                        "plan approval prompt")
+DUP_COLLIDING_KEYWORDS = "seat stall on plan prompt, plan approval prompt, tmux"
+
+
+class AddGateBase(StoreBase):
+    """Shared harness for the add-time findability gate tests."""
+
+    def add(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(["add", *args])
+        return rc, out.getvalue(), err.getvalue()
+
+
+class AddArgumentScannerTest(AddGateBase):
+    """#214: add flags are one validated grammar, not terminal special cases."""
+
+    def _seed_sibling(self):
+        self.seed_prior("seat-freeze-law", "seats freeze on plan prompts",
+                        keywords=DUP_SIBLING_KEYWORDS)
+
+    def test_rationale_stops_at_trailing_force_new_and_scanning_resumes(self):
+        """The reported regression: the override must act, not become prose."""
+        self._seed_sibling()
+        rc, out, err = self.add(
+            "prior", "seat-freeze-two | a second law | 0.7 | "
+            + DUP_COLLIDING_KEYWORDS,
+            "--rationale", "observed", "in", "two", "incidents", "--force-new")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("DUP OVERRIDE recorded", out)
+        e = self.one(store.load_all(), "seat-freeze-two")
+        self.assertEqual(e["evidence_log"][0]["reason"],
+                         "observed in two incidents")
+        self.assertEqual(e["confidence_history"][0]["reason"],
+                         "observed in two incidents")
+
+    def test_reverse_order_keeps_the_exact_rationale(self):
+        self._seed_sibling()
+        rc, out, err = self.add(
+            "prior", "seat-freeze-two | a second law | 0.7 | "
+            + DUP_COLLIDING_KEYWORDS,
+            "--force-new", "--rationale", "observed", "in", "two", "incidents")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("DUP OVERRIDE recorded", out)
+        e = self.one(store.load_all(), "seat-freeze-two")
+        self.assertEqual(e["evidence_log"][0]["reason"],
+                         "observed in two incidents")
+
+    def test_source_candidate_and_rationale_work_in_both_orders(self):  # noqa: VACUOUS_ASSERTION — fixed nonempty cases each assert the stored candidate
+        cases = (
+            ("capture-a", ("--source", "trace-a", "--candidate", "--rationale",
+                           "seen", "during", "capture"), "trace-a"),
+            ("capture-b", ("--rationale", "seen", "during", "capture",
+                           "--candidate", "--source", "trace-b"), "trace-b"),
+        )
+        for eid, flags, source in cases:
+            with self.subTest(eid=eid):
+                rc, _, err = self.add(
+                    "prior", "%s | an inferred belief | 0.6 | %skw" % (eid, eid),
+                    *flags)
+                self.assertEqual((rc, err), (0, ""))
+                e = self.one(store.candidates(), eid)
+                self.assertEqual((e["status"], e["source"]),
+                                 ("candidate", source))
+                self.assertEqual(e["evidence_log"][0]["reason"],
+                                 "seen during capture")
+
+    def test_duplicate_add_flags_refuse_without_store_work(self):  # noqa: VACUOUS_ASSERTION — fixed nonempty cases prove parser refusal before the final absence check
+        cases = (
+            ("--source", ("--source", "one", "--source", "two")),
+            ("--rationale", ("--rationale", "one", "--rationale", "two")),
+            ("--candidate", ("--candidate", "--candidate")),
+            ("--force-new", ("--force-new", "--force-new")),
+        )
+        from helm.store import cli as store_cli
+        for n, (flag, flags) in enumerate(cases):
+            with self.subTest(flag=flag), mock.patch.object(
+                    store_cli.pk, "now_ts",
+                    side_effect=AssertionError("invalid argv reached store work")):
+                rc, out, err = self.add(
+                    "prior", "dup-%d | a belief | 0.6 | dupkw%d" % (n, n), *flags)
+                self.assertEqual((rc, out), (2, ""))
+                self.assertIn("%s may appear only once" % flag, err)
+        self.assertEqual(store.load_all(), [])
+
+    def test_missing_or_flag_shaped_values_refuse_without_store_work(self):  # noqa: VACUOUS_ASSERTION — fixed nonempty cases prove parser refusal before the final absence check
+        cases = (
+            ("missing-source", ("--source",), "--source needs a value"),
+            ("empty-source", ("--source", ""), "--source needs a value"),
+            ("flag-source", ("--source", "--candidate"),
+             "--source needs a value before --candidate"),
+            ("missing-rationale", ("--rationale",), "--rationale needs text"),
+            ("empty-rationale", ("--rationale", ""), "--rationale needs text"),
+            ("flag-rationale", ("--rationale", "--force-new"),
+             "--rationale needs text before --force-new"),
+        )
+        from helm.store import cli as store_cli
+        for n, (name, flags, message) in enumerate(cases):
+            with self.subTest(name=name), mock.patch.object(
+                    store_cli.pk, "now_ts",
+                    side_effect=AssertionError("invalid argv reached store work")):
+                rc, out, err = self.add(
+                    "prior", "missing-%d | a belief | 0.6 | missingkw%d" % (n, n),
+                    *flags)
+                self.assertEqual((rc, out), (2, ""))
+                self.assertIn(message, err)
+        self.assertEqual(store.load_all(), [])
+
+    def test_unknown_flag_shaped_args_refuse_in_payload_or_rationale(self):  # noqa: VACUOUS_ASSERTION — fixed nonempty cases prove parser refusal before the final absence check
+        cases = (("--wat",), ("--rationale", "because", "--wat"))
+        from helm.store import cli as store_cli
+        for n, flags in enumerate(cases):
+            with self.subTest(flags=flags), mock.patch.object(
+                    store_cli.pk, "now_ts",
+                    side_effect=AssertionError("invalid argv reached store work")):
+                rc, out, err = self.add(
+                    "prior", "unknown-%d | a belief | 0.6 | unknownkw%d" % (n, n),
+                    *flags)
+                self.assertEqual((rc, out), (2, ""))
+                self.assertIn("unknown store add option --wat", err)
+        self.assertEqual(store.load_all(), [])
+
+
+class EntryMintGuardTest(AddGateBase):
+    """#204 CORE: activation mints pay add's guard; raw lifecycle stays raw."""
+
+    def raw(self, path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def run_cli(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = store.cmd_store(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_guard_is_pure_and_accepts_caller_corpus_exclusions(self):  # noqa: VACUOUS_ASSERTION — deferred event data is the positive control for the empty journal
+        self.seed_prior("seat-freeze-law", "seats freeze on plan prompts",
+                        keywords=DUP_SIBLING_KEYWORDS)
+        corpus = store.load_all()
+        kw, err, notes, events = store.guard_entry_keywords(
+            "prior", "seat-freeze-two", DUP_COLLIDING_KEYWORDS,
+            force=True, corpus=corpus)
+        self.assertIsNone(err)
+        # the author's EXACT string survives at the head; the tail is the stem
+        # decomposition of its >= 3-word cells, which the guard reports in notes
+        self.assertTrue(kw.startswith(DUP_COLLIDING_KEYWORDS), kw)
+        # and the byte-identity contract itself, on an input with nothing to
+        # stem: a guard that merely INSPECTED must not rewrite
+        untouched, err2, _n, _e = store.guard_entry_keywords(
+            "prior", "quiet-law", "alpha, beta", corpus=corpus)
+        self.assertIsNone(err2)
+        self.assertEqual(untouched, "alpha, beta")
+        self.assertTrue(notes)
+        self.assertEqual(events[0][0], "store.dup_override")
+        self.assertEqual(pk.read_events(20), [],
+                         "the pure guard must defer its journal receipt")
+        _kw, err, notes, events = store.guard_entry_keywords(
+            "prior", "seat-freeze-two", DUP_COLLIDING_KEYWORDS,
+            force=True, corpus=corpus, exclusions=(corpus[0],))
+        self.assertIsNone(err)
+        # excluding the sibling removes the OVERRIDE specifically — asserted by
+        # naming it, not by an empty-notes check that any unrelated note breaks
+        self.assertEqual(events, [])
+        self.assertEqual([n for n in notes if "DUP OVERRIDE" in n], [])
+        # The pre-generalization spelling keeps its three-value unpack contract.
+        _kw, err, notes = store.guard_add_keywords(
+            "prior", "distinct-law", "quota headroom, cred rotation")
+        self.assertEqual((err, notes), (None, []))
+
+    def test_writer_failure_emits_no_duplicate_override(self):  # noqa: VACUOUS_ASSERTION — forced duplicate setup and raised writers positively exercise both absence checks
+        self.seed_prior("seat-freeze-law", "seats freeze on plan prompts",
+                        keywords=DUP_SIBLING_KEYWORDS)
+        from helm.store import cli as store_cli
+        with mock.patch.object(store_cli, "write_prior",
+                               side_effect=ValueError("writer refused")):
+            with self.assertRaisesRegex(ValueError, "writer refused"):
+                self.add("prior", "seat-freeze-two | a second law | 0.7 | "
+                         + DUP_COLLIDING_KEYWORDS, "--force-new")
+        self.assertFalse(any(r.get("verb") == "store.dup_override"
+                             for r in pk.read_events(20)))
+        self.assertIsNone(store._find("seat-freeze-two"))
+
+        path = store.write_prior({
+            "id": "seat-freeze-three", "statement": "a third law",
+            "confidence": 0.7, "keywords": DUP_COLLIDING_KEYWORDS,
+            "status": "candidate", "source": "inferred", "stated_ts": TS,
+            "last_updated": TS})
+        before = self.raw(path)
+        fail = mock.Mock(side_effect=ValueError("activation writer refused"))
+        with mock.patch.dict(store._WRITERS, {"prior": fail}):
+            with self.assertRaisesRegex(ValueError, "activation writer refused"):
+                store.confirm("seat-freeze-three", TS, force=True)
+        self.assertEqual(self.raw(path), before)
+        self.assertFalse(any(r.get("verb") == "store.dup_override"
+                             and r.get("target") == "seat-freeze-three"
+                             for r in pk.read_events(20)))
+
+    def test_raw_empty_and_salad_candidates_refuse_activation_byte_identically(self):  # noqa: VACUOUS_ASSERTION — fixed nonempty cases each assert the candidate bytes remain unchanged
+        cases = (
+            ("empty-candidate", "", lambda eid: store.confirm(eid, TS),
+             "NO keywords"),
+            ("salad-candidate", "one giant comma missing keyword cell",
+             lambda eid: store.xrev_clear(eid, TS, by="codex-seat"),
+             "comma-less cell"),
+        )
+        for eid, keywords, activate, message in cases:
+            with self.subTest(eid=eid):
+                path = store.write_prior({
+                    "id": eid, "statement": "raw candidate", "confidence": 0.7,
+                    "keywords": keywords, "status": "candidate",
+                    "source": "inferred", "stated_ts": TS,
+                    "last_updated": TS})
+                before = self.raw(path)
+                e, err = activate(eid)
+                self.assertIsNone(e)
+                self.assertIn(message, err)
+                self.assertEqual(self.raw(path), before,
+                                 "a refused activation must not rewrite one byte")
+
+    def test_confirm_rechecks_the_current_corpus_and_force_new_is_deferred(self):
+        path = store.write_prior({
+            "id": "seat-freeze-two", "statement": "a second law",
+            "confidence": 0.7, "keywords": DUP_COLLIDING_KEYWORDS,
+            "status": "candidate", "source": "inferred", "stated_ts": TS,
+            "last_updated": TS})
+        self.seed_prior("seat-freeze-law", "seats freeze on plan prompts",
+                        keywords=DUP_SIBLING_KEYWORDS)
+        before = self.raw(path)
+        e, err = store.confirm("seat-freeze-two", TS)
+        self.assertIsNone(e)
+        self.assertIn("seat-freeze-law", err)
+        self.assertEqual(self.raw(path), before)
+        rc, out, err = self.run_cli("confirm", "seat-freeze-two", "--force-new")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("DUP OVERRIDE recorded", out)
+        self.assertEqual(self.one(store.load_all(), "seat-freeze-two")["status"],
+                         "live")
+        self.assertTrue(any(r.get("verb") == "store.dup_override"
+                            and r.get("target") == "seat-freeze-two"
+                            for r in pk.read_events(20)))
+
+    def test_candidate_to_provisional_stems_the_heuristic_trigger(self):  # noqa: VACUOUS_ASSERTION — stored trigger, derived probes, and live resolve are unconditional positive controls
+        store.write_heuristic({
+            "id": "stem-move", "move": "inspect the frozen seat",
+            "trigger": "seat freezes on plan prompt, pane tail",
+            "status": "candidate", "source": "inferred", "stated_ts": TS,
+            "last_updated": TS})
+        notes = []
+        e, err = store.xrev_clear("stem-move", TS, by="codex-seat",
+                                  guard_notes=notes)
+        self.assertIsNone(err)
+        self.assertEqual(e["status"], "provisional")
+        self.assertTrue(any("stem probes auto-added" in n for n in notes))
+        e = self.one(store.load_all(), "stem-move")
+        probes = store._kw_list(e["trigger"])
+        self.assertEqual(e["keywords"], e["trigger"])
+        for stem in ("seat", "freezes", "prompt", "seat freezes", "plan prompt"):
+            self.assertIn(stem, probes)
+        self.assertEqual([x["id"] for x in store.resolve_prompt("the seat freezes")],
+                         ["stem-move"])
+
+    def test_provisional_to_live_is_lifecycle_only_and_not_relinted(self):  # noqa: VACUOUS_ASSERTION — live rewrite and preserved empty keyword line are both asserted positively
+        path = store.write_prior({
+            "id": "legacy-provisional", "statement": "already firing",
+            "confidence": 0.7, "keywords": "", "status": "provisional",
+            "source": "inferred", "stated_ts": TS, "last_updated": TS,
+            "xrev_by": "codex-seat", "xrev_ts": TS})
+        before = self.raw(path)
+        e, err = store.confirm("legacy-provisional", TS)
+        self.assertIsNone(err)
+        self.assertEqual((e["status"], e["keywords"]), ("live", ""))
+        after = self.raw(path)
+        self.assertNotEqual(after, before)
+        self.assertIn(b"  status: live", after)
+        self.assertIn(b"  keywords: \n", after)
+
+    def test_raw_writers_and_nonactivation_lifecycle_remain_unguarded(self):
+        paths = (
+            store.write_prior({
+                "id": "raw-prior", "statement": "raw", "confidence": 0.7,
+                "keywords": "", "status": "candidate", "stated_ts": TS,
+                "last_updated": TS}),
+            store.write_lexicon({"term": "raw-lex", "definition": "raw",
+                                 "keywords": ""}),
+            store.write_heuristic({
+                "id": "raw-heur", "move": "raw", "trigger": "",
+                "status": "live", "stated_ts": TS, "last_updated": TS}),
+            store.write_reference({
+                "id": "raw-ref", "statement": "raw",
+                "keywords": "one giant comma missing keyword cell",
+                "status": "live", "stated_ts": TS, "last_updated": TS}),
+        )
+        self.assertTrue(all(os.path.isfile(path) for path in paths))
+        rejected, err = store.reject("raw-prior", TS, why="raw lifecycle")
+        self.assertIsNone(err)
+        self.assertEqual(rejected["status"], "retired")
+        retired, err = store.retire("raw-heur", TS, "raw lifecycle")
+        self.assertIsNone(err)
+        self.assertEqual(retired["status"], "retired")
+
+
+class AddKeywordLintTest(AddGateBase):
+    """GUARD 1 — the three MEASURED degenerate keyword shapes (SA audit
+    2026-08-03: 9% EMPTY + 12% comma-missing salad + 4% lone word = 26% of
+    the store structurally near-unfindable) refuse at add time, each with the
+    teaching cure; healthy fields pass untouched (the controls)."""
+
+    def test_empty_keywords_refuse_and_write_nothing(self):
+        rc, out, err = self.add("prior", "no-kw-law | a belief nobody can find | 0.7")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("NO keywords", err)
+        self.assertIn("comma-separated SYMPTOM phrases, 1-3 words", err)
+        self.assertEqual(store.load_all(), [])   # a refusal writes NOTHING
+        # positive control on the SAME observable: the same add WITH keywords
+        # lands, so the empty list above is the refusal and not a dead store
+        rc, _, err = self.add("prior",
+                              "no-kw-law | a belief nobody can find | 0.7 | pane freeze")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual([e["id"] for e in store.load_all()], ["no-kw-law"])
+
+    def test_every_add_branch_is_gated(self):
+        # one refusal per WRITER BRANCH — a guard wired into three of four
+        # branches passes every single-type test above and still leaks
+        for args in (("prior", "b1 | s | 0.7"),
+                     ("premise", "b2 | s"),
+                     ("heuristic", "b3 | s"),
+                     ("reference", "b4 | s | https://x.example")):
+            rc, _, err = self.add(*args)
+            self.assertEqual(rc, 1, args[0])
+            self.assertIn("NO keywords", err, args[0])
+        self.assertEqual(store.load_all(), [])
+        # positive control: one keyworded add lands, so the empty store above
+        # is four refusals and not a broken harness
+        rc, _, _ = self.add("prior", "b1 | s | 0.7 | pane freeze")
+        self.assertEqual(rc, 0)
+        self.assertEqual([e["id"] for e in store.load_all()], ["b1"])
+
+    def test_the_measured_salad_shape_refuses(self):
+        # the exact measured shape: one comma-less cell that indexes as ONE
+        # giant probe only a verbatim repeat of the whole phrase can match
+        rc, _, err = self.add(
+            "prior", "salad-law | a statement | 0.7 | "
+            "workforce team fable opus codex kimi subagent orchestrator role")
+        self.assertEqual(rc, 1)
+        self.assertIn("comma-less cell of 9 words", err)
+        self.assertIn("VERBATIM", err)
+        self.assertIn("comma-separated SYMPTOM phrases", err)
+        self.assertEqual(store.load_all(), [])
+        # positive control: the SAME vocabulary with its commas restored lands
+        # — the refusal is about the missing commas and nothing else
+        rc, _, err = self.add(
+            "prior", "salad-law | a statement | 0.7 | "
+            "workforce team, fable opus, codex kimi, subagent orchestrator role")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual([e["id"] for e in store.load_all()], ["salad-law"])
+
+    def test_the_measured_lone_word_shape_refuses_when_df_common(self):
+        # 'infrastructure' is generic IN THIS CORPUS: carried by >= 3 live
+        # entries, so as the SOLE probe it discriminates nothing — genericity
+        # is measured (df), never a hand-kept word list (house law).
+        for i in range(3):
+            self.seed_prior("infra-%d" % i, "S%d" % i,
+                            keywords="infrastructure, seed-%d" % i)
+        rc, _, err = self.add("prior",
+                              "lone-law | a statement | 0.7 | infrastructure")
+        self.assertEqual(rc, 1)
+        self.assertIn("'infrastructure'", err)
+        self.assertIn("3 live entries", err)
+        self.assertIn("comma-separated SYMPTOM phrases", err)
+
+    def test_a_lone_function_word_refuses_even_in_an_empty_store(self):
+        # a GENERIC_KEYWORDS member can never satisfy the specificity guard,
+        # so the entry could literally never fire — no df evidence needed
+        rc, _, err = self.add("prior", "modal-law | a statement | 0.7 | should")
+        self.assertEqual(rc, 1)
+        self.assertIn("generic", err)
+
+    def test_controls_healthy_field_and_rare_lone_word_pass(self):
+        # the refusals above are about the SHAPES, not a gate that refuses all
+        rc, _, err = self.add("prior", "good-law | a findable belief | 0.7 | "
+                              + DUP_SIBLING_KEYWORDS)
+        self.assertEqual((rc, err), (0, ""))
+        # a single RARE coined word is a legitimate probe (df 0 — one seat's
+        # coinage is exactly how lexicon symptom vocabulary is born)
+        rc, _, err = self.add("prior", "coin-law | another belief | 0.7 | glorpnax")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(sorted(e["id"] for e in store.load_all()),
+                         ["coin-law", "good-law"])   # both actually ON DISK
+
+    def test_lexicon_is_exempt_from_the_empty_case_only(self):
+        # the term IS a probe by construction, so empty keywords stay legal...
+        rc, _, err = self.add("lexicon", "youable | able to be you")
+        self.assertEqual((rc, err), (0, ""))
+        # ...but PROVIDED keywords are linted like everyone else's
+        rc, _, err = self.add("lexicon", "saladterm | a definition | phrase | "
+                              "one giant comma missing keyword cell")
+        self.assertEqual(rc, 1)
+        self.assertIn("comma-less cell", err)
+
+
+class AddStemDecompositionTest(AddGateBase):
+    """GUARD 2 — a fused phrase is a probe only its VERBATIM repeat can match
+    (every measured near-miss). Cells of >= 3 words get their 1-2-word
+    content stems AUTO-ADDED (never replacing the original), stopwords
+    dropped, total probes capped."""
+
+    def test_a_long_cell_gains_its_stems_and_keeps_the_original(self):
+        rc, out, err = self.add("prior", "stem-law | a belief | 0.7 | "
+                                "seat freezes on plan prompt, pane tail")
+        self.assertEqual((rc, err), (0, ""))
+        kws = store._kw_list(self.one(store.load_all(), "stem-law")["keywords"])
+        self.assertIn("seat freezes on plan prompt", kws)  # original KEPT
+        self.assertIn("pane tail", kws)                    # short cell untouched
+        for stem in ("seat", "freezes", "prompt",          # 1-word content stems
+                     "seat freezes", "plan prompt"):       # 2-word adjacencies
+            self.assertIn(stem, kws, stem)
+        self.assertIn("stem probes auto-added", out)       # the visible receipt
+        # and the entry now RESOLVES by a sub-phrase the fused original missed
+        self.assertEqual([x["id"] for x in
+                          store.resolve_prompt("my seat freezes every time")],
+                         ["stem-law"])
+
+    def test_short_cells_pass_byte_identical(self):
+        # the guard never rewrites what it merely inspected
+        self.add("prior", "short-law | a belief | 0.7 | pane freeze, seat stall")
+        self.assertEqual(self.one(store.load_all(), "short-law")["keywords"],
+                         "pane freeze, seat stall")
+
+    def test_stopwords_are_dropped_from_stems(self):
+        self.add("prior", "stop-law | a belief | 0.7 | "
+                 "recovery of the loom, pane tail")
+        kws = store._kw_list(self.one(store.load_all(), "stop-law")["keywords"])
+        self.assertIn("recovery", kws)
+        self.assertIn("loom", kws)
+        self.assertIn("recovery loom", kws)  # the bigram BRIDGES the stopwords
+        self.assertNotIn("the", kws)
+        self.assertNotIn("of", kws)
+
+    def test_the_probe_cap_bounds_decomposition(self):
+        cells = ", ".join("alpha%d beta%d gamma%d delta%d" % (i, i, i, i)
+                          for i in range(6))     # 6 originals, 42 potential stems
+        rc, _, err = self.add("prior", "cap-law | a belief | 0.7 | " + cells)
+        self.assertEqual((rc, err), (0, ""))
+        kws = store._kw_list(self.one(store.load_all(), "cap-law")["keywords"])
+        from helm.store import write as store_write
+        self.assertEqual(len(kws), store_write._PROBE_CAP)   # bounded, exactly
+        self.assertIn("alpha0 beta0 gamma0 delta0", kws)     # first original kept
+        self.assertIn("alpha5 beta5 gamma5 delta5", kws)     # ...and the last
+        for i in range(6):                                    # originals all kept
+            self.assertIn("alpha%d beta%d gamma%d delta%d" % (i, i, i, i), kws)
+
+
+class AddDuplicateProbeTest(AddGateBase):
+    """GUARD 3 — keywords that ALREADY resolve to a live sibling refuse
+    toward update-beats-add (a live duplicate pair was measured splitting
+    retrieval weight); --force-new / HELM_STORE_FORCE_NEW override with the
+    override recorded in the events journal."""
+
+    def _seed_sibling(self):
+        self.seed_prior("seat-freeze-law", "seats freeze on plan prompts",
+                        keywords=DUP_SIBLING_KEYWORDS)
+
+    def test_probe_overlap_refuses_toward_update(self):
+        self._seed_sibling()
+        rc, out, err = self.add("prior", "seat-freeze-two | a second law "
+                                "| 0.7 | " + DUP_COLLIDING_KEYWORDS)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("'seat-freeze-law'", err)               # names the sibling
+        self.assertIn("2 shared probes", err)
+        self.assertIn("8 words", err)                         # the mass, not a tally
+        # #271: the refusal NAMES the shared evidence. Reading it must settle
+        # "are these the same thing?" without opening the other entry — the
+        # surfacing incident cost a five-minute detour to learn the two shared
+        # tokens were `remember` and `process`, which answered it instantly.
+        self.assertIn("seat stall on plan prompt", err)
+        self.assertIn("plan approval prompt", err)
+        self.assertIn("helm store keywords seat-freeze-law --add", err)
+        self.assertIn("--force-new", err)
+        self.assertEqual(len(store.load_all(types=("prior",))), 1)  # not written
+
+    def test_top_rank_on_two_cells_refuses_without_two_shared_probes(self):
+        # leg (b): ONE shared probe winning TWO different cells, below leg (a)'s
+        # two-probe floor. Post-#271 that probe must carry _DUP_MIN_WORDS of
+        # mass — a whole shared symptom phrase, not a shared word.
+        self.seed_prior("pane-law", "panes die",
+                        keywords="pane freeze after the tmux reboot, "
+                                 "quota headroom")
+        rc, _, err = self.add(
+            "prior", "pane-two | more pane trouble | 0.7 | "
+            "why did pane freeze after the tmux reboot, "
+            "pane freeze after the tmux reboot on a fresh seat")
+        self.assertEqual(rc, 1)
+        self.assertIn("'pane-law'", err)
+        self.assertIn("top-ranked for 2", err)
+        # names BOTH the cells that lost and the probe that won them
+        self.assertIn("pane freeze after the tmux reboot", err)
+
+    def test_one_shared_word_across_two_cells_is_not_a_duplicate(self):
+        """#271, leg (b): the exact live false positive, in miniature.
+
+        `pane` here stands in for `remember` — one bare English word that a
+        reference doc on generational garbage collection and a premise on
+        agent dependence both happened to carry. It top-ranked two cells and
+        the guard called them the same entry. The author's only exit was to
+        DELETE the colliding keyword, and deleting it measurably broke
+        retrieval: of four symptom phrasings a person would really type, two
+        stopped firing, including the owner's own wording. A guard that exists
+        to protect retrieval was destroying it, so this is the direction that
+        MUST pass."""
+        self.seed_prior("pane-law", "panes die", keywords="pane")
+        rc, out, err = self.add("prior", "pane-two | more pane trouble | 0.7 | "
+                                "pane freeze, pane crash")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("stored:", out)
+        self.assertIsNotNone(store._find("pane-two"))    # actually landed
+        # ...and the keyword the author would have been forced to drop SURVIVED
+        self.assertIn("pane", self.one(store.load_all(types=("prior",)),
+                                       "pane-two")["keywords"])
+
+    def test_shared_word_mass_is_what_separates_the_two(self):
+        """The mechanism, asserted directly rather than through the CLI: the
+        SAME two-probe overlap refuses or passes purely on word mass, so the
+        discriminator is phrase mass and not the count of shared probes."""
+        from helm.store import write as store_write
+        self.seed_prior("thin-law", "a thin sibling", keywords="pane, tmux")
+        self.seed_prior("fat-law", "a fat sibling",
+                        keywords="pane froze on the plan prompt, "
+                                 "tmux pane died mid reboot")
+        corpus = store.load_all()
+        thin = [e for e in corpus if e["id"] == "thin-law"]
+        fat = [e for e in corpus if e["id"] == "fat-law"]
+        self.assertEqual((len(thin), len(fat)), (1, 1))   # MUST-HIT control
+        sib, why = store_write._dup_sibling(
+            "new-law", ["pane", "tmux"], None, corpus)
+        self.assertIsNone(sib, "two shared bare words are vocabulary, not kinship")
+        sib, why = store_write._dup_sibling(
+            "new-law", ["pane froze on the plan prompt",
+                        "tmux pane died mid reboot"], None, corpus)
+        self.assertIsNotNone(sib, "two shared symptom PHRASES are a duplicate")
+        self.assertEqual(sib["id"], "fat-law")
+        self.assertIn("11 words", why)
+        self.assertIn("pane froze on the plan prompt", why)
+
+    def test_dup_word_mass_counts_words_not_probes(self):
+        from helm.store import write as store_write
+        self.assertEqual(store_write._dup_word_mass(["alpha", "beta"]), 2)
+        self.assertEqual(
+            store_write._dup_word_mass(["seat stall on plan prompt"]), 5)
+        self.assertEqual(store_write._dup_word_mass([]), 0)
+
+    def test_force_new_overrides_and_records(self):
+        self._seed_sibling()
+        rc, out, err = self.add("prior", "seat-freeze-two | a second law "
+                                "| 0.7 | " + DUP_COLLIDING_KEYWORDS,
+                                "--force-new")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("DUP OVERRIDE recorded", out)
+        self.assertIn("seat-freeze-law", out)             # who it collided with
+        self.assertTrue(any(r.get("verb") == "store.dup_override"
+                            and r.get("target") == "seat-freeze-two"
+                            for r in pk.read_events(20)),
+                        "the override must leave a journal receipt")
+
+    def test_env_override_works_too(self):  # noqa: VACUOUS_ASSERTION — the empty stderr has its refusing control one test up: the SAME add without the env var refuses (test_probe_overlap_refuses_toward_update), and the landing is asserted positively via _find
+        self._seed_sibling()
+        with mock.patch.dict(os.environ, {"HELM_STORE_FORCE_NEW": "1"}):
+            rc, _, err = self.add("prior", "seat-freeze-two | a second law "
+                                  "| 0.7 | " + DUP_COLLIDING_KEYWORDS)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIsNotNone(store._find("seat-freeze-two"))   # actually landed
+
+    def test_a_distinct_entry_passes(self):
+        # the CONTROL: the guard accuses shared retrieval surface, not mere
+        # coexistence
+        self._seed_sibling()
+        rc, _, err = self.add("prior", "quota-law | a different law | 0.7 | "
+                              "quota headroom, cred rotation")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(len(store.load_all(types=("prior",))), 2)
+
+
+class AddRetestNudgeTest(AddGateBase):
+    """GUARD 4 — a capture is done at FIRES, never at stored:. Every live add
+    ends with THE one retest line — the same _RETEST constant `keywords
+    --add` prints (one source of truth, two emitters)."""
+
+    def test_add_prints_the_one_retest_constant(self):
+        from helm.store import cli as store_cli
+        rc, out, err = self.add("prior", "nudge-law | a belief | 0.7 | "
+                                "pane freeze, seat stall")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn(store_cli._RETEST, out)     # THE constant, verbatim
+        self.assertIn("now RETEST", out)
+
+    def test_keywords_add_prints_the_same_constant(self):
+        from helm.store import cli as store_cli
+        self.seed_prior("plaw", "S", keywords="alpha")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = store.cmd_store(["keywords", "plaw", "--add", "beta"])
+        self.assertEqual(rc, 0)
+        self.assertIn(store_cli._RETEST, out.getvalue())
+
+    def test_a_candidate_add_does_not_nudge(self):  # noqa: VACUOUS_ASSERTION — the not-nudge has its positive control in-test: the live twin add asserts RETEST IS printed on the same surface
+        # a candidate cannot fire until confirmed — resolve would MISS by
+        # design, and nudging a retest that must fail teaches authors to
+        # ignore the nudge
+        rc, out, _ = self.add("prior", "cand-law | a guess | 0.6 | glorpwork",
+                              "--candidate")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("RETEST", out)
+        self.assertEqual([e["id"] for e in store.candidates()], ["cand-law"])
+        # positive control on the SAME surface: the LIVE twin of this add DOES
+        # nudge, so the silence above is the candidate rule, not a dead print
+        rc, out, _ = self.add("prior", "live-law | a truth | 0.6 | glorpother")
+        self.assertEqual(rc, 0)
+        self.assertIn("RETEST", out)

@@ -35,9 +35,9 @@ _CORE_KEYS = ("v", "op", "premise_id", "root", "project", "digest", "ts",
               "source", "attest_by", "supersedes", "supersedes_record")
 
 _USAGE_PREMISE = ("usage: helm premise <id> | <statement> [| keywords [| domain]] "
-                  "[--project P] [--no-attest]\n"
+                  "[--project P] [--no-attest] [--force-new]\n"
                   "       helm premise --supersede <old-id> <new-id> | <statement> "
-                  "[| keywords [| domain]]\n"
+                  "[| keywords [| domain]] [--project P] [--force-new]\n"
                   "       helm premise --retry-queue\n"
                   "       helm premise --attest-existing <id> [--project P]\n"
                   "       helm premise --attest-sweep [--dry] [--limit N]")

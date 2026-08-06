@@ -6,13 +6,16 @@ backfill + sweep + the `helm premise` command. Depends on _common + _chain
 """
 import json
 import os
+import re
 import sys
 
-from .. import cell, home, pk, store
+from .. import cell, delim, home, pk, store
 from ._chain import record_attestation
 from ._common import (CHAIN_V, DEFAULT_PROFILE, _USAGE_PREMISE, _front,
                       _queue_path, _root_label, canonicalize, digest_payload,
                       payload_digest)
+
+_GRAMMAR = "helm premise <id> | <statement> [| keywords [| domain]]"
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +152,32 @@ def attest_profile():
 # capture
 # ---------------------------------------------------------------------------
 
-def _capture_store(parts, project, ts):
-    """The store leg every capture path shares (write_prior, CERTAIN, human).
+def _derived_keywords(statement):
+    """Conservative symptom probes for the optional-keyword premise surface.
+
+    Omitted keywords remain compatible by deriving bounded single-word probes;
+    an explicitly empty third field stays empty and is refused by the shared
+    mint guard. The guard still owns lint, duplicate detection, and stems.
+    """
+    out = []
+    for word in re.findall(r"[a-z0-9][a-z0-9'-]*", statement.lower()):
+        if word not in store.GENERIC_KEYWORDS and word not in out:
+            out.append(word)
+    return ", ".join(out[:8])
+
+
+def _capture_store(parts, project, ts, force=False, corpus=None, exclusions=(),
+                   mint_notes=None, mint_events=None):
+    """The guarded store leg every semantic premise capture path shares.
+
     Re-minting over a NON-live prior life starts FRESH (stale tombstone/attest
     metadata never rides into the new lifecycle). A LIVE attested entry whose
     canonical statement would CHANGE is refused toward --supersede (an in-place
-    edit orphans the attestation). -> (path, entry, None) or (None, None,
-    refusal)."""
+    edit orphans the attestation). The pure mint guard runs before the serializer;
+    deferred duplicate receipts are returned through the optional sinks and are
+    otherwise recorded only after the writer succeeds. -> (path, entry, None) or
+    (None, None, refusal).
+    """
     pid, statement = parts[0], parts[1]
     path = os.path.join(store._default_dir("prior", project),
                         store.PRIOR_PREFIX + pk.slug(pid) + ".md")
@@ -167,8 +189,21 @@ def _capture_store(parts, project, ts):
             "attestation (the chain law). Evolve it instead:\n"
             "  helm premise --supersede %s <new-id> | %s%s"
             % (pid, pid, statement, (" --project " + project) if project else ""))
+    keywords = parts[2] if len(parts) > 2 else \
+        (e.get("keywords", "") if e else _derived_keywords(statement))
+    current = dict(e, path=path, type="prior") if e else None
+    omitted = tuple(exclusions) + ((current,) if current else ())
+    keywords, refusal, notes, events = store.guard_entry_keywords(
+        "prior", pid, keywords, project=project, force=force, corpus=corpus,
+        exclusions=omitted)
+    if refusal:
+        return None, None, refusal
     if e and e.get("status") != store.STATUS_LIVE:
-        for stale in ("replaced_by", "supersedes", "retired_ts", "retired_why",
+        # THE SHARED CONTRACT plus this path's own attest/evidence receipts.
+        # This used to be a second hard-coded copy, and `gloss` was added to
+        # the other one — so a re-minted premise kept a line it no longer said.
+        from ..store._common import STALE_ON_REMINT
+        for stale in STALE_ON_REMINT + (
                       "evidence_log", "confidence_history", "attest_payload",
                       "attest_ts", "attest_by", "attest_record",
                       "attest_chain_index", "attest_supersedes_record",
@@ -176,17 +211,24 @@ def _capture_store(parts, project, ts):
                       "attest_turn", "attest_receipt", "attest_supersedes_turn"):
             e.pop(stale, None)
     e.update({"id": pid, "statement": statement, "confidence": store.CERTAIN,
-              "keywords": parts[2] if len(parts) > 2 else e.get("keywords", ""),
+              "keywords": keywords,
               "domain": parts[3] if len(parts) > 3 else e.get("domain", ""),
               "status": store.STATUS_LIVE, "stated_ts": ts, "last_updated": ts,
               "source": "human"})
     store.write_prior(e, path=path)
+    if mint_notes is not None:
+        mint_notes.extend(notes)
+    if mint_events is not None:
+        mint_events.extend(events)
+    else:
+        store.record_mint_events(events)
     return path, e, None
 
 
 def cmd_premise(args):
-    """premise <id> | <statement> [| keywords [| domain]] — store + attest.
-    premise --supersede <old-id> <new-id> | <statement> — evolve the chain.
+    """premise <id> | <statement> [| keywords [| domain]] [--force-new] —
+    store + attest. premise --supersede <old-id> <new-id> | <statement>
+    [--force-new] — evolve the chain.
     premise --retry-queue — re-attempt OPTIONAL dregg anchors queued while no
     node was reachable (the native record already stands).
     premise --attest-existing <id> — backfill a native record for one entry.
@@ -214,7 +256,14 @@ def cmd_premise(args):
             return 2
         return _attest_one(pid, project)
     no_attest = _pop_flag(args, "--no-attest", False)
-    parts = [p.strip() for p in " ".join(args).split("|")]
+    force_new = bool(_pop_flag(args, "--force-new", False))
+    # arity 4 — and this verb SIGNS parts[1] into the attestation chain, so a
+    # delimiter cascade here does not merely store a fragment, it attests one
+    # at confidence 1.00. The refusal is load-bearing.
+    parts, refused = delim.split(" ".join(args), 4, _GRAMMAR)
+    if refused:
+        print("helm premise: " + refused, file=sys.stderr)
+        return 2
     if len(parts) < 2 or not parts[0] or not parts[1]:
         print(_USAGE_PREMISE, file=sys.stderr)
         return 2
@@ -223,17 +272,40 @@ def cmd_premise(args):
             print("helm premise: --supersede IS the attested lifecycle — for a "
                   "store-only tombstone use `helm store supersede`", file=sys.stderr)
             return 2
-        return _supersede(sup_of, parts, project)
+        return _supersede(sup_of, parts, project, force=force_new)
     pid, statement = parts[0], parts[1]
     ts = pk.now_ts()
 
-    # 1. STORE — the native record + store both land offline; nothing lost.
-    path, e, refuse = _capture_store(parts, project, ts)
+    # 0. The SAME statement-overlap warn `store add` gives, through the SAME
+    # shared wording (store.near_dup_warning) — a warn, never a block, printed
+    # before the guarded store leg exactly as add prints it before its guards.
+    # The --supersede leg deliberately does NOT warn: it IS the cure this warn
+    # teaches, and its predecessor is being tombstoned in the same breath.
+    dup, ov = store._near_dup("prior", pid, statement, project=project)
+    if dup:
+        warn = store.near_dup_warning(dup, ov, ts, pid, project=project)
+        print("helm premise: " + warn[0])
+        for line in warn[1:]:
+            print(line)
+
+    # 1. STORE — the pure guard runs before every semantic side effect; the
+    # serializer lands before any deferred duplicate-override receipt.
+    mint_notes, mint_events = [], []
+    path, e, refuse = _capture_store(
+        parts, project, ts, force=force_new,
+        mint_notes=mint_notes, mint_events=mint_events)
     if refuse:
         print("helm premise: " + refuse, file=sys.stderr)
         return 1
+    store.record_mint_events(mint_events)
     print("helm premise: LIVE '%s' [certain 1.00] - %s" % (pid, statement))
     print("  stored: " + path)
+    for note in mint_notes:
+        print(note)
+    # THE one retest nudge every live capture surface ends its store leg with
+    # (store._common.RETEST — the same constant `store add` prints): a capture
+    # is done at FIRES, never at stored:.
+    print(store.RETEST)
 
     if no_attest:
         print("  attestation skipped (--no-attest)")
@@ -262,11 +334,14 @@ def cmd_premise(args):
     return 0
 
 
-def _supersede(old_id, parts, project):
+def _supersede(old_id, parts, project, force=False):
     """--supersede <old-id> <new-id> | <statement>: capture NEW, tombstone OLD
     (store lifecycle — lands with no node), and append ONE native supersede
-    record linking supersedes_record to OLD's rec_hash. A never-attested OLD is
-    stated honestly: the chain starts at the new premise."""
+    record linking supersedes_record to OLD's rec_hash. The selected predecessor
+    and an exact same-id retry destination are excluded from the pure mint
+    corpus; every other sibling can still refuse the revision. A never-attested
+    OLD is stated honestly: the chain
+    starts at the new premise."""
     old = store._find(old_id, project=project, types=("prior",))
     if not old:
         print("helm premise: '%s' not found (helm store list)" % old_id,
@@ -283,10 +358,18 @@ def _supersede(old_id, parts, project):
         return 1
     ts = pk.now_ts()
     old_record = _front(old, "attest_record")   # capture before the tombstone
-    path, _e, refuse = _capture_store(parts, project, ts)
+    corpus = store.load_all(project=project, include_dormant=False,
+                            types=store._JIT_TYPES)
+    mint_notes, mint_events = [], []
+    path, _e, refuse = _capture_store(
+        parts, project, ts, force=force, corpus=corpus, exclusions=(old,),
+        mint_notes=mint_notes, mint_events=mint_events)
     if refuse:
         print("helm premise: " + refuse, file=sys.stderr)
         return 1
+    store.record_mint_events(mint_events)
+    for note in mint_notes:
+        print(note)
     _old, err = store.mark_superseded(str(old["id"]), parts[0], ts,
                                       reason="premise --supersede", project=project)
     if err:
@@ -295,6 +378,8 @@ def _supersede(old_id, parts, project):
     print("helm premise: LIVE '%s' [certain 1.00] - %s" % (parts[0], parts[1]))
     print("  supersedes '%s' — tombstoned (delete_eligible, file kept)"
           % old["id"])
+    # the successor is a NEW live capture — the same retest law applies to it
+    print(store.RETEST)
     if not old_record:
         print("  note: '%s' was never attested — the chain starts here" % old["id"])
     digest = digest_payload(parts[1])
@@ -410,6 +495,26 @@ def _retry_queue():
         tail += ", %d annotation%s reconciled" % (reconciled, "s"[:reconciled != 1])
     print("helm premise: anchor replay — %d anchored, %d still pending%s."
           % (done, len(kept), tail))
+    # SAY WHY THEY ARE PENDING. `_replay_anchor` already records the exact
+    # failure on each kept row (`rec["reason"]`), and this summary used to throw
+    # every one of them away — so an operator saw "0 anchored, 85 still pending"
+    # and could not tell a down node from a wrong auth from a bug. Measured
+    # 2026-07-26: all 85 were one cause, and the per-row error already named it
+    # precisely ("the node is UP and REFUSING this turn — an auth problem, not a
+    # reachability one"). The diagnosis existed and the surface discarded it.
+    #
+    # Grouped and capped: identical causes collapse to one line with a count, so
+    # 85 rows failing the same way report once rather than 85 times.
+    seen = {}
+    for rec in kept:
+        why = str(rec.get("reason") or "").strip().splitlines()[0:1]
+        if why:
+            seen[why[0]] = seen.get(why[0], 0) + 1
+    for why, n in sorted(seen.items(), key=lambda kv: -kv[1])[:3]:
+        print("  %d pending: %s" % (n, why[:200]))
+    if len(seen) > 3:
+        print("  (+%d further distinct cause(s) — `helm premise --retry-queue "
+              "--json` for all)" % (len(seen) - 3))
     return 0 if not kept else 1
 
 
@@ -519,7 +624,7 @@ def _attest_sweep(dry=False, limit=None):
     allc = certain_set()
     todo = [(e, p) for e, p in allc if not _front(e, "attest_record")]
     profile = attest_profile()
-    print("helm premise sweep: %d live certain entries — %d attested, %d to attest"
+    print("helm premise --attest-sweep: %d live certain entries — %d attested, %d to attest"
           % (len(allc), len(allc) - len(todo), len(todo)))
     if limit is not None:
         todo = todo[:limit]
@@ -533,7 +638,7 @@ def _attest_sweep(dry=False, limit=None):
         if pruned:
             print("  pruned %d stale queue row%s (entries already anchored)"
                   % (pruned, "s"[:pruned != 1]))
-        print("helm premise sweep: nothing to attest.")
+        print("helm premise --attest-sweep: nothing to attest.")
         return 0
     done = pending = 0
     for e, proj in todo:
@@ -553,6 +658,6 @@ def _attest_sweep(dry=False, limit=None):
     pruned = _prune_queue()
     tail = (", %d stale queue row%s pruned" % (pruned, "s"[:pruned != 1])) \
         if pruned else ""
-    print("helm premise sweep: %d attested (native), %d anchor%s pending%s."
+    print("helm premise --attest-sweep: %d attested (native), %d anchor%s pending%s."
           % (done, pending, "s"[:pending != 1], tail))
     return 0

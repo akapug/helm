@@ -38,7 +38,7 @@ from ._common import (
     CERTAIN, DORMANT_BELOW, ACT_AT, BELIEF_CLAMP,
     STATUS_LIVE, STATUS_RETIRED, STATUS_DELETE_ELIGIBLE, STATUS_CANDIDATE,
     STATUS_PROVISIONAL, INJECTABLE_STATUSES, PINNED_SLUGS,
-    LEGACY_PREFIX, PRIOR_PREFIX, GENERIC_KEYWORDS, _HEURISTIC_GENERIC,
+    LEGACY_PREFIX, PRIOR_PREFIX, RETEST, GENERIC_KEYWORDS, _HEURISTIC_GENERIC,
     _MIN_HEURISTIC_TOKEN, TYPE_SUBDIR, _SCAN_SUBDIRS, _TYPE_ORDER, _JIT_TYPES,
     _coerce_conf, derive_class, derive_load_class, _is_pinned, _decode_lists,
     _json1, _scope_rank, _recency,
@@ -49,6 +49,7 @@ from .load import (
     _EPISODIC_DEFAULTS, _parse_prior, _parse_lexicon, _parse_heuristic,
     _parse_reference, _parse_episodic, _parse_entry, _entry_files, _load_root,
     load_all, entries, candidates, reviewable, counts, _find,
+    load_certain_policy, policy_declared,
 )
 from .resolve import (
     _probes, _jit_candidates, _df_map, _probe_hits, resolve_prompt, pinned,
@@ -57,11 +58,12 @@ from .write import (
     write_prior, _lexicon_path, write_lexicon, write_heuristic, write_reference,
     _WRITERS, apply_evidence, mark_superseded, retire, _STMT_ALIAS,
     _CANDIDATE_TYPES, _pick_candidate, confirm, reject, _notify_graduation,
-    xrev_clear, demote, pinned_stats,
+    xrev_clear, demote, pinned_stats, retag, _kw_list, _KEYWORD_TYPES,
+    guard_entry_keywords, guard_add_keywords, record_mint_events,
 )
 from .index import (
     INDEX_BUDGET_LINES, _memory_index_path, _index_link_backing, index_cap,
-    cmd_index, DUP_OVERLAP, _tokens, _near_dup, _fmt,
+    cmd_index, DUP_OVERLAP, _tokens, _near_dup, near_dup_warning, _fmt,
 )
 from .cli import _GUARD_TYPE, _STALE_ON_REMINT, _USAGE, cmd_store
 
