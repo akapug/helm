@@ -36,16 +36,82 @@ import time
 from . import home, pk, registry
 
 _FM_DEFAULTS = {"name": "", "description": "", "type": "", "load_class": "",
-                "originsessionid": ""}
+                "originsessionid": "", "statement": ""}
 
 TYPED_PREFIXES = ("prior-", "lex-", "heuristic-", "ref-", "reflex-")
 DRAIN_CONFIDENCE = 0.9  # human feedback is strong evidence, not certainty
 
-# Built-in alias map: bulk global entries can name a project by a short/old
-# handle the registry knows under a different canonical name. Per-project
-# authored `aliases` (registry AUTHORED_FIELDS) are folded in on top when present
-# (registry.py is another lane's — we only READ). No built-in defaults ship.
-_BUILTIN_ALIASES = {}
+# The cap on a drained STATEMENT — deliberately equal to inject's LINE_CAP, the
+# per-entry byte budget an entry gets when it FIRES. It used to be 300 here and
+# 170 on the `description:` line the statement was actually read from, so an
+# entry was cut to 170 at mint while the lane it fires into would have carried
+# 400: pure loss, and it landed on the sharpest entries. One MEASURED example:
+# the owner's "[CORRECTION ...] never clear your context mid-work, it destroys
+# your working memory" was stored as "...let alone anything more [CORREC" — the
+# entry could only ever inject his disappointment, never the directive.
+# tests/test_drain.py asserts this stays == inject._common.LINE_CAP.
+_STATEMENT_CAP = 400
+
+# Built-in alias map: some global entries name a project by a short or old
+# handle the registry knows under a different canonical name. The map is
+# config-driven and EMPTY by default — the shipped tree carries no site-specific
+# names; a deployment that has such legacy entries sets
+# HELM_PROJECT_ALIASES="handle=canonical,handle=canonical". Per-project authored
+# `aliases` (registry AUTHORED_FIELDS) fold in on top when present (registry.py
+# is another lane's — we only READ). This is OPERATOR-AUTHORED ROUTING CONFIG
+# feeding a copy-then-DELETE (--apply), so it validates LOUDLY (stderr, never a
+# crash) and matches LONGEST-HANDLE-FIRST on the MERGED map — see _alias_map /
+# _route_target.
+#
+# The DETERMINISM model (CD/codex-3/OI meld) — the map is SOURCE-TRACKED per
+# handle, and every collision has ONE documented resolution:
+#   1. canonical registry names always beat aliases (_route_target order);
+#   2. env vs authored, same handle: AUTHORED wins (the project record is the
+#      closer authority) — warned, naming ENV as the overridden side;
+#   3. authored vs authored, same handle from two DIFFERENT projects:
+#      AMBIGUOUS — the handle is REFUSED entirely (routes nothing), both
+#      projects named. Never registry-iteration order: --apply copies then
+#      DELETES intake, so a wrong winner LOSES the file, while a refused
+#      handle only leaves it in intake (recoverable);
+#   4. env vs env, same handle: first definition wins, rest rejected
+#      (_builtin_aliases);
+#   5. an UNREADABLE authored source (exists but cannot be read/parsed)
+#      REFUSES alias routing for the whole drain — a partial env-only map
+#      would route with HALF the authority while every surface reports
+#      success. Absent file = legitimately empty layer, fine.
+_ALIAS_ENV = "HELM_PROJECT_ALIASES"
+
+
+def _alias_err(msg):
+    # alias-config problems surface per parse, never raise: a typo'd entry
+    # must not take the whole drain down, but silence would mis-route a
+    # copy-then-delete (codex-3 review, finding #2)
+    print("helm drain: " + msg, file=sys.stderr)
+
+
+def _builtin_aliases():
+    """handle(lowercased) -> canonical, parsed from HELM_PROJECT_ALIASES
+    (``handle=canonical,handle=canonical``; whitespace stripped). Malformed
+    entries — no ``=``, an empty half, or a second ``=`` (no project name
+    contains one) — are REJECTED loudly; a duplicate handle keeps its FIRST
+    definition and rejects the rest. Default empty: the public tree ships no
+    site-specific aliases. Targets are checked against the registry in
+    _alias_map (the registry lives there, not here)."""
+    out = {}
+    for pair in os.environ.get(_ALIAS_ENV, "").split(","):
+        if not pair.strip():
+            continue  # unset env / a trailing comma — absence, not malformation
+        handle, eq, canonical = pair.partition("=")
+        handle, canonical = handle.strip().lower(), canonical.strip()
+        if not eq or not handle or not canonical or "=" in canonical:
+            _alias_err("%s: malformed entry %r — want handle=canonical"
+                       % (_ALIAS_ENV, pair.strip()))
+        elif handle in out:
+            _alias_err("%s: duplicate handle %r — first definition (%s) kept"
+                       % (_ALIAS_ENV, handle, out[handle]))
+        else:
+            out[handle] = canonical
+    return out
 
 
 def _mem_dir():
@@ -72,33 +138,154 @@ def _project_mem_dir(project):
     return None
 
 
+def _authored_source_error():
+    """None when the authored registry layer is ABSENT (no file — an empty
+    layer, legitimate) or reads as a JSON object; else a short reason string
+    (unreadable / unparseable / wrong shape). The distinction is load-bearing
+    for alias routing: registry._authored_load() nets a corrupt file and
+    returns an EMPTY layer so the rest of helm keeps working, which is exactly
+    the degrade drain must NOT ride — a half-written or permission-broken
+    authored file would leave an env-only map routing a copy-then-DELETE with
+    half the authority (and no surface would say so). So drain probes the file
+    ITSELF (home.authored_path() — the one place the authored layer lives,
+    read via registry.load), after registry.load() ran: load() never rewrites
+    the file outside the one-time mixed-era migration, so the broken bytes are
+    still there to see."""
+    path = home.authored_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None            # genuinely absent — an empty authored layer
+    except OSError as e:       # permission / I-O: exists but cannot be READ
+        return "unreadable (%s)" % (e.strerror or e)
+    try:
+        val = json.loads(raw)
+    except ValueError as e:    # bad JSON / a half-written concurrent write
+        return "unparseable JSON (%s)" % e
+    if not isinstance(val, dict) or not isinstance(val.get("projects", {}), dict):
+        return "wrong shape (top level or `projects` is not an object)"
+    return None
+
+
 def _alias_map(reg):
-    """alias(lowercased) -> canonical project name. Built-ins plus every
-    project record's authored `aliases` list."""
-    m = dict(_BUILTIN_ALIASES)
-    for name, rec in (reg.get("projects") or {}).items():
-        for a in rec.get("aliases") or []:
-            if str(a).strip():
-                m[str(a).strip().lower()] = name
-    return m
+    """-> (aliases, refused): alias(lowercased) -> canonical project name as
+    ONE MERGED source-tracked map (env built-ins + every record's authored
+    `aliases` — merged HERE so _route_target's longest-handle-first ranking
+    spans sources), plus `refused` (None normally; a short reason when alias
+    routing is OFF for this drain and the map is empty).
+
+    An env target must name an existing registry project EXACTLY — a case
+    mismatch or unknown name is dropped loudly, never guessed (authored
+    targets are the record's own key, valid by construction). An authored
+    field that is a bare string becomes ONE alias — it must never iterate
+    char-by-char. Collisions per the determinism model above:
+    same-handle env-vs-authored -> authored wins, warned naming ENV;
+    same-handle authored-vs-authored (different projects) -> the handle is
+    REFUSED outright, both projects named, any env definition suppressed with
+    it (when the two closer authorities disagree, authority is not
+    determinable — never pick by iteration order). Same-target duplicates
+    (env and a record agreeing, or one record repeating itself) are harmless
+    and silent. Projects iterate SORTED so no message or outcome ever depends
+    on registry file order.
+
+    An unreadable authored source refuses the WHOLE alias layer: announced on
+    stderr with the path and why; classify keeps alias-routable entries in
+    intake (reported) instead of falling back to env-only."""
+    err = _authored_source_error()
+    if err is not None:
+        _alias_err("ALIAS ROUTING REFUSED for this drain — authored source %s "
+                   "is %s. Alias-routable entries stay in intake; NOT falling "
+                   "back to the env-only map (--apply deletes on route, and "
+                   "the authored layer may refuse what env alone would route)."
+                   % (home.authored_path(), err))
+        return {}, "authored alias source " + err.split(" (")[0]
+    projects = reg.get("projects") or {}
+    by_fold = {n.lower(): n for n in projects}
+    m = {}
+    env_handles = set()   # env-sourced handles (for honest conflict receipts)
+    authored_by = {}      # handle -> the project that authored it
+    overridden = {}       # handle -> the env target an authored alias beat
+    ambiguous = {}        # handle -> [projects] that all authored it (>= 2)
+    for handle, canonical in _builtin_aliases().items():
+        if canonical in projects:
+            m[handle] = canonical
+            env_handles.add(handle)
+        elif canonical.lower() in by_fold:
+            _alias_err("%s: %s=%s — case mismatch (registry has %r); dropped"
+                       % (_ALIAS_ENV, handle, canonical, by_fold[canonical.lower()]))
+        else:
+            _alias_err("%s: %s=%s — target names no registry project; dropped"
+                       % (_ALIAS_ENV, handle, canonical))
+    for name in sorted(projects):
+        authored = projects[name].get("aliases")
+        if isinstance(authored, str):
+            _alias_err("project %s: authored `aliases` is a string, not a list "
+                       "— treated as the single alias %r" % (name, authored))
+            authored = [authored]
+        if not isinstance(authored, (list, tuple)):
+            if authored is not None:
+                _alias_err("project %s: authored `aliases` is %s, not a list — "
+                           "ignored" % (name, type(authored).__name__))
+            authored = []
+        for a in authored:
+            a = str(a).strip().lower()
+            if not a:
+                continue
+            if a in ambiguous:                 # a third+ claimant piles on
+                if name not in ambiguous[a]:
+                    ambiguous[a].append(name)
+                continue
+            prior = authored_by.get(a)
+            if prior is None:
+                if a in env_handles and m[a] != name:
+                    overridden[a] = m[a]       # warned below, unless refused
+                m[a] = name
+                authored_by[a] = name
+            elif prior != name:                # two RECORDS claim one handle
+                ambiguous[a] = [prior, name]
+    # receipts last, one line per handle, sorted: an env-override warning must
+    # not fire for a handle that then turns out ambiguous (the refusal is the
+    # only truth about it), and the ACTUAL source of each side is named —
+    # env-vs-authored says ENV, authored-vs-authored names BOTH projects.
+    for a in sorted(overridden):
+        if a not in ambiguous:
+            _alias_err("alias %r: authored (%s) overrides %s (%s)"
+                       % (a, authored_by[a], _ALIAS_ENV, overridden[a]))
+    for a in sorted(ambiguous):
+        _alias_err("alias %r: AMBIGUOUS — authored by BOTH %s; handle REFUSED "
+                   "(routes nothing, matching entries stay in intake)%s"
+                   % (a, " AND ".join(ambiguous[a]),
+                      " — its %s definition is suppressed with it" % _ALIAS_ENV
+                      if a in env_handles else ""))
+        del m[a]
+    return m, None
 
 
 def _route_target(base, blob, project_names, aliases):
     """The project an entry routes to, canonical names first (filename prefix or
     exact, then a specific >=6-char description word), aliases second — a short
-    alias matches by filename only (a 2-char word wallpapers)."""
+    2-char alias matches by filename only (a 2-char word wallpapers). Aliases
+    rank LONGEST HANDLE FIRST (the law project_names already follows in
+    classify), alphabetical on equal length — never dict insertion order:
+    --apply copies-then-DELETES on a match, so `old-api-roadmap.md` must reach
+    `old-api` whichever side of `old` the operator listed it (codex-3, #1).
+    The ranking runs on the ONE MERGED map _alias_map returns — a prefix pair
+    can straddle sources (`old` from env, `old-api` authored), so any
+    per-source sort-before-merge would silently rank them apart (meld)."""
+    ranked = sorted(aliases.items(), key=lambda kv: (-len(kv[0]), kv[0]))
     low = base.lower()
     for pn in project_names:
         if low.startswith(pn.lower() + "-") or low == pn.lower():
             return pn
-    for alias, canon in aliases.items():
+    for alias, canon in ranked:
         if canon in project_names and (low.startswith(alias + "-") or low == alias):
             return canon
     for pn in project_names:
         if len(pn) >= 6 and re.search(
                 r"(?<![a-z0-9])" + re.escape(pn.lower()) + r"(?![a-z0-9])", blob):
             return pn
-    for alias, canon in aliases.items():
+    for alias, canon in ranked:
         if canon in project_names and len(alias) >= 6 and re.search(
                 r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", blob):
             return canon
@@ -127,8 +314,13 @@ def _retype_or_conflict(src, dst, slug, to_type, e, names, planned_dsts):
                 "why": "two intake files map to %s (also %s) — slug collision"
                        % (dst, planned_dsts[dst])}
     planned_dsts[dst] = src
+    # an explicit `statement:` is AUTHORITATIVE; `description:` is the fallback.
+    # description is a SUMMARY field (writers cap it at 170 with an "id - " tag
+    # prefix), so reading the statement out of it silently truncated every
+    # drained entry to a 170-char prefix of itself. Intake files that carry no
+    # statement still fall back, so nothing pre-existing stops draining.
     return {"op": "retype", "src": src, "to_type": to_type, "dst": dst,
-            "id": slug, "statement": e.get("description") or "",
+            "id": slug, "statement": e.get("statement") or e.get("description") or "",
             "origin": e.get("originsessionid") or ""}
 
 
@@ -138,7 +330,7 @@ def classify(mem=None):
     names = set(os.listdir(mem)) if os.path.isdir(mem) else set()
     reg = registry.load()
     project_names = sorted(reg["projects"], key=len, reverse=True)
-    aliases = _alias_map(reg)
+    aliases, alias_refused = _alias_map(reg)
     plan = []
     planned_dsts = {}   # dst filename -> first src that claimed it (collision guard)
     for n, p in _entries(mem):
@@ -184,8 +376,13 @@ def classify(mem=None):
                 plan.append({"op": "route-project", "src": n, "project": target,
                              "dst": os.path.join(home.project_dir(target), "journal", n)})
             else:
-                plan.append({"op": "keep", "src": n,
-                             "why": "project entry, no registry match"})
+                # under an alias refusal every unrouted project entry is
+                # REPORTED as held by it — with the authored layer dark we
+                # cannot know which of them an authored alias would claim
+                why = "project entry, no registry match"
+                if alias_refused:
+                    why += " (alias routing refused: %s)" % alias_refused
+                plan.append({"op": "keep", "src": n, "why": why})
             continue
         plan.append({"op": "keep", "src": n, "why": "episodic"})
     return plan
@@ -212,9 +409,10 @@ def _retype_text(src_path, act, ts):
     with open(src_path, encoding="utf-8", errors="replace") as f:
         raw = f.read()
     body = raw.split("---", 2)[2].lstrip("\n") if raw.count("---") >= 2 else raw
-    st = re.sub(r"\s+", " ", (act["statement"] or act["id"]).replace('"', "'"))[:300]
-    to_prior = act["to_type"] == "prior"
-    kind = "prior" if to_prior else "reference"
+    st = re.sub(r"\s+", " ", (act["statement"] or act["id"]).replace('"', "'"))[:_STATEMENT_CAP]
+    kind = act["to_type"]
+    to_prior = kind == "prior"
+    value_key = "move" if kind == "heuristic" else "statement"
     fm = [
         "---",
         "name: " + act["dst"][:-3],
@@ -223,7 +421,7 @@ def _retype_text(src_path, act, ts):
         "  node_type: memory",
         "  type: " + kind,
         "  id: " + act["id"],
-        "  statement: " + st,
+        "  " + value_key + ": " + st,
     ]
     if to_prior:
         fm += ["  confidence: %.2f" % DRAIN_CONFIDENCE,
@@ -236,8 +434,10 @@ def _retype_text(src_path, act, ts):
                '"reason":"drained from feedback memory"}]' % (ts, DRAIN_CONFIDENCE)]
     else:
         fm += ["  load_class: jit"]
+    kw = act["trigger"] if act["to_type"] == "heuristic" else \
+        act.get("keywords", _keywords_from(act["id"], act["statement"] or ""))
     fm += ["  status: live",
-           "  keywords: " + _keywords_from(act["id"], act["statement"] or ""),
+           ("  trigger: " if act["to_type"] == "heuristic" else "  keywords: ") + kw,
            "  source: drain",
            "  stated_ts: " + ts,
            "  last_updated: " + ts,
@@ -261,8 +461,29 @@ def _upgrade_text(src_path, act, ts):
     with open(src_path, encoding="utf-8", errors="replace") as f:
         raw = f.read()
     body = raw.split("---", 2)[2].lstrip("\n") if raw.count("---") >= 2 else raw
-    st = re.sub(r"\s+", " ", (act["statement"] or act["id"]).replace('"', "'"))[:300]
-    kw = act.get("keywords") or _keywords_from(act["id"], act["statement"] or "")
+    st = re.sub(r"\s+", " ", (act["statement"] or act["id"]).replace('"', "'"))[:_STATEMENT_CAP]
+    kw = act.get("trigger") if act["to_type"] == "heuristic" else \
+        act.get("keywords", _keywords_from(act["id"], act["statement"] or ""))
+    if act["to_type"] == "heuristic":
+        fm = [
+            "---",
+            "name: " + act["dst"][:-3],
+            'description: "heuristic: ' + (act["id"] + " - " + st)[:170] + '"',
+            "metadata:",
+            "  node_type: memory",
+            "  type: heuristic",
+            "  id: " + act["id"],
+            "  move: " + st,
+            "  trigger: " + kw,
+            "  load_class: jit",
+            "  status: live",
+            "  source: drain-upgrade",
+            "  stated_ts: " + ts,
+            "  last_updated: " + ts,
+            "  upgraded_from: " + act["src"],
+            "---", "",
+        ]
+        return "\n".join(fm) + body
     if act["to_type"] == "lexicon":
         fm = [
             "---",
@@ -278,6 +499,10 @@ def _upgrade_text(src_path, act, ts):
             "  updated_ts: " + ts,
             "  hits: 0",
             "  definition: " + st,
+        ]
+        if kw:
+            fm.append("  keywords: " + kw)
+        fm += [
             "  upgraded_from: " + act["src"],
             "---", "",
         ]
@@ -509,21 +734,191 @@ def _cmd_expire_candidates(args, project=None):
 # Explicit durable-knowledge markers in USER-typed text. Precision is
 # load-bearing (the card's own RISKS): the USER-role restriction, the length
 # guard, the cap, and the dedupe keep agent-authored text and task prompts out.
+#
+# THEY DID NOT. MEASURED over the cohort this gauntlet minted (43 entries, all
+# retired 2026-08-03): the marker was a bare substring test, so ANY message
+# carrying one of these words ANYWHERE was minted as durable canon — 43 junk
+# priors, 903 JIT injection fires, ~198KB injected in 4 days, and because the
+# JIT lane caps at 4 entries per prompt, every junk hit EVICTED a real one.
+# Minted examples: "spark is idle again as always bc it's so fast haha",
+# "i never saw the verification", and five verbatim <task-notification> XML
+# blobs. Three of the 43 were genuine. The three failures, in order of damage:
+#
+#   1. SUBSTRING, NOT WORD.  "always "/"never " matched inside other words:
+#      3 of the 43 were minted purely because "whenever" contains "never ".
+#   2. CONTAINS-A-MARKER != IS-A-DIRECTIVE.  "i never saw the verification"
+#      reports the past; "we should always have the latest" states a rule.
+#      Same word, opposite speech act.
+#   3. NO STRUCTURAL FLOOR.  XML notification payloads, pasted chat logs,
+#      [Image #4] attachment stubs, and fleet seat-address wake prompts are
+#      machine traffic that happens to arrive on the role:user channel.
+#
+# So the gate below is three layers, cheapest first: PROVENANCE (is this even
+# owner-typed?), STRUCTURE (does it look like prose at all?), then SPEECH ACT
+# (is the marker doing directive work?). All stdlib, all deterministic; the
+# labelled 43-message corpus in tests/fixtures/promote-corpus.json is the
+# regression test, and its 3 genuine entries are the positive controls that
+# stop this from degenerating into "refuse everything".
 _PROMOTE_MARKERS = ("from now on", "remember this", "remember that",
                     "make it a rule", "going forward", "the rule is",
-                    "always ", "never ")
+                    "always", "never")
 _PROMOTE_MAXLEN = 600  # a durable rule is a sentence, not an essay/task prompt
+_PROMOTE_MINLEN = 30   # ...and not a bare exclamation. Deliberately LOW: on the
+                       # 43-message corpus the floor buys nothing the speech-act
+                       # check below does not already catch (measured identical
+                       # at 0, 30 and 60), and a real rule can be terse — "never
+                       # touch the gamma3 store directly" is 37 chars. It exists
+                       # only so "always!" cannot reach the analyzer at all.
+
+# The two markers that are ordinary English words carry no directive force by
+# themselves; the rest are explicit "capture this" phrasings that do.
+_WEAK_MARKERS = ("always", "never")
+
+# Layer 2 — STRUCTURE. Any hit refuses outright, before speech-act analysis.
+_PROMOTE_REFUSALS = (
+    # literal markup: XML/HTML notification payloads (<task-notification>,
+    # </summary>, &lt;repo&gt;). A closing tag or an escaped entity in owner
+    # prose is vanishingly rare; in machine payloads it is universal.
+    ("markup", re.compile(r"</[A-Za-z][\w.-]*>|&(?:lt|gt|amp|quot|#\d+);")),
+    # attachment stubs — the referent is a picture nobody can re-read later
+    ("attachment", re.compile(r"\[(?:Image|Screenshot)\b[^\]]*\]", re.I)),
+    # a pasted chat log is a transcript OF a conversation, not a directive in one
+    ("chat-log", re.compile(r"\[\d{1,2}:\d{2}\s*[AP]M\]|\bcmr://")),
+    # laughter/emoticons mark banter. "spark is idle again as always ... haha"
+    ("banter", re.compile(r"\b(?:ha(?:ha)+|hehe+|lol|lmao|rofl)\b|:-?[)D]|!!!", re.I)),
+    # fleet seat addresses (w5:p1), handoff tags and commit reports are
+    # agent-to-agent traffic — real on the role:user channel, never owner canon
+    ("fleet-traffic", re.compile(
+        r"\bw\d+:p\w+|\bthis pane\b|\[[\w-]+-DONE\]|\bCODE_READY\b"
+        r"|\bcommit [0-9a-f]{7,40}\b", re.I)),
+    # a leading ellipsis means the subject is off-screen in an earlier message
+    ("fragment", re.compile(r"^\s*(?:\.\.\.|…)")),
+)
+
+# Layer 3 — SPEECH ACT, evaluated per clause. Clauses split on sentence AND
+# comma/dash boundaries: "yes, always best of both, agents def need to be able
+# to know their own auth" put a bare "always" and a distant "need to" in one
+# sentence, and only clause-level scope keeps them apart.
+#
+# Two boundary bugs this spelling exists to avoid, both MEASURED on the corpus,
+# both of which severed a subordinator from its clause and promoted a purpose
+# clause ("...updated so state is always clear") into a bare normative copula:
+#   - sentence punctuation only counts at a word boundary, or "planning.linear"
+#     splits mid-token;
+#   - a newline is WHITESPACE, not a boundary (the text wrapped between "so"
+#     and "state"), so the caller collapses runs of whitespace first.
+_CLAUSE_SPLIT = re.compile(r"[.?!;:](?=\s|$)|,| -- | — ")
+
+# The marker is DESCRIBING, not directing. Checked first — a disqualified
+# clause cannot be rescued by an obligation word elsewhere in it.
+_NOT_DIRECTIVE = (
+    re.compile(r"\bas always\b"),                       # idiom, pure filler
+    # the speaker reporting on HIMSELF ("i never saw...", "im just always
+    # concerned"). Only copulas and adverbs may sit between the pronoun and the
+    # marker: "i WANT YOU TO always sign before ship" is a directive addressed
+    # OUTWARD and must survive, and a {0,3} any-word gap swallowed it.
+    re.compile(r"\b(?:i|im|i'm)\b"
+               r"(?:\s+(?:am|was|were|really|just|honestly|also|still|only))*"
+               r"\s+(?:always|never)\b"),
+    # past-tense narration ("that was never ported", "the card was never
+    # moved"). have/has/had + "to" is EXCLUDED: it is an obligation modal, and
+    # counting it as past tense refused "we have to always sign before ship".
+    re.compile(r"(?:\b(?:was|were|been|'ve|'d)\b|\b(?:had|has|have)\b(?!\s+to\b))"
+               r"(?:\s+\w+){0,3}?\s+(?:always|never)\b"),
+    re.compile(r"\b(?:why|how|whether|what|so that|so|because|bc|since|"
+               r"unless|though|although)\b.*?\b(?:always|never)\b"),  # subordinate
+)
+
+# The marker IS directing: an obligation modal in the clause, a normative
+# copula bound to the marker, or the marker fronting an imperative verb.
+_IS_DIRECTIVE = (
+    re.compile(r"\b(?:should|must|shall|ought to|need to|needs to|"
+               r"have to|has to)\b"),
+    re.compile(r"\b(?:is|are|'s|'re)\s+(?:always|never)\b"),
+    re.compile(r"\b(?:always|never)\s+(?:be|do|use|make|keep|push|pull|run|"
+               r"write|read|send|report|check|verify|trust|clear|touch|leave|"
+               r"rely|end|start|stop|integrate|assume|delete|commit|land|ask|"
+               r"tell|treat|prefer|ship|squelch|sign|merge|branch)\b"),
+)
+
+
+def _promote_marker(low):
+    """The durable-knowledge marker in `low` (already lowercased), or None.
+    Word-boundary matched: "whenever" no longer reads as "never"."""
+    for m in _PROMOTE_MARKERS:
+        if re.search(r"\b" + re.escape(m) + r"\b", low):
+            return m
+    return None
+
+
+def _marker_is_directive(low, marker):
+    """True when SOME clause uses `marker` to direct rather than to describe.
+    Explicit capture phrasings ("from now on", "remember this") are directive
+    by construction; the two bare English words have to earn it."""
+    if marker not in _WEAK_MARKERS:
+        return True
+    for clause in _CLAUSE_SPLIT.split(low):
+        if not re.search(r"\b" + marker + r"\b", clause):
+            continue
+        if any(p.search(clause) for p in _NOT_DIRECTIVE):
+            continue
+        if any(p.search(clause) for p in _IS_DIRECTIVE):
+            return True
+    return False
+
+
+def promote_verdict(text):
+    """-> (marker, None) when `text` may be promoted, else (None, reason).
+
+    The reason string names the LAYER that refused, so the receipt's `refused`
+    histogram (and the line cmd_promote prints from it) can tell an operator
+    why a message was dropped instead of dropping it silently."""
+    n = len(text)
+    if n > _PROMOTE_MAXLEN:
+        return None, "too-long"
+    if n < _PROMOTE_MINLEN:
+        return None, "too-short"
+    for name, rx in _PROMOTE_REFUSALS:
+        if rx.search(text):
+            return None, name
+    low = re.sub(r"\s+", " ", text.lower())   # newlines are whitespace, not
+    marker = _promote_marker(low)             # clause boundaries — see _CLAUSE_SPLIT
+    if not marker:
+        return None, "no-marker"
+    if not _marker_is_directive(low, marker):
+        return None, "marker-not-directive"
+    return marker, None
 
 
 def _promote_cache_path():
     return os.path.join(registry.cache_root(), "promote-scan.json")
 
 
+def _injected_prompt(d):
+    """True when a role:user record is MACHINE-ORIGINATED — a task notification,
+    a scheduled wake, any system-authored prompt. The harness records this:
+    `isMeta: true`, `promptSource: "system"`, or `origin.kind` naming a
+    non-human source; owner keystrokes carry promptSource typed/queued and
+    origin.kind "human".
+
+    MEASURED on the 43-entry junk cohort: 5 of them were machine traffic this
+    predicate identifies exactly — 4 <task-notification> payloads and one
+    autonomous fallback wake. FAIL-OPEN by design: older transcripts carry none
+    of these fields, and treating absence as "injected" would silently stop
+    promoting from every pre-2.1.176 session."""
+    if d.get("isMeta") is True or d.get("promptSource") == "system":
+        return True
+    origin = d.get("origin")
+    kind = origin.get("kind") if isinstance(origin, dict) else None
+    return bool(kind) and kind != "human"
+
+
 def _user_texts(path):
     """Yield (line_no, text) for REAL user-typed messages in a harness jsonl —
     content str, or list TEXT blocks (tool_result/other blocks skipped, so tool
-    output injected as role:user never counts). Claude (type:user +
-    message.role) and the generic role:user shape both parse. Fail-open."""
+    output injected as role:user never counts), and machine-originated prompts
+    dropped by _injected_prompt. Claude (type:user + message.role) and the
+    generic role:user shape both parse. Fail-open."""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for i, line in enumerate(f, 1):
@@ -540,7 +935,7 @@ def _user_texts(path):
                 if d.get("type") == "user" and isinstance(d.get("message"), dict):
                     msg = d["message"]
                     role = msg.get("role") or "user"
-                if role != "user":
+                if role != "user" or _injected_prompt(d):
                     continue
                 content = msg.get("content")
                 if isinstance(content, str):
@@ -603,6 +998,7 @@ def promote(since_days=7, cap=20, apply=False, roots=None, mem=None):
     ex_slugs = {store._slug(str(e["id"])) for e in existing}
     ex_tokens = [t for t in (store._tokens(e.get("statement")) for e in existing) if t]
     planned, scanned, skipped_cache, hit_cap = {}, 0, 0, False
+    refusals = {}   # gauntlet layer -> count, surfaced on the receipt
     for p, mtime, size in _jsonl_files(roots, since_days):
         if cache.get(p) == [mtime, size]:
             skipped_cache += 1
@@ -611,11 +1007,9 @@ def promote(since_days=7, cap=20, apply=False, roots=None, mem=None):
         sid = os.path.basename(p)[:-6]
         file_done = True
         for line_no, text in _user_texts(p):
-            if len(text) > _PROMOTE_MAXLEN:
-                continue
-            low = text.lower()
-            marker = next((m for m in _PROMOTE_MARKERS if m in low), None)
-            if not marker:
+            marker, refused = promote_verdict(text)
+            if refused:
+                refusals[refused] = refusals.get(refused, 0) + 1
                 continue
             slug = _promotion_slug(text)
             if not slug or slug in planned or slug in ex_slugs:
@@ -625,7 +1019,7 @@ def promote(since_days=7, cap=20, apply=False, roots=None, mem=None):
             ctoks = store._tokens(text)
             if ctoks and any(len(ctoks & et) / len(ctoks | et) >= 0.6 for et in ex_tokens):
                 continue
-            planned[slug] = {"slug": slug, "statement": text[:300],
+            planned[slug] = {"slug": slug, "statement": text[:_STATEMENT_CAP],
                              "marker": marker.strip(), "origin_session": sid,
                              "origin_line": line_no, "proposed_type": "prior",
                              "capture_confidence": 0.5}
@@ -639,7 +1033,7 @@ def promote(since_days=7, cap=20, apply=False, roots=None, mem=None):
     acts = list(planned.values())
     receipt = {"ts": ts, "since_days": since_days, "scanned": scanned,
                "skipped_cache": skipped_cache, "found": len(acts),
-               "written": 0, "actions": acts}
+               "written": 0, "actions": acts, "refused": refusals}
     if not apply:
         return receipt
     os.makedirs(mem, exist_ok=True)
@@ -657,9 +1051,14 @@ def promote(since_days=7, cap=20, apply=False, roots=None, mem=None):
 def _write_promotion_candidate(mem, a, ts):
     """One intake candidate file drain routes as feedback->prior. proposed_type,
     capture_confidence, origin_line + session ride the frontmatter for the
-    operator's dry-run review; the body preserves the provenance line."""
+    operator's dry-run review; the body preserves the provenance line.
+
+    `statement:` is written EXPLICITLY and is what classify() drains. The
+    170-char `description:` beside it stays a human-readable summary for the
+    operator's dry-run listing — it is no longer the field the durable
+    statement is read out of."""
     slug = a["slug"]
-    st = re.sub(r"\s+", " ", a["statement"].replace('"', "'"))[:300]
+    st = re.sub(r"\s+", " ", a["statement"].replace('"', "'"))[:_STATEMENT_CAP]
     body = [
         "---",
         "name: feedback-promoted-" + slug,
@@ -667,6 +1066,7 @@ def _write_promotion_candidate(mem, a, ts):
         "metadata:",
         "  node_type: memory",
         "  type: feedback",
+        "  statement: " + st,
         "  originSessionId: " + a["origin_session"],
         "  origin_line: " + str(a["origin_line"]),
         "  proposed_type: " + a["proposed_type"],
@@ -734,6 +1134,12 @@ def cmd_promote(args):
                  a["origin_session"][:8], a["origin_line"], a["statement"][:70]))
     if len(r["actions"]) > 8:
         print("  ... %d more" % (len(r["actions"]) - 8))
+    # WHY the rest were dropped. A gauntlet that refuses silently is how the
+    # old one ran for weeks: `found 0` and `found 43` looked equally healthy.
+    refused = r.get("refused") or {}
+    if refused:
+        print("  refused: %s" % ", ".join(
+            "%s=%d" % kv for kv in sorted(refused.items(), key=lambda kv: -kv[1])))
     if not apply:
         print("helm promote: DRY-RUN (no intake files written). Re-run with "
               "--apply, then `helm drain` to route them.")
@@ -762,16 +1168,105 @@ def _repoint_index(mem, renames):
     return hits
 
 
-def apply(plan, mem=None, sweep_dups=False, limit=None):
-    """Execute a plan. Archive-first with a verified net; returns the receipt."""
-    mem = mem or _mem_dir()
-    ts = pk.now_ts()
+def _doable_actions(plan, sweep_dups=False, limit=None):
     doable = [a for a in plan if a["op"] in ("retype", "route-project", "upgrade")
               or (sweep_dups and a["op"] == "sweep-dup")]
-    if limit:
-        doable = doable[:limit]
+    return doable[:limit] if limit else doable
+
+
+def _semantic_keywords(a):
+    """The probes the raw drain serializer would mint for one semantic action.
+
+    An explicit action field wins even when empty: forwarded/hand-written plans
+    are linted as written, not silently repaired with a derived fallback.
+    Classify-created retypes carry no field and use drain's derivation."""
+    if a.get("to_type") == "heuristic" and "trigger" in a:
+        return a["trigger"]
+    if "keywords" in a:
+        return a["keywords"]
+    return _keywords_from(a["id"], a.get("statement") or "")
+
+
+def _staged_corpus_entry(a, mem, ts):
+    """A guarded mint in the resolver shape needed by the next batch guard."""
+    etype = a["to_type"]
+    kw = a.get("trigger") if etype == "heuristic" else a.get("keywords")
+    return {"type": etype, "id": a["id"], "path": os.path.join(mem, a["dst"]),
+            "statement": a.get("statement") or "", "keywords": kw or "",
+            "trigger": kw or "", "load_class": "jit", "status": "live",
+            "confidence": DRAIN_CONFIDENCE if etype == "prior" else 1.0,
+            "last_updated": ts}
+
+
+def _prepare_actions(plan, mem, ts, sweep_dups=False, limit=None,
+                     project=None, force_new=False):
+    """Pure preflight: guard + serialize every mint before physical mutation.
+
+    The caller owns one existing corpus and extends it with earlier staged mints,
+    so same-batch duplicates refuse. Each action excludes only its exact source
+    mapping: self cannot inflate DF/collide, while every other sibling remains.
+    """
+    from . import store
+    doable = _doable_actions(plan, sweep_dups=sweep_dups, limit=limit)
+    semantic = [a for a in doable if a["op"] in ("retype", "upgrade")]
+    corpus = store.load_all(project=project, include_dormant=False,
+                            types=store._JIT_TYPES) if semantic else []
+    prepared, refused = [], []
+    for a in doable:
+        if a["op"] not in ("retype", "upgrade"):
+            prepared.append(dict(a))
+            continue
+        b = dict(a)
+        etype = b["to_type"]
+        predecessor_paths = {os.path.join(mem, b["src"]),
+                             os.path.join(mem, b["dst"])}
+        exclusions = tuple({"type": etype, "id": b["id"], "path": p}
+                           for p in predecessor_paths)
+        kw, bad, notes, events = store.guard_entry_keywords(
+            etype, b["id"], _semantic_keywords(b), project=project,
+            force=force_new, corpus=corpus, exclusions=exclusions)
+        if bad:
+            r = dict(a)
+            r.update({"op": "refuse", "guarded_op": a["op"], "why": bad})
+            refused.append(r)
+            continue
+        b["keywords"] = kw
+        if etype == "heuristic":
+            b["trigger"] = kw
+        src = os.path.join(mem, b["src"])
+        serializer = _retype_text if b["op"] == "retype" else _upgrade_text
+        b["_staged_text"] = serializer(src, b, ts)
+        b["_mint_notes"] = notes
+        b["_mint_events"] = events
+        prepared.append(b)
+        # The staged corpus represents POST-action state. Remove this accepted
+        # action's exact predecessor before adding its replacement; otherwise a
+        # later guard counts old+self as two documents and inflates DF. Match all
+        # three identity axes so same-id/type siblings at other paths remain.
+        predecessor_ids = {(etype, store._slug(str(b["id"])), p)
+                           for p in predecessor_paths}
+        corpus[:] = [e for e in corpus if (
+            str(e.get("type") or ""), store._slug(str(e.get("id") or "")),
+            str(e.get("path") or "")) not in predecessor_ids]
+        corpus.append(_staged_corpus_entry(b, mem, ts))
+    return prepared, refused
+
+
+def _public_action(a):
+    return {k: v for k, v in a.items() if not k.startswith("_")}
+
+
+def apply(plan, mem=None, sweep_dups=False, limit=None, project=None,
+          force_new=False):
+    """Guard/serialize first, then archive + write; returns a truthful receipt."""
+    mem = mem or _mem_dir()
+    ts = pk.now_ts()
+    doable, refused = _prepare_actions(
+        plan, mem, ts, sweep_dups=sweep_dups, limit=limit,
+        project=project, force_new=force_new)
     if not doable:
-        return {"ts": ts, "applied": 0, "note": "nothing to apply"}
+        return {"ts": ts, "applied": 0, "actions": [], "refused": refused,
+                "note": "nothing to apply"}
 
     net = os.path.join(mem, "archive", "drain-" + ts.replace(":", "").replace("-", "")[:13])
     os.makedirs(net, exist_ok=True)
@@ -797,19 +1292,19 @@ def apply(plan, mem=None, sweep_dups=False, limit=None):
             raise RuntimeError("drain: rollback net incomplete for %s — ABORTING, "
                               "nothing mutated" % label)
 
-    renames = {}
-    applied = []
+    from . import store
+    renames, applied, mint_notes = {}, [], []
     for a in doable:
         src = os.path.join(mem, a["src"])
         if a["op"] == "sweep-dup":
             os.remove(src)
             renames[a["src"]] = a["twin"]
         elif a["op"] == "retype":
-            pk.atomic_write(os.path.join(mem, a["dst"]), _retype_text(src, a, ts))
+            pk.atomic_write(os.path.join(mem, a["dst"]), a["_staged_text"])
             os.remove(src)
             renames[a["src"]] = a["dst"]
         elif a["op"] == "upgrade":
-            pk.atomic_write(os.path.join(mem, a["dst"]), _upgrade_text(src, a, ts))
+            pk.atomic_write(os.path.join(mem, a["dst"]), a["_staged_text"])
             if a["dst"] != a["src"]:   # prem- -> prior- rename; in-place keeps src==dst
                 os.remove(src)
             renames[a["src"]] = a["dst"]
@@ -818,18 +1313,26 @@ def apply(plan, mem=None, sweep_dups=False, limit=None):
             shutil.copy2(src, a["dst"])
             os.remove(src)
             renames[a["src"]] = a["dst"]
-        applied.append(a)
+        # Duplicate-override receipts are transaction data: journal only after
+        # this action's physical write/copy/delete completed successfully.
+        store.record_mint_events(a.get("_mint_events") or [])
+        if a.get("_mint_notes"):
+            mint_notes.append({"src": a["src"], "notes": a["_mint_notes"]})
+        applied.append(_public_action(a))
     repointed = _repoint_index(mem, renames)
     receipt = {"ts": ts, "applied": len(applied), "actions": applied,
+               "refused": refused, "mint_notes": mint_notes,
                "index_lines_repointed": repointed, "net": net}
     pk.write_json(os.path.join(net, "RECEIPT.json"), receipt)
-    pk.event("drain.apply", net, "%d action%s routed, %d index lines re-pointed"
-             % (len(applied), "s"[:len(applied) != 1], repointed))
+    pk.event("drain.apply", net,
+             "%d action%s routed, %d refused, %d index lines re-pointed"
+             % (len(applied), "s"[:len(applied) != 1], len(refused), repointed))
     return receipt
 
 
 def cmd_drain(args):
-    """drain [--apply] [--sweep-dups] [--limit N] [--project P] | drain --rekey
+    """drain [--apply] [--sweep-dups] [--force-new] [--limit N] [--project P]
+    | drain --rekey
     [--apply] | drain --expire-candidates [--days N] [--apply] — classify raw
     memory entries and route them to typed homes; --project P drains that
     project's OWN claude memory dir (the adopted per-project pile) with the
@@ -841,10 +1344,10 @@ def cmd_drain(args):
     # the typo'd flag existed.
     from .cli import guard_tail
     rc = guard_tail("helm drain", args,
-                    flags=("--apply", "--sweep-dups", "--rekey",
+                    flags=("--apply", "--sweep-dups", "--force-new", "--rekey",
                            "--expire-candidates"),
                     valued=("--limit", "--project", "--days"),
-                    usage="drain [--apply] [--sweep-dups] [--limit N] "
+                    usage="drain [--apply] [--sweep-dups] [--force-new] [--limit N] "
                           "[--project P] | drain --rekey [--apply] | drain "
                           "--expire-candidates [--days N] [--apply]")
     if rc is not None:
@@ -871,25 +1374,45 @@ def cmd_drain(args):
     if not os.path.isdir(mem):
         print("helm drain: no adopted memory dir at " + mem)
         return 1
+    limit = None
+    if "--limit" in args:
+        try:
+            limit = int(args[args.index("--limit") + 1])
+        except (ValueError, IndexError):
+            print("helm drain: --limit needs an integer", file=sys.stderr)
+            return 2
     plan = classify(mem)
+    if "--apply" not in args:
+        _prepared, refused = _prepare_actions(
+            plan, mem, pk.now_ts(), sweep_dups="--sweep-dups" in args,
+            limit=limit, project=project, force_new="--force-new" in args)
+        by_src = {a["src"]: a for a in refused}
+        plan = [by_src.get(a["src"], a) for a in plan]
     by_op = {}
     for a in plan:
         by_op.setdefault(a["op"], []).append(a)
-    print("helm drain plan (%d raw entries%s):"
+    print("helm drain: plan (%d raw entries%s):"
           % (len(plan), (" — project " + project + " @ " + mem) if project else ""))
     # per op: (rows shown, "... more" threshold); everything else defaults (3, 3)
-    show_limit = {"conflict": (5, 5), "keep": (2, 3)}
-    for op in ("retype", "upgrade", "route-project", "sweep-dup", "conflict", "keep"):
+    show_limit = {"refuse": (5, 5), "conflict": (5, 5), "keep": (2, 3)}
+    for op in ("retype", "upgrade", "route-project", "sweep-dup", "refuse",
+               "conflict", "keep"):
         acts = by_op.get(op, [])
         if not acts:
             continue
         shown, more_at = show_limit.get(op, (3, 3))
         print("  %-14s %d" % (op, len(acts)))
         for a in acts[:shown]:
-            tgt = a.get("dst") or a.get("twin") or a.get("why", "")
+            tgt = a.get("why", "") if op == "refuse" else \
+                (a.get("dst") or a.get("twin") or a.get("why", ""))
             print("      %s -> %s" % (a["src"], tgt))
         if len(acts) > more_at:
             print("      ... %d more" % (len(acts) - more_at))
+    if by_op.get("refuse"):
+        print("  note: %d semantic mint%s REFUSED by the store findability guard; "
+              "source%s stay in intake" % (
+                  len(by_op["refuse"]), "s"[:len(by_op["refuse"]) != 1],
+                  "s"[:len(by_op["refuse"]) != 1]))
     if by_op.get("conflict"):
         print("  note: %d conflict%s NOT auto-drained (would overwrite a curated "
               "entry or collide) — resolve by hand" % (
@@ -902,14 +1425,20 @@ def cmd_drain(args):
         print("helm drain: DRY-RUN (nothing moved). Re-run with --apply%s." %
               (" [--sweep-dups]" if by_op.get("sweep-dup") else ""))
         return 0
-    limit = None
-    if "--limit" in args:
-        limit = int(args[args.index("--limit") + 1])
-    receipt = apply(plan, mem, sweep_dups="--sweep-dups" in args, limit=limit)
-    print("helm drain: APPLIED %d action%s; net + receipt at %s; "
-          "%d index lines re-pointed"
-          % (receipt["applied"], "s"[:receipt["applied"] != 1],
-             receipt.get("net", "-"), receipt.get("index_lines_repointed", 0)))
+    receipt = apply(plan, mem, sweep_dups="--sweep-dups" in args, limit=limit,
+                    project=project, force_new="--force-new" in args)
+    if receipt.get("net"):
+        print("helm drain: APPLIED %d action%s; REFUSED %d; net + receipt at %s; "
+              "%d index lines re-pointed"
+              % (receipt["applied"], "s"[:receipt["applied"] != 1],
+                 len(receipt.get("refused") or []), receipt["net"],
+                 receipt.get("index_lines_repointed", 0)))
+    else:
+        print("helm drain: APPLIED 0 actions; REFUSED %d; no files written"
+              % len(receipt.get("refused") or []))
+    for group in receipt.get("mint_notes") or []:
+        for note in group["notes"]:
+            print(note)
     return 0
 
 

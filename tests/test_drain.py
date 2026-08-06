@@ -8,9 +8,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
-from helm import drain, home, pk  # noqa: E402
+from helm import drain, home, pk, registry  # noqa: E402
 
 
 def _mem_entry(name, etype, description, body="the full body\nwith detail\n"):
@@ -22,6 +25,8 @@ def _mem_entry(name, etype, description, body="the full body\nwith detail\n"):
 class DrainTest(unittest.TestCase):
     def setUp(self):
         self.mem = tempfile.mkdtemp(prefix="helm-test-mem-")
+        self.adopted_prior = os.environ.get("HELM_ADOPTED_DIR")
+        os.environ["HELM_ADOPTED_DIR"] = self.mem
         write = lambda n, t: pk.atomic_write(os.path.join(self.mem, n), t)
         write("feedback-short-dms.md", _mem_entry(
             "feedback-short-dms.md", "feedback", "DMs must be short and direct"))
@@ -48,6 +53,10 @@ class DrainTest(unittest.TestCase):
             "meldproj": {"name": "meldproj", "path": "/x", "kind": "git"}}})
 
     def tearDown(self):
+        if self.adopted_prior is None:
+            os.environ.pop("HELM_ADOPTED_DIR", None)
+        else:
+            os.environ["HELM_ADOPTED_DIR"] = self.adopted_prior
         shutil.rmtree(self.mem, ignore_errors=True)
 
     def _plan(self):
@@ -242,21 +251,27 @@ class RekeyTest(unittest.TestCase):
 
 
 class AliasRoutingTest(unittest.TestCase):
-    """The registry alias map fixes unroutable global project entries: a
-    canonical name matched by filename or a specific description word, or an
-    authored per-project alias, routes to the canonical project."""
+    """Short and old handles route through the shipped alias map or an authored
+    per-project alias, without duplicating private canonical labels in fixtures."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-alias-")
-        self.env_prior = {"HELM_HOME": os.environ.get("HELM_HOME")}
+        self.env_prior = {"HELM_HOME": os.environ.get("HELM_HOME"),
+                          "HELM_PROJECT_ALIASES": os.environ.get("HELM_PROJECT_ALIASES")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         self.mem = os.path.join(self.tmp, "mem")
         os.makedirs(self.mem)
+        # The built-in alias map is config-driven and EMPTY by default: the
+        # shipped tree carries no site-specific names, only the mechanism.
+        os.environ.pop("HELM_PROJECT_ALIASES", None)
+        self.assertEqual(drain._builtin_aliases(), {})
+        os.environ["HELM_PROJECT_ALIASES"] = "oldhandle=alpha-project"
+        self.assertEqual(drain._builtin_aliases(), {"oldhandle": "alpha-project"})
         pk.write_json(home.registry_path(), {"version": 1, "projects": {
-            "example-app": {"name": "example-app", "path": "/x/b",
-                            "kind": "git", "sessions": {}},
-            "project-b": {"name": "project-b", "path": "/x/pb",
-                          "kind": "git", "sessions": {}, "aliases": ["pb"]}}})
+            "alpha-project": {"name": "alpha-project", "path": "/x/a",
+                              "kind": "git", "sessions": {}},
+            "beta-project": {"name": "beta-project", "path": "/x/b",
+                             "kind": "git", "sessions": {}, "aliases": ["bx"]}}})
 
     def tearDown(self):
         for k, v in self.env_prior.items():
@@ -269,24 +284,363 @@ class AliasRoutingTest(unittest.TestCase):
     def _classify(self):
         return {a["src"]: a for a in drain.classify(self.mem)}
 
-    def test_canonical_name_routes_by_description(self):
+    def test_builtin_alias_routes_by_description(self):
         pk.atomic_write(os.path.join(self.mem, "proj-note.md"),
-                        _mem_entry("proj-note.md", "project", "the example-app roadmap and vision"))
+                        _mem_entry("proj-note.md", "project", "the oldhandle roadmap and vision"))
         a = self._classify()["proj-note.md"]
-        self.assertEqual((a["op"], a["project"]), ("route-project", "example-app"))
+        self.assertEqual((a["op"], a["project"]),
+                         ("route-project", "alpha-project"))
 
     def test_authored_short_alias_routes_by_filename(self):
-        # 'pb' is 2 chars — filename prefix only (a 2-char word wallpapers the corpus)
-        pk.atomic_write(os.path.join(self.mem, "pb-standup.md"),
-                        _mem_entry("pb-standup.md", "project", "the standup notes"))
-        a = self._classify()["pb-standup.md"]
-        self.assertEqual((a["op"], a["project"]), ("route-project", "project-b"))
+        # 'bx' is 2 chars — filename prefix only (a 2-char word wallpapers the corpus)
+        pk.atomic_write(os.path.join(self.mem, "bx-standup.md"),
+                        _mem_entry("bx-standup.md", "project", "the standup notes"))
+        a = self._classify()["bx-standup.md"]
+        self.assertEqual((a["op"], a["project"]), ("route-project", "beta-project"))
 
     def test_short_alias_never_wallpapers_by_description(self):
-        # 'pb' appearing as a description word must NOT route (len < 6 guard)
+        # 'bx' appearing as a description word must NOT route (len < 6 guard)
         pk.atomic_write(os.path.join(self.mem, "random-thing.md"),
-                        _mem_entry("random-thing.md", "project", "the pb was loud"))
+                        _mem_entry("random-thing.md", "project", "the bx was loud"))
         self.assertEqual(self._classify()["random-thing.md"]["op"], "keep")
+
+
+class AliasPrecedenceTest(unittest.TestCase):
+    """Review finding: alias matching is LONGEST-HANDLE-FIRST — never env insertion
+    order. --apply copies to the matched project then DELETES the intake, so an
+    order-dependent match is destructive, not cosmetic. Equal lengths tie-break
+    alphabetically; on a duplicate handle the authored definition beats the env."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-aliasprec-")
+        self.env_prior = {"HELM_HOME": os.environ.get("HELM_HOME"),
+                          "HELM_PROJECT_ALIASES": os.environ.get("HELM_PROJECT_ALIASES")}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        self.mem = os.path.join(self.tmp, "mem")
+        os.makedirs(self.mem)
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "alpha-project": {"name": "alpha-project", "path": "/x/a",
+                              "kind": "git", "sessions": {}},
+            "beta-project": {"name": "beta-project", "path": "/x/b",
+                             "kind": "git", "sessions": {}}}})
+
+    def tearDown(self):
+        for k, v in self.env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _routes(self, filename, env, description="no matching words here"):
+        """The project `filename` routes to under `env` — hermetic per call."""
+        os.environ["HELM_PROJECT_ALIASES"] = env
+        p = os.path.join(self.mem, filename)
+        pk.atomic_write(p, _mem_entry(filename, "project", description))
+        try:
+            a = {x["src"]: x for x in drain.classify(self.mem)}[filename]
+            return a.get("project") if a["op"] == "route-project" else None
+        finally:
+            os.remove(p)
+
+    def test_overlapping_handles_route_most_specific_both_env_orders(self):
+        # old-api-roadmap.md must reach `old-api`, never `old`, whichever side
+        # of the comma the operator listed the more specific handle
+        for env in ("old=alpha-project,old-api=beta-project",
+                    "old-api=beta-project,old=alpha-project"):
+            self.assertEqual(self._routes("old-api-roadmap.md", env),
+                             "beta-project", env)
+            # the short handle still owns files that are ONLY its own
+            self.assertEqual(self._routes("old-notes.md", env),
+                             "alpha-project", env)
+
+    def test_equal_length_description_handles_tiebreak_alphabetical(self):
+        # two >=6-char handles of EQUAL length both in the description: the
+        # alphabetically first handle decides, not the env listing order
+        desc = "the mmmmmm and aaaaaa are both named"
+        for env in ("mmmmmm=beta-project,aaaaaa=alpha-project",
+                    "aaaaaa=alpha-project,mmmmmm=beta-project"):
+            self.assertEqual(self._routes("plain-note.md", env, desc),
+                             "alpha-project", env)
+
+    def test_duplicate_handle_authored_beats_env_loudly(self):
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "alpha-project": {"name": "alpha-project", "path": "/x/a", "kind": "git"},
+            "beta-project": {"name": "beta-project", "path": "/x/b", "kind": "git",
+                             "aliases": ["shared"]}}})
+        os.environ["HELM_PROJECT_ALIASES"] = "shared=alpha-project"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            m, refused = drain._alias_map(registry.load())
+        self.assertIsNone(refused)
+        self.assertEqual(m["shared"], "beta-project")   # the record is closer truth
+        # the warning names the ACTUAL source of each side: the authored
+        # winner by project, the loser as the ENV var (never another project)
+        self.assertIn("authored (beta-project) overrides HELM_PROJECT_ALIASES "
+                      "(alpha-project)", err.getvalue())
+
+
+class AliasConfigValidationTest(unittest.TestCase):
+    """Review finding: HELM_PROJECT_ALIASES is operator-authored ROUTING config
+    feeding a copy-then-delete — malformed entries, duplicates, unknown or
+    case-mismatched targets, and wrong-shape authored fields all surface on
+    stderr, never degrade into a silent 'no registry match'."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-aliascfg-")
+        self.env_prior = {"HELM_HOME": os.environ.get("HELM_HOME"),
+                          "HELM_PROJECT_ALIASES": os.environ.get("HELM_PROJECT_ALIASES")}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "alpha-project": {"name": "alpha-project", "path": "/x/a",
+                              "kind": "git", "sessions": {}}}})
+
+    def tearDown(self):
+        for k, v in self.env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _parse(self, env):
+        os.environ["HELM_PROJECT_ALIASES"] = env
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            return drain._builtin_aliases(), err.getvalue()
+
+    def test_malformed_entries_rejected_loudly(self):
+        # no '=', empty handle, empty target, extra '=' (partition used to keep
+        # 'alpha-project=typo' as the target) — each rejected with its own line
+        m, err = self._parse("broken,=alpha-project,name=,old=alpha-project=typo")
+        self.assertEqual(m, {})                        # nothing salvaged by guesswork
+        self.assertEqual(err.count("malformed entry"), 4)
+
+    def test_blank_segments_are_absence_not_malformation(self):
+        m, err = self._parse("old=alpha-project, ,")   # trailing comma / spaces
+        self.assertEqual(m, {"old": "alpha-project"})
+        self.assertEqual(err, "")
+
+    def test_whitespace_stripped_handle_lowercased(self):
+        m, err = self._parse(" OLD = alpha-project ")
+        self.assertEqual(m, {"old": "alpha-project"})
+        self.assertEqual(err, "")
+
+    def test_duplicate_env_handle_first_wins_loudly(self):
+        m, err = self._parse("old=alpha-project,old=beta-project")
+        self.assertEqual(m, {"old": "alpha-project"})  # FIRST definition kept
+        self.assertIn("duplicate handle", err)
+
+    def test_env_target_must_name_registry_project_exactly(self):
+        os.environ["HELM_PROJECT_ALIASES"] = "gone=ghost-project,cased=Alpha-Project"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            m, _ = drain._alias_map(registry.load())
+        self.assertEqual(m, {})                        # both dropped, both loud
+        self.assertIn("names no registry project", err.getvalue())
+        self.assertIn("case mismatch", err.getvalue())
+        self.assertIn("'alpha-project'", err.getvalue())  # the registry spelling, named
+
+    def test_authored_string_aliases_never_iterate_char_by_char(self):
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "beta-project": {"name": "beta-project", "path": "/x/b", "kind": "git",
+                             "aliases": "bx"}}})       # wrong shape: bare string
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            m, _ = drain._alias_map(registry.load())
+        self.assertEqual(m, {"bx": "beta-project"})    # ONE alias, not {'b','x'}
+        self.assertIn("string, not a list", err.getvalue())
+
+    def test_authored_nonlist_shape_ignored_loudly(self):
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            "beta-project": {"name": "beta-project", "path": "/x/b", "kind": "git",
+                             "aliases": 7}}})          # not a string, not a list
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            m, _ = drain._alias_map(registry.load())
+        self.assertEqual(m, {})
+        self.assertIn("not a list", err.getvalue())
+
+
+class AliasDeterminismTest(unittest.TestCase):
+    """The converged determinism model (a melded cross-family review): the alias map is
+    SOURCE-TRACKED per handle. Authored-authored same-handle conflicts REFUSE
+    the handle under EVERY registry order (a winner picked by iteration order
+    would copy-then-DELETE the intake file — unrecoverable; a refusal only
+    leaves it in intake). An UNREADABLE authored source refuses ALIAS routing
+    outright — no env-only degrade, because a partial map routes deletions
+    with half the authority while every surface reports success. And
+    longest-handle-first ranks the ONE MERGED map, so a prefix pair straddling
+    sources still routes the specific handle."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-aliasdet-")
+        self.env_prior = {"HELM_HOME": os.environ.get("HELM_HOME"),
+                          "HELM_PROJECT_ALIASES": os.environ.get("HELM_PROJECT_ALIASES")}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        os.environ.pop("HELM_PROJECT_ALIASES", None)
+        self.mem = os.path.join(self.tmp, "mem")
+        os.makedirs(self.mem)
+
+    def tearDown(self):
+        for k, v in self.env_prior.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _registry(self, order, authored=()):
+        """BOTH registry layers written in `order` (dict order IS file order —
+        the axis the determinism tests vary): registry.json projections plus
+        registry-authored.json entries (path-stamped so load() merges them).
+        authored = ((project, [aliases...]), ...)."""
+        pk.write_json(home.registry_path(), {"version": 1, "projects": {
+            n: {"name": n, "path": "/x/" + n, "kind": "git", "sessions": {}}
+            for n in order}})
+        pk.write_json(home.authored_path(), {"version": 1, "projects": {
+            n: {"path": "/x/" + n, "aliases": list(al)} for n, al in authored}})
+
+    def _classify(self, filename, description="no matching words here"):
+        """(action, stderr) for one intake file — hermetic per call."""
+        p = os.path.join(self.mem, filename)
+        pk.atomic_write(p, _mem_entry(filename, "project", description))
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                a = {x["src"]: x for x in drain.classify(self.mem)}[filename]
+            return a, err.getvalue()
+        finally:
+            os.remove(p)
+
+    def test_authored_authored_same_handle_refused_both_registry_orders(self):
+        # two RECORDS both author `shared`: the handle routes NOTHING and both
+        # projects are named — IDENTICALLY under both registry file orders
+        # (the determinism proof: no picked winner exists to flip)
+        decl = {"beta-project": ["shared", "solo"], "gamma-project": ["shared"]}
+        for order in (("beta-project", "gamma-project"),
+                      ("gamma-project", "beta-project")):
+            self._registry(order, tuple((n, decl[n]) for n in order))
+            act, err = self._classify("shared-notes.md")
+            self.assertEqual(act["op"], "keep", order)          # refused, not routed
+            self.assertIn("AMBIGUOUS", err)
+            self.assertIn("beta-project AND gamma-project", err)  # both named, sorted
+            self.assertIn("REFUSED", err)
+            # the poison is per-HANDLE: beta's uncontested alias still routes
+            act, _ = self._classify("solo-notes.md")
+            self.assertEqual((act["op"], act.get("project")),
+                             ("route-project", "beta-project"), order)
+
+    def test_ambiguous_handle_suppresses_env_definition_too(self):
+        # when the two CLOSER authorities disagree, authority is not
+        # determinable — the env definition must not resurrect the handle
+        self._registry(("alpha-project", "beta-project", "gamma-project"),
+                       (("beta-project", ["shared"]), ("gamma-project", ["shared"])))
+        os.environ["HELM_PROJECT_ALIASES"] = "shared=alpha-project"
+        act, err = self._classify("shared-notes.md")
+        self.assertEqual(act["op"], "keep")
+        self.assertIn("AMBIGUOUS", err)
+        self.assertIn("suppressed", err)                # the env side, named as such
+
+    def test_authored_conflict_receipt_never_blames_env(self):
+        # the FALSE-ATTRIBUTION fix: with no env at all, the old message said
+        # 'overrides HELM_PROJECT_ALIASES (...)' about a mapping that came
+        # from ANOTHER AUTHORED project — the receipt must name both projects
+        # and never mint a silent winner
+        self._registry(("beta-project", "gamma-project"),
+                       (("beta-project", ["shared"]), ("gamma-project", ["shared"])))
+        _, err = self._classify("shared-notes.md")
+        self.assertIn("beta-project", err)
+        self.assertIn("gamma-project", err)
+        self.assertNotIn("HELM_PROJECT_ALIASES", err)
+        self.assertNotIn("overrides", err)
+
+    def test_same_target_duplicate_is_silent_and_routes(self):
+        # env and a record AGREEING (and a record repeating itself) is not a
+        # conflict — no warning, and the handle routes normally
+        self._registry(("beta-project",),
+                       (("beta-project", ["shared", "shared"]),))
+        os.environ["HELM_PROJECT_ALIASES"] = "shared=beta-project"
+        act, err = self._classify("shared-notes.md")
+        self.assertEqual((act["op"], act["project"]),
+                         ("route-project", "beta-project"))
+        self.assertEqual(err, "")
+
+    def test_unreadable_authored_source_refuses_alias_routing(self):
+        # a half-written registry-authored.json: alias routing REFUSES for the
+        # whole drain (env-alias entries STAY in intake and are reported; no
+        # env-only fallback), canonical routing is untouched, and stderr names
+        # the failed source and why
+        self._registry(("alpha-project", "beta-project"))
+        os.environ["HELM_PROJECT_ALIASES"] = "oldhandle=alpha-project"
+        pk.atomic_write(home.authored_path(), '{"version": 1, "projects": {')
+        pk.atomic_write(os.path.join(self.mem, "oldhandle-note.md"),
+                        _mem_entry("oldhandle-note.md", "project", "the notes"))
+        pk.atomic_write(os.path.join(self.mem, "beta-project-plan.md"),
+                        _mem_entry("beta-project-plan.md", "project", "the plan"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            plan = {a["src"]: a for a in drain.classify(self.mem)}
+        act = plan["oldhandle-note.md"]
+        self.assertEqual(act["op"], "keep")                    # NOT routed by env alone
+        self.assertIn("alias routing refused", act["why"])     # held AND reported
+        self.assertEqual(plan["beta-project-plan.md"]["op"], "route-project")
+        self.assertIn("ALIAS ROUTING REFUSED", err.getvalue())
+        self.assertIn(home.authored_path(), err.getvalue())    # the failed source
+        self.assertIn("unparseable JSON", err.getvalue())      # ...and why
+        # --apply under the refusal: the alias-routable entry survives in
+        # intake (recoverable), the canonical one still routes
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            drain.apply(drain.classify(self.mem), self.mem)
+        self.assertTrue(os.path.isfile(os.path.join(self.mem, "oldhandle-note.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.mem, "beta-project-plan.md")))
+
+    @unittest.skipIf(os.geteuid() == 0, "chmod-based denial is a no-op as root")
+    def test_permission_unreadable_authored_source_refuses(self):
+        # same refusal for the EXISTS-but-unreadable state — and the drain
+        # survives to say so (registry's corruption net used to crash on the
+        # backup copy it cannot read)
+        self._registry(("alpha-project",))
+        os.environ["HELM_PROJECT_ALIASES"] = "oldhandle=alpha-project"
+        os.chmod(home.authored_path(), 0)
+        try:
+            act, err = self._classify("oldhandle-note.md")
+        finally:
+            os.chmod(home.authored_path(), 0o600)
+        self.assertEqual(act["op"], "keep")
+        self.assertIn("alias routing refused", act["why"])
+        self.assertIn("ALIAS ROUTING REFUSED", err)
+        self.assertIn("unreadable", err)
+
+    def test_absent_authored_file_is_empty_layer_not_refusal(self):
+        # no file at all = a legitimately empty authored layer: env aliases
+        # route normally and nothing is announced
+        self._registry(("alpha-project",))
+        os.remove(home.authored_path())
+        os.environ["HELM_PROJECT_ALIASES"] = "oldhandle=alpha-project"
+        act, err = self._classify("oldhandle-note.md")
+        self.assertEqual((act["op"], act["project"]),
+                         ("route-project", "alpha-project"))
+        self.assertEqual(err, "")
+
+    def test_cross_source_prefix_pair_ranks_on_the_merged_map(self):
+        # `old` / `old-api` STRADDLE sources, both directions: the specific
+        # handle wins regardless of WHICH source holds it — any per-source
+        # sort-before-merge would consult one source's ranking first and send
+        # old-api-roadmap.md through the short handle
+        cases = (("old=alpha-project", (("beta-project", ["old-api"]),)),
+                 ("old-api=beta-project", (("alpha-project", ["old"]),)))
+        for env, authored in cases:
+            self._registry(("alpha-project", "beta-project"), authored)
+            os.environ["HELM_PROJECT_ALIASES"] = env
+            act, err = self._classify("old-api-roadmap.md")
+            self.assertEqual((act["op"], act.get("project")),
+                             ("route-project", "beta-project"), env)
+            self.assertEqual(err, "", env)                     # no conflict here
+            act, _ = self._classify("old-notes.md")
+            self.assertEqual((act["op"], act.get("project")),
+                             ("route-project", "alpha-project"), env)
 
 
 class DrainProjectTest(unittest.TestCase):
@@ -295,15 +649,18 @@ class DrainProjectTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-drainproj-")
-        self.env_prior = {"HELM_HOME": os.environ.get("HELM_HOME")}
+        self.env_prior = {k: os.environ.get(k)
+                          for k in ("HELM_HOME", "HELM_ADOPTED_DIR")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         self.projmem = os.path.join(self.tmp, "projmem")
         os.makedirs(self.projmem)
+        os.environ["HELM_ADOPTED_DIR"] = self.projmem
         pk.atomic_write(os.path.join(self.projmem, "feedback-x.md"),
-                        _mem_entry("feedback-x.md", "feedback", "an x rule to keep"))
+                        _mem_entry("feedback-x.md", "feedback",
+                                   "signed checkpoints protect widgetron recovery"))
         pk.write_json(home.registry_path(), {"version": 1, "projects": {
-            "example-app": {"name": "example-app", "path": "/dev/example-app", "kind": "git",
-                            "sessions": {}}}})
+            "demo-project": {"name": "demo-project", "path": "/dev/demo-project", "kind": "git",
+                        "sessions": {}}}})
 
     def tearDown(self):
         for k, v in self.env_prior.items():
@@ -316,15 +673,15 @@ class DrainProjectTest(unittest.TestCase):
     def _patch(self):
         return mock.patch.object(
             home, "claude_memory_dir_for",
-            side_effect=lambda p: self.projmem if p == "/dev/example-app" else "/nonexistent-xyz")
+            side_effect=lambda p: self.projmem if p == "/dev/demo-project" else "/nonexistent-xyz")
 
     def test_drain_project_scans_project_memdir(self):
         with self._patch():
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                rc = drain.cmd_drain(["--project", "example-app"])
+                rc = drain.cmd_drain(["--project", "demo-project"])
         self.assertEqual(rc, 0)
-        self.assertIn("project example-app", out.getvalue())
+        self.assertIn("project demo-project", out.getvalue())
         self.assertIn("retype", out.getvalue())
         self.assertIn("DRY-RUN", out.getvalue())
 
@@ -463,6 +820,220 @@ class PromoteTest(unittest.TestCase):
         self.assertIn("DRY-RUN", out.getvalue())
         self.assertIn("widgetron", out.getvalue())
 
+    def test_refusals_are_surfaced_not_swallowed(self):
+        """`found 0` and `found 43` looked equally healthy while the old gate
+        ran. The receipt names the layer, and the CLI prints it."""
+        self._jsonl("77777777-7777-7777-7777-777777777777.jsonl", [
+            self._user("from now on the widgetron idles at 40hz between runs"),
+            self._user("spark is idle again as always bc it is so fast haha"),
+            self._user("<task-notification> always ship it </task-notification>"),
+        ])
+        r = drain.promote(since_days=30, roots=[self.tx])
+        self.assertEqual(r["found"], 1)                    # the real rule landed
+        self.assertEqual(r["refused"], {"banter": 1, "markup": 1})
+        orig = drain.promote
+        with mock.patch.object(drain, "promote",
+                               side_effect=lambda **kw: orig(**{**kw, "roots": [self.tx]})):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                drain.cmd_promote([])
+        self.assertIn("refused:", out.getvalue())
+        self.assertIn("banter=1", out.getvalue())
+
+
+_CORPUS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fixtures", "promote-corpus.json")
+
+
+def _corpus():
+    with open(_CORPUS_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+class PromoteGauntletCorpusTest(unittest.TestCase):
+    """The acceptance that decides the gauntlet: the REAL 43 messages the old
+    substring gate minted into the typed store (all 43 since retired),
+    labelled by the cleanup that retired them. 40 junk, 3 genuine.
+
+    A gauntlet that refuses everything scores perfectly on the junk and is
+    worthless, so the 3 genuine entries are asserted INDIVIDUALLY as positive
+    controls — they are the point. The junk side is asserted as a floor, not an
+    exact count, so a later tightening can improve it without editing a test;
+    the control side is exact."""
+
+    CONTROLS = ("should-always-integrate-emberian",
+                "pointless-operating-reliably-harness",
+                "completely-dogfooding-followups-zeroflaws")
+
+    # the two labelled-junk messages this gauntlet deliberately accepts, each
+    # with the reason it is a defensible disagreement rather than a miss
+    KNOWN_ACCEPTS = {
+        # "...never clear your context mid-work, it destroys your working
+        # memory" — a real directive. The cleanup retired it because the 170-char
+        # truncation cut it at "[CORREC", so it could only ever inject the
+        # owner's disappointment. _STATEMENT_CAP now carries the directive, which
+        # is exactly the defect this lane fixed; refusing it would be refusing a
+        # rule for a reason that no longer exists.
+        "context-clear-anything-instruction",
+        # "lcoal and remote should always match" — textbook `should always`.
+        # Refusing it means refusing `should always`, which positive control
+        # #1 ("we should always have the latest") is built on.
+        "retired-embark-remote-should",
+    }
+
+    def test_positive_controls_are_kept(self):
+        by_slug = {r["slug"]: r for r in _corpus()}
+        self.assertEqual(sorted(r["slug"] for r in _corpus()
+                                if r["label"] == "keep"), sorted(self.CONTROLS))
+        # named individually and unconditionally — these three ARE the acceptance
+        self.assertEqual(drain.promote_verdict(
+            by_slug["should-always-integrate-emberian"]["text"])[0], "always")
+        self.assertEqual(drain.promote_verdict(
+            by_slug["pointless-operating-reliably-harness"]["text"])[0], "never")
+        self.assertEqual(drain.promote_verdict(
+            by_slug["completely-dogfooding-followups-zeroflaws"]["text"])[0],
+            "always")
+        for slug in self.CONTROLS:
+            self.assertEqual(by_slug[slug]["label"], "keep", slug)
+            marker, why = drain.promote_verdict(by_slug[slug]["text"])
+            self.assertIsNone(why, "positive control %s was REFUSED (%s)"
+                              % (slug, why))
+            self.assertTrue(marker)
+
+    def test_junk_cohort_is_refused(self):
+        junk = [r for r in _corpus() if r["label"] == "refuse"]
+        self.assertEqual(len(junk), 40)
+        accepted = [r["slug"] for r in junk
+                    if drain.promote_verdict(r["text"])[0]]
+        self.assertEqual(set(accepted) - self.KNOWN_ACCEPTS, set(),
+                         "new false-accepts against the real corpus")
+        # MEASURED 38/40 at the time of writing; the floor guards the direction
+        self.assertGreaterEqual(len(junk) - len(accepted), 38)
+
+    def test_the_five_task_notifications_are_refused_as_markup(self):
+        """FIVE of the 43 were verbatim <task-notification> XML. Markup is a
+        hard refusal, so this holds even when a payload has no marker at all."""
+        xml = [r for r in _corpus() if "<task-notification>" in r["text"]
+               or "</task-id>" in r["text"]]
+        self.assertEqual(len(xml), 5)
+        for r in xml:
+            self.assertEqual(drain.promote_verdict(r["text"])[1], "markup", r["slug"])
+
+    def test_every_corpus_message_passed_the_OLD_substring_gate(self):
+        """The corpus is only evidence if the old gate really did accept it.
+        Reproduces the pre-fix rule: bare substring, no word boundary."""
+        old = ("from now on", "remember this", "remember that", "make it a rule",
+               "going forward", "the rule is", "always ", "never ")
+        corpus = _corpus()
+        self.assertEqual(len(corpus), 43)
+        self.assertTrue(any(m in corpus[0]["text"].lower() for m in old))
+        for r in corpus:
+            low = r["text"].lower()
+            self.assertTrue(any(m in low for m in old), r["slug"])
+
+
+class PromoteGauntletUnitTest(unittest.TestCase):
+    """Each gauntlet layer, one behaviour at a time."""
+
+    def test_marker_is_word_matched_not_substring(self):
+        """3 of the 43 were minted ONLY because "whenever" contains "never "."""
+        self.assertIsNone(drain._promote_marker(
+            "continue, and remove loop whenever you'd like, what is left to do"))
+        self.assertEqual(drain._promote_marker(
+            "the gate must never be skipped before a ship"), "never")
+
+    def test_describing_a_marker_is_not_directing_with_one(self):
+        report = "i never saw the verification you promised me last night ok"
+        rule = "the release gate should never be skipped before a ship"
+        self.assertEqual(drain.promote_verdict(report)[1], "marker-not-directive")
+        self.assertIsNone(drain.promote_verdict(rule)[1])
+
+    def test_past_tense_and_subordinate_clauses_are_not_directives(self):
+        # the SAME words in directive position must still be kept — otherwise
+        # this test would pass just as well against a gauntlet that refuses all
+        self.assertEqual(drain.promote_verdict(
+            "the linear board should always be updated before a handoff")[0],
+            "always")
+        for text in ("that seat was always opus and you redirected it anyway",
+                     "keep the linear board updated so state is always clear",
+                     "figure out why you never ran the frontend check at all"):
+            self.assertEqual(drain.promote_verdict(text)[1],
+                             "marker-not-directive", text)
+
+    def test_a_directive_addressed_outward_is_not_an_i_report(self):
+        """The owner's most natural directive phrasing puts the pronoun FIRST:
+        "i want you to always X", "i need you to never Y", "we have to always
+        Z". An I-report rule with a loose word gap, and a past-tense rule that
+        did not except the "have to" modal, refused all three."""
+        self.assertEqual(drain.promote_verdict(
+            "i want you to always sign the widgetron before ship")[0], "always")
+        for text in ("i want you to always sign the widgetron before ship",
+                     "i need you to never touch the gamma store directly",
+                     "we have to always sign the widgetron before we ship"):
+            marker, why = drain.promote_verdict(text)
+            self.assertIsNone(why, "%s refused as %s" % (text, why))
+            self.assertIn(marker, ("always", "never"))
+        # the genuine self-reports they must not drag back in
+        for text in ("i never saw the verification you promised me last night",
+                     "im just always concerned that we are steadily going"):
+            self.assertEqual(drain.promote_verdict(text)[1],
+                             "marker-not-directive", text)
+
+    def test_structural_refusals(self):
+        clean = "the release gate should never be skipped before a ship"
+        self.assertEqual(drain.promote_verdict(clean)[0], "never")  # all layers
+        cases = {
+            "markup": "<task-notification> " + clean + " </task-notification>",
+            "attachment": "the seat was always opus here [Image #31] look at it",
+            "chat-log": "[8:11 AM]ops (owner): we should always keep one box on",
+            "banter": "spark is idle again as always bc it's so fast haha ok",
+            "fleet-traffic": "resume: never sit idle, report to captain pane:w5:p1",
+            "fragment": "..." + clean,
+            "too-short": "always!",
+            "too-long": clean + " " + "x" * 700,
+        }
+        for want, text in cases.items():
+            self.assertEqual(drain.promote_verdict(text)[1], want, want)
+
+    def test_explicit_capture_phrasings_need_no_directive_shape(self):
+        """"from now on"/"remember this" ARE the speech act; only the two bare
+        English words have to earn it."""
+        marker, why = drain.promote_verdict(
+            "from now on the widgetron idles at 40hz between runs")
+        self.assertIsNone(why)
+        self.assertEqual(marker, "from now on")
+
+    def test_statement_cap_equals_the_injection_line_cap(self):
+        """The mint-time cap and the fire-time cap are the same number on
+        purpose: truncating below what the lane would carry is loss for
+        nothing. This test is the drift guard between the two modules."""
+        from helm.inject._common import LINE_CAP
+        self.assertEqual(drain._STATEMENT_CAP, LINE_CAP)
+        # and the effect: a 300-char directive survives to the statement whole,
+        # where the old 170-char description path cut it to a fragment
+        long_rule = ("the release gate should never be skipped before a ship, "
+                     + "and the reason matters " * 11)[:300]
+        self.assertEqual(len(long_rule), 300)
+        act = {"statement": long_rule, "id": "x", "to_type": "prior",
+               "dst": "prior-x.md", "src": "feedback-x.md", "origin": ""}
+        import tempfile as _tf
+        with _tf.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+            f.write("---\nname: feedback-x\n---\n\nbody\n")
+            src = f.name
+        out = drain._retype_text(src, act, "2026-08-03T00:00:00Z")
+        os.unlink(src)
+        self.assertIn("  statement: " + long_rule, out)
+
+    def test_injected_prompts_are_not_owner_speech(self):
+        self.assertTrue(drain._injected_prompt({"isMeta": True}))
+        self.assertTrue(drain._injected_prompt({"promptSource": "system"}))
+        self.assertTrue(drain._injected_prompt(
+            {"origin": {"kind": "task-notification"}}))
+        self.assertFalse(drain._injected_prompt(
+            {"promptSource": "typed", "origin": {"kind": "human"}}))
+        self.assertFalse(drain._injected_prompt({"promptSource": "queued"}))
+        self.assertFalse(drain._injected_prompt({}))   # old transcripts: fail-open
+
 
 def _bulk(name, description, mtype="project", body="the full body\nwith detail\n"):
     """A typed-PREFIX file with NO typed fields (name+description only) — the
@@ -546,9 +1117,11 @@ class UpgradeTest(HermeticMemBase):
         self.assertIn("type: lexicon", raw)
         self.assertIn("term: quorumward", raw)
         self.assertIn("definition: quorumward means toward a signed quorum gate", raw)
+        self.assertIn("  keywords: ", raw)          # guarded derivation reached output
         from helm import store
         e = self.one_store(store.load_all(types=("lexicon",)), "quorumward")
         self.assertEqual(e["type"], "lexicon")
+        self.assertTrue(e["keywords"])
 
     def test_prior_bulk_upgrades_in_place(self):
         self._w("prior-widget-idle.md",
@@ -687,6 +1260,235 @@ class RetypeEdgeCaseTest(HermeticMemBase):
         act = self._plan()["prem-mute.md"]
         self.assertEqual(act["op"], "keep")
         self.assertIn("no description to upgrade", act["why"])
+
+
+class DrainMintGuardTest(HermeticMemBase):
+    """Semantic drain mints cross the shared store guard transactionally."""
+
+    def _prior(self, eid, keywords):
+        from helm import store
+        return store.write_prior({
+            "id": eid, "statement": "seed " + eid, "confidence": 0.8,
+            "keywords": keywords, "source": "human", "stated_ts": pk.now_ts(),
+            "last_updated": pk.now_ts()}, root_dir=self.mem)
+
+    def _feedback(self, name, statement):
+        self._w(name, _mem_entry(name, "feedback", statement))
+
+    def test_existing_duplicate_refuses_and_source_stays(self):
+        self._prior("widgetron-recovery-law",
+                    "widgetron,checkpoint,freezes,recovery,rollback")
+        src = "feedback-widgetron-recovery-two.md"
+        self._feedback(src, "widgetron checkpoint freezes during recovery rollback")
+        receipt = drain.apply(drain.classify(self.mem), self.mem)
+        self.assertEqual(receipt["applied"], 0)
+        self.assertEqual(len(receipt["refused"]), 1)
+        self.assertIn("widgetron-recovery-law", receipt["refused"][0]["why"])
+        self.assertTrue(os.path.isfile(os.path.join(self.mem, src)))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.mem, "prior-widgetron-recovery-two.md")))
+
+    def test_same_batch_duplicate_sees_earlier_staged_entry_one_corpus_read(self):
+        from helm import store
+        first = "feedback-alpha-recovery.md"
+        second = "feedback-beta-recovery.md"
+        statement = "widgetron checkpoint freezes during signed recovery"
+        self._feedback(first, statement)
+        self._feedback(second, statement)
+        with mock.patch.object(store, "load_all", wraps=store.load_all) as load:
+            receipt = drain.apply(drain.classify(self.mem), self.mem)
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual(receipt["applied"], 1)
+        self.assertEqual([a["src"] for a in receipt["refused"]], [second])
+        self.assertFalse(os.path.exists(os.path.join(self.mem, first)))
+        self.assertTrue(os.path.isfile(os.path.join(self.mem, second)))
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.mem, "prior-alpha-recovery.md")))
+
+    def test_exact_predecessor_exclusion_avoids_self_df_inflation(self):
+        self._prior("infra-one", "infrastructure,seedone")
+        self._prior("infra-two", "infrastructure,seedtwo")
+        path = self._prior("self-map", "infrastructure")
+        plan = [{"op": "upgrade", "src": os.path.basename(path),
+                 "dst": os.path.basename(path), "id": "self-map",
+                 "to_type": "prior", "statement": "self mapped infrastructure",
+                 "keywords": "infrastructure", "origin": ""}]
+        receipt = drain.apply(plan, self.mem)
+        self.assertEqual((receipt["applied"], receipt["refused"]), (1, []))
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("  keywords: infrastructure", f.read())
+
+    def test_predecessor_exclusion_retains_all_other_df_siblings(self):  # noqa: VACUOUS_ASSERTION — three seeded siblings and source bytes control refusal
+        for n in ("one", "two", "three"):
+            self._prior("infra-" + n, "infrastructure,seed" + n)
+        path = self._prior("self-map", "infrastructure")
+        with open(path, "rb") as f:
+            before = f.read()
+        plan = [{"op": "upgrade", "src": os.path.basename(path),
+                 "dst": os.path.basename(path), "id": "self-map",
+                 "to_type": "prior", "statement": "self mapped infrastructure",
+                 "keywords": "infrastructure", "origin": ""}]
+        receipt = drain.apply(plan, self.mem)
+        self.assertEqual(receipt["applied"], 0)
+        self.assertIn("3 live entries", receipt["refused"][0]["why"])
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_staged_replacement_does_not_double_count_its_predecessor(self):
+        self._prior("infra-sibling", "infrastructure,seedone")
+        path = self._prior("self-map", "infrastructure")
+        src = "feedback-new-map.md"
+        self._feedback(src, "new mapping with useful provenance")
+        plan = [
+            {"op": "upgrade", "src": os.path.basename(path),
+             "dst": os.path.basename(path), "id": "self-map",
+             "to_type": "prior", "statement": "self mapped infrastructure",
+             "keywords": "infrastructure", "origin": ""},
+            {"op": "retype", "src": src, "dst": "prior-new-map.md",
+             "id": "new-map", "to_type": "prior", "statement": "new mapping",
+             "keywords": "infrastructure", "origin": ""},
+        ]
+        receipt = drain.apply(plan, self.mem)
+        self.assertEqual((receipt["applied"], receipt["refused"]), (2, []))
+        self.assertTrue(os.path.isfile(os.path.join(self.mem, "prior-new-map.md")))
+
+    def test_staged_overwrite_replaces_existing_destination_in_corpus(self):
+        self._prior("infra-sibling", "infrastructure,seedone")
+        self._prior("self-map", "infrastructure")
+        replace = "feedback-replace.md"
+        following = "feedback-following.md"
+        self._feedback(replace, "replacement with useful provenance")
+        self._feedback(following, "following mint with useful provenance")
+        plan = [
+            {"op": "retype", "src": replace, "dst": "prior-self-map.md",
+             "id": "self-map", "to_type": "prior", "statement": "replacement",
+             "keywords": "infrastructure", "origin": ""},
+            {"op": "retype", "src": following, "dst": "prior-following.md",
+             "id": "following", "to_type": "prior", "statement": "following",
+             "keywords": "infrastructure", "origin": ""},
+        ]
+        receipt = drain.apply(plan, self.mem)
+        self.assertEqual((receipt["applied"], receipt["refused"]), (2, []))
+        self.assertTrue(os.path.isfile(os.path.join(self.mem, "prior-following.md")))
+
+    def test_empty_and_salad_refuse_without_mutating_sources(self):  # noqa: VACUOUS_ASSERTION — byte snapshots positively control each refused source
+        empty = "feedback-x.md"
+        self._feedback(empty, "go now")
+        with open(os.path.join(self.mem, empty), "rb") as f:
+            before = f.read()
+        receipt = drain.apply(drain.classify(self.mem), self.mem)
+        self.assertIn("NO keywords", receipt["refused"][0]["why"])
+        with open(os.path.join(self.mem, empty), "rb") as f:
+            self.assertEqual(f.read(), before)
+
+        salad = "feedback-salad.md"
+        self._feedback(salad, "a statement with useful provenance")
+        path = os.path.join(self.mem, salad)
+        with open(path, "rb") as f:
+            before = f.read()
+        plan = [{"op": "retype", "src": salad, "dst": "prior-salad.md",
+                 "id": "salad", "to_type": "prior", "statement": "a statement",
+                 "keywords": "one giant comma missing keyword cell", "origin": ""}]
+        receipt = drain.apply(plan, self.mem)
+        self.assertIn("comma-less cell", receipt["refused"][0]["why"])
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_override_receipt_follows_successful_write(self):
+        from helm import store
+        self._prior("widgetron-recovery-law",
+                    "widgetron,checkpoint,freezes,recovery,rollback")
+        src = "feedback-widgetron-recovery-two.md"
+        dst = "prior-widgetron-recovery-two.md"
+        self._feedback(src, "widgetron checkpoint freezes during recovery rollback")
+        calls = []
+        write = pk.atomic_write
+        record = store.record_mint_events
+
+        def ordered_write(path, text):
+            if os.path.basename(path) == dst:
+                calls.append("write")
+            return write(path, text)
+
+        def ordered_record(events):
+            if events:
+                calls.append("event")
+            return record(events)
+
+        with mock.patch.object(drain.pk, "atomic_write", side_effect=ordered_write), \
+                mock.patch.object(store, "record_mint_events",
+                                  side_effect=ordered_record):
+            receipt = drain.apply(drain.classify(self.mem), self.mem, force_new=True)
+        self.assertEqual(receipt["applied"], 1)
+        self.assertEqual(calls[:2], ["write", "event"])
+        self.assertTrue(any(r.get("verb") == "store.dup_override"
+                            and r.get("target") == "widgetron-recovery-two"
+                            for r in pk.read_events(20)))
+
+    def test_writer_failure_records_no_duplicate_override(self):  # noqa: VACUOUS_ASSERTION — surviving source positively controls the failed destination/event
+        from helm import store
+        self._prior("widgetron-recovery-law",
+                    "widgetron,checkpoint,freezes,recovery,rollback")
+        src = "feedback-widgetron-recovery-two.md"
+        dst = "prior-widgetron-recovery-two.md"
+        self._feedback(src, "widgetron checkpoint freezes during recovery rollback")
+        write = pk.atomic_write
+
+        def fail_destination(path, text):
+            if os.path.basename(path) == dst:
+                raise OSError("writer failed")
+            return write(path, text)
+
+        with mock.patch.object(drain.pk, "atomic_write", side_effect=fail_destination), \
+                mock.patch.object(store, "record_mint_events") as record:
+            with self.assertRaisesRegex(OSError, "writer failed"):
+                drain.apply(drain.classify(self.mem), self.mem, force_new=True)
+        record.assert_not_called()
+        self.assertTrue(os.path.isfile(os.path.join(self.mem, src)))
+        self.assertFalse(os.path.exists(os.path.join(self.mem, dst)))
+        self.assertFalse(any(r.get("verb") == "store.dup_override"
+                             for r in pk.read_events(20)))
+
+    def test_dry_run_surfaces_refusal_and_force_override_mutates_nothing(self):  # noqa: VACUOUS_ASSERTION — refusal output and stable directory listing control no-write claims
+        self._prior("widgetron-recovery-law",
+                    "widgetron,checkpoint,freezes,recovery,rollback")
+        src = "feedback-widgetron-recovery-two.md"
+        self._feedback(src, "widgetron checkpoint freezes during recovery rollback")
+        before = sorted(os.listdir(self.mem))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(drain.cmd_drain([]), 0)
+        self.assertIn("refuse", out.getvalue())
+        self.assertEqual(sorted(os.listdir(self.mem)), before)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(drain.cmd_drain(["--force-new"]), 0)
+        self.assertIn("DRY-RUN", out.getvalue())
+        self.assertEqual(sorted(os.listdir(self.mem)), before)
+        self.assertFalse(any(r.get("verb") == "store.dup_override"
+                             for r in pk.read_events(20)))
+
+    def test_guarded_heuristic_trigger_is_written_to_staged_output(self):
+        src = "feedback-heuristic.md"
+        self._feedback(src, "inspect frozen pane state before relaunch")
+        plan = [{"op": "retype", "src": src, "dst": "heuristic-frozen-pane.md",
+                 "id": "frozen-pane", "to_type": "heuristic",
+                 "statement": "inspect frozen pane state before relaunch",
+                 "trigger": "pane freezes on plan prompt, relaunch check",
+                 "origin": ""}]
+        receipt = drain.apply(plan, self.mem)
+        self.assertEqual(receipt["applied"], 1)
+        with open(os.path.join(self.mem, "heuristic-frozen-pane.md"),
+                  encoding="utf-8") as f:
+            raw = f.read()
+        self.assertIn("type: heuristic", raw)
+        self.assertIn("  trigger: pane freezes on plan prompt, relaunch check,", raw)
+        self.assertIn("pane freezes", raw)
+        from helm import store
+        e = next(e for e in store.load_all(types=("heuristic",))
+                 if e["id"] == "frozen-pane")
+        self.assertEqual(e["keywords"], e["trigger"])
+        self.assertIn("plan prompt", store._kw_list(e["trigger"]))
 
 
 class ExpireCandidatesTest(unittest.TestCase):

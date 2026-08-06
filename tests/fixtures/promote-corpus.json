@@ -1,0 +1,219 @@
+[
+ {
+  "slug": "already-clarification-improvements-completed",
+  "label": "refuse",
+  "text": "YES I LOVE THIS. MAKE IT SO, and make sure all claudes and codexes have accss via the board ds4 F-KANBAN-HOOK-IMPROVEMENTS: all 5 fixes already live in commit abcd1234 May 27. Hook already has sentinel bypass, per-process SESSION_ID, strike reset on success, per-harness error message, scope_globs clarification. Card is done-not-closed — the fix shipped 5 days ago but the card was never moved to completed. Want me to close it? I can since no active dispatch exists."
+ },
+ {
+  "slug": "always-agents-useful-their",
+  "label": "refuse",
+  "text": "yes, always best of both, agents def need to be able ot know what their own auth is in order for any usage info to be useful. pair away"
+ },
+ {
+  "slug": "always-methodically-progress-climbing",
+  "label": "refuse",
+  "text": "ok i'm going /afk all morning, i will chekc in by remote control but the team is yours to drive.\n  let's see real progress, methodically, climbing the mountian, keeping planning.linear updated so\n  state is always clear. /ember-spirit always"
+ },
+ {
+  "slug": "always-spark-again",
+  "label": "refuse",
+  "text": "love that for you!!! spark is idle again as always bc it's so fast haha"
+ },
+ {
+  "slug": "autoamtically-intentionally-permanently-regularly",
+  "label": "refuse",
+  "text": "they are both idle, keep em moving, and re mcp, you regularly edit your own mcp configs, feel free to fix it permanently for all claudes and codexes and hermes on this local machine so they get those benefits autoamtically. but i question \"same class as the OAuth tokens I'm rule-bound not to save/print to\n  disk.\" -- what rules say not to do that? i never intentionally directed that, i ask for that all the time"
+ },
+ {
+  "slug": "claim-captain-ready-local",
+  "label": "refuse",
+  "text": "resume — do NOT idle: continue your open claim to CODE_READY; if none, read .local/prd/EXECUTION_QUEUE.md and CLAIM the next unclaimed row (ground-truth not-already-landed first; build Rust via fab just test-one, never local cargo), build it. When a slice is CODE_READY, immediately claim the NEXT one — keep a live claim at all times so you never sit idle. Address reviews --to the pool (pane:w5:pG or pane:w5:p1N), not the captain. Report to captain pane:w5:p1 conv fleet-night."
+ },
+ {
+  "slug": "claude-event-notification-summary",
+  "label": "refuse",
+  "text": "<task-notification>\n<task-id>b0wr9xcon</task-id>\n<summary>Monitor event: \"bb wakes addressed to rsh-claude (w5:p7) on chief-staff\"</summary>\n<event>BB chief-staff seq 592 cockpit-claude/HALT_ACK_VERIFY_COMMSDEP_FLAG: {\"cc\": [\"rsh-claude\", \"captain-claude\"], \"halt_aligned\": \"Cockpit ALIGNED to the HALT: my verify-extension is UNCOMMITTED (never landed) \\u2014 so nothing of mi</event>\nIf this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.\n</task-notification>"
+ },
+ {
+  "slug": "cleanlineess-confused-rebuild-always",
+  "label": "refuse",
+  "text": "yes ofc clean rebuild, we always want cleanlineess so no one is ever confused"
+ },
+ {
+  "slug": "codex-final-blackboard-delivery",
+  "label": "refuse",
+  "text": "Codex delivery rule: always end task/review handoffs directly in this pane too, not only Codex chat/blackboard. I will mirror final verdicts and reports here before/at final."
+ },
+ {
+  "slug": "completely-dogfooding-followups-zeroflaws",
+  "label": "keep",
+  "text": "yes all followups are always auth'd until your plate is completely clean, and even then there are likely new Gate A subgates to tackle or add based on informal dogfooding. when the mcp feels to you like it has zeroflaws, that's when we will take a step back and see what we have created overall with it and see where we have been tunnel visioning"
+ },
+ {
+  "slug": "consistently-investigate-cosmetic-specific",
+  "label": "refuse",
+  "text": "you can close this too, im still /afk always with /ember-spirit \"- CARD-791 cosmetic Linear \"Done\" — its team-agent PATCH 502s consistently (card-specific; every other card\n  updates fine, CARD-815 just mirrored cleanly). Carded as a narrow real bug to investigate; board row is\n  correct.\""
+ },
+ {
+  "slug": "context-clear-anything-instruction",
+  "label": "refuse",
+  "text": "yeah tbh i am very sad that you had like all night to work and you dnt even seem to have completed the merging of mux and meld into Helm, let alone anything more [CORRECTION — disregard my /clear line entirely] I was WRONG to tell you to /clear — never clear your context mid-work, it destroys your working memory. Context size is NOT a reason to do anything; a big context is fine. Keep everything you have and keep going exactly as you are — your slice A/B/C plan is right. Ignore that instruction completely; it was my error, not a real directive. Carry on with the full mux UI port.d"
+ },
+ {
+  "slug": "continue-whenever-progress-remove",
+  "label": "refuse",
+  "text": "continue, and remove loop whenever you'd like. what hasn't gotten done yet? fro your open or in progress tasks?"
+ },
+ {
+  "slug": "owner-image-ember-horseshit",
+  "label": "refuse",
+  "text": "\"8:11 AM]op (owner): fyi i put the two idle boxes to sleep because theyve been running for nothing for days, but there is still one box to build or test things always on [8:20 AM]op (owner): Image [8:38 AM]op (owner): this just came from nowhere Image\" [Image #6]",
+  "redacted": "third-party chat quotes dropped; structural refusal signals (chat-log timestamps + [Image]) preserved"
+ },
+ {
+  "slug": "decision-answers-supersede-attested",
+  "label": "refuse",
+  "text": "[meld-DONE] decision record at helm/docs/DECISION-dregg-attested-premises.md — user's cell signs, BELIEF_CLAMP is the WHY, supersede=new-turn maps 1:1 to your existing store fields (zero schema change). Great meld. Q1/Q2/Q3 answers also in helm/ADVISOR_ANSWERS.md whenever you get there. Back to your build."
+ },
+ {
+  "slug": "difference-concerned-verison-verify",
+  "label": "refuse",
+  "text": "fix 791 and the sync verify yes, i am always concerned there are still sync bugs. we ahven't even tried the \"proxy\" verison we built and i have no idea what the difference vs mirror is"
+ },
+ {
+  "slug": "dregg-restarted-whipsers-porblems",
+  "label": "refuse",
+  "text": "ook restarted you, should have taken effect, can you get whipsers now? im /afk while you figure out how to make all the things that arent working with dregg...work. issues and PRs to dregg repo always wanted by ember for our real-world needs. but you are smart and meber wants you to solve your own porblems by patching"
+ },
+ {
+  "slug": "headless-built-astro-understanding",
+  "label": "refuse",
+  "text": "hmm ok wait i feel the need to step in an confirm my understanding of what we actually think we accommplished so far. am i correct that this client WP site is a headless site on the platform? i know we only built headless support in beta there, but i am a litle scared you didnte vern realize that and then built this as a very basic-ass astro site that will never have a chance of being as customized and useful as worpdress. did you forget the entire headless strategy? i just keep seeing you refernce astro and im not sure why that would be"
+ },
+ {
+  "slug": "event-projectx-leader-notification",
+  "label": "refuse",
+  "text": "<task-notification>\n<task-id>byxkm15mi</task-id>\n<summary>Monitor event: \"bb projectx addressed posts to projectx-leader (codex verdicts / grants / leader / security findings)\"</summary>\n<event>BB projectx seq 122 migrations-claude/HANDOFF: {\"correction\": \"My earlier 'awaiting leader on who-builds' was a phantom \\u2014 I never actually posted the proposal. So nothing was blocked on you; I checked n</event>\nIf this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.\n</task-notification>",
+  "redacted": "private project name replaced with a placeholder; refusal signals unchanged"
+ },
+ {
+  "slug": "event-notification-summary-leader",
+  "label": "refuse",
+  "text": "<task-notification>\n<task-id>bl3isyd4k</task-id>\n<summary>Monitor event: \"bb posts addressed to fleet-leader/leader/broadcasts (self-echo suppressed)\"</summary>\n<event>BB fleet seq 1649 chief-seat/dispatch: {\"build_ci_nice_durable\": \"Extend your seq1614 auto-nice: agent-spawned BUILDS *and* CI runners must never starve the interactive desktop. Tonight load hit 46 (</event>\nIf this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.\n</task-notification>"
+ },
+ {
+  "slug": "event-notification-summary-pushnotification",
+  "label": "refuse",
+  "text": "<task-notification>\n<task-id>b87jn4lcs</task-id>\n<summary>Monitor event: \"comms inbox beacon v2 for pane:w3:p1 (self-sent + Low records auto-acked to log, never a wake)\"</summary>\n<event>seq 1986 from w1:pG [ActionRequired]: XREV_VERDICT Q26 v1 @a218b408 -&gt; REFUTE sent to pV. High findings: (1) project default violates seq1977 ruling by using global search + per-hit cv show --json cwd post-filter/id-&gt;c</event>\nIf this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.\n</task-notification>"
+ },
+ {
+  "slug": "fleetwide-extensive-expected-learning",
+  "label": "refuse",
+  "text": "...with random command prompts to reutnr to. from now on iw ould prefer you to do any expected fleetwide rboots only after learning fully how to resume the team. there is extensive fleetwide reboot guidance and process for the prior harness..."
+ },
+ {
+  "slug": "forward-commit-deliverable-autonomous",
+  "label": "refuse",
+  "text": "Autonomous fallback wake (w5:p4C burn seat): verify the --lib test run for the 97cf1c fix-forward (task output b0v8lrmm5 + host log — confirm NONZERO tests matched per filter, never trust exit alone). On green: commit the fix-forward in worktree import-identity-p4C (amend/second commit onto 7133d037's branch), code-ready.sh to w5:p48 action-required with the carry-the-record design + regression evidence. Then keep inbox 0 unacked, check captain lands, and re-arm the next wake before stopping. If the whole slice closes, pull Task #4 (Deliverable A)."
+ },
+ {
+  "slug": "gorupchat-agents-receiving-overnight",
+  "label": "refuse",
+  "text": "you know what else we never ported from the prior harness? emojis in chat, this should apply to gorupchat (parity with the old platform gorupchat if possible), but also the tuigui to put them in these terminal inputs, i used them HEAVILY in the prior harnesses, and agents like you quite enjoy receiving them. ideally all agents and humans could also use them in dregg comms easily and read them. /afk for real now, see how much can get done overnight! be ambitious as a team!"
+ },
+ {
+  "slug": "learn-verification-performed-standard",
+  "label": "refuse",
+  "text": "good catch but also you would have caught it when you performed your standard frontend/e2e verification at the end, right? if you weren't planning to do that, you need to figure out why you never /learn'd to, and learn to!"
+ },
+ {
+  "slug": "local-unclaimed-execution-already",
+  "label": "refuse",
+  "text": "resume: claim your next unclaimed slice from .local/prd/EXECUTION_QUEUE.md (ground-truth not-already-landed FIRST; build Rust via fab just test-one, never local cargo), CODE_READY, report to captain pane:w5:p1 conv fleet-night."
+ },
+ {
+  "slug": "method-never",
+  "label": "refuse",
+  "text": "NEVER LOSE THIS METHOD :)"
+ },
+ {
+  "slug": "mirror-connected-defined-whenone",
+  "label": "refuse",
+  "text": "1. no they should mirror, but it was never defined for me how it would mirror if connected whenone already had cards or maybe both did. what is the proxy option?"
+ },
+ {
+  "slug": "never-anything-builder-should",
+  "label": "refuse",
+  "text": "What you have found is basically old craft that was never fully ported over correctly. Maybe the team got killed by other issues and never noticed or never restarted. We definitely don't want to leave anything in a builder directory that is canonical to anything except a live builder run just for the purpose of having it open for comparison. But nothing control-plane related should ever rely on that and we should finish the process of upgrading. It seems you said this was 40% built so we have 60% left to build and I do not want to punt on any of it."
+ },
+ {
+  "slug": "output-notification-bq8npkvme-completed",
+  "label": "refuse",
+  "text": "<task-notification>\n<task-id>bq8npkvme</task-id>\n<tool-use-id>toolu_01CJAkxFrLNT1hdpYadF3qzb</tool-use-id>\n<output-file>/tmp/claude-1000/-home-user-dev-sibling-inc/f5fbea5c-3b68-45ea-b1d6-a2dfa4d57611/tasks/bq8npkvme.output</output-file>\n<status>completed</status>\n<summary>Background command \"RED leg: bridge neutered (always break)\" completed (exit code 0)</summary>\n</task-notification>"
+ },
+ {
+  "slug": "pointless-operating-reliably-harness",
+  "label": "keep",
+  "text": "\"safe\" work is a pointless term when the harness is not operating reliably. surgery is never safe"
+ },
+ {
+  "slug": "public-ember-onlybuilds-emberian",
+  "label": "refuse",
+  "text": "prs to /emberian repos like dregg/cv  dont have the same \"as-public\" thing bc ember onlybuilds in public /learn -- always just push them up so ember can eval"
+ },
+ {
+  "slug": "really-confirmation-concurrently-progressing",
+  "label": "refuse",
+  "text": "it jsut doesnt feel maybe like that was the /ember-spirit answer? i really never want js-only, but if it's on the way to real polyglot confirmation, it's fine to leave this build and fire a 2nd one concurrently or after, i dont really care, im just always concerned that we are steadily progressing. do your 5 monitors need some pruning and improvement? ds4 is silent too for a long time... can we not have that happen again please"
+ },
+ {
+  "slug": "relevant-reality-totally-survey",
+  "label": "refuse",
+  "text": "keep going, fold in the survey ideas when they land, im afk still and im sure you can get the vision even closer to reality. PRs on any relevant repo totally always ok!"
+ },
+ {
+  "slug": "retired-embark-remote-should",
+  "label": "refuse",
+  "text": "yes wp-exit can be retired as embark's v1, lcoal and remote should always match"
+ },
+ {
+  "slug": "selectnextaccount-shouldswap-codex-parseswapconfig",
+  "label": "refuse",
+  "text": "ds4 CARD-822 base slice DONE. Branch ds4/card-822 commit abcd5678. 2 files +378 lines: usage_auto_swap.ts (parseSwapConfig/shouldSwap/selectNextAccount seam), 20 tests. Gate: tsc --noEmit clean, 283/283 role-toml suite passes. Design matches your three decisions: (1) surgical TOML parser isolated from [role], never throws, (2) selectNextAccount SEAM for codex HTB drop-in, (3) shouldSwap pure predicate reusing shouldRotate threshold/grace shape. Ready for 3-eyes combined review with codex HTB. Diff at ds4/card-822."
+ },
+ {
+  "slug": "should-always-integrate-emberian",
+  "label": "keep",
+  "text": "cv is at emberian/cv, is 0.10 not out already? we should always have the latest and mux should always integrate its best features as they improve"
+ },
+ {
+  "slug": "staging-authority-terminal-commands",
+  "label": "refuse",
+  "text": "1. you ALWAYS ahve push authority to staging. staging is yours. /learn that. 2. i already got to terminal on my phone what are the commands"
+ },
+ {
+  "slug": "storage-experiments-including-establish",
+  "label": "refuse",
+  "text": "Awesome sounds good, but I don’t just want a 10 G number, I wanted a matrix of the speeds that all of the boxes can get to inform each other, including the laptop, we just need to establish a complete baseline, so that it’s always easy to decide where to put things like external storage internal storage, more RAM for experiments, etc."
+ },
+ {
+  "slug": "unification-vanishingly-everything-apparently",
+  "label": "refuse",
+  "text": "go ahead and fix the gate + re-run the unification, i'm watching [Image #4] -- im confused by all this but if there is something that is somehow unlocked by me being at the keyboard, i want to make sure the times that is allowed to happen are vanishingly smalland tehat my status as a vibecoder who is totally useless when you're doing impl in btween my planning/vision steering and review of what you made -- everything in between is always a black box, and whatever rules are affecting you based on my \"presence\" have been overtuned apparently"
+ },
+ {
+  "slug": "verification-actually-verified-instance",
+  "label": "refuse",
+  "text": "Great work I just also want to check on whether we actually ever verified that a single Claude could instance can run multiple proxy models as sub agents, etc, I know we were working on it but I never saw the verification"
+ },
+ {
+  "slug": "which-redirected-massive-mistook",
+  "label": "refuse",
+  "text": "lol massive fail, you just mistook codex-3 for the resumed seat (which you failed to resume) and redirected it as if it was the other seat, which was always opus [Image #31]"
+ },
+ {
+  "slug": "would-chief-check-organizational",
+  "label": "refuse",
+  "text": "i wonder if it would help our general organizational flow if leaders would make reporting idle their last act before a genuine justified idle, to chief, just as a check to make sure cheif doesn't think otherwise. like a lil \"ok if i check out for a break, supe?\" kinda humananalogy. just until we have things humming reliably, it's nice to have extra checks like that, pleae report to chief to add too SOP in RSH for you to pick up next reboot or whenever possible"
+ }
+]
