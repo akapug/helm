@@ -14,7 +14,10 @@ import time
 import unittest
 from unittest import mock
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import gc, home, pk, premise, store  # noqa: E402
 
@@ -38,12 +41,30 @@ class GcBase(unittest.TestCase):
         self.cwd_prior = os.getcwd()
         os.chdir(self.tmp)
         self.env_prior = {k: os.environ.get(k) for k in (
-            "HELM_HOME", "HELM_CACHE_DIR", "MELD_CACHE_DIR", "HELM_ADOPTED_DIR")}
+            "HELM_HOME", "HELM_CACHE_DIR", "MELD_CACHE_DIR", "HELM_ADOPTED_DIR",
+            "HELM_CHAT_DIR")}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
         os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
+        # THE CHAT SEAM, and leaving it unset made this suite a live-fleet reaper.
+        # chat lives in tmpfs at /dev/shm/helm-chat, which no HELM_HOME redirect
+        # touches, so the chat-cursors stream read the REAL fleet directory while
+        # every other stream read tmp. Measured on this branch before the fix:
+        # scan() returned over=True with 24,001 victims, all of them live-fleet
+        # files, and ApplyTest calls `gc --apply`, which reaps every reapable row
+        # — so RUNNING THE TEST SUITE would have deleted 24,001 cursors out from
+        # under the running fleet. The seat that survived would then re-read its
+        # whole room and re-deliver everything it had already seen.
+        #
+        # Same class as an earlier inject-test hermeticity fix ("inject tests
+        # read the LIVE fleet's chat, so their result depended on it"). There the
+        # cost was a flaky assertion; here it is destruction of live state, which
+        # is what a non-hermetic test earns you once the code under test can WRITE.
+        # Every env seam a stream reads belongs in this dict, not just the ones
+        # the current assertions happen to notice.
+        os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.environ.pop("MELD_CACHE_DIR", None)
-        for d in ("cache", "adopted"):
+        for d in ("cache", "adopted", "chat"):
             os.makedirs(os.path.join(self.tmp, d))
 
     def tearDown(self):
@@ -135,6 +156,85 @@ class ScanTest(GcBase):
         self.assertTrue(self.row(rows, "keepalive-log")["over"])  # sweep went on
         rc, out, _ = run(gc.cmd_gc, [])
         self.assertEqual(rc, 0)
+
+
+class CursorRefusalTest(GcBase):
+    """A cross-family review's REFUTE, and the hermeticity hole found while
+    fixing it."""
+
+    def _cursor(self, sid, room="main"):
+        return self.plant(os.path.join(
+            os.environ["HELM_CHAT_DIR"], "%s.cursor.seat-a.%s" % (room, sid)), "9\n")
+
+    def test_unprovable_liveness_is_a_loud_ERR_never_a_clean_sweep(self):
+        """THE FINDING. chat.dead_cursors returns `err` precisely so that an
+        unprovable liveness refuses to act. An early revision collapsed that to
+        `[]` under a bare
+        `except Exception: return []`, so BOTH "I could not prove any session
+        dead" and "I crashed" reached gc as an empty victim list — which gc reads
+        as nothing-to-prune and prints in its reassuring `in budget` line.
+
+        A reaper that proved nothing reporting CLEAN is the vacuous pass: the
+        check ran, the input was absent, the answer was confident. gc already
+        owned the honest channel (row["error"] -> ERR line, _reapable refuses it),
+        so the fix was to DELETE the handler's own error handling and let the
+        framework's surface it."""
+        self._cursor("dead0001")
+        with mock.patch("helm.chat.dead_cursors",
+                        return_value=([], 0, "no session homes readable")):
+            row = self.row(gc.scan(), "chat-cursors")
+            self.assertIn("unprovable", row.get("error", ""))
+            self.assertFalse(gc._reapable(row), "a refused row must never reap")
+            rc, out, _ = run(gc.cmd_gc, ["--apply"])
+        self.assertEqual(rc, 0)                 # gc is a janitor, not a gate
+        self.assertIn("ERR", out)
+        # and the refusal must not be laundered into the reassuring line
+        for line in out.splitlines():
+            if "in budget:" in line:
+                self.assertNotIn("chat-cursors", line,
+                                 "a stream that could not measure read as in budget")
+
+    def test_a_crashing_cursor_scan_also_surfaces(self):
+        """The other half of that revision's `except Exception: return []`. A crash is not
+        evidence of an empty estate."""
+        with mock.patch("helm.chat.dead_cursors",
+                        side_effect=OSError("chat dir vanished")):
+            row = self.row(gc.scan(), "chat-cursors")
+        self.assertIn("vanished", row.get("error", ""))
+        self.assertFalse(row["over"], "a crashed measurement is not an over-budget one")
+
+    def test_the_cursor_stream_reads_only_the_test_chat_dir(self):
+        """HERMETICITY PIN, and the reason it exists is not hypothetical. With
+        HELM_CHAT_DIR unset this suite read /dev/shm/helm-chat — the live fleet's
+        tmpfs — and scan() returned 24,001 victims that ApplyTest's `gc --apply`
+        would have deleted out from under running seats.
+
+        So this asserts the stream is confined by PATH, not merely that the counts
+        look plausible: every victim must live under this test's OWN tempdir. A
+        count-based assertion would pass just as happily against production.
+
+        And it checks against self.tmp rather than re-reading HELM_CHAT_DIR, which
+        is the variable the planting used — asserting a value against itself is
+        consistent by construction and would hold no matter where that variable
+        pointed. self.tmp is the hermetic boundary the whole class rests on."""
+        for i in range(3):
+            self._cursor("dead%04d" % i)
+        with mock.patch("helm.sessions.live_sids", return_value=set()):
+            row = self.row(gc.scan(), "chat-cursors")
+        self.assertTrue(row["victims"], "planted dead cursors were not found")
+        for v in row["victims"]:
+            self.assertTrue(v.startswith(self.tmp),
+                            "gc reached outside the test tempdir: " + v)
+
+    def test_apply_reaps_only_planted_cursors_and_keeps_the_live_one(self):
+        live = "0fa7c4ed-9a5e-46a0-b2da-f862eb8afad6"
+        keep = self._cursor(live[:8])
+        drop = self._cursor("dead0001")
+        with mock.patch("helm.sessions.live_sids", return_value={live}):
+            rc, _out, _ = run(gc.cmd_gc, ["--apply"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(keep), "reaped a LIVE session's cursor")
+        self.assertFalse(os.path.exists(drop))
 
 
 class DryRunTest(GcBase):
@@ -259,3 +359,54 @@ class TableTest(GcBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TimerShipsTest(unittest.TestCase):
+    """The drain must SHIP its own cadence. gc knew its retention policy from
+    the start and nothing ever ran it — 11,192 items over budget when a
+    sustainability audit finally measured it. A policy with no
+    scheduler is a policy that does not exist, so the installer is part of the
+    verb, and these controls keep it honest."""
+
+    def test_units_are_wellformed_and_hourly(self):
+        spath, service, tpath, timer = gc.timer_units()
+        self.assertTrue(spath.endswith("helm-gc.service"))
+        self.assertTrue(tpath.endswith("helm-gc.timer"))
+        self.assertIn("ExecStart=", service)
+        self.assertIn("gc --apply", service)          # the DRAIN, not a dry-run
+        self.assertIn("OnUnitActiveSec=3600", timer)  # hourly by default
+        self.assertIn("Persistent=true", timer)       # survives a reboot gap
+        self.assertIn("WantedBy=timers.target", timer)
+
+    def test_workingdirectory_is_the_shared_checkout_never_a_worktree(self):
+        # A persistent unit that captured a disposable lane worktree as its cwd
+        # would die with that worktree; work.find_root folds a lane back to the
+        # shared checkout. Also the never-track law: no operator path may be a
+        # LITERAL in the tracked template.
+        _s, service, _t, _tm = gc.timer_units()
+        line = [l for l in service.splitlines()
+                if l.startswith("WorkingDirectory=")]
+        self.assertEqual(len(line), 1, service)
+        cwd = line[0].split("=", 1)[1]
+        self.assertNotIn("-wt/", cwd, "unit captured a lane worktree")
+        self.assertTrue(os.path.isdir(cwd), cwd)
+        src = open(os.path.join(os.path.dirname(gc.__file__), "gc.py")).read()
+        self.assertNotIn(cwd, src, "operator path baked into the template")
+
+    def test_interval_must_be_positive(self):
+        ok, detail = gc.ensure_timer(interval=0)
+        self.assertFalse(ok)
+        self.assertIn("at least 1 second", detail)
+
+    def test_install_timer_flag_is_accepted_and_reports(self):
+        # MUST-NOT-HIT the scan path: --install-timer never reaps.
+        with mock.patch.object(gc, "ensure_timer",
+                               return_value=(True, "timer enabled")) as m, \
+                mock.patch.object(gc, "scan") as scanned:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = gc.cmd_gc(["--install-timer"])
+            self.assertEqual(rc, 0)
+            m.assert_called_once()
+            scanned.assert_not_called()
+            self.assertIn("timer enabled", buf.getvalue())

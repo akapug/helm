@@ -81,6 +81,36 @@ def _lane_orphans():
     return work.gc_orphans()
 
 
+def _dead_cursors():
+    """Per-session chat read cursors whose session is dead (chat.dead_cursors).
+    Liveness-gated, never age-gated: a pane thinking for an hour looks exactly
+    like one that exited an hour ago, and dropping a LIVE cursor makes that seat
+    re-read its room and re-deliver what it already saw. Budget is count>0
+    because a dead session's cursor has no retention value at all — it is pure
+    directory-entry tax on every list_rooms, which runs on every tool boundary.
+
+    RAISES when liveness is unprovable, and that is the whole contract. A
+    cross-family review caught an earlier draft returning `[] if err else
+    victims` under a bare `except Exception: return []` — so BOTH "I could not
+    prove any session dead" and "I crashed" arrived at gc as an empty victim
+    list, which gc reads as "nothing to prune" and prints in its `in budget`
+    line. chat.dead_cursors returns `err` precisely so an unprovable liveness
+    refuses to act; laundering that refusal into a clean report is the exact
+    class this reaper was built to avoid, one layer up.
+
+    So there is no local try/except: scan() already wraps every find() and puts
+    the message in row["error"], _reapable() refuses any row carrying one, and
+    cmd_gc prints it as a loud ERR line excluded from `in budget`. The honest
+    channel existed the whole time; the handler's own error handling was strictly
+    worse than the framework's, and deleting it IS the fix.
+    """
+    from . import chat
+    victims, _kept, err = chat.dead_cursors()
+    if err:
+        raise RuntimeError("cursor liveness unprovable, reaped nothing: %s" % err)
+    return victims
+
+
 def _size(p):
     """Bytes at p, dirs walked. Fail-open 0."""
     try:
@@ -134,6 +164,8 @@ def _human(n):
 # means the module's own rotation broke; the cache jsonls have NO rotation of
 # their own — gc is their only cap (the exact 32MB-guard-ledger gap).
 POLICIES = (
+    {"stream": "chat-cursors", "cls": "exhaust", "act": "prune", "count": 0,
+     "find": _dead_cursors},
     {"stream": "inject-ledger", "cls": "exhaust", "act": "rotate",
      "size": inject.LEDGER_MAX + MB,
      "find": lambda: _one(_state("inject-ledger.jsonl"))},
@@ -250,16 +282,111 @@ def _reap(row):
     return lines, reaped
 
 
+_SERVICE = """[Unit]
+Description=helm gc — enforce declared retention over the derived exhaust
+Documentation=premise:nothing-may-gate-on-an-undrained-pile
+
+[Service]
+WorkingDirectory=%(cwd)s
+Type=oneshot
+# THE DRAIN THAT EXISTED AND WAS NEVER SCHEDULED. gc has always known its own
+# per-stream retention policy; nothing ever ran it, so the exhaust grew without
+# bound — measured at 11,192 items over budget (11,191 chat cursors
+# plus a 31.5MB usage-history file against a 5MB budget) on a fleet whose work
+# actuator was ALSO gated on an undrained pile. A policy with no scheduler is a
+# policy that does not exist.
+# --apply is safe by construction: each stream reaps only what its own declared
+# budget names, and non-exhaust streams stay report-only (a dirty lane is never
+# discarded here; `helm work gc --apply` rescue-commits first).
+ExecStart=%(helm)s gc --apply
+# THE SIDEBAR RECURRENCE, KILLED AT THE CADENCE (a repeated owner ask):
+# every claim/peek/fold mints a worktree, and with no scheduled reap a
+# metaharness sidebar accretes one ghost project per room forever — the owner
+# once hand-swept ~90 of them. work gc --apply retires clean LANDED
+# rooms, prunes phantom records, and TTL-drops idle peeks; every live-room
+# refusal (lease, cwd occupant, bound pane, dirty tree) keeps its room.
+ExecStart=%(helm)s work gc --apply --repo %(cwd)s
+Nice=15
+"""
+
+_TIMER = """[Unit]
+Description=periodic helm gc (keeps every declared-retention stream in budget)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=%(interval)ds
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+TIMER_INTERVAL_S = 3600
+
+
+def timer_units(interval=TIMER_INTERVAL_S):
+    """(service_path, service_text, timer_path, timer_text). WorkingDirectory is
+    DERIVED, never a literal — an operator path baked into a tracked template is
+    both a never-track needle and a machine identity this repo cannot carry.
+    work.find_root folds a lane worktree back to the SHARED checkout so a
+    persistent unit never captures a disposable worktree as its cwd."""
+    helm_bin = os.path.join(os.path.expanduser("~"), ".local", "bin", "helm")
+    udir = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+    from . import work
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cwd = work.find_root(here) or here
+    return (os.path.join(udir, "helm-gc.service"),
+            _SERVICE % {"helm": helm_bin, "cwd": cwd},
+            os.path.join(udir, "helm-gc.timer"),
+            _TIMER % {"interval": interval})
+
+
+def ensure_timer(interval=TIMER_INTERVAL_S):
+    """(ok, detail) — install + enable the cadence. Mirrors proxywatch's
+    installer exactly, because the drain deserves the same shipping path the
+    watchers already have."""
+    import shutil
+    import subprocess
+    from . import pk
+    if interval < 1:
+        return False, "interval must be at least 1 second"
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return False, ("systemctl unavailable; run `helm gc --apply` from "
+                       "another scheduler (cron, a supervisor) — the drain "
+                       "matters more than the mechanism")
+    spath, service, tpath, timer = timer_units(interval)
+    try:
+        pk.atomic_write(spath, service)
+        pk.atomic_write(tpath, timer)
+    except OSError as e:
+        return False, "unit write failed: %s" % e
+    for cmd in ([systemctl, "--user", "daemon-reload"],
+                [systemctl, "--user", "enable", "--now", "helm-gc.timer"]):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, "%s failed: %s" % (
+                " ".join(cmd), (r.stderr or r.stdout or "").strip()[:200])
+    return True, "timer enabled every %ds (%s)" % (interval, tpath)
+
+
 def cmd_gc(args):
-    """gc [--dry | --apply] — enforce the declared retention budgets over the
-    derived exhaust. Dry-run default: report what WOULD be reaped, reap
-    NOTHING. --apply rotates/prunes exhaust streams only; source/archive/
-    state streams are surfaced loudly, never touched. Always rc 0 — gc is a
-    janitor, not a gate."""
+    """gc [--dry | --apply] [--install-timer] — enforce the declared retention
+    budgets over the derived exhaust. Dry-run default: report what WOULD be
+    reaped, reap NOTHING. --apply rotates/prunes exhaust streams only; source/
+    archive/state streams are surfaced loudly, never touched. --install-timer
+    wires the hourly cadence, because a retention policy nothing SCHEDULES is a
+    policy that does not exist (measured: 11,192 items over budget on a gc that
+    had never once run). Always rc 0 — gc is a janitor, not a gate."""
     args = list(args)
+    if "--install-timer" in args:
+        ok, detail = ensure_timer()
+        print("helm gc: %s" % detail, file=sys.stderr if not ok else sys.stdout)
+        return 0 if ok else 1
     bad = [a for a in args if a not in ("--dry", "--apply")]
     if bad or ("--dry" in args and "--apply" in args):
-        print("usage: helm gc [--dry | --apply]", file=sys.stderr)
+        print("usage: helm gc [--dry | --apply] [--install-timer]",
+              file=sys.stderr)
         return 2
     enforcing = "--apply" in args
     rows = scan()
