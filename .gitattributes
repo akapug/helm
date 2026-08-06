@@ -1,0 +1,25 @@
+# Normalise line endings in the repo so a checkout on any platform, and every
+# diff, agrees. Text files are stored LF and checked out native.
+* text=auto eol=lf
+
+# Shell entry points and hooks must stay LF even on a CRLF checkout — a shebang
+# followed by \r is not a shebang, and the failure ("bad interpreter") names the
+# interpreter rather than the line ending, which is a long detour.
+*.sh        text eol=lf
+bin/helm    text eol=lf
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.md        text eol=lf
+*.json      text eol=lf
+*.toml      text eol=lf
+
+# Binary — never touched, never diffed as text.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.gz        binary
+*.zip       binary

@@ -1,0 +1,131 @@
+name: ci
+
+# WHY THIS EXISTS: until now "main is green" meant an agent ran the suite by hand
+# and reported a number. That is a claim, and a claim is not a gate — a land whose
+# author forgot, or measured a different tree, was indistinguishable from a
+# verified one. This makes green a property of the commit instead.
+#
+# THE MATRIX IS THE POINT, not decoration. The install script and README declare
+# a Python 3.9 floor. That floor was derived from evidence (an AST sweep finds no
+# walrus, no match, no except*, no async anywhere in helm/, and the one 3.11-only
+# import — tomllib — is guarded with an ImportError fallback that degrades config
+# validation to a warning), but derived is not tested. Running the real suite on
+# 3.9 through 3.13 is what converts the declared floor into a measured one. If the
+# oldest column fails, the honest response is to RAISE THE DECLARED FLOOR to what
+# actually passes, never to drop the column and keep the claim.
+#
+# No secrets, no services, no network, no cache: helm is stdlib-only, so a CI that
+# needed provisioning would contradict the thing it is testing.
+
+# TRIGGERS ARE NARROW ON PURPOSE, and the concurrency comment below already said
+# why before the triggers obeyed it: "batching CI at slice ends is the repo's
+# convention". A bare `push:` fires on EVERY branch, and this repo runs ~40 live
+# lane worktrees at once — so the day Actions is enabled, one slice of ordinary
+# lane work would launch hundreds of hosted jobs. The owner's rule is explicit
+# and it is about SPAM, not about hosted runners: commits stay fine-grained,
+# pushes batch at the end of a slice, and a mid-slice run is waste.
+#
+# `push: branches: [main]` IS that batch point: the integrator lands to main, and
+# exactly one matrix runs per landed batch. `workflow_dispatch` keeps a manual
+# run available for anyone who wants one before landing.
+#
+# NO `pull_request:` — lanes here are merged locally by the integrator after a
+# fab-node gate; there is no PR in the loop to verify, so the trigger would only
+# ever duplicate the main run. Add it back the day this repo takes outside PRs,
+# and add it deliberately.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # a new push supersedes an in-flight run for the same ref — batching CI at slice
+  # ends is the repo's convention, so overlapping runs are waste, not coverage
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: suite (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false        # one column failing must not hide the others
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: identify the interpreter under test
+        run: python -c "import sys; print(sys.version)"
+
+      - name: git identity
+        # parts of the suite build throwaway git repos and COMMIT in them; a
+        # runner has no global identity, so those tests would fail for a reason
+        # that has nothing to do with helm
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "ci"
+          git config --global init.defaultBranch main
+
+      - name: the full suite
+        run: python -m unittest discover -s tests -q
+
+      - name: every verb is reachable and documented
+        # redundant with discovery, and deliberately so: this is the sweep that
+        # answers "does every verb a user can type actually respond", and naming
+        # it as its own step means a failure here is legible in the run list
+        # instead of buried in 3200 dots
+        run: python -m unittest tests.test_verb_sweep -v
+
+  install:
+    name: install script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"     # the DECLARED floor, tested at the floor
+
+      - name: dry run changes nothing
+        run: |
+          sh scripts/install.sh --prefix "$RUNNER_TEMP/bin" --dry-run
+          test ! -e "$RUNNER_TEMP/bin/helm" || { echo "dry-run created a link"; exit 1; }
+
+      - name: install, then RUN what was installed
+        # the install is not done because a symlink exists; it is done when the
+        # thing on PATH answers
+        run: |
+          sh scripts/install.sh --prefix "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/helm" --version
+          "$RUNNER_TEMP/bin/helm" --help > /dev/null
+
+      - name: re-running is idempotent, not an error
+        run: sh scripts/install.sh --prefix "$RUNNER_TEMP/bin"
+
+      - name: it refuses to clobber a file it did not create, and leaves it intact
+        # the assertion that matters is not just the non-zero exit — it is that
+        # the other file is still THERE afterwards
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin2"
+          printf 'someone elses binary\n' > "$RUNNER_TEMP/bin2/helm"
+          ! sh scripts/install.sh --prefix "$RUNNER_TEMP/bin2"
+          grep -q 'someone elses binary' "$RUNNER_TEMP/bin2/helm"
+
+      - name: --force replaces it deliberately
+        run: |
+          sh scripts/install.sh --prefix "$RUNNER_TEMP/bin2" --force
+          "$RUNNER_TEMP/bin2/helm" --version
+
+      - name: uninstall removes only its own link
+        run: |
+          sh scripts/install.sh --prefix "$RUNNER_TEMP/bin" --uninstall
+          test ! -e "$RUNNER_TEMP/bin/helm"
+          sh scripts/install.sh --prefix "$RUNNER_TEMP/bin" --uninstall

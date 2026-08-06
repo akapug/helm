@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # NODE MIGRATION — the one-node cutover.
 #
-# Migrates the team node (upstream unit dregg-cave.service, :8899 — the
-# owner's attestation chain) to RAM-hot (tmpfs data-dir) with disk as
+# Migrates the attestation-chain node (upstream unit dregg-cave.service, :8899)
+# to RAM-hot (tmpfs data-dir) with disk as
 # LOG-AFTER: restore-on-boot, snapshot after every attestation turn (helm's
 # cell.py fires ~/.local/bin/dregg-cave-snapshot), interval snapshot timer,
 # snapshot on stop. The strict RAM canon (premise a2a-ram-only-disk-log-after)
@@ -56,7 +56,7 @@ NODE_TOKEN=""
 unlock_node() {  # a freshly-booted node serves an EMPTY api until unlocked.
                  # Captures the bearer token so every later beat authenticates
                  # with MELD_NODE_TOKEN — the unlock endpoint RATE-LIMITS (429,
-                 # measured live 2026-07-19), and a passphrase-auth beat
+                 # the unlock endpoint rate-limits, and a passphrase-auth beat
                  # re-unlocks internally on every try, burning that budget.
   [ -n "${NODE_PASSPHRASE:-}" ] || { say "no NODE_PASSPHRASE — skipping unlock (reads may be empty on a fresh boot)"; return 0; }
   local i out tok
@@ -136,7 +136,7 @@ for line in reversed(sys.stdin.read().splitlines()):
   PROBE_BEAT_SEQ="$(printf '%s' "$BEAT_LINE" | python3 -c "import json,sys;print(json.load(sys.stdin)['seq'])")"
   say "probe beat receipt $PROBE_BEAT_RECEIPT (cell $PROBE_CELL, chain_index $PROBE_BEAT_INDEX, seq $PROBE_BEAT_SEQ, attempt $PROBE_BEAT_ATTEMPTS)"
 }
-# FIELD SEMANTICS (measured live 2026-07-19): `seq` is the cell's DURABLE slot
+# FIELD SEMANTICS: `seq` is the cell's DURABLE slot
 # counter — it lives in the redb and survives snapshot+cold-boot; `chain_index`
 # is the per-boot in-memory receipt chain and RESETS every restart (dregg#62
 # class) — it must never be used as a cross-restart invariant. attested_height
