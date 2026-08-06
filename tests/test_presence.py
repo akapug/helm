@@ -22,10 +22,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import chat, seats, web  # noqa: E402
 
+RUNTIME_ENV_KEYS = ("HELM_AGENT_HARNESS", "HELM_MODEL_FAMILY",
+                    "HELM_MODEL_BACKEND", "PI_CODING_AGENT",
+                    "HELM_PI_PROXY_KEY")
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
+            "HELM_PROC",
             "HELM_CHAT_NODE_URL", "MELD_CHAT_NODE_URL",
             "HELM_CELL_BIN", "MELD_CELL_BIN",
-            "HELM_CHAT_NAME", "MELD_CHAT_NAME")
+            "HELM_CHAT_NAME", "MELD_CHAT_NAME") + RUNTIME_ENV_KEYS
 
 
 class PresenceBase(unittest.TestCase):
@@ -38,6 +42,15 @@ class PresenceBase(unittest.TestCase):
         os.environ["HELM_HOME"] = os.path.join(cls.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(cls.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""  # transport off — hermetic
+        # DETERMINISTIC LIVENESS. A claim minted here records no session,
+        # so the classifier falls to a /proc scan for the HOLDER NAME —
+        # and against the real /proc that answers "live" or "unknown"
+        # depending on whether some unrelated process happens to carry
+        # the string. "porter" did on this box and "coder" did not, so
+        # the same fixture classified two ways and the suite disagreed
+        # with the fab node. An empty root makes the answer a DECISION.
+        os.makedirs(os.path.join(cls.tmp, "proc"), exist_ok=True)
+        os.environ["HELM_PROC"] = os.path.join(cls.tmp, "proc")
         cls.cwd_prior = os.getcwd()
         os.chdir(cls.tmp)  # no git cwd — homing defaults stay 'main'
 
@@ -53,6 +66,60 @@ class PresenceBase(unittest.TestCase):
 
     def setUp(self):
         shutil.rmtree(os.environ["HELM_CHAT_DIR"], ignore_errors=True)
+        for key in RUNTIME_ENV_KEYS:
+            os.environ.pop(key, None)
+
+
+class RuntimeMetadataTest(PresenceBase):
+    def test_runtime_metadata_persists_and_reaches_every_roster_projection(self):
+        runtime = {"agent_harness": "pi", "family": "codex",
+                   "backend": "proxy"}
+        seats.write_roster("pi-codex", session="p" * 32, cwd=self.tmp,
+                           runtime=runtime)
+        self.assertEqual(seats.roster()["pi-codex"]["runtime"], runtime)
+        full = seats.roster_report()["seats"][0]
+        light = seats.presence_report()[0]
+        self.assertEqual(full["runtime"], runtime)
+        self.assertEqual(light["runtime"], runtime)
+        self.assertEqual(seats.runtime_label(full), "codex · pi/proxy")
+        seats.write_roster("z-legacy", session="l" * 32, cwd=self.tmp)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(seats.cmd("seats", []), 0)
+        text = out.getvalue()
+        self.assertIn("[codex · pi/proxy]", text)
+        lines = [line for line in text.splitlines() if " pending " in line]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(len({line.index("pending") for line in lines}), 1)
+
+    def test_join_reads_pi_harness_and_canonical_backend_without_the_key(self):
+        seats.write_roster(
+            "pi-worker", session="q" * 32, cwd=self.tmp,
+            runtime={"agent_harness": "claude", "family": "old",
+                     "backend": "native"})
+        os.environ["PI_CODING_AGENT"] = "true"
+        os.environ["HELM_MODEL_BACKEND"] = "proxy"
+        os.environ["HELM_PI_PROXY_KEY"] = "secret-never-store"
+        with contextlib.redirect_stdout(io.StringIO()):
+            seats.join("q" * 32, cwd=self.tmp, seat="pi-worker")
+        text = json.dumps(seats.roster()["pi-worker"])
+        self.assertEqual(seats.roster()["pi-worker"]["runtime"],
+                         {"agent_harness": "pi", "backend": "proxy"})
+        self.assertNotIn("secret-never-store", text)
+
+    def test_explicit_runtime_never_composes_with_ambient_launch_labels(self):
+        os.environ["HELM_MODEL_FAMILY"] = "stale-family"
+        os.environ["HELM_MODEL_BACKEND"] = "native"
+        seats.write_roster(
+            "pi-worker", session="q" * 32, cwd=self.tmp,
+            runtime={"agent_harness": "pi"})
+        self.assertEqual(seats.roster()["pi-worker"]["runtime"],
+                         {"agent_harness": "pi"})
+
+    def test_legacy_join_stays_unlabelled_instead_of_guessing_from_name(self):
+        seats.write_roster("pi-looking-name", session="r" * 32, cwd=self.tmp)
+        self.assertNotIn("runtime", seats.roster()["pi-looking-name"])
+        self.assertEqual(seats.runtime_label(seats.roster_report()["seats"][0]), "")
 
 
 class StatusVerbTest(PresenceBase):
@@ -136,7 +203,15 @@ class PrecedenceTest(PresenceBase):
         claim = seats._claims_by_holder().get("coder")
         line, source = seats.status_line(row, claim)
         self.assertEqual(source, "claim")
-        self.assertIn("working lane/web-presence (helm)", line)
+        # THE VERB IS "UNVERIFIED", NOT "working", AND THAT IS THE POINT OF
+        # THE CLAIM-TIER FIX: this fixture mints a claim with NO session, so
+        # its holder cannot be proven live OR dead. Rendering it "working"
+        # is the collapse the liveness meld removed — an unprovable hold
+        # read exactly like a healthy one. The LADDER assertion is what this
+        # test is for and it is unchanged; only the honest word moved.
+        # (Measured 2026-08-04: 4 of 4 live production claims DO carry a
+        # session, so UNVERIFIED is an edge case, not the common render.)
+        self.assertIn("UNVERIFIED hold on lane/web-presence (helm)", line)
         self.assertIn("left", line)
         # an explicit status beats the claim
         seats.set_status("coder", "reviewing codex's diff")
@@ -157,7 +232,10 @@ class PrecedenceTest(PresenceBase):
         seats.claim("port:8317", "porter", ttl=120)
         line, source = seats.status_line({}, seats._claims_by_holder()["porter"])
         self.assertEqual(source, "claim")
-        self.assertIn("holds port:8317", line)
+        # Same claim-tier fix on the NON-worktree branch: a sessionless
+        # hold is unprovable, so it says so rather than reading as settled
+        # work. The tier assertion above is what this test is for.
+        self.assertIn("UNVERIFIED hold on port:8317", line)
 
     def test_presence_report_composes_the_same_line(self):
         seats.write_roster("coder", session="w" * 32, cwd=self.tmp,
@@ -327,6 +405,10 @@ class RosterLaunderCompletenessTest(PresenceBase):
             row["status"] = "busy" + ESC + "[2J" + BIDI + "wiping"
             row["status_ts"] = time.time()        # FRESH: the status tier wins
             row["status_by"] = "boss" + ESC + "[31m" + BIDI + "man"
+            row["runtime"] = {
+                "agent_harness": "pi" + ESC + "[2J" + BIDI + "h",
+                "family": "codex" + ESC + "[31m" + BIDI + "f",
+                "backend": "proxy" + ESC + "]0;t\x07" + BIDI + "b"}
             pk.write_json(seats.roster_path(), r)
         seats.claim("res" + ESC + "[2J" + BIDI + "ource",
                     self.SEAT, ttl=600)
@@ -404,14 +486,14 @@ class RosterLaunderCompletenessTest(PresenceBase):
         the seat column would 'pass' the leak walk while blanking the bar)."""
         self._plant()
         rep = seats.roster_report()
-        for field in ("seat", "project", "cwd", "home_room",
+        for field in ("seat", "runtime", "project", "cwd", "home_room",
                       "home_room_source", "status", "status_by", "line",
                       "source", "todo"):
             self.assertIn(field, rep["seats"][0],
                           "roster_report dropped field %r" % field)
         pres = seats.presence_report()
-        for field in ("seat", "presence", "dot", "status", "status_by",
-                      "line", "source"):
+        for field in ("seat", "runtime", "presence", "dot", "status",
+                      "status_by", "line", "source"):
             self.assertIn(field, pres[0],
                           "presence_report dropped field %r" % field)
         # the seat label must SURVIVE (laundered, inert), not vanish
@@ -469,7 +551,7 @@ class RosterLaunderCompletenessTest(PresenceBase):
 
 
 class StatusDecayTest(PresenceBase):
-    """Reviewer pin: a 3-day-old explicit status must not mask a LIVE
+    """Reviewer pin (P9): a 3-day-old explicit status must not mask a LIVE
     worktree lease — fresh claim beats stale status, fresh status still
     beats the claim, and the status age shows on every surface."""
 
@@ -487,7 +569,7 @@ class StatusDecayTest(PresenceBase):
         seats.claim("worktree:helm:web-presence", "victim", ttl=600)
         row = {x["seat"]: x for x in seats.presence_report()}["victim"]
         self.assertEqual(row["source"], "claim")      # live truth wins
-        self.assertIn("working lane/web-presence", row["line"])
+        self.assertIn("UNVERIFIED hold on lane/web-presence", row["line"])
         self.assertGreaterEqual(row["status_age"], 3 * 86400 - 60)
         # a FRESH status still outranks the claim
         seats.set_status("victim", "actually on triage")
@@ -537,7 +619,7 @@ class StatusDecayTest(PresenceBase):
         seats.claim("worktree:helm:real-work", "fut", ttl=600)
         row = {x["seat"]: x for x in seats.presence_report()}["fut"]
         self.assertEqual(row["source"], "claim")      # the lease surfaces
-        self.assertIn("working lane/real-work", row["line"])
+        self.assertIn("UNVERIFIED hold on lane/real-work", row["line"])
         self.assertIsNone(row["status_age"])          # junk ts = unknown age
 
     def test_small_clock_skew_still_reads_fresh(self):
@@ -655,7 +737,10 @@ class WebPresenceTest(PresenceBase):
     def test_poll_carries_the_presence_bar(self):
         """GET /api/chat — the existing ~2s poll — now carries `presence`:
         one light row per seat with the dot + the composed status line."""
-        seats.write_roster("coder", session="z" * 32, cwd=self.tmp)
+        seats.write_roster(
+            "coder", session="z" * 32, cwd=self.tmp,
+            runtime={"agent_harness": "pi", "family": "codex",
+                     "backend": "proxy"})
         seats.set_status("coder", "wiring the presence bar")
         st, body = self.get("/api/chat?since=0")
         self.assertEqual(st, 200)
@@ -665,16 +750,23 @@ class WebPresenceTest(PresenceBase):
         self.assertEqual(rows["coder"]["line"], "wiring the presence bar")
         self.assertEqual(rows["coder"]["source"], "status")
         self.assertEqual(rows["coder"]["dot"], "\U0001f7e2")
+        self.assertEqual(rows["coder"]["runtime"],
+                         {"agent_harness": "pi", "family": "codex",
+                          "backend": "proxy"})
 
     def test_roster_endpoint_carries_status_and_line(self):
-        seats.write_roster("coder", session="z" * 32, cwd=self.tmp,
-                           home_room="helm", home_room_source="explicit")
+        seats.write_roster(
+            "coder", session="z" * 32, cwd=self.tmp,
+            home_room="helm", home_room_source="explicit",
+            runtime={"agent_harness": "pi", "backend": "proxy"})
         st, body = self.get("/api/chat/roster")
         self.assertEqual(st, 200)
         d = json.loads(body)
         row = next(s for s in d["seats"] if s["seat"] == "coder")
         self.assertEqual(row["line"], "in #helm")
         self.assertEqual(row["source"], "home")
+        self.assertEqual(row["runtime"],
+                         {"agent_harness": "pi", "backend": "proxy"})
         self.assertIn("dot", row)
 
     def test_stale_seat_serves_black_dot(self):

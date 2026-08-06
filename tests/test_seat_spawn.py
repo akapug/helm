@@ -23,12 +23,50 @@ def _herdr_reply(result):
     return json.dumps({"id": "cli:x", "result": result})
 
 
+
+def _free_pid():
+    """A pid NOTHING is using, verified, not a hopeful constant.
+
+    This module hardcoded 4242. After a host reboot the pid space
+    refilled and 4242 became a live ROOT-owned process, so the reap path's
+    kill() returned EPERM instead of ESRCH and the test failed with "stale
+    headless codex pid 4242 NOT reaped ([Errno 1] Operation not permitted)".
+
+    The PRODUCTION code was right — refusing to signal a process you do not own
+    is correct. The test's premise (this pid is free) was simply never checked,
+    which made the suite depend on which pids the kernel had handed out. Scan
+    downward from the max and confirm /proc has no such entry."""
+    import os as _os
+    try:
+        with open("/proc/sys/kernel/pid_max") as f:
+            top = int(f.read().strip())
+    except Exception:
+        top = 4194304
+    for cand in range(top - 1, top - 5000, -1):
+        if not _os.path.exists("/proc/%d" % cand):
+            return cand
+    raise RuntimeError("no free pid found in the top 5000 — cannot fake a dead process")
+
+
+# Computed ONCE so every assertion in this module talks about the same pid.
+_FAKE_PID = _free_pid()
+
+
 class FakeProc:
     def __init__(self, stdout, rc=0, stderr=""):
         self.stdout, self.returncode, self.stderr = stdout, rc, stderr
 
 
-class FakeAdapter:
+# A pane whose composer is EMPTY — one that took its turn. Synthetic, but a
+# real frame's shape: `submit` proves delivery by READING THE COMPOSER BACK,
+# so a double returning "" models an UNREADABLE pane (UNKNOWN), not a
+# working one.
+ADVANCED_PANE = "\n".join(("─" * 40, "❯", "─" * 40,
+                           "  opus-5 | ~/dev/example/repo",
+                           "  ⏵⏵ bypass permissions on"))
+
+
+class FakeAdapter(harness._CLIAdapter):
     """Records the uniform seam ops spawn drives: list/stop (reap), spawn
     (pane create), send (onboarding injection)."""
     name, path = "fake", "/bin/fake"
@@ -45,8 +83,8 @@ class FakeAdapter:
     def list(self):
         return list(self.rows)
 
-    def read(self, handle, limit=3000):
-        return ""
+    def read(self, handle, limit=3000, timeout=60):
+        return ADVANCED_PANE
 
     def send(self, handle, text, enter=True):
         self.sent.append((handle, text, enter))
@@ -71,22 +109,38 @@ class FakeOrcaAdapter(FakeAdapter):
 
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
-            "HELM_SPAWN_SEND_DELAY", "HELM_CHAT_NAME")
+            "HELM_SPAWN_SEND_DELAY", "HELM_CHAT_NAME",
+            "HELM_SUBMIT_SETTLE_S")
 
 
 class SpawnBase(unittest.TestCase):
+    # A spawn with no --cwd now PROVISIONS the seat's home worktree (the
+    # dirty-main cure). Every test that is not about that seam stubs it to a
+    # tmp dir, so the suite never touches the real repo's worktrees.
+    PATCH_SEAT_HOME = True
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="helm-test-spawn-")
         self._env = {k: os.environ.get(k) for k in ENV_KEYS}
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm-home")
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.environ["HELM_SPAWN_SEND_DELAY"] = "0"
+        os.environ["HELM_SUBMIT_SETTLE_S"] = "0"
         for k in ("MELD_HOME", "MELD_CHAT_DIR", "HELM_CHAT_NAME"):
             os.environ.pop(k, None)
         self.timer = mock.patch.object(seat, "_ensure_autocompact_timer")
         self.ensure_timer = self.timer.start()
+        self.home = os.path.join(self.tmp, "seat-home")
+        os.makedirs(self.home, exist_ok=True)
+        self.seat_home = None
+        if self.PATCH_SEAT_HOME:
+            self.seat_home = mock.patch.object(seat, "_seat_home_cwd",
+                                               return_value=self.home)
+            self.seat_home.start()
 
     def tearDown(self):
+        if self.seat_home is not None:
+            self.seat_home.stop()
         self.timer.stop()
         for k, v in self._env.items():
             if v is None:
@@ -120,7 +174,7 @@ class SpawnBase(unittest.TestCase):
 
     def _spawn(self, args, adapter, popen=None):
         out, err = io.StringIO(), io.StringIO()
-        popen = popen or mock.Mock(return_value=mock.Mock(pid=4242))
+        popen = popen or mock.Mock(return_value=mock.Mock(pid=_FAKE_PID))
         with mock.patch.object(seat, "_write_launch_assets") as wla, \
                 mock.patch.object(harness, "detect", return_value=adapter), \
                 mock.patch.object(seat.subprocess, "Popen", popen), \
@@ -149,10 +203,10 @@ class HeadlessSpawnTest(SpawnBase):
         self.assertNotIn("\n", onboard)            # single keystroke burst
         kw = popen.call_args[1]
         self.assertTrue(kw.get("start_new_session"))   # setsid = detached
-        self.assertEqual(kw.get("cwd"), os.getcwd())
+        self.assertEqual(kw.get("cwd"), self.home)     # its OWN worktree
         wla.assert_called_once()                   # mint hygiene refreshed
         self.assertIn("HEADLESS", out)
-        self.assertIn("pid 4242", out)
+        self.assertIn("pid %d" % _FAKE_PID, out)
 
     def test_headless_registers_spawn_json_and_roster_mirror(self):
         d, launch = self._mint()
@@ -161,8 +215,8 @@ class HeadlessSpawnTest(SpawnBase):
         with open(os.path.join(d, "spawn.json")) as f:
             rec = json.load(f)
         self.assertEqual(rec["harness"], "headless")
-        self.assertEqual(rec["pid"], 4242)
-        self.assertEqual(rec["worktree"], os.getcwd())
+        self.assertEqual(rec["pid"], _FAKE_PID)
+        self.assertEqual(rec["worktree"], self.home)   # the register carries it
         self.assertEqual(rec["room"], "team-z")
         from helm import seats
         row = seats.roster().get("codex")
@@ -236,7 +290,7 @@ class HeadlessSpawnTest(SpawnBase):
             rc, _, _, _, _ = self._spawn(["codex"], None)
         self.assertEqual(rc, 1)
         self.assertEqual([x for x in kills if x[1]],
-                         [(4242, seat.signal.SIGTERM)])
+                         [(_FAKE_PID, seat.signal.SIGTERM)])
 
 
 class AdapterSpawnTest(SpawnBase):
@@ -252,12 +306,17 @@ class AdapterSpawnTest(SpawnBase):
         command, title, cwd = fake.spawned[0]
         self.assertEqual(command, shlex.quote(launch))
         self.assertEqual(title, "codex")
-        self.assertEqual(cwd, os.getcwd())
+        self.assertEqual(cwd, self.home)
+        # The onboarding brief is TYPED (no Enter), then submitted by a bare
+        # Enter of its own — and rc 0 above means the composer read back clear.
+        self.assertEqual(len(fake.sent), 2)
         handle, text, enter = fake.sent[0]
         self.assertEqual(handle, "pane-1")
-        self.assertTrue(enter)
+        self.assertFalse(enter, "the text leg must NOT carry Enter")
+        self.assertEqual(fake.sent[1], ("pane-1", "", True))
         self.assertIn("helm chat wait --seat codex --follow", text)
         self.assertIn("@codex", text)
+        self.assertIn("onboarding submitted", out)
         self.assertIn("spawned codex via fake", out)
         with open(os.path.join(d, "spawn.json")) as f:
             rec = json.load(f)
@@ -286,13 +345,13 @@ class AdapterSpawnTest(SpawnBase):
         d, _ = self._mint()
         sessions_dir = os.path.join(d, "claude", "sessions")
         os.makedirs(sessions_dir, exist_ok=True)
-        with open(os.path.join(sessions_dir, "4242.json"), "w") as f:
-            json.dump({"sessionId": "session-live", "pid": 4242,
+        with open(os.path.join(sessions_dir, "%d.json" % _FAKE_PID), "w") as f:
+            json.dump({"sessionId": "session-live", "pid": _FAKE_PID,
                        "procStart": "123"}, f)
         real_open = open
 
         def open_selected(path, *args, **kwargs):
-            if path == "/proc/4242/environ":
+            if path == "/proc/%d/environ" % _FAKE_PID:
                 return io.BytesIO(
                     b"SECRET=never-returned\0ORCA_PANE_KEY=tab:leaf\0"
                     b"ORCA_WORKTREE_ID=workspace:/w\0")
@@ -304,10 +363,10 @@ class AdapterSpawnTest(SpawnBase):
             identity, err = seat._live_session_orca_identity(
                 d, "session-live")
         self.assertIsNone(err)
-        self.assertEqual(identity, {"pid": 4242, "pane_key": "tab:leaf",
+        self.assertEqual(identity, {"pid": _FAKE_PID, "pane_key": "tab:leaf",
                                     "worktree_id": "workspace:/w"})
         self.assertNotIn("SECRET", identity)
-        alive.assert_called_once_with(4242, "123")
+        alive.assert_called_once_with(_FAKE_PID, "123")
 
     def test_spawn_backfills_session_when_sessionstart_won_the_race(self):
         d, _ = self._mint()
@@ -376,8 +435,10 @@ class AdapterSpawnTest(SpawnBase):
 
     def test_stale_orca_handle_repairs_from_exact_live_session(self):
         d, _ = self._mint()
-        sid = "8d2e1ff0-46c3-45b5-b817-8d82d7bc8d74"
-        self._record(d, handle="old", harness_name="orca", session=sid)
+        sid = "00000000-0000-4000-8000-000000000000"
+        self._record(d, handle="old", harness_name="orca", session=sid,
+                     pane_key="old-tab:old-leaf",
+                     worktree_id="workspace:/w")
         row = {"handle": "new", "title": "unrelated dynamic title",
                "status": "connected", "writable": True,
                "pty_id": "pty-1", "worktree_id": "workspace:/w"}
@@ -394,14 +455,101 @@ class AdapterSpawnTest(SpawnBase):
         self.assertIs(ad, fake)
         self.assertEqual(handle, "new")
         self.assertIn("repaired spawn handle", detail)
-        self.assertEqual(fake.pane_keys,
-                         ["old-tab:old-leaf", "old-tab:old-leaf"])
+        self.assertEqual(fake.pane_keys, ["old-tab:old-leaf"])
         with open(os.path.join(d, "spawn.json")) as f:
             rec = json.load(f)
         self.assertEqual(rec["handle"], "new")
         self.assertEqual(rec["pane_key"], "old-tab:old-leaf")
         self.assertEqual(rec["pty_id"], "pty-1")
         self.assertEqual(rec["session"], sid)
+
+    def test_stale_orca_handle_can_use_a_newer_proven_session_without_rebinding(self):
+        d, _ = self._mint()
+        registered = "00000000-0000-4000-8000-000000000000"
+        measured = "11111111-1111-4111-8111-111111111111"
+        self._record(d, handle="old", harness_name="orca", session=registered,
+                     pane_key="tab:leaf", worktree_id="workspace:/w")
+        row = {"handle": "new", "status": "connected", "writable": True,
+               "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        fake = FakeOrcaAdapter(
+            rows=[row], resolved={"handle": "new", "pty_id": "pty-1"})
+        identity = {"pid": 42, "pane_key": "tab:leaf",
+                    "worktree_id": "workspace:/w"}
+        with mock.patch.object(
+                seat, "_live_session_orca_identity",
+                return_value=(identity, None)) as prove:
+            ad, handle, detail = seat._resolve_registered_pane(
+                "codex", d=d, adapter=fake, identity_session=measured)
+        self.assertIs(ad, fake)
+        self.assertEqual(handle, "new")
+        self.assertIn("repaired spawn handle", detail)
+        prove.assert_called_once_with(d, measured)
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["handle"], "new")
+        self.assertEqual(rec["session"], registered)
+
+    def test_newer_session_cannot_fill_an_incomplete_spawn_identity(self):  # noqa: VACUOUS_ASSERTION — exact refusal and unchanged register are positive controls
+        d, _ = self._mint()
+        registered = "00000000-0000-4000-8000-000000000000"
+        measured = "11111111-1111-4111-8111-111111111111"
+        self._record(d, handle="old", harness_name="orca", session=registered,
+                     worktree_id="workspace:/w")
+        row = {"handle": "new", "status": "connected", "writable": True,
+               "pty_id": "pty-1", "worktree_id": "workspace:/w"}
+        fake = FakeOrcaAdapter(
+            rows=[row], resolved={"handle": "new", "pty_id": "pty-1"})
+        identity = {"pid": 42, "pane_key": "tab:leaf",
+                    "worktree_id": "workspace:/w"}
+        with mock.patch.object(
+                seat, "_live_session_orca_identity",
+                return_value=(identity, None)):
+            ad, handle, detail = seat._resolve_registered_pane(
+                "codex", d=d, adapter=fake, identity_session=measured)
+        self.assertIs(ad, fake)
+        self.assertIsNone(handle)
+        self.assertIn("no complete pane/worktree identity", detail)
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["handle"], "old")
+        self.assertEqual(rec["session"], registered)
+        self.assertNotIn("pane_key", rec)
+
+    def test_stale_orca_orphaned_replacement_repairs_only_for_send(self):
+        d, _ = self._mint()
+        self._record(d, handle="old", harness_name="orca", session="s1",
+                     pane_key="old-tab:old-leaf",
+                     worktree_id="workspace:/w")
+        row = {"handle": "new", "status": "connected", "writable": True,
+               "orphaned": True, "pty_id": "pty-1",
+               "worktree_id": "workspace:/w"}
+        fake = FakeOrcaAdapter(
+            rows=[row], resolved={"handle": "new", "pty_id": "pty-1"})
+        identity = {"pid": 42, "pane_key": "old-tab:old-leaf",
+                    "worktree_id": "workspace:/w"}
+        with mock.patch.object(seat, "_live_session_orca_identity",
+                               return_value=(identity, None)):
+            ad, handle, detail = seat._resolve_registered_pane(
+                "codex", d=d, adapter=fake, repair=False)
+            self.assertIs(ad, fake)
+            self.assertIsNone(handle)
+            self.assertIn("read-live", detail)
+            ad, handle, detail = seat._resolve_registered_pane(
+                "codex", d=d, adapter=fake, for_send=True)
+        self.assertIs(ad, fake)
+        self.assertEqual(handle, "new")
+        self.assertIn("SEND-ONLY", detail)
+        self.assertEqual(fake.pane_keys,
+                         ["old-tab:old-leaf", "old-tab:old-leaf"])
+        with open(os.path.join(d, "spawn.json")) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["handle"], "new")
+        self.assertEqual(rec["pane_key"], "old-tab:old-leaf")
+        ad, handle, detail = seat._resolve_registered_pane(
+            "codex", d=d, adapter=fake, repair=False)
+        self.assertIs(ad, fake)
+        self.assertIsNone(handle)
+        self.assertIn("orphaned", detail)
 
     def test_stale_orca_handle_ambiguity_fails_closed(self):
         d, _ = self._mint()
@@ -692,12 +840,18 @@ class AdapterSpawnTest(SpawnBase):
         self.assertEqual(fake.stopped, ["pane-1"])
 
     def test_orca_path_end_to_end_exact_cli_calls(self):
-        """The real OrcaAdapter under spawn: terminal list (reap scan) +
-        create + send --enter, exact argv, subprocess fully mocked."""
+        """The real OrcaAdapter under spawn, at the ARGV: terminal list (reap
+        scan) + create + the SPLIT submit — text with NO --enter, then a BARE
+        --enter, then the composer read-back that proves the pane advanced."""
         d, launch = self._mint()
+        advanced = FakeProc(_orca_reply({"terminal": {
+            "tail": ADVANCED_PANE.splitlines()}}))
         replies = [FakeProc(_orca_reply({"terminals": []})),
                    FakeProc(_orca_reply({"terminal": {"handle": "t7"}})),
-                   FakeProc(_orca_reply({}))]
+                   advanced,                           # the composer PRE-read
+                   FakeProc(_orca_reply({})),          # text, no Enter
+                   FakeProc(_orca_reply({})),          # the bare Enter
+                   advanced]                           # the read-back
         ad = harness.OrcaAdapter("/fake/bin/orca")
         with mock.patch.object(harness.subprocess, "run",
                                side_effect=replies) as run:
@@ -707,21 +861,35 @@ class AdapterSpawnTest(SpawnBase):
         self.assertEqual(calls[0], ["/fake/bin/orca", "terminal", "list",
                                     "--json"])
         self.assertEqual(calls[1], ["/fake/bin/orca", "terminal", "create",
-                                    "--worktree", "path:" + os.getcwd(),
+                                    "--worktree", "path:" + self.home,
                                     "--title", "codex", "--command",
                                     shlex.quote(launch), "--json"])
-        self.assertEqual(calls[2][:6], ["/fake/bin/orca", "terminal", "send",
+        self.assertEqual(calls[2][:5], ["/fake/bin/orca", "terminal", "read",
+                                        "--terminal", "t7"],
+                         "the composer is read BEFORE anything is typed")
+        self.assertEqual(calls[3][:6], ["/fake/bin/orca", "terminal", "send",
                                         "--terminal", "t7", "--text"])
-        self.assertIn("helm chat wait --seat codex --follow", calls[2][6])
-        self.assertEqual(calls[2][7:], ["--enter", "--json"])
+        self.assertIn("helm chat wait --seat codex --follow", calls[3][6])
+        self.assertEqual(calls[3][7:], ["--json"],
+                         "the text leg must NOT carry --enter")
+        self.assertEqual(calls[4], ["/fake/bin/orca", "terminal", "send",
+                                    "--terminal", "t7", "--text", "",
+                                    "--enter", "--json"])
+        self.assertEqual(calls[5][:5], ["/fake/bin/orca", "terminal", "read",
+                                        "--terminal", "t7"])
 
     def test_herdr_path_end_to_end_exact_cli_calls(self):
-        """The real HerdrAdapter under spawn: pane list + agent start +
-        pane run (text + Enter), exact argv, subprocess fully mocked."""
+        """The real HerdrAdapter under spawn: pane list + agent start + the
+        SPLIT submit (send-text, then a bare `pane run`), then the composer
+        read-back. Exact argv, subprocess fully mocked."""
         d, launch = self._mint()
+        advanced = FakeProc(_herdr_reply({"read": {"text": ADVANCED_PANE}}))
         replies = [FakeProc(_herdr_reply({"panes": []})),
                    FakeProc(_herdr_reply({"agent": {"pane_id": "w1:p1"}})),
-                   FakeProc(_herdr_reply({}))]
+                   advanced,                            # the composer PRE-read
+                   FakeProc(_herdr_reply({})),          # send-text, no Enter
+                   FakeProc(_herdr_reply({})),          # the bare Enter
+                   advanced]                            # the read-back
         ad = harness.HerdrAdapter("/fake/bin/herdr")
         with mock.patch.object(harness.subprocess, "run",
                                side_effect=replies) as run:
@@ -730,12 +898,23 @@ class AdapterSpawnTest(SpawnBase):
         calls = [c[0][0] for c in run.call_args_list]
         self.assertEqual(calls[0], ["/fake/bin/herdr", "pane", "list"])
         self.assertEqual(calls[1], ["/fake/bin/herdr", "agent", "start",
-                                    "codex", "--cwd", os.getcwd(),
+                                    "codex", "--cwd", self.home,
                                     "--no-focus", "--", "sh", "-lc",
                                     shlex.quote(launch)])
-        self.assertEqual(calls[2][:4], ["/fake/bin/herdr", "pane", "run",
+        # THE SPLIT, at herdr's own argv: `pane send-text` is literal
+        # keystrokes with no Enter; `pane run` is text+Enter, so a bare Enter
+        # is `pane run <handle> ""`. Both adapters inherit ONE submit, and this
+        # is what that one definition looks like on the other CLI.
+        self.assertEqual(calls[2][:5], ["/fake/bin/herdr", "pane", "read",
+                                        "w1:p1", "--source"],
+                         "the composer is read BEFORE anything is typed")
+        self.assertEqual(calls[3][:4], ["/fake/bin/herdr", "pane", "send-text",
                                         "w1:p1"])
-        self.assertIn("helm chat wait --seat codex --follow", calls[2][4])
+        self.assertIn("helm chat wait --seat codex --follow", calls[3][4])
+        self.assertEqual(calls[4], ["/fake/bin/herdr", "pane", "run",
+                                    "w1:p1", ""])
+        self.assertEqual(calls[5][:5], ["/fake/bin/herdr", "pane", "read",
+                                        "w1:p1", "--source"])
 
 
 class DryRunTest(SpawnBase):
@@ -781,6 +960,168 @@ class DryRunTest(SpawnBase):
         self.assertIn("first-prompt", out)
 
 
+class HomeWorktreeSpawnTest(SpawnBase):
+    """A spawn with no
+    --cwd lands the seat in its OWN worktree, never the shared main checkout.
+    The seam is NOT stubbed here: a throwaway git repo is the ground truth."""
+    PATCH_SEAT_HOME = False
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "proj")
+        os.makedirs(self.repo)
+        self._git("init", "-q", "-b", "main", ".")
+        self._git("config", "user.email", "t@t")
+        self._git("config", "user.name", "t")
+        with open(os.path.join(self.repo, "a.txt"), "w") as f:
+            f.write("hi\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "init")
+        self.prev = os.getcwd()
+        os.chdir(self.repo)
+        self.wt = os.path.join(self.tmp, "proj-wt", "seats", "codex")
+
+    def tearDown(self):
+        os.chdir(self.prev)
+        super().tearDown()
+
+    def _git(self, *args, where=None):
+        import subprocess
+        return subprocess.run(["git", "-C", where or self.repo] + list(args),
+                              capture_output=True, text=True)
+
+    def _spawn(self, args, adapter, remint=False):
+        """SpawnBase._spawn patches `seat.subprocess.Popen` — the attribute on
+        the SHARED subprocess module — which silently neuters `subprocess.run`
+        and therefore every `git` call this slice is built on (git answers a
+        Mock returncode ⇒ 'not a repo'). The headless launch is stubbed at its
+        OWN seam instead, so real git keeps working. remint=True lets the real
+        _write_launch_assets run (trust seeding)."""
+        out, err = io.StringIO(), io.StringIO()
+        launched = mock.Mock(return_value=_FAKE_PID)
+        with contextlib.ExitStack() as stack:
+            wla = (mock.Mock() if remint
+                   else stack.enter_context(
+                       mock.patch.object(seat, "_write_launch_assets")))
+            stack.enter_context(mock.patch.object(seat, "_headless_spawn",
+                                                  launched))
+            stack.enter_context(mock.patch.object(harness, "detect",
+                                                 return_value=adapter))
+            stack.enter_context(mock.patch.object(seat, "_pid_identity",
+                                                 return_value="test-start"))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            rc = seat.cmd_seat(["spawn"] + list(args))
+        return rc, out.getvalue(), err.getvalue(), wla, launched
+
+    @staticmethod
+    def _launched_cwd(launched):
+        return launched.call_args[0][2]   # _headless_spawn(sh, onboard, cwd, log)
+
+    def test_default_spawn_provisions_the_seat_home_and_never_uses_main(self):
+        self._mint()
+        rc, out, err, _, launched = self._spawn(["codex"], None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._launched_cwd(launched), self.wt)
+        self.assertNotEqual(self._launched_cwd(launched), self.repo)
+        self.assertTrue(os.path.isdir(self.wt))
+        self.assertEqual(self._git("rev-parse", "--abbrev-ref", "HEAD",
+                                   where=self.wt).stdout.strip(), "seat/codex")
+        # a seat HOME is long-lived, so it is NOT worktree-locked (a lane lock
+        # is a task lease; locking a home would make prune/gc refuse forever)
+        self.assertNotIn("locked", self._git("worktree", "list").stdout)
+        # and the register carries the path any agent resolves with `seat where`
+        with open(os.path.join(seat._instance_dir("codex", "codex"),
+                               "spawn.json")) as f:
+            self.assertEqual(json.load(f)["worktree"], self.wt)
+
+    def test_default_spawn_homes_to_the_same_project_room_no_scatter(self):
+        """The worktree folds to the project root via --git-common-dir, so
+        isolation must NOT scatter the seat out of its project room."""
+        from helm import seats
+        self._mint()
+        rc, _, err, _, _ = self._spawn(["codex"], None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(seats._git_project(self.wt),
+                         seats._git_project(self.repo))
+
+    def test_second_spawn_reuses_the_same_home_idempotently(self):
+        self._mint()
+        rc, _, err, _, _ = self._spawn(["codex"], None)
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(self.wt, "seat-scratch.txt"), "w") as f:
+            f.write("work in progress\n")
+        rc, out, err, _, launched = self._spawn(["codex", "--replace"], None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._launched_cwd(launched), self.wt)
+        self.assertTrue(os.path.exists(os.path.join(self.wt,
+                                                    "seat-scratch.txt")))
+        rows = [l for l in self._git("worktree", "list").stdout.splitlines()
+                if os.path.join("seats", "codex") in l]
+        self.assertEqual(len(rows), 1)      # one home, not two
+
+    def test_explicit_cwd_still_wins(self):
+        self._mint()
+        explicit = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(explicit)
+        rc, _, err, _, launched = self._spawn(["codex", "--cwd", explicit],
+                                              None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._launched_cwd(launched), explicit)
+        self.assertFalse(os.path.isdir(self.wt))   # nothing provisioned
+
+    def test_dry_run_shows_the_home_without_provisioning_it(self):
+        self._mint()
+        rc, out, err, _, launched = self._spawn(["codex", "--print"], None)
+        self.assertEqual(rc, 0, err)
+        launched.assert_not_called()
+        self.assertIn(self.wt, out)
+        self.assertIn("per-seat home worktree", out)
+        self.assertFalse(os.path.isdir(self.wt))   # a plan has NO side effects
+
+    def test_provisioning_failure_falls_open_to_the_shared_checkout(self):
+        """A git/metaharness hiccup must degrade the spawn to the old shared-
+        tree behaviour with a loud note — never abort the spawn."""
+        self._mint()
+        with mock.patch.object(harness, "ensure_home_worktree",
+                               side_effect=harness.HarnessError("disk full")):
+            rc, out, err, _, launched = self._spawn(["codex"], None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._launched_cwd(launched), self.repo)
+        self.assertIn("home worktree unavailable", err)
+        self.assertIn("disk full", err)
+
+    def test_adapter_without_the_optional_method_uses_the_native_floor(self):
+        """ensure_home_worktree is OPTIONAL on an adapter — a metaharness that
+        does not implement it still gets the isolated worktree."""
+        self._mint()
+        fake = FakeAdapter()
+        self.assertFalse(hasattr(fake, "ensure_home_worktree"))
+        rc, _, err, _, _ = self._spawn(["codex"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.spawned[0][2], self.wt)
+        self.assertTrue(os.path.isdir(self.wt))
+
+    def test_outside_a_checkout_the_old_cwd_default_holds(self):
+        plain = os.path.join(self.tmp, "no-repo")
+        os.makedirs(plain)
+        os.chdir(plain)
+        self._mint()
+        rc, _, err, _, launched = self._spawn(["codex"], None)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._launched_cwd(launched), plain)
+
+    def test_trust_seed_follows_the_home_worktree(self):
+        """_write_launch_assets(workdir=cwd) is what skips the folder-trust
+        dialog; it must be seeded for the NEW worktree, not the old cwd."""
+        d, _ = self._mint()
+        rc, _, err, _, _ = self._spawn(["codex"], None, remint=True)
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(d, "claude", ".claude.json")) as f:
+            trusted = json.load(f)["projects"]
+        self.assertIn(os.path.realpath(self.wt), trusted)
+
+
 class WhereTest(SpawnBase):
     def _where(self, args):
         out, err = io.StringIO(), io.StringIO()
@@ -794,9 +1135,9 @@ class WhereTest(SpawnBase):
         with mock.patch.object(seat, "_recorded_pid_alive", return_value=True):
             rc, out, err = self._where(["codex"])
         self.assertEqual(rc, 0, err)
-        self.assertIn("codex: headless pid 4242 — LIVE", out)
+        self.assertIn("codex: headless pid %d — LIVE" % _FAKE_PID, out)
         self.assertIn("room team-z", out)
-        self.assertIn(os.getcwd(), out)
+        self.assertIn(self.home, out)
 
     def test_where_json_is_machine_readable(self):
         self._mint()
@@ -806,7 +1147,7 @@ class WhereTest(SpawnBase):
         self.assertEqual(rc, 0, err)
         got = json.loads(out)
         self.assertEqual(got["harness"], "headless")
-        self.assertEqual(got["pid"], 4242)
+        self.assertEqual(got["pid"], _FAKE_PID)
         self.assertIs(got["alive"], False)
 
     def test_where_pane_record_checks_the_same_harness(self):
@@ -854,6 +1195,172 @@ class WhereTest(SpawnBase):
         rc, _, err = self._where(["codex", "--surprise"])
         self.assertEqual(rc, 2)
         self.assertIn("usage: helm seat where", err)
+
+
+class RebindTest(SpawnBase):
+    """`helm seat rebind` — the REBOOT verb.
+
+    helm keys a seat's register on its orca HANDLE, which is per-pane and dies
+    with the machine. Measured the morning after a host reboot:
+    `helm seat where` reported 6 of 7 seats GONE while two of them were
+    posting in chat at that moment. The seats never died; the REGISTER did."""
+
+    def _cli(self, args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(["rebind"] + list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_the_timer_reruns_rather_than_firing_once_at_boot(self):
+        """THE WHOLE POINT OF THE CADENCE. A register goes stale at boot, but
+        at boot the orca panes do not exist yet — a boot-ONLY pass would find
+        nothing to bind and report success over an empty fleet, which is the
+        confident-answer-over-skipped-work failure exactly. OnBootSec starts
+        the clock; OnUnitActiveSec is what makes it heal when the panes
+        actually come back (and again when one is replaced mid-day)."""
+        _, service, _, timer = seat.rebind_timer_units()
+        self.assertIn("seat rebind --all --apply", service)
+        self.assertIn("OnBootSec=", timer)
+        self.assertIn("OnUnitActiveSec=%ds" % seat.REBIND_INTERVAL_S, timer)
+
+    def test_the_timer_never_captures_a_disposable_worktree(self):
+        """A persistent unit outlives the checkout that installed it. This
+        verb is routinely run FROM a worktree, so a PATH-resolved helm would
+        point the fleet's repair at a directory `helm work gc` later reaps."""
+        with mock.patch.object(seat.shutil, "which",
+                               return_value="/tmp/helm-wt/gone/bin/helm"):
+            _, service, _, _ = seat.rebind_timer_units()
+        self.assertIn(os.path.expanduser("~/.local/bin/helm"), service)
+        self.assertNotIn("helm-wt", service)
+
+    def test_a_nonpositive_interval_installs_nothing(self):
+        ok, detail = seat.ensure_rebind_timer(0)
+        self.assertFalse(ok)
+        self.assertIn("at least 1 second", detail)
+
+    def test_the_documented_single_seat_form_reaches_the_verb(self):
+        """REGRESSION, and a lesson about where the tests were pointed. The
+        dispatcher handed the POSITIONAL seat name to a flags-only guard, so
+        `helm seat rebind gemini` answered "unknown arg 'gemini'" while
+        printing a usage line that shows exactly that call. Only `--all` ever
+        worked — which is precisely the form the fleet-wide reboot repair used,
+        so the break shipped green.
+
+        Every rebind test above calls seat._rebind() directly, i.e. it runs
+        UNDER the dispatcher rather than THROUGH it, and none of them could see
+        this. Assert on the CLI surface the operator actually types."""
+        rc, out, err = self._cli(["gemini"])
+        self.assertNotIn("unknown arg", err,
+                         "the seat name is a positional, not an unknown flag")
+        self.assertNotIn("usage: seat rebind", err)
+
+    def test_all_takes_no_seat_name(self):
+        """The guard that must survive the fix: --all and a name together are
+        contradictory, and that refusal comes from _rebind itself."""
+        rc, out, err = self._cli(["--all", "gemini"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--all takes no seat name", err)
+
+    def test_an_actually_unknown_flag_is_still_refused(self):
+        """The negative control. Loosening the guard to let the positional
+        through must not let a typo'd flag through with it — without this,
+        deleting the guard entirely passes the test above."""
+        rc, out, err = self._cli(["gemini", "--aply"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--aply", err)
+
+    def test_rebind_is_refused_when_two_panes_claim_one_seat(self):
+        """Ambiguity must FAIL CLOSED. Two live processes claiming one seat name
+        is a real condition (double-open, half-finished relaunch) and binding
+        either would make the register a coin flip."""
+        # TWO DISTINCT PANES, really present. The first version of this test
+        # mocked glob to return NOTHING — so it exercised ZERO panes while its
+        # name claimed two, and a mutation weakening the guard to `< 1` passed
+        # it unchanged. A test whose fixture cannot produce the condition it
+        # names proves only that the empty case refuses.
+        envs = {
+            "/proc/101/environ": b"HELM_CHAT_NAME=codex\0ORCA_PANE_KEY=pane-A\0"
+                                 b"ORCA_WORKTREE_ID=w1\0",
+            "/proc/202/environ": b"HELM_CHAT_NAME=codex\0ORCA_PANE_KEY=pane-B\0"
+                                 b"ORCA_WORKTREE_ID=w2\0",
+        }
+
+        def fake_open(path, *a, **kw):
+            return io.BytesIO(envs[path])
+
+        with mock.patch.object(seat.glob, "glob", return_value=list(envs)), \
+                mock.patch("builtins.open", fake_open):
+            ident, err = seat._live_seat_orca_identity("codex")
+        self.assertIsNone(ident, "two distinct panes must never resolve")
+        self.assertIn("2 distinct live panes", err)
+        self.assertIn("refusing to guess", err)
+
+    def test_one_seats_many_processes_are_one_pane_not_an_ambiguity(self):
+        """A seat legitimately owns several processes — the pane, its beacon,
+        its hooks — all carrying the SAME pane identity. Collapsing on pid
+        count would refuse every healthy seat; collapse on the identity."""
+        same = (b"HELM_CHAT_NAME=codex\0ORCA_PANE_KEY=pane-A\0"
+                b"ORCA_WORKTREE_ID=w1\0")
+        envs = {"/proc/101/environ": same, "/proc/202/environ": same,
+                "/proc/303/environ": same}
+
+        def fake_open(path, *a, **kw):
+            return io.BytesIO(envs[path])
+
+        with mock.patch.object(seat.glob, "glob", return_value=list(envs)), \
+                mock.patch("builtins.open", fake_open):
+            ident, err = seat._live_seat_orca_identity("codex")
+        self.assertIsNone(err, err)
+        self.assertEqual(ident["pane_key"], "pane-A")
+
+    def test_rebind_matches_on_the_seat_name_not_a_title_or_cwd(self):
+        """Identity is process-proven. A title or cwd is copyable presentation
+        and authorizes nothing — the same standard the pane resolver holds."""
+        import inspect
+        src = inspect.getsource(seat._live_seat_orca_identity)
+        self.assertIn("HELM_CHAT_NAME=", src)
+        for forgeable in ("title", "preview", "cwd"):
+            self.assertNotIn('row.get("%s")' % forgeable, src)
+
+    def test_rebind_dry_runs_by_default(self):
+        """A register rewrite leaves NO trace to inspect afterwards, so it must
+        prove-and-report before it writes. Asserted on the source contract:
+        apply=False never reaches the write."""
+        import inspect
+        src = inspect.getsource(seat.rebind_seat)
+        self.assertIn("if not apply:", src)
+        self.assertLess(src.index("if not apply:"), src.index("pk.write_json"))
+
+    def test_rebind_is_not_repair_and_drops_only_the_stale_guards(self):
+        """_prove_orca_replacement guards pane_key/worktree_id drift — correct
+        for a handle change WITHIN a generation, and exactly why it refuses a
+        reboot with 'spawn pane key conflicts with the live session'. Rebind
+        drops those two cached-copy comparisons and NOTHING else: the session
+        anchor, the resolve_pane chain and the single-writable-row match all
+        remain."""
+        import ast, inspect
+
+        def body_src(fn):
+            """Source with the DOCSTRING STRIPPED. The first version of this
+            test compared raw source and failed on rebind's own docstring, which
+            QUOTES the repair error to explain the difference — testing prose,
+            not behavior."""
+            tree = ast.parse(inspect.getsource(fn).lstrip())
+            node = tree.body[0]
+            stmts = node.body[1:] if (isinstance(node.body[0], ast.Expr) and
+                                      isinstance(node.body[0].value, ast.Constant)
+                                      ) else node.body
+            return "\n".join(ast.unparse(x) for x in stmts)
+
+        rebind = body_src(seat._prove_orca_rebind)
+        repair = body_src(seat._prove_orca_replacement)
+        # the repair GUARDS the cached keys; that is its job and it stays
+        self.assertIn("conflicts with the live session", repair)
+        # the rebind must not — a reboot changes both keys legitimately
+        self.assertNotIn("conflicts with the live session", rebind)
+        # ...and drops NOTHING else: every real check survives
+        for kept in ("resolve_pane", "writable", "_pane_live"):
+            self.assertIn(kept, rebind, kept)
 
 
 class GuardsAndHelpTest(SpawnBase):
@@ -908,6 +1415,35 @@ class GuardsAndHelpTest(SpawnBase):
         self.assertNotIn("\n", p)          # single keystroke burst, one line
         q = seat.onboarding_prompt("codex", room="team-x")
         self.assertIn("--room team-x", q)
+
+    def test_onboarding_takes_work_from_the_ledger_fold_not_history(self):
+        """THE RECOVERED-SEAT TRAP, three live instances inside 90 minutes:
+        a fresh session reads history, and stale rows read as
+        invitations. One seat rebuilt an already-superseded lane; another claimed
+        a CANCELLED row, then assembled a LAND READY from a cancelled vehicle
+        + an ungated approve + a tip that no longer resolves. The onboarding
+        prompt was the vector — it said "rows addressed @you are yours" with
+        nothing distinguishing live rows from dead ones.
+
+        The prompt must now direct work-taking through the LEDGER FOLD
+        (`helm dispatch list --open`) and state the status law: cancelled /
+        superseded / verdicted rows are DEAD however open the chat reads."""
+        p = seat.onboarding_prompt("codex")
+        # The fold is the work list...
+        self.assertIn("helm dispatch list --open", p)
+        # ...the status decides, and each dead state is named...
+        self.assertIn("CURRENT STATUS decides", p)
+        for word in ("cancelled", "superseded", "verdicted"):
+            self.assertIn(word, p)
+        # ...and the room is explicitly demoted to context.
+        self.assertIn("never your work list", p)
+        # The fold's own failure mode, an adversarial review's finding: "ONLY
+        # open rows" with no escape hatch inverts a blind read into no-work.
+        # An unreadable fold must be UNKNOWN, never an empty obligation set.
+        self.assertIn("UNKNOWN, never empty", p)
+        self.assertIn("do not infer no-work", p)
+        # Still one pane-safe line: the delivery constraint outranks prose.
+        self.assertNotIn("\n", p)
 
     def test_seat_usage_lists_spawn_and_where(self):
         out, err = io.StringIO(), io.StringIO()
