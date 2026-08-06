@@ -14,16 +14,17 @@ verb/what -> the surfaced line. So a capability rides the ONE JIT resolver
 gated (generic-only never fires), cap-4, per-session cooldown — with NO parallel
 injector. When the agent's current reasoning touches a capability's trigger, the
 capability surfaces one terse line: "you have <verb>: <what> (wired via <hook>,
-live)". The owner never has to say "reach for cv / a meld now".
+live)". The owner never has to say "reach for cv / a meld / a code-analysis powerpack now".
 
 live/absent is a PROBE, not a static fact: a POWERPACK only surfaces if actually
 wired (its MCP server present, or an explicit HELM_CAP_<id> flag). CORE is helm's
 own substrate — always live. VISIBILITY gates the PUBLIC export only: a
-private-hold powerpack still surfaces to its OWN wired agent (that is the whole
-point — its reasoning moment should reach for it), but helm does NOT advertise it
-in any public powerpack catalog (public_set withholds it).
+private-hold powerpack still surfaces to its OWN wired agent (that is
+the whole point — deep-code-analysis reasoning should reach for it), but helm
+does NOT advertise it in any public powerpack catalog (public_set withholds it).
 """
 import os
+import sys
 
 TIER_CORE = "core"
 TIER_POWERPACK = "powerpack"
@@ -149,11 +150,11 @@ CAPABILITIES = (
     },
     {
         "id": "recall",
-        "verb": "cv recall",
+        "verb": "cv recall (helm recall)",
         "tool": "mcp__cv__recall",
         "what": "cold semantic search over past agent sessions — 'have we "
                 "solved this before / where's the prior art'",
-        "wired_via": "clustervision (cv) MCP",
+        "wired_via": "clustervision (cv) MCP + the recall skill",
         "keywords": "recall,have we solved,solved this before,prior art,"
                     "prior session,past session,cold recall,already solved,"
                     "seen this before,did we do this,previously,dejavu",
@@ -162,6 +163,40 @@ CAPABILITIES = (
         "mcp": "cv",
     },
 )
+
+
+# ---------------------------------------------------------------------------
+# host-authored private-hold powerpacks (never shipped in the tree)
+# ---------------------------------------------------------------------------
+
+def _authored_powerpacks():
+    """Private-hold powerpacks declared HOST-LOCAL in the authored `host` block
+    (registry-authored.json `private_powerpacks`: a list of full capability
+    dicts, each shaped like a CAPABILITIES row — id/verb/tool/what/wired_via/
+    keywords/tier/visibility/mcp). EMPTY in the public tree: no powerpack name
+    ships in code, a deployment adds its own. Propagates registry.
+    AuthoredUnreadable so _capabilities() can surface a corrupt layer rather
+    than let it read as 'none configured' (a cross-family review finding)."""
+    from . import registry
+    pps = registry.authored_host().get("private_powerpacks")
+    return [p for p in pps if isinstance(p, dict)] if isinstance(pps, list) else []
+
+
+def _capabilities():
+    """Shipped CORE + public powerpacks, plus any host-authored private-hold
+    powerpacks. On an UNREADABLE authored layer this surfaces the failure LOUDLY
+    (stderr) and continues with the shipped set only — the corruption becomes
+    visible instead of silently reading as 'no private powerpacks configured',
+    the exact silent-drop the refuse discipline forbids."""
+    from . import registry
+    try:
+        extra = _authored_powerpacks()
+    except registry.AuthoredUnreadable as e:
+        print("helm capabilities: authored layer unreadable (%s) — private-hold "
+              "powerpacks omitted this pass; config recoverable from its "
+              ".corrupt backup" % e, file=sys.stderr)
+        extra = []
+    return tuple(CAPABILITIES) + tuple(extra)
 
 
 # ---------------------------------------------------------------------------
@@ -225,12 +260,12 @@ def is_wired(cap, env=None, mcps=None):
     return server in mcps
 
 
-def _probe_mcps_if_needed(env):
+def _probe_mcps_if_needed(env, caps):
     """One _effective_mcps() call per surfacing pass — and ONLY when a powerpack
-    lacks a decisive flag (a pure-core estate reads no config at all, keeping
-    the per-turn tax at zero)."""
+    in `caps` lacks a decisive flag (a pure-core estate reads no config at all,
+    keeping the per-turn tax at zero)."""
     need = any(c.get("tier") != TIER_CORE and c.get("mcp")
-               and _flag(c["id"], env) is None for c in CAPABILITIES)
+               and _flag(c["id"], env) is None for c in caps)
     return _effective_mcps() if need else set()
 
 
@@ -262,13 +297,15 @@ def _entry(cap):
 def live_entries(project=None, env=None):
     """The WIRED capabilities as JIT entries for the inject resolver — every
     capability whose live-probe passes. Visibility is NOT a gate here: a
-    private-hold powerpack still surfaces to its OWN wired agent (its reasoning
-    moment must reach for it); the hold bars only the PUBLIC export (public_set).
-    Fail-open per row: a raising probe drops that one capability, never the lane."""
+    private-hold powerpack still surfaces to its OWN wired agent (the
+    deep-code-analysis reasoning moment must reach for it); the hold bars only
+    the PUBLIC export (public_set). Fail-open per row: a raising probe drops
+    that one capability, never the lane."""
     env = os.environ if env is None else env
-    mcps = _probe_mcps_if_needed(env)
+    caps = _capabilities()
+    mcps = _probe_mcps_if_needed(env, caps)
     out = []
-    for cap in CAPABILITIES:
+    for cap in caps:
         try:
             if is_wired(cap, env=env, mcps=mcps):
                 out.append(_entry(cap))
@@ -285,15 +322,16 @@ def all_capabilities(env=None):
     """Every capability with its computed live/absent — the owner's OWN
     self-index (helm capabilities) sees everything, private-hold rows tagged."""
     env = os.environ if env is None else env
-    mcps = _probe_mcps_if_needed(env)
+    caps = _capabilities()
+    mcps = _probe_mcps_if_needed(env, caps)
     return [dict(cap, live=is_wired(cap, env=env, mcps=mcps))
-            for cap in CAPABILITIES]
+            for cap in caps]
 
 
 def public_set(env=None):
-    """The SHAREABLE capability set: public-visibility only. A private-hold
-    powerpack is withheld — helm does not advertise it in any public powerpack
-    catalog (owner packaging note)."""
+    """The SHAREABLE capability set: public-visibility only. private-hold
+    powerpacks are withheld — helm does not advertise them in any public
+    powerpack catalog (owner packaging note)."""
     return [c for c in all_capabilities(env=env) if c.get("visibility") == VIS_PUBLIC]
 
 

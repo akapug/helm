@@ -16,14 +16,19 @@ name is accepted READ-ONLY as a migration fallback (via home.env):
 
 OPTIONAL a2a transport: a small explicit-opt-in escape hatch (`helm cell
 <verb>` + chat's signed rows) can still drive a co-located cell binary when
-HELM_CELL_BIN (legacy MELD_CELL_BIN) points at one. It is NEVER auto-resolved
-(no PATH probe, no sibling-build guess) and NEVER used for attestation; with no
-HELM_CELL_BIN set it degrades cleanly. helm is fully functional without it.
+HELM_CELL_BIN (legacy MELD_CELL_BIN) points at one, or when the operator's
+`signer.env` names one — the file is a way of being TOLD, and being told is the
+whole content of the rule. A real env var still WINS; the file fills the gap.
+It is NEVER auto-resolved (no PATH probe, no sibling-build guess) and NEVER
+used for attestation; with neither set it degrades cleanly. helm is fully
+functional without it.
 
 Import-safe, stdlib-only.
 """
 import json
 import os
+import re
+import stat
 import subprocess
 import sys
 
@@ -151,10 +156,32 @@ def get_json(url, timeout=4):
         return None
 
 
-def post_json(url, payload, timeout=8, headers=None):
+def post_json(url, payload, timeout=8, headers=None, diag=None):
     """One node POST (JSON in, JSON out), same fail-open None law as get_json.
     `headers` layers over the default Content-Type (e.g. an Authorization
-    bearer for a gated node)."""
+    bearer for a gated node).
+
+    `diag`, when a dict is passed, is filled with WHY None came back: `status`
+    (int, for an HTTP error), `body` (a short excerpt) and `reason` (a sentence).
+    The fail-open contract is unchanged and no existing caller has to adapt.
+
+    THIS THREW AWAY THE ONE FACT THE CALLER NEEDED. `except HTTPError: return
+    None` collapsed a 401, a 404, a 500 and a refused connection into the same
+    value, which is why anchor() could only report "node unreachable/locked" —
+    a disjunction it had no way to resolve. Live case: every helm premise
+    attestation had been failing its external anchor with that message while the
+    node was demonstrably UP (GET /api/receipts -> 200 on the same host and
+    port). The real answer was HTTP 401 on POST /turn/submit, which is a
+    different problem with a different fix, and the message actively pointed
+    away from it — an operator reading "unreachable" checks whether the node is
+    running, and the node was running.
+
+    Third instance of one shape: the watchdog counting its own
+    input, `helm chat node up` reporting "the API never answered" while dregg had
+    printed the exact remedy, and now this. The pattern is always the same — an
+    error path that discards the discriminator and then reports the ambiguity as
+    if it were the finding.
+    """
     import urllib.error
     import urllib.request
     hdr = {"Content-Type": "application/json"}
@@ -165,9 +192,20 @@ def post_json(url, payload, timeout=8, headers=None):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
+        if diag is not None:
+            try:
+                body = e.read()[:300].decode("utf-8", "replace").strip()
+            except Exception:
+                body = ""
+            diag.update(status=e.code, body=body,
+                        reason="HTTP %s from %s%s" % (
+                            e.code, url, (": " + body) if body else ""))
         e.close()
         return None
-    except Exception:
+    except Exception as exc:
+        if diag is not None:
+            diag.update(status=None, body="",
+                        reason="%s: %s" % (exc.__class__.__name__, exc))
         return None
 
 
@@ -216,10 +254,21 @@ def anchor_submit(rec_hash, memo=None, timeout=8):
     tok = home.env("NODE_TOKEN")
     if tok:
         headers["Authorization"] = "Bearer " + tok
+    diag = {}
     resp = post_json(node_url() + ANCHOR_ENDPOINT, body, timeout=timeout,
-                     headers=headers)
+                     headers=headers, diag=diag)
     if resp is None:
-        return None, "node unreachable/locked at " + node_url()
+        # SAY WHICH. "unreachable/locked" is a disjunction, and an operator
+        # reading "unreachable" checks whether the node is running — which, for
+        # the 401 this actually was, is the one check that comes back fine.
+        why = diag.get("reason") or "no response and no error detail"
+        if diag.get("status") in (401, 403):
+            why += ("\n  the node is UP and REFUSING this turn — an auth "
+                    "problem, not a reachability one. helm sends a bearer from "
+                    "HELM_NODE_TOKEN; a node gated behind cipherclerk needs that "
+                    "token, while the signature-based client-sign path "
+                    "authenticates differently and can succeed while this fails.")
+        return None, "anchor rejected by %s — %s" % (node_url(), why)
     if not isinstance(resp, dict):   # a valid JSON list/string is NOT acceptance
         return None, "node returned a non-object anchor response — fail open"
     if resp.get("accepted") and resp.get("turn_hash"):
@@ -312,6 +361,125 @@ def _signer_env_file():
     return out
 
 
+PROFILE_ENV = ("HELM_CELL_PROFILE", "DREGG_PROFILE", "MELD_AGENT_PROFILE")
+
+
+def signer_profile():
+    """(profile, source) — the AMBIENT/configured signing profile, or (None,
+    None). Env only; this deliberately does NOT resolve identity.
+
+    Split out from the identity question on purpose: what the ENVIRONMENT says
+    and who this process ACTUALLY IS are different facts, and conflating them
+    is how a machine-global shell export came to speak for individual seats.
+    `signing_identity` is the one that decides; this only reports the claim.
+
+    AN ABSENT PROFILE IS ALSO NOT A NEUTRAL STATE. `build_env` mapped HELM_*
+    onto DREGG_* only when the HELM_* var was set, so an unset profile left
+    DREGG_PROFILE MISSING from the child env — and dregg's `active_name()`
+    then falls through to a machine-global ACTIVE file
+    (dregg/sdk/src/profiles.rs). helm chose nothing and the downstream default
+    filled the vacuum. Naming the profile explicitly closes that second hole
+    even where the first one is not what bit us."""
+    for name in PROFILE_ENV:
+        v = (os.environ.get(name) or "").strip()
+        if v:
+            return v, name
+    return None, None
+
+
+def derived_seat():
+    """This process's OWN seat name, or "" when it cannot prove which seat it
+    is. Never guesses.
+
+    THE SESSION ID IS THE AUTHORITY, NOT THE ENV VAR. `HELM_CHAT_NAME` is a
+    hint any ambient shell can set or clear; the session id is minted per
+    session and looked up in the roster, so it survives an environment that
+    lies. Measured in a fresh process with HELM_CHAT_NAME UNSET and
+    an ambient profile naming the owner: the sid path still resolved this seat
+    correctly. `meld._self_seat` already composes both in that order and is
+    reused rather than re-implemented — two identity resolvers diverge, and the
+    divergence is silent.
+
+    AND A NAME IS NOT YET A SIGNING IDENTITY — the row must be a FLEET ACTOR.
+    The roster holds two populations and they are already distinguishable
+    without inventing a marker: every fleet actor carries `home_room` (minted
+    by the join/adopt path when the session ACTS), while the owner's ad-hoc
+    sessions are OBSERVED rows with a sid and no home_room. Measured on a
+    live roster: 12 actors carry it, 10 rows do not, and the second set is
+    exactly the owner's own ad-hoc sessions plus never-joined rows.
+
+    That distinction is load-bearing, not cosmetic. Without it, the owner's own
+    session would resolve to its own session name, disagree with his ambient
+    and go UNSIGNED — breaking the one case that was always correct in order to
+    fix the ones that were not. With it, a home_room-less row is simply not a
+    signing identity, no conflict can fire, and his rows keep signing as
+    himself. It is also self-consistent going forward: the moment a session
+    joins a room it becomes an actor, which is precisely the moment
+    misattribution becomes possible."""
+    try:
+        from . import seats
+        from .meld import _self_seat
+        name = (_self_seat() or "").strip()
+        if not name:
+            return ""
+        row = (seats.roster() or {}).get(name)
+    except Exception:
+        return ""                     # unreadable identity is NOT permission
+    if not isinstance(row, dict) or not row.get("home_room"):
+        return ""                     # observed session, not a fleet actor
+    return name
+
+
+def signing_identity(explicit=None):
+    """(profile, refusal) — who this process may sign as, or why it may not.
+    Exactly one is non-None.
+
+    THE LAW ALREADY EXISTED AND WAS ENFORCED IN THE WRONG PLACE. `launch.py`
+    sets HELM_CELL_PROFILE and DREGG_PROFILE to the seat and says why: "a child
+    speaking as `seat` must sign as that same seat, not its launcher". That is
+    a SPAWN-TIME gate, so any seat arriving by another door — adopted, hand
+    started, restarted outside the launcher — bypasses it entirely and then
+    inherits whatever the ambient environment says. On the owner's box an ambient
+    shell rc exports HIS profile machine-wide, so 6 of 10 live seats were
+    signing as the OWNER. Owner-observed. This moves the same law to SIGNING time, which is
+    the boundary that actually matters: never trust that the caller checked.
+
+    WHY REFUSE RATHER THAN SIGN AS THE DERIVED SEAT — the argument
+    that settles the design: signing is
+    CRYPTOGRAPHIC. A seat cannot sign as itself without ITS OWN key material,
+    so "just use the derived identity" is not an available move. The only two
+    outcomes are BORROWING someone else's key or REFUSING, and a row signed
+    with a name its author does not hold the key for is a false claim about a
+    specific person on an append-only ledger. Refusing is the honest one.
+
+    PRECEDENCE:
+      1. `explicit` — a caller deliberately speaking for someone (`--seat kimi`
+         signing as kimi). STATED INTENT, never an inherited accident, so it
+         wins outright and is not a conflict.
+      2. a proven seat identity that AGREES with the ambient profile — the
+         normal, correctly-launched case.
+      3. DISAGREEMENT between a proven seat identity and the ambient profile —
+         REFUSED, naming both values so the reader can see what was rejected.
+      4. no proven seat identity — the ambient profile stands. This is the
+         population with no seat context, and collapsing it into a refusal
+         would strand it unsigned for no benefit."""
+    ambient, _src = signer_profile()
+    if explicit:
+        return explicit, None
+    seat = derived_seat()
+    if seat and ambient and ambient != seat:
+        return None, ("identity conflict: this process resolves to seat %r but "
+                      "the environment names profile %r. Signing as %r would "
+                      "attribute this row to someone who did not write it, and "
+                      "signing as %r is impossible without that seat's own key "
+                      "— so it is left UNSIGNED. Relaunch through `helm launch` "
+                      "(which sets both vars to the seat) or pass an explicit "
+                      "profile if you mean to speak for %r."
+                      % (seat, ambient, ambient, seat, ambient))
+    return (ambient or seat or None,
+            None if (ambient or seat) else "no profile and no derivable seat")
+
+
 def build_env():
     """Subprocess env for the OPTIONAL a2a transport: a copy of os.environ with
     each set HELM_* mapped onto its signer-facing names (legacy MELD_* and
@@ -331,14 +499,134 @@ def build_env():
         v = os.environ.get(h)
         if v is not None:
             env[m] = v
+    # THE PROFILE IS STATED EXPLICITLY OR NOT AT ALL. Leaving it absent hands
+    # the choice to the dregg client's default, which is the OWNER's profile —
+    # see `signer_profile`. When a seat identity is derivable but no profile
+    # env is set, name it on BOTH signer-facing vars so neither the dregg-native
+    # nor the legacy bin can fall back. When nothing is derivable the vars stay
+    # unset and `run_bin` refuses rather than letting the signer pick.
+    # Only fill a GAP: an operator's signer.env may legitimately name the
+    # profile, and a DERIVED seat identity must never clobber an EXPLICIT
+    # configuration — that is the same fills-gaps-only contract the file
+    # already has with os.environ, applied one layer further in.
+    if not (env.get("DREGG_PROFILE") or "").strip():
+        profile, _refusal = signing_identity()
+        if profile:
+            env["DREGG_PROFILE"] = profile
+            if not (env.get("MELD_AGENT_PROFILE") or "").strip():
+                env["MELD_AGENT_PROFILE"] = profile
     return env
+
+
+def _signer_env_writable_by_others(path=None):
+    """True when signer.env — or the directory holding it — is group- or
+    world-writable, i.e. when a seat OTHER than this one could choose the
+    binary this one is about to exec.
+
+    A blocking cross-family review finding, measured live: signer.env is -rw-rw-r--
+    inside a drwxrwxr-x ~/.helm, and `bin_path` execs whatever path it names
+    for EVERY seat. That is a CROSS-SEAT REDIRECT THE ENV ROUTE CANNOT
+    PRODUCE: one seat's environ is private to that process, but a shared file
+    is a channel from any same-uid seat into every other seat's exec. `_usable`
+    does not help — it happily passes a planted binary, because being a real
+    executable is exactly what an attacker's payload is.
+
+    THE DIRECTORY COUNTS AS MUCH AS THE FILE. A 0600 signer.env inside a
+    group-writable directory can be REPLACED wholesale — unlink plus create —
+    so checking the file alone would be a guard that reads the wrong object.
+    This is OpenSSH's StrictModes rule and it is right for the same reason.
+
+    AN ABSENT FILE ANSWERS FALSE and short-circuits: there is no file route to
+    abuse, bin_path returns None on its own a line later, and calling that
+    "writable by others" would be a guard inventing a threat. The directory's
+    mode is therefore only ever consulted for a file that EXISTS — which is
+    exactly the case where a loose directory lets someone replace it — and an
+    unstattable directory under an existing file answers True, because a mode
+    we could not check must never authorize an exec.
+
+    The env var route is untouched — a seat that sets HELM_CELL_BIN is
+    choosing its own signer and no shared file is involved, so a hostile
+    signer.env cannot disarm a seat that never consulted one."""
+    p = path or (home.env("CELL_ENV_FILE")
+                 or os.path.join(home.helm_home(), "signer.env"))
+    for target in (p, os.path.dirname(p) or "."):
+        try:
+            mode = os.stat(target).st_mode
+        except OSError:
+            if target == p:
+                return False        # absent file: nothing to trust, nothing to fear
+            return True             # unstattable directory: cannot verify, refuse
+        if mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return True
+    return False
 
 
 def bin_path():
     """The OPTIONAL a2a cell binary, EXPLICIT only: HELM_CELL_BIN (legacy
-    MELD_CELL_BIN). Never auto-resolved — no PATH probe, no sibling-build guess
-    — so helm never silently execs a binary. None => the transport degrades."""
-    return home.env("CELL_BIN") or None
+    MELD_CELL_BIN), else the operator's `signer.env`. Never auto-resolved — no
+    PATH probe, no sibling-build guess — so helm never silently execs a binary.
+    None => the transport degrades.
+
+    THE FILE IS A WAY OF BEING TOLD, WHICH IS THE LAW'S ACTUAL CONTENT. The
+    rule is that helm never execs a signer it was not TOLD about; an operator
+    writing an absolute path into signer.env has told it, as deliberately as an
+    export does. `build_env` has always read this file, with exactly these
+    semantics — gaps only, real env WINS — so a deployment can configure the
+    signer's posture ONCE and "an already-running seat picks it up with no
+    relaunch". This key was the one it skipped, and it is the key that decides
+    whether signing happens at all.
+
+    THE GAP THAT MADE THIS NECESSARY, measured over 30 room rows:
+    proxy-family seats carry HELM_CELL_BIN in their process env and signed
+    12/12; the two claude-direct seats must prefix it onto EVERY command,
+    because their shell state does not persist between tool calls, and signed
+    7 of 16. The board row said "RELAUNCH is the sole path" — it is not, but
+    the alternative was per-command ritual that both seats forgot about half
+    the time. A capability that degrades silently unless a human-shaped habit
+    holds every single time is not wired; it is available.
+
+    PRECEDENCE IS UNCHANGED AND DELIBERATE: a real env var still WINS, so a
+    seat that sets HELM_CELL_BIN keeps whatever it set, and an unset key falls
+    to the file. Absent file => None => the transport degrades exactly as
+    before, and `_usable()` still decides whether what we were told is real."""
+    told = home.env("CELL_BIN")
+    if told:
+        return told
+    # ONE read, both spellings — an operator writes the file by hand and the
+    # legacy MELD_ name is still accepted everywhere else helm reads config.
+    # STRICT MODES FIRST: a file ANY same-uid seat can rewrite must not choose
+    # the binary EVERY seat execs (see _signer_env_writable_by_others).
+    if _signer_env_writable_by_others():
+        return None
+    fromfile = _signer_env_file()
+    return fromfile.get("HELM_CELL_BIN") or fromfile.get("MELD_CELL_BIN") or None
+
+
+def _resolve(b):
+    """The configured signer as an executable path, or None.
+
+    A BARE NAME RESOLVES THROUGH PATH. seat.py's module doc has always taught
+    `HELM_CELL_BIN=dregg-client-sign` (the form every adopter copies), while
+    the launch env exports the absolute default — and the first cut of
+    `_usable` took the value as a literal path, so an operator who followed
+    the doc exactly got usable:False at runtime (measured on the original
+    row: doc says bare name, code exec's the value without PATH resolution).
+    The doc is the better form: a name the PATH already knows survives a
+    prefix change, and `helm seat`'s own proxy binary resolves the same way
+    (`_proxy_bin`: default, else PATH). Absolute and relative paths are taken
+    as-is; only a slash-free name goes to shutil.which, which is the
+    resolution the exec would have done — declared HERE, where the verdict
+    can still be refused, not left to the exec's silent failure.
+
+    THE TOLD-ABOUT LAW IS UNTOUCHED. This resolves a value the operator
+    already SET; it never probes PATH for a signer nobody configured.
+    """
+    if not b:
+        return None
+    if "/" in b:
+        return b
+    import shutil
+    return shutil.which(b)
 
 
 def _usable(b):
@@ -347,7 +635,169 @@ def _usable(b):
     a usable binary. os.path.exists() would say yes and let status claim
     'signed' + let the signing leg burn an unlock lap; isfile + X_OK is the
     minimum honest meaning of 'signer ready'."""
-    return bool(b and os.path.isfile(b) and os.access(b, os.X_OK))
+    p = _resolve(b)
+    return bool(p and os.path.isfile(p) and os.access(p, os.X_OK))
+
+
+SIGNER_CRATE = "dregg-sdk-net"   # the source the deployed signer must not lag
+_CORE_RE = re.compile(r"verified ML-DSA cores:\s*(.+)")
+
+
+def dregg_repo():
+    """Where the signer's SOURCE lives, or None when unconfigured. Config-driven,
+    never a hardcoded identity (a path literal inside portable logic is a bug):
+    HELM_DREGG_REPO env, else the host's authored `dregg_repo` (registry-authored
+    `host` block). No site-specific path ships in code. On an UNREADABLE authored
+    layer it warns LOUDLY and returns None (signer source unknown -> posts ride
+    unsigned, but never silently) rather than crashing the signer callers."""
+    v = home.env("DREGG_REPO")
+    if not v:
+        from . import registry
+        try:
+            v = registry.authored_host().get("dregg_repo")
+        except registry.AuthoredUnreadable as e:
+            print("helm cell: authored layer unreadable (%s) — signer source "
+                  "unknown; posts ride unsigned until fixed (config recoverable "
+                  "from its .corrupt backup)" % e, file=sys.stderr)
+            v = None
+    return os.path.expanduser(v) if v else None
+
+
+def _git(repo, args, timeout=10):
+    """(rc, stdout) from git in `repo`; rc None when git cannot run at all."""
+    try:
+        p = subprocess.run(["git", "-C", repo] + args, capture_output=True,
+                           text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ""
+    return p.returncode, p.stdout.strip()
+
+
+def signer_source_head(repo=None):
+    """Newest commit touching the signer's crate ON ANY REF.
+
+    `--all` is the load-bearing flag, not a flourish. The fix that repairs a
+    signer routinely lives on a LANE that was never merged — so a check against
+    main would have reported everything current while the cure sat one branch
+    away, which is precisely what happened in a prior incident.
+    """
+    repo = repo or dregg_repo()
+    if not repo:
+        return None  # no signer source configured -> no head; callers report it
+    rc, out = _git(repo, ["log", "-1", "--format=%ct%x09%h%x09%s", "--all",
+                          "--", SIGNER_CRATE])
+    if rc != 0 or not out:
+        return None
+    ts, _, rest = out.partition("\t")
+    commit, _, subject = rest.partition("\t")
+    try:
+        return {"ts": int(ts), "commit": commit, "subject": subject}
+    except ValueError:
+        return None
+
+
+def signer_staleness(repo=None):
+    """Does the DEPLOYED signer predate its own SOURCE?
+
+    THE 52-MINUTE CHECK. The owner once asked why dregg signing "is
+    broken again every time I look". It was not breaking repeatedly: the fix
+    (an exempt join must zero BOTH funding bounds — without it the first join
+    still asks the faucet for a funded grant and dies on `rate limited: 1
+    request per cell per minute`) was committed at 17:44 and the deployed
+    binary was built at 16:52. Fifty-two minutes too old, for twenty hours,
+    and every helm surface said "signer ready" the whole time.
+
+    Nothing here needs a provenance file or a build-system change: a binary's
+    mtime against its source's newest commit is enough, and it is the cheapest
+    honest answer available.
+
+    UNKNOWN IS NOT OK. No binary, no repo, or an unreadable git all return
+    state "unknown" — never "current". An unproven thing is not a safe thing,
+    and a staleness check that fails open would re-create the exact silence it
+    exists to break.
+    """
+    b = bin_path()
+    if not _usable(b):
+        return {"state": "unknown", "reason": "no usable signer configured"}
+    head = signer_source_head(repo)
+    if not head:
+        return {"state": "unknown",
+                "reason": "signer source unreadable (no %s repo at %s)"
+                          % (SIGNER_CRATE, repo or dregg_repo()
+                             or "(unconfigured — set HELM_DREGG_REPO or host.dregg_repo)")}
+    try:
+        built = os.path.getmtime(_resolve(b))
+    except OSError as exc:
+        return {"state": "unknown", "reason": "signer mtime unreadable (%s)"
+                % (exc.strerror or exc.__class__.__name__)}
+    lag = head["ts"] - built
+    row = {"built_at": int(built), "source_ts": head["ts"],
+           "commit": head["commit"], "subject": head["subject"],
+           "lag_s": int(lag)}
+    if lag <= 0:
+        row["state"] = "current"
+        row["reason"] = "signer is newer than its source"
+        return row
+    row["state"] = "stale"
+    row["reason"] = (
+        "the DEPLOYED signer predates its own source by %s — it was built "
+        "before %s (%s). Whatever that commit fixes is NOT in the running "
+        "binary. Rebuild the signer binary (never on the agent hub)."
+        % (_ago(lag), head["commit"], head["subject"]))
+    return row
+
+
+def _ago(seconds):
+    s = int(max(0, seconds))
+    if s < 5400:
+        return "%dm" % round(s / 60.0)
+    if s < 172800:
+        return "%.1fh" % (s / 3600.0)
+    return "%.1fd" % (s / 86400.0)
+
+
+def signer_cores():
+    """CAPABILITY, not presence: can the configured signer actually SIGN?
+
+    The binary announces this itself, unprompted, on stderr of EVERY run —
+    `verified ML-DSA cores: sign ExportAbsent, verify ExportAbsent` — and helm
+    had no code that read it, so `bin_status()` reported "signer ready" about a
+    binary that was telling us in plain text it had no signing cores. The probe
+    costs nothing measurable (the line is printed before any work: 0.00s wall,
+    ~9MB RSS) because it needs no verb and no network.
+
+    ExportAbsent is NOT automatically a fault — a deliberate marshal-only
+    devnet posture reports exactly that and signs via the unaudited fips204
+    fallback. So this REPORTS the cores and refuses to editorialise; the caller
+    decides whether the deployment it is looking at expects them present.
+    """
+    b = bin_path()
+    if not _usable(b):
+        return {"state": "unknown", "reason": "no usable signer configured"}
+    try:
+        p = subprocess.run([_resolve(b)], capture_output=True, text=True,
+                           timeout=20, env=build_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"state": "unknown",
+                "reason": "signer would not run (%s)"
+                          % (getattr(exc, "strerror", None) or
+                             exc.__class__.__name__)}
+    m = _CORE_RE.search((p.stderr or "") + "\n" + (p.stdout or ""))
+    if not m:
+        return {"state": "unknown",
+                "reason": "signer printed no ML-DSA core line"}
+    cores = {}
+    for part in m.group(1).split(","):
+        name, _, val = part.strip().partition(" ")
+        if name and val:
+            cores[name.strip()] = val.strip()
+    absent = sorted(k for k, v in cores.items() if v != "Installed")
+    return {"state": "marshal-only" if absent else "verified",
+            "cores": cores, "absent": absent,
+            "reason": ("Lean-verified cores present"
+                       if not absent else
+                       "running the unaudited fallback; absent: %s"
+                       % ", ".join(absent))}
 
 
 def bin_status():
@@ -358,10 +808,18 @@ def bin_status():
     if not b:
         return {"configured": False, "usable": False, "state": "unset",
                 "reason": "HELM_CELL_BIN is unset"}
-    if not os.path.exists(b):
+    p = _resolve(b)
+    if not p or not os.path.exists(p):
+        # The reason names the FORM looked up, never the VALUE: this string
+        # renders on status surfaces and a hostile path would ride it (the
+        # existing missing-signer test carries an ESC sequence for exactly
+        # that law).
         return {"configured": True, "usable": False, "state": "missing",
-                "reason": "HELM_CELL_BIN is set but the signer path does not exist"}
-    if not os.path.isfile(b):
+                "reason": ("HELM_CELL_BIN is set but the signer path does "
+                           "not exist" + ("" if "/" in b
+                                          else " (a bare name, looked up on "
+                                          "PATH)"))}
+    if not os.path.isfile(p):
         return {"configured": True, "usable": False, "state": "not_file",
                 "reason": "HELM_CELL_BIN is set but the signer path is not a regular file"}
     if not _usable(b):
