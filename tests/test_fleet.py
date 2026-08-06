@@ -5,11 +5,14 @@ session's record reader / _resume_sid and fleet's daemon matcher/walk run on
 real inputs, never mocked. SID truth is DELEGATED: fleet consumes
 session._proc_claude_rows() verbatim and re-derives none of it — pinned here
 both behaviorally and against the module source."""
+import ast
 import contextlib
 import inspect
 import io
+import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -105,12 +108,17 @@ class FleetRowsTest(unittest.TestCase):
         envs = {10: {"HELM_CHAT_NAME": "a-seat",
                      "CLAUDE_CODE_CHILD_SESSION": "1",
                      "CLAUDE_CODE_SESSION_ID": "x",
-                     "HELM_SKILL_DECK": "/home/u/dev/helm/skills"}}
+                     "HELM_SKILL_DECK": "/x/special-deck/skills"}}
         census = [srow(10, SID_A, "declared", root="/h/.claude")]
-        rows, daemons = self._rows(envs, census, {99: "111"})
+        # the deck tag is config-driven: the authored host block supplies the
+        # {substring: tag} map. Mock the accessor so no site deck name is baked
+        # into the test and the label-mechanism itself is what's under test.
+        with mock.patch("helm.registry.authored_host",
+                        return_value={"deck_labels": {"special-deck": "SD"}}):
+            rows, daemons = self._rows(envs, census, {99: "111"})
         r = rows[0]
         self.assertEqual((r["seat"], r["stamps"], r["deck"], r["daemon"]),
-                         ("a-seat", 2, "helm", 99))
+                         ("a-seat", 2, "SD", 99))
         self.assertEqual((r["sid"], r["sid_src"]), (SID_A, "record"))
         self.assertFalse(r["unknown"])
         self.assertEqual(daemons, [99])
@@ -158,7 +166,7 @@ class FleetRowsTest(unittest.TestCase):
         rows, _ = self._rows({6: {}}, [srow(6, root="/r")], roster=({}, True))
         self.assertEqual((rows[0]["seat"], rows[0]["seat_src"]),
                          (None, "roster-error"))
-        # Review note: a failed roster probe is a row-level UNKNOWN —
+        # round-2 finding 4: a failed roster probe is a row-level UNKNOWN —
         # the JSON bit must agree with the footer, and the render must never
         # claim the affirmative '(no seat)' fact
         self.assertTrue(rows[0]["unknown"])
@@ -176,7 +184,615 @@ class FleetRowsTest(unittest.TestCase):
         census = [srow(6, SID_A, "declared", root="/r")]
         rows, _ = self._rows({6: {}}, census, roster=({}, False))
         self.assertFalse(rows[0]["unknown"])
+        self.assertFalse(rows[0]["seat_unrenderable"])
         self.assertIn("(no seat)", self._render({6: {}}, census))
+
+    def test_empty_scrubbed_seat_name_renders_unrenderable_and_sets_json_bit(self):
+        # Present seat identity whose unprintable/hostile name scrubs to empty:
+        # seat_unrenderable is True, unknown is True, seat is '?', and render
+        # prints UNRENDERABLE rather than claiming '(no seat)' absence.
+        census = [srow(6, SID_A, "declared", root="/r")]
+        env = {6: {"HELM_CHAT_NAME": "\x00\x01"}}
+        rows, _ = self._rows(env, census, roster=({}, False))
+        self.assertEqual(rows[0]["seat"], "?")
+        self.assertTrue(rows[0]["seat_unrenderable"])
+        self.assertTrue(rows[0]["unknown"])
+        out = self._render(env, census)
+        self.assertIn("UNRENDERABLE", out)
+        self.assertNotIn("(no seat)", out)
+
+    def test_a_partially_scrubbed_name_cannot_ALIAS_a_real_seat(self):  # noqa: VACUOUS_ASSERTION — the unconditional control is the real-seat census asserted BEFORE the loop — seat=='alpha', unrenderable False — on the same observable
+        """THE COLLISION @codex-2 FOUND (gate:7ed2df89b215598c), and the arm
+        above is why it hid: a name that scrubs to NOTHING was handled, and a
+        name that scrubs to SOMETHING silently became that something.
+
+        Reproduced on the reviewed tip before the cure:
+            _seat_label('alpha')       -> 'alpha'
+            _seat_label('alpha\\u202e') -> 'alpha'   seat_unrenderable=False
+        so an attacker-shaped HELM_CHAT_NAME rendered as a legitimate seat in
+        the first and widest column of the census the owner reads to decide
+        what to kill. Laundering made it SAFE TO PRINT, never TRUE."""
+        census = [srow(6, SID_A, "declared", root="/r")]
+        # CONTROL FIRST: the real seat is untouched, so the assertions below
+        # are the alias being refused and not the census failing to resolve.
+        real, _ = self._rows({6: {"HELM_CHAT_NAME": "alpha"}}, census,
+                             roster=({}, False))
+        self.assertEqual(real[0]["seat"], "alpha")
+        self.assertFalse(real[0]["seat_unrenderable"])
+
+        for hostile, why in (("alpha‮", "RLO"),
+                             ("alpha​", "zero-width space"),
+                             ("alpha ", "trailing space")):
+            with self.subTest(why=why):
+                env = {6: {"HELM_CHAT_NAME": hostile}}
+                rows, _ = self._rows(env, census, roster=({}, False))
+                self.assertNotEqual(rows[0]["seat"], "alpha",
+                                    "%s aliased the real seat" % why)
+                self.assertEqual(rows[0]["seat"], "?")
+                self.assertTrue(rows[0]["seat_unrenderable"])
+                self.assertIn("UNRENDERABLE", self._render(env, census))
+
+    def test_a_hostile_ROSTER_KEY_cannot_alias_a_real_seat_either(self):
+        """DEFENCE IN DEPTH, and the distinction is measured rather than
+        assumed — an earlier draft of this docstring called it the twin of the
+        env arm and that was wrong. `home.chat_name()` RAISES SeatNameError on
+        a noncanonical name, so nothing hostile reaches the roster THROUGH
+        JOIN; `write_roster` itself carries no token check, so this rung
+        guards a direct roster write. Kept because the cost is one call and
+        the roster is a file — not because a reachable writer is known."""
+        census = [srow(6, SID_A, "declared", root="/r")]
+        # CONTROL: a canonical roster key still resolves normally.
+        ok, _ = self._rows({6: {}}, census,
+                           roster=({"beta-two": {"session": SID_A}}, False))
+        self.assertEqual((ok[0]["seat"], ok[0]["seat_src"]),
+                         ("beta-two", "roster"))
+        rows, _ = self._rows({6: {}}, census,
+                             roster=({"beta-two‮": {"session": SID_A}},
+                                     False))
+        self.assertNotEqual(rows[0]["seat"], "beta-two")
+        self.assertEqual(rows[0]["seat"], "?")
+        self.assertTrue(rows[0]["seat_unrenderable"])
+
+    def test_the_rung_accepts_what_helm_ITSELF_GENERATES(self):
+        """THE ORACLE THE ARM BELOW LACKS, and the reason it lacks it.
+
+        The arm below pins seven name shapes I HAND-WROTE. They are literals,
+        so it is not blind by the derived-expectation rule — but they are
+        shapes I IMAGINED. `seats.auto_name` is what helm actually ISSUES, and
+        it was available the whole time. If the generator or `pk.slug` ever
+        emitted something `_SEAT_TOKEN` rejects, my list could not notice: it
+        only knows what I thought of.
+
+        A derived oracle cannot see a bug because it agrees with itself; an
+        IMAGINED oracle cannot see one because it only knows the author's
+        imagination. One question catches both — if the system started
+        emitting something new tomorrow, would this test see it?
+
+        So this drives the REAL producer across the inputs that actually shape
+        its output — project basename, spaces, dots, case, non-ASCII, the
+        no-cwd fallback — plus the two shapes it reaches for when the base is
+        taken (the -N dedup) or unavailable (the agent-<sid8> hex floor). All
+        MEASURED canonical today; this is what makes that a standing property
+        instead of a fact about tonight."""
+        sid = "12345678-1234-1234-1234-123456789abc"
+        emitted = []
+        for cwd in ("/w/helm", "/w/My Project", "/w/weird.name",
+                    "/w/UPPER_Case", "/w/uber-projekt", None):
+            with self.subTest(cwd=cwd):
+                name = seats.auto_name(sid, cwd)
+                emitted.append(name)
+                self.assertTrue(
+                    seats._SEAT_TOKEN.fullmatch(name),
+                    "helm GENERATES %r and its own identity rung refuses it — "
+                    "the census would render a real seat UNRENDERABLE" % name)
+        # the two shapes auto_name reaches for beyond the base case, spelled
+        # the way its own source spells them.
+        for name in ("%s-2" % emitted[0], "agent-%s" % sid.replace("-", "")[:8]):
+            with self.subTest(name=name):
+                self.assertTrue(seats._SEAT_TOKEN.fullmatch(name), name)
+        # CONTROL on the same predicate: it is not simply saying yes. A name
+        # helm could never issue is still refused, so the accepts above are
+        # the rung agreeing with the generator and not a vacuous rung.
+        self.assertFalse(seats._SEAT_TOKEN.fullmatch("alpha\u202e"))
+        self.assertFalse(seats._SEAT_TOKEN.fullmatch("has space"))
+
+    def test_every_live_seat_name_survives_the_canonical_rung(self):  # noqa: VACUOUS_ASSERTION — this test IS the positive direction: every subTest asserts seat==name and unrenderable is False, so there is no absence to control for
+        """THE OTHER DIRECTION, which is the one that breaks an owner console
+        rather than a threat model: a rung that refuses hostile names is only
+        safe if it accepts every REAL one. Measured over the live population
+        before landing — 22 roster seats and 7 live HELM_CHAT_NAME values, all
+        canonical — and pinned here against the shapes helm actually issues."""
+        for name in ("alpha", "beta-two", "gamma-delta-epsilon",
+                     "delta7", "epsilon-long-hyphenated-name",
+                     "seat.with.dots", "seat_with_underscores"):
+            with self.subTest(name=name):
+                self.assertTrue(seats._SEAT_TOKEN.fullmatch(name), name)
+                census = [srow(6, SID_A, "declared", root="/r")]
+                rows, _ = self._rows({6: {"HELM_CHAT_NAME": name}}, census,
+                                     roster=({}, False))
+                self.assertEqual(rows[0]["seat"], name)
+                self.assertFalse(rows[0]["seat_unrenderable"])
+
+    def test_an_EXPLICIT_EMPTY_name_is_present_not_absent(self):
+        """@codex's exact-tip finding, and the door the rung did not cover.
+
+        `if name:` read an EXPLICIT empty identity — `HELM_CHAT_NAME=`, which
+        `session._full_environ` faithfully preserves as "" — as ABSENT, so it
+        fell through to the ROSTER branch and the process was handed whatever
+        seat owned that session. Measured before the cure: `_seat_for('sid',
+        {'HELM_CHAT_NAME': ''}, {'real': ...})` returned ('real', 'roster')
+        with unrenderable=False.
+
+        An empty declaration says "I am nobody", which is not the same as
+        saying nothing. Only the second may fall through — and the control
+        below is that arm, because a rung that also swallowed the ABSENT case
+        would break every roster-resolved row on the fleet."""
+        census = [srow(6, SID_A, "declared", root="/r")]
+        roster = ({"real": {"session": SID_A}}, False)
+        # CONTROL FIRST: a genuinely ABSENT key still resolves via the roster.
+        ok, _ = self._rows({6: {}}, census, roster=roster)
+        self.assertEqual((ok[0]["seat"], ok[0]["seat_src"]), ("real", "roster"))
+        self.assertFalse(ok[0]["seat_unrenderable"])
+        # ...and an EXPLICIT empty one is refused at the env arm instead.
+        rows, _ = self._rows({6: {"HELM_CHAT_NAME": ""}}, census, roster=roster)
+        self.assertNotEqual(rows[0]["seat"], "real",
+                            "an empty declaration aliased the roster identity")
+        self.assertEqual((rows[0]["seat"], rows[0]["seat_src"]), ("?", "env"))
+        self.assertTrue(rows[0]["seat_unrenderable"])
+
+    def test_a_row_can_be_BOTH_refused_and_probe_unknown(self):
+        """@codex's second finding: the footer partitioned on
+        `seat_unrenderable`, which assumed the two causes were exclusive. They
+        co-occur, and the probe evidence was the half that vanished — a
+        hostile name plus a failed cwd probe printed only the refusal."""
+        census = [srow(6, SID_A, "declared", root="/r", cwd=None)]
+        env = {6: {"HELM_CHAT_NAME": "alpha‮"}}
+        rows, _ = self._rows(env, census, roster=({}, False))
+        self.assertTrue(rows[0]["seat_unrenderable"])
+        self.assertTrue(rows[0]["probe_unknown"],
+                        "the failed cwd probe was swallowed by the refusal")
+        out = self._render(env, census)
+        self.assertIn("failed probes, not absence", out)
+        self.assertIn("show UNRENDERABLE", out)
+
+    # The row keys that carry UNKNOWN and its two causes. A site that puts any
+    # of these into a mapping is writing the vocabulary, whatever syntax it uses.
+    _UNKNOWN_VOCAB = ("unknown", "probe_unknown", "seat_unrenderable")
+
+    # ALLOWLIST OF LOCATIONS, derived by running the scan below over the real
+    # module — not from memory. Everything else that writes the vocabulary is
+    # an offender, including syntaxes nobody has thought of yet.
+    _MAY_WRITE_THE_VOCAB = {
+        "rows": "the row BUILDER — constructs each row with its causes",
+        "_mark_unknown": "the ONLY post-builder writer, and it always "
+                         "sets a cause",
+    }
+
+    @staticmethod
+    def _vocab_key_writes(tree, vocab):
+        """Every site putting a VOCAB word into a mapping, keyed by function.
+
+        Detects the four ways to name a mapping key without indirection: a
+        keyword argument, a dict-literal key, a subscript in STORE context,
+        and a constant argument to a mutator method. READS are deliberately
+        untouched — fleet._daemon_for returns the bare string "unknown" as a
+        daemon-attribution verdict, a HOMONYM of the row key, and a scan that
+        flagged it would be teaching people to ignore this guard."""
+        mutators = {"update", "setdefault", "__setitem__"}
+        found = {}
+
+        def note(scope, kind, word, lineno):
+            found.setdefault(scope, []).append("%s %r:%d" % (kind, word, lineno))
+
+        def check(n, scope):
+            if isinstance(n, ast.keyword) and n.arg in vocab:
+                note(scope, "kwarg", n.arg, getattr(n.value, "lineno", 0))
+            elif isinstance(n, ast.Dict):
+                for k in n.keys:
+                    if isinstance(k, ast.Constant) and k.value in vocab:
+                        note(scope, "dict-key", k.value, k.lineno)
+            elif (isinstance(n, ast.Subscript)
+                    and isinstance(n.ctx, ast.Store)
+                    and isinstance(n.slice, ast.Constant)
+                    and n.slice.value in vocab):
+                note(scope, "subscript-store", n.slice.value, n.lineno)
+            elif (isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr in mutators):
+                for a in n.args:
+                    if isinstance(a, ast.Constant) and a.value in vocab:
+                        note(scope, n.func.attr + "()", a.value, a.lineno)
+
+        # EVERY PRODUCER-CAPABLE SCOPE, not every FunctionDef. Descending from
+        # the module and renaming the scope at each producer boundary is what
+        # makes module-level statements and lambdas reachable at all; the
+        # previous cut iterated FunctionDef nodes, so anything outside a def
+        # was never visited and returned clean.
+        # Scope names are QUALIFIED, because the allowlist matches on this
+        # string. A bare name would allowlist `rows` ANYWHERE — a method
+        # `C.rows` writing the vocabulary would pass as though it were the
+        # module-level builder. I found that hole by testing a belief I had
+        # just told a reviewer was untested; it is the same too-coarse
+        # identity that produced the previous two defeats.
+        def header_nodes(node):
+            """Everything in a def/lambda/class that is NOT its body, DERIVED
+            from the node rather than listed from memory.
+
+            Decorators, argument defaults, annotations, return annotations,
+            base classes and class keywords all evaluate WHERE THE DEF IS
+            WRITTEN, so attributing them to the definition's own scope lets a
+            write hide in the header of an allowlisted owner and inherit its
+            permission.
+
+            THIS IS DERIVED, AND THE PREVIOUS CUT WAS NOT. That one
+            hand-enumerated the fields — decorator_list, defaults,
+            kw_defaults, the three arg lists, returns — and @codex-2 defeated
+            it three ways in one verdict: `*args: <write>` and `**kwargs:
+            <write>` (vararg/kwarg carry their OWN annotations and were in no
+            list I wrote), and `class C(metaclass=<write>)` (ClassDef
+            keywords, which I never enumerated at all). A hand-written field
+            list is my imagination standing in for the grammar, which is the
+            same failure as a hand-written test oracle.
+
+            Asking the NODE what its children are makes the answer complete
+            by construction, including for grammar Python has not shipped
+            yet: anything that is not a body statement is header."""
+            body = getattr(node, "body", None)
+            body = body if isinstance(body, list) else ([body] if body else [])
+            skip = {id(stmt) for stmt in body}
+            return [c for c in ast.iter_child_nodes(node) if id(c) not in skip]
+
+        # ONE visitor that dispatches on THE NODE ITSELF. An earlier cut had
+        # a helper that checked a node then descended into it, with the
+        # boundary test applied only to CHILDREN — so a def handed to that
+        # helper directly was walked in its PARENT's scope, and `def evil`
+        # nested inside allowlisted `rows` was attributed to `rows` and
+        # allowed. Dispatching on the node removes the class of bug rather
+        # than the instance.
+        def visit(node, scope, prefix):
+            if isinstance(node, ast.ClassDef):
+                for h in header_nodes(node):           # bases, decorators AND
+                    visit(h, scope, prefix)            # keywords (metaclass=)
+                for stmt in node.body:
+                    visit(stmt, scope, prefix + node.name + ".")
+                return
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qual = prefix + node.name
+                for h in header_nodes(node):
+                    visit(h, scope, prefix)            # header: parent scope
+                for stmt in node.body:
+                    visit(stmt, qual, qual + ".")
+                return
+            if isinstance(node, ast.Lambda):
+                for h in header_nodes(node):
+                    visit(h, scope, prefix)            # header: parent scope
+                visit(node.body, "<lambda@%d>" % node.lineno, prefix)
+                return
+            check(node, scope)
+            for child in ast.iter_child_nodes(node):
+                visit(child, scope, prefix)
+
+        for child in ast.iter_child_nodes(tree):
+            visit(child, "<module>", "")
+        return found
+
+    def test_NO_site_writes_the_UNKNOWN_vocabulary_outside_its_two_owners(self):
+        """THE STRUCTURAL GUARD — an ALLOWLIST of locations, after the
+        blocklist of syntaxes was defeated on review.
+
+        The first cut of this guard matched one syntax: an ast.Assign whose
+        target is a Subscript named "unknown". @codex-2 defeated it in one
+        line by appending an unused `_future_unknown_bypass(row)` calling
+        `row.update(unknown=True)`. All 233 fleet tests stayed green. That
+        future site mints the exact NEITHER-BUCKET state — unknown with no
+        cause, rc=1 with no owner-facing sentence — without touching
+        `_mark_unknown` and without a single subscript assignment.
+
+        A guard that enumerates FORBIDDEN SYNTAXES is a blocklist: it must be
+        widened for update, then setdefault, then |=, then whatever Python
+        adds, and it is silently wrong in between. So this inverts to an
+        ALLOWLIST OF LOCATIONS. Only two functions may write the vocabulary;
+        every other site is an offender no matter how it spells the write.
+        That is the same inversion landed in dispatches this session, applied
+        to the guard that was itself a blocklist.
+
+        THEN @codex-2 DEFEATED IT A SECOND TIME, and the second one is the
+        better lesson: `future = lambda row: row.update(unknown=True)` at
+        module scope returned {}. Not key indirection — an INVISIBLE FUTURE
+        PRODUCER. The scan iterated FunctionDef nodes, so a lambda (not a
+        FunctionDef) and anything at module scope (inside no def at all) were
+        never visited, and the scan reported clean by never looking. My
+        own stated limit had covered indirection and said nothing about
+        SCOPE COVERAGE, so I had under-scoped my own honesty note.
+
+        It now descends from the module and renames the scope at each
+        producer boundary, so module statements, lambdas, and nested defs are
+        all reachable and each is named in its own right.
+
+        HONEST LIMIT, because a guard that overclaims is worse than a narrow
+        one: this reads syntax, so KEY INDIRECTION defeats it —
+        `k = "unknown"; row[k] = True` is invisible here, as is any write
+        through a name computed at runtime. The runtime invariant in
+        test_NO_call_shape_... is the backstop for what syntax cannot see,
+        and neither arm alone is the whole claim. (A write in a nested def
+        USED to be attributed to its enclosing function and hidden by an
+        allowlisted parent; the scope-descent fixed that too, and the nested
+        case is a planted control below.)"""
+        scan = self._vocab_key_writes
+        vocab = self._UNKNOWN_VOCAB
+
+        # MUST-HIT CONTROLS, and the first is @codex-2's exact bypass kept as
+        # a live regression. A scan that cannot flag a planted offender would
+        # report the real module clean by failing to look.
+        planted = [
+            ("kwarg update (codex-2's exact bypass)",
+             "def _future_unknown_bypass(row):\n    row.update(unknown=True)\n"),
+            ("dict-literal update",
+             'def f(r):\n    r.update({"unknown": True})\n'),
+            ("setdefault",
+             'def f(r):\n    r.setdefault("unknown", True)\n'),
+            ("dict |= merge",
+             'def f(r):\n    r |= {"unknown": True}\n'),
+            ("plain subscript store",
+             'def f(r):\n    r["unknown"] = True\n'),
+            # @codex-2's THIRD bypass: a producer in a scope the scan never
+            # visited. Not key indirection — an invisible future producer.
+            ("lambda at MODULE scope (codex-2's third)",
+             "future = lambda row: row.update(unknown=True)\n"),
+            ("bare module-level statement",
+             'row = {}\nrow["unknown"] = True\n'),
+            ("lambda INSIDE a function",
+             'def f():\n    return lambda r: r.update(unknown=True)\n'),
+            ("nested def inside another def",
+             'def outer(r):\n'
+             '    def inner(x):\n        x["unknown"] = True\n'
+             '    return inner\n'),
+            # IMPERSONATION. I found these by testing a belief I had just
+            # told a reviewer was untested. The allowlist matches on the
+            # scope string, so an unqualified name would allowlist `rows`
+            # ANYWHERE — a method or nested def merely NAMED like an owner
+            # would inherit the owner's permission.
+            ("method impersonating the builder",
+             'class C:\n    def rows(self, r):\n        r["unknown"] = True\n'),
+            ("method impersonating the helper",
+             'class C:\n'
+             '    def _mark_unknown(self, r):\n        r["unknown"] = True\n'),
+            ("nested def impersonating the builder",
+             'def outer():\n'
+             '    def rows(r):\n        r["unknown"] = True\n'),
+            ("class BODY at module scope",
+             'class C:\n    row = {}\n    row["unknown"] = True\n'),
+            # HEADER vs BODY. @codex-2's second half: decorators and argument
+            # defaults evaluate where the def is WRITTEN, so attributing them
+            # to the function's own scope lets a write hide in the header of
+            # an allowlisted owner and inherit its permission.
+            ("decorator on the allowlisted builder",
+             '@deco(unknown=True)\ndef rows(r):\n    pass\n'),
+            ("argument default on the allowlisted builder",
+             'def rows(r, _x=D.update(unknown=True)):\n    pass\n'),
+            ("kwonly default on the allowlisted builder",
+             'def rows(r, *, _k=D.update(unknown=True)):\n    pass\n'),
+            # NESTED INSIDE an allowlisted owner — found by testing the
+            # visitor against its own structure, not by review.
+            ("def nested inside the allowlisted builder",
+             'def rows(r):\n'
+             '    def evil(x):\n        x["unknown"] = True\n'
+             '    return evil\n'),
+            ("class nested inside the allowlisted builder",
+             'def rows(r):\n    class C:\n'
+             '        def go(self, x):\n            x["unknown"] = True\n'),
+            ("lambda nested inside the allowlisted builder",
+             'def rows(r):\n    return lambda x: x.update(unknown=True)\n'),
+            # HEADER FIELDS I HAND-ENUMERATED AND MISSED. @codex-2 defeated
+            # the listed-by-hand version three ways in one verdict; the
+            # derived version catches these plus the two below it that I
+            # never thought to plant.
+            ("*args annotation on the allowlisted builder",
+             'def rows(*args: D.update(unknown=True)):\n    pass\n'),
+            ("**kwargs annotation on the allowlisted builder",
+             'def rows(**kw: D.update(unknown=True)):\n    pass\n'),
+            ("class metaclass= keyword",
+             'class C(metaclass=D.update(unknown=True)):\n    pass\n'),
+            ("positional-only annotation",
+             'def rows(a: D.update(unknown=True), /):\n    pass\n'),
+            ("return annotation",
+             'def rows() -> D.update(unknown=True):\n    pass\n'),
+        ]
+        # THE UNCONDITIONAL POSITIVE CONTROL, hoisted out of the loop below.
+        # Everything after this runs inside a for, so an empty or truncated
+        # `planted` would skip every control and leave the final assertion
+        # proving nothing — helm's vacuous-assertion rung caught that shape
+        # here twice. This one call cannot be skipped, and it is @codex-2's
+        # exact bypass, so the single most important control is the one that
+        # does not depend on loop iteration.
+        self.assertTrue(
+            scan(ast.parse("def _future_unknown_bypass(row):\n"
+                           "    row.update(unknown=True)\n"), vocab),
+            "the scan cannot see the bypass this guard was rewritten for, so "
+            "its verdict on the real module below means nothing")
+        # The SECOND defeat, also unconditional: a module-scope lambda. The
+        # scan returned {} for this while passing every control above, so a
+        # control set that only covers def-scope proves nothing about reach.
+        self.assertTrue(
+            scan(ast.parse("f = lambda row: row.update(unknown=True)\n"), vocab),
+            "the scan cannot see a MODULE-SCOPE LAMBDA producer, which is "
+            "how it read clean while a live bypass sat in the file")
+        # ONE function computes offenders, and it is called on a KNOWN-BAD
+        # module and on the real one. Both assertions below therefore
+        # constrain the SAME observable — which is what makes the empty
+        # result meaningful, and is also the only form helm's
+        # vacuous-assertion rung accepts as a positive control (it matches
+        # on the root NAME, so a separately-named control variable does not
+        # cover the assertion it was written for).
+        def offenders_in(src):
+            writes = scan(ast.parse(src) if isinstance(src, str) else src,
+                          vocab)
+            return {fn: sites for fn, sites in writes.items()
+                    if fn not in self._MAY_WRITE_THE_VOCAB}
+
+        self.assertTrue(
+            offenders_in('def evil(r):\n    r["unknown"] = True\n'),
+            "the allowlist filter produced NO offender for a module that "
+            "plainly contains one, so the empty result below would prove "
+            "nothing about the real module")
+        self.assertEqual(len(planted), 24,
+                         "the planted-offender set was truncated to %d, so "
+                         "the loop controls cannot vouch for the scan"
+                         % len(planted))
+        for label, src in planted:
+            self.assertTrue(
+                scan(ast.parse(src), vocab),
+                "the scan did NOT flag a planted offender (%s), so its "
+                "verdict on the real module means nothing" % label)
+
+        # BOTH CONTROLS ON ONE OBSERVABLE, adjacent on purpose. A negative
+        # control alone cannot tell "reads are correctly ignored" from "the
+        # scan is dead"; the positive beside it settles which, and the two
+        # catch opposite failures.
+        write_src = 'def f(r):\n    r["unknown"] = True\n'
+        read_src = 'def f(r):\n    return r.get("unknown")\n'
+        self.assertTrue(
+            scan(ast.parse(write_src), vocab),
+            "the scan is dead: it did not flag a plain write, so the READ "
+            "control below would pass for the wrong reason")
+        self.assertFalse(
+            scan(ast.parse(read_src), vocab),
+            "reading the field was flagged as a write — the guard would cry "
+            "wolf and get deleted by whoever needs to read it")
+
+        # CONTROL: the allowlist names must EXIST, or a rename silently
+        # empties the guard while leaving it green.
+        module_fns = {n.name for n in ast.walk(ast.parse(inspect.getsource(fleet)))
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+        def missing_from(names):
+            return sorted(set(names) - module_fns)
+
+        # Same one-helper-two-inputs shape as offenders_in: a name fleet
+        # provably does NOT have must come back missing, or an empty result
+        # for the real allowlist would only mean module_fns came back empty.
+        self.assertTrue(
+            missing_from(["_a_name_fleet_definitely_does_not_define"]),
+            "a name fleet does not define was NOT reported missing, so the "
+            "function inventory is empty and the check below is vacuous")
+        self.assertEqual(missing_from(self._MAY_WRITE_THE_VOCAB), [],
+                         "allowlisted %r no longer exist in fleet, so the "
+                         "allowlist is stale and permits nothing it names"
+                         % (missing_from(self._MAY_WRITE_THE_VOCAB),))
+
+        real_src = inspect.getsource(fleet)
+        self.assertEqual(offenders_in(real_src), {},
+                         "these write UNKNOWN or one of its causes outside "
+                         "the two owners, so a row can be minted that lands "
+                         "in NEITHER footer bucket: %s" % (offenders_in(real_src),))
+
+    def test_NO_call_shape_of_the_helper_yields_an_UNCATEGORIZED_unknown(self):
+        """THE INVARIANT, ASKED OF THE SIGNATURE INSTEAD OF OF MY MEMORY.
+
+        `unknown` with no cause bit is rc=1 with NO owner-facing sentence —
+        the NEITHER-bucket class this helper exists to close. I closed it at
+        the four call sites and then reopened it myself: a `probe=False`
+        escape, added so "a closed class has a door", emitted precisely that
+        row, and the test that stood here asserted the uncategorized row was
+        CORRECT. It had no call site and could not have gained a right one.
+        @codex-2 caught it on review.
+
+        So this arm does not enumerate the call shapes I remember. It reads
+        them off `inspect.signature` and drives every one, and it reads the
+        CAUSE NAMES off the footer's own partition rather than restating
+        them. Both oracles are things helm already contains, and neither is
+        the code under test — the footer CONSUMES these bits, `_mark_unknown`
+        produces them, so the check cannot pass by agreeing with itself.
+
+        A bypass that suppresses the only cause the helper can state fails
+        here the day it lands. A genuine second cause — its own bit, its own
+        footer sentence, a producer that emits it — passes without an edit."""
+        src = inspect.getsource(fleet)
+        causes = sorted(set(re.findall(
+            r'for r in unknowns if r\.get\("(\w+)"\)', src)))
+        # MUST-HIT: an empty or shrunken derivation would make every
+        # assertion below vacuously true, so prove the oracle read the footer
+        # before trusting a single verdict it produces.
+        self.assertIn("probe_unknown", causes,
+                      "derived the footer's cause bits as %r — the partition "
+                      "at fleet._render moved or was renamed, so this test "
+                      "was about to pass without checking anything" % (causes,))
+
+        sig = inspect.signature(fleet._mark_unknown).parameters
+        # POSITIVE CONTROL for the emptiness assertion below. "No undrivable
+        # parameters" and "I could not read the signature at all" produce the
+        # SAME empty list, so prove the read worked by finding the one
+        # parameter that must always be present. helm's own vacuous-assertion
+        # rung caught this arm missing exactly this, which is the class the
+        # arm is itself about.
+        self.assertIn("row", sig,
+                      "signature read returned %r — every assertion below "
+                      "would pass by having looked at nothing" % (list(sig),))
+        params = [p for p in sig.values() if p.name != "row"]
+        undrivable = [p.name for p in params if not isinstance(p.default, bool)]
+        self.assertEqual(undrivable, [],
+                         "cannot drive %r, so this test would report 'no "
+                         "uncategorized row reachable' having never looked. "
+                         "Extend the driver to cover it." % (undrivable,))
+
+        names = [p.name for p in params]
+        for combo in itertools.product((True, False), repeat=len(names)):
+            kwargs = dict(zip(names, combo))
+            row = {}
+            fleet._mark_unknown(row, **kwargs)
+            self.assertTrue(row.get("unknown"),
+                            "_mark_unknown(%r) did not mark the row" % kwargs)
+            self.assertTrue(
+                [c for c in causes if row.get(c)],
+                "_mark_unknown(%r) produced unknown=True with NONE of the "
+                "footer's cause bits %r — rc=1, and the row appears under "
+                "neither owner-facing sentence: %r" % (kwargs, causes, row))
+
+    def test_late_probe_failures_still_carry_their_cause(self):
+        """@codex's three: terminal-inventory failure, unproven pane, and
+        duplicate pane all mutate `unknown` AFTER the row is built. Each used
+        to leave probe_unknown false, so the row vanished from both footers
+        while the JSON still claimed a two-cause model."""
+        census = [srow(6, SID_A, "declared", root="/r")]
+        # (a) terminal inventory failed
+        rows, _ = self._rows({6: {}}, census, daemons={9: "d1"},
+                             terminals=([], True))
+        self.assertTrue(rows[0]["unknown"])
+        self.assertTrue(rows[0]["probe_unknown"], "terminal-inventory failure")
+        # (b) pane not proven
+        rows, _ = self._rows({6: {}}, census, daemons={9: "d1"},
+                             terminals=([{"handle": "t1"}], False),
+                             pane_for=lambda env, terms: (None, False))
+        self.assertTrue(rows[0]["probe_unknown"], "unproven pane")
+        # (c) two rows claiming one pane
+        two = [srow(6, SID_A, "declared", root="/r"),
+               srow(7, SID_B, "declared", root="/r")]
+        rows, _ = self._rows({6: {}, 7: {}}, two, daemons={9: "d1"},
+                             terminals=([{"handle": "t1"}], False),
+                             pane_for=lambda env, terms: ("t1", True))
+        for r in rows:
+            self.assertTrue(r["probe_unknown"], "duplicate pane")
+
+    def test_the_footer_separates_a_REFUSED_name_from_a_FAILED_probe(self):
+        """SEEN ON THE OWNER'S SURFACE, not inferred from the table dict.
+
+        Both cases set `unknown`, and before this the footer called every one
+        of them a FAILED PROBE — which sent a reader hunting a broken
+        instrument while a noncanonical name sat in the row it was printed
+        for. The next move differs: a failed probe means doubt the
+        instrument, a refused identity means doubt the PROCESS. The tool
+        already knew which; it just said the wrong one."""
+        census = [srow(6, SID_A, "declared", root="/r"),
+                  srow(7, SID_B, "declared", root="/r")]
+        env = {6: {"HELM_CHAT_NAME": "alpha‮"},   # refused identity
+               7: None}                                 # genuinely failed probe
+        out = self._render(env, census)
+        self.assertIn("UNRENDERABLE — a name was present", out)
+        self.assertIn("Identify the process by pid, never by that name", out)
+        self.assertIn("failed probes, not absence", out)
+        # ...and each counts ONE row, so neither swallowed the other.
+        self.assertIn("1 row(s) show UNRENDERABLE", out)
+        self.assertIn("1 row(s) carry UNKNOWN columns", out)
 
     def test_roster_fallback_uses_session_not_a_nonexistent_pid_field(self):
         roster = {"codex-2": {"session": SID_A, "sessions": [SID_A]}}
@@ -213,7 +829,7 @@ class RosterCheckedTest(unittest.TestCase):
 
 
 class SidDelegationTest(FleetRowsTest):
-    """Review finding: SID truth is session._proc_claude_rows(),
+    """codex+codex-2 finding 1: SID truth is session._proc_claude_rows(),
     consumed whole — record, argv, who, cwd-candidate rungs AND the final
     generation recheck — never a fleet-side splice of private helpers."""
 
@@ -231,17 +847,17 @@ class SidDelegationTest(FleetRowsTest):
     def test_fleet_source_rederives_no_sid_or_config_parsing(self):
         # the design law, pinned at the source level: fleet may CALL the
         # census; the private sid/config helpers it once spliced are gone,
-        # and so are the second comm scan and the
+        # and (round-2 finding 1) so are the second comm scan and the
         # unbracketed /proc cwd re-read
         src = inspect.getsource(fleet)
         for banned in ("_proc_snapshot", "_session_record", "_resume_sid",
                        "_sid_for", "_sids_for", "argv~ancestor",
                        "_config_root", "CLAUDE_CONFIG_DIR",
                        "_claude_pids", "glob", "readlink",
-                       # Review note: env facts come from the census
+                       # round-3 finding 1: env facts come from the census
                        # bracket — fleet never re-opens a proc environ file
                        "proc/%d/environ", "_environ(",
-                       # Review note: the completeness-blind rows-only
+                       # round-3 finding 2: the completeness-blind rows-only
                        # shape is not fleet's entry point
                        "_proc_claude_rows"):
             self.assertNotIn(banned, src, banned)
@@ -272,14 +888,14 @@ class SidDelegationTest(FleetRowsTest):
         self.assertIn("live in MULTIPLE pids", out)
 
     def test_rows_come_solely_from_the_census_no_second_scan(self):
-        # Review note: a pid the census rejected (its generation
+        # round-2 finding 1: a pid the census rejected (its generation
         # recheck failed — no two reads cohere) must never be resurrected by
         # a fleet-side comm scan and composed into a row of fictions
         rows, _ = self._rows({5: {}}, census=())
         self.assertEqual(rows, [])
 
     def test_census_none_cwd_is_never_re_read_from_proc(self):
-        # Review note: census cwd=None means the BRACKETED probe
+        # round-2 finding 1: census cwd=None means the BRACKETED probe
         # failed. Use our OWN pid, whose /proc/<pid>/cwd is readable — a
         # surviving unbracketed fallback would return a real path and clear
         # the unknown bit; the row must stay '?' and UNKNOWN
@@ -300,7 +916,7 @@ class SidDelegationTest(FleetRowsTest):
 
 
 class HomeColumnTest(FleetRowsTest):
-    """Review finding: home is session's canonical
+    """codex finding 4 / codex-2 finding 3: home is session's canonical
     config root for the TARGET process — never the inspector's ~/.claude,
     never a fleet-side re-derivation of config policy."""
 
@@ -315,7 +931,7 @@ class HomeColumnTest(FleetRowsTest):
         rows, _ = self._rows({8: {}}, [srow(8, reason="config-untrusted",
                                             root=None)])
         self.assertEqual(rows[0]["home"], "?")
-        # Review note: home='?' is unproven evidence — the row-level
+        # round-2 finding 4: home='?' is unproven evidence — the row-level
         # bit must say so, not hand JSON consumers a false known-row bit
         self.assertTrue(rows[0]["unknown"])
 
@@ -329,7 +945,7 @@ class DaemonDetectionTest(unittest.TestCase):
             self.assertFalse(fleet._is_daemon_argv(argv), argv)
 
     def test_non_orca_runtimes_reading_the_script_are_not_daemons(self):
-        # Review note: the SHAPE must be the orca daemon's, not any
+        # codex-2 finding 4: the SHAPE must be the orca daemon's, not any
         # argv element that basenames to daemon-entry.js
         for argv in (["cat", "/tmp/daemon-entry.js"],
                      ["python", "worker.py", "/tmp/daemon-entry.js"],
@@ -352,7 +968,7 @@ class DaemonDetectionTest(unittest.TestCase):
 
 
 class DaemonWalkTest(unittest.TestCase):
-    """Review finding: daemon identity is re-proven at match time (argv
+    """codex finding 2: daemon identity is re-proven at match time (argv
     still daemon-shaped, starttime still the scanned incarnation) — bare set
     membership across PID reuse is never trusted. The REAL _daemon_for walk
     runs; only the /proc probes are mocked."""
@@ -393,7 +1009,7 @@ class DaemonWalkTest(unittest.TestCase):
         self.assertEqual(self._walk(tree, {}), ("unknown", None))
 
     def test_walk_through_an_unproven_pid_is_unknown_never_headless(self):
-        # Review note, exact probe: daemon-shaped 99 whose starttime
+        # round-2 finding 2, exact probe: daemon-shaped 99 whose starttime
         # read failed is UNPROVEN; child 7->99->1 must answer UNKNOWN, not
         # walk through the maybe-daemon to init and claim proven HEADLESS
         self.assertEqual(self._walk({7: 99, 99: 1}, {}, unproven={99}),
@@ -495,7 +1111,7 @@ class WhoCensusContextTest(unittest.TestCase):
 
 
 class DaemonScanTest(unittest.TestCase):
-    """Review finding: partial probe failures inside the daemon
+    """codex round-2 finding 2: partial probe failures inside the daemon
     scan must surface as UNPROVEN pids — never be silently dropped behind
     scan_failed=False and later converted into a proven-HEADLESS absence.
     The REAL _daemon_pids runs; only the /proc probes are mocked."""
@@ -522,7 +1138,7 @@ class DaemonScanTest(unittest.TestCase):
                          ({99: "111"}, set(), False))
 
     def test_daemon_shape_without_starttime_is_unproven_not_dropped(self):
-        # daemon argv recognized, _proc_start=None
+        # the review's exact probe: daemon argv recognized, _proc_start=None
         # -> previously ({}, False); now the pid survives as UNPROVEN
         self.assertEqual(self._scan({99: self.DAEMON}, {}),
                          ({}, {99}, False))
@@ -600,7 +1216,7 @@ class OrcaTerminalsTest(unittest.TestCase):
 
 
 class UnknownPlumbingTest(FleetRowsTest):
-    """Review finding: a failed probe is UNKNOWN in the
+    """codex finding 3 / codex-2 finding 2: a failed probe is UNKNOWN in the
     ROW and the FOOTER — never converted into HEADLESS/no-pane or an
     owner-cannot-see claim."""
 
@@ -651,7 +1267,7 @@ class UnknownPlumbingTest(FleetRowsTest):
 
 
 class GenerationBracketTest(FleetRowsTest):
-    """Review finding: a census row is only coherent for ITS
+    """codex-2 round-3 finding 1: a census row is only coherent for ITS
     process generation. Env facts come from the census's bracketed environ
     (never a later live re-read), and the host walk's fresh /proc reads are
     only composed in when a FINAL recheck proves the same generation still
@@ -672,7 +1288,7 @@ class GenerationBracketTest(FleetRowsTest):
         self.assertFalse(r["unknown"])
 
     def test_reused_pid_display_probes_are_discarded_not_composed(self):
-        # old canonical row (sid/home/cwd) + a
+        # the review's exact probe: old canonical row (sid/home/cwd) + a
         # reused pid answering the walk as proven-HEADLESS with a new seat.
         # The failed recheck must kill the host claim to UNKNOWN — never
         # compose old census facts with the new process's ancestry
@@ -756,7 +1372,7 @@ class GenerationBracketTest(FleetRowsTest):
 
 
 class CensusCompletenessTest(FleetRowsTest):
-    """Review finding: the sole-source census carries a
+    """codex-2 round-3 finding 2: the sole-source census carries a
     completeness channel. A failed /proc enumeration is estate-UNKNOWN
     (exit 1), never a certified-empty fleet; a failed who scan marks every
     sub-declared/resume row sid-UNKNOWN."""
@@ -821,7 +1437,7 @@ def pfrow(pid, start="g1"):
 
 
 class PerPidProbeFailureTest(FleetRowsTest):
-    """Review finding: per-PID mandatory probe failures below the global bits
+    """codex-2 HIGH: per-PID mandatory probe failures below the global bits
     must never vanish as proven absence. A post-comm failure is an UNKNOWN
     row in the output AND the exit status; a pre-comm failure is
     census_partial — the estate total is a floor, surfaced like
@@ -879,7 +1495,7 @@ class PerPidProbeFailureTest(FleetRowsTest):
 
 @unittest.skipIf(os.geteuid() == 0, "root bypasses file permissions")
 class ProbeFailedEndToEndTest(unittest.TestCase):
-    """The exact probe, END TO END through the CLI: a planted
+    """The finding's exact probe, END TO END through the CLI: a planted
     /proc pid whose comm proves 'claude' and whose cmdline raises
     PermissionError must surface as an UNKNOWN row and a nonzero exit —
     helm fleet must never certify 0 live processes after failing to read a
@@ -962,7 +1578,7 @@ class SidParserTest(unittest.TestCase):
             ["claude", "--resume", SID_A, "--resume=" + SID_B]))
 
     def test_valid_resume_beside_an_invalid_occurrence_fails_closed(self):
-        # parser note: contradictory evidence poisons the parse —
+        # codex-2 parser note: contradictory evidence poisons the parse —
         # a valid --resume plus a bare/invalid repeat is UNKNOWN
         self.assertIsNone(session._resume_sid(
             ["claude", "--resume", SID_A, "--resume"]))
@@ -1016,7 +1632,7 @@ class PaneIdentityTest(FleetRowsTest):
 
 
 class EstateProbeExitTest(FleetRowsTest):
-    """A cross-family review (both lenses): every estate-wide failed probe — who
+    """fable review MED (both lenses): every estate-wide failed probe — who
     scan, daemon scan, terminal list — must reach the machine-readable
     verdict exactly like census_failed/census_partial: exit 1 and a named
     --json completeness bit. A scripted consumer keying on rc or the JSON
@@ -1085,7 +1701,7 @@ class EstateProbeExitTest(FleetRowsTest):
 
 
 class ProbeOrderingTest(unittest.TestCase):
-    """A cross-family review: the daemon scan runs AFTER the census bracket. A
+    """fable review LOW: the daemon scan runs AFTER the census bracket. A
     daemon that starts between the two scans — whose freshly-spawned claude
     IS censused — is then in the set, so the ppid walk cannot pass through
     the missing pid to init and read a false proven-HEADLESS (a ghost

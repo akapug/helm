@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """helm watchdog — the context-window brick backstop.
 
-The seat launch line teaches CC each proxy model's real window
-(seat.py CLAUDE_CODE_MAX_CONTEXT_TOKENS), which defuses the small-window class:
+The seat launch line teaches CC each proxy model's real window (seat.py mints
+BOTH CLAUDE_CODE_MAX_CONTEXT_TOKENS and CLAUDE_CODE_AUTO_COMPACT_WINDOW —
+capacity and window, and the second is clamped by the first), which defuses the
+small-window class:
 a seat now compacts before it overflows. But a seat can still wedge the OTHER
 way — CC's token gauge silently under-reads (stale usage anchor after a 429
 storm / aborted streams), sails past the real window, and 400s "input exceeds
@@ -29,15 +31,83 @@ from . import home
 SIGNATURES = ("exceeds the context window", "context_length_exceeded",
               "context window")
 
+# THE RESPONSE MARKER, and counting on the wrong side of it was the bug.
+# A CLIProxyAPI error log holds the FULL REQUEST followed by this marker and the
+# response. The counter used to scan the whole tail, so every occurrence of the
+# phrase in the REQUEST BODY counted as a wedge hit — and an agent discussing
+# context windows writes that phrase into its own transcript. Measured on a
+# REAL wedge: 5 occurrences in the request, 1 in the response, counted as 6.
+# The alert was a true positive with a fabricated count.
+#
+# That defeats WEDGE_THRESHOLD's whole purpose. The threshold exists to separate
+# a genuine wedge from "a single transient over-large turn CC could still compact
+# past" — and a single genuine failure, in any conversation that mentions the
+# phrase twice, clears a threshold of 2 on its own. So the discriminator could
+# never discriminate. Count RESPONSES, never requests.
+RESPONSE_MARKER = "=== response ==="
+
 # >=2 recent ctx-window 400s = the compaction-also-400s loop, i.e. a real wedge
 # rather than a single transient over-large turn CC could still compact past.
 WEDGE_THRESHOLD = 2
 # Scan only the tail of each (large, rotated) proxy log.
 TAIL_BYTES = 256 * 1024
+# How many of the most recent error logs to consider. The old scan read ONLY
+# the newest, so a wedge LOOP — which is by definition several consecutive
+# failed requests, each its own log — was judged from a single sample.
+RECENT_LOGS = 6
+# ...and only ones this fresh. RECENT_LOGS alone would break RECOVERY: a seat
+# that wedged, got /cleared, and is now healthy would keep reading WEDGED
+# forever, because its old failure logs stay on disk and stay inside the last-6
+# window. The newest-only scan got recovery for free, and trading it away for
+# loop detection is the tempting mistake; the window buys both. A wedge is
+# several failures CLOSE TOGETHER IN TIME, which is also what "the
+# compaction-also-400s loop" means.
+RECENT_SECONDS = 900
 
 # Proxy families that run inside CC via cli-proxy and can therefore wedge this
 # way. Claude-family seats never hit it (CC sizes their window correctly).
-PROXY_FAMILIES = ("codex", "kimi")
+# Derived from seat.FAMILIES rather than hardcoded: a hardcoded pair silently
+# stopped covering ds4pro when it was added, and would have missed gemini and
+# grok the same way. An unwatched proxy seat wedges invisibly, which is the exact
+# failure this module exists to prevent — so the watch list must grow with the
+# fleet by construction, not by someone remembering to edit a tuple.
+def proxy_families():
+    try:
+        from .seat import FAMILIES
+        return tuple(sorted(FAMILIES))
+    except Exception:
+        return ("codex", "kimi", "ds4pro")
+
+
+PROXY_FAMILIES = proxy_families()
+
+# KNOWN BLIND SPOT, stated because implying coverage is worse than admitting the
+# gap: a proxy failure that returns HTTP 200 WITH AN EMPTY OR MALFORMED BODY
+# writes NO error log at all — the proxy does not consider it a failure. So this
+# watchdog is structurally incapable of seeing it, and no signature can fix that
+# because there is no file to scan. Observed live: a codex seat's
+# /compact died on "API returned an empty or malformed response (HTTP 200) —
+# check for a proxy or gateway intercepting the request", and the log directory
+# contains zero error logs with Status 200. Catching that class needs a change in
+# the PROXY (log a 200 whose body is empty/unparseable), not here. `check()`
+# reports this limitation rather than reporting silence as health.
+BLIND_SPOT = ("a 200-with-empty-body proxy failure writes no error log and is "
+              "invisible to this scan — needs a proxy-side fix, not a signature")
+
+
+def _mtime(path):
+    """mtime, or -1 for a log that vanished between glob and stat.
+
+    This closes a real bug in this module: log rotation races the scan, and a
+    bare os.path.getmtime used as a sort key raises FileNotFoundError from
+    INSIDE sorted(), which is OUTSIDE every try block here, so it would crash
+    the whole watchdog pass rather than degrade. A vanished file sorts oldest,
+    so it can never be chosen as the newest log.
+    """
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return -1.0
 
 
 def _log_dirs(family):
@@ -56,38 +126,81 @@ def _state_path():
 
 
 def _count_ctx_400s(logdir):
-    """Count ctx-window signature hits in the tail of the newest error log.
-    Returns (hits, newest_log_path_or_None)."""
-    logs = sorted(glob.glob(os.path.join(logdir, "error-*.log")),
-                  key=os.path.getmtime)
+    """(failed requests whose RESPONSE carries the signature, newest log path or
+    None, unreadable count).
+
+    ONE HIT PER ERROR LOG, because one log IS one failed request — that is what
+    makes WEDGE_THRESHOLD's ">=2 recent 400s" mean what it says. The old version
+    counted matching LINES inside the single newest log, which conflated "N
+    failed requests" with "one failure whose text mentions the phrase N times",
+    and because it scanned the request body too, it counted the agent's own
+    words about context windows as evidence of a wedge.
+
+    An unreadable log is counted separately and NEVER as a hit or a miss: a file
+    we could not parse is not evidence of health.
+    """
+    import time
+    logs = sorted(glob.glob(os.path.join(logdir, "error-*.log")), key=_mtime)
     if not logs:
-        return 0, None
-    newest = logs[-1]
+        return 0, None, 0
+    cutoff = time.time() - RECENT_SECONDS
+    hits = unreadable = 0
+    newest_hit = None
+    for path in logs[-RECENT_LOGS:]:
+        try:
+            if os.path.getmtime(path) < cutoff:
+                continue                      # aged out — a recovered seat
+        except OSError:
+            unreadable += 1
+            continue
+        resp = _response_side(path)
+        if resp is None:
+            unreadable += 1
+            continue
+        if any(sig in resp for sig in SIGNATURES):
+            hits += 1
+            newest_hit = path
+    # Report the newest MATCHING log, not merely the newest log: naming a clean
+    # unrelated failure in a wedge alert sends the reader to the wrong evidence.
+    return hits, (newest_hit or logs[-1]), unreadable
+
+
+def _response_side(path):
+    """The RESPONSE half of one error log's tail, lowercased — or None if we did
+    not actually read a response.
+
+    Returning None rather than falling back to the request text is the whole
+    point: an error log is REQUEST + RESPONSE_MARKER + RESPONSE, and scanning the
+    request half is what fabricated wedge counts out of an agent's own prose. If
+    the marker is not in our tail window the response is out of reach, and
+    "could not read" must never be laundered into "read the request instead".
+    """
     try:
-        size = os.path.getsize(newest)
-        with open(newest, "rb") as f:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
             if size > TAIL_BYTES:
                 f.seek(size - TAIL_BYTES)
             tail = f.read().decode("utf-8", "replace").lower()
     except OSError:
-        return 0, newest
-    hits = sum(1 for ln in tail.splitlines()
-               if any(sig in ln for sig in SIGNATURES))
-    return hits, newest
+        return None
+    i = tail.rfind(RESPONSE_MARKER)
+    return tail[i + len(RESPONSE_MARKER):] if i >= 0 else None
 
 
 def scan(families=PROXY_FAMILIES):
-    """Return [{family, count, log}] for seats wedging on ctx-window
-    (>= WEDGE_THRESHOLD ctx-window 400s in their newest error log)."""
+    """Return [{family, count, log, unreadable}] for seats wedging on ctx-window
+    (>= WEDGE_THRESHOLD failed requests whose RESPONSE carries the signature)."""
     wedged = []
     for fam in families:
-        best, where = 0, None
+        best, where, unread = 0, None, 0
         for d in _log_dirs(fam):
-            n, log = _count_ctx_400s(d)
+            n, log, bad = _count_ctx_400s(d)
+            unread += bad
             if n > best:
                 best, where = n, log
         if best >= WEDGE_THRESHOLD:
-            wedged.append({"family": fam, "count": best, "log": where})
+            wedged.append({"family": fam, "count": best, "log": where,
+                           "unreadable": unread})
     return wedged
 
 

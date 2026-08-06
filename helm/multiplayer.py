@@ -32,7 +32,9 @@ MAX_TTL = 300
 
 
 def multiplayer_dir():
-    return home.env("MULTIPLAYER_DIR") or DEFAULT_DIR
+    # Same law as chat_dir: explicit env wins, a redirected HELM_HOME
+    # isolates, the default root keeps the shared tmpfs bus.
+    return home.surface_dir("MULTIPLAYER_DIR", "helm-multiplayer", DEFAULT_DIR)
 
 
 def default_cave():
@@ -336,7 +338,7 @@ def register_adapter(name, factory):
 
 def adapters(name=None):
     """Resolve the selected adapter pair. The CLI ships local only; embeddings
-    and a future external bridges register another factory without changing
+    and future external bridges register another factory without changing
     the consumer."""
     name = _identity(name or home.env("MULTIPLAYER_BACKEND") or "local", "adapter")
     factory = ADAPTER_FACTORIES.get(name)
@@ -427,7 +429,9 @@ def cmd_multiplayer(args, adapter_factory=adapters):
               "       helm multiplayer read <doc> [--cave C] [--after CURSOR] [--json]\n"
               "       helm multiplayer presence [--cave C] [--actor A] [--connection ID] [--state S] [--ttl N]\n"
               "       helm multiplayer peers [--cave C] [--json]\n"
-              "       helm multiplayer leave [--cave C] [--actor A] [--connection ID]", file=sys.stderr)
+              "       helm multiplayer leave [--cave C] [--actor A] [--connection ID]\n"
+              "       (any verb: --backend V selects the adapter pair; default "
+              "local, or HELM_MULTIPLAYER_BACKEND)", file=sys.stderr)
         return 2
     try:
         verb = args[0]

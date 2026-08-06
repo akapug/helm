@@ -31,8 +31,10 @@ _LOOPS = None         # test seam: cap the shell loop
 
 
 def operator_name():
-    """The human at the helm: HELM_CHAT_NAME else owner (the web default)."""
-    return home.chat_name() or "owner"   # THE validated seam (home.chat_name)
+    """The human at the helm: HELM_CHAT_NAME else the derived owner handle
+    (seats.owner_name — git user.name else the login; no name ships in code)."""
+    from . import seats
+    return home.chat_name() or seats.owner_name()  # THE validated seam (home.chat_name)
 
 
 def model_new(room="main"):
@@ -130,7 +132,21 @@ def _submit(m):
                               m["room"], who=operator_name())
         m["notice"] = err or ""
         return
-    chat.post(text, m["room"], who=operator_name(), origin="tui")
+    # A REFUSED POST IS A NOTICE, NEVER AN EXIT. chat.post now raises on a
+    # padded short sha (shaguard), and _submit is called BARE from the key
+    # loop — so an unguarded raise would drop the owner out of curses mid-key
+    # and leave the terminal to whatever the exception path restored. The
+    # guard exists to stop a wrong sha reaching a reader; crashing the one
+    # surface the owner types into would be a worse trade than the bug.
+    try:
+        chat.post(text, m["room"], who=operator_name(), origin="tui")
+    except ValueError as exc:
+        # AND THE TEXT COMES BACK. m["input"] was cleared at the top of this
+        # function, so returning without restoring it would eat what the owner
+        # typed — refusing a message and destroying it are different acts, and
+        # only the first one is the guard's business.
+        m["input"], m["notice"] = text, str(exc)
+        return
     chat.mark_owner_unread(m["room"])
     m["notice"] = ""
 
@@ -209,8 +225,15 @@ def cmd_human(args):
             rc = 0
     finally:
         if not chat.log_disabled():
-            n = chat.log_flush()
-            if n > 0:
-                print("helm chat: log-flush appended %d row%s (the log-after leg)"
-                      % (n, "s"[:n != 1]))
+            try:
+                n = chat.log_flush()
+            except Exception as exc:
+                # Cleanup is warning-only: a journal failure must not replace
+                # the shell action's original exit status.
+                print("helm chat: WARNING: exit-time log-flush failed: %s" % exc,
+                      file=sys.stderr)
+            else:
+                if n > 0:
+                    print("helm chat: log-flush appended %d row%s (the log-after leg)"
+                          % (n, "s"[:n != 1]))
     return rc

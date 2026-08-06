@@ -53,11 +53,12 @@ One row per census (same-uid live claude) process:
   (session's canonical config root; '?' when untrusted/unproven), daemon
   (ppid-walk to an orca daemon whose incarnation is re-proven at match time),
   pane (orca terminal handle when the join is unambiguous; '?' otherwise —
-  never guessed), stamps (child-session trio count), deck (helm = repointed
-  skill-deck env, - = unset).
+  never guessed), stamps (child-session trio count), deck (a physics-deck tag
+  from HELM_SKILL_DECK — host-authored deck_labels tag site-specific decks,
+  else 'helm' when set, '-' when unset).
 
 Every column comes from a live probe; nothing is cached. A FAILED probe is
-UNKNOWN, never an absence fact: HEADLESS is
+UNKNOWN, never an absence fact (premise failed-probe-not-absence): HEADLESS is
 a PROVEN verdict (a fully-parsed ppid walk that reached init, touching no pid
 the daemon scan left unproven); an unparsable hop, exhausted walk, stale or
 unprovable daemon evidence, failed daemon scan, unreadable environ/cwd,
@@ -68,11 +69,35 @@ and safe to run at any moment.
 """
 import json
 import os
+import re
 import socket
 import subprocess
 import uuid
 
 from . import session
+
+
+def _deck_label(deck):
+    """A short physics-deck tag for a seat's HELM_SKILL_DECK value. EMPTY public
+    default — the authored `host.deck_labels` ({substring: tag}) supplies any
+    site-specific deck names; first substring match wins, else 'helm' when a deck
+    is set, '-' when unset. No site-specific deck name ships in code. This is a
+    cosmetic listing column, so an UNREADABLE authored layer degrades quietly to
+    the default rather than refusing the fleet listing — unlike the
+    data-affecting host-config readers (skillsync/envtidy/capability), which
+    refuse, because a wrong fleet label costs nothing a wrong sync/surface does."""
+    if not deck:
+        return "-"
+    from . import registry
+    try:
+        labels = registry.authored_host().get("deck_labels", {})
+    except registry.AuthoredUnreadable:
+        labels = {}
+    if isinstance(labels, dict):
+        for sub, tag in labels.items():
+            if sub and sub in deck:
+                return str(tag)
+    return "helm"
 
 _DAEMON_ENTRY = "daemon-entry.js"
 # the runtimes that actually execute the orca daemon script (orca-ide is the
@@ -180,6 +205,60 @@ def _daemon_pids():
         else:
             unproven.add(pid)
     return out, unproven, False
+
+
+def _daemon_generations(daemons):
+    """({generation: [pid, ...]}, unknown_count) — the PROTOCOL generation each
+    live daemon is serving, re-proven against the incarnation it was scanned as.
+
+    An orca upgrade starts a NEW daemon and does NOT reap the old one, so more
+    than one generation alive at once is not cosmetic: the current UI cannot
+    render sessions owned by another generation, and the agents inside them go
+    INVISIBLE while still running. Measured 2026-07-27 on this fleet — four
+    generations (v23/v24/v26/v28) spanning a week, 13 daemon startups against 5
+    shutdowns, and the owner reasonably concluded an upgrade had killed his
+    fleet when nothing had been killed at all.
+
+    The count alone was already printed and read past, by two agents, on the
+    morning it mattered. A number with no NORMAL beside it is a fact, not a
+    finding, which is why the caller renders a verdict rather than a total.
+
+    Fails CLOSED in both directions a probe can fail: a pid whose starttime no
+    longer matches is a REUSED pid and is not the daemon we scanned, and an
+    unreadable or unparseable cmdline is UNKNOWN. Neither collapses into a
+    clean single-generation answer — "I could not look" must never render as
+    "there is only one".
+    """
+    gens, unknown = {}, 0
+    for pid, start in sorted(daemons.items()):
+        if session._proc_start(pid) != start:
+            unknown += 1
+            continue
+        status, argv = _cmdline_probe(pid)
+        if status != "ok" or not argv:
+            unknown += 1
+            continue
+        hit = re.search(r"daemon-(v\d+)\.sock", " ".join(argv))
+        if not hit:
+            unknown += 1
+            continue
+        gens.setdefault(hit.group(1), []).append(pid)
+    return gens, unknown
+
+
+def _generation_verdict(gens, unknown):
+    """The one line that says what the daemon count MEANS, or '' when clean."""
+    if unknown:
+        return (" — %d daemon(s) UNPROVEN: generation unreadable, so a stale "
+                "generation cannot be ruled out" % unknown)
+    if len(gens) <= 1:
+        return ""
+    live = sorted(gens)
+    return (" — %d PROTOCOL GENERATIONS ALIVE (%s): an orca upgrade starts a new "
+            "daemon and does not reap the old one, so agents owned by a stale "
+            "generation are INVISIBLE to the current UI, not dead. Roll-call "
+            "them (helm chat) before concluding anything about liveness."
+            % (len(live), ", ".join(live)))
 
 
 def _stat_link(pid):
@@ -413,10 +492,139 @@ def _roster():
         return {}, True
 
 
+def _mark_unknown(row):
+    """Mark a row UNKNOWN *and* record WHY, in one call.
+
+    `unknown` has two kinds of cause — a refused identity and a failed probe —
+    and the footer counts them independently. Every mutation below the row
+    builder is a probe outcome, never an identity refusal, so both bits move
+    together or the row lands in NEITHER bucket and simply stops being
+    reported.
+
+    THIS EXISTS AS A FUNCTION BECAUSE PATCHING THE SITES DID NOT HOLD. The
+    cause bit was added at the builder and maintained at ONE of four
+    post-builder mutations; I fixed the one a failing test pointed at and said
+    out loud that I did not assume it was the only one. @codex then found the
+    other three — terminal-inventory failure, unproven pane, duplicate pane —
+    each leaving rows invisible to both footers and a JSON body contradicting
+    its own two-cause model. A rule that must be remembered at every call site
+    is a rule that will be missed at the next one, so the pair is now
+    unsplittable by construction.
+
+    PROBE-ONLY IS DELIBERATE, NOT MERELY CURRENT — DO NOT ADD A BYPASS. This
+    helper serves the POST-BUILDER mutations, and every one of them is a probe
+    outcome; the other cause, `seat_unrenderable`, is set at the row BUILDER
+    and never travels through here. An earlier cut of this docstring argued
+    the opposite and grew a `probe=False` escape "so a closed class has a
+    door". That escape emitted `unknown` with NEITHER cause bit — rc=1 and no
+    owner-facing sentence, which is the exact NEITHER-BUCKET class this helper
+    exists to close. It had no call site and could not have acquired a correct
+    one: a non-probe post-builder cause has no bit, no producer, and no name
+    to write down, so the door led nowhere nameable. (@codex-2 found it on
+    review; a test of mine had pinned the uncategorized row as CORRECT.)
+
+    A genuine second cause arrives as its own bit plus its own footer
+    sentence, added here with the producer that emits it — never as a flag
+    that suppresses the only cause this helper can state. Mislabelling is
+    recoverable because it is counted; an uncategorized row is invisible.
+    """
+    row["unknown"] = True
+    row["probe_unknown"] = True
+    return True
+
+
+def _display_seat(seat, seat_src):
+    """(label, unrenderable) for the fleet table AND the --json body.
+
+    When a seat identity is present in env or roster (seat_src in ('env', 'roster'))
+    but scrubbing stripped all unprintable or hostile characters leaving an empty label,
+    label is '?' and unrenderable is True so consumers and rendering logic don't
+    conflate empty-scrubbed seats with absent ones ('(no seat)').
+
+    A PARTIALLY scrubbed name reaches here too, and that is the case @codex-2
+    found: the FULLY-scrubbed name was handled and the
+    partial one silently ALIASED A LEGITIMATE SEAT. `_seat_for` now refuses to
+    hand a noncanonical identity down, so those arrive empty and take the arm
+    above — see its docstring for the reproduction.
+    """
+    if seat_src in ("env", "roster") and not seat:
+        return "?", True
+    return seat, False
+
+
 def _seat_for(sid, env, roster, roster_err):
-    name = (env or {}).get("HELM_CHAT_NAME")
-    if name:
-        return name, "env"
+    """(seat, source) for a censused pid — LAUNDERED at this one boundary.
+
+    BOTH NAME SOURCES ARE ATTACKER-SHAPED AND NEITHER WAS SCRUBBED — but only
+    ONE of them is reachable, and this docstring used to say otherwise. It
+    claimed "the seat key is unvalidated at the join seam", I believed it, and
+    I repeated it in a verdict before checking. MEASURED: `home.chat_name()`
+    RAISES SeatNameError on a noncanonical HELM_CHAT_NAME, so nothing hostile
+    reaches the ROSTER through join. What IS reachable is the other half —
+    this function reads HELM_CHAT_NAME straight out of a foreign process's
+    environ, bypassing that seam entirely. One module reading raw where every
+    other consumer reads validated is the whole defect, and it is a sharper
+    statement than "neither is validated". This function is where either
+    becomes the
+    row's `seat`, and `rows()` prints that into `%-18s` — the first, widest,
+    most prominent column of the census the owner reads to decide what to
+    kill, resume or trust. An ESC or bidi run there reshapes the operator's
+    terminal at exactly the moment they are making a fleet decision.
+
+    `helm/fleet.py` carried ZERO calls to _seat_label/_pub_row/_scrub before
+    this. The display-launder tripwire could not see the gap because it
+    matched the regex `\\broster\\(\\)` and fleet obtains the roster through
+    `roster_checked()` — invisible to that pattern, so the module never
+    reached the allowlist and its emission was never questioned.
+
+    _seat_label is scrub+clip, NOT anonymisation: "a legit seat … is
+    unchanged", so `codex-3` still prints `codex-3` and the census reads
+    exactly as before. Only a hostile name changes, which is the point.
+
+    LAUNDERING IS NOT ENOUGH FOR AN IDENTITY, AND THAT IS THIS FUNCTION'S
+    SECOND LESSON (@codex-2's FIX on this lane's reviewed tip; the receipt id
+    is in that verdict and in this commit's message, not inlined here — it
+    addresses a RUN, and a reader who greps it in source finds no commit).
+    Scrubbing made a hostile
+    name SAFE TO PRINT; it did not make it TRUE. A name that scrubs to nothing
+    was already handled — `_display_seat` renders UNRENDERABLE. A name that
+    scrubs to SOMETHING was not, and it aliased whatever it landed on:
+
+        _seat_label('alpha')            -> 'alpha'
+        _seat_label('alpha\\u202e')      -> 'alpha'    <- RLO stripped
+        _seat_label('alpha\\u200b')      -> 'alpha'    <- ZWSP stripped, and
+                                                         nobody named this one
+        collision: the last two are INDISTINGUISHABLE from the real seat,
+        with seat_unrenderable=False and unknown=False, in the first and
+        widest column of the census the owner reads to decide what to kill.
+
+    So the rung is IDENTITY, not printability, and helm already owns that
+    predicate: `seats._SEAT_TOKEN` is what an @mention may say. A raw name
+    that does not fullmatch it is not a seat name, whatever it scrubs to, and
+    is refused here rather than laundered into one. Refusing returns an EMPTY
+    label so it takes `_display_seat`'s existing UNRENDERABLE arm — one
+    "present but unprintable-as-identity" concept, not a second flag beside
+    it. VERIFIED IN BOTH DIRECTIONS over the live population before landing:
+    all 22 roster seats and all 7 live HELM_CHAT_NAME values are canonical
+    (nothing legitimate changes), and every attack shape above is refused.
+    """
+    from . import seats
+    # PRESENCE, NOT TRUTHINESS. `if name:` read an EXPLICIT empty identity —
+    # `HELM_CHAT_NAME=`, which `session._full_environ` faithfully preserves as
+    # "" — as ABSENT, so it fell through to the roster branch and the process
+    # was handed whatever seat owned that session. Measured on the previous
+    # tip: _seat_for('sid', {'HELM_CHAT_NAME': ''}, {'real': …}) returned
+    # ('real', 'roster') with unrenderable=False — the alias this whole
+    # function exists to stop, through the one door the rung did not cover
+    # (@codex, exact-tip repro). An empty declaration is a PRESENT
+    # noncanonical identity: it says "I am nobody", which is not the same as
+    # saying nothing, and only the second may fall through.
+    env = env or {}
+    if "HELM_CHAT_NAME" in env:
+        name = env["HELM_CHAT_NAME"]
+        if not isinstance(name, str) or not seats._SEAT_TOKEN.fullmatch(name):
+            return None, "env"          # present, but not an identity
+        return seats._seat_label(name), "env"
     if roster_err:
         return None, "roster-error"
     if not sid:
@@ -425,7 +633,18 @@ def _seat_for(sid, env, roster, roster_err):
             if row.get("session") == sid
             or sid in (row.get("sessions") or [])]
     if len(hits) == 1:
-        return hits[0], "roster"
+        # DEFENCE IN DEPTH, AND SAYING SO IS THE POINT — this arm is NOT the
+        # twin of the env one, and an earlier draft of this comment claimed it
+        # was. MEASURED: `home.chat_name()` is the validated seam and RAISES
+        # SeatNameError on a noncanonical HELM_CHAT_NAME ("refusing to join or
+        # post under it"), so a hostile name cannot reach the roster through
+        # join at all. `write_roster` itself carries no token check across any
+        # of its four call sites, so this rung guards a direct roster write
+        # rather than a live join path. Kept because the cost is one call and
+        # the roster is a file, not because a reachable writer is known.
+        if not seats._SEAT_TOKEN.fullmatch(hits[0]):
+            return None, "roster"
+        return seats._seat_label(hits[0]), "roster"
     return (None, "roster-ambiguous") if hits else (None, None)
 
 
@@ -467,6 +686,7 @@ def rows():
             or (who_failed and not sr.get("child")))
         double_open = bool(sid) and len(live.get(sid) or ()) > 1
         seat, seat_src = _seat_for(sid, env, roster, roster_err)
+        seat, seat_unrenderable = _display_seat(seat, seat_src)
         deck = (env or {}).get("HELM_SKILL_DECK", "")
         # the census's BRACKETED cwd, verbatim: cwd=None is a failed probe
         # and stays UNKNOWN — a later /proc read would be a different
@@ -482,6 +702,7 @@ def rows():
         out.append({
             "pid": pid,
             "seat": seat, "seat_src": seat_src,
+            "seat_unrenderable": seat_unrenderable,
             "sid": sid, "sid_src": sid_src,
             "candidates": candidates,
             "double_open": double_open,
@@ -490,17 +711,30 @@ def rows():
             # (home/config root and seat included) so JSON consumers never
             # receive a false known-row bit the footer contradicts
             "unknown": (probe_failed or env_unknown or sid_unknown
-                        or cwd is None or root is None
+                        or cwd is None or root is None or seat_unrenderable
                         or seat_src in ("roster-error", "roster-ambiguous")
                         or daemon_state == "unknown"),
+            # THE SAME DISJUNCTION MINUS THE SEAT REFUSAL, because `unknown`
+            # has two KINDS of cause and they CO-OCCUR. The footer used to
+            # partition on `seat_unrenderable`, which silently assumed they
+            # were exclusive: a row with a hostile name AND a failed cwd probe
+            # reported only the refusal and hid the probe failure (@codex,
+            # exact-tip repro). This is computed HERE, where the causes are
+            # already in hand, so no reader has to re-derive a disjunction and
+            # drift from it — which is how the footer got it wrong in the
+            # first place.
+            "probe_unknown": bool(probe_failed or env_unknown or sid_unknown
+                                  or cwd is None or root is None
+                                  or seat_src in ("roster-error",
+                                                  "roster-ambiguous")
+                                  or daemon_state == "unknown"),
             "home": tilde(root) if root else "?",
             "cwd": tilde(cwd) if cwd else "?",
             "daemon": daemon, "daemon_state": daemon_state,
             "pane": None,
             "stamps": None if env_unknown else
                       sum(1 for k in stamp_keys if k in env),
-            "deck": "?" if env_unknown else
-                    ("helm" if deck else "-"),
+            "deck": "?" if env_unknown else _deck_label(deck),
         })
     hosted = [r for r in out if r["daemon_state"] == "daemon"]
     terms_failed, inventories = False, {}
@@ -513,11 +747,11 @@ def rows():
                 daemon, daemons[daemon], env)
         terminals, failed = inventories[key]
         if failed:
-            terms_failed = r["unknown"] = True
+            terms_failed = _mark_unknown(r)
             continue
         r["pane"], proven = _pane_for(env, terminals)
         if not proven:
-            r["unknown"] = True
+            _mark_unknown(r)
     pane_counts = {}
     for r in hosted:
         if r["pane"]:
@@ -525,7 +759,7 @@ def rows():
     for r in hosted:
         if r["pane"] and pane_counts[r["pane"]] > 1:
             r["pane"] = None
-            r["unknown"] = True  # one live pane cannot own two process rows
+            _mark_unknown(r)   # one live pane cannot own two process rows
     # FINAL generation recheck, AFTER every display probe: the host walk
     # re-read /proc later than the census bracket. If the pid's generation
     # changed in between, those fresh reads describe a DIFFERENT process
@@ -536,7 +770,9 @@ def rows():
         if _generation_intact(r["pid"], census[r["pid"]]["start"]):
             continue
         r["daemon"], r["daemon_state"], r["pane"] = None, "unknown", None
-        r["unknown"] = True
+        # a failed generation recheck IS a failed probe — the recheck is the
+        # probe. Same helper as every other post-builder mutation.
+        _mark_unknown(r)
     return out, sorted(daemons), {
         "census_failed": census_failed, "census_partial": census_partial,
         "who_failed": who_failed, "daemons_failed": daemons_failed,
@@ -577,8 +813,11 @@ def cmd_fleet(args):
         ("CENSUS PARTIAL", census_partial),
         ("DAEMON CENSUS PARTIAL", flags["daemons_partial"])) if bit]
     partial = " — " + ", ".join(partial_bits) if partial_bits else ""
-    print("helm fleet — %s live claude process(es), %s orca daemon(s)%s"
-          % (process_count, daemon_count, partial))
+    gens, gens_unknown = _daemon_generations(
+        {p: session._proc_start(p) for p in daemons})
+    print("helm fleet — %s live claude process(es), %s orca daemon(s)%s%s"
+          % (process_count, daemon_count, partial,
+             _generation_verdict(gens, gens_unknown)))
     for r in table:
         sid8 = (r["sid"] or "?")[:8]
         if r["sid_src"] in ("argv", "who"):
@@ -595,7 +834,7 @@ def cmd_fleet(args):
                 if r["daemon_state"] == "daemon" else
                 "HEADLESS/no-pane" if r["daemon_state"] == "headless"
                 else "host=?")
-        seat = r["seat"] or ("?" if r["unknown"] else "(no seat)")
+        seat = "UNRENDERABLE" if r.get("seat_unrenderable") else (r["seat"] or ("?" if r["unknown"] else "(no seat)"))
         stamps = "?" if r["stamps"] is None else str(r["stamps"])
         print("  pid %-8d %-18s sid=%s%s%s"
               % (r["pid"], seat, sid8, tag,
@@ -606,10 +845,28 @@ def cmd_fleet(args):
     if ghosts:
         print("  ⚠ %d process(es) have NO orca pane — the owner cannot see or "
               "type at them" % len(ghosts))
+    # TWO REASONS A ROW IS UNKNOWN, AND THE OPERATOR'S NEXT MOVE DIFFERS.
+    # A failed probe says DOUBT THE INSTRUMENT; a refused identity says a
+    # process presented a name that is not a seat name, so doubt the PROCESS.
+    # Before the identity rung existed every UNKNOWN really was a probe
+    # failure and one sentence was honest; now the same sentence would send a
+    # reader hunting a broken probe while a noncanonical name sat in the row
+    # it was printed for. The tool knows the difference — it must say it.
+    # INDEPENDENT, NEVER PARTITIONED — a row can be both, and the first cut
+    # of this split used `not seat_unrenderable` for the probe side, which
+    # dropped every such row from the probe count and hid real evidence.
     unknowns = [r for r in table if r["unknown"]]
-    if unknowns:
+    refused = [r for r in unknowns if r.get("seat_unrenderable")]
+    probes = [r for r in unknowns if r.get("probe_unknown")]
+    if probes:
         print("  ? %d row(s) carry UNKNOWN columns — failed probes, not "
-              "absence; verify by hand before acting" % len(unknowns))
+              "absence; verify by hand before acting" % len(probes))
+    if refused:
+        print("  ? %d row(s) show UNRENDERABLE — a name was present and is "
+              "NOT a canonical seat token, so it is refused rather than "
+              "printed; it can neither reshape this table nor impersonate a "
+              "seat. Identify the process by pid, never by that name."
+              % len(refused))
     estate = [name for name, bit in (
         ("who scan", flags["who_failed"]),
         ("daemon scan", flags["daemons_failed"]),

@@ -63,11 +63,50 @@ def check_authored():
              % (n, "y" if n == 1 else "ies", live))]
 
 
+_FOLD_SHOW = 6          # names printed inline before "+N more"
+
+
+def _folded(level, rows, summary):
+    """One line for a whole CLASS of finding, or nothing when the class is empty.
+
+    `rows` is [(name, detail)]. The names are what an operator acts on; the
+    per-project detail is a path they can reconstruct from the name, so it is
+    dropped past the first few rather than printed 193 times."""
+    if not rows:
+        return []
+    names = [n for n, _d in rows]
+    shown = ", ".join(names[:_FOLD_SHOW])
+    if len(names) > _FOLD_SHOW:
+        shown += ", +%d more" % (len(names) - _FOLD_SHOW)
+    return [(level, "%d project%s %s: %s"
+             % (len(names), ("s" if len(names) != 1 else ""), summary, shown))]
+
+
 def check_projects():
     """Per registry project: home dir sane (broken symlink = FAIL), repo path
-    still on disk (gone = WARN), memory_dir pointer still valid (gone = WARN)."""
+    still on disk (gone = WARN), memory_dir pointer still valid (gone = WARN).
+
+    REPEATED CLASSES ARE FOLDED TO ONE LINE EACH, and that is a correctness
+    property of the report, not cosmetics. MEASURED live: `helm doctor`
+    printed 208 warnings, of which ~193 were the SAME finding — "home dir
+    missing — run `helm sync`" — once per registry project. Buried at line 209
+    of 229 was the one warning that mattered: the pre-push leak guard had been
+    built, documented, given its own installer, and never installed, leaving 131
+    pushes unscanned. A correct detector fired correctly on every run for two
+    days and nobody could see it.
+    #
+    A report nobody can read is a report that does not exist, so a check that
+    can emit one line per project is a check that can hide the other findings.
+    Folding is what keeps the signal reachable: the operator's ACTION for all
+    193 is identical (`helm sync`), so 193 lines carry exactly the information
+    of one line plus a count.
+    #
+    FAIL IS NEVER FOLDED. A broken symlink is individually actionable, rare, and
+    the thing you most need named — folding it would trade this bug for a worse
+    one. Fold only where the remedy is shared."""
     projects = registry.load().get("projects") or {}
     out = []
+    missing_home, path_gone, mem_stale = [], [], []
     healthy = 0
     checked = 0
     for name in sorted(projects):
@@ -75,22 +114,30 @@ def check_projects():
         if rec.get("retired"):
             continue
         checked += 1
-        issues = len(out)
+        issues = len(out) + len(missing_home) + len(path_gone) + len(mem_stale)
         p = home.project_dir(name)
         if not rec.get("external"):
             if os.path.islink(p) and not os.path.exists(p):
                 out.append((FAIL, "%s: home is a broken symlink (%s -> %s)"
                             % (name, p, os.readlink(p))))
             elif not os.path.isdir(p):
-                out.append((WARN, "%s: home dir missing (%s) — run `helm sync`" % (name, p)))
+                missing_home.append((name, p))
         path = rec.get("path") or ""
         if path and not os.path.exists(path):
-            out.append((WARN, "%s: path gone (%s) — repo moved or deleted; "
-                        "lineage/archive candidate" % (name, path)))
+            path_gone.append((name, path))
         mem = rec.get("memory_dir")
         if mem and not os.path.isdir(mem):
-            out.append((WARN, "%s: memory_dir pointer stale (%s)" % (name, mem)))
-        healthy += issues == len(out)
+            mem_stale.append((name, mem))
+        healthy += issues == (len(out) + len(missing_home) + len(path_gone)
+                              + len(mem_stale))
+    out.extend(_folded(WARN, missing_home, "with no home dir — run `helm sync`"))
+    # The phrase "repo moved or deleted" is load-bearing and stays intact:
+    # tests/test_doctor.py asserts on it in two places, and folding a class must
+    # not silently change what a reader (or a test) greps for.
+    out.extend(_folded(WARN, path_gone,
+                       "whose path is gone — repo moved or deleted; "
+                       "lineage/archive candidates"))
+    out.extend(_folded(WARN, mem_stale, "with a stale memory_dir pointer"))
     if checked:
         out.append((OK, "projects: %d of %d healthy" % (healthy, checked)))
     return out
@@ -100,12 +147,13 @@ def check_adoption():
     """A registry project in the adoption map whose helm dir is a REAL dir
     (not the adoption symlink) = WARN — sync kept user data, doctor surfaces it."""
     projects = registry.load().get("projects") or {}
+    homes = registry.adopted_homes()
     out = []
-    for name in sorted(set(projects) & set(registry.ADOPTED_HOMES)):
+    for name in sorted(set(projects) & set(homes)):
         p = home.project_dir(name)
         if os.path.isdir(p) and not os.path.islink(p):
             out.append((WARN, "%s: adoption conflict — helm dir is a real dir, expected "
-                        "symlink -> %s" % (name, registry.ADOPTED_HOMES[name])))
+                        "symlink -> %s" % (name, homes[name])))
     return out
 
 
@@ -113,9 +161,10 @@ def check_projection_registry():
     """Constitution laws 2+3 as a standing guard, over registry.projections():
     a projection with no declared rebuild/source FAILs (it cannot be safely
     wiped or gitignored), a projection ON DISK whose every declared source is
-    gone FAILs (the copy just became the only truth), staleness beyond a
-    row's declared freshness horizon WARNs, and any file under the helm home
-    or cache root named by NO manifest row is an unclassified SQUATTER (the
+    gone FAILs unless BOTH the estate has no registered seat and the file
+    matches its manifest-declared exact empty genesis. Staleness beyond a row's
+    declared freshness horizon WARNs, and any file under the helm home or cache
+    root named by NO manifest row is an unclassified SQUATTER (the
     ~/.remember rot class) — the ancestor's one-time squatter eviction, made
     permanent. Read-only: rebuilds stay with their legs (sync / sessions /
     inject / drift); the test suite pins rebuild-and-converge."""
@@ -140,9 +189,18 @@ def check_projection_registry():
                         % (r["name"], "/".join(missing))))
             continue
         if r["files"] and not any(os.path.exists(s) for s in r["sources"]):
-            out.append((FAIL, "%s: ORPHANED — projection on disk but every "
-                              "declared source is gone (%s); the copy just "
-                              "became the only truth" % (r["name"], r["source"])))
+            # Register state answers whether this estate has ever had a chance
+            # to create sources; the row contract answers whether the bytes
+            # contain any truth to orphan. BOTH are required to silence FAIL.
+            genesis = _is_genesis() and registry.projection_is_genesis(r)
+            if genesis:
+                out.append((OK, "%s: exact clean genesis — projection files "
+                                 "present, every source not yet created; a "
+                                 "healthy empty estate, not orphaned" % r["name"]))
+            else:
+                out.append((FAIL, "%s: ORPHANED — projection on disk but every "
+                                  "declared source is gone (%s); the copy just "
+                                  "became the only truth" % (r["name"], r["source"])))
             continue
         if r["fresh_days"] and r["files"]:
             try:
@@ -166,6 +224,44 @@ def check_projection_registry():
     out.append((OK, "projection registry: %d rows, %d projection%s, %d squatter%s"
                 % (len(rows), n_proj, "s"[:n_proj != 1], n_sq, "s"[:n_sq != 1])))
     return out
+
+
+def _doctor_ok_path():
+    return os.path.join(home.helm_home(), "_global", ".doctor-ok")
+
+
+def _is_genesis():
+    """True while the estate has never had the chance to create the sources
+    its projections reference — i.e., NO seat has ever been spawned. Once a
+    live seat has existed, sources missing after that point are genuine orphans.
+
+    The stamp-based approach deferred the false-FAIL by exactly one run (a
+    cross-family e2e repro: run1 rc=0 writes stamp, run2 rc=1 ORPHANED
+    forever). A brand-
+    new machine legitimately has no harness stores until seats run — the
+    projection IS the promise, not the corruption."""
+    try:
+        from . import seat as smod
+        names, blind = smod.registered_seats()
+        if blind:
+            # A PARTLY-READABLE TREE IS NOT A NEW MACHINE. Genesis means "no
+            # seat has ever existed here"; a walk that could not see the whole
+            # tree cannot claim that, and claiming it would hide exactly the
+            # orphan this check exists to surface.
+            return False
+        return not names
+    except Exception:
+        return False  # unreadable -> genesis FALSE (never hide a real orphan)
+
+
+def _record_genesis():
+    """Called after the first FAIL-free doctor pass — a no-op in the
+    seat-counting design. Kept as a trivial wrapper for legacy callers
+    and for the control assertion in tests that verifies the stamp path
+    still exists for cold-start detection."""
+    # pass — genesis is determined by zero registered seats, not a stamp
+
+
 
 
 def check_adopted_store(adopted_dir=None):
@@ -253,6 +349,35 @@ def check_inject_coverage():
     if n < len(rows):
         return [(WARN, msg + " — `helm hooks install` closes the gap")]
     return [(OK, msg)]
+
+
+def check_hook_scopes():
+    """Owned hooks loaded at both home and project scope fire twice.
+
+    Project-only wiring is supported and therefore quiet; an unreadable scan is
+    UNKNOWN, never a clean bill. This is read-only — doctor names the defect but
+    never guesses which deliberately-authored scope to delete."""
+    from . import hooks
+    try:
+        rows = hooks.project_scope_rows()
+    except Exception as e:
+        return [(WARN, "project hook scan UNKNOWN (%s: %s)"
+                       % (e.__class__.__name__, e))]
+    return [(WARN, hooks.project_scope_message(r)) for r in rows
+            if r["status"] in ("duplicate", "unknown")]
+
+
+def check_filesystems():
+    """The mount plane (scratch.py): every filesystem helm writes measured on
+    BOTH axes — bytes AND INODES. An explicit tmpfs `nr_inodes=` cap is
+    invisible to every bytes-based check, which is exactly how the fleet hit
+    `No space left on device` on a /tmp reading 36% used. Fail-open."""
+    try:
+        from . import scratch
+        return scratch.doctor_rows()
+    except Exception as e:
+        return [(WARN, "filesystem check unavailable (%s: %s) — bytes AND "
+                       "inode pressure UNKNOWN" % (e.__class__.__name__, e))]
 
 
 def check_env():
@@ -436,6 +561,75 @@ def check_git():
              % _git_install_hint())]
 
 
+def check_actuator_wiring():
+    """Declared detectors/actions have an installed scheduled or hooked reader.
+
+    One folded WARN carries the whole class: emitting one row per missing action
+    recreates the warning flood that buried the original pre-push gap.
+    """
+    from . import wiring
+    try:
+        data = wiring.actuator_census()
+    except Exception as e:
+        return [(WARN, "actuator wiring UNKNOWN (%s: %s)"
+                 % (e.__class__.__name__, e))]
+    issue = wiring.actuator_issue_summary(data)
+    if issue:
+        return [(WARN, "actuator wiring: " + issue)]
+    return [(OK, "actuator wiring: every declared action has an installed "
+                 "consumer (%d observed)" % data["consumers"])]
+
+
+def check_work_guard(root=None):
+    """The composed git guard rail (`helm work install-guard`): installed AND
+    current in the repo doctor runs from? The pre-commit leg carries the
+    never-track staged-set scan — a prior leak proved a suite-run
+    guard cannot cover the `git add`->`git commit` window, so a rail-managed
+    repo with a missing/stale hook is running without its privacy gate and
+    NOBODY SEES IT until the next leak. That silent state is this check's
+    whole target: a hook shipped in code but absent from .git/hooks is the
+    'built but never wired' class. Silent when cwd is not a git repo, or the
+    repo shows no sign of the rail (no owned hook, no <root>-wt/ container)
+    — not every repo is rail-managed, and nagging foreign repos gets a check
+    switched off."""
+    from .work import _guard
+    from .work._lanes import find_root
+    root = root or find_root()
+    if not root:
+        return []
+    try:
+        _base, plan = _guard._guard_plan(root)
+    except Exception as e:
+        return [(WARN, "work-guard rail state unknown (%s: %s)"
+                 % (e.__class__.__name__, e))]
+    current, stale, owned = [], [], 0
+    for p in plan:
+        snap = _guard._path_snapshot(p["target"])
+        if snap == ("file", p["script"].encode("utf-8"), 0o755):
+            current.append(p["name"])
+        else:
+            stale.append(p["name"])
+            if _guard._owned_hook(snap):
+                owned += 1
+    for installed, source in sorted(_guard._scanner_assets(root).items()):
+        try:
+            with open(source, "rb") as f:
+                want = ("file", f.read(), 0o644)
+        except OSError:
+            want = None
+        if want is None or _guard._path_snapshot(installed) != want:
+            stale.append("scanner:" + os.path.basename(installed))
+    if not current and not owned and not os.path.isdir(root + "-wt"):
+        return []
+    if stale:
+        return [(WARN, "git guard rail incomplete in %s — missing/stale: %s; "
+                       "`helm work install-guard --apply` closes it (pre-commit "
+                       "runs the vacuity advisory then never-track enforcement)"
+                 % (root, ", ".join(stale)))]
+    return [(OK, "git guard rail current in %s (%s)"
+             % (root, ", ".join(current)))]
+
+
 def check_metaharness(detect=None, which=None):
     """The metaharness seam (helm/harness.py): which pane-op companion drives
     `helm seat resume`. helm is metaharness-AGNOSTIC — none installed is a
@@ -459,13 +653,15 @@ def check_metaharness(detect=None, which=None):
                 "; also present: " + ", ".join(others) if others else ""))]
 
 
-CHECKS = ("check_home", "check_authored", "check_projects", "check_adoption",
+CHECKS = ("check_home", "check_actuator_wiring",
+          "check_authored", "check_projects", "check_adoption",
           "check_projection_registry",
           "check_adopted_store", "check_lexicon_dead_vocabulary",
-          "check_know_your_user", "check_cv",
-          "check_inject_coverage", "check_env", "check_physics_currency", "check_record",
+          "check_know_your_user", "check_cv", "check_filesystems",
+          "check_inject_coverage", "check_hook_scopes", "check_env",
+          "check_physics_currency", "check_record",
           "check_chat_node", "check_cred_families", "check_cred_drift", "check_git",
-          "check_metaharness")
+          "check_work_guard", "check_metaharness")
 
 
 def cmd_doctor(args):
@@ -475,4 +671,6 @@ def cmd_doctor(args):
         print("  %-4s %s" % (level, msg))
     tally = {lvl: sum(1 for l, _ in results if l == lvl) for lvl in (OK, WARN, FAIL)}
     print("helm doctor: %d ok, %d warn, %d fail" % (tally[OK], tally[WARN], tally[FAIL]))
+    if not tally[FAIL]:
+        _record_genesis()
     return 1 if tally[FAIL] else 0

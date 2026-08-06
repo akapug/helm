@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """doctor tests — hermetic: a synthetic HELM_HOME in a tempdir with a broken
 symlink, a missing repo path, a stale memory_dir, an adoption conflict, and a
-dup-prefix adopted store. Never touches the real ~/.helm, ~/.claude."""
+dup-prefix adopted store. Never touches the real ~/.helm or ~/.claude."""
 import contextlib
 import io
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from helm import chat, doctor, home, pk, registry, whoami
+from helm import chat, doctor, home, pk, whoami, wiring
 
 
 def levels(results, level):
@@ -29,7 +32,6 @@ class DoctorBase(unittest.TestCase):
         })
         self.envp.start()
         os.environ.pop("MELD_HOME", None)
-        os.environ.pop("HELM_PROFILE_SCAFFOLD", None)
         self.assertTrue(home.helm_home().startswith(self.tmp.name))
 
     def tearDown(self):
@@ -41,7 +43,7 @@ class DoctorBase(unittest.TestCase):
         home.scaffold_global()
         repo = os.path.join(self.tmp.name, "repos", "good")
         os.makedirs(repo)
-        for name in ("good", "gone-repo", "brokelink", "memstale", "example-adopted"):
+        for name in ("good", "gone-repo", "brokelink", "memstale", "adopted-proj"):
             if name != "brokelink":
                 home.scaffold_project(name)
         os.symlink(os.path.join(self.tmp.name, "no-such-target"),
@@ -54,8 +56,13 @@ class DoctorBase(unittest.TestCase):
             "gone-repo": rec("gone-repo", os.path.join(self.tmp.name, "repos", "gone")),
             "brokelink": rec("brokelink", repo),
             "memstale": rec("memstale", repo, mem=os.path.join(self.tmp.name, "no-such-mem")),
-            "example-adopted": rec("example-adopted", repo),
+            "adopted-proj": rec("adopted-proj", repo),
         }})
+        # adopted-proj declares an adopt home in the authored layer but its helm
+        # dir was scaffolded as a REAL dir, not the adoption symlink — the
+        # conflict check_adoption() surfaces (adopted_homes reads authored `adopt`).
+        pk.write_json(home.authored_path(), {"version": 1, "projects": {
+            "adopted-proj": {"adopt": os.path.join(self.tmp.name, "external-home")}}})
 
     def seed_adopted(self):
         d = os.path.join(self.tmp.name, "adopted")
@@ -115,14 +122,56 @@ class TestChecks(DoctorBase):
         self.assertTrue(any("memstale" in m and "memory_dir" in m for m in warns))
         self.assertFalse(any("good:" in m for m in fails + warns))
 
+    def test_a_repeated_class_folds_to_ONE_line_with_a_count(self):
+        """MEASURED on a live estate: `helm doctor` printed 208 warnings, ~193 of them
+        the SAME finding — home dir missing, once per registry project. Buried at
+        line 209 of 229 was the pre-push leak guard, built and never installed,
+        leaving 131 pushes unscanned. A correct detector fired correctly for two
+        days into noise nobody could read.
+
+        A report nobody can read is a report that does not exist, so this is a
+        correctness property, not cosmetics."""
+        home.scaffold_global()
+        repo = os.path.join(self.tmp.name, "repos", "good")
+        os.makedirs(repo)
+        rec = lambda name: {"name": name, "path": repo, "kind": "git",
+                            "status": "active", "sessions": {}, "memory_dir": None}
+        names = ["nohome-%02d" % i for i in range(20)]      # none scaffolded
+        pk.write_json(home.registry_path(), {"version": 1,
+                                             "projects": {n: rec(n) for n in names}})
+        warns = levels(doctor.check_projects(), doctor.WARN)
+        homeless = [m for m in warns if "no home dir" in m]
+        self.assertEqual(len(homeless), 1,
+                         "a repeated class emitted %d lines, not 1" % len(homeless))
+        self.assertIn("20 projects", homeless[0])
+        self.assertIn("+14 more", homeless[0], "the tail was not truncated")
+
+    def test_FAIL_is_NEVER_folded(self):
+        """THE CARVE-OUT, and the control that stops the fix becoming a worse
+        bug. A broken symlink is rare, individually actionable, and the line you
+        most need named. Fold only where the REMEDY is shared — all 193 homeless
+        projects share `helm sync`; a broken symlink shares nothing."""
+        self.seed_home()
+        fails = levels(doctor.check_projects(), doctor.FAIL)
+        self.assertTrue(any("brokelink" in m and "broken symlink" in m
+                            for m in fails),
+                        "the individually-actionable FAIL was folded away")
+
+    def test_a_folded_line_still_NAMES_the_projects(self):
+        """A count alone is unactionable. The names are what an operator acts
+        on; only the per-project path detail is dropped, because it is
+        reconstructible from the name."""
+        self.seed_home()
+        warns = levels(doctor.check_projects(), doctor.WARN)
+        self.assertTrue(any("gone-repo" in m for m in warns))
+        self.assertTrue(any("memstale" in m for m in warns))
+        self.assertFalse(any("good" in m for m in warns),
+                         "a healthy project was named in a warning")
+
     def test_adoption_conflict_real_dir_warns(self):
         self.seed_home()
-        # no adopted home ships by default; a deployment registers one — seed a
-        # neutral entry so the adoption-conflict check still has coverage.
-        with mock.patch.object(registry, "ADOPTED_HOMES",
-                               {"example-adopted": "/external/example-adopted"}):
-            results = doctor.check_adoption()
-        self.assertTrue(any("example-adopted" in m and "adoption conflict" in m
+        results = doctor.check_adoption()
+        self.assertTrue(any("adopted-proj" in m and "adoption conflict" in m
                             for m in levels(results, doctor.WARN)))
 
     def test_adopted_store_counts_and_dup_warn(self):
@@ -289,13 +338,85 @@ class TestProjectionRegistry(DoctorBase):
             self.assertTrue(any("undeclared" in m and "gitignored" in m
                                 for m in fails), kw)
 
-    def test_orphaned_projection_fails(self):
+    def test_exact_genesis_fails_when_seats_exist(self):
+        """A registered seat ends cold genesis even while projection bytes
+        remain canonically empty: missing sources are now real orphans."""
         home.scaffold_global()
-        pk.atomic_write(os.path.join(self.helm_home, "probe.json"), "{}")
-        res = self._check(self._row(
-            sources=(os.path.join(self.tmp.name, "no-such-source"),)))
+        pk.write_json(os.path.join(self.helm_home, "probe.json"), {
+            "version": 1, "projects": {}, "generated_ts": "2026-07-31T00:00:00Z",
+        })
+        row = self._row(
+            sources=(os.path.join(self.tmp.name, "no-such-source"),),
+            genesis={
+                "json": {"version": 1, "projects": {}},
+                "volatile_strings": ("generated_ts",),
+            },
+        )
+        with mock.patch("helm.seat.registered_seats",
+                        return_value=(["codex"], False)):
+            res = self._check(row)
         self.assertTrue(any("ORPHANED" in m and "only truth" in m
                             for m in levels(res, doctor.FAIL)))
+
+    def test_declared_exact_genesis_is_not_orphaned(self):
+        home.scaffold_global()
+        pk.write_json(os.path.join(self.helm_home, "probe.json"), {
+            "version": 1, "projects": {}, "generated_ts": "2026-07-31T00:00:00Z",
+        })
+        res = self._check(self._row(
+            sources=(os.path.join(self.tmp.name, "no-such-source"),),
+            genesis={
+                "json": {"version": 1, "projects": {}},
+                "volatile_strings": ("generated_ts",),
+            },
+        ))
+        self.assertEqual(levels(res, doctor.FAIL), [])
+
+    def test_declared_genesis_with_data_is_orphaned(self):
+        home.scaffold_global()
+        pk.write_json(os.path.join(self.helm_home, "probe.json"), {
+            "version": 1,
+            "projects": {"lost": {"path": "/gone"}},
+            "generated_ts": "2026-07-31T00:00:00Z",
+        })
+        res = self._check(self._row(
+            sources=(os.path.join(self.tmp.name, "no-such-source"),),
+            genesis={
+                "json": {"version": 1, "projects": {}},
+                "volatile_strings": ("generated_ts",),
+            },
+        ))
+        self.assertTrue(any("ORPHANED" in m
+                            for m in levels(res, doctor.FAIL)))
+
+    def test_genesis_contract_is_exact_and_fails_closed(self):
+        home.scaffold_global()
+        path = os.path.join(self.helm_home, "probe.json")
+        row = self._row(
+            sources=(os.path.join(self.tmp.name, "no-such-source"),),
+            genesis={
+                "json": {"version": 1, "projects": {}},
+                "volatile_strings": ("generated_ts",),
+            },
+        )
+        cases = (
+            {"version": 1, "projects": {}},
+            {"version": 1, "projects": {}, "generated_ts": 7},
+            {"version": 1, "projects": {},
+             "generated_ts": "2026-07-31T00:00:00Z", "extra": True},
+        )
+        for body in cases:
+            with self.subTest(body=body):
+                pk.write_json(path, body)
+                res = self._check(row)
+                self.assertTrue(any("ORPHANED" in m
+                                    for m in levels(res, doctor.FAIL)))
+        pk.atomic_write(path, "{")
+        self.assertTrue(any("ORPHANED" in m for m in
+                            levels(self._check(row), doctor.FAIL)))
+        from helm import registry
+        self.assertFalse(registry.projection_is_genesis(
+            dict(row, files=("probe.json", "another.json"))))
 
     def test_present_source_is_ok_and_absent_projection_skips_orphan_check(self):
         home.scaffold_global()
@@ -340,6 +461,64 @@ class TestProjectionRegistry(DoctorBase):
         self.assertIn("unreadable", res[0][1])
 
 
+class CleanHomeColdStartTest(unittest.TestCase):
+    def test_sync_then_doctor_accepts_source_free_genesis(self):
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        helm = os.path.join(root, "bin", "helm")
+        with tempfile.TemporaryDirectory(prefix="helm-clean-home-") as tmp:
+            env = {
+                "HOME": tmp,
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "PYTHONIOENCODING": "utf-8",
+                "HELM_METAHARNESS": "none",
+            }
+            for rel in ("dev", ".claude", ".codex",
+                        ".local/share/opencode", ".pi"):
+                self.assertFalse(os.path.exists(os.path.join(tmp, rel)), rel)
+
+            sync = subprocess.run(
+                [sys.executable, helm, "sync"], cwd=tmp, env=env,
+                text=True, capture_output=True, timeout=30,
+            )
+            self.assertEqual(sync.returncode, 0, sync.stdout + sync.stderr)
+
+            with open(os.path.join(tmp, ".helm", "_global", "registry.json"),
+                      encoding="utf-8") as f:
+                reg = json.load(f)
+            self.assertEqual(reg["version"], 1)
+            self.assertEqual(reg["projects"], {})
+            self.assertIsInstance(reg["generated_ts"], str)
+            with open(os.path.join(tmp, ".cache", "helm",
+                                   "codex-cwd-cache.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {})
+
+            for run in range(3):
+                check = subprocess.run(
+                    [sys.executable, helm, "doctor"], cwd=tmp, env=env,
+                    text=True, capture_output=True, timeout=30,
+                )
+                output = check.stdout + check.stderr
+                self.assertEqual(check.returncode, 0, "run %d:\n%s" % (run + 1, output))
+                self.assertIn("0 fail", output)
+                self.assertNotIn("ORPHANED", output)
+
+
+class ActuatorWiringDoctorTest(unittest.TestCase):
+    def test_registered_check_folds_the_whole_class_into_one_warning(self):
+        data = {"consumers": 2, "wired": {},
+                "missing": ["hostpath-pre-push", "worktree-gc"],
+                "unknown": ["dispatch-mix"], "invalid_allowed": []}
+        with mock.patch.object(wiring, "actuator_census", return_value=data):
+            rows = doctor.check_actuator_wiring()
+        self.assertIn("check_actuator_wiring", doctor.CHECKS)
+        self.assertLessEqual(doctor.CHECKS.index("check_actuator_wiring"), 1,
+                             "the warning must not be buried below the flood")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], doctor.WARN)
+        self.assertIn("hostpath-pre-push", rows[0][1])
+        self.assertIn("dispatch-mix", rows[0][1])
+
+
 class TestCmdDoctor(DoctorBase):
     def run_doctor(self):
         buf = io.StringIO()
@@ -364,8 +543,6 @@ class TestCmdDoctor(DoctorBase):
         adopted = self.seed_adopted()
         before = self.snapshot(self.tmp.name)
         with mock.patch.object(home, "adopted_memory_dir", lambda: adopted), \
-                mock.patch.object(registry, "ADOPTED_HOMES",
-                                  {"example-adopted": "/external/example-adopted"}), \
                 mock.patch.object(doctor, "check_cv",
                                   lambda: [(doctor.OK, "cv stub")]), \
                 mock.patch.object(doctor, "check_cred_families",
@@ -504,6 +681,76 @@ class PhysicsCurrencyTest(unittest.TestCase):
             res = doctor.check_authored()
         self.assertEqual(res[0][0], doctor.FAIL)
         self.assertIn("proj", res[0][1])
+
+
+class ColdGenesisTest(TestProjectionRegistry):
+    """An adjudicated review item: a valid ZERO-STATE machine must pass the
+    advertised health gate right after the documented first command.
+
+    THE COMMIT THAT INTRODUCED THE FIX SAID "the test below exercises that
+    exact path" AND SHIPPED NO TEST. It also cut the tail off
+    check_projection_registry — the summary row and its `return out` ended up
+    inside `_record_genesis` — so the function returned None and `helm doctor`
+    died with `TypeError: NoneType is not iterable` before reaching any of
+    this. The subprocess control below is what makes that undetectable-by-
+    reading class detectable: it runs the REAL verb and reads its REAL exit.
+    """
+
+    def test_check_projection_registry_RETURNS_ITS_FINDINGS(self):
+        """The floor. A check that returns None is not a check that passed —
+        every caller iterates it, and `helm doctor` composes them all."""
+        got = doctor.check_projection_registry()
+        self.assertIsInstance(got, list)
+        self.assertTrue(all(isinstance(r, tuple) and len(r) == 2 for r in got),
+                        got)
+
+    def _orphan(self):
+        """One exact producer-declared genesis whose source never existed."""
+        home.scaffold_global()
+        pk.atomic_write(os.path.join(self.helm_home, "probe.json"), "{}")
+        return self._row(
+            sources=(os.path.join(self.tmp.name, "no-such"),),
+            genesis={"json": {}, "volatile_strings": ()},
+        )
+
+    def test_the_genesis_exemption_and_its_CONTROL_on_one_fixture(self):
+        """Both directions on ONE planted orphan, in one test, because they are
+        the same claim read twice.
+
+        The first draft of this called check_projection_registry() against the
+        BASE estate, which plants no orphan at all — so the control could never
+        have gone red for the reason it names. Measuring the wrong fixture is
+        how a control becomes decoration."""
+        row = self._orphan()
+        with mock.patch.object(doctor, "_is_genesis", return_value=False):
+            seen = [m for m in levels(self._check(row), doctor.FAIL)
+                    if "ORPHANED" in m]
+        with mock.patch.object(doctor, "_is_genesis", return_value=True):
+            silenced = [m for m in levels(self._check(row), doctor.FAIL)
+                        if "ORPHANED" in m]
+        self.assertTrue(seen, "the fixture never reaches ORPHANED, so the "
+                              "genesis half below is vacuous")
+        self.assertEqual(silenced, [])
+
+    def test_an_UNREADABLE_register_is_not_genesis(self):
+        """Genesis SILENCES a FAIL. When the register cannot be read,
+        genesis is FALSE — an estate whose state is unknown must surface
+        orphaned projections, never hide them behind a guess."""
+        with mock.patch("helm.seat.registered_seats",
+                        side_effect=OSError("EIO")):
+            self.assertFalse(doctor._is_genesis())
+
+    def test_genesis_holds_while_no_seat_has_ever_run(self):
+        """Genesis determined by register: an estate with zero registered
+        seats has never had the chance to create harness stores, so absent
+        sources are unrealized projections, not orphans. Once seats exist,
+        genesis lifts permanently — no stamp to race with."""
+        with mock.patch("helm.seat.registered_seats",
+                        return_value=([], False)):
+            self.assertTrue(doctor._is_genesis())
+        with mock.patch("helm.seat.registered_seats",
+                        return_value=(["codex"], False)):
+            self.assertFalse(doctor._is_genesis())
 
 
 if __name__ == "__main__":

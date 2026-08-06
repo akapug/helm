@@ -29,6 +29,9 @@ class HumanBase(unittest.TestCase):
         self.env_prior = {k: os.environ.get(k) for k in ENV_KEYS}
         for k in ENV_KEYS:
             os.environ.pop(k, None)
+        # The fixture homes its posts EXPLICITLY through the same env seam
+        # launched seats use — the old accidental "main" default, now stated.
+        os.environ["HELM_CHAT_ROOM"] = "main"
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""
@@ -53,8 +56,10 @@ class ModelTest(HumanBase):
         self.assertEqual([r["text"] for r in m["rows"]], ["9"])
         self.assertEqual(m["total"], 1)
 
-    def test_operator_name_env_then_owner(self):
-        self.assertEqual(human.operator_name(), "owner")
+    def test_operator_name_env_then_derived_owner(self):
+        # no name ships in code: the default is the DERIVED owner handle
+        with mock.patch("helm.seats.owner_name", return_value="hostowner"):
+            self.assertEqual(human.operator_name(), "hostowner")
         os.environ["HELM_CHAT_NAME"] = "skipper"
         self.assertEqual(human.operator_name(), "skipper")
 
@@ -125,14 +130,17 @@ class RenderTest(HumanBase):
 
 
 class SubmitTest(HumanBase):
-    def test_submit_posts_as_operator_and_marks_unread(self):
+    def test_submit_posts_as_operator_and_marks_unread(self):  # noqa: VACUOUS_ASSERTION — total==1 and rows[0] exact actor/text are unconditional non-empty controls; only marker existence is an absence-style filesystem claim
+        # This test asserts an exact actor, so provide it through the public
+        # identity seam instead of inheriting the build host's derived owner.
+        os.environ["HELM_CHAT_NAME"] = "alice"
         m = human.model_new()
         m["input"] = "  hello fleet :fire:  "
         human._submit(m)
         self.assertEqual(m["input"], "")
         rows, total = chat.read()
         self.assertEqual(total, 1)
-        self.assertEqual(rows[0]["from"], "owner")
+        self.assertEqual(rows[0]["from"], "alice")
         self.assertEqual(rows[0]["text"], "hello fleet 🔥")
         # the OWNER posted: the marker drops so agents get the reflex nudge
         self.assertTrue(os.path.exists(chat.marker_path("main")))
@@ -150,6 +158,32 @@ class SubmitTest(HumanBase):
         m["input"] = "/react 99 :tada:"
         human._submit(m)
         self.assertIn("out of range", m["notice"])
+
+    def test_a_refused_post_is_a_notice_and_gives_the_text_back(self):
+        """_submit is called BARE from the key loop, so a raise drops the owner
+        out of curses mid-key. chat.post now refuses a padded short sha
+        (shaguard), and this function's own docstring already promised it never
+        raises — the guard exists to stop a wrong sha reaching a reader, and
+        crashing the one surface the owner types into would be a worse trade
+        than the bug. The text comes BACK too: m["input"] is cleared at the top
+        of _submit, so refusing without restoring would EAT what they typed."""
+        import subprocess
+        from helm import shaguard
+        real = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+        if len(real) != 40:
+            self.skipTest("not a git checkout")
+        padded = real[:12] + "9" * 28
+        # CONTROL: the guard really refuses this token from here, so the notice
+        # below is the refusal and not some unrelated failure.
+        self.assertTrue(shaguard.refuse("tip %s" % padded))
+        m = human.model_new()
+        m["input"] = "landed at %s" % padded
+        human._submit(m)                       # must NOT raise
+        self.assertIn("padded short sha", m["notice"])
+        self.assertEqual(m["input"], "landed at %s" % padded,
+                         "the owner's text must come back to the composer")
+        self.assertEqual(chat.read(), ([], 0), "and nothing reaches the room")
 
     def test_empty_submit_is_a_noop(self):
         m = human.model_new()
