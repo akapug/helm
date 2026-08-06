@@ -4,12 +4,17 @@ helm is small on purpose: Python standard library only, one checkout, no
 install step, no build. That makes the on-ramp short — and the laws below are
 what keep it short.
 
+> **Contributing with an AI agent?** [AGENTS.md](AGENTS.md) is the terse
+> agent-facing version of this file — build/test, the laws in one breath, the
+> repo map, and the working style. This document is the human-readable long
+> form; they say the same things.
+
 ## Setup and tests
 
 ```console
 $ git clone <your-fork-or-origin> helm && cd helm
 $ ./bin/helm --help                          # runs from the checkout, nothing to install
-$ python3 -m unittest discover -s tests      # the full suite; a few seconds
+$ python3 -m unittest discover -s tests      # the full suite; a few minutes
 ```
 
 Optional PATH install (the entry script resolves the package through any
@@ -19,16 +24,75 @@ symlink):
 $ ln -s "$PWD/bin/helm" ~/.local/bin/helm
 ```
 
-**Python floor: 3.8+.** The source uses no syntax newer than that (verified by
-AST scan — no walrus, no structural pattern matching, no positional-only
-defs); the newest hard runtime requirements are 3.7-era
-(`subprocess.run(capture_output=)`, `ThreadingHTTPServer`, ordered dicts). The
-one version-gated import — `tomllib`, 3.11+ — is guarded: TOML validation
-degrades to a warning without it.
+**Python floor: 3.9+.** CI runs the full suite on 3.9 through 3.13, so the
+floor is measured, not asserted. (The source itself uses no syntax newer than
+3.8 — an AST scan finds no walrus, no structural pattern matching, no
+positional-only defs, and the newest hard runtime requirements are 3.7-era:
+`subprocess.run(capture_output=)`, `ThreadingHTTPServer`, ordered dicts — but
+3.8 is untested, so 3.9 is the supported floor.) The one version-gated
+import — `tomllib`, 3.11+ — is guarded: TOML validation degrades to a warning
+without it.
 
 Tests are `unittest`, not pytest, and never touch your real `~/.helm` or
 harness stores — they point `HELM_HOME` / `HELM_ADOPTED_DIR` at temp dirs.
 New tests must do the same.
+
+### Mutation matrix
+
+Commit the baseline before mutation testing, then describe byte-exact mutants in
+JSON and run:
+
+```console
+$ python3 scripts/mutation_matrix.py matrix.json
+```
+
+```json
+{
+  "command": ["python3", "-m", "unittest", "tests.test_example"],
+  "timeout_seconds": 300,
+  "mutations": [
+    {
+      "name": "remove-example-guard",
+      "path": "helm/example.py",
+      "find": "    if guarded:\n        return\n",
+      "replace": ""
+    }
+  ]
+}
+```
+
+`command` must be a Python `-m unittest` invocation. The runner resets
+`sys.argv`, owns test loading, and receives the real result/count over a
+parent-created anonymous pipe that is absent from test arguments, so
+footer-shaped output and forged pathname receipts are never evidence.
+`timeout_seconds` must be finite, positive, and at most 86,400; one monotonic
+deadline covers the test leader and nonblocking receipt drain. A surviving
+process-group member is killed and makes the run `MATRIX-ERROR`, never a
+verdict. Mutation names are trimmed printable ASCII so result lines cannot be
+injected; paths must be normalized relative, UTF-8-encodable, printable text,
+and `find` and `replace` must encode as UTF-8. Targets must be tracked, clean in
+index and worktree, free of semantic index flags, and every UTF-8 `find` anchor
+must occur exactly once.
+
+The baseline, each mutant, and final control run in separate disposable clones
+at the full HEAD captured on startup, so repository-local test state cannot leak
+between observations. Tests must still be deterministic with respect to state
+outside the repository. Each mutant is an atomic byte replacement. Before any
+verdict, the runner restores every declared target with `git restore
+--source=<captured-full-sha> --staged --worktree -- <literal-path>`, removes the
+clone, and proves the caller's symbolic+commit HEAD identity plus target diffs,
+semantic index flags, blob/mode, and bytes. The mutant and controls must all run
+the same nonzero test count. Only exact process/result pairs are verdicts:
+exit 0 with `OK` is `SURVIVED`, and exit 1 with `FAILED` is `KILLED`.
+
+Signals, other exits, apply, collection/import, count, command,
+timeout/interruption, Git, checkout, or restore failures print `MATRIX-ERROR`
+and can never print `ALL-KILLED`.
+
+Exit 0 means a valid all-killed matrix, exit 1 means one or more valid survivors,
+and exit 2 means the matrix itself was invalid. An unexpected survivor is a
+finding: delete genuinely inert code or add a direct primitive-contract witness
+that kills it; never dismiss it.
 
 ## The laws new code obeys
 

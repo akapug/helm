@@ -13,7 +13,10 @@ import os
 import tempfile
 import unittest
 
-os.environ.setdefault("HELM_HOME", tempfile.mkdtemp(prefix="helm-test-home-"))
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tests._tmphome import home as _tmp_home  # noqa: E402
+_tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import cli  # noqa: E402
 
@@ -46,6 +49,14 @@ class CliHelpHonestyTest(unittest.TestCase):
         self.assertIn("store list|get", out)
         self.assertNotIn("steering station", out)
 
+    def test_dispatch_help_renders_force_on_the_send_synopsis(self):
+        rc, out, err = _run(["dispatch", "--help"])
+        self.assertEqual(rc, 0, err)
+        rendered = out + err
+        send_help = rendered.split("|add", 1)[0]
+        self.assertIn("dispatch send", send_help)
+        self.assertIn("[--force]", send_help)
+
     def test_global_help_forms_exit_0(self):
         for argv in ([], ["--help"], ["-h"], ["help"]):
             rc, out, _ = _run(argv)
@@ -73,6 +84,12 @@ class DispatcherHonestyTest(unittest.TestCase):
 
     def test_watchdog_unknown_arg(self):
         self._refuses(["watchdog", "frobnicate"], "unknown arg 'frobnicate'")
+
+    def test_lr_help_names_every_terminal_annotation(self):  # noqa: VACUOUS_ASSERTION — paired positive control binds a real row/event
+        rc, out, err = _run(["lr", "--help"])
+        self.assertEqual(rc, 0, err)
+        for verb in ("discharge", "withdraw", "abandon", "close-landed"):
+            self.assertIn(verb, out)
 
 
 if __name__ == "__main__":

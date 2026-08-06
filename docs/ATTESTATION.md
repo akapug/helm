@@ -180,7 +180,12 @@ history thereby becomes a provable chain — *held X until T, then Y* — which 
 drift report reads as attested belief evolution rather than lost history.
 
 `helm premise --supersede <old-id> <new-id> | <statement> [| keywords [|
-domain]]` does all three legs in one verb:
+domain]] [--project P] [--force-new]` first runs the shared semantic-mint
+findability/duplicate guard, then does all three legs in one verb. The selected
+predecessor and an exact same-id retry destination are excluded from duplicate/
+DF comparison; unrelated siblings remain able to refuse the revision. A forced
+duplicate receipt is committed
+after the NEW premise file succeeds and before the lifecycle/attestation legs:
 
 1. **Store** — the new premise is captured and the old one is tombstoned
    through the store's own lifecycle (`status: delete_eligible`, the existing
@@ -215,7 +220,7 @@ The store's lifecycle writers carry the `attest_*` keys through rewrites
 keys. The attestation truth lives in the native chain; the file keys are the
 convenient pointer back to it (record hash, chain index), and `verify_chain`
 recomputes the whole ledger from `attest-chain.jsonl` alone. The normative
-spec for the digest + record contract is the `helm/premise.py` docstring.
+spec for the digest + record contract is the `helm/premise` package docstring.
 
 ## Sequencing: git history vs the external anchor
 

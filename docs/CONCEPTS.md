@@ -28,6 +28,7 @@ Every entry in the typed store declares its class in frontmatter (`type:`):
 | **heuristic** | a *move* you apply — "when X, do Y" | always 1.0; the only question is whether its trigger fires |
 | **lexicon** | a term and its meaning | capture-confidence only |
 | **reference** | harvested external material worth keeping | n/a |
+| **capability** | the wired-substrate self-index — "you have `<verb>`: `<what>` (wired via `<hook>`, live)", surfaced when reasoning touches its trigger | n/a; live/absent is a PROBE (a powerpack surfaces only when actually wired), never a static fact |
 | **episodic** | dated raw record — journals, session residue | n/a; never injected |
 
 **A premise is not a leg and not a type of its own** — it is the special case

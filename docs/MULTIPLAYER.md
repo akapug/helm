@@ -20,7 +20,7 @@ The slice deliberately separates two channels:
    enters or mutates the update log, so reconnecting or expiring cannot corrupt
    shared state.
 
-This is the useful pair from Mosaic: blind relay + opaque CRDT at the state
+This is the useful pair from prior multiplayer art: blind relay + opaque CRDT at the state
 boundary; a decoupled, disposable presence channel at the attention boundary.
 
 ```text
@@ -70,20 +70,23 @@ The relay's only authority is transport order. It is not the document authority.
 
 ## try it (owner walkthrough)
 
-For a hands-on, gui-first test drive — open the cockpit **cave** tab, publish
-from a terminal, and watch two actors converge on a shared board with a live
-presence panel — see **[MULTIPLAYER_TESTDRIVE.md](MULTIPLAYER_TESTDRIVE.md)**.
-That walkthrough uses the built-in demo board: a last-writer-wins keyed map the
-*client* materializes (`helm multiplayer set|status`, and the cockpit's cave
-tab), while the relay stays blind.
+For a hands-on test drive — publish from two terminals as two actors and watch
+them converge on a shared board with a live presence list — see
+**[MULTIPLAYER_TESTDRIVE.md](MULTIPLAYER_TESTDRIVE.md)**. That walkthrough uses
+the built-in demo board: a last-writer-wins keyed map the *client* materializes
+(`helm multiplayer set|status`), while the relay stays blind. It is a
+**terminal** walkthrough: the cockpit tab that used to show this board was
+retired on 2026-07-30 (its one owner-facing payload, the fleet's notes, moved
+to `helm note` and the cockpit's home tab). The HTTP seam
+(`/api/multiplayer/*`) is still served for a bridge or a script.
 
 ## dogfood
 
 Two local participants can share opaque updates without sharing a harness:
 
 ```console
-$ helm multiplayer presence --cave helm --actor owner --connection phone --state editing
-$ printf %s 'base64:opaque-crdt-update-a' | helm multiplayer publish board --stdin --cave helm --actor owner
+$ helm multiplayer presence --cave helm --actor alice --connection phone --state editing
+$ printf %s 'base64:opaque-crdt-update-a' | helm multiplayer publish board --stdin --cave helm --actor alice
 $ printf %s 'base64:opaque-crdt-update-b' | helm multiplayer publish board --stdin --cave helm --actor codex
 $ helm multiplayer read board --cave helm --json
 $ helm multiplayer peers --cave helm --json

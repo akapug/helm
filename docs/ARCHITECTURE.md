@@ -19,9 +19,13 @@ helm inherits a hard-won information architecture. Its laws:
    row per on-disk store, classified (`authored | projection | events | state
    | backup`), every projection declaring its source and rebuild command.
    `helm projections` renders it; `helm doctor` enforces it (undeclared
-   rebuild, orphaned projection, staleness, and unclassified-squatter files
-   under `~/.helm` or `~/.cache/helm` — the standing guard against the
-   store-rot that killed the ancestor's `~/.remember`).
+   rebuild, source-free projections containing data, staleness, and
+   unclassified-squatter files under `~/.helm` or `~/.cache/helm` — the
+   standing guard against the store-rot that killed the ancestor's
+   `~/.remember`). A manifest row may declare the exact empty JSON its producer
+   writes at genesis. While no seat is registered, only that source-free shape
+   is healthy; once a seat exists, missing sources fail again even if the bytes
+   remain empty. Malformed, extended, or nonempty copies always fail closed.
 4. **One recall index.** Transcript search/recall lives in one place; helm
    records *how to query it* per project and never builds a second index.
 5. **Placement is policy.** Local-vs-shared, private-vs-published are
@@ -157,9 +161,9 @@ registered COMPARISON backend runs in **parallel** and its results are
 **logged/compared, never trusted as truth** (the overlay-not-store law: a
 projection is compared, not injected).
 
-Shipped comparison backend: **Cloudflare agentic-memory** (owner decision #21 —
-the private-beta seat is warm), a thin stdlib-`urllib` stub behind `HELM_CF_*`
-([ENVIRONMENT.md](ENVIRONMENT.md)). Its laws, enforced in `helm/inject.py`:
+Shipped comparison backend: **Cloudflare agentic-memory**, a thin
+stdlib-`urllib` stub behind `HELM_CF_*`
+([ENVIRONMENT.md](ENVIRONMENT.md)). Its laws, enforced in the `helm/inject` package:
 
 - **OFF by default, zero cost.** No `HELM_CF_ENDPOINT` ⇒ the comparison is
   simply off; the turn pays one env read, no import / object build / I/O /
@@ -176,7 +180,66 @@ the private-beta seat is warm), a thin stdlib-`urllib` stub behind `HELM_CF_*`
   `_global/.state/compare-ledger.jsonl`; `helm inject --compare-report` renders
   the accumulated verdict so the owner judges a real backend on evidence.
 
-The write leg (`helm backend push` mirroring typed entries up as an explicit,
-never-canonical replica; a `_global/backends.json` registry) is the connector's
-outbound half and lives on its own lane — the seam above is the read/compare
+A future write leg (mirroring typed entries up as an explicit, never-canonical
+replica through a `_global/backends.json` registry) is the connector's outbound
+half and remains unimplemented on its own lane — the seam above is the read/compare
 half that needs no Cloudflare account.
+
+### The version-control seam (git | jj)
+
+`helm/vcs.py` holds a small `Vcs` interface — five call primitives
+(`run`/`text`/`probe`/`capture`/`proc`, each one existing call site's exact
+contract, including whether a missing binary fails open or loud) plus the
+semantic ops a second backend must really reimplement (`worktrees`,
+`add`/`remove`/`lock`/`unlock_worktree`, `dirty`, `head_sha`, `base_branch`,
+`has_branch`, `is_ancestor`, `delete_branch`, `wip_commit`, `ahead_behind`) —
+and today's only backend, `GitVcs`.
+
+**Its reach, stated exactly.** The seam owns the version-control calls of
+`helm work` (worktree + lane lifecycle), `helm ship`, `helm capsule`, the
+handoff/now probes, the lane gc verdict reads, and the auto-map's root resolver.
+Six private `_git` helpers existed; **five are migrated** (`capsule`, `handoff`,
+`ship`, and `work/_lanes`' two) and `landreq.py`'s `--git-dir` helper is not —
+it is a declared exception, so "six replaced" would be wrong. It is **not** yet
+every git call in helm: **43 direct git spawns** remain across `cli`, `landreq`,
+`seats`, `dispatches`, `gateimport`, `record`, `lineage`, `rearm`, `seat`, `web`,
+`wiring`, `cell`, `nevertrack`, `vacuous_assertion`, `hardcode`, `hostpath_guard`
+`conflict_marker`, `lane_discipline` and `clearspan` — each entry carrying its reason. The ordinary call sites
+are migration debt; the pre-commit/pre-push scanners are standing exceptions
+because their canonical scripts must run with no importable helm package and
+must not be editable by the lane whose staged set they judge.
+
+That set is enumerated and count-pinned by `DirectSpawnAuditTest` in
+`tests/test_vcs.py`. Its guarantee is bounded and worth stating precisely. The
+pass has an explicit decided grammar: subprocess imports, simple aliases,
+literal/string argv, and recursively-composed `functools.partial` calls using
+Python's positional/keyword precedence. A separate reference ledger tracks direct
+subprocess spawner attributes, imported or derived aliases, and any `getattr` on
+a known subprocess module that names or might name a spawner. Each reference on
+**that named surface** is either consumed by a decided binding/call or reported
+**unresolved**; transport through a dict, class attribute, callback or conditional
+therefore cannot silently clear its source reference. The detector's own decided
+and unresolved spellings are a test battery.
+
+This is not complete Python data-flow or introspection analysis. A capability
+obtained through another module's re-export, `vars()`/`__dict__`, or otherwise
+constructed without one of the tracked references is outside the audit's sight.
+Runtime-assembled argv likewise cannot be decoded; those modules are pinned as a
+named set, so known residue is declared rather than hidden. Silence means no
+reference on the explicitly named accounting surface, not proof that arbitrary
+Python cannot eventually reach a subprocess spawner.
+
+**Selection is per-target, never per-cwd.** `backend(target)` takes the repo or
+checkout the operation is about; a cwd-derived answer would pick git for a jj
+repo the moment a verb ran from elsewhere. Order: `HELM_VCS=git|jj`, else the
+nearest `.jj`/`.git` marker walking **up** from the target (git's own discovery
+rule — the inner marker wins, so a `.jj` above an unrelated git checkout cannot
+hijack it; a colocated repo carrying both resolves to jj), else **git** (the
+default spelled out, never implied). Only `GitVcs` exists, so jj or an unknown
+value resolves to git with one stderr line — a VCS preference can never take a
+verb down. `helm ship` keeps the raw-process primitive on purpose (an operator
+verb fails loudly). A jj backend would ride colocated (`jj git init --colocate`
+keeps a real `.git`, so metaharness worktree adoption keeps working) and buy the
+AX-safety win: jj records the working copy in its op-log on every change, so a
+naive user's uncommitted work is recoverable rather than lost. See
+[ENVIRONMENT.md](ENVIRONMENT.md) for the knob.

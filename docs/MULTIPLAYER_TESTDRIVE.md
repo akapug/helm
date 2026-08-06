@@ -1,161 +1,185 @@
-# Multiplayer test-drive — try it tomorrow
+# Multiplayer test-drive — try it in two terminals
 
-This is the **owner walkthrough** for local multiplayer. You open one web view;
-a terminal (you, or an agent) publishes; you watch two actors' edits **converge**
-on a shared board while a **presence** panel shows who's connected. Nothing here
-talks to the network — it's all on this machine, over the blind relay and the
-TTL presence channel that already shipped in `helm/multiplayer.py`.
+This is the **owner walkthrough** for local multiplayer. Two terminals act as
+two different people; you watch their edits **converge** on a shared board while
+a **presence** list shows who is connected. Nothing here talks to the network —
+it is all on this machine, over the blind relay and the TTL presence channel
+that ship in `helm/multiplayer.py`.
 
 Everything below is `helm …`. If `helm` isn't on your PATH, use `./bin/helm …`
-from the repo root instead. It's Python stdlib only — no install, no services.
+from the repo root instead. It is Python stdlib-only — no install, no services.
 
 The demo lives in one cave named **`main`** and one board doc named **`board`**.
-Every terminal command below passes `--cave main` so it lands in the exact cave
-the web tab shows by default. (If your shell sets `HELM_CHAT_ROOM`, the CLI's
-default cave would follow *that* instead — so keep the `--cave main` on.)
+Every command below passes `--cave main` so every terminal lands in the same
+cave. (If your shell sets `HELM_CHAT_ROOM`, the default cave would follow *that*
+instead — so keep the `--cave main` on.)
+
+> **This walkthrough used to start in the browser.** The cockpit had a **cave**
+> tab that rendered this board, and it was retired on 2026-07-30. Two reasons,
+> neither of them the transport's fault: the word *cave* means the **attestation
+> node** everywhere else in helm (that is what the **ledger** tab shows, one tab
+> over), and the only owner-facing thing on that board — the fleet's notes to
+> you — belongs somewhere **durable**, because the relay is tmpfs and a reboot
+> emptied it. Those notes are `helm note` now, and a card on the cockpit's home
+> tab. The relay, its adapters, its CLI verbs and its `/api/multiplayer/*` HTTP
+> seam are all unchanged.
 
 ---
 
-## 1. Open the surface
+## 1. Watch the board
+
+Open a terminal and leave this running. It re-prints the whole board every two
+seconds, which is exactly what the retired tab's poll did:
 
 ```bash
-helm web --open
+watch -n2 'helm multiplayer status board --cave main'
 ```
 
-A browser opens to the helm cockpit. In the top nav, click **cave**.
+**Working looks like:** a heading `board board @ main`, then `(no cells yet)`,
+then `peers:` / `(nobody connected)`, then a `cursor` line.
 
-**Working looks like:** three panels appear —
-- **presence** (left): within ~2 seconds a row **`owner · cockpit · watching`**
-  shows up with a **green dot**. That's *you* — opening the tab makes you a live
-  peer. The `cave` / `board` boxes at the top read `main` / `board`.
-- **board** (middle): "no cells yet — set one below", with a key box, a value
-  box, and a **set →** button.
-- **relay log** (right): "no updates yet".
-
-Leave this tab open for the rest of the walkthrough.
+No `watch` on this box? `helm multiplayer status board --cave main` on demand
+shows the same thing; just re-run it after each step.
 
 ---
 
 ## 2. Set a cell yourself
 
-In the **board** panel, type a **key** of `greeting` and a **value** of
-`hello from owner`, then click **set →** (or press Enter).
+In a **second terminal**, write one cell as `alice`:
+
+```bash
+helm multiplayer set board greeting "hello from alice" --cave main --actor alice
+```
 
 **Working looks like:**
-- the **board** immediately shows a row: **`greeting  hello from owner  owner`**.
-- the **relay log** on the right gains one line: a short id, `owner`, and a byte
-  size like `81 B` — **not** your text. The relay stored an opaque blob; it never
-  reads your words. The **cursor** near the top ticks forward.
+
+- the command prints an **acknowledgement** — an envelope `id`, a `ts`, a
+  `cursor`, and `bytes`. Note what is *not* in it: your text. The relay stored an
+  opaque blob and the ack never echoes it.
+- within ~2s the watching terminal gains a row:
+  `greeting = hello from alice   — alice (1s ago)`, and the `cursor` ticks
+  forward.
 
 ---
 
-## 3. Bring in a second actor from a terminal
+## 3. Bring in a second actor
 
-Open a **second terminal**. Publish a note as a *different* actor, `codex`:
+Publish a note as a *different* actor, `codex`:
 
 ```bash
 helm multiplayer set board status "building the demo" --cave main --actor codex
 ```
 
-Watch the still-open **cave** tab (don't touch it).
-
-**Working looks like:** within ~2 seconds, without any refresh —
-- a new board row appears: **`status  building the demo  codex`**.
-- the relay log gains a second line attributed to `codex`.
-
-Two actors — one in the browser, one in a terminal — are now writing to the same
-board through the same blind relay, and you're watching both land.
+**Working looks like:** within ~2s the watching terminal gains a second row,
+`status = building the demo — codex`. Two actors are now writing to the same
+board through the same blind relay, and you are watching both land.
 
 ---
 
 ## 4. Watch convergence (last-writer-wins)
 
-Now make them **collide on the same key**. In the terminal, set `greeting` —
-the key you already set as `owner` in step 2 — but as `codex`:
+Now make them **collide on the same key**. Set `greeting` — the key `alice`
+already set in step 2 — as `codex`:
 
 ```bash
 helm multiplayer set board greeting "hi from the terminal" --cave main --actor codex
 ```
 
-**Working looks like:** on the board, the **`greeting`** row **flips** from
-`hello from owner` (owner) to **`hi from the terminal` (codex)** within ~2s. The
-later write won. That's the CRDT resolving the conflict — a last-writer-wins map.
-Both clients, given the same relay log, land on the *same* board regardless of
-who polled first. The relay itself never decided anything; it just kept the
+**Working looks like:** the **`greeting`** row **flips** from
+`hello from alice` (alice) to `hi from the terminal` (codex) within ~2s. The
+later write won. That is the CRDT resolving the conflict — a last-writer-wins
+map. Every client, given the same relay log, lands on the *same* board no matter
+who read first, because the winner per key is the update with the greatest
+`(ts, id)` and that order is total. The relay itself decided nothing; it kept
 opaque updates in order and the **client** folded them.
 
-Set the same key again from the browser (board panel: key `greeting`, any new
-value, **set →**) and it flips back to `owner`. Back and forth — the newest set
-always wins.
+Set the same key again as `alice` and it flips back. Back and forth — the newest
+set always wins.
 
 ---
 
 ## 5. Watch presence fade
 
-Presence is a heartbeat with a ~30-second time-to-live. From the terminal, make
-`codex` announce itself once, then go quiet:
+Presence is a heartbeat with a ~30-second time-to-live. Make `codex` announce
+itself once, then go quiet:
 
 ```bash
 helm multiplayer presence --cave main --actor codex --state building --connection term-1
 ```
 
 **Working looks like:**
-- within ~2s a second presence row appears: **`codex · term-1 · building`** with
-  a **green** dot (fresh).
-- after ~10s with no further heartbeat, its dot turns **amber** (quiet).
-- after ~30s the `codex` row **disappears** entirely — the heartbeat expired.
 
-Your own `owner · cockpit` row stays green the whole time, because the open web
-tab re-heartbeats you every 2 seconds. Close the cave tab (or switch to another
-tab) and, ~30s later, you'd fade out too. Presence is pure attention state — it
-never touches the board; an actor vanishing never disturbs a single cell.
+- within ~2s the watching terminal's `peers:` list gains
+  `codex@term-1  building  (seen 1.2s ago)`.
+- the `seen …s ago` figure climbs on every refresh.
+- after ~30s with no further heartbeat the `codex` row **disappears** — the
+  heartbeat expired. `helm multiplayer leave --cave main --actor codex
+  --connection term-1` drops it immediately instead of waiting.
+
+Presence is pure attention state. It never touches the board; an actor vanishing
+never disturbs a single cell.
 
 ---
 
 ## 6. Prove the relay stayed blind
 
-Look at the **relay log** panel again. Every row is `id · actor · N B` — an id,
-who published, and a **byte size**. Your actual text is **never** shown there,
-because helm never decoded it. The words only exist on the **board**, which your
-*browser* materialized from those opaque blobs. That split — a blind transport
-plus a client-side CRDT — is the whole point, and it's what lets an external bridge
-remote relay drop in later without helm ever learning what a "board" is.
+Read the raw log the relay actually keeps:
+
+```bash
+helm multiplayer read board --cave main
+```
+
+**Working looks like:** one line per update — an id, an actor, and
+`<N opaque bytes>`. Your words are **never** there, because helm never decoded
+them. The text exists only on the **board**, which `status` materialized from
+those opaque blobs on the client side. That split — a blind transport plus a
+client-side CRDT — is the whole point, and it is what lets an external remote
+relay drop in later without helm ever learning what a "board" is.
+
+To see it from the other side, publish something helm has no idea how to read:
+
+```bash
+printf %s 'not-a-demo-cell' | helm multiplayer publish board --stdin --cave main --actor stranger
+```
+
+The board is unchanged and `status` now reports
+`+1 opaque update(s) from other clients — relay stays blind`. Counted, never
+decoded.
 
 ---
 
-## 7. (Optional) drive and read it entirely from the terminal
+## 7. The machine-readable form
 
-You don't need the browser to see the same truth. Any terminal can materialize
-the board and list peers:
+Everything above has a `--json` form for an agent to drive and verify:
 
 ```bash
-helm multiplayer status board --cave main
+helm multiplayer status board --cave main --json
+helm multiplayer read board --cave main --after 0 --json
+helm multiplayer peers --cave main --json
 ```
 
-**Working looks like:** the current board printed key-by-key (matching what the
-web tab shows), then a `peers:` list, then the `cursor`. Add `--json` for the
-machine-readable form. This is the exact same fold the browser runs — an agent
-can drive the board with `helm multiplayer set …` and verify it with
-`helm multiplayer status …`, while you watch the web view move.
+`status --json` returns `{cave, doc, cursor, board, foreign, peers}` — the same
+fold, machine-shaped.
 
 ---
 
 ## If something looks off
 
-- **Nothing on the board / peers after a terminal command?** Make sure both the
-  web tab's `cave` box and every terminal command say `main`. A mismatched cave
-  name is a different, empty board.
+- **Nothing on the board / no peers after a command?** Make sure every terminal
+  says `--cave main`. A mismatched cave name is a different, empty board.
 - **`helm: command not found`?** Use `./bin/helm …` from the repo root.
-- **Board is empty after a reboot?** Expected. The cave lives in tmpfs
+- **Board empty after a reboot?** Expected. The cave lives in tmpfs
   (`/dev/shm/helm-multiplayer`) and is disposable by design — durable history is
-  a client/CRDT concern, not the relay's. Just set cells again.
+  a client/CRDT concern, not the relay's. Just set the cells again. If what you
+  wanted was a note that SURVIVES the reboot, that is
+  `helm note set <key> <text…>`, which is a different substrate on purpose.
 - **Want a clean slate now?** `rm -rf /dev/shm/helm-multiplayer` wipes every
-  cave; reload the tab.
+  cave.
 
 ## What this is *not*
 
 This is **local** multiplayer — one machine, human + agents in one cave. There's
 no web/hosted cave, no cross-machine sync, no accounts. That remote half is
-an external bridge's, and it slots into the **same** five adapter methods
-(`publish / updates / heartbeat / peers / leave`) without changing helm's core or
-this cockpit tab. See [MULTIPLAYER.md](MULTIPLAYER.md) for the adapter contract.
+an external bridge adapter's, and it slots into the **same** five adapter methods
+(`publish / updates / heartbeat / peers / leave`) without changing helm's core.
+See [MULTIPLAYER.md](MULTIPLAYER.md) for the adapter contract.
