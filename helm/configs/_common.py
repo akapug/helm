@@ -230,10 +230,16 @@ _MISSING_REVISION = "missing"
 # Linux gives us an atomic exchange primitive. It is what lets the writer inspect
 # the exact inode displaced by the save and exchange it back if another process
 # replaced or changed the file in the final check-to-rename window.
+# macOS spells the same dirfd-relative primitive renameatx_np(RENAME_SWAP)
+# (atomic on APFS; an unsupporting volume errors and the writer's existing
+# "atomic" error arm fires exactly as on a renameat2-less Linux). Darwin's
+# RENAME_SWAP == 2 == Linux's RENAME_EXCHANGE, so call sites carry unchanged.
 _RENAME_NOREPLACE = 1
 _RENAME_EXCHANGE = 2
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _RENAMEAT2 = getattr(_LIBC, "renameat2", None)
+if _RENAMEAT2 is None:
+    _RENAMEAT2 = getattr(_LIBC, "renameatx_np", None)
 if _RENAMEAT2 is not None:
     _RENAMEAT2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
                            ctypes.c_char_p, ctypes.c_uint)
