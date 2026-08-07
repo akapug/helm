@@ -512,12 +512,13 @@ def sign_failures_dir():
     durable storage. The production default already lives under /dev/shm; a
     custom room gets an isolated tmpfs key, so status never writes disk."""
     d = os.path.realpath(chat_dir())
-    shm = os.path.realpath("/dev/shm")
+    shm = os.path.realpath(home.ram_root())
     if d == shm or d.startswith(shm + os.sep):
         return chat_dir()
     key = hashlib.blake2b(os.path.abspath(chat_dir()).encode("utf-8"),
                           digest_size=8).hexdigest()
-    return os.path.join(SIGN_FAILURES_ROOT, key)
+    return os.path.join(
+        SIGN_FAILURES_ROOT.replace("/dev/shm", home.ram_root(), 1), key)
 
 
 def sign_failures_path():

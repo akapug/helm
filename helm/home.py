@@ -183,7 +183,24 @@ def surface_dir(env_name, name, default):
     root = helm_home()
     if os.path.realpath(root) != os.path.realpath(default_home()):
         return os.path.join(root, name)
+    if default.startswith("/dev/shm") and not os.path.isdir("/dev/shm"):
+        return default.replace("/dev/shm", ram_root(), 1)
     return default
+
+
+def ram_root():
+    """The machine's boot-scoped RAM root: /dev/shm where it exists (Linux).
+
+    On hosts without it (macOS mounts no tmpfs), fall back to a subdir of the
+    per-user Darwin temp dir ($TMPDIR, confstr DARWIN_USER_TEMP_DIR): the same
+    lifecycle contract (per-user 0700 territory, cleared at reboot) with a
+    weaker residency guarantee (disk-backed, purgeable). The RAM law degrades
+    to the boot-scope law, never to a durable path — and the write-behind log
+    remains the durable truth either way, exactly as on Linux."""
+    if os.path.isdir("/dev/shm"):
+        return "/dev/shm"
+    return os.path.join(os.path.realpath(os.environ.get("TMPDIR") or "/tmp"),
+                        "helm-ram")
 
 
 def global_dir():
