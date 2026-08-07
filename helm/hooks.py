@@ -898,8 +898,14 @@ def project_scope_rows(contexts=None):
     from .skillsync import config_dirs
     home_roots = {os.path.realpath(p) for _n, p in config_dirs()}
     for ctx in contexts:
-        root = ctx["root"]
-        path = os.path.join(root, ".claude", "settings.json")
+      root = ctx["root"]
+      # BOTH project surfaces: committed settings.json AND per-machine
+      # settings.local.json (where `hooks install --project` writes) — a
+      # local-only wiring invisible to this scan was a blind spot: the one
+      # census whose job is cross-scope duplicates could not see the scope
+      # the installer itself creates.
+      for _fname in ("settings.json", "settings.local.json"):
+        path = os.path.join(root, ".claude", _fname)
         scope_dir = os.path.realpath(os.path.dirname(path))
         active_roots = {os.path.realpath(p) for p in ctx.get("homes") or ()}
         if scope_dir in home_roots | active_roots:
@@ -1104,7 +1110,7 @@ def _rooms_clean(settings, owns=None):
                    for cmd in _all_hook_cmds(settings) if owns(cmd))
 
 
-def _merge_all(settings, specs=SPECS, path="<settings>"):
+def _merge_all(settings, specs=SPECS, path="<settings>", defaults=True):
     """-> (merged_copy, {spec_name: action}) across `specs` — the whole estate
     for a home (SPECS), the delivery lane for a seat (DELIVERY_SPECS) — plus
     the beacon permit rules (every surface that gets the delivery lane must
@@ -1124,7 +1130,7 @@ def _merge_all(settings, specs=SPECS, path="<settings>"):
     out = json.loads(json.dumps(settings))  # deep copy — never mutate the input
     actions = {s["name"]: _merge_event(out, s) for s in specs}
     actions["permits"] = _merge_permits(out)
-    actions["defaults"] = _merge_defaults(out)
+    actions["defaults"] = _merge_defaults(out) if defaults else "ok"
     notes = repair_lane_room_commands(out, path)
     actions["rooms"] = "update" if any(n[0] == "repaired" for n in notes) else "ok"
     # A tuple value, never an action word — _agg compares against "fail"/
@@ -1169,6 +1175,58 @@ def install_home(path, dry=False, specs=SPECS):
     # residue was found by re-running the DETECTION scan rather than by reading
     # this line. A report that says `ok` while the file changed underneath it is
     # that same disease in its purest form: a claim about intent, not about disk.
+    if action == "ok":
+        return "ok", "hook up to date" + ("; " + rooms if rooms else "")
+    if dry:
+        diff = difflib.unified_diff(
+            res["before"].splitlines(), res["after"].splitlines(),
+            sp, sp + " (after install)", lineterm="")
+        return "dry-" + action, "\n".join(diff) + (("\n" + rooms) if rooms else "")
+    return action, "backup: %s; CAS attempts: %d%s" % (
+        res.get("backup") or "none — new file", res["attempts"],
+        "; " + rooms if rooms else "")
+
+
+def project_settings_path(project_dir):
+    """<project>/.claude/settings.local.json — the per-machine project surface.
+
+    LOCAL, deliberately: the generated commands carry THIS machine's absolute
+    helm path, so the file must never ride a commit into someone else's
+    checkout. The harness merges local scope last, so a project install is
+    additive over user settings, never a replacement of them."""
+    return os.path.join(os.path.abspath(os.path.expanduser(project_dir)),
+                        ".claude", "settings.local.json")
+
+
+def install_project(project_dir, dry=False, specs=SPECS):
+    """Install/refresh the full hook estate into ONE project — the scoped
+    alternative to a home install: every session launched in the project gets
+    the physics, every other session on the machine stays hook-free.
+
+    Two deltas from install_home, both deliberate: ESTATE_DEFAULTS are NOT
+    seeded (a project file is neither a home nor a seat — helm does not own a
+    project's scalar settings), and the target is settings.local.json (see
+    project_settings_path). The beacon permits ARE granted, same as a home: a
+    fresh session in the project must arm its wake beacon without a human
+    prompt. Same CAS pipeline, same merge-preservation laws."""
+    sp = project_settings_path(project_dir)
+
+    def transform(cur):
+        merged, actions = _merge_all(cur, specs, sp, defaults=False)
+        return merged, {"actions": actions}
+
+    def verify(candidate, before, _metadata):
+        expected, _actions = _merge_all(before, specs, sp, defaults=False)
+        return (candidate == expected
+                and all(_lane_live(candidate, s) for s in specs)
+                and _permits_live(candidate) and _rooms_clean(candidate))
+
+    res = configs.transform_json_file(sp, transform, verify=verify, dry_run=dry)
+    if not res.get("ok"):
+        return "fail", res["error"]
+    actions = (res.get("initial_metadata") or res.get("metadata") or {}).get("actions") or {}
+    rooms = lane_room_report(actions.get("rooms_notes") or ())
+    action = _agg(actions)
     if action == "ok":
         return "ok", "hook up to date" + ("; " + rooms if rooms else "")
     if dry:
@@ -1764,7 +1822,7 @@ def surface_uncovered(out=None):
 _CODEX_PENDING = ("codex: recipe pending — docs/HOOKS.md carries no mechanical "
                   "notify-hook shape yet; wire it by hand per that doc's codex section")
 
-_USAGE = """usage: helm hooks install [--harness claude|codex] [--home NAME] [--dry]
+_USAGE = """usage: helm hooks install [--harness claude|codex] [--home NAME] [--project DIR] [--dry]
        helm hooks status
        helm hooks sync [--apply]   (reconcile every home to the canonical set)"""
 
@@ -1782,7 +1840,7 @@ def _select_homes(name):
 
 
 def cmd_hooks(args):
-    """hooks [install [--harness claude|codex] [--home NAME] [--dry] | status
+    """hooks [install [--harness claude|codex] [--home NAME] [--project DIR] [--dry] | status
     | sync [--apply]] — self-wire the per-turn inject hook into every claude
     home, and the fleet-delivery lane (DELIVERY_SPECS) into every seat config
     dir; sync (envtidy) reconciles every home to the named canonical hook set,
@@ -1881,9 +1939,9 @@ def cmd_hooks(args):
         # used to run the full install and exit 0 as if --bogus existed.
         from .cli import guard_tail
         rc = guard_tail("helm hooks install", rest, flags=("--dry",),
-                        valued=("--harness", "--home"),
+                        valued=("--harness", "--home", "--project"),
                         usage="hooks install [--harness claude|codex] "
-                              "[--home NAME] [--dry]")
+                              "[--home NAME] [--project DIR] [--dry]")
         if rc is not None:
             return rc
         harness = "claude"
@@ -1902,6 +1960,46 @@ def cmd_hooks(args):
         if harness == "codex":
             print("helm hooks: " + _CODEX_PENDING)
             return 0
+        if "--project" in rest:
+            i = rest.index("--project")
+            project = rest[i + 1] if i + 1 < len(rest) else None
+            if not project:
+                print("helm hooks: --project needs a directory", file=sys.stderr)
+                return 2
+            if home_name is not None:
+                # contradictory scopes: a home install and a project install
+                # write different files for different populations — refusing
+                # beats guessing which one the operator meant.
+                print("helm hooks: --project and --home are different scopes"
+                      " — pick one", file=sys.stderr)
+                return 2
+            if not os.path.isdir(project):
+                print("helm hooks: no such project directory: %s" % project,
+                      file=sys.stderr)
+                return 1
+            for s in SPECS:
+                print("helm hooks: %s (%s): %s"
+                      % (s["name"], s["event"], spec_command(s)))
+            action, detail = install_project(project, dry=dry)
+            sp = project_settings_path(project)
+            if action.startswith("dry-"):
+                print("  %-28s %s (dry — nothing written)"
+                      % (os.path.basename(os.path.abspath(project)), action[4:]))
+                if detail:
+                    print("    " + detail.replace("\n", "\n    "))
+            else:
+                print("  %-28s %-6s %s"
+                      % (os.path.basename(os.path.abspath(project)), action, detail))
+            if action != "fail":
+                print("helm hooks: project scope %s — sessions launched in the"
+                      " project get the physics; the rest of the machine stays"
+                      " hook-free. Only NEW sessions pick it up (the harness"
+                      " snapshots hooks at start)." % sp)
+                print("helm hooks: keep %s out of the repo (per-machine paths)"
+                      " — add `.claude/settings.local.json` to the project's"
+                      " .gitignore if it is not already there; helm never edits"
+                      " a repo's ignore file for you." % os.path.basename(sp))
+            return 1 if action == "fail" else 0
         targets, err = _select_homes(home_name)
         if err:
             print("helm hooks: " + err, file=sys.stderr)

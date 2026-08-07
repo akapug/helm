@@ -115,6 +115,26 @@ failing helm injects nothing instead of blocking.
 `helm hooks install --harness codex` reports honestly: the codex notify-hook
 recipe below is not yet mechanical, so codex stays hand-wired for now.
 
+### Project scope: `helm hooks install --project DIR`
+
+Not every operator wants the physics machine-wide. `--project` installs the
+same full spec set into `DIR/.claude/settings.local.json` instead of any
+claude home: sessions launched in that project get inject, the delivery lane,
+the stop-guard and the handoff contract; every other session on the machine
+stays hook-free. Same CAS pipeline, same merge-preservation laws, same beacon
+permits — with one deliberate delta: the scalar estate defaults are **not**
+seeded, because a project file is neither a home nor a seat and helm does not
+own a project's other settings.
+
+`settings.local.json`, deliberately: the generated commands carry this
+machine's absolute helm path, so the file is per-machine and must never ride
+a commit into someone else's checkout. Add `.claude/settings.local.json` to
+the project's `.gitignore` — the installer reminds you, and never edits a
+repo's ignore file itself. Only *new* sessions pick the hooks up (the harness
+snapshots hook config at session start). `helm hooks status` reports
+project-scoped wiring in its project-scopes lines, and flags a spec loaded at
+both project and active-home scope as a cross-scope duplicate.
+
 ## The contract
 
 ```console
