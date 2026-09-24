@@ -1,0 +1,110 @@
+# helm concepts — the two axes, disambiguated
+
+Two taxonomies grew up sharing the phrase "the fourth leg", and the overload
+caused real design debt. helm names them apart, permanently.
+
+## Axis 1 — PERSONALIZATION (the four legs of "the substrate learns you")
+
+What a knowledge layer must know about its *operator* to feel personal:
+
+| leg | question it answers | helm home |
+|---|---|---|
+| **did** | what happened — episodes, sessions, project history | harness transcripts + recall index (referenced, never copied) |
+| **believes** | what the operator holds true or likely | the priors store (typed entries with confidence) |
+| **means** | what the operator's words mean — their idiolect | the lexicon |
+| **who** | who the operator *is* — voice, autonomy, style, goals | `~/.helm/_global/know-your-user/` |
+
+**The fourth leg is WHO.** Personalization without a live `who` leg is what
+makes a coordination layer feel like an admin panel. In helm, `who` is
+load-bearing: the interview fills it, agents read it, rapport follows.
+
+## Axis 2 — CONTENT CLASS (what a stored entry *is*)
+
+Every entry in the typed store declares its class in frontmatter (`type:`):
+
+| type | what it is | confidence |
+|---|---|---|
+| **prior** | a belief, confidence-weighted, updated on logged evidence | 0.05–0.99 for beliefs; **1.0 = a premise** |
+| **heuristic** | a *move* you apply — "when X, do Y" | always 1.0; the only question is whether its trigger fires |
+| **lexicon** | a term and its meaning | capture-confidence only |
+| **reference** | harvested external material worth keeping | n/a |
+| **capability** | the wired-substrate self-index — "you have `<verb>`: `<what>` (wired via `<hook>`, live)", surfaced when reasoning touches its trigger | n/a; live/absent is a PROBE (a powerpack surfaces only when actually wired), never a static fact |
+| **episodic** | dated raw record — journals, session residue | n/a; never injected |
+
+**A premise is not a leg and not a type of its own** — it is the special case
+of a prior at confidence 1.0 (entirely load-bearing, human-stated). One store,
+one file class, one confidence spectrum; `class: certain` is *derived*, never
+authored.
+
+## The routing law (belief vs move vs reflex)
+
+> A premise/prior is a belief you **hold** — it gates decisions; confidence is
+> meaningful. A heuristic is a move you **apply** across domains — confidence
+> is always 1; the only question is whether its trigger-pattern fires this
+> turn. A reflex is a heuristic **operationalized** to fire on every turn or
+> tool call — delivery is guaranteed by the harness hook; only the heeding is
+> probabilistic.
+
+And the artifact-class law that routes a capture to its home:
+
+```
+verb → skill · fact → memory · term → lexicon · guarantee → hook
+move → heuristic · belief → prior · fires-unbidden → reflex
+```
+
+## Load class (when an entry reaches context)
+
+Orthogonal to type. `load_class:` ∈
+
+- **always** — injected every turn. Budget-capped, pin-earned, kept tiny.
+- **jit** — injected only when the prompt matches the entry's id or a
+  *specific* keyword (generic-word matches are rejected — the anti-wallpaper
+  guard). The default. Ranking is **DF-weighted**: each matched keyword
+  contributes 1/df — df being how many entries carry it, computed over the
+  in-memory store per call — summed, then confidence-weighted. A keyword
+  shared by many entries is a weak signal; a rare one is strong, so one
+  distinctive match outranks a pile of shared ones. Ties break
+  most-recently-updated first, never alphabetically.
+- **dormant** — never injected until re-confirmed; where decayed beliefs go.
+
+The salience law governs all three: **empty on no match**. Salience is the
+scarce resource; spend it only when newly relevant.
+
+## Attested premises (shipped)
+
+Premises (confidence 1.0) are provable, standing truths — so they live as
+*attested records* on a verifiable chain, not just files. The design converged
+2026-07-18 between the build and substrate poles; the attestation model was
+**corrected 2026-07-20 to be native-first** (the earlier "the operator's cell
+signs each premise" plan was not reproducible in stdlib and, per the owner, not
+required — his stated quote *is* the proof). It ships as `helm premise` /
+`helm premise-check` (operational detail: [ATTESTATION.md](ATTESTATION.md)).
+The shape:
+
+- **The proof is the quote plus a native hash-chain.** A premise's provenance
+  (the operator stated it, with a date and source) is the attestation;
+  confidence 1.0 is human-only by law, so the attestable set is precisely the
+  operator's stated truths. Each capture appends a record to a local
+  append-only chain (`_global/.state/attest-chain.jsonl`) whose
+  `rec_hash = blake2b(canonical(core) + predecessor_hash)` — tamper-evident and
+  verifiable entirely offline.
+- **Thin claim, fat corroboration**: the record holds an *unsigned* blake2b
+  digest of the canonical premise text; the text stays in the storehouse. A
+  checker recomputes the digest and re-walks the chain — match plus intact
+  linkage means the native record is verified.
+- **Supersession is a new chain record** linking `attest_supersedes_record` to
+  the prior `rec_hash` (append-only, never delete — retire keeps the file).
+  Belief history becomes a provable chain: *held X until T, then Y* — which the
+  drift report reads as attested belief evolution.
+- **dregg is an optional external checkpoint, never the proof.** When a dregg
+  node is configured and reachable, helm may anchor the record digest to it,
+  labeled honestly ("node `<url>` anchored digest at turn `<hash>`") — the node
+  signs as *its own* operator cell, so this is never labeled as the user's cell
+  signing. Best-effort and fail-open: no node ⇒ the native record stands and
+  the anchor queues for `--retry-queue`.
+
+`attest_by`/`attest_profile` are **provenance labels, not signers**.
+`premise-check` reports three independent tiers — digest match, native chain
+verified, external anchor confirmed/unverified/none — and never collapses them
+or over-claims a signer. The substrate is an upgrade, never a dependency:
+without it, premises store normally and the native chain records offline.

@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "The example local-names file. Copy to <helm home>/_global/local-names.json",
+    "and edit: this file is documentation and is never read at runtime. It holds",
+    "the names of this operator's own projects, hosts and predecessor tools,",
+    "which helm's source does not carry. Every key is optional; without it the",
+    "behaviour it names is off or takes its neutral default, so a fresh clone",
+    "needs no file at all. Keys starting with '_' are ignored, and `helm doctor`",
+    "names an unreadable file, an unknown key and a value of the wrong shape.",
+    "",
+    "predecessor         the tool helm replaced on this host (a lowercase word):",
+    "                    its <NAME>_* variables and its ~/.cache/<name>/,",
+    "                    ~/.config/<name>/ and ~/.<name>-home-archive/ are still",
+    "                    honoured, and a keepalive it runs counts as a writer",
+    "qwen27-provider     the provider name the qwen27 pool row goes by (default",
+    "                    local-llamacpp); a seat minted under a name keeps it",
+    "deploy-dir          the directory a deployed gate's scripts run from",
+    "deploy-project      the registered project whose checkout owns them",
+    "local-review-script the findings pass's reading script",
+    "fab-node            the build node an operator's A/B eval rig runs on by default",
+    "generic-keywords    words the knowledge store never treats as a topic"
+  ],
+  "predecessor": "oldtool",
+  "qwen27-provider": "box-llamacpp",
+  "deploy-dir": "~/.local/share/gate-bin",
+  "deploy-project": "infra",
+  "local-review-script": "~/dev/infra/scripts/local-review.py",
+  "fab-node": "build-1",
+  "generic-keywords": ["oldtool"]
+}

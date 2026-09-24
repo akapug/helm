@@ -1,0 +1,490 @@
+/* ================= ledger view (read-only projection of the attestation node) =================
+   Polls /api/ledger every ~3s while open. The node down is a NORMAL state:
+   {"offline": true} renders as a quiet "substrate offline" strip, never an
+   error. The one write here — message a seat — rides the EXISTING /api/chat
+   POST (bearer + owner-unread marker); the ledger endpoints stay GET-only. */
+let LEDGER_TIMER = null;
+// wired ONCE — initLedger runs on every entry to the ledger tab, and a
+// listener added per entry would fire N times per return and re-poll N times
+let LEDGER_VIS_WIRED = false;
+const lsh = h => h ? String(h).slice(0, 10) + "…" : "—";
+const lago = t => {
+  if (!t) return "—";
+  const s = Math.max(0, Date.now() / 1e3 - t);
+  return s < 60 ? Math.round(s) + "s ago" : s < 3600 ? Math.round(s / 60) + "m ago"
+    : s < 86400 ? Math.round(s / 3600) + "h ago" : Math.round(s / 86400) + "d ago";
+};
+const lagoIso = t => { const e = Date.parse(t || ""); return isNaN(e) ? "—" : lago(e / 1e3); };
+
+// A poll that returns the same rows must not destroy and rebuild them. The
+// live-tab measurement behind task/1546 saw 79.1 MB of DOM replacement in 25m
+// while the JS heap stayed flat. Keep the structural HTML as the comparison
+// key, and refresh relative-age text in place — age passing is not a row change.
+function ledgerAgeHTML(t) {
+  const ts = typeof t === "number" ? t : Date.parse(t || "") / 1e3;
+  return Number.isFinite(ts)
+    ? '<span class="lage" data-ts="' + ts + '"></span>'
+    : '<span class="lage">—</span>';
+}
+function ledgerAges(el) {
+  el.querySelectorAll(".lage[data-ts]").forEach(age => {
+    const text = lago(Number(age.dataset.ts));
+    if (age.textContent !== text) age.textContent = text;
+  });
+}
+function ledgerHTML(el, html) {
+  if (el._helmLedgerHTML !== html) {
+    el._helmLedgerHTML = html;
+    el.innerHTML = html;
+  }
+  ledgerAges(el);
+}
+
+/* ── Transport status and row evidence answer different questions. A retained
+   profile failure makes the fleet DEGRADED even while other profiles commit
+   signed entries. LEDGER_SIGNED only chooses tier order / signed empty copy;
+   LEDGER_HEAD independently exposes entries this read may have missed. */
+let LEDGER_SIGNED = null, LEDGER_HEAD = null;
+function ledgerMode(tp) {
+  LEDGER_HEAD = tp && typeof tp.head === "number" ? tp.head : null;
+  const mode = tp && tp.mode, signed = mode === "signed";
+  const labels = {
+    signed: "signing is ON — committed entries appear below; signing evidence belongs to each row",
+    degraded: "signing is degraded — unresolved failure for " + ((tp && tp.profile) || "an unknown profile") + "; committed entries may still arrive",
+    ready: "signing is ready (unproven) — no committed signing success reported",
+    unsigned: "signing is off for this transport — existing shared entries remain readable",
+    "unsigned (no signer)": "signing is off (no signer) — existing shared entries remain readable"
+  };
+  const text = Object.hasOwn(labels, mode) ? labels[mode]
+    : "signing status is unknown — use the row evidence below";
+  if ($("#cavesub").textContent !== text) $("#cavesub").textContent = text;
+  const local = "what helm did here, newest first — local activity is a separate record, not proof of shared signing";
+  if ($("#nativesub").textContent !== local) $("#nativesub").textContent = local;
+  // Relabel on every semantic change, including DEGRADED -> READY and a new
+  // failed profile. Reorder only when the preferred tier actually changes.
+  if (signed === LEDGER_SIGNED) return;
+  LEDGER_SIGNED = signed;
+  const s = $("#tiersigned"), l = $("#tierlocal");
+  s.parentNode.insertBefore(signed ? s : l, signed ? l : s);
+}
+
+/* ── local activity (/api/ledger/native — local reads only, independent of
+   the signing node): the local blake2b attest-chain records merge with the
+   events journal's receipts into one newest-first feed, each row badged for
+   exactly what it is — "chained" = tamper-evident LOCAL note (never a signed
+   entry), "receipt" = append-only journal row (NOT chained). Nothing here
+   ever claims signed; the shared tier independently shows committed entries
+   and their own signing evidence, even during a transport incident. */
+function nativeHead(c) {
+  const el = $("#nativehead");
+  ledgerHTML(el, !c.count ? 'no local notes yet on this machine' : c.verified
+    ? c.count + ' notes · <span class="lbadge final">intact ✓</span> <span title="each note is hash-linked to the previous one; “intact” means nothing was altered (helm: chain head #' + c.head_index + ')">newest #' + c.head_index + '</span>'
+    : '<span class="lbadge tent">⚠ tampering or damage detected</span> ' + esc(c.detail || ""));
+}
+
+function nativeChat(p) {
+  // Aggregate incident status cannot establish whether any individual post
+  // signed. This activity summary carries no per-row signing evidence.
+  const tail = ') — live agent chatter; check each post’s committed signing evidence in the chat tab';
+  // THIS COUNT IS A READING, AND IT SAYS WHEN IT WAS TAKEN. The server walks
+  // every room to build it and now serves that walk from a short TTL, so the
+  // counts — and "quiet" above all — can lag a new post by up to one window.
+  // Nothing else here reveals that: last_ts is the POST's own stamp, so it
+  // keeps ticking in the same way whether this pulse is a second old or a
+  // whole window old. A pulse with no age_s is from a reader that does not
+  // send one and says nothing rather than guessing "live".
+  const read = !p || typeof p.age_s !== "number" ? ''
+    : ' · <span class="lmeta" title="how long ago helm last walked the rooms for this pulse — the counts can lag a new post by that much">read ' +
+      (p.age_s < 1 ? 'just now' : Math.round(p.age_s) + 's ago') + '</span>';
+  ledgerHTML($("#nativechat"), !p || !p.msgs
+    ? 'chat pulse: quiet — nothing posted yet' + read
+    : 'chat pulse: <b>' + p.msgs + '</b> msg(s) · ' + p.rooms + ' room(s) · last ' +
+      ledgerAgeHTML(p.last_ts) + ' (<b>' + esc(p.last_from) + '</b> in ' + esc(p.last_room) +
+      tail + read);
+}
+
+function nativeRows(d) {
+  const rows = (d.chain.records || []).map(r => ({ts: r.ts || "", rec: r}))
+    .concat((d.events || []).map(e => ({ts: e.ts || "", ev: e})));
+  rows.sort((a, b) => b.ts < a.ts ? -1 : b.ts > a.ts ? 1 : 0);
+  if (!rows.length) {
+    ledgerHTML($("#ledgernative"), '<div class="empty">nothing yet — helm’s operations land here as they happen (a lesson capture, a store write, most CLI verbs); empty just means this machine has been quiet</div>');
+    return;
+  }
+  ledgerHTML($("#ledgernative"), rows.slice(0, 30).map(x => {
+    if (x.rec) {
+      const r = x.rec;
+      return '<div class="lrow"><div class="lhead"><span class="lidx">#' + (r.chain_index ?? "?") + '</span>' +
+        '<span class="mono lhash copy" data-copy="' + esc(r.rec_hash || "") + '" title="native record hash — click to copy; verify with helm premise-check">' + lsh(r.rec_hash) + '</span>' +
+        '<span class="lbadge final">chained</span>' +
+        (r.op !== "create" ? '<span class="lbadge">' + esc(r.op || "") + '</span>' : '') +
+        ledgerAgeHTML(r.ts) + '</div>' +
+        '<div class="lmeta">' + esc(r.premise_id || "") + ' · ' + esc(r.project || r.root || "") +
+        (r.attest_by ? ' · recorded by ' + esc(r.attest_by) + ' (provenance, not a signer)' : '') + '</div></div>';
+    }
+    const e = x.ev;
+    return '<div class="lrow"><div class="lhead"><span class="lbadge">receipt</span>' +
+      '<b>' + esc(e.verb || "") + '</b><span class="mono">' + esc(e.target || "") + '</span>' +
+      ledgerAgeHTML(e.ts) + '</div>' +
+      '<div class="lmeta">' + esc(e.summary || "") + (e.actor ? ' · ' + esc(String(e.actor).slice(0, 12)) : '') + '</div></div>';
+  }).join(""));
+}
+
+/* the local tier's chain count, stashed by pollLedger's native read so the
+   strip can put the two records side by side. null = not read or unreadable
+   — either way the strip says UNKNOWN, never 0. */
+let NATIVE_COUNT = null;
+
+function caveActivity(ts, now) {
+  const oldest = Math.min.apply(null, ts);
+  const width = Math.max(60, now - oldest);
+  const B = 12, counts = new Array(B).fill(0);
+  ts.forEach(t => counts[Math.min(B - 1, Math.max(0,
+    Math.floor((t - oldest) / width * B)))]++);
+  const peak = Math.max.apply(null, counts);
+  const GLYPH = "▂▃▄▅▆▇█";
+  const bars = counts.map(c => c ? GLYPH[Math.min(6, Math.floor((c / peak) * 6.99))] : "▁").join("");
+  const age = now - oldest;
+  const span = age < 3600 ? Math.max(1, Math.round(age / 60)) + "m"
+    : age < 86400 ? Math.round(age / 3600) + "h" : Math.round(age / 86400) + "d";
+  return {bars, peak, span};
+}
+function caveActivityTitle(peak) {
+  return "each block is one twelfth of the span — taller means more entries signed then (peak " + peak + " in one block)";
+}
+function cavePulseClock(el, now) {
+  const pulse = el.querySelector(".lpulse[data-times]");
+  if (!pulse) return;
+  const ts = pulse.dataset.times.split(",").map(Number).filter(Number.isFinite);
+  const a = caveActivity(ts, now ?? Date.now() / 1e3);
+  const bars = pulse.querySelector(".lpulsebars"), span = pulse.querySelector(".lpulsespan");
+  if (bars.textContent !== a.bars) bars.textContent = a.bars;
+  const title = caveActivityTitle(a.peak);
+  if (bars.title !== title) bars.title = title;
+  if (span.textContent !== a.span) span.textContent = a.span;
+}
+
+/* PURE (data in, string out — the lrCardHTML pattern, so tests run this
+   exact source under node): the signing-pulse line for the signed-entries
+   card. Composes the SAME turns payload the rows below render — no second
+   fetch, no second truth — into the three facts the list itself cannot show
+   at a glance: WHEN signing happened (a word-sized activity strip over the
+   newest entries), HOW MUCH is consensus-final, and whether the shown chain
+   is CONTINUOUS (gapless positions, and not behind the service's own head).
+   Clock-dependent values are blank markers in this data-only structural key;
+   cavePulseClock patches them in place after ledgerHTML mounts the skeleton. */
+function cavePulse(turns, head) {
+  const rows = Array.isArray(turns) ? turns.filter(t => t && typeof t === "object") : [];
+  if (!rows.length)
+    return 'signing pulse: no signed entries in this read — nothing to measure';
+  // continuity — the shown entries' chain positions must be gapless
+  const idx = rows.map(t => t.chain_index).filter(i => typeof i === "number")
+    .sort((a, b) => a - b);
+  let missing = 0;
+  for (let i = 1; i < idx.length; i++) missing += Math.max(0, idx[i] - idx[i - 1] - 1);
+  const lo = idx.length ? idx[0] : null, hi = idx.length ? idx[idx.length - 1] : null;
+  const chain = !idx.length
+    ? '<span class="lbadge tent">⚠ positions unreadable</span> no entry in this read carries a usable chain position'
+    : (missing
+      ? '<span class="lbadge tent">⚠ gap</span> entries #' + lo + "–#" + hi + " with "
+        + missing + " missing in between — this read is not the whole span"
+      : "entries #" + lo + "–#" + hi + " unbroken ✓")
+      + (typeof head === "number" && hi !== null && head > hi
+        ? ' · <span class="lbadge tent">⚠ behind</span> the service’s newest is #' + head
+        : "");
+  // finality — counted over what is shown, in the SAME three states the badge
+  // renders (see ledgerBadges). Counting a solo entry as "awaiting finality"
+  // was the #220 lie: its node serves no certificate, so the wait it announced
+  // could never complete. One classifier decides each row exactly once, so the
+  // buckets cannot overlap and cannot sum to more than the rows shown.
+  // ABSENCE IS TESTED FIRST, and the order is the whole contract: it must match
+  // ledgerBadges exactly or the same row gets two different answers on two
+  // surfaces. It did — a review caught it. Testing `finality === "final"`
+  // first made {chain_index:2, finality:"final"} (certificate ABSENT) render
+  // "solo-committed" on its badge while the summary counted it "all 1 final".
+  // A node that serves no certificate cannot report consensus finality, so
+  // absence decides before any finality word is read. Cross-surface agreement is
+  // pinned by LedgerSurfaceAgreementTest, which runs BOTH functions on one row.
+  const tier = t => t.consensus_final === undefined ? "solo"
+                  : (t.consensus_final === true || t.finality === "final") ? "final"
+                  : "wait";
+  const n = {final: 0, solo: 0, wait: 0};
+  rows.forEach(t => { n[tier(t)]++; });
+  const fin = n.final;
+  const parts = [];
+  if (n.final) parts.push("<b>" + n.final + "</b> final");
+  if (n.solo) parts.push("<b>" + n.solo + "</b> solo-committed");
+  if (n.wait) parts.push("<b>" + n.wait + "</b> awaiting finality");
+  const split = n.final === rows.length ? 'all <b>' + n.final + "</b> final"
+    : n.solo === rows.length ? 'all <b>' + n.solo + "</b> solo-committed"
+    : parts.join(" · ");
+  // activity — the shown entries bucketed oldest→now into a word-sized
+  // graphic (▁ is a bucket with zero), direct-labeled with its span; the
+  // list is the server's newest-40 cap, so the label counts what is SHOWN
+  const ts = rows.map(t => t.timestamp).filter(t => typeof t === "number");
+  let strip = '<span class="lbadge tent">times unreadable</span>';
+  if (ts.length) {
+    strip = '<span class="lpulse" data-times="' + ts.join(",") + '"><span class="mono lpulsebars" title=""></span> ' +
+      rows.length + " entr" + (rows.length === 1 ? "y" : "ies") +
+      ' over <span class="lpulsespan"></span></span>';
+  }
+  return "signing pulse: " + strip + " · " + split + " · " + chain;
+}
+
+function ledgerStrip(d) {
+  const el = $("#ledgerstrip");
+  if (d.offline) {
+    const tp = d.transport, degraded = tp && tp.mode === "degraded";
+    ledgerHTML(el, '<span class="offline">substrate offline — node unreachable at <code>' +
+      esc(d.node) + '</code>; retrying quietly…</span>' + (degraded
+        ? '<span title="' + esc(tp.remediation || "repair signing and retry") +
+          '">chat signing <span class="lbadge tent">DEGRADED</span> · <b>' +
+          esc(tp.profile || "?") + '</b> · ' + esc(tp.reason || "signing failed") +
+          ' · first ' + esc(tp.first_failure || "?") + ' · last ' +
+          esc(tp.last_failure || "?") + ' (' + ledgerAgeHTML(tp.last_failure) +
+          ')</span>' : ''));
+    return;
+  }
+  const s = d.status || {}, fin = s.latest_height ?? 0, tp = d.transport;
+  const sig = !tp ? ''
+    : tp.mode === "signed"
+      ? '<span title="chat posts and lesson captures are being signed onto the shared record (helm chat status)">signing <span class="lbadge final">live</span></span>'
+      : tp.mode === "degraded"
+        ? '<span title="A profile has an unresolved signing failure; other profiles may still commit signed entries. Remediation: ' + esc(tp.remediation || "repair signing and retry") + '">signing <span class="lbadge tent">DEGRADED</span> · <b>' + esc(tp.profile || "?") + '</b> · ' + esc(tp.reason || "signing failed") + ' · first ' + esc(tp.first_failure || "?") + ' · last ' + esc(tp.last_failure || "?") + ' (' + ledgerAgeHTML(tp.last_failure) + ')</span>'
+        : '<span title="chat transport truth (helm chat status)">signing <span class="lbadge tent">' + esc(tp.label || tp.mode) + '</span></span>';
+  // THE RECORD IN ONE COMPARISON — Tufte's analytical act put where the eye
+  // lands first: entries on the shared signed record (provable anywhere)
+  // beside chained notes that exist only on this computer (provable only
+  // here). Either side unread says UNKNOWN — a "0" here would claim a record
+  // nobody counted.
+  const sharedN = typeof s.dag_height === "number" ? s.dag_height : null;
+  const split = '<span title="the two records side by side: signed entries on the shared record (checkable by anyone) vs tamper-evident notes that exist only on this machine (helm premise-check). Different contents, one question: how much of what helm knows is PROVABLE off this box.">'
+    + "record: <b>" + (sharedN === null ? "UNKNOWN" : sharedN) + "</b> signed·shared vs <b>"
+    + (NATIVE_COUNT === null ? "UNKNOWN" : NATIVE_COUNT) + "</b> local-only</span>";
+  ledgerHTML(el,
+    '<span><b>' + (s.healthy === true ? "healthy" : "degraded") + '</b></span>' + sig +
+    '<span title="turns accepted at ingress">ingress <b>' + esc(String(s.dag_height ?? "?")) + '</b></span>' +
+    '<span title="consensus-finalized height">finalized <b>' + fin + '</b>' + (fin === 0 ? ' <span class="lbadge tent">tentative</span>' : '') + '</span>' +
+    '<span>producer <b>' + esc(String(s.state_producer ?? "?")) + '</b>' + (s.lean_producer ? " ✓" : "") + '</span>' +
+    '<span>' + esc(String(s.federation_mode ?? "?")) + ' · <b>' + (s.peer_count ?? 0) + '</b> peers</span>' +
+    split +
+    '<span style="margin-left:auto"><code>' + esc(d.node || "") + '</code></span>');
+}
+
+function ledgerBadges(t) {
+  const b = [];
+  if (t.chain_head) b.push('<span class="lbadge head">head</span>');
+  if (t.has_proof) b.push('<span class="lbadge final">proof</span>');
+  if (t.executor_signed) b.push('<span class="lbadge">exec-signed</span>');
+  // Finality tier, FEATURE-DETECTED on `consensus_final` — three states, not
+  // two, because the field's ABSENCE and its being FALSE mean opposite things:
+  //   absent  -> this node does not serve consensus certificates at all. That
+  //              is every node we have ever run: the certificate was proposed
+  //              in dregg PR #54 and closed UNMERGED, so no node has ever
+  //              served it and none ever "predated" it (this comment used to
+  //              claim the fallback was for legacy nodes — exactly backwards,
+  //              the fallback is the ONLY path). A solo node stamps the
+  //              receipt's own `finality` "tentative" BY DESIGN and finalizes
+  //              internally, so rendering "awaiting finality" promised the
+  //              owner a wait that can never complete. Say what is true: the
+  //              entry is committed and attested on this node's chain.
+  //   false   -> a node that DOES serve certificates says this turn is not
+  //              final yet. That is a real wait, and it still renders as one.
+  //   true    -> finalized, with the attested height.
+  // Detecting the field rather than the deployment keeps this honest the day a
+  // certificate-serving node appears: it needs no code change to start reading
+  // as a genuine wait again.
+  if (t.consensus_final === undefined)
+    b.push('<span class="lbadge">solo-committed · attested h' + (t.chain_index ?? "?") + '</span>');
+  else if (t.consensus_final) b.push('<span class="lbadge final">final @ h' + (t.attested_height ?? "?") + '</span>');
+  else if (t.finality) b.push('<span class="lbadge' + (t.finality !== "final" ? " tent" : " final") + '">' + esc(t.finality) + '</span>');
+  return b.join(" ");
+}
+
+// A readable head proves entries exist regardless of transport incidents.
+// An empty read without a head does not prove the whole shared record empty.
+// Runtime tests execute this classifier and its rendered empty states.
+function ledgerEmptyClass(signed, head, nturns) {
+  if (nturns > 0) return "rows";
+  if (head != null) return "mismatch";
+  if (signed) return "fresh";
+  return "off";
+}
+
+// The about join (server-side): a turn helm can NAME — a chat post whose RAM
+// row carries this turn hash (topic helm.chat) or a premise anchor (topic
+// helm.attest). Named turns get a kind badge + a who-line, so the owner sees
+// "my post landed as entry #N" instead of a bare hash. Unlabeled turns render
+// exactly as before — helm never invents an identity for a turn it can't join.
+function ledgerTurns(turns) {
+  const cls = ledgerEmptyClass(!!LEDGER_SIGNED, LEDGER_HEAD, (turns || []).length);
+  if (cls !== "rows") {
+    ledgerHTML($("#ledgerturns"), '<div class="empty">' + (cls === "mismatch"
+      ? 'the signing service reports entries up to #' + LEDGER_HEAD +
+        ', but this read found none — helm is likely reading the wrong service; run <code>helm chat status</code>'
+      : cls === "fresh"
+        ? 'no shared entries returned yet — signing is available, but this read has no committed entries'
+        : 'no shared entries returned by this read — this does not establish whether new entries are being created') + '</div>');
+    return;
+  }
+  ledgerHTML($("#ledgerturns"), turns.map(t => {
+    const ab = t.about;
+    const kind = ab ? '<span class="lbadge head">' + (ab.kind === "chat" ? "chat" : "attest") + '</span> ' : '';
+    const who = !ab ? '' : '<div class="lmeta">' + (ab.kind === "chat"
+      ? '<b>' + esc(ab.from || "?") + '</b> in #' + esc(ab.room || "main") +
+        (ab.text ? ' · “' + esc(ab.text) + '”' : '')
+      : 'captured lesson <b>' + esc(ab.id || "?") + '</b>') + '</div>';
+    const signer = LEDGER_NAMES[t.agent]
+      ? 'signed by <b>' + esc(LEDGER_NAMES[t.agent]) + '</b>'
+      : 'signed by <span class="mono" title="signing-account id — no seat name known for it on this host">' + lsh(t.agent) + '</span>';
+    return '<div class="lrow"><div class="lhead"><span class="lidx">#' + (t.chain_index ?? "?") + '</span>' +
+      '<span class="mono lhash copy" data-copy="' + esc(t.turn_hash || "") + '" title="the entry’s hash (helm: turn hash) — click to copy">' + lsh(t.turn_hash) + '</span> ' +
+      kind + ledgerBadges(t) + ledgerAgeHTML(t.timestamp) + '</div>' + who +
+      '<div class="lmeta">' + signer + ' · receipt <span class="mono">' + lsh(t.receipt_hash) + '</span>' +
+      ' · ' + (t.action_count ?? 0) + ' action(s) · <span title="compute cost (helm: computrons)">' + (t.computrons_used ?? 0) + ' ⚙</span></div></div>';
+  }).join(""));
+}
+
+function seatState(ts, now) {
+  if (ts == null) return ["", "idle"];
+  const s = (now ?? Date.now() / 1e3) - ts;
+  return s < 120 ? ["active", "active"] : s < 1800 ? ["quiet", "quiet"] : ["stuck", "stuck?"];
+}
+function ledgerCellClock(el, now) {
+  const at = now ?? Date.now() / 1e3;
+  el.querySelectorAll(".lstate[data-ts]").forEach(row => {
+    const [cls, label] = seatState(Number(row.dataset.ts), at);
+    const dot = row.querySelector(".ldot"), badge = row.querySelector(".lbadge");
+    const dotClass = "ldot " + cls;
+    const badgeClass = "lbadge" + (cls === "active" ? " final" : cls === "quiet" ? " tent" : "");
+    if (dot.className !== dotClass) dot.className = dotClass;
+    if (badge.className !== badgeClass) badge.className = badgeClass;
+    if (badge.textContent !== label) badge.textContent = label;
+  });
+}
+
+// agent/cell hex -> seat name, rebuilt each poll from the cells the server
+// already joined (chat's {profile: cell} cache). Both signed-tier cards read
+// it, so "who signed" and the feed's "signed by" can never disagree.
+let LEDGER_NAMES = {};
+
+function ledgerCells(cells) {
+  const el = $("#ledgercells");
+  if (!cells || !cells.length) {
+    ledgerHTML(el, '<div class="empty">nobody has signed yet — a seat appears here the first time it signs an entry</div>');
+    return;
+  }
+  // the share meter: widths COMPARE one signer's recent entries against the
+  // busiest signer's — the comparison the numbers alone make the reader do in
+  // their head. Zero recent draws an empty track, never a sliver.
+  const peak = Math.max.apply(null, cells.map(c => c.recent_turns || 0));
+  ledgerHTML(el, cells.map(c => {
+    const timed = typeof c.last_turn_ts === "number";
+    const head = timed
+      ? '<div class="lhead lstate" data-ts="' + c.last_turn_ts + '">'
+      : '<div class="lhead">';
+    const badge = timed ? '<span class="lbadge"></span>' : '<span class="lbadge">idle</span>';
+    const name = c.seat ? '<b class="lseat">' + esc(c.seat) + '</b>' : '';
+    const meter = peak > 0
+      ? '<span class="lmeter" title="this signer’s share of the newest entries — the bar compares against the busiest signer in this list (' + peak + ')"><i style="width:' + Math.round((c.recent_turns || 0) / peak * 100) + '%"></i></span> '
+      : '';
+    return '<div class="lrow">' + head + '<span class="ldot"></span>' + name +
+      '<span class="mono lhash copy" data-copy="' + esc(c.id || "") + '" title="signing-account id (helm: cell) — click to copy' + (c.seat ? '' : '; no seat name known for it on this host') + '">' + lsh(c.id) + '</span>' +
+      badge + ledgerAgeHTML(c.last_turn_ts) + '</div>' +
+      '<div class="lmeta">' + meter + '<span title="entries in the list at left / signed ever (helm: nonce)">' +
+      (c.recent_turns || 0) + ' recent · <b>' + (c.nonce ?? 0) + '</b> ever</span> · ' +
+      '<span title="prepaid compute this account can still spend (helm: balance)">fee budget ' + (c.balance ?? 0) + '</span>' +
+      (c.has_program ? ' · <span class="lbadge">program</span>' : '') +
+      (c.capability_count ? ' · ' + c.capability_count + ' caps' : '') + '</div></div>';
+  }).join(""));
+  ledgerCellClock(el);
+}
+
+// The delivery roster maps the server's presence ("fresh"/"quiet"/"absent")
+// to the owner-facing word ("active"/"quiet"/"absent") — same word the seat
+// picker and the roster's own legend use, so the whole tab speaks one dialect.
+const presenceLabel = p => p === "fresh" ? "active" : p;
+const seatRuntime = s => {
+  const r = (s && s.runtime && typeof s.runtime === "object") ? s.runtime : {};
+  const route = [r.agent_harness, r.backend].filter(Boolean).join("/");
+  // WHICH MODEL ANSWERED comes RENDERED from the server (resolved_text), it is
+  // not re-derived here: the rung word needs the family catalog, which no
+  // browser can read, and a second renderer is how the console and the CLI
+  // come to word one seat two ways.
+  return [r.family, route, (s && s.resolved_text) || r.model]
+    .filter(Boolean).join(" · ");
+};
+
+let LAST_ROSTER = null;
+
+// A small anchored, data-dense card for one seat: its live facts + one deep
+// link into the sessions tab (its transcript). Minimal chrome — one card reused,
+// dismissed on any outside click / Escape. No network: reads the row already in
+// hand from the roster poll.
+function seatPop(anchor, seat, sess) {
+  closeSeatPop();
+  const s = ((LAST_ROSTER && LAST_ROSTER.seats) || []).find(x => x.seat === seat) || {seat: seat, session: sess};
+  const full = s.session || sess || "";
+  const fact = (k, v) => v ? '<div class="spk">' + esc(k) + '</div><div class="spv">' + esc(v) + '</div>' : '';
+  const pop = document.createElement("div");
+  pop.className = "seatpop";
+  pop.id = "seatpop";
+  pop.innerHTML =
+    '<div class="spname">' + esc(s.seat) + '</div>' +
+    '<div class="spgrid">' +
+      fact("presence", presenceLabel(s.presence)) +
+      fact("runtime", seatRuntime(s)) +
+      fact("⚠", s.warn || "") +          // honest-presence: WHY this row is unverified
+      fact("last seen", s.last_seen ? lago(s.last_seen) : "—") +
+      fact("home", (s.home_room || "—")) +
+      fact("project", s.project) +
+      fact("cwd", s.cwd) +
+      fact("pending", s.pending ? (s.pending + " undelivered") : "") +
+      fact("task", s.todo && s.todo.active) +
+      fact("session", full) +
+    '</div>' +
+    '<button type="button" class="spcfg">→ open Config + injection weight</button>' +
+    '<button type="button" class="spjump">→ open sessions + transcript</button>' +
+    '<button type="button" class="spren" data-rnkey="' + esc(full || s.seat) + '">rename @' + esc(chatShort(s.seat)) + '</button>';
+  document.body.appendChild(pop);
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = Math.min(r.left, window.innerWidth - pop.offsetWidth - 12) + "px";
+  pop.style.top = (r.bottom + 6) + "px";
+  pop.querySelector(".spcfg").onclick = () => { seatToConfig(seat, full); closeSeatPop(); };
+  pop.querySelector(".spjump").onclick = () => { seatToSessions(seat, full); closeSeatPop(); };
+  // rename: the same rename_seat flow the old activity panel had, keyed by the
+  // stable session id (or seat) so a garbled label stays addressable.
+  pop.querySelector(".spren").onclick = async () => {
+    const cur = s.seat, key = pop.querySelector(".spren").dataset.rnkey || cur;
+    const nn = (prompt('rename seat "' + cur + '" — the new @name (letters, digits, . _ -):', cur) || "").trim();
+    if (!nn || nn === cur) return;
+    try {
+      const rr = await post("/api/chat/seat", {action: "rename", seat: key, new: nn});
+      toast("seat renamed: " + cur + " → " + nn + " — @" + nn + " now delivers to it");
+      if (rr && rr.note && /beacon/.test(rr.note)) console.log(rr.note);
+      closeSeatPop(); pollRoster();
+    } catch (e) { toast("rename refused: " + e.message); }
+  };
+  setTimeout(() => document.addEventListener("mousedown", _seatPopAway), 0);
+  document.addEventListener("keydown", _seatPopEsc);
+}
+function _seatPopAway(ev) { const p = $("#seatpop"); if (p && !p.contains(ev.target)) closeSeatPop(); }
+function _seatPopEsc(ev) { if (ev.key === "Escape") closeSeatPop(); }
+function closeSeatPop() {
+  const p = $("#seatpop"); if (p) p.remove();
+  document.removeEventListener("mousedown", _seatPopAway);
+  document.removeEventListener("keydown", _seatPopEsc);
+}
+function seatToConfig(seat, sess) {
+  showView("configs");
+  cfgInjection(seat, sess);
+}
+function seatToSessions(seat, sess) {
+  // deep-link (reuses the day->sessions jump pattern): filter the sessions tab
+  // to this agent by its session id, name fallback, then focus the tab.
+  const q = sess || seat;
+  state.q = q; const box = $("#sq"); if (box) box.value = q;
+  CONTENT = null; showView("sessions"); renderSessions();
+  toast("sessions for " + seat);
+}
+

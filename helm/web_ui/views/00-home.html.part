@@ -1,0 +1,261 @@
+<div class="view on" id="view-work">
+  <header>
+    <div class="brandrow">
+      <span class="mark">⎈</span><h1>helm</h1>
+      <div class="stats" id="stats"></div>
+    </div>
+    <p id="hello">your projects, remembered</p>
+  </header>
+
+  <div id="banner">helm isn’t answering — start it with <code>helm web</code>; retrying quietly…</div>
+
+  <!-- SEPARATE from #banner on purpose: that one is a connectivity ERROR and
+       this one is an advisory about the server's own age. One element would
+       let either clobber the other, and the case that matters most is both
+       being true at once. -->
+  <div id="stalebanner"></div>
+
+  <!-- ON YOU (the owner's merge of board, work and scheduler into one Work
+       page): what is waiting on him comes first — the decisions he answers
+       here, and the owner asks and owner-held land requests the fleet filed,
+       off the one /api/lr read. ONE QUIET LINE when both reads say nothing is
+       waiting; "not read yet" until both have answered, never a quiet zero
+       over a read that has not arrived. -->
+  <section id="onyou">
+    <div id="onyouhead"><b>on you</b>
+      <span id="onyouline"><span class="bmut">not read yet</span></span>
+    </div>
+    <div id="onyouasks" hidden></div>
+    <!-- OWNER DECISION QUEUE: the durable "waiting on YOU" surface (the
+         store review queue generalized — owner 2026-08-04: "so that I can
+         just go review a durable queue"). Any seat files a card
+         (`helm decide file`); you answer HERE at your leisure; the verdict
+         DMs the filing seat via its beacon. Empty is a real state and
+         says so. -->
+    <section id="odq" hidden>
+      <div id="odqhead"><b>owner decisions</b>
+        <span class="cfgmut" id="odqmeta">not read yet</span>
+        <button class="chip" id="odqReload" style="margin-left:auto">↻ reload</button>
+      </div>
+      <div id="odqlist"><div class="empty">not read yet</div></div>
+    </section>
+  </section>
+
+  <!-- THE BOARD (task/2975): the lanes line, then ONE ROW PER PROJECT, light
+       first, because the light is AUTHORIZATION and a family's burn colour is
+       only SUPPLY. "lanes: R running of M possible" — R the live worktree
+       lanes across every project, M the seats able to take work now — with
+       one chip per model family in its credit colour, and a tap on it opens
+       Fleet's seats. The signing pulse sits beside it, the burn flags one fold
+       below. Everything boots saying "not read yet". -->
+  <section id="board">
+    <div id="bhead">
+      <span id="bheadline"><span class="bcap bmut">lanes: not read yet</span></span>
+      <span id="dreggstrip" title="the signing pulse: is activity landing on the shared signed record, and what landed last — click for the full ledger">⛓ signing — not read yet</span>
+    </div>
+    <details class="grp" id="flagcard">
+      <summary>burn flags<span class="gmeta">how much may run right now, per model family — one fold, read not probed</span></summary>
+      <div id="flagoverall"></div>
+      <div id="flagrows"></div>
+    </details>
+    <div id="controls">
+      <input id="q" type="search" placeholder="filter projects…  ( / )" autocomplete="off">
+      <button class="tog" id="togRetired">retired</button>
+      <span id="count"></span>
+    </div>
+    <div id="brows"></div>
+    <div id="empty"><div class="glyph">⎈</div>no projects yet — run <code>helm sync</code>, then refresh.</div>
+  </section>
+
+  <!-- THE FLEET-WIDE KANBAN, grouped by project: every project with work in
+       flight or landed lately, each as its own four columns (building,
+       review, gate, landed) — the same data as each row's own kanban, off
+       /api/board. The project this helm serves comes from its own pipeline
+       read; every other project from the all-projects read, which runs in the
+       background, so its columns say "loading" until it lands and UNKNOWN if
+       it fails, never empty. Nothing is withheld here.
+       Under it, folded: this helm's own land requests row by row (the wall
+       pollLr renders by id — honesty marks, closed footer, board/list toggle
+       unchanged), and the scheduler: who waits on whom over the same read. -->
+  <section class="ltier" id="tierpipeline">
+    <div class="ltierhead"><b>work landing · the kanban</b><span>every
+      change on its way into the shared code — who wrote it, who reviewed
+      it, and whether git agrees it landed. one row is what helm calls a
+      “land request”; alarms mean the record and reality disagree.</span></div>
+    <section id="fleetkb"><div class="fkline bmut">land requests not read yet</div></section>
+    <details class="grp" id="walldetail">
+      <summary>row by row<span class="gmeta">this helm's own land requests, every mark and verdict — the detail behind its group above</span></summary>
+      <section id="lrsec"></section>
+    </details>
+  </section>
+  <details class="grp" id="schedfold">
+    <summary>who waits on whom<span class="gmeta">the scheduler: every open land request, grouped by the holder it waits on — the same read as the pipeline above</span></summary>
+    <section id="schedulersec"><div class="empty">scheduler not read yet — this is not an empty graph</div></section>
+  </details>
+
+  <!-- THE TASK BACKLOG, and the three obligation lists that were beside it on
+       the work tab, under the kanban: the queue behind the work in flight. -->
+  <div id="worksections">
+    <!-- TASK BACKLOG (#218): the section this container was BUILT for
+         (docs/VERBS.md task-backlog intent; the sibling-joins assertion in
+         test_web_decisions). Team tasks the fleet files — read, annotate,
+         never decide-gated: the home badge counts decisions ONLY, so the
+         3 cards that need the owner stay findable above the 79 that do
+         not. Closed rows render as dim one-liners under a fold: a cited
+         task/NNN resolving to a sentence is the point (55% of citations
+         point at closed ids); resolving to nothing is the bug. -->
+    <section id="otq">
+      <div id="otqhead"><b>task backlog</b>
+        <span class="cfgmut" id="otqmeta">not read yet</span>
+        <button class="chip" id="otqReload" style="margin-left:auto">↻ reload</button>
+      </div>
+      <!-- THE QUEUE HEADER (task/2622), owner: "how am I supposed to help or
+           cross-check the priority ordering of such a massive outstanding
+           list". 477 open rows the morning he asked. He reads TOTAL NUMBERS
+           in the browser pane and does not read row text, so the numbers come
+           FIRST and the rows follow — five counts and the oldest open P0/P1
+           age, the same line the board home's queue cell draws off the same
+           function and the same read. -->
+      <div id="otqqueue" class="tqhead">not read yet</div>
+      <!-- THE CHIPS slice the payload already in hand; a filter that costs a
+           read would blank this card while it waited, and the whole backlog
+           arrives in one body anyway. Nothing here is a second API. -->
+      <div id="otqchips" class="tqchips"></div>
+      <div id="otqlist"><div class="empty">not read yet</div></div>
+    </section>
+
+    <!-- BURN-DOWN (task/955) — the owner asked to be ABLE TO BURN DOWN ALL
+         ROWS, and until this section the answer lived only in the obligation
+         ledger's own verb, which is not even on trunk. He is GUI-first; a terminal-only
+         answer does not discharge a request to SEE the backlog.
+         The meta line NEVER says "0 owed" for a ledger it could not read —
+         that is the same absent/cannot-look triad the task backlog above
+         enforces, and the reason both surfaces spell the failure out. -->
+    <section id="obd">
+      <div id="obdhead"><b>burn-down</b>
+        <span class="cfgmut" id="obdmeta">not read yet</span>
+        <button class="chip" id="obdReload" style="margin-left:auto">↻ reload</button>
+      </div>
+      <div id="obdlist"><div class="empty">not read yet</div></div>
+    </section>
+
+    <!-- CURED, AWAITING RE-DISPATCH — the SECOND obligation type, and the
+         console was silent about it. These rows are finished work with no
+         reader: the author cured and never handed back, so the board reads
+         them as owed BY the author while the author believes they are done.
+         Nobody is waiting on either side. They are invisible to every routine
+         sweep because `dispatch list --open` excludes CURED by construction.
+         Its state is INDEPENDENT of the burn-down above: two questions over
+         two sources, and one going blind must not blank the other. -->
+    <!-- UNDECLARED VERDICTS — the THIRD state, split out of the burn-down
+         after a post-land review: cmd_owed defines an undeclared
+         verdict as NEITHER owed nor clear, and the first version of this
+         surface counted all 26 of them inside "owed". That asserted unknowns
+         are debts. It over-reported in the SAFE direction, which is exactly
+         why it would have survived unnoticed — nobody is alarmed by a backlog
+         that looks too long. These rows need somebody to SAY whether a cure is
+         owed; they are not a cure anybody owes yet. -->
+    <section id="oub">
+      <div id="oubhead"><b>undeclared verdicts</b>
+        <span class="cfgmut" id="oubmeta">not read yet</span>
+      </div>
+      <div id="oublist"><div class="empty">not read yet</div></div>
+    </section>
+
+    <section id="ocb">
+      <div id="ocbhead"><b>cured, awaiting re-dispatch</b>
+        <span class="cfgmut" id="ocbmeta">not read yet</span>
+      </div>
+      <div id="ocblist"><div class="empty">not read yet</div></div>
+    </section>
+  </div>
+
+  <!-- SYSTEM DASHBOARD, under the board: the whole system in one glance —
+       record, fleet, pipeline, in-flight, recent lands, owner debt — each row the same
+       shape so components COMPARE instead of stacking. It replaced a ~90-row
+       pipeline wall of equal visual weight as the first paint (owner
+       2026-07-28: "the homepage should be much more of an above-the-fold
+       dashboard of the system and its components"; the 0.2 council found the
+       same hole independently: "NO HEALTH AT A GLANCE"). The wall itself
+       is the kanban above on this same page (it lived on the ledger tab
+       until the owner merged the pages); the pipeline row below links
+       straight to it.
+
+       The skeleton is STATIC and each cell is owned by exactly one poll
+       (record: pollLr 45s · fleet: pollChat 2s · pipeline / lands / owner:
+       pollLr 45s) — no new polling, and a renderer rewriting
+       the whole band would clobber the other polls' cells between beats.
+       Every cell BOOTS saying "not read yet": a dashboard that cannot tell
+       ZERO from UNREAD is the exact defect this console exists to kill. -->
+  <section id="dash">
+    <div class="dhead"><span class="dlabel">system</span>
+      <span class="dhow">the record's own numbers — <code>helm lr list</code> · <code>helm chat roster</code> · <code>helm premise-check &lt;id&gt;</code></span></div>
+    <div class="drow"><span class="dlab" title="who owes the next move, from the same projection helm lr list reads: one name per holder with how many live land loops are waiting on it, longest wait first inside a tie">owed by</span>
+      <div class="dval" id="downedby"><span class="dmut">not read yet</span></div></div>
+    <div class="drow"><span class="dlab" title="the local attest-chain's verification (with the pipeline read, 45s); the dregg signing pulse rides the board's headline">record</span>
+      <div class="dval">
+        <span id="dchain" class="dmut">chain not read yet</span>
+      </div></div>
+    <div class="drow"><span class="dlab" title="who is on right now — same vocabulary as chat + roster: green active <2m · orange unverified · yellow quiet <15m · gone">fleet</span>
+      <div class="dval" id="dfleet"><span class="dmut">not read yet</span></div></div>
+    <div class="drow"><span class="dlab" title="every open land loop, partitioned once per row: contrary > honored (verdict HONORED through succession) > stalled > unmeasurable > moving — one bar, widths are the counts">pipeline</span>
+      <div class="dval" id="dpipe"><span class="dmut">not read yet</span></div></div>
+    <div class="drow"><span class="dlab" title="the land-request ledger's own closed-as-landed rows, newest first — the same read helm lr list makes, so the card and the command line cannot disagree; each row names its task, its reviewed tip, its gate receipt and its age">landed</span>
+      <div class="dval" id="dlands"><span class="dmut">not read yet</span></div></div>
+    <!-- THE TASK QUEUE'S OWN NUMBERS (task/2622). The pipeline row above
+         counts LAND LOOPS — work already in flight — and the owner's question
+         was about the 477-row BACKLOG behind it, which had no number anywhere
+         on this page. Fed by the task poll that already runs for the work
+         tab's card (one poll owns one cell), and it obeys the band's law like
+         every other row: it names its command-line read, shows that read's
+         age, and renders NOTHING once the read is past its freshness bound. -->
+    <div class="drow"><span class="dlab" title="the fleet task backlog by rank, from the same read helm task list makes: how many P0/P1/P2/P3 are live, how many are in progress, and how long the oldest open P0 and P1 have been waiting">backlog</span>
+      <div class="dval" id="dqueue"><span class="dmut">not read yet</span></div></div>
+    <div class="drow"><span class="dlab" title="what is waiting on YOU: the fleet-filed owner asks and the land requests held for your approval, both off the one /api/lr read">owner</span>
+      <div class="dval" id="downer"><span class="dmut">not read yet</span></div></div>
+  </section>
+
+  <!-- ANSWERS FOR YOU (owner ruling, task/2364): replies that address HIM,
+       from the same reading of the room the push notification path uses. It
+       sits directly under the band and ABOVE readiness because it is the one
+       thing on this page that is waiting on him rather than reporting to him.
+       HIDDEN AT ZERO — chat states emptiness properly, and an empty card here
+       is one more thing to look past. It is not an inbox: it holds nothing,
+       acknowledges nothing, and reading the room clears it. -->
+  <section id="danswers" hidden></section>
+
+  <!-- AWAY MODE (task/3018): the owner's away flag and his notice to every
+       agent, set here because he does not type verbs. It sits beside the
+       owner row above because both are about him and the fleet. Agents learn
+       a change at their next turn; nothing here wakes anyone. It boots saying
+       "Not read yet", and an unreadable flag is never drawn as "here". -->
+  <section id="posturesec"></section>
+
+  <!-- READINESS: `helm ready`'s five signals — may forward work resume after
+       a crash/reboot? (#163). ALWAYS visible: a readiness gauge that hides
+       when unread is a gauge nobody checks after the reboot it exists for.
+       It boots saying "not read yet" (the dash law: zero and unread are
+       different facts). Advisory — it renders, it never gates. -->
+  <section id="readysec"></section>
+
+  <!-- GUARD REFUSALS, AND THE OWNER'S DIAL. How often a guard stopped an
+       agent this week (`helm friction`'s own numbers), and the one number
+       that decides when an agent is told it may stop and repair a guard. It
+       sits beside readiness because both answer "is the fleet's own machinery
+       getting in its way", and it is a control he turns here because he does
+       not type verbs. It boots saying "Not read yet", and an unreadable
+       record is never drawn as zero refusals. -->
+  <section id="frictionsec"></section>
+
+  <!-- FLEET NOTES: this is the "what happened overnight" answer the fleet
+       leaves for you (`helm note set <key> <text>`). It used to live on a nav
+       tab called "cave", over a tmpfs relay, so a reboot ate it. Durable now,
+       and on the tab you already open. -->
+  <section id="notesec"></section>
+  <section id="store"></section>
+  <section id="sessions"></section>
+  <section id="skillsec"></section>
+
+  <footer id="foot"></footer>
+</div>
+

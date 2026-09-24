@@ -1,0 +1,19 @@
+# helm idle-dispatch watchdog — the stranded-obligation detector. Crosses the
+# dispatch ledger against each recipient's presence and DMs the SENDER of any
+# dispatch stranded on an idle seat (recipient quiet/absent, no claim, past the
+# soft window). A DM, not a broadcast, so it wakes a PARKED coordinator's
+# `helm chat wait --follow` beacon — the missing wire that made idleness need a
+# human glance. Read-only; flags for re-check, never auto-reassigns.
+# Pairs with helm-idle-dispatch.timer. Enable (the owner one-step):
+#   cp scripts/helm-idle-dispatch.{service,timer} ~/.config/systemd/user/ \
+#     && systemctl --user daemon-reload && systemctl --user enable --now helm-idle-dispatch.timer
+[Unit]
+Description=helm idle-dispatch watchdog — dispatches stranded on idle seats
+Documentation=helm/idle_dispatch.py
+
+[Service]
+Type=oneshot
+# The always-on timer host matters: the parked-coordinator case (nobody
+# watching) is exactly when a maintenance seat is NOT up to run this.
+ExecStart=%h/.local/bin/helm seat idle-dispatch
+Nice=10

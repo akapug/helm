@@ -1,0 +1,26 @@
+<div class="view" id="view-boxes">
+  <section id="storagecard">
+    <div class="smhead">
+      <div><h2>boxes</h2>
+        <div class="smsub">every machine helm can see, with its live speed benchmarks · one bounded snapshot · one row per box · disk and memory paired within every metric</div></div>
+      <button class="chip smreload" id="storageReload">↻ reload snapshot</button>
+    </div>
+    <div id="storagestatus" role="status" aria-live="polite" aria-atomic="true">not read yet</div>
+    <div class="smmatrix">
+      <table class="storage">
+        <caption>Exact values stay visible. Each metric pairs disk (solid) and memory (hatched); compare bars only within one column. Fsync is lower-is-faster.</caption>
+        <thead><tr>
+          <th scope="col">box</th>
+          <th scope="col">sequential write<small>MiB/s · higher is faster</small></th>
+          <th scope="col">sequential read<small>MiB/s · higher is faster</small></th>
+          <th scope="col">random write<small>4 KiB IOPS · higher is faster</small></th>
+          <th scope="col">random read<small>4 KiB IOPS · higher is faster</small></th>
+          <th scope="col">fsync p95<small>milliseconds · lower is faster</small></th>
+        </tr></thead>
+        <tbody id="storageRows"><tr><td colspan="6" class="empty">open the boxes tab to load the snapshot…</td></tr></tbody>
+      </table>
+    </div>
+    <details id="storagemethod"><summary>method and interpretation</summary><div id="storagemethodbody"></div></details>
+  </section>
+</div>
+

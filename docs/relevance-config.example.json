@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "The example relevance settings. Copy to <helm home>/_global/relevance.json",
+    "and edit: this file is documentation and is never read at runtime.",
+    "",
+    "mode: off (the default when the file is absent), shadow (score every turn,",
+    "log what the classifier would keep, change nothing delivered) or live (the",
+    "scored order replaces keyword order; a turn whose score missed the wait",
+    "bound is delivered in keyword order and carries one marker word).",
+    "wait_s bounds the hook's wait in live mode, never the score: a late score",
+    "still lands in the per-turn cache a later read takes (`helm relevance",
+    "show` today). Values above 3 s are ignored.",
+    "local_by_choice: projects that MAY leave the LAN but should be scored by the",
+    "local head; honoured only while `helm relevance remeasure` has passed for",
+    "the head the service serves. Residency itself is a registry field",
+    "(`helm projects residency`), never a list here.",
+    "The scorer service's URL is the `relevance` key of endpoints.json."
+  ],
+  "mode": "shadow",
+  "wait_s": 1.0,
+  "candidates": 8,
+  "teach": true,
+  "local_by_choice": [],
+  "jev": {
+    "cred_file": "/path/to/gateway-credential",
+    "threshold": 0.32,
+    "timeout_s": 8
+  },
+  "local": {
+    "timeout_s": 10
+  }
+}

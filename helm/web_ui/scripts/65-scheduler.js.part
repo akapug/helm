@@ -1,0 +1,168 @@
+/* ================= SCHEDULER graph =================
+   One /api/lr answer, one canonical Python judgement model. This file owns
+   markup only: it never regroups cards, infers a holder, recomputes SUC, parses
+   timestamps, or fetches a second endpoint. */
+function schedulerSUC(suc, compact) {
+  const n = k => suc && typeof suc[k] === "number" ? String(suc[k]) : "?";
+  return compact
+    ? "S " + n("stalled") + " · U " + n("unmeasurable") + " · C " + n("contrary")
+    : n("stalled") + " stalled · " + n("unmeasurable")
+      + " unmeasurable · " + n("contrary") + " contrary";
+}
+
+function schedulerEdgeMap(model) {
+  const out = new Map();
+  (model && Array.isArray(model.edges) ? model.edges : []).forEach(edge => {
+    if (!edge || !edge.from) return;
+    if (!out.has(edge.from)) out.set(edge.from, []);
+    out.get(edge.from).push(edge);
+  });
+  return out;
+}
+
+function schedulerAskHTML(a, edges) {
+  const detail = a.detail ? ' <span class="askdetail">— ' + esc(a.detail) + "</span>" : "";
+  const edge = (edges.get(a.id) || []).find(e => String(e.kind || "").startsWith("waits_on_owner_"));
+  const kind = edge ? edge.kind : "waits_on_owner_unknown";
+  const label = kind === "waits_on_owner_usage_reset" ? "usage reset ←"
+    : kind === "waits_on_owner_decision" ? "owner decision ←"
+      : kind === "waits_on_owner_owner_input" ? "owner ←" : "edge UNKNOWN";
+  return '<div class="schask" data-edge-kind="' + esc(kind)
+    + '" data-edge-from="' + esc(a.id || "")
+    + '" data-edge-to="' + esc(edge ? edge.to : "") + '"><span class="edge">' + label + "</span>"
+    + '<span class="asktext" title="' + esc((a.title || "")
+      + (a.detail ? " — " + a.detail : "")) + '"><b>'
+    + esc(a.plain_title || a.title || "owner input") + "</b>" + detail + "</span>"
+    + '<span class="schage">' + (a.age_known ? esc(lrAgo(a.age_s)) : "age unknown")
+    + "</span></div>";
+}
+
+function schedulerRowHTML(row, edges) {
+  const own = edges.get(row.id) || [];
+  const wait = own.find(e => e.kind === "waits_on");
+  const supEdge = own.find(e => e.kind === "supersedes");
+  const alarms = row.stalled || row.unmeasurable || row.contrary;
+  const cls = "schrow" + (alarms ? " alarm" : "")
+    + (row.stage_class === "unknown" ? " unknown" : "")
+    + (row.honored ? " honored" : "");
+  const age = row.age_known ? lrAgo(row.age_s) : "age unknown";
+  const owed = row.owed_by_known ? esc(row.owed_by)
+    : row.owed_by_present ? "UNKNOWN" : "ABSENT — UNKNOWN";
+  const raw = '<span title="enforcement truth retained separately">owed_by '
+    + owed + "</span>";
+  const marks = [].concat(row.stalled ? ["STALLED"] : [])
+    .concat(row.unmeasurable ? ["UNMEASURABLE"] : [])
+    .concat(row.contrary ? ["CONTRARY"] : [])
+    .concat(row.honored ? ["SETTLED"] : [])
+    .concat(row.active === false && !row.honored ? ["ABSORBED"] : [])
+    .concat(wait || row.active === false ? [] : ["EDGE UNKNOWN"]);
+  const sup = supEdge
+    ? '<div class="schsup' + (supEdge.target_known ? "" : " dangling")
+      + '" data-edge-kind="supersedes">' + esc(row.id.slice(0, 10)) + " → supersedes "
+      + esc(String(supEdge.to || "UNKNOWN").slice(0, 12))
+      + (supEdge.target_known ? "" : " · predecessor not in this graph") + "</div>"
+    : "";
+  return '<article class="' + cls + '" data-id="' + esc(row.id)
+    + '" data-edge-to="' + esc(wait ? wait.to : "") + '"><div class="schtitle">'
+    + esc(row.plain_title || row.title || "(untitled)") + "</div>"
+    + '<div class="schmeta"><span class="schstate">' + esc(row.state || "UNKNOWN")
+    + '</span><span class="schage">' + esc(age) + "</span>"
+    + (marks.length ? '<span class="schwait">' + esc(marks.join(" · ")) + "</span>" : "")
+    + raw + "</div>" + sup + "</article>";
+}
+
+function schedulerAsksHTML(model, edgeMap) {
+  if (!model || typeof model !== "object") return "";
+  const asks = Array.isArray(model.owner_asks) ? model.owner_asks : [];
+  const dropped = typeof model.owner_asks_dropped === "number"
+    ? model.owner_asks_dropped : 0;
+  const count = typeof model.owner_ask_count === "number"
+    ? model.owner_ask_count : null;
+  const known = asks.length + dropped;
+  const countLabel = count === null
+    ? known + "+ known actionable asks · count UNKNOWN"
+    : count + " actionable ask" + (count === 1 ? "" : "s");
+  const edges = edgeMap || schedulerEdgeMap(model);
+  const head = '<div class="schaskshead"><b>waits on owner first</b><span>'
+    + countLabel + "</span></div>";
+  const unknown = model.owner_asks_unavailable
+    ? '<div class="schaskunknown">fleet-filed owner asks UNKNOWN — '
+      + esc(String(model.owner_asks_unavailable)) + "</div>" : "";
+  return asks.length || unknown || dropped
+    ? '<section class="schasks">' + head + unknown
+      + asks.map(a => schedulerAskHTML(a, edges)).join("")
+      + (model.owner_asks_dropped ? '<div class="schdrop">and '
+        + model.owner_asks_dropped + " more owner asks</div>" : "") + "</section>"
+    : "";
+}
+
+function schedulerHTML(d) {
+  if (!d || d.pending)
+    return '<div class="schwarming">scheduler not read yet — this is not an empty graph</div>';
+  const model = d.scheduler;
+  const edgeMap = schedulerEdgeMap(model);
+  const asksHTML = schedulerAsksHTML(model, edgeMap);
+  if (d.warming)
+    return asksHTML + '<div class="schwarming"><b>reading…</b> the pipeline projection is warming; no graph is claimed yet</div>';
+  if (d.unavailable)
+    return asksHTML + '<div class="schunknown"><b>DISPATCH LEDGER UNREADABLE — scheduler UNKNOWN</b><br>'
+      + esc(String(d.unavailable)) + '<br><span>no rows are shown because none could be read; this is not a healthy empty scheduler.</span></div>';
+  if (!model || typeof model !== "object")
+    return '<div class="schunknown"><b>SCHEDULER NOT SENT — UNKNOWN</b><br>'
+      + "this server predates the canonical graph projection; the pipeline list may still be readable.</div>";
+  if (model.unavailable)
+    return asksHTML + '<div class="schunknown"><b>SCHEDULER UNKNOWN</b><br>'
+      + esc(String(model.unavailable)) + "</div>";
+  const suc = model.suc || {};
+  const skipped = typeof d.receipts_skipped === "number"
+    ? " · " + d.receipts_skipped + " receipt row"
+      + (d.receipts_skipped === 1 ? "" : "s") + " skipped (failed self-hash)"
+    : "";
+  const fresh = "ledger read " + lrAgo(d.read_age_s)
+    + " · newest ledger write " + lrAgo(d.ledger_age_s) + skipped;
+  const graph = (model.groups || []).map(group => {
+    const gs = group.suc || {};
+    const alarm = typeof gs.total === "number" && gs.total > 0;
+    const oldest = group.oldest_age_s === null || group.oldest_age_s === undefined
+      ? "oldest age unknown" : "oldest " + lrAgo(group.oldest_age_s);
+    return '<section class="schgroup' + (alarm ? " alarm" : "") + '">'
+      + '<header class="schgrouphead"><div class="schwho"><span aria-hidden="true">↓</span><b>'
+      + esc(group.label || "holder UNKNOWN") + '</b><span class="schn">'
+      + group.count + " row" + (group.count === 1 ? "" : "s") + "</span></div>"
+      + '<div class="schgroupsuc' + (alarm ? " alarm" : "") + '">'
+      + esc(schedulerSUC(gs, true)) + " · " + esc(oldest) + "</div></header>"
+      + '<div class="schrows">' + (group.rows || []).map(r => schedulerRowHTML(r, edgeMap)).join("")
+      + (group.dropped ? '<div class="schdrop">and ' + group.dropped
+        + " more rows in this holder group</div>" : "") + "</div></section>";
+  }).join("");
+  return '<div class="schhead"><div class="schhero '
+    + (suc.zero ? "zero" : "debt") + '"><strong>SUC · '
+    + esc(schedulerSUC(suc, true)) + "</strong><span>"
+    + (suc.zero ? "zero SUC — healthy live rows may remain" : schedulerSUC(suc, false))
+    + '</span></div><div class="schhero"><strong>' + esc(String(model.row_count))
+    + '</strong><span>non-terminal rows · ' + esc(String(model.active_count))
+    + ' active</span></div><div class="schfresh">' + esc(fresh)
+    + ' · <a href="#work" data-scheduler-list>the kanban above, row by row ↑</a></div></div>'
+    + asksHTML + (graph ? '<div class="schgraph">' + graph + "</div>"
+      : '<div class="schempty">the read succeeded: no non-terminal land-request rows</div>');
+}
+
+function schedulerWire() {
+  const el = $("#schedulersec");
+  if (!el) return;
+  const link = el.querySelector("[data-scheduler-list]");
+  if (link) link.onclick = event => {
+    event.preventDefault();
+    // the row-by-row wall is a fold under the fleet kanban: open it, then go
+    const wall = $("#walldetail");
+    if (wall) wall.open = true;
+    (wall || $("#tierpipeline")).scrollIntoView({block: "start"});
+  };
+}
+
+function schedulerShow(d) {
+  const el = $("#schedulersec");
+  if (!el) return;
+  el.innerHTML = schedulerHTML(d);
+  schedulerWire();
+}

@@ -1,0 +1,76 @@
+/* ---------- roster tab: one dense Tuftian table for the whole fleet ---------- */
+table.roster{width:100%;border-collapse:collapse;font-size:var(--f2);table-layout:auto}
+table.roster th{text-align:left;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);padding:6px 9px;border-bottom:1px solid var(--line);cursor:pointer;user-select:none;white-space:nowrap}
+table.roster th.num{text-align:right}
+table.roster th:hover{color:var(--fg)}
+table.roster th .sar{opacity:.6;font-size:.85em}
+table.roster td{padding:6px 9px;border-bottom:1px solid var(--line);vertical-align:baseline;white-space:nowrap}
+table.roster tr:last-child td{border-bottom:none}
+table.roster td.num{text-align:right;font-variant-numeric:tabular-nums}
+table.roster tbody tr:hover td{background:color-mix(in srgb,var(--hl) 55%,transparent)}
+table.roster tr.absent td{opacity:.55}
+table.roster tr.eph td{opacity:.5;font-style:italic}
+/* the OWNER's row — a human among the seats, so it must not read as one more
+   agent: accent-tinted, always at the top, no transcript link. */
+table.roster tr.ownerrow td{background:var(--accent-soft);border-bottom:1px solid var(--accent)}
+.rowner{font-weight:var(--w-bold);color:var(--accent)}
+.rhuman{display:block;color:var(--sub);font-size:var(--f0);line-height:1.1;margin-top:2px;text-transform:uppercase;letter-spacing:.05em}
+.rhere{color:var(--accent)}
+.rdot{font-size:var(--f1)}
+.rdot.fresh{color:var(--ok)}.rdot.quiet{color:var(--warn)}.rdot.absent{color:var(--mut)}
+.rdot.unverified{color:var(--bad,#e06c50)}
+.rseat{font-family:ui-monospace,monospace;font-weight:var(--w-med);cursor:pointer;border-radius:5px;padding:0 3px;margin:0 -3px}
+.rseat:hover{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
+.rruntime{display:block;color:var(--mut);font-size:var(--f0);line-height:1.1;margin-top:2px}
+/* UPSTREAM STARVATION — the badge only a proxy seat can carry, and only when
+   it is NOT healthy. A HEALTHY chip on every proxy row would be ink that tells
+   the owner nothing; the whole point is that a rate-limited seat currently
+   reads as "quiet", which he cannot tell apart from "idle". */
+.rup{display:inline-block;margin-left:6px;padding:0 5px;border-radius:3px;
+     font-size:var(--f0);line-height:1.5;white-space:nowrap;vertical-align:1px}
+.rup.dark{background:var(--bad,#e06c50);color:#fff}
+/* calm = a named state whose recorded verdict is "not a wall" (or unreadable):
+   the fact renders, the alarm does not — same muted ink as unknown */
+.rup.unknown,.rup.calm{background:transparent;color:var(--mut);border:1px solid var(--line)}
+/* the wall's clock: since-age + reset horizon ride the badge dimmer than the
+   named cause, so the CAUSE stays the loudest word on the row */
+.rup .rupd{opacity:.8;font-weight:400;margin-left:4px}
+.rdoing.claim,.rdoing.status{color:var(--fg)}.rdoing.home,.rdoing.stale{color:var(--mut)}
+.rpend{font-size:var(--f0);font-weight:700;padding:1px 6px;border-radius:5px;background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+.rmsg{color:var(--sub);max-width:26ch;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
+.rsess{font-family:ui-monospace,monospace;color:var(--mut);font-size:var(--f0)}
+#rosterbar{display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap}
+#rosterbar .rcount{font-weight:var(--w-med)}
+#rosterq{background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:5px 10px;font-size:var(--f1);min-width:170px}
+#rosterq:focus{border-color:var(--accent);outline:none}
+#rosterclaims{color:var(--mut);font-size:var(--f1);margin:10px 0 0}
+.rstale{color:var(--bad,#c33)}
+#rosterorphans{margin-top:10px;color:var(--sub);font-size:var(--f1)}
+#rosterorphans>summary{cursor:pointer;color:var(--sub)}
+.spren{margin-top:8px;width:100%;text-align:left;font-size:var(--f0);padding:5px 10px;border-radius:7px;background:none;border:1px solid var(--line);color:var(--mut);cursor:pointer}
+.spren:hover{border-color:var(--accent);color:var(--accent)}
+.seatrn:hover{border-color:var(--accent);color:var(--accent)}
+.lmeta{font-size:var(--f1);color:var(--mut);margin-top:2px;word-break:break-all}
+.lbadge{font-size:var(--f0);font-weight:700;padding:2px 7px;border-radius:5px;white-space:nowrap;background:color-mix(in srgb,var(--mut) 14%,transparent);color:var(--mut)}
+.lbadge.final{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+.lbadge.tent{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)}
+.lbadge.head{background:var(--accent-soft);color:var(--accent)}
+.lhash{color:var(--accent)}
+.ldot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--sub);flex:none;align-self:center}
+.ldot.active{background:var(--ok);box-shadow:0 0 6px color-mix(in srgb,var(--ok) 60%,transparent)}
+.ldot.quiet{background:var(--warn)}
+.ldot.stuck{background:var(--bad)}
+.llegend{padding:7px 14px;border-bottom:1px solid var(--line);font-size:var(--f0);color:var(--sub);display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+#seatform{display:flex;flex-wrap:wrap;gap:8px;padding:12px 14px}
+#seatform input{flex:1 1 100%;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px 11px;font-size:var(--f2)}
+#seatform input:focus{border-color:var(--accent);outline:none}
+#seatform .seatpick{position:relative;flex:0 1 46%;min-width:0}
+#seatform .seatpick #seatkey{width:100%;height:100%}
+#seatlist{display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:25;max-height:240px;overflow-y:auto;padding:4px;background:var(--elev);border:1px solid var(--line2);border-radius:var(--r);box-shadow:var(--shadow)}
+#seatlist.show{display:block}
+.seatopt{display:block;width:100%;padding:7px 9px;border:0;border-radius:var(--r-sm);background:none;color:var(--fg);text-align:left;cursor:pointer;font-size:var(--f1)}
+.seatopt:hover,.seatopt.on{background:var(--accent-soft);color:var(--accent)}
+.seatopt .someta{display:block;color:var(--mut);font-size:var(--f0);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#seatmsg{flex:1 1 100%;font-size:var(--f1);color:var(--sub);min-height:1.1em;word-break:break-word}
+#seatmsg.ok{color:var(--ok)}#seatmsg.bad{color:var(--bad)}
+

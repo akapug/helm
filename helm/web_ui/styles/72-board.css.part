@@ -1,0 +1,100 @@
+/* ---------- THE WORK PAGE'S BOARD (task/2975) ----------
+   ON YOU, one lanes line, one row per project, in the page's own vocabulary:
+   the card surface and hairlines of the system band, the light's own .dot,
+   the flag colours the burn card always used, tabular numerals. Colour is
+   signal only. The row is a GRID so the columns line up down the whole board
+   on a desktop, and the same grid re-flows at 680px into the phone row the
+   owner scans: light, name and one count on the first line, the family chips
+   under it. */
+#onyou{margin:16px 0 0;padding:10px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px}
+#onyouhead{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;font-size:var(--f2)}
+#onyouhead>b{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--sub)}
+#onyou:not(.quiet){border-color:color-mix(in srgb,var(--warn) 45%,var(--line))}
+#onyouasks{margin:8px 0 0;border-top:1px solid var(--line);padding:6px 0 0}
+#onyouasks .yrow{padding:3px 0;font-size:var(--f1);overflow-wrap:anywhere}
+#onyouasks .yage{color:var(--sub);font-variant-numeric:tabular-nums}
+#onyou #odq{margin:10px 0 2px}
+#board{margin:16px 0 0}
+#bhead{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;padding:10px 14px;background:var(--card);border:1px solid var(--line);border-radius:12px}
+#bheadline{flex:1 1 320px;min-width:0;font-size:var(--f3);color:var(--fg)}
+#bheadline b{font-weight:var(--w-med)}
+#bheadline a.bcap{color:inherit;text-decoration:none}
+#bheadline a.bcap:hover b{text-decoration:underline}
+#bheadline .bfams{display:inline-flex;flex-wrap:wrap;gap:4px 6px;vertical-align:middle}
+#bheadline .balloc{color:var(--sub);font-size:var(--f1)}
+#bhead #dreggstrip{flex:0 1 auto;max-width:100%;font-size:var(--f1)}
+#bhead .chip{padding:4px 10px;font-size:var(--f1)}
+.bmut{color:var(--mut)}
+.bunk{color:var(--warn);font-weight:700}
+.bwarn{color:var(--warn);font-weight:var(--w-med)}
+.bgood{color:var(--ok);font-weight:var(--w-med)}
+#flagcard{margin:10px 0 0}
+#flagoverall{padding:0 16px 10px;font-size:var(--f2)}
+/* its own row class: the sessions view's global `.row` is a four-column grid,
+   and a flag row under it laid the colour, the family and the reason on top
+   of one another at phone width */
+#flagcard .frow{padding:7px 16px;border-top:1px solid var(--line);font-size:var(--f2)}
+#flagcard .frow .gmeta{white-space:normal}
+#board #controls{margin:12px 0 0}
+#brows{margin:10px 0 0;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+#brows:empty{display:none}
+.brow{border-top:1px solid var(--line)}
+.brow:first-child{border-top:none}
+.bline{display:grid;grid-template-columns:22px minmax(0,1.1fr) minmax(0,1.3fr) 5.5em minmax(0,1fr) 7.5em 7.5em 6.5em minmax(0,1fr);align-items:center;gap:4px 12px;padding:9px 14px;cursor:pointer}
+.bline:hover{background:var(--hover)}
+.brow.open{background:color-mix(in srgb,var(--accent) 4%,transparent)}
+.brow.open>.bline{border-bottom:1px solid var(--line)}
+.blight{display:grid;place-items:center;width:22px;height:22px;padding:0;border:0;border-radius:50%;background:none;cursor:pointer}
+.blight:hover{background:var(--line)}
+.blight:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.bname{min-width:0;font-weight:700;font-size:var(--f3);letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brow.unset .bname{color:var(--mut);font-weight:600}
+.bchips{display:flex;flex-wrap:wrap;gap:4px 6px;min-width:0}
+/* a family chip: the family's name, tinted by its flag colour (`--fc`). A chip
+   with no flag, or whose reading is not current, is drawn with no colour at
+   all, dashed or dimmed, so it can never pass for a measured one. */
+.fchip{display:inline-flex;align-items:center;gap:5px;padding:1px 8px 1px 6px;border-radius:var(--r-pill);border:1px solid color-mix(in srgb,var(--fc,var(--sub)) 60%,transparent);background:color-mix(in srgb,var(--fc,var(--sub)) 12%,transparent);color:var(--fg);font-size:var(--f0);font-weight:600;white-space:nowrap}
+.fchip i{width:7px;height:7px;border-radius:50%;background:var(--fc,var(--sub));flex:none}
+.fchip.fnone{border-style:dashed;color:var(--mut)}
+.fchip.fstale{color:var(--mut);opacity:.8}
+.bcount{text-align:right;white-space:nowrap;font-size:var(--f1);font-variant-numeric:tabular-nums;color:var(--fg)}
+.bwide{min-width:0;font-size:var(--f1);color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
+.bwork{color:var(--fg)}
+.bact{text-align:right}
+/* a repository's visibility: a known one is a link, an unknown one is dashed,
+   one still being checked is dim — neither of those two can pass for known */
+.rbadge{display:inline-block;padding:0 7px;border-radius:var(--r-pill);border:1px solid var(--line2);font-size:var(--f0);font-weight:600;line-height:1.6;text-decoration:none;color:var(--fg);white-space:nowrap}
+a.rbadge:hover{border-color:var(--accent)}
+.rbadge.public{border-color:color-mix(in srgb,var(--ok) 55%,transparent);color:var(--ok)}
+.rbadge.private{border-color:var(--line2);color:var(--sub)}
+.rbadge.internal{border-color:color-mix(in srgb,var(--ext) 55%,transparent);color:var(--ext)}
+.rbadge.unknown{border-style:dashed;color:var(--warn)}
+.rbadge.rwait{border-style:dotted;color:var(--mut)}
+.rrepo{white-space:nowrap}
+.rrepo .rname{color:var(--fg);font-size:var(--f1)}
+/* the kanban: four columns on a desktop, two on a phone, and it spans the
+   open row's text columns rather than being squeezed into one of them */
+.bdetail .dkb{column-span:all;break-inside:avoid}
+.bkb{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:2px 0 10px}
+.bkcol{min-width:0;border:1px solid var(--line);border-radius:9px;background:var(--bg);padding:6px 8px}
+.bkhead{font-size:var(--f0);font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--sub);margin-bottom:4px}
+.bkcard{font-size:var(--f1);padding:2px 0;overflow-wrap:anywhere}
+.bkcard b{font-weight:var(--w-med)}
+/* the fleet kanban: one group per project, its four columns under its name */
+#fleetkb{margin:0}
+#fleetkb .fkline{font-size:var(--f1);margin:0 0 8px}
+#fleetkb .fkgroup{padding:8px 12px 2px;margin:0 0 10px;background:var(--card);border:1px solid var(--line);border-radius:12px}
+#fleetkb .fkhead{font-size:var(--f2);margin:0 0 6px}
+#walldetail{margin:4px 0 0}
+#walldetail #lrsec{margin:0;border:0;border-top:1px solid var(--line);border-radius:0}
+.bdetail{padding:10px 14px 4px 48px;column-width:320px;column-gap:28px}
+.bdetail .dline{word-break:normal;overflow-wrap:anywhere}
+.bdetail .dline a{color:var(--accent);text-decoration:none}
+.bdetail .lightset{break-inside:avoid}
+.bfold>summary{padding:9px 14px;border-top:1px solid var(--line);color:var(--mut);font-size:var(--f1);cursor:pointer}
+.bfold>summary:hover{color:var(--fg)}
+.bfold[open]>summary{border-bottom:1px solid var(--line)}
+/* THE PHONE ROW (390px is the design floor): one column, light, name and the
+   one count on the first line, the family chips on the second; every
+   desktop-only cell is withheld here and stays one tap away in the open row. */
+@media (max-width:680px){.bkb{grid-template-columns:repeat(2,minmax(0,1fr))}#onyou{padding:9px 12px}.bline{grid-template-columns:22px minmax(0,1fr) auto;grid-template-areas:"light name count" ". chips chips";padding:9px 12px}.blight{grid-area:light}.bname{grid-area:name}.bcount{grid-area:count}.bchips{grid-area:chips}.bchips:empty{display:none}.brow .bwide{display:none}.bdetail{padding:8px 12px 2px;column-width:auto}#bheadline{flex-basis:100%}#flagcard>summary{align-items:baseline;flex-wrap:wrap}#flagcard>summary .gmeta{white-space:normal}}

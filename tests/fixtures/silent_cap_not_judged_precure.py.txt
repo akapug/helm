@@ -1,0 +1,13 @@
+# FROZEN shape of the SIBLING half this rung does not see: an empty collection
+# that answers both "nothing was wrong" and "nothing was examined". A caller
+# reading `not_judged == []` cannot tell a clean scan from a scan that never
+# ran. There is no bound applied here, so no bounded-write rule can reach it.
+def judge(paths, read):
+    findings = []
+    not_judged = []
+    for path in paths:
+        try:
+            findings += read(path)
+        except OSError:
+            not_judged.append(path)
+    return {"findings": findings, "not_judged": not_judged}

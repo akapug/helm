@@ -1,0 +1,188 @@
+{
+ "ceiling": 90.0,
+ "census": "measured",
+ "rows": [
+  {
+   "account_id": "f99c80",
+   "allowed": false,
+   "binding": {
+    "label": "7d",
+    "reset_after_seconds": 504521,
+    "reset_at": 1790200139,
+    "seconds": 604800,
+    "used_percent": 100.0
+   },
+   "email": "e0ec7e",
+   "file": "7c2e55",
+   "longest_pct": 100.0,
+   "note": null,
+   "plan": "team",
+   "reached_type": "workspace_member_credits_depleted",
+   "state": "exhausted",
+   "status": "blocked",
+   "tier": "team",
+   "windows": [
+    {
+     "label": "7d",
+     "reset_after_seconds": 504521,
+     "reset_at": 1790200139,
+     "seconds": 604800,
+     "used_percent": 100.0
+    }
+   ]
+  },
+  {
+   "account_id": "e051d4",
+   "allowed": false,
+   "binding": {
+    "label": "7d",
+    "reset_after_seconds": 364441,
+    "reset_at": 1790060059,
+    "seconds": 604800,
+    "used_percent": 100.0
+   },
+   "email": "e60123",
+   "file": "3972d8",
+   "longest_pct": 100.0,
+   "note": null,
+   "plan": "pro",
+   "reached_type": "rate_limit_reached",
+   "state": "exhausted",
+   "status": "blocked",
+   "tier": "ultra",
+   "windows": [
+    {
+     "label": "7d",
+     "reset_after_seconds": 364441,
+     "reset_at": 1790060059,
+     "seconds": 604800,
+     "used_percent": 100.0
+    }
+   ]
+  },
+  {
+   "account_id": "f99c80",
+   "allowed": true,
+   "binding": {
+    "label": "7d",
+    "reset_after_seconds": 463485,
+    "reset_at": 1790159104,
+    "seconds": 604800,
+    "used_percent": 95.0
+   },
+   "email": "f9b03f",
+   "file": "a78096",
+   "longest_pct": 95.0,
+   "note": null,
+   "plan": "team",
+   "reached_type": null,
+   "state": "near",
+   "status": "allowed",
+   "tier": "team",
+   "windows": [
+    {
+     "label": "7d",
+     "reset_after_seconds": 463485,
+     "reset_at": 1790159104,
+     "seconds": 604800,
+     "used_percent": 95.0
+    }
+   ]
+  },
+  {
+   "account_id": "b72956",
+   "allowed": false,
+   "binding": {
+    "label": "7d",
+    "reset_after_seconds": 289662,
+    "reset_at": 1789985281,
+    "seconds": 604800,
+    "used_percent": 100.0
+   },
+   "email": "3837bd",
+   "file": "4e1375",
+   "longest_pct": 100.0,
+   "note": null,
+   "plan": "pro",
+   "reached_type": "rate_limit_reached",
+   "state": "exhausted",
+   "status": "blocked",
+   "tier": "ultra",
+   "windows": [
+    {
+     "label": "7d",
+     "reset_after_seconds": 289662,
+     "reset_at": 1789985281,
+     "seconds": 604800,
+     "used_percent": 100.0
+    }
+   ]
+  },
+  {
+   "account_id": "bbd6e5",
+   "allowed": true,
+   "binding": {
+    "label": "5h",
+    "reset_after_seconds": 13452,
+    "reset_at": 1789709072,
+    "seconds": 18000,
+    "used_percent": 11.0
+   },
+   "email": "c820e7",
+   "file": "07979c",
+   "longest_pct": 2.0,
+   "note": null,
+   "plan": "team",
+   "reached_type": null,
+   "state": "ok",
+   "status": "allowed",
+   "tier": "team",
+   "windows": [
+    {
+     "label": "7d",
+     "reset_after_seconds": 600252,
+     "reset_at": 1790295872,
+     "seconds": 604800,
+     "used_percent": 2.0
+    },
+    {
+     "label": "5h",
+     "reset_after_seconds": 13452,
+     "reset_at": 1789709072,
+     "seconds": 18000,
+     "used_percent": 11.0
+    }
+   ]
+  },
+  {
+   "account_id": "f99c80",
+   "allowed": false,
+   "binding": {
+    "label": "7d",
+    "reset_after_seconds": 485791,
+    "reset_at": 1790181411,
+    "seconds": 604800,
+    "used_percent": 100.0
+   },
+   "email": "c10c1f",
+   "file": "df3060",
+   "longest_pct": 100.0,
+   "note": null,
+   "plan": "team",
+   "reached_type": "workspace_owner_credits_depleted",
+   "state": "exhausted",
+   "status": "blocked",
+   "tier": "team",
+   "windows": [
+    {
+     "label": "7d",
+     "reset_after_seconds": 485791,
+     "reset_at": 1790181411,
+     "seconds": 604800,
+     "used_percent": 100.0
+    }
+   ]
+  }
+ ],
+ "ts": 1789695620.222778
+}

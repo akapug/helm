@@ -1,0 +1,20 @@
+<div class="view" id="view-sessions">
+  <div id="sesscontrols">
+    <div class="row1">
+      <input type="search" id="sq" placeholder="search sessions — Enter also searches inside every transcript" autocomplete="off">
+      <input type="search" id="scope" list="scopelist" placeholder="scope: pick a project…" title="restrict the inside-transcript search to one project (greps its real sessions directly — instant, and skips the reference-transcript flood). Pick from your projects or type any path fragment." autocomplete="off">
+      <datalist id="scopelist"></datalist>
+      <span class="chip" id="synToggle" title="reference transcripts (daily-memory summarizers) are hidden from content search by default — they flood every term. Kept in the corpus as training data. Click to include them.">refs: off</span>
+      <span class="chip h on" data-h="claude">claude</span>
+      <span class="chip h on" data-h="codex">codex</span>
+      <select id="viewmode"><option value="recent">view: recent</option><option value="project">view: by project</option><option value="biggest">view: biggest</option><option value="oldest">view: oldest first</option></select>
+      <select id="model"><option value="">model: provider default</option><option value="fable">fable</option><option value="opus">opus</option><option value="sonnet">sonnet</option></select>
+      <span class="chip on" id="rec">last 45 days</span>
+      <button class="chip" id="refresh" title="incremental rescan of changed transcripts">↻</button>
+      <span id="sesscount"></span>
+    </div>
+    <div id="resumeAs" style="margin-top:8px"></div>
+  </div>
+  <div id="list"><div class="empty">loading…</div></div>
+</div>
+

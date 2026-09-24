@@ -1,0 +1,83 @@
+{
+ "fanout": {
+  "seat-b": {
+   "measured": true,
+   "running": 3
+  },
+  "seat-c": {
+   "measured": true,
+   "running": 1
+  },
+  "seat-d": {
+   "measured": true,
+   "running": 0
+  }
+ },
+ "note": "A FROZEN BENCH, not a capture of anybody's register. Seat names are synthetic on purpose: an arm that pinned live seat names would go red the next time a seat is renamed, and a test tree is not a place to record who is sitting where. What IS load-bearing and IS real: the home_room scoping, the family vocabulary, the pane states and the verdict values, all of which are the shapes seat_usability.join actually emits. Seats are seat-a..seat-h and each names its family by INDEX into _BENCH_FAMILIES in tests/test_route.py -- THIS BENCH'S OWN vocabulary, in its own order, and NOT the catalog's sorted list. Indexing the catalog directly made a new family relabel every seat above it and drop the last one off the end, with nothing to refuse; the reader now declares the order it means and refuses a vocabulary it does not cover. No real seat identity and no family spelling is baked in here.",
+ "seats": {
+  "seat-a": {
+   "can_take_work": true,
+   "family_index": 0,
+   "holding": 0,
+   "home_room": "helm",
+   "pane": "IDLE",
+   "verdict": "USABLE"
+  },
+  "seat-b": {
+   "can_take_work": true,
+   "family_index": 1,
+   "holding": 1,
+   "home_room": "helm",
+   "pane": "IDLE",
+   "verdict": "USABLE"
+  },
+  "seat-c": {
+   "can_take_work": true,
+   "family_index": 2,
+   "holding": 0,
+   "home_room": "helm",
+   "pane": "IDLE",
+   "verdict": "USABLE"
+  },
+  "seat-d": {
+   "can_take_work": true,
+   "family_index": 3,
+   "holding": 0,
+   "home_room": "helm",
+   "pane": "IDLE",
+   "verdict": "USABLE"
+  },
+  "seat-e": {
+   "can_take_work": true,
+   "family_index": 4,
+   "holding": 0,
+   "home_room": "helm",
+   "pane": "IDLE",
+   "verdict": "USABLE"
+  },
+  "seat-f": {
+   "can_take_work": true,
+   "family_index": 5,
+   "holding": 2,
+   "home_room": "helm",
+   "pane": "RUNNING",
+   "verdict": "USABLE"
+  },
+  "seat-g": {
+   "can_take_work": true,
+   "family_index": 6,
+   "holding": 0,
+   "home_room": "helm",
+   "pane": "IDLE",
+   "verdict": "USABLE"
+  },
+  "seat-h": {
+   "can_take_work": true,
+   "family_index": 5,
+   "holding": 0,
+   "home_room": "another-project",
+   "pane": "IDLE",
+   "verdict": "USABLE"
+  }
+ }
+}

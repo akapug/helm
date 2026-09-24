@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+"""helm rearm — the land-to-live compression verb.
+
+helm code lands on main; every fresh `helm` invocation is a process off main,
+so a CLI-class land is live AT LAND. But LONG-LIVED processes keep executing
+the code they loaded at start: an armed `helm chat wait --follow` inbox beacon,
+the web service, seat proxies/daemons. Until each re-arms, the fix has not
+reached them. `helm rearm` is the CHEAP OWNED pass that closes that gap
+minutes after a land batch (premise land-to-live-compression-owner-directive).
+
+  * dry-run DEFAULT: report which live processes still hold PRE-HEAD code —
+    every `helm chat wait` waiter (owning seat + start, STALE if it started
+    before main's current HEAD commit time), the web-service unit (active +
+    since, stale iff it predates HEAD), and every OTHER long-lived
+    helm process predating HEAD as an ADVISORY respawn candidate. Mutates
+    nothing.
+  * --apply: (1) FIRST post ONE owned ambient ANNOUNCE row to #main (ambient =
+    wakes nobody) saying the pass is cycling waiters and why; (2) SIGTERM ONLY
+    the stale waiters — each owning agent gets its Monitor-exit notification
+    and re-arms on new code at its own turn boundary (the OWNED version of the
+    unowned mass-SIGTERM beacon-killer incident class); (3) restart the web
+    unit iff it is active AND stale; (4) NEVER touch proxies/daemons/seats —
+    advisory only. Idempotent by convergence: staleness is recomputed from live
+    state each run, so once the signaled waiters exit a second --apply finds
+    nothing stale (a re-signal of a still-dying pid is a harmless no-op).
+
+SAFETY — failed-probe-is-not-absence: only a process whose cmdline argv EXACTLY
+matches the waiter shape (a `helm` executable token immediately followed by
+`chat wait`) is ever signaled. The bash Monitor wrapper (which carries the same
+string INSIDE a single `-c` argument, never as a standalone `helm` token) is
+excluded by construction. Ownership is the `--seat` token; a stale waiter with
+no readable seat, an unreadable start, or an unreachable HEAD (staleness
+unprovable) is SKIPPED and reported, NEVER signaled. The argv shape AND stat
+starttime are re-checked immediately before each SIGTERM (who.py's anti-reuse
+bracket), so a waiter that exited into a recycled pid during the announce
+round-trip is never hit.
+
+READS /proc cmdline + stat TO ACT, AND environ ONLY TO REPORT. The signal
+path is argv and nothing else, because argv is what the operator wrote while
+environ is inherited, and a wrong address here costs a SIGTERM in another
+seat's waiter. But a waiter with no `--seat` still BELONGS to somebody, and
+this is the one surface that tells an operator which seat is holding
+pre-HEAD beacon code — so it must be able to NAME that seat even where it
+must not act on it. Three states reach the render separately and are never
+collapsed: declares no seat, declares one, and an environ that could not be
+read. `_environ_seat` answers all three and reaches the render alone;
+`signalable` and _spare_last_wake_path read the argv token and only that.
+"""
+import glob
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+from . import chat, pk, seats_advice
+
+PROC = "/proc"          # module-level so tests point it at a fixture tree
+WEB_UNIT = "helm-web"   # the systemd --user web-service unit (docs/WEB.md)
+ANNOUNCE_ROOM = "main"
+ANNOUNCE_NAME = "helm-rearm"
+SKEW_S = 2              # whole-second flooring on BOTH /proc/stat btime and git
+                        # %ct underestimates a proc's start by up to ~1s, so a
+                        # freshly-spawned post-land waiter can compute just under
+                        # HEAD. Class STALE only when older than HEAD by this
+                        # band => a fresh waiter is never mis-killed (fail-safe).
+
+
+# ---------------------------------------------------------------------------
+# /proc reads (who.py's pattern) + start-epoch conversion
+# ---------------------------------------------------------------------------
+
+def _clk_tck():
+    try:
+        return os.sysconf("SC_CLK_TCK") or 100
+    except (ValueError, OSError):
+        return 100
+
+
+def _boot_time():
+    """Wall-clock seconds at boot (/proc/stat btime), or None. starttime is
+    ticks-since-boot; boot + ticks/tck is the process's CLOCK_REALTIME start,
+    the same axis as a git commit's %ct — so the two compare directly."""
+    try:
+        with open("%s/stat" % PROC) as f:
+            for line in f:
+                if line.startswith("btime"):
+                    return int(line.split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+    return None
+
+
+def _stat_field(pid, n, default):
+    """Field n of /proc/<pid>/stat COUNTING FROM the state field — comm may
+    contain spaces/parens, so parse after the LAST ')' (who.py)."""
+    try:
+        with open("%s/%d/stat" % (PROC, pid)) as f:
+            s = f.read()
+        return int(s.rsplit(")", 1)[1].split()[n])
+    except (OSError, IndexError, ValueError):
+        return default
+
+
+def starttime_of(pid):
+    return _stat_field(pid, 19, float("inf"))
+
+
+def proc_start_epoch(pid):
+    """The process's start as CLOCK_REALTIME epoch, or None when boot time or
+    the stat starttime is unreadable (no evidence — the row is never classed
+    stale, so it is never signaled)."""
+    boot = _boot_time()
+    st = starttime_of(pid)
+    if boot is None or st == float("inf"):
+        return None
+    return boot + st / _clk_tck()
+
+
+def _cmdline(pid):
+    """/proc/<pid>/cmdline as an argv list, or None when unreadable. An
+    unreadable cmdline is no evidence of the waiter shape — the process is
+    simply not a signal candidate."""
+    try:
+        with open("%s/%d/cmdline" % (PROC, pid), "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    argv = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+    return argv or None
+
+
+ENVIRON_UNREADABLE = "<unreadable>"
+
+
+def _environ_seat(pid):
+    """The seat a process DECLARES about itself -> name | None | UNREADABLE.
+
+    REPORT-ONLY, AND THE SEPARATION IS THE POINT. Ownership for SIGNALLING is
+    the `--seat` argv token and this function must never widen it: argv is
+    what the operator wrote on the command line, while environ is inherited
+    and a wrong address here costs a SIGTERM in somebody else's waiter. So
+    this answer reaches the render and nothing else.
+
+    THREE ANSWERS, BECAUSE TWO WOULD LIE. A name is a name; None means the
+    process declares no seat; UNREADABLE means the environ could not be read
+    at all, which is a fact about the probe and not about the process — a
+    caller that collapsed it into None would report 'this waiter has no seat'
+    on the strength of a permission error.
+    """
+    try:
+        with open("%s/%d/environ" % (PROC, pid), "rb") as f:
+            raw = f.read()
+    except OSError:
+        return ENVIRON_UNREADABLE
+    for chunk in raw.split(b"\0"):
+        if chunk.startswith(b"HELM_CHAT_NAME="):
+            name = chunk.decode("utf-8", "replace").split("=", 1)[1].strip()
+            return name or None
+    return None
+
+
+def _helm_subargv(argv):
+    """The argv AFTER a `helm` invocation marker — a token whose basename is
+    `helm` (bin/helm through any symlink), or `-m helm` — else None. This is
+    the exact-shape gate: a bash `-c 'helm chat wait …'` wrapper carries the
+    text inside ONE argument, has no standalone `helm` token, and returns
+    None here — so it is never mistaken for a waiter."""
+    for i, tok in enumerate(argv):
+        if tok == "-m" and i + 1 < len(argv) and argv[i + 1] == "helm":
+            return argv[i + 2:]
+        if tok != "-m" and os.path.basename(tok) == "helm":
+            return argv[i + 1:]
+    return None
+
+
+def _flag(argv, name):
+    """--name VALUE or --name=VALUE from an argv list, else None."""
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(name + "="):
+            return a[len(name) + 1:]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# HEAD commit time — 'live' code (production runs off main; HEAD IS main's tip)
+# ---------------------------------------------------------------------------
+
+def _repo_root():
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        p = subprocess.run(["git", "-C", here, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout.strip() if p.returncode == 0 else None
+
+
+def _head_commit():
+    """(sha8, commit_epoch) of the helm checkout's HEAD, or (None, None) when
+    git is unreachable. Production `helm` runs off the main checkout, so HEAD
+    is main's tip. HEAD unresolvable => staleness cannot be asserted =>
+    nothing is ever signaled (the fail-safe)."""
+    root = _repo_root()
+    if not root:
+        return None, None
+    try:
+        p = subprocess.run(
+            ["git", "-C", root, "show", "-s", "--format=%h %ct", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    parts = p.stdout.split() if p.returncode == 0 else []
+    if len(parts) < 2:
+        return None, None
+    try:
+        return parts[0], int(parts[1])
+    except ValueError:
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# the web-service unit (chatnode._systemctl idiom)
+# ---------------------------------------------------------------------------
+
+def _systemctl_show(unit):
+    """Unit properties as a dict, or None when systemctl is unavailable. Uses
+    --timestamp=unix so ActiveEnterTimestamp is `@<epoch>` (parseable), not a
+    locale-timezone string."""
+    try:
+        p = subprocess.run(
+            ["systemctl", "--user", "show", "--timestamp=unix",
+             "-p", "LoadState", "-p", "ActiveState", "-p", "MainPID",
+             "-p", "ActiveEnterTimestamp", unit],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    d = {}
+    for line in p.stdout.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            d[k.strip()] = v.strip()
+    return d
+
+
+def _systemctl_restart(unit):
+    """(ok, message) — restart a --user unit, degrading to a loud reason."""
+    try:
+        p = subprocess.run(["systemctl", "--user", "restart", unit],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, "systemctl unavailable: %s" % exc
+    if p.returncode != 0:
+        return False, (p.stdout + p.stderr).strip() or "restart failed"
+    return True, "restarted"
+
+
+def _active_enter_epoch(d, mainpid):
+    """When the unit became active, as epoch: the @<unix> ActiveEnterTimestamp
+    first, falling back to the MainPID's own start epoch (older systemd without
+    --timestamp=unix support)."""
+    raw = (d or {}).get("ActiveEnterTimestamp", "")
+    if raw.startswith("@"):
+        try:
+            return int(raw[1:])
+        except ValueError:
+            pass
+    return proc_start_epoch(mainpid) if mainpid else None
+
+
+def _web_state(head):
+    d = _systemctl_show(WEB_UNIT)
+    if d is None:
+        return None
+    if d.get("LoadState") in (None, "", "not-found"):
+        return {"unit": WEB_UNIT, "loaded": False, "active": False,
+                "since": None, "mainpid": None, "stale": False}
+    active = d.get("ActiveState") == "active"
+    try:
+        mainpid = int(d.get("MainPID") or 0) or None
+    except ValueError:
+        mainpid = None
+    since = _active_enter_epoch(d, mainpid)
+    stale = bool(active and since and head and since < head)
+    return {"unit": WEB_UNIT, "loaded": True, "active": active,
+            "since": since, "mainpid": mainpid, "stale": stale}
+
+
+# ---------------------------------------------------------------------------
+# scan (read-only) + apply (the owned mutation)
+# ---------------------------------------------------------------------------
+
+def _still_waiter(pid, starttime):
+    """Re-validate a scan-time waiter immediately before signaling (who.py's
+    anti-reuse bracket): the pid must still carry the SAME stat starttime — the
+    canonical anti-recycle key, since a reused pid has a different one — AND the
+    exact `chat wait` argv shape. Any mismatch (exited, recycled, or reshaped)
+    means it is no longer our waiter, so it is skipped, never signaled. Closes
+    the pid-reuse TOCTOU across the announce round-trip: the scan-time guarantee
+    that only the waiter shape is ever signaled is re-asserted AT kill time."""
+    if starttime_of(pid) != starttime:
+        return False
+    sub = _helm_subargv(_cmdline(pid) or [])
+    return sub is not None and sub[:2] == ["chat", "wait"]
+
+
+def scan():
+    """One read-only pass -> the plan dict: HEAD identity, every waiter
+    (status STALE|current|UNKNOWN + signalable), the web unit, and pre-HEAD
+    advisory helm processes. Never mutates. The scanning process itself and the
+    web MainPID are excluded from the generic process sweep."""
+    head_sha, head = _head_commit()
+    web = _web_state(head)
+    web_pid = web["mainpid"] if web else None
+    mypid = os.getpid()
+    waiters, advisory = [], []
+    for entry in glob.glob(os.path.join(PROC, "[0-9]*")):
+        try:
+            pid = int(os.path.basename(entry))
+        except ValueError:
+            continue
+        if pid == mypid or pid == web_pid:
+            continue
+        argv = _cmdline(pid)
+        if not argv:
+            continue
+        sub = _helm_subargv(argv)
+        if sub is None:
+            continue
+        start = proc_start_epoch(pid)
+        if sub[:2] == ["chat", "wait"]:
+            seat = _flag(sub, "--seat")
+            st_ticks = starttime_of(pid)     # raw ticks: the kill-time re-check key
+            if start is None or head is None:
+                status = "UNKNOWN"       # cannot classify -> never signal
+            elif start < head - SKEW_S:
+                status = "STALE"
+            else:
+                status = "current"
+            waiters.append({
+                # `seat` STAYS ARGV-ONLY — `signalable` below and
+                # _spare_last_wake_path both read it, and both decide who gets
+                # a SIGTERM. `seat_declared` is the weaker, report-only
+                # answer; nothing that acts may read it.
+                "pid": pid, "seat": seat, "start": start,
+                "seat_declared": _environ_seat(pid),
+                "starttime": st_ticks, "status": status,
+                "signalable": status == "STALE" and bool(seat),
+                "cmdline": " ".join(argv)})
+        else:
+            verb = sub[0] if sub else "?"
+            if start is not None and head is not None and start < head:
+                advisory.append({"pid": pid, "verb": verb, "start": start,
+                                 "cmdline": " ".join(argv)})
+    waiters.sort(key=lambda w: w["pid"])
+    advisory.sort(key=lambda a: a["pid"])
+    return {"head_sha": head_sha, "head_time": head, "waiters": waiters,
+            "web": web, "advisory": advisory}
+
+
+def _announce_text(head_sha, seats, web_restart):
+    bits = []
+    if seats:
+        bits.append(
+            "cycling %d stale inbox waiter%s [%s] — each seat's Monitor exits "
+            "and re-arms on the new code at its OWN turn boundary (the owned "
+            "beacon-cycle, not an unowned mass-kill)"
+            % (len(seats), "s"[:len(seats) != 1], ", ".join(seats)))
+    if web_restart:
+        bits.append("restarting the stale web service")
+    # kimi field datapoint (accepted verbatim, 2026-07-22): a resumed/cleared
+    # owner that lost its beacon context needs the EXACT re-arm incantation in
+    # the row — the monitor-exit alone does not carry it.
+    # THE INCANTATION IS THE IDEMPOTENT ONE (task/2542). Every agent that reads
+    # this row may act on it, subagents included, and `--follow --replace` from
+    # a subagent SIGTERMs the main conversation's beacon and routes the seat's
+    # wake lines to a sidechain. A bare --follow exits cleanly beside a live
+    # beacon of the same session WITH THE SAME NORMALIZED WAIT (room, --any,
+    # --ambient, timeout); a mismatch is a conflict that exits 2 and names
+    # --replace (beacons.arm). From a seat with replacement authority it
+    # already stops a dead or ghost incumbent (beacons.arm keeps the
+    # replacement pass for those states); without that authority seats_cli
+    # passes reap=False and the new beacon arms ALONGSIDE it. The row states
+    # both conditions. What only --replace does is rotate a
+    # LIVE waiter, such as the stale one this pass spared, and that is the
+    # main conversation's deliberate act.
+    rearm = (" If your beacon was cycled and you resumed/cleared without it, "
+             "re-arm from your main conversation, never from a subagent: "
+             + seats_advice.beacon_monitor("<your-seat>") + ". "
+             + seats_advice.BEACON_EXPIRY
+             + " A bare --follow is idempotent for the same "
+             "wait — beside a live beacon of your session with the same room, "
+             "--any, --ambient and timeout it exits cleanly (a mismatch exits "
+             "2 and names --replace), and from a seat with replacement "
+             "authority it clears a dead or ghost one (without it, the new "
+             "beacon arms alongside it); use --replace only to rotate a LIVE "
+             "waiter, deliberately, from your main conversation. If Monitor is "
+             "DEFERRED, "
+             "ToolSearch(query: \"select:Monitor\") first." if seats else "")
+    return ("helm rearm @ HEAD %s: %s.%s Proxies, daemons and seats are "
+            "untouched (advisory only)." % (head_sha or "?", "; ".join(bits),
+                                            rearm))
+
+
+def _spare_last_wake_path(all_waiters, kill_set):
+    """[waiter] that MUST NOT be signaled: each is the last wake path its seat
+    has left once `kill_set` is removed.
+
+    A SEAT'S BEACON IS ITS WAKE PATH. Nothing external can re-invoke a PTY
+    agent, so a seat re-arms only ON A TURN, and it only gets a turn if
+    something wakes it. Signal every waiter a seat owns and it cannot re-arm —
+    not "until its next turn", but ever, because the thing that would have
+    carried that turn is exactly what was just killed. The report's own line,
+    "-> SIGTERM sent (re-arms at its owner's next turn)", is true precisely
+    when a turn can still reach the seat; this is what keeps that true.
+
+    WHY THE PREDICATE IS THIS ONE. The obvious guard — "is this seat idle /
+    will it get a turn anyway" — is not knowable from here, and an earlier
+    attempt keyed on pending rows neutered the verb and was reverted. This asks
+    a question that is pure arithmetic on the plan scan() already returns: does
+    MY OWN kill set remove this seat's last waiter? Nothing about the seat's
+    future is guessed.
+
+    IT DOES NOT DEPEND ON THE OPEN QUESTION, which is why it can land while
+    that question is still open: whether a Monitor's SIGTERM-exit notification
+    re-invokes an IDLE agent's turn loop is unverified (rearm.py's own comment
+    asserts "the owners still re-arm via the independent Monitor-exit path").
+    If it does, sparing one already-stale beacon costs almost nothing. If it
+    does not, this is the difference between a live fleet and a deaf one.
+    Measured 2026-08-02 at HEAD bdd7ed7: 12 stale waiters, and an unguarded
+    --apply would have left SEVEN of nine seats holding zero — including the
+    integrator. Staleness tracks TRUNK VELOCITY, not seat health: one land
+    twelve minutes earlier is what made a fifteen-minute-old beacon stale, so
+    on a night that lands often the kill set converges on the whole fleet minus
+    whoever just took a turn — i.e. exactly the quiet seats.
+
+    THE VERB KEEPS ITS TEETH. A seat with six stale waiters still loses five.
+    Only the last one is held back, and the caller reports it LOUDLY by name so
+    a seat left on pre-HEAD beacon code is visible rather than quietly wrong.
+
+    Waiters whose status is UNKNOWN are never signalable, so they already count
+    as survivors here — a seat this pass cannot classify is not a seat this
+    pass may leave deaf."""
+    kill_ids = {id(w) for w in kill_set}
+    by_seat = {}
+    for w in all_waiters:
+        if w.get("seat"):
+            by_seat.setdefault(w["seat"], []).append(w)
+    spared = []
+    for _seat, group in sorted(by_seat.items()):
+        if any(id(w) not in kill_ids for w in group):
+            continue                      # a survivor remains — signal freely
+        doomed = [w for w in group if id(w) in kill_ids]
+        if not doomed:
+            continue
+        # THE NEWEST of them: closest to HEAD, least stale, likeliest to speak
+        # the current delivery protocol. pid breaks a start-time tie so the
+        # choice is deterministic and a test can pin it.
+        spared.append(max(doomed, key=lambda w: (w.get("start") or 0, w["pid"])))
+    return spared
+
+
+def apply(plan):
+    """Execute the owned pass over `plan`. ORDER IS LOAD-BEARING: announce
+    FIRST (ambient — wakes nobody), THEN SIGTERM only signalable-stale waiters,
+    THEN restart the web unit iff active+stale. Advisory/web-nonstale/uncertain
+    are never touched. No stale target => no-op (nothing announced, idempotent).
+    Two fail-safes at the kill boundary: (a) fail-CLOSED — if the announce did
+    NOT land, the disruptive re-arm is exactly the unexplained mass-SIGTERM this
+    verb exists to replace, so signal/restart NOTHING and surface the reason
+    loudly; (b) each pid is re-validated (starttime + argv shape) right before
+    os.kill, so a waiter that exited into a recycled pid during the announce
+    round-trip is skipped, not killed.
+
+    THIRD FAIL-SAFE, and it is the one that keeps the fleet alive: NEVER SIGNAL
+    A SEAT'S LAST REMAINING WAITER (see `_spare_last_wake_path`)."""
+    stale_waiters = [w for w in plan["waiters"] if w["signalable"]]
+    spared = _spare_last_wake_path(plan["waiters"], stale_waiters)
+    if spared:
+        keep = {id(w) for w in spared}
+        stale_waiters = [w for w in stale_waiters if id(w) not in keep]
+    web = plan.get("web")
+    web_restart = bool(web and web["stale"])
+    actions = {"announced": False, "signaled": [], "failed": [], "skipped": [],
+               "web_restarted": False, "web_msg": None,
+               "spared": [[w["pid"], w["seat"]] for w in spared]}
+    if not stale_waiters and not web_restart:
+        return actions
+    txt = _announce_text(plan.get("head_sha"),
+                         [w["seat"] for w in stale_waiters], web_restart)
+    try:
+        chat.post(txt, room=ANNOUNCE_ROOM, who=ANNOUNCE_NAME, ambient=True)
+        actions["announced"] = True
+    except Exception as exc:
+        # fail-CLOSED: announce-first is load-bearing. A chat-node hiccup must
+        # not degrade into the unexplained mass-SIGTERM the verb replaces — so
+        # signal and restart nothing this pass; the owners still re-arm via the
+        # independent Monitor-exit path, and the next --apply retries the announce.
+        actions["announce_error"] = str(exc)
+        pk.event("rearm", "waiters", "ABORTED: announce failed (%s)" % exc)
+        return actions
+    for w in stale_waiters:
+        if not _still_waiter(w["pid"], w["starttime"]):
+            actions["skipped"].append(w["pid"])   # exited/recycled since scan
+            continue
+        try:
+            os.kill(w["pid"], signal.SIGTERM)
+            actions["signaled"].append(w["pid"])
+        except OSError as exc:
+            actions["failed"].append([w["pid"], str(exc)])
+    if web_restart:
+        ok, msg = _systemctl_restart(web["unit"])
+        actions["web_restarted"], actions["web_msg"] = ok, msg
+    summary = "signaled %d stale waiter%s%s%s%s" % (
+        len(actions["signaled"]), "s"[:len(actions["signaled"]) != 1],
+        "; %d skipped (pid reuse/exit)" % len(actions["skipped"])
+        if actions["skipped"] else "",
+        # NAMED, never a bare count: a spared waiter means a seat is still on
+        # pre-HEAD beacon code and needs a hand re-arm. A number alone would
+        # make that invisible in exactly the log someone greps afterwards.
+        "; SPARED %s (last wake path — re-arm by hand)"
+        % ", ".join(sorted(s for _pid, s in actions["spared"]))
+        if actions["spared"] else "",
+        "; web restarted" if actions["web_restarted"] else "")
+    pk.event("rearm", "waiters", summary)
+    return actions
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _age(epoch):
+    if not epoch:
+        return "?"
+    d = time.time() - epoch
+    if d < 90:
+        return "%ds ago" % int(d)
+    if d < 5400:
+        return "%dm ago" % int(d / 60)
+    if d < 129600:
+        return "%dh ago" % int(d / 3600)
+    return "%dd ago" % int(d / 86400)
+
+
+def _web_word(web):
+    if not web or not web["loaded"]:
+        return "n/a"
+    if web["stale"]:
+        return "stale"
+    return "current" if web["active"] else "inactive"
+
+
+def _print_report(plan, actions, applying):
+    head_sha, head_t = plan["head_sha"], plan["head_time"]
+    mode = ("APPLYING" if applying
+            else "dry-run; `helm rearm --apply` cycles the stale waiters")
+    print("helm rearm — land-to-live: live processes still holding pre-HEAD "
+          "code (%s)" % mode)
+    if head_t:
+        print("  HEAD %s committed %s" % (head_sha, _age(head_t)))
+    else:
+        print("  HEAD unknown (git unreachable) — nothing can be classed "
+              "stale; nothing is signaled")
+    waiters = plan["waiters"]
+    signaled = set(actions["signaled"]) if actions else set()
+    skipped = set(actions.get("skipped", [])) if actions else set()
+    aborted = bool(actions and actions.get("announce_error"))
+    # RE-DERIVED FROM THE PLAN, not read out of `actions`, so the DRY RUN shows
+    # exactly what an --apply would spare. A dry run that hid the sparing would
+    # be the one report where "what will this do" is answered wrong, and it is
+    # the report people read before deciding to run the real thing. apply()
+    # computes this from the same plan by the same function, so the two agree
+    # by construction rather than by two lists being kept in step.
+    spared = {w["pid"] for w in _spare_last_wake_path(
+        waiters, [w for w in waiters if w["signalable"]])}
+    print("  waiters (helm chat wait): %s"
+          % ("" if waiters else "none live"))
+    for w in waiters:
+        note = ""
+        if w["status"] == "STALE" and not w["seat"]:
+            note = "  (no --seat — SKIPPED, never signaled)"
+            if w.get("seat_declared") not in (None, ENVIRON_UNREADABLE):
+                # NAMING IT DOES NOT WIDEN THE SIGNAL. The operator can now
+                # see WHOSE waiter is holding pre-HEAD code and re-arm it by
+                # hand, which is the whole remedy; the SIGTERM still refuses,
+                # because argv is what the operator wrote and environ is only
+                # what the process inherited.
+                note = ("  (no --seat — SKIPPED, never signaled; it declares "
+                        "%s, re-arm that seat by hand)" % w["seat_declared"])
+        elif w["status"] == "UNKNOWN":
+            note = "  (start/HEAD unreadable — SKIPPED)"
+        elif w["pid"] in spared:
+            note = ("  -> SPARED, its seat's LAST wake path (stale, and killing "
+                    "it removes the only thing that can give this seat the turn "
+                    "it would re-arm on) — re-arm this seat by hand")
+        elif w["pid"] in signaled:
+            note = "  -> SIGTERM sent (re-arms at its owner's next turn)"
+        elif w["pid"] in skipped:
+            note = "  -> skipped (exited/recycled before signal — fail-safe)"
+        elif applying and aborted and w["signalable"]:
+            note = "  -> NOT signaled (announce failed — fail-closed)"
+        elif applying and w["signalable"]:
+            note = "  -> signal FAILED"
+        # THE THREE ANSWERS STAY THREE ON THE SCREEN. A bare "?" cannot
+        # separate "no seat" from "declares one we may not act on" from
+        # "could not look", and the last is a fact about the PROBE — so any
+        # rendering that folds it into the first reports an absence nobody
+        # measured.
+        declared = w.get("seat_declared")
+        if w["seat"]:
+            shown = w["seat"]
+        elif declared == ENVIRON_UNREADABLE:
+            shown = "? (environ unreadable)"
+        elif declared:
+            shown = "%s (environ)" % declared
+        else:
+            shown = "?"
+        print("    %-7s pid %-8d seat %-22s started %s%s" % (
+            w["status"], w["pid"], shown, _age(w["start"]), note))
+    web = plan["web"]
+    if web is None:
+        print("  web-service: systemctl --user unavailable (unqueried)")
+    elif not web["loaded"]:
+        print("  web-service: %s not loaded" % web["unit"])
+    else:
+        line = "  web-service: %s %s since %s" % (
+            web["unit"], _web_word(web), _age(web["since"]))
+        if actions and actions["web_restarted"]:
+            line += "  -> restarted"
+        elif web["stale"]:
+            line += "  [--apply restarts]"
+        print(line)
+    adv = plan["advisory"]
+    if adv:
+        print("  advisory (pre-HEAD long-lived helm procs — respawn "
+              "candidates, NEVER signaled):")
+        for a in adv:
+            print("    pid %-8d helm %-14s started %s" % (
+                a["pid"], a["verb"], _age(a["start"])))
+        # kimi field datapoint (accepted, 2026-07-22): a land never
+        # self-propagates to a running proxy — each carries pre-HEAD config
+        # until respawned by its owner (per-instance + family cli-proxies too).
+        # NAMES THE PID, because a pid is what these rows actually carry.
+        # The old recipe asked the reader to substitute a seat name twice,
+        # and no advisory row has a `seat` key at all (only the waiters
+        # branch does) — these are ANY pre-HEAD long-lived helm process
+        # (`helm web`, `helm keepalive`, a proxy), and `helm seat up/down`
+        # takes a proxy FAMILY or family-instance, not a pid and not a seat
+        # every row can supply. So it asked for a substitution the reader
+        # could not make.
+        print("    respawn: each row above names its PID — restart it from "
+              "whatever owns it (a proxy: `helm seat down <family[-N]> && "
+              "helm seat up <family[-N]>`; a daemon: its own restart). "
+              "A land never self-propagates to a running proxy")
+    n_stale = sum(1 for w in waiters if w["status"] == "STALE")
+    tail = "%d waiter%s stale, web %s, %d advisory" % (
+        n_stale, "s"[:n_stale != 1], _web_word(web), len(adv))
+    if applying and actions:
+        if actions["announced"]:
+            print("  announced to #%s (ambient — woke nobody)" % ANNOUNCE_ROOM)
+        elif actions.get("announce_error"):
+            print("  ANNOUNCE FAILED (%s) — fail-closed: nothing signaled or "
+                  "restarted this pass" % actions["announce_error"])
+        print("helm rearm: %s" % tail)
+    else:
+        print("helm rearm: %s" % tail)
+
+
+def cmd_rearm(args):
+    """rearm [--apply] [--json] — land-to-live: report (dry-run DEFAULT) which
+    long-lived processes still hold pre-HEAD code; --apply announces (ambient),
+    SIGTERMs only the stale `helm chat wait` waiters so their owners re-arm on
+    new code at their own turn boundary, and restarts a stale web unit. Proxies,
+    daemons and seats are advisory only, never signaled."""
+    args = list(args)
+    bad = [a for a in args if a not in ("--apply", "--json")]
+    if bad:
+        print("usage: helm rearm [--apply] [--json]", file=sys.stderr)
+        return 2
+    applying = "--apply" in args
+    plan = scan()
+    actions = apply(plan) if applying else None
+    if "--json" in args:
+        out = dict(plan)
+        if actions is not None:
+            out["actions"] = actions
+        print(json.dumps(out, indent=2))
+        return 0
+    _print_report(plan, actions, applying)
+    return 0

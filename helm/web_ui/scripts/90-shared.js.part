@@ -1,0 +1,117 @@
+/* ---------- dregg ticker: the signed-turn pulse, the dashboard's RECORD row ----------
+   Born global under the nav (owner ask 2026-07-23: "get that back at the top
+   of the UI"); folded into the home dashboard's first row 2026-07-28 when the
+   owner asked for one above-the-fold system band and no duplicated UI — the
+   pulse now lives where the rest of the system's vitals do. Reuses
+   /api/ledger (the ledger tab's own read); its OWN slow timer (8s — a pulse,
+   not a poll storm) and the same structural delta boundary as the ledger tab.
+   Fail-quiet on an ERRORED poll (the last strip stays — the boot text says
+   "not read yet" until a first answer, so keep-last never fakes a first
+   read). Click anywhere -> the full ledger tab. */
+let DREGG_POLLING = false, DREGG_TIMER = null, DREGG_RUN = 0;
+function stopDreggPolling() {
+  if (DREGG_TIMER !== null) clearInterval(DREGG_TIMER);
+  DREGG_TIMER = null;
+  DREGG_RUN++;
+  DREGG_POLLING = false;
+}
+function startDreggPolling() {
+  if (DREGG_TIMER !== null) return;
+  DREGG_TIMER = setInterval(pollDregg, 8000);
+  pollDregg();
+}
+async function pollDregg() {
+  if (document.hidden) return;
+  const el = $("#dreggstrip");
+  if (el) ledgerAges(el);
+  if (DREGG_POLLING) return;
+  const run = DREGG_RUN;
+  DREGG_POLLING = true;
+  try {
+    let d;
+    try { d = await j("/api/ledger", 6000); } catch (e) { return; } // keep the last strip
+    if (run !== DREGG_RUN || !el) return;
+    const tp = d.transport, t = (d.turns || [])[0];
+    el.hidden = false;
+    const turnBit = !t ? "" :
+      ' <span class="dsturn">#' + (t.chain_index ?? "?") +
+      (t.about && t.about.kind === "chat"
+        ? " chat by " + esc(t.about.from || "?") + (t.about.text ? " · “" + esc(String(t.about.text).slice(0, 60)) + "”" : "")
+        : t.about ? " attest " + esc(t.about.id || "") : "") +
+      (t.executor_signed ? ' · exec-signed' : '') + '</span> · ' + ledgerAgeHTML(t.timestamp);
+    ledgerHTML(el, d.offline
+      ? '⛓ <span class="dsbad">node unreachable</span> — retrying quietly · <span class="dslink">ledger →</span>'
+      : tp && tp.mode === "signed"
+        ? '⛓ <span class="dsok">signing live</span> ·' + turnBit + ' · <span class="dslink">ledger →</span>'
+        : '⛓ <span class="dsbad">signing ' + esc((tp && (tp.label || tp.mode)) || "?") + '</span>' +
+          // the glance strip carries the CAUSE, not the raw signer transcript:
+          // take the tail after the last "error:" and clamp — the full reason
+          // lives one click away in the ledger tab (attention budget)
+          (tp && tp.reason ? ' · ' + esc(String(tp.reason).split("error:").pop().trim().slice(0, 90)) : '') +
+          (turnBit ? ' · last' + turnBit : '') +
+          ' · <span class="dslink">ledger →</span>');
+  } finally { if (run === DREGG_RUN) DREGG_POLLING = false; }
+}
+
+/* ================= rail resize ================= */
+/* (owner 2026-08-01: "the sidebars need to be adjustable width") every
+   .raildrag handle drags the rail beside it. The width lands in a --railw
+   CSS variable, so the stylesheet keeps owning layout — the mobile media
+   queries still win, because they set the property itself, not the variable.
+   Persisted per rail; double-click returns the stylesheet default. */
+function railClamp(px, vw) {   // pure: min a readable rail, max half the viewport
+  return Math.max(180, Math.min(Math.round((vw || innerWidth) / 2), px | 0));
+}
+function railWire(handle, host, rail, key) {
+  const h = $(handle), el = $(host), rl = $(rail);
+  if (!h || !el || !rl) return;
+  const saved = parseInt(localStorage.getItem(key) || "", 10);
+  if (saved > 0) el.style.setProperty("--railw", railClamp(saved) + "px");
+  h.ondblclick = () => { localStorage.removeItem(key); el.style.removeProperty("--railw"); };
+  h.addEventListener("pointerdown", dn => {
+    dn.preventDefault();
+    h.setPointerCapture(dn.pointerId);
+    h.classList.add("live");
+    const x0 = dn.clientX, w0 = rl.getBoundingClientRect().width;
+    let w = w0;
+    const mv = ev => { w = railClamp(w0 + ev.clientX - x0); el.style.setProperty("--railw", w + "px"); };
+    const up = () => {
+      h.classList.remove("live");
+      h.removeEventListener("pointermove", mv);
+      h.removeEventListener("pointerup", up);
+      h.removeEventListener("pointercancel", up);
+      localStorage.setItem(key, String(w));
+    };
+    h.addEventListener("pointermove", mv);
+    h.addEventListener("pointerup", up);
+    h.addEventListener("pointercancel", up);
+  });
+}
+railWire("#chatraildrag", "#chatrooms", "#chatrooms", "helm.rail.chat");
+railWire("#cfgraildrag", "#cfgsplit", "#cfgtree", "helm.rail.cfg");
+
+/* ================= boot ================= */
+{
+  const raw = location.hash.slice(1), v = canonView(raw);
+  if (VIEWS.includes(v)) { showView(v); goOldSection(raw); }
+  else if (v === "homes") {
+    showView("quota");
+    $("#homescard").open = true;
+    setTimeout(() => $("#homescard").scrollIntoView({block: "start"}), 400);
+  } else {
+    const sv = canonView(localStorage.getItem("helm.view"));
+    if (sv && VIEWS.includes(sv)) showView(sv);
+  }
+  const o = new URLSearchParams(location.search).get("open");
+  if (o) { showView("sessions"); openSession(o); }
+  // UNCONDITIONALLY, because the boot above routes only when a hash or a saved
+  // view names one: a first visit renders the markup's own selected area and
+  // calls showView never, so anything sticking below the navigation would open
+  // its first page against the CSS fallback rather than the measured height.
+  publishNavHeight();
+  const strip = $("#dreggstrip");
+  if (strip) strip.onclick = () => showView("history");
+  startDreggPolling();
+  esConnect();   // the doorbell: push wakes the cursor reads
+}
+</script>

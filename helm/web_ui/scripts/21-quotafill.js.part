@@ -1,0 +1,411 @@
+
+/* ── FILL MODE: every declared account on one screen, editable in place ──
+   The owner asked for "a place where i could update and edit the details of
+   all my accounts and subs and api keys in helm so that you would never have
+   to guess". The card above this one READS well and edits one row at a time
+   through a modal form, which is the wrong shape for the job he described:
+   twenty-odd rows, most of them seeded stubs, each needing four or five short
+   answers. Opening, filling and closing a form twenty times is why the rows
+   stayed empty.
+
+   THE FORM ABOVE IS KEPT, NOT REPLACED, and it is not duplication. It is the
+   only way to ADD a row, the only way to describe a measured account the card
+   only knows by an opaque handle (declOpenForKey), and the only editor that
+   fits a phone — these cells need a wide screen. Fill mode is the BULK path
+   for rows that already exist; the form is the add/describe/narrow path.
+
+   THE SORT IS FROZEN AT RENDER. Rows that still need him come first, but the
+   order is computed when the table is drawn and never again — a row that
+   re-sorted itself the moment he ticked `confirmed` would jump out from under
+   the cursor mid-column, which is the one thing a keyboard fill cannot
+   survive. Reload, or leave and re-enter fill mode, to re-sort.
+
+   A CELL IS ITS OWN WRITER. Each cell posts ONE field through the SAME
+   declPost save the form uses, with the SAME revision guard, and the door
+   merges it over what is on disk — which is why a one-field payload is legal
+   here and why `declConfirm` above could always send {id, confirmed} alone.
+   Two tabs still cannot clobber each other: a stale revision is refused, the
+   refusal NAMES the row, and the card reloads. */
+
+/* THE COLUMNS, and why these. Every editable field of the schema except `id`
+   (the row's key — retyping it would be a second row, which the door refuses)
+   and `measured_as` (the provider's own spelling, which the card is usually
+   only given masked). `billing` is the one closed set, so it is a <select>
+   and cannot be typed wrong. */
+const FILL_COLS = [
+  {key: "vendor", label: "vendor", w: "9em"},
+  {key: "plan", label: "plan", w: "13em"},
+  {key: "count", label: "how many", w: "6em"},
+  {key: "price_month", label: "$/month", w: "7em"},
+  {key: "billing", label: "billing", w: "9em", choices: true},
+  {key: "allowance", label: "allowance", w: "12em"},
+  {key: "key_where", label: "key kept where", w: "13em"},
+  {key: "good_for", label: "what it IS for", w: "18em"},
+  {key: "not_for", label: "what it is NOT for", w: "16em"},
+  {key: "renews_on", label: "renews", w: "9em", type: "date"},
+  /* THE ONE HE WENT LOOKING FOR AND DID NOT FIND: "i didnt see a field for
+     notes". It was on the add/edit form all along and only this table lacked
+     it — and this table is the screen he filled. It is the widest column on
+     purpose: it holds the facts that fit nowhere else and that agents
+     otherwise guess at (the reset day, the real allowance, the quirk), so it
+     is the last column, after everything with a shape of its own. */
+  {key: "notes", label: "notes", w: "22em"},
+  {key: "confirmed", label: "mine", w: "4em", tick: true},
+];
+
+/* sub | payg | prepaid | free, and the empty option that means "not declared".
+   The words come from the SERVER on every row (`billing_word`), so this list
+   is the only place the page names the tokens themselves. */
+const FILL_BILLING = ["", "sub", "payg", "prepaid", "free"];
+
+let DECL_FILL = false;      // is the owner in fill mode right now?
+
+/* ── THE SAME ROWS THE TABLE SHOWS ────────────────────────────────────────
+   The owner's ruling: "i dont understand why the accounts we pay for [aren't
+   handled] by making it editable and adding fields intelligently, to compose
+   instead of make new".
+
+   THIS SCREEN EDITS SUBSCRIPTIONS, not declared records: one row per thing he
+   pays for, whether a record exists for it yet or not. Editing records instead
+   keeps an account helm measures but nobody has described off the screen
+   entirely, and the only way onto it is for the seed to mint a record first —
+   which is the "make new" he is objecting to.
+   Typing in a cell on a row that has no record CREATES one against that
+   account, composing the fields helm has already measured with the one he
+   typed. Nothing is minted ahead of him, and nothing he edits is a second row.
+
+   A ROW WITH NO MEASUREMENT IS STILL A ROW — a prepaid balance, a seatless
+   subscription — and it edits exactly as it always did, by its declared id. */
+function fillRows() {
+  /* the table's own composition, called rather than re-derived: two screens
+     disagreeing about which accounts exist is the failure this whole pass is
+     about. */
+  const rows = (typeof quotaRows === "function" ? quotaRows() : []).map(r => ({
+    /* THE SUBSCRIPTION, NEVER THE RECORD'S ID, and that is not a detail: the
+       cells carry this key in the DOM from the moment the table is drawn, and
+       creating a record for a row CHANGES which record it has. Keyed by the
+       record, the first cell he filled on an undescribed account would create
+       one — and every cell after it on that same line would look up a key that
+       no longer existed and silently save nothing. The subscription is the one
+       name the row has before and after. */
+    key: r.sub,
+    id: r.decl ? r.decl.id : null,
+    /* the handle the door resolves back to the provider's own name — the page
+       is never given that name, so this is the only thing it can post. */
+    measured_key: (!r.decl && r.cred) ? r.cred.measured_key : null,
+    decl: r.decl || {},
+    cred: r.cred || null,
+    label: (r.cred && r.cred.name) || (r.decl && r.decl.id) || "?",
+    aliases: r.aliases || [],
+  }));
+  return rows;
+}
+
+/* WHAT HELM ALREADY KNOWS ABOUT THIS ACCOUNT, for the create. Every value is a
+   READING — the provider reports the vendor and the plan tier, and the reach is
+   the provider itself — so none of it is a guess presented as his words.
+   `good_for` and `not_for` are exactly the fields no reading can supply, and
+   they stay empty until he answers them. */
+function fillComposed(row) {
+  const c = row.cred;
+  if (!c) return {};
+  return {vendor: c.provider || "unknown",
+          plan: c.tier || "unknown plan",
+          reach: c.provider || "unknown",
+          /* THE WRITER REQUIRES A COUNT and this is the only honest one: the
+             row is ONE measured account, so it is one of whatever plan it is
+             on. Without it every create is refused "count is required — how
+             many of this exact plan do you have?", a question about a box that
+             is not on this screen, in answer to a price he just typed. */
+          count: 1};
+}
+
+/* ROWS THAT STILL NEED HIM FIRST. An unconfirmed row and a row nobody has
+   described are the two states this whole surface exists to drain, so they
+   sort above everything else and he fills from the top until the header says
+   he is done. Inside a tier the DECLARED order is preserved — the server's
+   order is the file's order, and a second sort key would shuffle rows he has
+   already learned the position of. */
+function declFillSort(rows) {
+  /* 0: nobody has said what it is for — the emptiest rows, and every account
+     helm measures that has no record yet.  1: described but not yet HIS
+     words.  2: done. */
+  const rank = r => fillNeedsDescribe(r) ? 0 : (r.decl.confirmed ? 2 : 1);
+  return (rows || []).map((r, i) => [r, i])
+    .sort((x, y) => (rank(x[0]) - rank(y[0])) || (x[1] - y[1]))
+    .map(p => p[0]);
+}
+/* A ROW WITH NO RECORD AT ALL is the emptiest kind of undescribed, not a
+   described row: `needs_describe` is a field of a record, and there is none. */
+function fillNeedsDescribe(r) { return !r.id || !!r.decl.needs_describe; }
+
+/* ONE LINE THAT SAYS HOW MUCH IS LEFT. "12 of 21 confirmed · 9 still unpriced"
+   is the progress bar for a job with no other end condition — without it he
+   cannot tell a card he has finished from a card he has not started. The
+   counts are COUNTED HERE from the rows on screen rather than read off
+   `totals`, because `totals.unpriced` counts price alone and this line also
+   has to say how many rows nobody has described. */
+function declFillHeader(rows) {
+  const all = rows || [];
+  const confirmed = all.filter(r => r.decl.confirmed).length;
+  const unpriced = all.filter(r => r.decl.price_value == null).length;
+  const undescribed = all.filter(r => fillNeedsDescribe(r)).length;
+  const done = all.length && confirmed === all.length && !unpriced;
+  return `<div class="dfillhead${done ? " dfilldone" : ""}">`
+    + `<b>${confirmed}</b> of <b>${all.length}</b> row${all.length === 1 ? "" : "s"} confirmed`
+    + ` · <b>${unpriced}</b> unpriced`
+    + (undescribed ? ` · <b>${undescribed}</b> nobody has described` : "")
+    + (done ? ` — that is all of them.` : ` — the ones that still need you are at the top.`)
+    + `<span class="dfillhint">Enter or Tab moves DOWN the column; each box saves itself when you leave it.</span>`
+    + `</div>`;
+}
+
+function declFillCell(r, col, rowIndex) {
+  const a = r.decl;
+  const at = `data-fkey="${esc(col.key)}" data-frow="${rowIndex}" data-fkeyrow="${esc(r.key)}"`;
+  if (col.tick) {
+    return `<td class="dfillcell"><input type="checkbox" class="dfillbox" ${at}`
+      + `${a.confirmed ? " checked" : ""} title="tick this once the row says what you would say"></td>`;
+  }
+  if (col.choices) {
+    return `<td class="dfillcell"><select class="dfillbox" ${at}>`
+      + FILL_BILLING.map(v => `<option value="${esc(v)}"${v === (a.billing || "") ? " selected" : ""}>`
+        + `${esc(v || "not declared")}</option>`).join("")
+      + `</select></td>`;
+  }
+  /* A CELL HELM HAS ALREADY MEASURED SHOWS THE MEASUREMENT, greyed, as a
+     placeholder rather than a value: it is what the row will be created with
+     if he types anywhere else on it, and showing it as text he must retype
+     would be the "make new" this screen exists to stop. */
+  const composed = fillComposed(r);
+  const value = a[col.key] == null ? "" : String(a[col.key]);
+  const hint = (!value && composed[col.key]) ? composed[col.key] : "";
+  return `<td class="dfillcell"><input class="dfillbox" ${at} autocomplete="off"`
+    + `${col.type ? ` type="${esc(col.type)}"` : ""}`
+    + (hint ? ` placeholder="${esc(hint)}"` : "")
+    + ` style="width:${esc(col.w)}" value="${esc(value)}"></td>`;
+}
+
+function declFillRowHTML(r, rowIndex) {
+  const need = r.decl.needs_confirm || fillNeedsDescribe(r);
+  /* THE ALIASES RIDE THE ROW, never a row of their own — the same rule the
+     table above follows, because these are the same subscriptions. */
+  const alias = r.aliases.length
+    ? `<span class="dfillalias" title="${esc(r.aliases.map(x => x.home_name || x.name).join(", "))}">+${r.aliases.length}</span>` : "";
+  const nomeasure = !r.cred ? ` title="nothing measures this one — it is here because you declared it"` : "";
+  return `<tr class="dfillrow${need ? " dfillneed" : ""}" data-fkeyrow="${esc(r.key)}">`
+    + `<th class="dfillid"${nomeasure || ` title="${esc(r.label)}"`}>${esc(short(r.label, 18))}${alias}</th>`
+    + FILL_COLS.map(c => declFillCell(r, c, rowIndex)).join("")
+    + `<td class="dfillmsg" data-fmsg="${esc(r.key)}"></td></tr>`;
+}
+
+function renderDeclFill() {
+  const host = $("#declfill");
+  if (!host) return;
+  host.hidden = !DECL_FILL;
+  if (!DECL_FILL) { host.innerHTML = ""; return; }
+  if (DECL.unreadable) {
+    /* the same UNKNOWN strip the reading card draws. Offering editable boxes
+       over an inventory helm could not read would invite him to type into a
+       file whose contents nobody knows. */
+    host.innerHTML = `<div class="dunknown">✗ ${esc(DECL.unreadable)}<br>`
+      + `<span class="rst">helm cannot read your accounts right now, so there is nothing safe to edit. `
+      + `Fix or move that file, then reload.</span></div>`;
+    return;
+  }
+  const rows = declFillSort(fillRows());
+  if (!rows.length) {
+    host.innerHTML = declFillHeader(rows)
+      + `<div class="dundesc">nothing declared yet — hit “add an account”, or run one seed, and they will all be here.</div>`;
+    return;
+  }
+  host.innerHTML = declFillHeader(rows)
+    + `<div class="dfillwrap"><table class="dfilltab"><thead><tr><th>account</th>`
+    + FILL_COLS.map(c => `<th>${esc(c.label)}</th>`).join("")
+    + `<th></th></tr></thead><tbody>`
+    + rows.map((a, i) => declFillRowHTML(a, i)).join("")
+    + `</tbody></table></div>`
+    + `<div class="dnosecret">never a password, key, token or email in any of these boxes — helm refuses them. `
+    + `“key kept where” is the PLACE (a credential home, an env file, the provider's dashboard), never the key.</div>`;
+  declFillBind();
+}
+
+/* THE KEYBOARD CONTRACT. He is filling one COLUMN at a time — every vendor,
+   then every price — so Enter and Tab both go DOWN, and shift+Tab goes up.
+   The browser's own left-to-right Tab would walk him across one row's eleven
+   boxes, which is the order nobody fills this in. */
+function declFillBind() {
+  const host = $("#declfill");
+  if (!host || !host.querySelectorAll) return;
+  host.querySelectorAll(".dfillbox").forEach(box => {
+    box.onblur = () => declFillSave(box);
+    box.onkeydown = e => declFillKey(e, box);
+    if (box.type === "checkbox") box.onchange = () => declFillSave(box);
+  });
+}
+
+function declFillKey(e, box) {
+  const key = e && e.key;
+  if (key !== "Enter" && key !== "Tab") return;
+  if (e.preventDefault) e.preventDefault();
+  const step = (key === "Tab" && e.shiftKey) ? -1 : 1;
+  const next = declFillNext(box, step);
+  /* the blur handler is what SAVES, so moving focus is the save. A cell with
+     nowhere to go still has to save, because nothing will blur it. */
+  if (next && next.focus) next.focus();
+  else declFillSave(box);
+}
+
+/* the box one row DOWN in the same column, or null at the end of it. */
+function declFillNext(box, step) {
+  const host = $("#declfill");
+  if (!host || !host.querySelectorAll) return null;
+  const col = box.dataset.fkey;
+  const at = Number(box.dataset.frow);
+  const want = String(at + step);
+  let found = null;
+  host.querySelectorAll(".dfillbox").forEach(b => {
+    if (!found && b.dataset.fkey === col && b.dataset.frow === want) found = b;
+  });
+  return found;
+}
+
+/* ONE CELL, ONE FIELD, THE SAME DOOR. The payload carries the row's id, the
+   one field and nothing else: the writer merges over what is on disk, so a
+   partial save cannot destroy the ten fields this cell is not about. */
+function declFillSave(box) {
+  const key = box.dataset.fkey, rowKey = box.dataset.fkeyrow;
+  const row = declFillRowFor(rowKey);
+  /* A CELL MAY NEVER SAVE INTO NOTHING QUIETLY. These cells carry their row's
+     key from the moment the table was drawn, and the composition under them
+     can move — a re-measure that re-keys an account, a row that goes away
+     under another tab. Answering "nothing happened" to a value he typed is the
+     worst shape this screen has: his only feedback IS the row, so a silent
+     no-op reads exactly like a save. It says so and reloads instead. */
+  if (!row) return declFillLost(rowKey);
+  const value = box.type === "checkbox" ? !!box.checked
+    : (typeof box.value === "string" ? box.value.trim() : "");
+  const was = row.decl[key] == null ? (box.type === "checkbox" ? false : "") : row.decl[key];
+  /* NOTHING CHANGED IS NOTHING POSTED. Every Tab through a full table would
+     otherwise be twenty saves, twenty revisions and twenty chances for two
+     tabs to collide over an edit nobody made. */
+  if (String(value) === String(was)) return Promise.resolve(null);
+  return declFillPost(row, key, value, box);
+}
+
+/* the CURRENT composition for one row key — recomputed rather than captured,
+   because a save that created a record changes what `fillRows` answers. */
+function declFillRowFor(rowKey) {
+  return fillRows().find(r => r.key === rowKey) || null;
+}
+
+/* THE ROW THIS CELL BELONGS TO IS NOT THERE ANY MORE. Nothing can be written,
+   because there is nothing to write it against — so the one thing owed is to
+   say that, keep what he typed on screen, and put the screen back in step. */
+async function declFillLost(rowKey) {
+  const msg = declFillMsg(rowKey);
+  const said = "this account is not on the screen any more — nothing was "
+    + "saved. Reloading so you can see what is.";
+  if (msg) msg.innerHTML = `<span class="dupwarn">✗ ${esc(said)}</span>`;
+  toast("✗ " + said, 7000);
+  await loadDeclared();
+  return {error: said, code: "gone"};
+}
+
+async function declFillPost(row, key, value, box) {
+  const cell = {};
+  cell[key] = value;
+  /* A ROW THAT ALREADY HAS A RECORD IS EDITED; one that does not is CREATED
+     against the account it belongs to, composing what helm has measured with
+     the one field he typed. The `id` on a create is helm's suggestion for a
+     key, never a name he has to invent — and `measured_key` is what binds the
+     new record to the account rather than leaving it floating. */
+  if (row.id) {
+    cell.id = row.id;
+  } else {
+    Object.assign(cell, fillComposed(row), cell);
+    /* THE ID CARRIES THE PROVIDER, exactly as the seed's did: two vendors can
+       hold the same login and a key made from the local part alone would put
+       the second one under `-2`, which names nothing. `declSlug` drops the
+       domain, so the key is a name rather than a way to reach anybody. */
+    cell.id = declFreeId(declSlug(
+      (row.cred && row.cred.provider ? row.cred.provider + "-" : "") + row.label));
+    cell.measured_key = row.measured_key;
+  }
+  const r = await declPost({action: "save", account: cell,
+                            revision: DECL.revision,
+                            original_id: row.id || undefined});
+  const msg = declFillMsg(row.key);
+  if (r && r.error) {
+    /* THE REFUSAL STAYS BESIDE THE ROW IT IS ABOUT and the box keeps what he
+       typed, so the cure is one keystroke rather than a retype. A conflict or
+       a vanished row is somebody else's write and the only cure is a reload —
+       which is the one case the typed value cannot be kept. */
+    /* A SAVE THAT LANDED IS NOT A REFUSAL, even when what came back is an
+       error object. `stale` means the write went through and the screen has
+       stopped describing his inventory; marking it ✗ would tell him the thing
+       he typed was rejected, which is the opposite of what happened. */
+    const landed = r.code === "stale";
+    if (msg) msg.innerHTML = landed
+      ? `<span class="dfillok">✓ saved — ${esc(r.error)}</span>`
+      : `<span class="dupwarn">✗ ${esc(r.error)}</span>`;
+    if (landed || r.code === "conflict" || r.code === "gone") {
+      toast((landed ? "✓ " : "✗ ") + row.label + ": " + r.error, 7000);
+      await loadDeclared();
+    }
+    return r;
+  }
+  if (msg) msg.innerHTML = `<span class="dfillok">✓ saved</span>`;
+  /* THE NEW REVISION, KEPT. Without this the next cell posts the revision the
+     page loaded with and every save after the first is a self-conflict. */
+  if (r && r.revision) DECL.revision = r.revision;
+  if (r && r.account) {
+    /* the SERVER's row replaces the local one — it carries the derived fields
+       (headline, billing_word, price_value, needs_describe) the header counts,
+       and a locally-patched copy would count them off the page's own guess.
+       A row this save CREATED is appended, so the next cell on the same line
+       edits the record instead of creating a second one. */
+    const rows = DECL.accounts || [];
+    const at = rows.findIndex(a => a.id === r.account.id);
+    if (at >= 0) rows[at] = r.account;
+    else rows.push(r.account);
+    DECL.accounts = rows;
+    /* …and the table above is now about a different set of declared cells. */
+    if (typeof renderAccts === "function") renderAccts();
+  }
+  declFillRefreshHeader();
+  return r;
+}
+
+function declFillMsg(id) {
+  const host = $("#declfill");
+  if (!host || !host.querySelectorAll) return null;
+  let found = null;
+  host.querySelectorAll("[data-fmsg]").forEach(el => {
+    if (el.dataset.fmsg === id) found = el;
+  });
+  return found;
+}
+
+/* THE HEADER RECOUNTS, THE TABLE DOES NOT REDRAW. Re-rendering would re-sort
+   the rows and take the focus off the box he is still in. */
+function declFillRefreshHeader() {
+  const host = $("#declfill");
+  if (!host || !host.querySelectorAll) return;
+  host.querySelectorAll(".dfillhead").forEach(el => {
+    el.outerHTML = declFillHeader(fillRows());
+  });
+}
+
+function declFillToggle() {
+  DECL_FILL = !DECL_FILL;
+  const btn = $("#dFill");
+  if (btn) btn.textContent = DECL_FILL ? "done filling" : "fill in all my details";
+  /* reading and filling are two jobs and the screen does one at a time: the
+     reading card's rows would double every line of the table under it. */
+  const read = $("#declrows");
+  if (read) read.hidden = DECL_FILL;
+  renderDeclFill();
+}
+
+if ($("#dFill")) $("#dFill").onclick = () => declFillToggle();

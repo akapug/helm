@@ -1,0 +1,62 @@
+/* ---------- toast (theme + tray toggles now live in the nav) ---------- */
+.hint{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:var(--r);font:var(--f1) var(--mono);opacity:0;transition:.2s;pointer-events:none;z-index:70;max-width:92vw;word-break:break-all}
+.hint.show{opacity:.96}
+/* the stale-build offer — pinned under the top edge, never over the tab he is
+   reading, and it wraps rather than pushing anything off a phone screen. */
+#stalebuild{position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:69;display:flex;gap:8px;align-items:center;background:#c9772e;color:#fff;padding:7px 12px;border-radius:0 0 var(--r) var(--r);font-size:var(--f1);box-shadow:0 2px 10px rgba(0,0,0,.25);max-width:94vw;flex-wrap:wrap;justify-content:center}
+#stalebuild .chip{background:rgba(255,255,255,.18);border-color:rgba(255,255,255,.45);color:#fff}
+#stalebuild .chip:hover{background:rgba(255,255,255,.32)}
+</style>
+
+<nav id="nav">
+  <span class="brand"><span class="mark">⎈</span>helm</span>
+  <!-- FOUR PAGES, the owner's words: "are board and work and the 'work
+       landing' section at the top of history (which is really the kanban
+       board) really all separate things? what if it was just work and
+       history and history focuses on signing stuff", and "since chat already
+       needs no sub menu, maybe board needs no submenu either and history just
+       moves to the 4th item in the top level menu?". So WORK is one page (the
+       board, the work tab, the scheduler and the land pipeline), CHAT is
+       unchanged, FLEET keeps its sections, and HISTORY is the signing ledger.
+       Only Fleet has a section row. Every retired hash (#board, #helm,
+       #scheduler, #ledger) still lands on the page that took it over, through
+       canonView; AREA_OF in the nav script is the one map. -->
+  <div class="navareas">
+    <button class="navarea on" data-a="work">Work</button>
+    <button class="navarea" data-a="chat">Chat</button>
+    <button class="navarea" data-a="fleet">Fleet</button>
+    <button class="navarea" data-a="history">History</button>
+  </div>
+  <span class="spacer"></span>
+  <div class="stats" id="navstats"></div>
+  <button class="icon" id="themetog" title="toggle light / dark">◐</button>
+  <button class="icon" id="trayBtn" title="team tray — collect seats">⊞</button>
+  <!-- the section row of the OPEN area. Only Fleet has one; the row is hidden
+       (.solo) while a single-page area is open. The Fleet group stays in the
+       document while closed, so its badges keep rendering and every data-v
+       stays queryable. -->
+  <div class="navtabs solo">
+    <div class="navsec" data-a="fleet">
+      <button class="navtab" data-v="quota">credit</button>
+      <button class="navtab" data-v="roster">seats</button>
+      <button class="navtab" data-v="sessions">sessions</button>
+      <button class="navtab" data-v="configs">configs</button>
+      <button class="navtab" data-v="boxes">boxes</button>
+    </div>
+  </div>
+</nav>
+<!-- THE STALE-PAGE TELL. This tab is long-lived and the server is assembled
+     fresh per request, so the page he is reading can be hours older than the
+     one helm would serve — he read a card for hours that a newer build had
+     already moved, and reported what the old page showed. Nothing on the
+     console could tell him, because nothing on the console knew. It is an
+     OFFER and never an act: a console that reloaded itself would throw away
+     whatever he was in the middle of typing. -->
+<div id="stalebuild" hidden>
+  <span>helm has changed since you opened this page</span>
+  <button class="chip" id="stalereload">reload it</button>
+  <button class="chip" id="stalehide" title="keep reading this version">not now</button>
+</div>
+
+<div class="wrap">
+

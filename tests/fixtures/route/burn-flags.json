@@ -1,0 +1,313 @@
+{
+ "captured_now": 1789764669.8460352,
+ "families": {
+  "family-a": {
+   "abundance_read": null,
+   "axes": {
+    "declared": "ORANGE",
+    "money": "ORANGE",
+    "policy": null,
+    "reach": null
+   },
+   "axis": "money",
+   "behaviour": {
+    "capacity": 1,
+    "delegate_factor": 0.25,
+    "say": "critical path only, one delegate at a time, prefer another family"
+   },
+   "capped_by_coverage": true,
+   "cause": "3 of 4 accounts have spent more than half their longest window and no reset lands within 5h to carry the base load; the repair is active management, not fan-out",
+   "cause_id": "money:pool-thin",
+   "colour": "ORANGE",
+   "coverage": {
+    "measured": 4,
+    "total": 6,
+    "unread": 2,
+    "unread_why": "1 reauth-needed, 1 stale"
+   },
+   "declared_ignored": false,
+   "declared_unmeasured": null,
+   "expires_at": 1790060400,
+   "expires_kind": "weekly-reset",
+   "expires_source": "budget rows: the 7d window's reset",
+   "family": "family-a",
+   "measured_at": 1789764646,
+   "provenance": "measured",
+   "reading_age_s": 24
+  },
+  "family-b": {
+   "abundance_read": false,
+   "axes": {
+    "declared": "RED",
+    "money": "YELLOW",
+    "policy": null,
+    "reach": null
+   },
+   "axis": "declared",
+   "behaviour": {
+    "capacity": 0,
+    "delegate_factor": 0.0,
+    "say": "start nothing new on this family; finish or park what is running"
+   },
+   "capped_by_coverage": false,
+   "cause": "the owner read the fleet and stated this colour",
+   "cause_id": "declared:owner",
+   "colour": "RED",
+   "coverage": {
+    "measured": 6,
+    "total": 6,
+    "unread": 0,
+    "unread_why": ""
+   },
+   "declared_ignored": false,
+   "declared_unmeasured": null,
+   "expires_at": 1789776120,
+   "expires_kind": "owner-declared",
+   "expires_source": "helm burn declare",
+   "family": "family-b",
+   "measured_at": 1789689720,
+   "provenance": "owner-declared",
+   "reading_age_s": 74950
+  },
+  "family-c": {
+   "abundance_read": null,
+   "axes": {
+    "declared": null,
+    "money": "GREY",
+    "policy": null,
+    "reach": null
+   },
+   "axis": null,
+   "behaviour": {
+    "capacity": 2,
+    "delegate_factor": 0.5,
+    "say": "not measured; treated as yellow and said out loud"
+   },
+   "capped_by_coverage": false,
+   "cause": "no money reader exists for this family yet, so nothing is known about what it has left",
+   "cause_id": "money:no-reader",
+   "colour": "GREY",
+   "coverage": null,
+   "declared_ignored": false,
+   "declared_unmeasured": null,
+   "expires_at": null,
+   "expires_kind": "none",
+   "expires_source": null,
+   "family": "family-c",
+   "measured_at": null,
+   "provenance": "unmeasured",
+   "reading_age_s": null
+  },
+  "family-d": {
+   "abundance_read": null,
+   "axes": {
+    "declared": "YELLOW",
+    "money": "GREY",
+    "policy": null,
+    "reach": null
+   },
+   "axis": "declared",
+   "behaviour": {
+    "capacity": 2,
+    "delegate_factor": 0.5,
+    "say": "normal work, no speculative fan-out"
+   },
+   "capped_by_coverage": false,
+   "cause": "the owner read the fleet and stated this colour",
+   "cause_id": "declared:owner",
+   "colour": "YELLOW",
+   "coverage": null,
+   "declared_ignored": false,
+   "declared_unmeasured": null,
+   "expires_at": 1789776120,
+   "expires_kind": "owner-declared",
+   "expires_source": "helm burn declare",
+   "family": "family-d",
+   "measured_at": 1789689720,
+   "provenance": "owner-declared",
+   "reading_age_s": 74950
+  },
+  "family-e": {
+   "abundance_read": null,
+   "axes": {
+    "declared": "YELLOW",
+    "money": "GREY",
+    "policy": null,
+    "reach": null
+   },
+   "axis": "declared",
+   "behaviour": {
+    "capacity": 2,
+    "delegate_factor": 0.5,
+    "say": "normal work, no speculative fan-out"
+   },
+   "capped_by_coverage": false,
+   "cause": "the owner read the fleet and stated this colour",
+   "cause_id": "declared:owner",
+   "colour": "YELLOW",
+   "coverage": null,
+   "declared_ignored": false,
+   "declared_unmeasured": null,
+   "expires_at": 1789776120,
+   "expires_kind": "owner-declared",
+   "expires_source": "helm burn declare",
+   "family": "family-e",
+   "measured_at": 1789689720,
+   "provenance": "owner-declared",
+   "reading_age_s": 74950
+  },
+  "family-f": {
+   "abundance_read": null,
+   "axes": {
+    "declared": "YELLOW",
+    "money": "GREY",
+    "policy": null,
+    "reach": null
+   },
+   "axis": "declared",
+   "behaviour": {
+    "capacity": 2,
+    "delegate_factor": 0.5,
+    "say": "normal work, no speculative fan-out"
+   },
+   "capped_by_coverage": false,
+   "cause": "the owner read the fleet and stated this colour",
+   "cause_id": "declared:owner",
+   "colour": "YELLOW",
+   "coverage": null,
+   "declared_ignored": false,
+   "declared_unmeasured": null,
+   "expires_at": 1789776120,
+   "expires_kind": "owner-declared",
+   "expires_source": "helm burn declare",
+   "family": "family-f",
+   "measured_at": 1789689720,
+   "provenance": "owner-declared",
+   "reading_age_s": 74950
+  },
+  "family-g": {
+   "abundance_read": null,
+   "axes": {
+    "declared": "YELLOW",
+    "money": "GREY",
+    "policy": null,
+    "reach": null
+   },
+   "axis": "declared",
+   "behaviour": {
+    "capacity": 2,
+    "delegate_factor": 0.5,
+    "say": "normal work, no speculative fan-out"
+   },
+   "capped_by_coverage": false,
+   "cause": "the owner read the fleet and stated this colour",
+   "cause_id": "declared:owner",
+   "colour": "YELLOW",
+   "coverage": null,
+   "declared_ignored": false,
+   "declared_unmeasured": null,
+   "expires_at": 1789776120,
+   "expires_kind": "owner-declared",
+   "expires_source": "helm burn declare",
+   "family": "family-g",
+   "measured_at": 1789689720,
+   "provenance": "owner-declared",
+   "reading_age_s": 74950
+  },
+  "family-h": {
+   "abundance_read": null,
+   "axes": {
+    "declared": "YELLOW",
+    "money": "GREY",
+    "policy": null,
+    "reach": null
+   },
+   "axis": "declared",
+   "behaviour": {
+    "capacity": 2,
+    "delegate_factor": 0.5,
+    "say": "normal work, no speculative fan-out"
+   },
+   "capped_by_coverage": false,
+   "cause": "the owner read the fleet and stated this colour",
+   "cause_id": "declared:owner",
+   "colour": "YELLOW",
+   "coverage": null,
+   "declared_ignored": false,
+   "declared_unmeasured": null,
+   "expires_at": 1789776120,
+   "expires_kind": "owner-declared",
+   "expires_source": "helm burn declare",
+   "family": "family-h",
+   "measured_at": 1789689720,
+   "provenance": "owner-declared",
+   "reading_age_s": 74950
+  },
+  "family-i": {
+   "abundance_read": null,
+   "axes": {
+    "declared": null,
+    "money": "GREY",
+    "policy": null,
+    "reach": null
+   },
+   "axis": null,
+   "behaviour": {
+    "capacity": 2,
+    "delegate_factor": 0.5,
+    "say": "not measured; treated as yellow and said out loud"
+   },
+   "capped_by_coverage": false,
+   "cause": "no money reader exists for this family yet, so nothing is known about what it has left",
+   "cause_id": "money:no-reader",
+   "colour": "GREY",
+   "coverage": null,
+   "declared_ignored": false,
+   "declared_unmeasured": null,
+   "expires_at": null,
+   "expires_kind": "none",
+   "expires_source": null,
+   "family": "family-i",
+   "measured_at": null,
+   "provenance": "unmeasured",
+   "reading_age_s": null
+  }
+ },
+ "fold_version": 1,
+ "note": "Families are keyed family-a..family-i, ALPHABETICAL in the catalog's own order, and the loader re-keys them onto the real vocabulary. Several family names are also seat names on a live host, and a real seat identity in tests/ is publication debt; the fold itself is the real one.",
+ "overall": {
+  "capacity": 0,
+  "colour": "RED",
+  "family": "family-b",
+  "scope": "all-families",
+  "until": 1789776120
+ },
+ "readers": {
+  "declared": [
+   "family-a",
+   "family-b",
+   "family-d",
+   "family-e",
+   "family-f",
+   "family-g",
+   "family-h"
+  ],
+  "money": [
+   "family-a",
+   "family-b"
+  ],
+  "policy": [
+   "family-a"
+  ],
+  "reach": [
+   "family-b",
+   "family-d",
+   "family-e",
+   "family-f",
+   "family-g",
+   "family-h"
+  ]
+ },
+ "ts": 1789764669.8460352,
+ "v": 1
+}

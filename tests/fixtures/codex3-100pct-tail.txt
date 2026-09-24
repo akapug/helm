@@ -1,0 +1,33 @@
+handle: term_f451dbb0-0a77-4aee-8fc0-abcf58b2b782
+status: running
+cursor: 1
+oldest cursor: 0
+latest cursor: 1
+
+  Thought for 1m 50s, searched for 4 patterns, read 1 file, ran 8 shell commands
+● API Error: 400 Your input exceeds the context window of this model. Please adjust your input and try again.
+✻ Brewed for 21m 19s · 1 monitor still running
+● Monitor event: "codex-3 Helm inbox"
+● API Error: 400 Your input exceeds the context window of this model. Please adjust your input and try again.
+✻ Churned for 12s · 1 monitor still running
+● Monitor event: "codex-3 Helm inbox"
+● API Error: 400 Your input exceeds the context window of this model. Please adjust your input and try again.
+✻ Sautéed for 9s · 1 monitor still running
+● Monitor event: "codex-3 Helm inbox"
+● API Error: 400 Your input exceeds the context window of this model. Please adjust your input and try again.
+✻ Baked for 9s · 1 monitor still running
+● Monitor event: "codex-3 Helm inbox"
+● API Error: 400 Your input exceeds the context window of this model. Please adjust your input and try again.
+✻ Worked for 11s · 1 monitor still running
+● Monitor event: "codex-3 Helm inbox"
+● API Error: 400 Your input exceeds the context window of this model. Please adjust your input and try again.
+✻ Cogitated for 11s · 1 monitor still running
+  1 tasks (0 done, 1 in progress, 0 open)
+  ◼ Close superseded dispatch parents
+                                                                                                         100% context used
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 monitor · ctrl+t to hide tasks · ← for agents · ↓ to manage
+  ● main
+  ◯ claude  Refute duplicate-work guard design                                                                      12m 48s

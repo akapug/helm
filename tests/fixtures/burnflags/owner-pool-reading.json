@@ -1,0 +1,19 @@
+{
+  "note": "THE OWNER'S OWN READING OF THE NATIVE POOL, frozen as an input. Four Max accounts and one Team account, each with the percent of its weekly window it has spent and that window's next reset; the Team account also carries its session window. His reading of this world is ORANGE: most of the accounts need active management and no reset is coming up soon enough to carry base load while the others finish. The account names are house convention; the percentages and the reset instants are his.",
+  "colour": "ORANGE",
+  "ceiling": 90.0,
+  "measured_at": 1789702860,
+  "rows": [
+    {"state": "ok", "account": "max-a", "longest_pct": 69.0,
+     "windows": [{"label": "7d", "used_percent": 69.0, "reset_at": 1789963200, "seconds": 604800}]},
+    {"state": "ok", "account": "max-b", "longest_pct": 74.0,
+     "windows": [{"label": "7d", "used_percent": 74.0, "reset_at": 1790049600, "seconds": 604800}]},
+    {"state": "ok", "account": "max-c", "longest_pct": 60.0,
+     "windows": [{"label": "7d", "used_percent": 60.0, "reset_at": 1790082000, "seconds": 604800}]},
+    {"state": "ok", "account": "max-d", "longest_pct": 87.0,
+     "windows": [{"label": "7d", "used_percent": 87.0, "reset_at": 1790168400, "seconds": 604800}]},
+    {"state": "ok", "account": "team-a", "longest_pct": 25.0,
+     "windows": [{"label": "7d", "used_percent": 25.0, "reset_at": 1790168400, "seconds": 604800},
+                 {"label": "5h", "used_percent": 16.0, "reset_at": 1789710060, "seconds": 18000}]}
+  ]
+}

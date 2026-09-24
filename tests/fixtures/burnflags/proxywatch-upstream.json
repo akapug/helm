@@ -1,0 +1,168 @@
+{
+ "ts": 1789695563,
+ "upstream": {
+  "family-a": {
+   "dark": false,
+   "falsification_bar_s": 900,
+   "last_dark_state": "PROXY-COOLDOWN",
+   "seats": {
+    "seat-a": {
+     "dark": false,
+     "since": "2026-09-17T16:18:40Z",
+     "state": "HEALTHY"
+    },
+    "seat-b": {
+     "dark": false,
+     "since": "2026-09-17T16:18:40Z",
+     "state": "HEALTHY"
+    },
+    "seat-c": {
+     "dark": false,
+     "since": "2026-09-17T16:18:40Z",
+     "state": "HEALTHY"
+    },
+    "seat-d": {
+     "dark": false,
+     "since": "2026-09-17T16:18:40Z",
+     "state": "HEALTHY"
+    },
+    "seat-e": {
+     "dark": false,
+     "since": "2026-09-17T16:18:40Z",
+     "state": "HEALTHY"
+    },
+    "seat-f": {
+     "dark": false,
+     "since": "2026-09-17T19:54:15Z",
+     "state": "HEALTHY"
+    },
+    "seat-g": {
+     "dark": false,
+     "since": "2026-09-17T16:18:40Z",
+     "state": "HEALTHY"
+    },
+    "seat-h": {
+     "dark": false,
+     "since": "2026-09-17T16:18:40Z",
+     "state": "HEALTHY"
+    },
+    "seat-i": {
+     "dark": false,
+     "since": "2026-09-17T16:18:40Z",
+     "state": "HEALTHY"
+    },
+    "seat-j": {
+     "dark": false,
+     "since": "2026-09-17T19:54:15Z",
+     "state": "HEALTHY"
+    },
+    "seat-k": {
+     "dark": false,
+     "since": "2026-09-17T16:18:40Z",
+     "state": "HEALTHY"
+    },
+    "seat-l": {
+     "dark": false,
+     "since": "2026-09-17T16:18:40Z",
+     "state": "HEALTHY"
+    },
+    "seat-m": {
+     "dark": true,
+     "falsification_age_s": 99070,
+     "falsification_due": true,
+     "falsification_identity_state": "VERIFIED",
+     "falsification_observed_at": "2026-09-16T22:08:13Z",
+     "falsification_proxy_identity": "7ff92e",
+     "falsification_seat": "f30614",
+     "since": "2026-09-16T19:07:32Z",
+     "state": "PROXY-COOLDOWN"
+    }
+   },
+   "since": "2026-09-17T16:18:40Z",
+   "state": "UNKNOWN",
+   "transition_id": "aecb7b7e0ba64e61"
+  },
+  "family-b": {
+   "dark": false,
+   "last_dark_state": "MALFORMED200",
+   "seats": {
+    "seat-a": {
+     "dark": false,
+     "since": "2026-09-17T23:09:20Z",
+     "state": "HEALTHY"
+    }
+   },
+   "since": "2026-09-17T23:09:20Z",
+   "state": "HEALTHY",
+   "transition_id": "b9776df2ee6d86e3"
+  },
+  "family-c": {
+   "dark": false,
+   "last_dark_state": "PROXY-COOLDOWN",
+   "seats": {
+    "seat-a": {
+     "dark": false,
+     "since": "2026-09-16T22:38:15Z",
+     "state": "HEALTHY"
+    }
+   },
+   "since": "2026-09-16T22:38:15Z",
+   "state": "HEALTHY",
+   "transition_id": "ee13adfd007de9ad"
+  },
+  "family-d": {
+   "dark": false,
+   "last_dark_state": "AUTH-UNAVAILABLE",
+   "seats": {
+    "seat-a": {
+     "dark": false,
+     "since": "2026-09-16T17:52:01Z",
+     "state": "HEALTHY"
+    }
+   },
+   "since": "2026-09-16T17:52:01Z",
+   "state": "HEALTHY",
+   "transition_id": "bb377eb582eb17a6"
+  },
+  "family-e": {
+   "dark": false,
+   "last_dark_state": "PROXY-COOLDOWN",
+   "seats": {
+    "seat-a": {
+     "dark": false,
+     "since": "2026-09-17T20:09:16Z",
+     "state": "HEALTHY"
+    }
+   },
+   "since": "2026-09-17T20:09:16Z",
+   "state": "HEALTHY",
+   "transition_id": "60ba5074964406b3"
+  },
+  "family-f": {
+   "dark": false,
+   "last_dark_state": "PROXY-COOLDOWN",
+   "seats": {
+    "seat-a": {
+     "dark": false,
+     "since": "2026-09-18T00:09:21Z",
+     "state": "HEALTHY"
+    }
+   },
+   "since": "2026-09-18T00:09:21Z",
+   "state": "HEALTHY",
+   "transition_id": "da7de3d0c549a6a2"
+  },
+  "family-g": {
+   "dark": false,
+   "seats": {
+    "seat-a": {
+     "dark": false,
+     "since": "2026-09-18T21:12:52Z",
+     "state": "HEALTHY"
+    }
+   },
+   "since": "2026-09-18T21:12:52Z",
+   "state": "HEALTHY"
+  }
+ }
+}

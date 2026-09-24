@@ -1,0 +1,133 @@
+/* ================= storage matrix ================= */
+let STORAGE_INIT = false;
+const STORAGE_METRICS = [
+  ["seq_write_mib_s", "sequential write", v => v.toLocaleString(undefined, {maximumFractionDigits:1}) + " MiB/s", false, null],
+  ["seq_read_mib_s", "sequential read", v => v.toLocaleString(undefined, {maximumFractionDigits:1}) + " MiB/s", false, "seq_read_cache_evicted"],
+  ["random_write_iops", "random write", v => Math.round(v).toLocaleString() + " IOPS", false, null],
+  ["random_read_iops", "random read", v => Math.round(v).toLocaleString() + " IOPS", false, "random_read_cache_evicted"],
+  ["fsync_p95_ms", "fsync p95", v => v.toLocaleString(undefined, {maximumFractionDigits:3}) + " ms", true, null],
+];
+function storageAge(s) {
+  if (typeof s !== "number" || !Number.isFinite(s)) return "unknown age";
+  if (s < 60) return Math.floor(s) + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+function smNode(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+function renderStorage(d) {
+  const status = $("#storagestatus"), body = $("#storageRows"), method = $("#storagemethodbody");
+  body.replaceChildren(); method.replaceChildren();
+  status.className = "";
+  if (!d || d.state !== "ok") {
+    status.classList.add("bad");
+    status.textContent = (d && d.message) || "measurement unavailable — the snapshot did not answer";
+    const tr = document.createElement("tr"), td = smNode("td", "empty", "No measured values are shown.");
+    td.colSpan = 6; tr.append(td); body.append(tr); return;
+  }
+  const tiers = [["local-disk", "disk"], ["memory", "memory"]];
+  const rows = [...(d.rows || [])].sort((a, b) =>
+    Number(a.order ?? 999) - Number(b.order ?? 999) ||
+    String(a.box_label || a.box).localeCompare(String(b.box_label || b.box)) ||
+    (a.tier === "local-disk" ? -1 : 1));
+  const ok = rows.filter(r => r.status === "ok" && r.metrics), bounds = {};
+  for (const [key,,, lower, evidence] of STORAGE_METRICS) {
+    const values = ok.filter(r => !evidence || r.metrics[evidence] === true)
+      .map(r => Math.log10(Math.max(Number(r.metrics[key]), .0001)));
+    bounds[key] = {min: Math.min(...values), max: Math.max(...values), lower};
+  }
+  const groups = [], byBox = new Map();
+  for (const row of rows) {
+    let group = byBox.get(row.box);
+    if (!group) {
+      group = {box: row.box, label: row.box_label || row.box,
+               order: Number(row.order ?? 999), tiers: {}};
+      byBox.set(row.box, group); groups.push(group);
+    }
+    group.order = Math.min(group.order, Number(row.order ?? 999));
+    group.tiers[row.tier] = row;
+  }
+  groups.sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
+  const exact = new Date(d.measured_at);
+  const when = Number.isNaN(exact.getTime()) ? d.measured_at : exact.toLocaleString();
+  const age = d.age_message || storageAge(d.age_s);
+  status.classList.toggle("stale", !!d.stale);
+  status.textContent = `${d.stale ? "STALE · " : ""}measured ${age} · ${when} · ${ok.length}/${rows.length} tiers available`;
+  for (const group of groups) {
+    const tr = document.createElement("tr"), th = smNode("th", "smname");
+    th.scope = "row"; th.append(smNode("b", "", group.label));
+    const detail = smNode("details", "smdetail"), summary = smNode("summary", "", "paths and probe details");
+    let hasDetail = false;
+    for (const [tier, short] of tiers) {
+      const row = group.tiers[tier];
+      if (!row) {
+        th.append(smNode("div", "smstate bad", `${short}: not measured`));
+      } else if (row.status !== "ok" || !row.metrics) {
+        th.append(smNode("div", "smstate bad", `${short}: ${row.error || "unavailable"}`));
+      } else {
+        const m = row.metrics, free = typeof m.free_bytes_before === "number" ?
+          ` · ${(m.free_bytes_before / (1024 * 1024 * 1024)).toLocaleString(undefined, {maximumFractionDigits:1})} GiB free before probe` : "";
+        detail.append(smNode("div", "", `${short}: ${row.path_label || "storage path"} · fsync p50 ${Number(m.fsync_p50_ms).toLocaleString(undefined, {maximumFractionDigits:3})} ms${free}`));
+        hasDetail = true;
+      }
+    }
+    if (hasDetail) { detail.replaceChildren(summary, ...detail.children); th.append(detail); }
+    tr.append(th);
+    for (const [key, label, format, lower, evidence] of STORAGE_METRICS) {
+      const td = smNode("td", "smmetric"), pair = smNode("div", "smpair");
+      for (const [tier, short] of tiers) {
+        const row = group.tiers[tier], item = smNode("div", `smtier ${tier === "memory" ? "memory" : "disk"}`);
+        item.append(smNode("span", "smlabel", short));
+        if (!row || row.status !== "ok" || !row.metrics) {
+          item.classList.add("smna");
+          item.append(smNode("span", "smvalue", "—"));
+          item.setAttribute("aria-label", `${group.label} · ${short} · ${label}: unavailable`);
+        } else {
+          const value = Number(row.metrics[key]), text = format(value);
+          const comparable = !evidence || row.metrics[evidence] === true;
+          const track = smNode("span", "smtrack"), fill = smNode("i", "smfill");
+          const valueEl = smNode("span", "smvalue", text + (comparable ? "" : " · cache not cleared"));
+          item.tabIndex = 0;
+          item.dataset.tip = `${group.label} · ${short} · ${label}: ${text}` +
+            (comparable ? "" : " · cache not cleared; excluded from bar comparison");
+          item.setAttribute("aria-label", item.dataset.tip);
+          track.setAttribute("aria-hidden", "true");
+          if (comparable) {
+            const b = bounds[key], x = Math.log10(Math.max(value, .0001)), span = b.max - b.min;
+            const equal = Math.abs(span) < .0001;
+            let score = equal ? 1 : (x - b.min) / span;
+            if (lower && !equal) score = 1 - score;
+            fill.style.width = (4 + Math.max(0, Math.min(1, score)) * 96) + "%";
+          } else {
+            item.classList.add("smnc"); fill.style.width = "0%";
+          }
+          track.append(fill); item.append(track, valueEl);
+        }
+        pair.append(item);
+      }
+      td.append(pair); tr.append(td);
+    }
+    body.append(tr);
+  }
+  const m = d.method || {}, note = m.notes || "Method note unavailable.";
+  const stop = /[.!?]$/.test(note) ? "" : ".";
+  method.textContent = `${Number(m.sequential_bytes || 0) / (1024 * 1024)} MiB sequential I/O in ${Number(m.sequential_block_bytes || 0) / (1024 * 1024)} MiB blocks; ${Number(m.random_operations || 0).toLocaleString()} random operations at ${Number(m.random_block_bytes || 0) / 1024} KiB; ${Number(m.fsync_operations || 0)} fsync samples. ${note}${stop} Bars use a separate logarithmic scale for each metric; they are not comparable across columns.`;
+}
+async function loadStorage() {
+  const status = $("#storagestatus");
+  status.className = ""; status.textContent = "reading the last snapshot…";
+  try { renderStorage(await j("/api/storage-matrix")); }
+  catch (e) { renderStorage({state:"unavailable", message:"measurement unavailable — " + e.message}); }
+}
+function initStorage() {
+  if (STORAGE_INIT) return;
+  STORAGE_INIT = true;
+  $("#storageReload").onclick = loadStorage;
+  loadStorage();
+}
+

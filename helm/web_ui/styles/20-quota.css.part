@@ -1,0 +1,195 @@
+/* ================= quota view (CSS ported from the predecessor, on helm's variables) ================= */
+/* ---------- attention row ----------
+   Uniform pills: same height, same weight, one border. Colour is a single
+   signal dot on the left, not a full-pill wash — so the row reads as one
+   scale of items differing only by their signal (Tufte: colour as data).
+   Long detail is truncated with the full text on hover-title. */
+#attn{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0 0;min-height:1.6em}
+.attn{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 12px;border-radius:var(--r-pill);border:1px solid var(--line);background:var(--card);font-size:var(--f1);color:var(--mut);max-width:34ch;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;cursor:pointer}
+.attn b{color:var(--fg);font-weight:var(--w-med)}
+.attn::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--sub);flex:none}
+.attn.ok::before{background:var(--ok)}
+.attn.warn::before{background:var(--warn)}
+.attn.bad::before{background:var(--bad)}
+.attn.next{border-style:dashed}.attn.next::before{background:var(--accent)}
+/* tap-to-reveal detail — the hover title is desktop-only; this works on touch */
+#attndetail{display:none;margin:8px 0 0;padding:8px 12px;background:var(--card);border:1px solid var(--line);border-radius:var(--r);font-size:var(--f1);color:var(--mut)}
+#attndetail.show{display:block}
+
+/* ---------- chart card ---------- */
+#chartcard{margin:14px 0 0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px 6px;position:relative}
+/* a quiet caption UNDER the chart, not floating over its x-axis */
+#zoomhint{text-align:right;font-size:var(--f0);color:var(--sub);pointer-events:none;padding:2px 2px 0}
+#chartcard .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px}
+#chartcard .chead b{font-size:var(--f4)}
+.qtab{padding:5px 16px;border-radius:16px;border:1px solid var(--line);font-size:var(--f2);cursor:pointer;color:var(--mut);background:none;display:inline-block}
+.qtab.on{border-color:var(--accent);color:var(--accent);font-weight:700}
+#qsub{margin-left:auto;font-size:var(--f1);color:var(--mut)}
+#chart{width:100%;height:auto;min-height:300px;display:block;cursor:crosshair}
+#chart text{font-variant-numeric:tabular-nums}  /* % labels stop jittering as values change */
+#tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:var(--f1) ui-monospace,Menlo,monospace;display:none;z-index:5;box-shadow:0 3px 14px rgba(0,0,0,.18);white-space:nowrap}
+#tip .tt{color:var(--mut)}
+
+/* ---------- THE ONE TABLE ----------
+   No panel borders and no rounded boxes inside it: a family rule, a hairline
+   between rows, right-aligned tabular numerals and a fixed 0-100 % bar scale
+   are the whole hierarchy. Layering by grouping, not by boxes. */
+#qonecard{margin:14px 0 0}
+.qonetop{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;padding:0 2px 8px}
+.qonetop b{font-size:var(--f4)}
+.qonetop #qoneMeasure{margin-left:auto}
+.qonehint{padding:8px 2px 0;font-size:var(--f0);color:var(--sub)}
+/* ONE chip rule for every view. */
+.chip{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:var(--r);padding:7px 12px;font-size:var(--f2);cursor:pointer;transition:border-color .12s,background .12s}
+.chip:hover{background:var(--hover);border-color:var(--line2)}
+.chip.on{border-color:var(--accent);color:var(--accent);font-weight:var(--w-med);background:var(--accent-soft)}
+/* THE TABLE SCROLLS IN ITS OWN BOX, never in the document: the headers are
+   nowrap and the layout is auto, so the table refuses to go below its natural
+   width and nothing else would contain it. */
+.qonescroll{overflow-x:auto;max-width:100%}
+table.qone{width:100%;border-collapse:collapse;font-size:var(--f2);table-layout:auto}
+table.qone th.qh{text-align:left;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap;font-weight:400}
+table.qone th.qh.num{text-align:right}
+table.qone td,table.qone th.qid{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle;text-align:left}
+table.qone th.qid{font-weight:400;min-width:16em}
+table.qone tr.qrow.sel td,table.qone tr.qrow.sel th.qid{background:var(--hl)}
+table.qone tbody tr.qrow{cursor:pointer}
+table.qone tbody tr.qrow:hover td,table.qone tbody tr.qrow:hover th.qid{background:color-mix(in srgb,var(--hl) 55%,transparent)}
+/* the family group header: one rule above it does a panel border's work with
+   one line of ink instead of four. The family's burn flag lives on the board. */
+tr.qfam>th{text-align:left;font-weight:var(--w-med);padding:16px 10px 6px;border-bottom:1px solid var(--fg);border-top:none;white-space:normal;cursor:pointer;user-select:none}
+tr.qfam .qfamcaret{color:var(--mut);margin-right:7px}
+tr.qfam .qfamname{font-size:var(--f3);margin-right:10px}
+tr.qfam .qfamn{color:var(--mut);font-weight:400;font-size:var(--f1);margin-right:10px}
+.qdecl,.qfor{color:var(--fg);max-width:26em}
+.qfor{color:var(--mut)}
+.qnotmeasured{color:var(--mut);font-size:var(--f1)}
+.qreset{min-width:88px}
+/* THE BAND THAT SAYS HOW THE TABLE IS ORDERED — the owner's own question,
+   answered inside the table rather than in a legend he would have to find. It
+   is not a row of data: no pointer, no hover lift, nothing to select. */
+/* the alias and the spare-record tells: quiet, on the row they are about, and
+   visually different because one is a FACT about the account and the other is
+   a small job he can finish. */
+.qalias{font-size:var(--f0);color:var(--mut)}
+.qspare{display:block;margin-top:3px;font-size:var(--f0);color:#b4442e}
+.dfillalias{font-size:var(--f0);color:var(--mut);margin-left:4px}
+table.qone tbody tr.atier{cursor:default}
+table.qone tbody tr.atier:hover td{background:transparent}
+td.atiercell{padding:13px 10px 5px;border-bottom:1px solid var(--line);font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
+td.atiercell .rst{text-transform:none;letter-spacing:0}
+table.qone tbody tr.atier:first-child td.atiercell{padding-top:4px}
+.adot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px;vertical-align:0;flex:none}
+.acct-name{display:flex;align-items:center;font-weight:var(--w-med)}
+.acct-name .live{width:6px;height:6px;border-radius:50%;background:var(--ok);margin-left:7px;box-shadow:0 0 5px var(--ok)}
+.acct-line2{font-size:var(--f0);color:var(--sub);margin-top:2px;white-space:nowrap}
+.acct-line2 .sep{opacity:.5;margin:0 5px}
+/* a quota cell: right-aligned % with a slim bar underneath */
+.qcell{text-align:right;white-space:nowrap;font-variant-numeric:var(--num);min-width:66px}
+.qcell .qv{font-weight:var(--w-med)}
+.qcell .qbar{height:3px;border-radius:2px;background:var(--line);margin-top:3px;overflow:hidden}
+.qcell .qbar>i{display:block;height:100%;border-radius:2px}
+.qcell .rst{display:block;font-size:var(--f0);color:var(--sub);margin-top:2px}
+.rst{color:var(--mut);font-size:var(--f1)}
+.st-ok{color:var(--ok)}.st-approaching,.st-expired-token,.st-due-refresh{color:var(--warn)}.st-exhausted,.st-api-error,.st-unknown{color:var(--bad)}
+.stfix{cursor:pointer;text-decoration:underline dotted}
+.flagchip{font-size:var(--f0);color:var(--warn)}
+
+/* ---------- collapsible group cards (burn / homes) ---------- */
+.grp{margin:14px 0 0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--card)}
+.grp>summary{cursor:pointer;padding:11px 16px;display:flex;align-items:center;gap:10px;font-weight:600;list-style:none}
+.grp>summary::-webkit-details-marker{display:none}
+.grp>summary::before{content:"▸";color:var(--mut);font-size:var(--f1);transition:.15s}
+.grp[open]>summary::before{transform:rotate(90deg)}
+.gmeta{color:var(--mut);font-size:var(--f1);font-weight:400;white-space:nowrap}
+#burncard>summary .gmeta{margin-left:auto}
+#homescard>summary .gmeta{margin-left:auto}
+.burnrow{display:flex;gap:14px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:baseline;flex-wrap:wrap;font-size:var(--f2)}
+.burnrow:last-of-type{border-bottom:none}
+.burnt{color:var(--mut);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:92px}
+.burnchips{display:flex;gap:10px;flex-wrap:wrap}
+.burnchip{white-space:nowrap;font-variant-numeric:tabular-nums;font-weight:600}
+.burnsesss{flex:1;min-width:240px;display:flex;gap:4px 14px;flex-wrap:wrap}
+.burnsess{cursor:pointer;color:var(--accent);text-decoration:underline dotted;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.burnsess:hover{text-decoration:underline solid}
+.burnnote{padding:9px 16px;font-size:var(--f1);color:var(--mut);border-top:1px solid var(--line)}
+
+/* ---------- credential homes ---------- */
+.hbadge{font-size:var(--f0);font-weight:700;text-transform:uppercase;padding:3px 7px;border-radius:5px;text-align:center}
+.homerow{display:flex;gap:12px;padding:9px 16px;border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap;font-size:var(--f2)}
+.homerow:last-of-type{border-bottom:none}
+.homerow .hn{font:600 var(--f2) ui-monospace,Menlo,monospace;white-space:nowrap}
+.homerow .hn .rst{font-weight:400}
+.homerow .hchips{display:flex;gap:10px;flex-wrap:wrap;flex:1;min-width:220px;align-items:baseline}
+.homerow .hacts{display:flex;gap:6px}
+.homerow .hacts button{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:4px 10px;font-size:var(--f1);cursor:pointer}
+.homerow .hacts button:hover{border-color:var(--accent);color:var(--accent)}
+.homefix{flex-basis:100%;font-size:var(--f1);color:var(--mut);white-space:pre-wrap;word-break:break-word}
+#homeform{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap;align-items:center}
+#homeform input{flex:1;min-width:220px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font-size:var(--f1)}
+#homeform select{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:6px 10px;font-size:var(--f1);cursor:pointer}
+#homeform .cmdbox{flex-basis:100%;background:var(--fg);color:var(--bg);border-radius:8px;padding:9px 12px;font:var(--f1) ui-monospace,Menlo,monospace;word-break:break-all;cursor:pointer}
+#homeform .cmdbox .hintline{font:italic var(--f0) -apple-system,sans-serif;opacity:.7;margin-top:4px}
+.homehdr{padding:8px 16px;font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut);border-bottom:1px solid var(--line)}
+.dupwarn{color:var(--bad);font-size:var(--f1);margin:6px 0}
+/* declared accounts — the owner's own inventory, one plain line per account */
+#acctdeclared>summary .gmeta{margin-left:auto}
+.decltotals{padding:9px 16px;border-bottom:1px solid var(--line);font-size:var(--f2)}
+.decltotals b{font-weight:600}
+.declrow{padding:9px 16px;border-bottom:1px solid var(--line);font-size:var(--f2)}
+.declrow:last-of-type{border-bottom:none}
+.declhead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.declhead .dname{font:600 var(--f2) ui-monospace,Menlo,monospace;white-space:nowrap}
+.declline{flex:1;min-width:200px}
+.declrow details{margin-top:5px}
+.declrow summary{cursor:pointer;color:var(--mut);font-size:var(--f1);list-style:revert}
+.declrow .dfield{margin:4px 0 0}
+.declrow .dlabel{color:var(--mut);text-transform:uppercase;letter-spacing:.05em;font-size:var(--f0);margin-right:6px}
+.dacts{display:flex;gap:6px}
+.dacts button{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:4px 10px;font-size:var(--f1);cursor:pointer}
+.dacts button:hover{border-color:var(--accent);color:var(--accent)}
+#declform{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap;align-items:center}
+#declform[hidden]{display:none}
+#declform input{flex:1;min-width:220px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:6px 10px;font-size:var(--f1)}
+#declform #dMsg{flex-basis:100%;font-size:var(--f1)}
+#decladd{display:flex;gap:10px;align-items:center;padding:10px 16px}
+.dnosecret{color:var(--mut);font-size:var(--f0)}
+.declare{cursor:pointer;text-decoration:underline dotted}
+.dunknown{padding:10px 16px;color:var(--bad);font-size:var(--f2)}
+.dseeded{color:var(--warn,var(--mut));font-size:var(--f0)}
+/* the duplicate tells: a PROVEN one is stated, a QUESTION is asked, and they
+   do not look alike — he acts differently on each. */
+.ddup{font-size:var(--f0);color:#b4442e;border:1px solid currentColor;border-radius:999px;padding:1px 7px;white-space:nowrap}
+.dask{font-size:var(--f0);color:var(--mut);border:1px dashed currentColor;border-radius:999px;padding:1px 7px;white-space:nowrap}
+/* the confirm button rides the "please confirm" text, not the edit/remove pair:
+   it answers the question printed beside it, and sitting next to `remove` is
+   how a yes becomes a delete. */
+.declhead button[data-dact="confirm"]{background:var(--card);border:1px solid var(--warn,var(--line));color:var(--warn,var(--fg));border-radius:8px;padding:2px 8px;margin-left:6px;font-size:var(--f0);cursor:pointer}
+.declhead button[data-dact="confirm"]:hover{border-color:var(--accent);color:var(--accent)}
+.dconfirm{display:flex;align-items:center;gap:6px;color:var(--mut);font-size:var(--f1);white-space:nowrap}
+#declform .dconfirm input{flex:0 0 auto;min-width:0;width:auto;padding:0}
+#declform input[type="date"]{flex:0 1 180px;min-width:150px}
+.dundesc{padding:9px 16px;border-bottom:1px solid var(--line);font-size:var(--f1);color:var(--mut);display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+
+/* ── fill mode: every row on one screen, editable in place ── */
+#decltop{display:flex;gap:10px;align-items:center;padding:10px 16px 0}
+#declfill[hidden]{display:none}
+.dfillhead{padding:10px 16px;font-size:var(--f2);border-bottom:1px solid var(--line);display:flex;gap:10px;flex-wrap:wrap;align-items:baseline}
+.dfillhead.dfilldone{color:var(--ok,var(--accent))}
+.dfillhint{color:var(--mut);font-size:var(--f0)}
+/* THE TABLE SCROLLS, THE PAGE DOES NOT. Eleven columns do not fit a narrow
+   window and a horizontally-scrolling PAGE loses the nav; the wrapper keeps
+   the overflow local to the one thing that is genuinely wide. */
+.dfillwrap{overflow-x:auto;padding:0 16px 10px}
+.dfilltab{border-collapse:collapse;font-size:var(--f1)}
+.dfilltab th{text-align:left;color:var(--mut);font-weight:400;font-size:var(--f0);text-transform:uppercase;letter-spacing:.05em;padding:4px 6px;white-space:nowrap}
+.dfilltab td{padding:2px 6px}
+.dfillid{max-width:14em;overflow:hidden;text-overflow:ellipsis;color:var(--fg)}
+/* the rows that still need him, marked on the row rather than on a chip: he is
+   reading down a column, not across a row, and a chip at the far left is off
+   the screen he is looking at */
+.dfillrow.dfillneed .dfillid{border-left:2px solid var(--warn,var(--accent));padding-left:6px}
+.dfillbox{background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:4px 6px;font-size:var(--f1);max-width:100%}
+.dfillbox:focus{border-color:var(--accent);outline:none}
+.dfillmsg{font-size:var(--f0);white-space:nowrap}
+.dfillok{color:var(--ok,var(--accent))}

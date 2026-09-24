@@ -1,0 +1,85 @@
+{
+  "_origin": "RECORDED, NOT IMAGINED. Two live 200 responses to GET https://chatgpt.com/backend-api/wham/usage with headers Authorization: Bearer <pooled access_token> and chatgpt-account-id: <pooled account_id>, read from the codex seat proxy's auth-dir (~/.helm/_global/seats/codex/auth) on 2026-09-14 while task/2480 reproduced the weekly-pacing bug. Every rate-limit field, plan_type, window length, percent, reset and reached-type is byte-exact as the vendor sent it. ONLY the three identity fields (user_id, account_id, email) were replaced with placeholders, and the long-tail marketing blocks (rate_limit_upsell, promo, model_usage, credits, spend_control, rate_limit_reset_credits) were dropped — the reader never looks at them. THE TEAM BODY IS THE BUG: primary (5h) 52% with real headroom while secondary (7d) is at 100% and limit_reached is true, which is exactly the shape helm was pacing on the 5h window and calling healthy. THE PRO BODY IS THE SECOND SHAPE: a single 7d primary with secondary_window null, plus a scoped additional_rate_limits entry that is NOT the account budget.",
+  "team": {
+    "user_id": "user-FIXTURE-team",
+    "account_id": "acct-fixture-team",
+    "email": "team@fixture.invalid",
+    "plan_type": "team",
+    "rate_limit": {
+      "allowed": false,
+      "limit_reached": true,
+      "primary_window": {
+        "used_percent": 52,
+        "limit_window_seconds": 18000,
+        "reset_after_seconds": 5431,
+        "reset_at": 1789383626
+      },
+      "secondary_window": {
+        "used_percent": 100,
+        "limit_window_seconds": 604800,
+        "reset_after_seconds": 483728,
+        "reset_at": 1789861924
+      }
+    },
+    "code_review_rate_limit": null,
+    "additional_rate_limits": null,
+    "rate_limit_reached_type": {
+      "type": "workspace_owner_credits_depleted",
+      "details": null
+    }
+  },
+  "pro": {
+    "user_id": "user-FIXTURE-pro",
+    "account_id": "acct-fixture-pro",
+    "email": "pro@fixture.invalid",
+    "plan_type": "pro",
+    "rate_limit": {
+      "allowed": false,
+      "limit_reached": true,
+      "primary_window": {
+        "used_percent": 100,
+        "limit_window_seconds": 604800,
+        "reset_after_seconds": 427487,
+        "reset_at": 1789805666
+      },
+      "secondary_window": null
+    },
+    "code_review_rate_limit": null,
+    "additional_rate_limits": [
+      {
+        "limit_name": "GPT-5.3-Codex-Spark",
+        "metered_feature": "codex_bengalfox",
+        "rate_limit": {
+          "allowed": true,
+          "limit_reached": false,
+          "primary_window": {
+            "used_percent": 0,
+            "limit_window_seconds": 18000,
+            "reset_after_seconds": 18000,
+            "reset_at": 1789396180
+          },
+          "secondary_window": {
+            "used_percent": 0,
+            "limit_window_seconds": 604800,
+            "reset_after_seconds": 604800,
+            "reset_at": 1789982980
+          }
+        },
+        "normal_model_slug": null
+      }
+    ],
+    "rate_limit_reached_type": {
+      "type": "rate_limit_reached",
+      "details": "default"
+    }
+  },
+  "unauthorized": {
+    "error": {
+      "message": "Could not parse your authentication token. Please try signing in again.",
+      "type": null,
+      "code": "unauthorized_unknown",
+      "param": null
+    },
+    "status": 401
+  }
+}

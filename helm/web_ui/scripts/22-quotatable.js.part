@@ -1,0 +1,506 @@
+/* ── THE QUOTA TAB IS ONE TABLE ──────────────────────────────────────────────
+   The tab answers ONE question — what may run right now, on which account,
+   for how long, and what is it costing. Split across panels, each with its own
+   chrome and its own vocabulary, that question reads as five reports about one
+   subject. Here the ROWS ARE ACCOUNTS, grouped by family, and each panel's
+   data is a CELL of the row it is about:
+
+     the family header IS the burn flag (the colour as a WORD, and its reason)
+     the LEFT half is what the OWNER declared — plan, billing, what it is for
+     the MIDDLE is the seven-day series as a sparkline, one per row
+     the RIGHT half is what helm MEASURED — session %, weekly %, model windows
+
+   THE DECLARED AND THE MEASURED ARE ONE ROW, joined through `measured_as` and
+   through nothing else, because guessing the binding from a vendor name is the
+   failure that made a declared layer necessary. Neither side is dropped when
+   the other is missing: a declared row nothing measures keeps its measured
+   half EMPTY and says "not measured" once, in words, rather than growing a
+   dash per column — a dash reads as a broken measurement. A measured row
+   nobody has described keeps its declared half empty and carries the one
+   affordance that fills it.
+
+   LAYERING BY GROUPING, NOT BY BOXES. There are no panel borders inside this
+   table: a family rule, a hairline between rows, right-aligned tabular
+   numerals and a fixed 0-100 % scale on every bar are the whole hierarchy. */
+
+/* The two families the owner pays per-seat for lead; everything else follows
+   in name order, so the head of the table does not reorder itself as a vendor
+   appears or goes quiet. */
+const QFAM_FIRST = ["anthropic", "codex"];
+/* family -> true while its rows are folded away. The family headers ARE the
+   filter this table has: the all/claude/codex chips asked the same question
+   one row further from the answer. */
+let QFOLD = {};
+
+/* ONE ROW PER SUBSCRIPTION, AND THAT IS THE OWNER'S RULING FOR THIS SURFACE:
+   "i dont understand why the accounts we pay for [aren't handled] by making it
+   editable and adding fields intelligently, to compose instead of make new".
+
+   A ROW IS A THING HE PAYS FOR, never a directory on this disk. `subscription`
+   is the server's opaque key for one vendor plus one login, carried by BOTH
+   sides of the wire, and every credential home that resolves to that login
+   lands on the same row as an ALIAS. Joining on `measured_as` instead — the
+   provider's name for ONE home — puts a subscription reached through two homes
+   on two rows, and puts the `~/.claude` default, which is whichever account is
+   selected, on a third.
+
+   THE PRIMARY IS THE ONE THE ROW SPEAKS FOR. The aliases under it are the same
+   bill, so the quota cells come from whichever of them is live, or failing
+   that the one with a reading: a row whose numbers came from the idle home of
+   an account an agent is working on right now would be true about a directory
+   and wrong about the question he is asking.
+
+   NEITHER SIDE IS DROPPED. A declared row nothing measures is still a row —
+   that is a prepaid balance or a seatless subscription, and it is the only way
+   such a thing appears at all. A measured row nobody has described is a row
+   with its declared cells EMPTY and editable, never a row that is missing. */
+function quotaRows() {
+  /* the same rule the measured table has always used: a home with no auth and
+     no reading is a HOMES row, not a quota row with empty cells. */
+  /* …and a row helm COULD NOT READ is not a row with nothing in it. The
+     server marks those: the account is one it measures, only its numbers are
+     unknown this minute, and filtering it into the homes list would be the
+     page drawing "nothing there" for "could not read" on the table he steers
+     from. */
+  const hasData = c => c.state !== "unknown" || c.tier || c.headroom != null
+    || c.windows_left != null || c.quota_unreadable || c.member_unproven;
+  const bySub = {}, order = [], keyOfName = {};
+  for (const c of CREDS) {
+    if (!hasData(c)) continue;
+    /* NO KEY MEANS NO PEERS, never "group with the other keyless ones": a
+       provider row helm could not resolve a login for is its own account
+       until something proves otherwise. */
+    const k = c.subscription || ("name:" + c.name);
+    if (!bySub[k]) { bySub[k] = []; order.push(k); }
+    bySub[k].push(c);
+    keyOfName[c.name] = k;
+  }
+  /* THE DECLARED RECORDS THAT BELONG TO EACH ROW. A subscription key when the
+     server sent one; failing that, the key of the measured row the record's
+     `measured_as` names; failing that, the name itself — which is right for a
+     record no row on this page speaks for.
+
+     BOTH SIDES FALL BACK TOGETHER, OR THE RECORD LEAVES ITS ROW. The server
+     WITHHOLDS a record's key while it cannot read the measured world, because
+     it does not know which subscription the record is on. This page does: it
+     polls CREDS on its own clock, so it still holds the keyed row that
+     `measured_as` names, and a keyless record joins THROUGH that row. Falling
+     back to the name on this side alone, while the measured row keeps its
+     key, draws the record as a second row and leaves the row he was editing
+     with none, where the next cell he types creates a second record for one
+     bill. */
+  const declBy = {};
+  for (const a of DECL.accounts || []) {
+    const k = a.subscription || (a.measured_as
+      ? (keyOfName[a.measured_as] || "name:" + a.measured_as) : null);
+    if (!k) continue;
+    (declBy[k] = declBy[k] || []).push(a);
+  }
+  const declUsed = {};
+  const rows = order.map(k => {
+    const group = quotaAliasOrder(bySub[k]);
+    const mine = quotaDeclOrder(declBy[k] || []);
+    for (const a of mine) declUsed[a.id] = true;
+    return {fam: group[0].provider || "other", name: group[0].name,
+            cred: group[0], aliases: group.slice(1),
+            decl: mine[0] || null,
+            /* A SECOND RECORD FOR ONE SUBSCRIPTION IS NOT DROPPED. It is one
+               of the duplicates he is here to clear, and a row that quietly
+               hid it would take a thing he edited off his screen — the exact
+               failure this pass is about, pointed the other way. It rides the
+               row it belongs to, named, with the affordance that removes it. */
+            spare: mine.slice(1), sub: k};
+  });
+  /* …and every declared row that no measured row speaks for: a prepaid
+     balance, a seatless subscription, a login only Orca can see. */
+  for (const a of DECL.accounts || []) {
+    if (declUsed[a.id]) continue;
+    const k = a.subscription || ("id:" + a.id);
+    if (declUsed["k:" + k]) continue;
+    declUsed["k:" + k] = true;
+    const mine = quotaDeclOrder((DECL.accounts || []).filter(
+      x => !declUsed[x.id] && (x.subscription || ("id:" + x.id)) === k));
+    for (const x of mine) declUsed[x.id] = true;
+    rows.push({fam: String(mine[0].vendor || "other").toLowerCase(), name: null,
+               cred: null, aliases: [], decl: mine[0], spare: mine.slice(1),
+               sub: k});
+  }
+  return rows;
+}
+
+/* WHICH RECORD SPEAKS FOR THE ROW when more than one claims it: the one he has
+   CONFIRMED, then the one carrying the most of his answers, then by name so
+   the choice never moves on its own. Picking the first-seen would have let an
+   alphabetical accident decide which of his sentences the row shows. */
+function quotaDeclOrder(list) {
+  const filled = a => ["plan", "price_month", "good_for", "not_for", "billing",
+                       "allowance", "key_where", "notes", "renews_on"]
+    .filter(k => a[k] != null && String(a[k]).trim() !== "").length;
+  return [...list].sort((a, b) =>
+    (!!b.confirmed - !!a.confirmed) || (filled(b) - filled(a))
+    || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/* WHICH HOME THE ROW SPEAKS FOR: a live one first, then one that actually
+   measured something, then the plainest name — a `#home` suffix exists only to
+   break a tie between two homes and a `(default-…)` handle points at whichever
+   account is selected, so either would make the row's identity the most
+   fragile of its names. */
+function quotaAliasOrder(group) {
+  return [...group].sort((a, b) => {
+    if (!!b.active !== !!a.active) return b.active ? 1 : -1;
+    const am = a.headroom != null, bm = b.headroom != null;
+    if (am !== bm) return am ? -1 : 1;
+    const aw = /^\(default-/.test(a.name) ? 2 : a.name.indexOf("#") >= 0 ? 1 : 0;
+    const bw = /^\(default-/.test(b.name) ? 2 : b.name.indexOf("#") >= 0 ? 1 : 0;
+    return (aw - bw) || (a.name < b.name ? -1 : 1);
+  });
+}
+
+function quotaFamilies(rows) {
+  const by = {};
+  for (const r of rows) (by[r.fam] = by[r.fam] || []).push(r);
+  const rank = f => { const i = QFAM_FIRST.indexOf(f); return i < 0 ? QFAM_FIRST.length : i; };
+  return Object.keys(by)
+    .sort((a, b) => (rank(a) - rank(b)) || (a < b ? -1 : a > b ? 1 : 0))
+    .map(f => [f, by[f]]);
+}
+
+/* ── the declared half ─────────────────────────────────────────────────────
+   Two cells: what he PAYS (plan, billing word, price, allowance) and what he
+   bought it FOR. An empty cell carries the question rather than a dash,
+   because this half is always something he can answer — and `needs_describe`
+   marks a row a seed minted, whose stub sentence is the seeder's words and
+   not his, so quoting it back would hide the affordance that fixes it. */
+function quotaDeclCells(r) {
+  const a = r.decl;
+  const money = a ? [a.plan, a.billing_word,
+                     a.price_month ? a.price_month + "/mo" : "", a.allowance]
+    .filter(Boolean).map(v => esc(v)).join('<span class="sep">·</span>') : "";
+  const described = a && !a.needs_describe && a.good_for;
+  const ask = r.name ? declareChip(r.name) : '<span class="rst">not described</span>';
+  const nf = a && a.not_for ? "not for: " + a.not_for : "";
+  /* THE REDUNDANT RECORD, NAMED ON THE ROW IT DUPLICATES. He asked for one row
+     per thing he pays for; the rows are composed now, but his file still holds
+     the pairs an older seed minted. Saying which one is spare, beside the row
+     it is spare OF, is the one thing that turns that into a job he can finish —
+     and removing it sticks, because a removal now leaves a tombstone. */
+  const spare = (r.spare || []).length
+    ? `<span class="qspare" title="this subscription has more than one declared record; '${esc(r.spare.map(x => x.id).join("', '"))}' says nothing the row above does not, and removing it will not come back">`
+      + `also declared as ${esc(r.spare.map(x => x.id).join(", "))}</span>` : "";
+  return `<td class="qdecl">${money || '<span class="rst">not declared</span>'}${spare}</td>`
+    + `<td class="qfor"${nf ? ` title="${esc(nf)}"` : ""}>`
+    + (described ? esc(short(a.good_for, 46)) : ask) + `</td>`;
+}
+
+/* the signal colour for a remaining-%: green healthy -> amber -> low. */
+function pctCol(pct) { return pct == null ? "var(--mut)" : pct >= 50 ? "var(--ok)" : pct >= 20 ? "var(--warn)" : "var(--bad)"; }
+const LOGIN_CMDS = {anthropic: h => `CLAUDE_CONFIG_DIR=${h} claude /login`, codex: h => `CODEX_HOME=${h} codex login --device-auth`};
+function latestGauges(acct) {
+  const out = {}, when = {};
+  for (const r of HIST) {
+    if (r.account !== acct) continue;
+    for (const g of r.gauges || []) {
+      if (g.utilization == null) continue;
+      if (!(g.label in when) || r.probed_at > when[g.label]) {
+        when[g.label] = r.probed_at;
+        out[g.label] = {rem: (1 - Math.min(1, g.utilization)) * 100, reset: g.reset ? g.reset * 1000 : null};
+      }
+    }
+  }
+  return out;
+}
+/* one quota cell: right-aligned %, a slim proportional bar, and the reset ETA
+   underneath — no chunky battery glyph, colour only on the bar/number. */
+function qcell(g, fallbackReset) {
+  if (!g) return `<td class="qcell rst">—</td>`;
+  const pct = g.rem, col = pctCol(pct);
+  const reset = g.reset && g.reset > Date.now() ? g.reset : (fallbackReset && fallbackReset > Date.now() ? fallbackReset : null);
+  const rl = reset ? `<span class="rst" title="resets ${new Date(reset).toLocaleString([], {weekday: "short", hour: "numeric", minute: "2-digit"})}">↻ ${fmtIn(reset)}</span>` : "";
+  return `<td class="qcell"><span class="qv" style="color:${col}">${pct.toFixed(0)}%</span>`
+    + `<div class="qbar"><i style="width:${Math.max(2, Math.min(100, pct))}%;background:${col}"></i></div>${rl}</td>`;
+}
+
+/* ── the measured half ─────────────────────────────────────────────────────
+   The same quota cells the account table has always drawn, at the same fixed
+   0-100 % scale with the reset horizon under each. */
+function quotaMeasuredCells(r, extras) {
+  const c = r.cred;
+  if (!c) {
+    return `<td class="qnotmeasured" colspan="${3 + extras.length}">`
+      + `not measured<span class="rst"> — no quota provider watches this one</span></td>`;
+  }
+  const G = latestGauges(c.name);
+  return qcell(G["5h"]) + qcell(G["7d"], c.resets_at_ms)
+    + extras.map(l => qcell(G[l])).join("")
+    + quotaResetCell(c, G);
+}
+
+/* WHEN THE ROOM COMES BACK. The soonest FUTURE reset across this row's gauges
+   is the horizon that binds it; the windows-left figure under it says how much
+   of the weekly allowance is still spendable before that horizon arrives, and
+   a non-ok verdict says how much of it is projected to expire unused. */
+function quotaResetCell(c, G) {
+  const now = Date.now();
+  let soonest = null;
+  for (const l in G) {
+    const t = G[l].reset;
+    if (t && t > now && (soonest === null || t < soonest)) soonest = t;
+  }
+  if (!soonest && c.resets_at_ms && c.resets_at_ms > now) soonest = c.resets_at_ms;
+  const win = c.windows_left != null && c.windows_per_week != null
+    ? c.windows_left.toFixed(1) + "/" + c.windows_per_week.toFixed(1) + " windows" : "";
+  const wv = c.windows_verdict && c.windows_verdict !== "ok" ? c.windows_verdict : "";
+  return `<td class="qcell qreset"><span class="qv">${soonest ? esc(fmtIn(soonest)) : "—"}</span>`
+    + (win ? `<div class="rst">${esc(win)}</div>` : "")
+    + (wv ? `<div class="rst" title="projected unused capacity at the reset">${esc(wv)}</div>` : "")
+    + `</td>`;
+}
+
+/* ── identity ──────────────────────────────────────────────────────────────
+   The colour dot binds the row to its line in the big chart and to its
+   sparkline; the state is a word, and a state with a repair carries the
+   repair as a click-to-copy the owner runs himself (logins are human-only).
+   A row with no measurement is named by its DECLARED id, which is the only
+   name it has. A codex Team member whose workspace IS pooled, with no pool
+   file proven to be it (`member_unproven`, task/2981), is measured, not
+   missing: its word says so and its repair is `helm codex pool`, never a
+   login. */
+function quotaIdCell(r) {
+  const c = r.cred;
+  if (!c) {
+    return `<th class="qid"><div class="acct-name"><span class="adot" style="background:var(--line2)"></span>`
+      + `${esc(r.decl ? r.decl.id : "?")}</div>`
+      + `<div class="acct-line2"><span class="rst">declared by you</span></div></th>`;
+  }
+  const fix = c.state === "due-refresh" ? "helm keepalive --apply"
+    : c.member_unproven ? "helm codex pool " + (c.home_name || "<home>")
+    : (LOGIN_CMDS[c.provider] || (x => ""))(c.home);
+  /* THE WORD IS THE WHOLE SURFACE OF THE DISTINCTION. `unknown` belongs to a
+     provider that ANSWERED and had no state to give; a provider helm could not
+     read gets its own word and says what that means, because the two look
+     identical to him and only one of them is about his account. */
+  const st = c.quota_unreadable
+    ? `<span class="st-unknown" title="helm could not read this account's quota windows just now — these numbers are UNKNOWN, not zero">unreadable</span>`
+    : c.member_unproven
+    ? `<span class="st-unknown stfix" data-fix="${esc(fix)}" title="no pool file matches this member; UNKNOWN until you run: ${esc(fix)}">member unproven</span>`
+    : c.state === "ok" ? `<span class="st-ok">ok</span>`
+    : `<span class="st-${c.state} stfix" data-fix="${esc(fix)}" title="click to copy the fix (you run it yourself): ${esc(fix)}">${esc(c.state)}</span>`;
+  const flags = [c.name_lies ? `drifted: holds ${c.identity || "?"}, named ${c.home_name || "?"} (helm cred heal)` : "",
+                 c.duplicate_homes ? c.duplicate_homes.length + " homes" : ""].filter(Boolean).join(", ");
+  /* THE OTHER HOMES ON THIS ONE BILL, named as what they are. He was shown
+     them as separate accounts and could not place them; the fix is not to hide
+     them — he still has to know a second home exists when a login goes
+     stale — but to say they are the SAME subscription, on the row that is. */
+  const alias = r.aliases && r.aliases.length
+    ? `<span class="qalias" title="${esc(r.aliases.map(x => x.home_name || x.name).join(", "))}">`
+      + `+${r.aliases.length} more home${r.aliases.length === 1 ? "" : "s"} on this account</span>`
+    : "";
+  const meta = [esc((c.tier || c.provider).replace("Max 20x", "Max 20×")), st,
+                "home: " + esc(c.home_name || "?")]
+    .concat(alias ? [alias] : [])
+    .concat(flags ? [`<span class="flagchip" title="${esc(flags)}">${esc(short(flags, 28))}</span>`] : [])
+    .join('<span class="sep">·</span>');
+  return `<th class="qid"><div class="acct-name"><span class="adot" style="background:${acol(c.name)}"></span>`
+    + `${esc(c.name)}${c.active ? '<span class="live" title="a live agent is on this account right now"></span>' : ""}</div>`
+    + `<div class="acct-line2">${meta}</div></th>`;
+}
+
+function quotaRowHTML(r, extras) {
+  const sel = r.cred && SEL[r.cred.provider] === r.cred.name;
+  return `<tr class="qrow${sel ? " sel" : ""}" data-a="${esc(r.name || "")}"`
+    + ` data-p="${esc(r.cred ? r.cred.provider : "")}" data-fam="${esc(r.fam)}">`
+    + quotaIdCell(r) + quotaDeclCells(r)
+    + quotaMeasuredCells(r, extras) + `</tr>`;
+}
+
+/* ── THE DEFAULT ORDER: what is worth using now, at the top ──────────────
+   The owner, reading this table: "how are these ordered? most relevant should
+   be top, kicked/awaiting reset should be bottom, no?" They were ordered by
+   provider and then alphabetically — which is to say, not ordered at all for
+   the one decision he makes here.
+
+   THREE TIERS, AND THE MIDDLE ONE IS THE WHOLE CARE. "Exhausted" and "the
+   token needs refreshing" are not the same news and must not share a tier: an
+   expired token is a chore, one command long, on an account that may be
+   completely fresh — two rows read expired-token today while his own usage
+   pages showed them working (the task/2680 class). Sinking those to the bottom
+   beside genuinely walled accounts would tell him an account is spent when
+   nothing has measured it spent. So a due token sits in the MIDDLE, under
+   everything usable and above everything walled, saying what it needs.
+
+   A LIVE SEAT OUTRANKS EVERY MEASUREMENT, including a missing one: an agent
+   working on that account right now is the strongest evidence the account
+   works, and it is the row he is most likely to be asking about. */
+/* the three tiers, as one table so the suite can LIFT them rather than mirror
+   them — a python or harness copy of these numbers would keep agreeing with
+   itself long after the page moved. */
+const ATIER = {USABLE: 0, UNMEASURED: 1, WALLED: 2};
+/* THE TIER OF A ROW, not of a credential home — the row is the subscription,
+   and its usability is the best its homes can do. */
+function acctTier(r) {
+  const c = r.cred;
+  /* NOTHING MEASURES IT AT ALL: a prepaid balance, a seatless subscription, a
+     login only Orca can see. Unknown, which is not empty. */
+  if (!c) return ATIER.UNMEASURED;
+  if (c.active || c.headroom > 0) return ATIER.USABLE;
+  // A NULL HEADROOM IS THE ABSENCE OF A READING, never a reading of zero — the
+  // difference between "we could not ask" and "it said none left", and the
+  // whole reason these are two tiers.
+  if (c.headroom == null) return ATIER.UNMEASURED;
+  return ATIER.WALLED;
+}
+/* when this row's quota comes back — the account's own weekly reset, or the
+   reset the newest weekly gauge carried. Used two ways: among usable rows the
+   SOONEST is the strand risk (capacity about to expire unused), and among
+   walled rows the soonest is the one he can use again first. */
+function acctResetAt(r) {
+  const c = r.cred;
+  if (!c) return null;
+  const G = latestGauges(c.name);
+  const g = (G["7d"] && G["7d"].reset) || null;
+  return c.resets_at_ms || g || null;
+}
+function acctRowName(r) {
+  return String((r.cred && r.cred.name) || (r.decl && r.decl.id) || "").toLowerCase();
+}
+function acctDefaultSort(rows) {
+  const FAR = 8.64e15;   // a row with no known reset sorts last among equals
+  const room = r => (r.cred && r.cred.headroom != null) ? r.cred.headroom : -1;
+  const live = r => !!(r.cred && r.cred.active);
+  return [...rows].sort((a, b) => {
+    const ta = acctTier(a), tb = acctTier(b);
+    if (ta !== tb) return ta - tb;
+    if (ta === ATIER.WALLED) return (acctResetAt(a) || FAR) - (acctResetAt(b) || FAR);
+    if (ta === ATIER.UNMEASURED) return acctRowName(a) < acctRowName(b) ? -1 : 1;
+    if (live(b) !== live(a)) return live(b) ? 1 : -1;
+    if (room(b) !== room(a)) return room(b) - room(a);
+    return (acctResetAt(a) || FAR) - (acctResetAt(b) || FAR);
+  });
+}
+/* THE TABLE ANSWERS HIS QUESTION ON ITS FACE. He asked how the rows were
+   ordered; a table that is now ordered but still silent about it would leave
+   him asking again. One banded row per tier, only when that tier has rows.
+
+   THE MIDDLE BAND NAMES A MEASUREMENT THAT IS MISSING, not a fault, because
+   two different things land in it: a token due for refresh, and a
+   subscription helm has no quota API for at all. Calling that tier "needs a
+   login" would be a false instruction on half of it. */
+const ATIER_SAID = [
+  ["use these", "a live agent on it first, then most left, then the one that resets soonest"],
+  ["helm is not measuring these", "a due token or an account with no quota to read — neither means empty"],
+  ["walled until they reset", "soonest first"],
+];
+function acctTierRow(tier, span) {
+  const said = ATIER_SAID[tier];
+  return `<tr class="atier"><td class="atiercell" colspan="${span}">`
+    + `<b>${esc(said[0])}</b><span class="rst"> — ${esc(said[1])}</span></td></tr>`;
+}
+
+/* ── the family group ─────────────────────────────────────────────────────
+   One rule across the table, carrying the family's name and how many accounts
+   are under it. Clicking it folds the family away. */
+function quotaFamHeadHTML(fam, rows, span) {
+  const folded = !!QFOLD[fam];
+  return `<tr class="qfam${folded ? " qfolded" : ""}" data-fam="${esc(fam)}">`
+    + `<th colspan="${span}"><span class="qfamcaret">${folded ? "▸" : "▾"}</span>`
+    + `<span class="qfamname">${esc(fam)}</span>`
+    + `<span class="qfamn">${rows.length} account${rows.length === 1 ? "" : "s"}</span>`
+    + `</th></tr>`;
+}
+
+/* ── the table ─────────────────────────────────────────────────────────────
+   ONE header row for the whole table rather than one per panel, and the read
+   age is printed ONCE beside the page's own header line rather than per
+   section. */
+function quotaHeadHTML(extras) {
+  return `<th class="qh">account</th><th class="qh">declared</th>`
+    + `<th class="qh">what it is for</th>`
+    + `<th class="qh num">session</th><th class="qh num">weekly</th>`
+    + extras.map(l => `<th class="qh num">${esc(LBL_NICE[l] || l)}</th>`).join("")
+    + `<th class="qh num">resets in</th>`;
+}
+
+function renderAccts() {
+  const head = $("#qonehead"), body = $("#qonebody");
+  if (!head || !body) return;
+  const extras = gaugeLabels().filter(l => l !== "5h" && l !== "7d");
+  const span = 6 + extras.length;
+  head.innerHTML = quotaHeadHTML(extras);
+  const rows = quotaRows();
+  if (!rows.length) { body.innerHTML = ""; quotaRenderAge(); return; }
+  body.innerHTML = quotaFamilies(rows).map(([fam, rs]) => {
+    const head = quotaFamHeadHTML(fam, rs, span);
+    if (QFOLD[fam]) return head;
+    /* WITHIN THE FAMILY, WORTH-USING FIRST, and the band says so. The family
+       rule answers "whose account is this"; the tier band answers the question
+       he actually asked of this table, which is "which one do I use". */
+    let drawn = -1;
+    return head + acctDefaultSort(rs).map(r => {
+      const tier = acctTier(r);
+      const band = tier === drawn ? "" : acctTierRow(tier, span);
+      drawn = tier;
+      return band + quotaRowHTML(r, extras);
+    }).join("");
+  }).join("");
+  quotaBind();
+  quotaRenderAge();
+}
+
+/* THE PAGE'S ONE AGE LINE. Every number in this table comes from the same
+   history read, so the age is a property of the TABLE and is printed once —
+   and a table with no reading says so rather than printing an empty span,
+   because a value with no age is the one thing this surface may not render. */
+function quotaRenderAge() {
+  const el = $("#qoneage");
+  if (!el) return;
+  let newest = 0;
+  for (const r of HIST) { const t = Date.parse(r.probed_at); if (t > newest) newest = t; }
+  if (!newest) { el.textContent = "nothing measured yet"; return; }
+  const m = Math.round((Date.now() - newest) / 60e3);
+  el.textContent = "read " + (m < 1 ? "just now" : m + "m ago");
+}
+
+/* ── what a click means ────────────────────────────────────────────────────
+   A family header folds its family. A state word copies its repair. A
+   "+ describe" opens the form on that account and does NOT select the row.
+   Anything else on a measured row selects it for resumes. */
+function quotaBind() {
+  const body = $("#qonebody");
+  if (!body || !body.querySelectorAll) return;
+  body.querySelectorAll(".qfam").forEach(tr => {
+    tr.onclick = () => { const f = tr.dataset.fam; QFOLD[f] = !QFOLD[f]; renderAccts(); };
+  });
+  body.querySelectorAll(".qrow").forEach(tr => {
+    tr.onclick = e => {
+      const fx = e.target.closest(".stfix");
+      if (fx) {
+        navigator.clipboard.writeText(fx.dataset.fix);
+        toast("copied login fix (run it yourself — logins are human-only): " + fx.dataset.fix, 5000);
+        return;
+      }
+      const dc = e.target.closest("[data-declare]");
+      if (dc) { declOpenFor(dc.dataset.declare); return; }
+      if (!tr.dataset.p) return;
+      SEL[tr.dataset.p] = tr.dataset.a;
+      renderAccts(); renderResumeAs(); renderTray();
+    };
+    tr.onmouseenter = () => { if (tr.dataset.a) { EMPH = tr.dataset.a; renderChart(); } };
+    tr.onmouseleave = () => { if (EMPH === tr.dataset.a) { EMPH = null; renderChart(); } };
+  });
+}
+
+/* THE PAGE'S ONE "GO AND LOOK" AFFORDANCE. Every band on this table is fed by
+   the same two reads, so one button refreshes both rather than each section
+   carrying its own. It says what it is doing while it does it: a re-probe
+   takes seconds per account and a button that looks idle gets pressed twice. */
+if ($("#qoneMeasure")) $("#qoneMeasure").onclick = async () => {
+  const btn = $("#qoneMeasure");
+  btn.disabled = true;
+  const was = btn.textContent;
+  btn.textContent = "measuring…";
+  try { await loadCreds(true); await loadHist(); } finally {
+    btn.disabled = false;
+    btn.textContent = was;
+  }
+};

@@ -1,0 +1,64 @@
+<div class="view" id="view-quota">
+  <div id="attn"></div>
+  <div id="attndetail"></div>
+  <div id="chartcard">
+    <div class="chead"><b>quota</b>
+      <span id="qtabs"><span class="qtab on" data-w="7d">weekly</span><span class="qtab" data-w="5h">session</span></span>
+      <span id="qsub">remaining % · history + projection to reset</span>
+    </div>
+    <svg id="chart" viewBox="0 0 1400 430"></svg>
+    <div id="tip"></div>
+    <div id="zoomhint">scroll = zoom · drag = pan · double-click = reset</div>
+  </div>
+  <div id="qonecard">
+    <div class="qonetop"><b>what may run right now</b>
+      <span id="qoneage" class="gmeta"></span>
+      <button class="chip" id="qoneMeasure" title="re-read every account from its provider now">measure now</button>
+    </div>
+    <div class="qonescroll"><table class="qone"><thead><tr id="qonehead"></tr></thead><tbody id="qonebody"></tbody></table></div>
+    <div class="qonehint">click a family to fold it · click a row to select it for resumes · click a state to copy its fix</div>
+  </div>
+  <details class="grp" id="acctdeclared" open>
+    <summary>accounts we pay for<span class="gmeta">declared by YOU — what each is for, what it is not for; agents read this instead of asking</span></summary>
+    <div id="decltop"><button class="chip" id="dFill" title="edit every row on one screen: tab down a column and each box saves itself">fill in all my details</button></div>
+    <div id="declrows"></div>
+    <div id="declfill" hidden></div>
+    <div id="declform" hidden>
+      <input id="dId" placeholder="short id — x-premium (never an email)" autocomplete="off">
+      <input id="dVendor" placeholder="vendor — x" autocomplete="off">
+      <input id="dPlan" placeholder="plan — X Premium" autocomplete="off">
+      <input id="dCount" placeholder="how many of this plan — 1" autocomplete="off">
+      <input id="dPrice" placeholder="price per month — $7 (optional)" autocomplete="off">
+      <input id="dGood" placeholder="what it IS for" autocomplete="off">
+      <input id="dNot" placeholder="what it must NOT be used for" autocomplete="off">
+      <input id="dReach" placeholder="how an agent reaches it — grok, or: owner-only, ask" autocomplete="off">
+      <input id="dMeasured" placeholder="measured account name, if helm watches its quota (optional)" autocomplete="off">
+      <input id="dRenews" type="date" title="renews or expires on (optional)" autocomplete="off">
+      <input id="dNotes" placeholder="notes (optional)" autocomplete="off">
+      <select id="dBilling" title="how this one is billed"><option value="">billing — not declared</option><option value="sub">sub</option><option value="payg">payg</option><option value="prepaid">prepaid</option><option value="free">free</option></select>
+      <input id="dAllowance" placeholder="how much it allows — 20 requests per week (optional)" autocomplete="off">
+      <input id="dKeyWhere" placeholder="where the key is KEPT — the codex credhome (never the key itself)" autocomplete="off">
+      <label class="dconfirm" title="tick this once the row says what you would say"><input type="checkbox" id="dConfirm"> confirmed — these are my words</label>
+      <button class="chip" id="dSave">save</button>
+      <button class="chip" id="dCancel">cancel</button>
+      <div id="dMsg"></div>
+    </div>
+    <div id="decladd"><button class="chip" id="dAdd">+ add an account</button>
+      <span class="dnosecret">never a password, key, token or email — helm refuses them</span></div>
+  </details>
+  <details class="grp" id="burncard">
+    <summary>burn ↔ sessions<span class="gmeta">what was active when quota burned — last 48h, temporal join</span></summary>
+    <div class="rows" id="burnrows"></div>
+  </details>
+  <details class="grp" id="homescard">
+    <summary>credential homes<span class="gmeta">one home = one login — helm prepares, YOU run every login</span></summary>
+    <div id="homeform">
+      <input id="hEmail" placeholder="new home: account email (ann@example.com → home ann-example-com)" autocomplete="off">
+      <select id="hProv"><option value="claude">claude</option><option value="codex">codex</option></select>
+      <button class="chip" id="hCreate">new home</button>
+      <div id="hCmd" style="flex-basis:100%"></div>
+    </div>
+    <div id="homerows"></div>
+  </details>
+</div>
+

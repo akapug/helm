@@ -1,0 +1,41 @@
+# helm relevance scorer — the local head behind the long-tail re-rank
+# (`helm relevance serve`, helm/relevanced.py). One resident process: it starts
+# llama.cpp's embedding server on a loopback port, embeds each turn once and
+# each store line once per content hash, and applies the head as one dot
+# product. It stores no turn text. It carries no authentication, so bind
+# RELEVANCE_HOST to an address only the LAN reaches.
+#
+# The host's own values live in an environment file, never in this unit:
+#   ~/.config/helm/relevance.env
+#     RELEVANCE_HEAD=/path/to/head.json          # the frozen head
+#     RELEVANCE_LLAMA=/path/to/llama-server       # its libraries beside it
+#     RELEVANCE_MODEL=/path/to/Qwen3-Embedding-0.6B-Q8_0.gguf
+#     RELEVANCE_HOST=<LAN address>
+#     RELEVANCE_PORT=18780
+#     RELEVANCE_THREADS=10
+#     RELEVANCE_PARALLEL=4
+# Then point every client host at it: "relevance": "http://<host>:<port>" in
+# <helm home>/_global/endpoints.json.
+#
+# Enable (the placement owner's one-step, on the scoring host):
+#   cp scripts/helm-relevance.service ~/.config/systemd/user/ \
+#     && systemctl --user daemon-reload && systemctl --user enable --now helm-relevance.service
+[Unit]
+Description=helm relevance scorer (embedding head over llama.cpp)
+Documentation=helm/relevanced.py
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/helm/relevance.env
+ExecStart=%h/.local/bin/helm relevance serve --head ${RELEVANCE_HEAD} \
+  --llama-server ${RELEVANCE_LLAMA} --model ${RELEVANCE_MODEL} \
+  --host ${RELEVANCE_HOST} --port ${RELEVANCE_PORT} \
+  --threads ${RELEVANCE_THREADS} --parallel ${RELEVANCE_PARALLEL}
+# A build box runs other work: the scorer yields the CPU first.
+Nice=5
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

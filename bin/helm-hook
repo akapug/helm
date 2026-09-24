@@ -1,0 +1,186 @@
+#!/bin/sh
+# helm's hook wrapper: run ONE hook child under its budget and report a
+# fail-open verdict on the two channels the harness reads.
+#
+# WHY THIS IS A FILE AND NOT AN INLINE LADDER. Claude Code echoes a hook's
+# WHOLE command string every time that hook blocks or errors, so every
+# character of the wrapper is owner-facing output. Rendered inline, this
+# ladder measured 2,039 characters for the Stop gate — printed in front of the
+# one sentence the owner actually needed, on every blocked stop. Shipped as a
+# file, the
+# installed command is the short invocation `helm-hook <kind> <name> <event>
+# <budget> <consequence> <child…>` and this text is read only by whoever opens
+# it. The SEMANTICS below are unchanged and are not this file's to decide:
+# helm/hooks.py `spec_command` is the authority and its docstring carries the
+# measurements behind every arm.
+#
+# ARGV IS FIXED-WIDTH BEFORE THE CHILD, and that is a contract rather than a
+# convenience: `hooks._executed` steps over exactly five operands to find the
+# child's executable, which is what makes a marker like `chat stop-guard
+# --hook-json` still anchor at the child's FIRST ARGUMENT. Ownership is a
+# license to rewrite an entry, so a wrapper the walk cannot step over would
+# make helm read its own installed hooks as foreign and append a duplicate
+# beside every one of them.
+#
+#   $1 kind       gate | lane | posttool
+#   $2 name       the spec's name; also the hookalarm suppression key
+#   $3 event      the hook event, for the JSON envelope's hookEventName
+#   $4 budget     seconds handed to `timeout`
+#   $5 consequence  gate: the noun this hook allows ("stop", "tool call")
+#                   lane: the sentence naming what the seat lost
+#                   posttool: unused, passed as "-"
+#   $6…          the child program and its arguments
+#
+# THE BUDGET CARRIES NO KILL ESCALATION, deliberately. `timeout N` sends TERM
+# and nothing else, so a TERM-deaf child family can still outlive this wrapper
+# — a known, filed gap. `--kill-after` was tried and backed out because it
+# changes what an exit code MEANS (rc 137 belongs to every SIGKILL there is,
+# including an OOM kill well before the deadline) and because its effect is
+# host-dependent. See `hooks._timeout_prefix` for the two measurements.
+#
+# THIS SCRIPT NEVER SPEAKS FOR ITS OWN ABSENCE, and that is a different state
+# from the one the `127)` arm below reports. A missing CHILD reaches that arm
+# and helm says so on both channels. A missing THIS FILE exits 127 before any
+# line of it runs, which the harness reads as a hook error and therefore as
+# ALLOW — loud in the terminal, but not in helm's voice and on neither of its
+# channels. Only a reader that MEASURES the file can report that, so
+# `hooks._wrapper_state` does, and `helm hooks status` (homes and seats) plus
+# both of doctor's hook rungs render it. See docs/HOOKS.md, "TWO ABSENCES".
+
+kind=$1
+name=$2
+event=$3
+budget=$4
+what=$5
+shift 5
+child=$1
+
+# JSON STRING ESCAPING, AND IT HAS TO BE COMPLETE RATHER THAN CONVENIENT.
+# The inline ladder built its envelope with `json.dumps`, whose promise was
+# "the bytes are valid JSON however the text was spelled". This was two sed
+# rules — backslash and quote — which covers every character a path was
+# EXPECTED to contain and nothing else: a tab or a newline in a checkout path
+# is legal on every filesystem helm runs on, and either one emitted a raw
+# control character inside a JSON string, which is a parse error. The JSON
+# channel is the one the harness actually reads, so that failure is not a
+# mangled message, it is no message at all — on the hook that is already
+# reporting a broken estate.
+#
+# ONE PASS, BYTE BY BYTE, under LC_ALL=C so a multi-byte character passes
+# through as its own bytes instead of being decoded and re-encoded. awk has no
+# ord(), so the C0 table is built once in BEGIN from sprintf("%c"); a newline
+# is awk's RECORD separator and so is rejoined explicitly. One fork per value,
+# on the failure path only — a healthy hook never reaches it.
+#
+# WHAT IT STILL CANNOT CARRY IS A TRAILING NEWLINE: `say` reads this through
+# `$( )`, and command substitution strips trailing newlines before this output
+# is ever seen. That is the shell's property, not this function's, and it was
+# equally true of the sed version.
+esc() {
+    printf '%s' "$1" | LC_ALL=C awk '
+        BEGIN {
+            for (i = 1; i < 32; i++) c0[sprintf("%c", i)] = sprintf("\\u%04x", i)
+            c0[sprintf("%c", 8)] = "\\b"
+            c0[sprintf("%c", 9)] = "\\t"
+            c0[sprintf("%c", 12)] = "\\f"
+            c0[sprintf("%c", 13)] = "\\r"
+            c0[sprintf("%c", 127)] = "\\u007f"
+        }
+        NR > 1 { printf "%s", "\\n" }
+        {
+            n = length($0)
+            for (i = 1; i <= n; i++) {
+                ch = substr($0, i, 1)
+                if (ch == "\\") printf "%s", "\\\\"
+                else if (ch == "\"") printf "%s", "\\\""
+                else if (ch in c0) printf "%s", c0[ch]
+                else printf "%s", ch
+            }
+        }
+    '
+}
+
+# ONE SENTENCE, BOTH CHANNELS. stderr reaches the debug log; the exit-0 JSON is
+# what the harness actually surfaces (`systemMessage` to the owner,
+# `hookSpecificOutput.additionalContext` to the agent). Rendering both from one
+# string is the point: two hand-kept copies is how a hardcoded "this stop" came
+# to be printed in front of a PreToolUse reader.
+say() {
+    printf '%s\n' "$1" >&2
+    printf '{"systemMessage": "%s", "hookSpecificOutput": {"hookEventName": "%s", "additionalContext": "%s"}}\n' \
+        "$(esc "$1")" "$(esc "$event")" "$(esc "$1")"
+}
+
+# ONE TIMEOUT LINE PER HOOK CLASS PER WINDOW. The state format is shared with
+# helm/hookalarm.py — same directory, same bucket token, same arrears clause —
+# and this body is `hookalarm.shell_suppressed` rendered with the key `$name`
+# and `say "$m$ha"` as the speaking half. tests/test_hookalarm.py compares the
+# two renderings byte for byte, so a change on either side is a red arm rather
+# than two directories and every line printed twice.
+alarm() {
+    m=$1
+    hd=${HELM_HOOK_ALARM_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/helm-hookalarm-${LOGNAME:-${USER:-helm}}}; mkdir -p "$hd" 2>/dev/null; hw=$(date -u +%Y%m%d%H%M); hp=$hd/$name; hf=$hp.${hw%?}; ha=; if [ -e "$hf" ]; then printf . >> "$hf" 2>/dev/null; else set -- "$hp".*; hc=$(cat "$@" 2>/dev/null); rm -f "$@" 2>/dev/null; if [ -n "$hc" ]; then hs=${1##*.}; hs=${hs#????????}; ha=" (+${#hc} suppressed since ${hs%?}:${hs#??}0Z)"; fi; printf '' > "$hf" 2>/dev/null; say "$m$ha"; fi
+}
+
+timeout "$budget" "$@"
+rc=$?
+
+# THE POSTTOOL RUNNER OWNS PUBLICATION AND ITS RECEIPT. After a kill or a
+# partial write the shell cannot know whether JSON already escaped, so a
+# fallback envelope here could corrupt that one-response contract: stderr only,
+# never buffered stdout, and UNKNOWN is never rewritten into a claimed delivery.
+if [ "$kind" = posttool ]; then
+    case "$rc" in
+    0) ;;
+    *) printf '%s%s\n' "[helm $name] outer runner failed; publication UNKNOWN at $child; rc=" "$rc" >&2 ;;
+    esac
+    exit 0
+fi
+
+# A GATE PROPAGATES ONLY rc 2. An ADVISORY has no `2)` arm at all, on purpose:
+# propagating it would make every lane hook a silent blocker, so an advisory 2
+# is an anomaly and falls to the unknown-code arm — announced, and still 0.
+#
+# A REFUSAL IS COUNTED, and the refusal does not wait for the count. One line
+# goes to the friction ledger (`helm friction`) carrying the gate's NAME and
+# the EVENT -- never the payload, which this wrapper does not read. The count
+# runs DETACHED with every descriptor closed to the harness, so the exit 2
+# below is reached at once: a gate that overran its deadline while bookkeeping
+# would be read by the harness as a hook error, and a hook error ALLOWS. The
+# helm asked is the one beside this file, so an external gate is counted too.
+# A `dispatch-*` name is the in-process dispatcher, which counts its own
+# refusal under the name of the handler that refused.
+if [ "$kind" = gate ] && [ "$rc" = 2 ]; then
+    case "$name" in
+    dispatch-*) ;;
+    *)
+        counter=${0%/*}/helm
+        if [ -x "$counter" ]; then
+            (timeout 5 "$counter" friction record "$name" --reason "$event" </dev/null >/dev/null 2>&1 &)
+        fi
+        ;;
+    esac
+    exit 2
+fi
+
+if [ "$rc" != 0 ]; then
+    if [ "$kind" = gate ]; then
+        t="[helm $name] TIMED OUT at ${budget}s — this $what is UNCHECKED"
+        m="[helm $name] THE GUARD IS MISSING — nothing executable at $child — this $what is ALLOWED and UNCHECKED; repair with: helm hooks install"
+        b="[helm $name] THE GUARD FAILED rc=$rc — this $what is ALLOWED and UNCHECKED"
+    else
+        t="[helm $name] TIMED OUT at ${budget}s — $what"
+        m="[helm $name] IS MISSING — nothing executable at $child — $what; repair with: helm hooks install"
+        b="[helm $name] FAILED rc=$rc — $what"
+    fi
+    # ONLY THE 124 ARM IS RATE-LIMITED. A timeout is the one failure that
+    # repeats per tool call with nothing new to say; MISSING and an unknown rc
+    # each name a broken estate that has to be read every single time.
+    case "$rc" in
+    124) alarm "$t" ;;
+    127) say "$m" ;;
+    *)   say "$b" ;;
+    esac
+fi
+
+exit 0

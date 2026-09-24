@@ -1,0 +1,1402 @@
+/* ================= owner decision queue (ON YOU, on the Work page) =================
+   The store-review idiom generalized (owner 2026-08-04): any seat files a
+   decision card (`helm decide file`), the owner answers on the work tab —
+   the owner⇄fleet surface — and the verdict DMs the FILING SEAT through the
+   same one-writer-path law: every POST below routes through the exact
+   ownerasks functions the CLI calls. The ON YOU line above the queue
+   carries its count (odqBadge). */
+let ODQ_GEN = 0; // monotonic render generation — a slow older response must never replace a newer render
+async function odqInit() {
+  const gen = ++ODQ_GEN;
+  try {
+    const d = await j("/api/decisions", 8000);
+    if (gen !== ODQ_GEN) return; // stale response — a newer call owns the surface
+    odqRender(d);
+  } catch (e) {
+    if (gen !== ODQ_GEN) return;
+    odqBadge({unavailable: true, why: e.message});
+    if (odqTyping()) { $("#odqmeta").textContent = "refresh held — you are typing"; return; }
+    odqComposerState(); // park blurred drafts in the ledger — the error card replaces the body
+    $("#odqlist").innerHTML = '<div class="empty">✗ decision queue unreadable: ' + esc(e.message) + "</div>"; $("#odqmeta").textContent = "UNKNOWN";
+  }
+}
+/* the owner is in a card's composer — NO render may replace the list body
+   under them (#231: the 45s poll erased an in-progress comment). FOCUS alone
+   holds it: a focused-but-EMPTY box is owner intent too — a redraw would
+   destroy focus before the first keystroke/IME commit lands. The next quiet
+   tick catches the queue up; headline meta/badge stay live. */
+function odqTyping() {
+  const a = document.activeElement, host = $("#odqlist");
+  return !!(a && host && host.contains(a) && a.classList && a.classList.contains("odqcomment"));
+}
+/* typed-but-undelivered text outlives EVERY #odqlist replacement — fetch
+   error, unavailable, empty queue, and renders that omit the card alike:
+   drafts live in a ledger keyed by card id, merged from the live DOM before
+   each replacement (an emptied box retracts its entry) and restored into
+   whichever later render shows the card again. A SENT comment leaves the
+   ledger at send time (odqAct), so a redraw never resurrects delivered text. */
+const ODQ_DRAFTS = {};
+function odqComposerState() {
+  document.querySelectorAll("#odqlist .odqcard").forEach(el => {
+    const c = el.querySelector(".odqcomment");
+    if (!c) return;
+    if (c.value) ODQ_DRAFTS[el.dataset.id] = c.value;
+    else delete ODQ_DRAFTS[el.dataset.id];
+  });
+  return ODQ_DRAFTS;
+}
+/* the card's LIVE comment box, scanned from the current DOM — never a
+   captured element, which a mid-flight poll may have detached. */
+function odqBox(id) {
+  let box = null;
+  document.querySelectorAll("#odqlist .odqcard").forEach(el => {
+    if (el.dataset.id === id) box = el.querySelector(".odqcomment");
+  });
+  return box;
+}
+function odqRender(d) {
+  const host = $("#odqlist"), meta = $("#odqmeta");
+  odqBadge(d);
+  if (odqTyping()) { meta.textContent = "refresh held — you are typing"; return; }
+  const saved = odqComposerState(); // parks drafts in the persistent ledger — held across EVERY branch below
+  if (!d || d.unavailable) { host.innerHTML = '<div class="empty">decision queue unavailable' + (d && d.why ? " — " + esc(d.why) : "") + "</div>"; meta.textContent = "UNKNOWN"; return; }
+  const rows = Array.isArray(d.entries) ? d.entries : [], c = d.counts || {};
+  meta.textContent = rows.length
+    ? `${c.open || 0} waiting on you` + (c.undelivered ? ` · ${c.undelivered} decided, delivery pending` : "") + " — pick an option; the verdict DMs the asker"
+    : "queue clear — nothing waiting on you";
+  if (!rows.length) { host.innerHTML = '<div class="empty">no open decision cards — agents file them with <code>helm decide file</code></div>'; return; }
+  host.innerHTML = rows.map(odqCard).join("");
+  host.querySelectorAll(".odqcard").forEach(el => {
+    const c = el.querySelector(".odqcomment");
+    if (c && saved[el.dataset.id]) c.value = saved[el.dataset.id];
+  });
+  host.querySelectorAll(".odqcard").forEach(el => {
+    const id = el.dataset.id;
+    const cbox = el.querySelector(".odqcomment");
+    el.querySelectorAll(".odqchoice").forEach(b => b.onclick = () => odqAct("/api/decisions/verdict",
+      {id, choice: b.dataset.key, comment: cbox ? cbox.value.trim() : ""}, el, "decided " + b.dataset.key));
+    const cbtn = el.querySelector(".odqsay");
+    if (cbtn) cbtn.onclick = () => {
+      const t = cbox.value.trim();
+      if (!t) { toast("type the comment first"); return; }
+      odqAct("/api/decisions/comment", {id, text: t}, el, "commented on");
+    };
+    const rbtn = el.querySelector(".odqretry");
+    if (rbtn) rbtn.onclick = () => odqAct("/api/decisions/deliver", {id}, el, "delivered");
+  });
+}
+function odqCard(r) {
+  const v = r.verdict || null;
+  const opts = (r.options || []).map(o =>
+    `<div class="odqopt"><button class="chip odqchoice${o.recommended ? " rec" : ""}" data-key="${esc(o.key)}" title="${esc(o.consequence)}">${esc(o.label)}${o.recommended ? " ★" : ""}</button>`
+    + `<span class="odqcons">${esc(o.consequence)}</span></div>`).join("");
+  const undeliv = r.status === "decided"
+    ? `<div class="odqundeliv">verdict recorded (${esc(v && v.label || "?")}) but NOT yet delivered to ${esc(r.asker)} — <button class="chip odqretry">retry delivery</button></div>`
+    : r.dm_lost
+      ? `<div class="odqundeliv">verdict (${esc(v && v.label || "?")}) was delivered, but the DM evidence is GONE from ${esc(r.asker)}'s lane (reboot/rotation) — <button class="chip odqretry">re-send from the ledger</button></div>`
+      : "";
+  return `<div class="odqcard" data-id="${esc(r.id)}">`
+    + `<div class="odqtop"><span class="odqtitle">${esc(r.title)}</span><span class="odqid">${esc(r.id)}</span></div>`
+    + `<div class="odqctx">${esc(r.context)}</div>`
+    + `<div class="odqmeta"><span>asked by ${esc(r.asker)}</span><span>${esc(String(r.ts).slice(0, 16))}</span>`
+    + (r.refs && r.refs.length ? `<span>refs: ${esc(r.refs.join(" "))}</span>` : "")
+    + (r.comments ? `<span>${r.comments} comment${r.comments > 1 ? "s" : ""}</span>` : "") + `</div>`
+    + (r.status === "open" ? `<div class="odqopts">${opts}</div>`
+      + `<div class="odqacts"><input class="odqcomment" placeholder="comment (rides the verdict, or send alone)…" autocomplete="off">`
+      + `<button class="chip odqsay">comment only</button></div>` : "")
+    + undeliv + `</div>`;
+}
+/* the decisions half of ON YOU (owner-surface-headlines): the count rides
+   the ON YOU line and the full queue renders in #odq right under it. An
+   unreadable queue is handed over as UNKNOWN, never as zero — whether he has
+   nothing waiting is a question of both reads, which onYouShow joins. */
+function odqBadge(d) {
+  if (typeof onYouShow === "function") onYouShow({odq: d || {unavailable: true}});
+}
+/* the submitted value is captured + CLEARED before the await: the 45s poll
+   can fire mid-flight, replace the card, and a still-parked draft would
+   resurrect delivered text into the fresh composer. A follow-up typed while
+   the POST is in flight is the OWNER'S — completion never touches the box.
+   A FAILED send restores the text — into the live box if still empty, else
+   the draft ledger — a failed send must not eat the comment. */
+async function odqAct(url, body, el, verb) {
+  el.style.opacity = ".5";
+  const id = el.dataset.id, box = el.querySelector(".odqcomment"), sent = box ? box.value : "";
+  if (box) box.value = "";
+  delete ODQ_DRAFTS[id];
+  try {
+    const d = await post(url, body);
+    toast(d.delivery_error ? "✗ " + d.delivery_error : verb + " " + body.id, d.delivery_error ? 5000 : 2600);
+    odqInit(true);
+  } catch (e) {
+    el.style.opacity = "1";
+    const live = odqBox(id);
+    if (sent && live && !live.value) live.value = sent;
+    else if (sent && !live && !(id in ODQ_DRAFTS)) ODQ_DRAFTS[id] = sent;
+    toast("✗ " + e.message, 4000);
+  }
+}
+
+let CFG_DETAIL_GEN = 0; // every new Config-detail owner invalidates older async responses
+function cfgDetailClaim() { return ++CFG_DETAIL_GEN; }
+function cfgObservedField(name, field) {
+  field = field || {};
+  const value = field.value == null ? '<span class="cfgro">unknown</span>' : '<b>' + esc(field.value) + '</b>';
+  const sources = (field.sources || []).length ? ' <span class="src">' + esc(field.sources.join(" + ")) + '</span>' : '';
+  const conflict = (field.conflict || []).length ? '<div class="cfgwarn">conflict: ' + esc(field.conflict.join(" vs ")) + '</div>' : '';
+  return '<div class="cfgitem"><span class="cfgbadge">' + esc(name.replace(/_/g, " ")) + '</span> ' + value + sources + conflict + '</div>';
+}
+async function cfgInjection(seat, session) {
+  const gen = cfgDetailClaim();
+  const host = $("#cfgdetail");
+  host.innerHTML = '<div class="empty">reading config identity + injection samples…</div>';
+  let d;
+  try { d = await j('/api/config/injection?seat=' + encodeURIComponent(seat || "") + '&session=' + encodeURIComponent(session || ""), 8000); }
+  catch (e) {
+    if (gen !== CFG_DETAIL_GEN) return;
+    host.innerHTML = '<div class="cfgwarn">Config observation failed: ' + esc(e.message) + '</div>';
+    return;
+  }
+  if (gen !== CFG_DETAIL_GEN) return;
+  const requested = d.requested || {seat, session};
+  const target = d.target || {}, samples = d.samples || {};
+  const exacts = [
+    {prefix: "v3", label: "v3 exact UTF-8 · agent runtime", loose: "unassigned v3 agent context"},
+    {prefix: "v2", label: "v2 exact UTF-8 · explicit env", loose: "unassigned v2 context"},
+  ];
+  const exactHtml = exacts.map(spec => {
+    const exact = samples[spec.prefix + "_utf8"] || {};
+    const others = samples[spec.prefix + "_other_cohorts"] || [];
+    const unassigned = samples[spec.prefix + "_unassigned"] || {};
+    return '<div class="cfgitem"><span class="cfgbadge">' + spec.label + '</span> <b>' + (exact.count || 0) + ' current-config samples</b>'
+      + (exact.count ? ' · ' + exact.rendered_bytes + ' B total · ' + exact.average_rendered_bytes + ' B avg' : ' · unknown') + '</div>'
+      + (others.length ? '<div class="cfgwarn">' + spec.prefix + ' not attributed: ' + others.reduce((n, c) => n + (c.count || 0), 0) + ' samples across ' + others.length + ' other config cohort' + (others.length === 1 ? '' : 's') + '</div>' : '')
+      + (unassigned.count ? '<div class="cfgwarn">' + spec.loose + ': ' + unassigned.count + ' samples</div>' : '');
+  }).join("");
+  const approx = samples.v1_approx || {};
+  const state = d.state || "unknown";
+  host.innerHTML = '<div class="cfgedbar"><b>Config request</b>'
+    + '<span class="cfgmut">requested seat: <b>' + esc(requested.seat || "none") + '</b></span>'
+    + (requested.session ? '<span class="cfgmut">requested session: <b>' + esc(requested.session) + '</b></span>' : '')
+    + '<span class="cfgbadge ' + esc(state) + '">' + esc(state) + '</span></div>'
+    + '<div class="cfgsec"><h4>backend-verified target</h4>'
+    + ["seat", "session", "cwd", "harness", "transcript_home", "config_home"].map(k => cfgObservedField(k, target[k])).join("") + '</div>'
+    + '<div class="cfgsec"><h4>injection weight</h4>' + exactHtml
+    + '<div class="cfgitem"><span class="cfgbadge">v1 approximate</span> <b>' + (approx.count || 0) + ' unassigned historical samples</b>'
+    + (approx.count ? ' · ~' + approx.approx_characters + ' characters total · ~' + approx.average_approx_characters + ' avg' : ' · ' + esc(approx.state || "unknown"))
+    + '<span class="src"> historical len(str), not UTF-8 bytes</span></div></div>'
+    + ((d.missing || []).length ? '<div class="cfgwarn">unknown: ' + esc(d.missing.join(", ")) + '</div>' : '')
+    + ((d.unavailable || []).length ? '<div class="cfgwarn">unavailable: ' + esc(d.unavailable.join(", ")) + '</div>' : '')
+    /* THE PACK RIDES THE IDENTITY THIS PANE JUST RESOLVED. Its own fetch is
+       slow enough (it reads the whole fire ledger) that it must not hold the
+       identity render, so the host lands now and fills itself in — and it is
+       handed THIS render's generation, so a click on another seat mid-flight
+       drops the late answer instead of writing it under the new heading.
+
+       THE HOST'S OWN TEXT SAYS THE SECTION IS ABSENT, and `ipkLoad` overwrites
+       it with "reading…" as its first act. The pack lives in a DIFFERENT
+       fragment, so it can be absent from a page this function is still running
+       on — and a bare call would then throw HERE, taking the seat identity
+       this function just resolved down with it. The identity is the more
+       important half and must not depend on the cheaper one loading. A silent
+       skip would instead leave a spinner that never resolves, so the absence
+       is written where the owner reads it. tests/test_injectpack.py holds the
+       arm that keeps the two fragments shipped together. */
+    + '<div id="ipkhost"><div class="empty">the injection-pack section is not '
+    + 'loaded on this page</div></div>';
+  if (typeof ipkLoad === "function")
+    ipkLoad(target.seat && target.seat.value || seat,
+            target.session && target.session.value || session, gen);
+}
+
+async function cfgInit(mode) {
+  // mode: nothing = open the tab (already-loaded is already right); "reload" =
+  // fetch again and let the server answer from its caches, which the write
+  // doors have already dropped whatever the write could change; "rescan" = the
+  // ↻ button, the one request that makes the server re-walk the cwd root.
+  // A SAVE ASKS FOR A RELOAD, NOT A RESCAN: the file it wrote was already on
+  // this tree, so re-walking tens of thousands of directories would buy the
+  // owner nothing but the wait this pane exists to have stopped having.
+  if (CFG.loaded && !mode) return;
+  $("#cfgtree").innerHTML = '<div class="empty">scanning config tree…</div>';
+  try {
+    const [tree, homes2] = await Promise.all([
+      j("/api/configs/tree" + (mode === "rescan" ? "?rescan=1" : "")), j("/api/configs/homes")]);
+    CFG.tree = tree; CFG.homes = Array.isArray(homes2) ? homes2 : []; CFG.loaded = true;
+    CFG.home = CFG.home || "(default-claude)";
+    cfgRenderTree();
+    $("#cfgStatus").textContent = `${tree.count} cwds · ${CFG.homes.length} homes`;
+  } catch (e) { $("#cfgtree").innerHTML = '<div class="empty">✗ config scan failed: ' + esc(e.message) + '</div>'; }
+}
+function cfgFileBadges(files) {
+  const seen = {};
+  for (const f of files) seen[f.kind] = (seen[f.kind] || 0) + 1;
+  return Object.keys(seen).map(k => `<span class="cfgbadge ${esc(k)}">${esc(k)}${seen[k] > 1 ? " " + seen[k] : ""}</span>`).join("");
+}
+function cfgMatch(node) {
+  const q = ($("#cfgFilter").value || "").toLowerCase();
+  const chOk = f => CFG.ch === "all" || f.harness === CFG.ch;
+  const selfFiles = node.files.filter(chOk);
+  const selfHit = (!q || node.path.toLowerCase().includes(q)) && selfFiles.length > 0;
+  const kids = node.children.map(cfgMatch).filter(Boolean);
+  if (selfHit || kids.length) return {...node, files: selfFiles, children: kids, _hit: selfHit};
+  return null;
+}
+function cfgTreeNode(node, depth) {
+  const id = node.path;
+  const filtering = !!(($("#cfgFilter").value || "").trim()) || CFG.ch !== "all";
+  const open = filtering || CFG.openDirs.has(id) || depth < 1;
+  const hasKids = node.children.length > 0;
+  const tw = hasKids ? (open ? "▾" : "▸") : "·";
+  const sel = CFG.sel && CFG.sel.type === "cwd" && CFG.sel.path === id ? " sel" : "";
+  let h = `<div class="cfgnode"><div class="cfgrow${sel}" data-cwd="${esc(id)}">`
+    + `<span class="cfgtw" data-tw="${esc(id)}">${tw}</span>`
+    + `<span class="cfgname">${esc(node.name)}</span> ${cfgFileBadges(node.files)}</div>`;
+  if (hasKids && open) h += `<div class="cfgkids">` + node.children.map(c => cfgTreeNode(c, depth + 1)).join("") + `</div>`;
+  return h + `</div>`;
+}
+function cfgRenderTree() {
+  const host = $("#cfgtree");
+  // cwd tree first (the primary axis), homes collapsible below
+  let h = `<div class="cfgsec"><h4>cwd tree · project-scope</h4>`;
+  const roots = (CFG.tree ? CFG.tree.roots : []).map(cfgMatch).filter(Boolean);
+  h += roots.length ? roots.map(r => cfgTreeNode(r, 0)).join("") : '<div class="empty">no configs match</div>';
+  h += `</div>`;
+  const homes2 = (CFG.homes || []).filter(hm => CFG.ch === "all" || hm.provider === CFG.ch);
+  h += `<details class="cfgsec" id="cfgHomesDet"${CFG.homesOpen ? " open" : ""}><summary><b>homes · user-scope</b> <span class="cfgmut">${homes2.length} · top of the cascade</span></summary>`;
+  for (const hm of homes2) {
+    const sel = CFG.sel && CFG.sel.type === "home" && CFG.sel.path === hm.path ? " sel" : "";
+    h += `<div class="cfgrow${sel}" data-home="${esc(hm.path)}"><span class="cfgtw">⌂</span>`
+      + `<span class="cfgname">${esc(hm.home)}</span> <span class="cfgbadge">${esc(hm.provider)}</span> ${cfgFileBadges(hm.files)}</div>`;
+  }
+  h += `</details>`;
+  host.innerHTML = h;
+  const det = $("#cfgHomesDet");
+  if (det) det.addEventListener("toggle", () => { CFG.homesOpen = det.open; });
+  host.querySelectorAll(".cfgtw[data-tw]").forEach(el => el.onclick = ev => {
+    ev.stopPropagation();
+    const p = el.dataset.tw;
+    CFG.openDirs.has(p) ? CFG.openDirs.delete(p) : CFG.openDirs.add(p);
+    cfgRenderTree();
+  });
+  host.querySelectorAll(".cfgrow[data-cwd]").forEach(el => el.onclick = () => cfgSelectCwd(el.dataset.cwd));
+  host.querySelectorAll(".cfgrow[data-home]").forEach(el => el.onclick = () => cfgSelectHome(el.dataset.home));
+}
+function cfgNodeByPath(node, path) {
+  if (node.path === path) return node;
+  for (const c of node.children) { const r = cfgNodeByPath(c, path); if (r) return r; }
+  return null;
+}
+async function cfgSelectCwd(path) {
+  cfgDetailClaim();
+  CFG.sel = {type: "cwd", path};
+  cfgRenderTree();
+  const detail = $("#cfgdetail");
+  let node = null;
+  for (const r of (CFG.tree.roots || [])) { node = cfgNodeByPath(r, path); if (node) break; }
+  const homeOpts = (CFG.homes || []).filter(h => h.provider === CFG.harness).map(h => h.home);
+  const defHome = CFG.harness === "codex" ? "(default-codex)" : "(default-claude)";
+  detail.innerHTML = `<div class="cfgedbar">
+    <b>${esc(path)}</b>
+    <span class="cfgpick" style="margin-left:auto">seat:</span>
+    <select class="cfgpick" id="cfgHarness"><option${CFG.harness === "claude" ? " selected" : ""}>claude</option><option${CFG.harness === "codex" ? " selected" : ""}>codex</option></select>
+    <select class="cfgpick" id="cfgHome"><option value="${defHome}">${defHome}</option>${homeOpts.map(h => `<option value="${esc(h)}">${esc(h)}</option>`).join("")}</select>
+  </div>
+  <div class="cfgsec"><h4>files at this cwd</h4>${(node ? node.files : []).map(f => cfgFileRow(f)).join("") || '<div class="cfgmut">none directly here</div>'}</div>
+  <div id="cfgResolved"><div class="empty">resolving what this seat loads…</div></div>`;
+  $("#cfgHarness").onchange = e => { CFG.harness = e.target.value; cfgSelectCwd(path); };
+  $("#cfgHome").onchange = e => { CFG.home = e.target.value; cfgResolve(path); };
+  CFG.home = $("#cfgHome").value;
+  detail.querySelectorAll(".cfgfile").forEach(el => el.onclick = () => cfgEdit(el.dataset.path));
+  cfgResolve(path);
+}
+function cfgFileRow(f) {
+  const ed = f.editable ? '<span class="cfgfile" data-path="' + esc(f.path) + '">✎ edit</span>'
+    : f.entries ? '<span class="cfgmut">' + f.entries.length + ' entries</span>'
+    : '<span class="cfgro" title="' + esc(f.reason) + '">🔒</span>';
+  return `<div class="cfgitem"><span class="cfgbadge ${esc(f.kind)}">${esc(f.kind)}</span> <span>${esc(f.rel)}</span> <span class="src">${esc(f.harness)} · ${esc(f.type)}</span> ${ed}</div>`;
+}
+async function cfgResolve(cwd) {
+  const host = $("#cfgResolved");
+  if (!host) return;
+  try {
+    const r = await j(`/api/configs/resolve?home=${encodeURIComponent(CFG.home)}&cwd=${encodeURIComponent(cwd)}&harness=${CFG.harness}`);
+    if (r.error) { host.innerHTML = '<div class="cfgwarn">' + esc(r.error) + '</div>'; return; }
+    host.innerHTML = cfgRenderResolved(r);
+    host.querySelectorAll(".cfgfile").forEach(el => el.onclick = () => cfgEdit(el.dataset.path));
+  } catch (e) { host.innerHTML = '<div class="cfgwarn">resolve failed: ' + esc(e.message) + '</div>'; }
+}
+function cfgFileLink(p) { return p ? `<span class="cfgfile" data-path="${esc(p)}">${esc(p.replace(/^.*\//, ""))}</span>` : ""; }
+function cfgRenderResolved(r) {
+  let h = "";
+  // the cascade — memory chain root→cwd (the "passes down through cwds" view)
+  const chain = (r.memory && r.memory.projectClaudeMdChain) || (r.agents && r.agents.projectAgentsMdChain) || [];
+  const homeMd = r.memory ? r.memory.homeClaudeMd : (r.agents && r.agents.homeAgentsMd);
+  h += `<div class="cfgsec"><h4>memory cascade (root → cwd)</h4><ul class="cfgcascade">`;
+  if (homeMd) h += `<li>home ${r.harness === "codex" ? "AGENTS.md" : "CLAUDE.md"} <span class="src">home-scope</span></li>`;
+  h += chain.length ? chain.slice().reverse().map(p => `<li>${cfgFileLink(p)}</li>`).join("") : (homeMd ? "" : `<li class="cfgmut">no project memory files in the chain</li>`);
+  h += `</ul></div>`;
+  // MCP servers — winners first, shadowed (overridden) ones grayed below
+  const servers = r.mcpServers || [];
+  const live = servers.filter(m => !m.shadowed), shadowed = servers.filter(m => m.shadowed);
+  h += `<div class="cfgsec"><h4>MCP servers (${live.length}${shadowed.length ? ` · ${shadowed.length} shadowed` : ""})</h4>`;
+  const mcpRow = m => `<div class="cfgitem${m.shadowed ? " cfgshadow" : ""}"><span class="cfgbadge mcp">mcp</span> <b>${esc(m.name)}</b> <span class="cfgmut">${esc(m.transport || "")}${m.detail ? " · " + esc(m.detail) : ""}</span> <span class="src">${esc(m.source)}${m.file ? " · " + cfgFileLink(m.file) : ""}${m.approval ? " · " + esc(m.approval) : ""}${m.shadowed ? ` · ⤺ shadowed by ${esc(m.shadowed_by || "?")}` : ""}</span></div>`;
+  h += live.map(mcpRow).join("") || '<div class="cfgmut">none</div>';
+  h += shadowed.map(mcpRow).join("");
+  h += `</div>`;
+  // hooks
+  h += `<div class="cfgsec"><h4>hooks (${(r.hooks || []).length})</h4>`;
+  h += (r.hooks || []).map(x => `<div class="cfgitem"><span class="cfgbadge hooks">hook</span> <b>${esc(x.event)}</b> <span class="cfgmut">×${x.count}</span> <span class="src">${esc(x.source || "")}</span></div>`).join("") || '<div class="cfgmut">none</div>';
+  h += `</div>`;
+  // skills / commands / agents
+  const cnt = o => o && typeof o.count === "number" ? o.count : 0;
+  h += `<div class="cfgsec"><h4>skills / commands / agents</h4><div class="cfgitem">skills <b>${cnt(r.skills)}</b> · commands <b>${cnt(r.commands)}</b> · agents <b>${cnt(r.agents)}</b> · plugins <b>${(r.plugins && r.plugins.enabled && r.plugins.enabled.length) || 0}</b></div></div>`;
+  // settings highlights
+  const s = r.settingsHighlights || {};
+  h += `<div class="cfgsec"><h4>settings</h4><div class="cfgitem cfgmut">model: ${esc(s.model || "—")}${s.modelReasoningEffort ? " · effort " + esc(s.modelReasoningEffort) : ""}${s.approvalPolicy ? " · approval " + esc(s.approvalPolicy) : ""}${s.sandboxMode ? " · sandbox " + esc(s.sandboxMode) : ""}</div></div>`;
+  // warnings
+  if ((r.warnings || []).length) h += `<div class="cfgsec"><h4>warnings</h4>` + r.warnings.map(w => `<div class="cfgwarn">⚠ ${esc(w)}</div>`).join("") + `</div>`;
+  return h;
+}
+async function cfgSelectHome(path) {
+  cfgDetailClaim();
+  CFG.sel = {type: "home", path};
+  cfgRenderTree();
+  const hm = (CFG.homes || []).find(h => h.path === path);
+  if (!hm) return;
+  const others = (CFG.homes || []).filter(h => h.provider === hm.provider && h.path !== path);
+  $("#cfgdetail").innerHTML = `<div class="cfgedbar"><b>⌂ ${esc(hm.home)}</b> <span class="cfgmut">${esc(hm.provider)} home · user-scope configs</span></div>`
+    + `<div class="cfgsec"><h4>files</h4>${hm.files.map(cfgFileRow).join("")}</div>`
+    + `<div class="cfgmut">these sit at the TOP of the cascade — every cwd under this home inherits them unless a deeper layer overrides.</div>`
+    + (others.length ? `<div class="cfgsec" style="margin-top:16px"><h4>physics diff · cred axis</h4>
+      <div class="cfgedbar"><span class="cfgmut">what a seat here loads vs</span>
+      <select class="cfgpick" id="cfgDiffB">${others.map(o => `<option value="${esc(o.path)}">${esc(o.home)}</option>`).join("")}</select>
+      <button class="chip" id="cfgDiffGo">diff</button></div>
+      <div id="cfgDiffOut"></div></div>` : "");
+  $("#cfgdetail").querySelectorAll(".cfgfile").forEach(el => el.onclick = () => cfgEdit(el.dataset.path));
+  if ($("#cfgDiffGo")) $("#cfgDiffGo").onclick = () => cfgPhysDiff(hm, $("#cfgDiffB").value);
+}
+async function cfgPhysDiff(hm, bPath) {
+  const out = $("#cfgDiffOut");
+  out.innerHTML = '<div class="empty">diffing physics…</div>';
+  let d;
+  try { d = await j(`/api/physics-diff?a=${encodeURIComponent(hm.path)}&b=${encodeURIComponent(bPath)}&harness=${encodeURIComponent(hm.provider)}`); }
+  catch (e) { out.innerHTML = '<div class="cfgwarn">✗ ' + esc(e.message) + '</div>'; return; }
+  if (d.error) { out.innerHTML = '<div class="cfgwarn">✗ ' + esc(d.error) + '</div>'; return; }
+  if (d.identical) { out.innerHTML = '<div class="cfgitem cfgmut">identical physics — a seat loads the same on either home</div>'; return; }
+  const fmt = v => typeof v === "string" ? v : JSON.stringify(v);
+  out.innerHTML =
+    Object.entries(d.added_in_b || {}).map(([k, v]) => `<div class="cfgdiff add">+ ${esc(k)} = ${esc(fmt(v))}</div>`).join("")
+    + Object.entries(d.removed_in_b || {}).map(([k, v]) => `<div class="cfgdiff del">− ${esc(k)} = ${esc(fmt(v))}</div>`).join("")
+    + Object.entries(d.changed || {}).map(([k, v]) => `<div class="cfgdiff chg">± ${esc(k)}: ${esc(fmt(v.a))} → ${esc(fmt(v.b))}</div>`).join("");
+}
+async function cfgEdit(path) {
+  const gen = cfgDetailClaim();
+  let r;
+  try { r = await j(`/api/configs/file?path=${encodeURIComponent(path)}`); }
+  catch (e) { if (gen === CFG_DETAIL_GEN) toast("✗ " + e.message); return; }
+  if (gen !== CFG_DETAIL_GEN) return;
+  const host = $("#cfgdetail");
+  const ro = !r.editable;
+  const isMcp = /\.mcp\.json$|\.claude\.json$/.test(path);
+  host.innerHTML = `<div class="cfgedbar"><button class="chip" id="cfgBack">← back</button>
+    <span class="cfgpath">${esc(r.path)}</span> <span class="cfgbadge">${esc(r.type)}</span>
+    ${ro ? '<span class="cfgro">🔒 ' + esc(r.reason || r.error || "") + '</span>' : ''}</div>
+    <div class="cfged"><textarea id="cfgTA" ${ro ? "readonly" : ""} spellcheck="false">${esc(r.content || "")}</textarea>
+      <div class="cfgedbar">
+        ${ro ? "" : '<button class="chip" id="cfgSave">save (backup + validate)</button>'}
+        ${isMcp && !ro ? '<button class="chip" id="cfgAddMcp">+ MCP server</button>' : ''}
+        <span id="cfgSaveMsg" class="cfgmut"></span>
+      </div></div>
+    <div id="cfgBackups"></div>`;
+  $("#cfgBack").onclick = () => { CFG.sel && CFG.sel.type === "home" ? cfgSelectHome(CFG.sel.path) : cfgSelectCwd((CFG.sel && CFG.sel.path) || path.replace(/\/[^/]*$/, "")); };
+  if (!ro) {
+    $("#cfgSave").onclick = async () => {
+      const res = await cfgPost("/api/configs/file", {path: r.path, content: $("#cfgTA").value, revision: r.revision});
+      const m = $("#cfgSaveMsg");
+      if (res.error) { m.innerHTML = '<span class="cfgro">' + esc(res.error) + '</span>'; }
+      else { r.revision = res.revision; m.textContent = `✓ ${res.note}${res.backup ? " · backup: " + res.backup : ""}`; toast("saved " + r.path); cfgLoadBackups(r.path); cfgInit("reload"); }
+    };
+    if (isMcp) $("#cfgAddMcp").onclick = () => cfgAddMcp(r.path);
+  }
+  cfgLoadBackups(r.path);
+}
+async function cfgAddMcp(path) {
+  const name = prompt("MCP server name?");
+  if (!name) return;
+  const cmd = prompt("command (stdio) — leave blank for a URL server:", "");
+  let value;
+  if (cmd) { const args = prompt("args (space-separated, optional):", ""); value = {command: cmd, ...(args ? {args: args.split(/\s+/).filter(Boolean)} : {})}; }
+  else { const url = prompt("server url:"); if (!url) return; value = {url}; }
+  const res = await cfgPost("/api/configs/entry", {action: "add", path, kind: "mcp", name, value});
+  if (res.error) toast("✗ " + res.error);
+  else { toast("added MCP " + name); cfgInit("reload"); cfgEdit(path); }
+}
+async function cfgLoadBackups(path) {
+  const host = $("#cfgBackups");
+  if (!host) return;
+  let all;
+  try { all = await j("/api/configs/backups"); } catch (e) { return; }
+  const mine = (Array.isArray(all) ? all : []).filter(b => b.orig === path).slice(0, 6);
+  if (!mine.length) { host.innerHTML = ""; return; }
+  host.innerHTML = `<div class="cfgsec"><h4>backups · undo</h4>` + mine.map(b =>
+    `<div class="cfgitem"><span class="cfgmut">${esc(b.at)}</span> <span class="src">${b.size}B</span> <button class="chip" data-bk="${esc(b.backup)}">restore</button></div>`).join("") + `</div>`;
+  host.querySelectorAll("button[data-bk]").forEach(el => el.onclick = async () => {
+    if (!confirm("restore this backup over the current file?")) return;
+    const res = await cfgPost("/api/configs/restore", {backup: el.dataset.bk});
+    if (res.error) toast("✗ " + res.error);
+    else { toast("restored"); cfgInit("reload"); cfgEdit(path); }
+  });
+}
+$("#cfgFilter").addEventListener("input", () => { if (CFG.loaded) cfgRenderTree(); });
+$$("#cfgbar .chip[data-ch]").forEach(ch => ch.onclick = () => {
+  CFG.ch = ch.dataset.ch;
+  $$("#cfgbar .chip[data-ch]").forEach(x => x.classList.toggle("on", x === ch));
+  if (CFG.loaded) cfgRenderTree();
+});
+$("#cfgReload").onclick = () => cfgInit("rescan");
+$("#storerevReload").onclick = () => srevInit(true);
+
+
+/* ================= task backlog (#218 — the socket's second section) ====
+   Same contract as the decision queue above, task-scoped: render
+   generations, typing-hold, and the draft ledger all mirror the odq
+   idioms because the owner reported the #231 composer wipe ON THIS TAB —
+   the protections are load-bearing, not style. NEVER touches the decisions badge or
+   the home deck: tasks are team work, decisions are owner gates, and the
+   badge counting both is the recorded 19-row collapse. */
+let TQ_GEN = 0;
+/* THE ACTIVE CHIPS AND THE ONE ACCEPTED SNAPSHOT THEY SLICE. Per-tab state on
+   purpose — a filter is a thing the reader is doing right now, not a
+   preference, and a chip that survived a reload would make him meet a 4-row
+   backlog with no memory of asking for one.
+
+   TQ_VIEW IS THE VERSION EVERY SURFACE RENDERS, AND THERE IS EXACTLY ONE OF
+   IT. {d, at} — one server payload and the instant it arrived here. The home
+   band cell, the card's headline and the card's rows all paint from this and
+   nothing else, so they cannot be showing two versions of the queue. The
+   first cut fed the band cell straight off the fetch and then let tqRender
+   HOLD, which is precisely two versions: the band advanced and the card did
+   not, off one read, with nothing on either saying so. */
+const TQ_ON = new Set();
+let TQ_VIEW = null;
+let TQ_PENDING = null;
+async function tqInit() {
+  const gen = ++TQ_GEN;
+  let body;
+  try {
+    body = await j("/api/tasks", 8000);
+  } catch (e) {
+    if (gen !== TQ_GEN) return;
+    /* A FAILED READ IS A SNAPSHOT TOO, AND IT IS THE UNKNOWN ONE. It REPLACES
+       the accepted view rather than sitting beside it: the defect this cures
+       is a headline of real numbers left standing on a card whose read has
+       stopped answering, which tells the owner the backlog is what it was at
+       the exact moment we lost the ability to say. */
+    tqAccept({unavailable: e.message, queue: null, entries: [], unscoped: [],
+              counts: {}, read_at: null});
+    return;
+  }
+  if (gen !== TQ_GEN) return;
+  tqAccept(body);
+}
+function tqAccept(d) {
+  /* A SNAPSHOT IS ACCEPTED ONLY IF THE CARD CAN RENDER IT. The one thing that
+     legitimately outranks a refresh is a reader with a comment disclosure
+     OPEN: replacing the list wholesale discards the fetched body and throws
+     the card out of the viewport mid-read. So the new body PARKS instead —
+     and, crucially, TQ_VIEW does not advance either, so the band and the card
+     stay on one version. What stops that version standing forever is that it
+     AGES: `tqPaint` re-reads its own age every tick and both cells blank past
+     the freshness bound, so a held card degrades to UNKNOWN rather than to a
+     confident stale number.
+
+     TYPING NO LONGER HOLDS ANYTHING, which is the other half of this cure. A
+     draft lives in TQ_DRAFTS — outside the rendered rows — and `tqRender`
+     restores it along with the caret, so a refresh under a typing reader
+     costs nothing and there is no reason left to defer a version for it. */
+  if (tqNotesOpen()) { TQ_PENDING = d; return; }
+  TQ_PENDING = null;
+  TQ_VIEW = {d: d, at: Date.now()};
+  tqPaint();
+}
+function tqPaint() {
+  /* THE ONE PAINT. Both cells, one snapshot, one age — computed HERE so the
+     band and the card can never disagree about how old the read is either. */
+  if (!TQ_VIEW) { dashQueue(null, null); return; }
+  const ageS = (Date.now() - TQ_VIEW.at) / 1e3;
+  dashQueue(TQ_VIEW.d, ageS);
+  tqRender(TQ_VIEW.d, ageS);
+}
+/* THE BOARD-HOME CELL (task/2622). The owner reads the browser pane beside
+   the integrator and reads TOTAL NUMBERS there; the queue he was asking about
+   had no number anywhere on the home band at all — the band's pipeline row
+   counts LAND LOOPS, which is a different population and answers a different
+   question. One cell, one snapshot, the SAME `tqHeadHTML` the card draws, and
+   the home-card law applies to it like every other cell: it names the read
+   behind it and renders NOTHING once that read is past its freshness bound. */
+function dashQueue(d, ageS) {
+  const cell = $("#dqueue");
+  if (!cell) return;                       // a page without the band (tests)
+  if (d === null || d === undefined) {
+    cell.innerHTML = '<span class="dmut">not read yet</span>';
+    return;
+  }
+  const go = ' <span class="dslink" data-gowork>the queue: work →</span>';
+  /* CANNOT SEE IS NOT ZERO, AND NEITHER IS TOO OLD TO SAY. Both branches
+     clear EVERY number through the same renderer the good branch uses, so
+     there is no path on which the previous totals survive a read that failed
+     or expired — the headline is drawn from `tqQueueOf`, which answers null
+     for both, and `tqHeadHTML(null)` is the word UNKNOWN in every field. */
+  const why = tqUnknownWhy(d, ageS);
+  cell.innerHTML = tqHeadHTML(tqQueueOf(d, ageS))
+    + (why ? ' <span class="dmut">— ' + esc(why) + "</span>" : "")
+    + cardSource("helm task list", ageS) + go;
+  cell.querySelectorAll("[data-gowork]").forEach(e => e.onclick = ev => {
+    ev.stopPropagation();
+    showView("work");
+  });
+}
+function tqUnknownWhy(d, ageS) {
+  /* WHY the numbers are not being shown, or "" when they are. One function,
+     so the band and the card give the same reason for the same snapshot. */
+  if (!d || d.unavailable)
+    return String((d && (d.why || d.unavailable)) || "the task read failed");
+  if (cardStale(ageS, 45))
+    return "the read behind these totals is " + lrAgo(ageS)
+      + ", past this card's freshness bound — run `helm task list`";
+  if (!d.queue)
+    return "this server sent no queue totals";
+  return "";
+}
+function tqQueueOf(d, ageS) {
+  /* THE TOTALS THIS SNAPSHOT MAY RENDER, or null. null is the ONLY thing a
+     failed, malformed or expired read produces, and `tqHeadHTML` draws null
+     as UNKNOWN — so "keep the last numbers" is not a reachable state rather
+     than a branch somebody has to remember not to write. */
+  return tqUnknownWhy(d, ageS) ? null : d.queue;
+}
+function tqClock() {
+  /* THE CARD'S OWN TICK, FASTER THAN THE FETCH IT RENDERS. A value that may
+     only stand for four poll intervals needs a reader that runs more often
+     than the poll, or the blanking arrives a whole cycle late. Pure DOM, no
+     network — it re-paints the SAME accepted snapshot with a fresh age, which
+     is what makes the freshness bound fire on a read that stopped answering
+     and on a version parked behind an open disclosure alike. */
+  if (TQ_VIEW) tqPaint();
+}
+async function tqNotes(det) {
+  const body = det.querySelector(".otqnotebody");
+  if (!body || det.dataset.filled) return;
+  det.dataset.filled = "1";           // one fetch per open card, not per toggle
+  try {
+    const d = await j("/api/task/notes?id=" + encodeURIComponent(det.dataset.id), 8000);
+    /* CANNOT SEE IS NOT "NO NOTES" — the same state triad the backlog uses.
+       Drawing an unreadable ledger as an empty comment list would tell the
+       owner nobody wrote anything at the moment we lost the ability to say. */
+    if (!d || d.unavailable) {
+      body.innerHTML = '<div class="empty">✗ CANNOT SEE these comments'
+        + (d && d.why ? " — " + esc(d.why) : "") + "</div>";
+      det.dataset.filled = "";        // a failure may be retried
+      return;
+    }
+    if (d.error) { body.innerHTML = '<div class="empty">' + esc(d.error) + "</div>"; return; }
+    const rows = Array.isArray(d.comments) ? d.comments : [];
+    body.innerHTML = rows.length
+      ? rows.map(c => '<div class="otqnote"><span class="otqnoteby">'
+          + esc(c.by || "unattributed") + '</span> <span class="odqid">'
+          + esc(tqWhen(c.ts_epoch)) + '</span><div class="otqnotetext">'
+          + esc(c.text || "") + "</div></div>").join("")
+      : '<div class="empty">no comments</div>';
+  } catch (e) {
+    body.innerHTML = '<div class="empty">✗ ' + esc(e.message) + "</div>";
+    det.dataset.filled = "";
+  }
+}
+async function tqNoteFull(det) {
+  /* THE DOOR THE EXCERPT OWES. `/api/tasks` bounds the row's `note` so the
+     backlog stays a payload rather than a download; that bound is only
+     honest if the rest is REACHABLE, and this is the fetch that reaches it.
+     Same route, same lazy-on-open discipline and the same state triad as the
+     comments above — `/api/task/notes` carries the row's whole note beside
+     its whole comment list, because both are the same kind of thing: prose
+     that belongs to ONE row and must not ride a list of every row. */
+  const body = det.querySelector(".otqnotebody");
+  if (!body || det.dataset.filled) return;
+  det.dataset.filled = "1";           // one fetch per open card, not per toggle
+  try {
+    const d = await j("/api/task/notes?id=" + encodeURIComponent(det.dataset.id), 8000);
+    /* CANNOT SEE IS NOT "THE NOTE ENDS HERE". Drawing an unreadable ledger
+       as the end of the text would turn a lost read into a shorter note,
+       which is the exact confusion the excerpt flag exists to prevent. */
+    if (!d || d.unavailable) {
+      body.innerHTML = '<div class="empty">✗ CANNOT SEE the rest of this note'
+        + (d && d.why ? " — " + esc(d.why) : "") + "</div>";
+      det.dataset.filled = "";        // a failure may be retried
+      return;
+    }
+    if (d.error) { body.innerHTML = '<div class="empty">' + esc(d.error) + "</div>"; return; }
+    /* AND A SERVER THAT DOES NOT SERVE IT SAYS SO. An older trunk answers
+       this route without `note`; rendering "" there would present an empty
+       string as the rest of the text. Absent is its own state and gets its
+       own words. */
+    if (typeof d.note !== "string") {
+      body.innerHTML = '<div class="empty">✗ this server does not serve the '
+        + "full note on this route</div>";
+      det.dataset.filled = "";
+      return;
+    }
+    body.innerHTML = '<div class="otqnotetext">' + esc(d.note) + "</div>";
+  } catch (e) {
+    body.innerHTML = '<div class="empty">✗ ' + esc(e.message) + "</div>";
+    det.dataset.filled = "";
+  }
+}
+$("#otqlist").addEventListener("toggle", ev => {
+  const det = ev.target;
+  if (!det || !det.classList || !det.classList.contains("otqnotes")) return;
+  /* TWO DISCLOSURES, ONE CLASS, ONE HOLD. Both carry `otqnotes` so
+     `tqNotesOpen` protects an open one from the 45-second refresh without
+     knowing which it is; `data-kind` is what picks the filler. */
+  if (det.open) {
+    if (det.dataset.kind === "note") tqNoteFull(det); else tqNotes(det);
+    return;
+  }
+  /* AND THE PARKED VERSION LANDS THE MOMENT THE READER IS DONE. A snapshot
+     deferred by an open disclosure must not wait for the next 45-second poll
+     to become the accepted one — that would leave the card a whole cadence
+     behind the board home for no reason once the thing that justified the
+     hold is gone. */
+  if (TQ_PENDING && !tqNotesOpen()) tqAccept(TQ_PENDING);
+}, true);   /* capture: `toggle` does not bubble */
+
+function tqNotesOpen() {
+  /* A REFRESH MUST NOT YANK THE PAGE OUT FROM UNDER A READER.
+     REPRODUCED AT THE EXACT TIP: task/329 open with 8,148 chars and
+     scrolled near the bottom, tqInit fires on its 45s timer, and the list is
+     replaced wholesale via innerHTML — the disclosure closes, the fetched
+     body is discarded, the placeholder returns and the card lands 1,671px
+     ABOVE the viewport. Reading a long ruling is exactly the use case this
+     feature exists for, so a 45-second guillotine made it worse than the
+     counter it replaced.
+
+     THE SIBLING RULE FOR A TYPING COMPOSER IS GONE, and deliberately: a
+     composer needs its TEXT and its CARET kept, which TQ_DRAFTS and
+     `tqFocusState` now do outside the rows, so there is nothing left for a
+     hold to protect and the hold was costing a split version. This one
+     remains because what an open disclosure holds is a FETCHED BODY and a
+     scroll position, neither of which survives being parked in a variable.
+     The version it defers ages like any other, so the card degrades to
+     UNKNOWN rather than standing on a confident stale number. */
+  return !!document.querySelector("#otqlist .otqnotes[open]");
+}
+const TQ_DRAFTS = {};
+function tqComposerState() {
+  document.querySelectorAll("#otqlist .otqcard").forEach(el => {
+    const c = el.querySelector(".otqcomment");
+    if (!c) return;
+    if (c.value) TQ_DRAFTS[el.dataset.id] = c.value;
+    else delete TQ_DRAFTS[el.dataset.id];
+  });
+  return TQ_DRAFTS;
+}
+/* ================= THE QUEUE HEADER (task/2622) ====================
+   THE OWNER'S QUESTION, in his words: "how am I supposed to help or
+   cross-check the priority ordering of such a massive outstanding list".
+   Measured the morning he asked: 477 open rows — 5 P0, 39 P1, 409 P2, 24 P3,
+   13 in progress. He reads TOTAL NUMBERS in the browser pane beside the
+   integrator and does not read row text, so the first thing this card owes
+   him is five numbers and two ages, not 477 sentences with the numbers
+   derivable from them.
+
+   AND THE SAME LINE RENDERS ON THE BOARD HOME, from the SAME function and
+   the SAME read. Two spellings of a headline is how a console comes to
+   disagree with itself; `tqHeadHTML` is the one spelling and the band cell
+   and the card both call it. */
+/* NOTHING IN THIS FILE PARSES A TIMESTAMP, AND THAT IS THE POINT. A reader
+   here is a SECOND reader — "a date is any number above 1e9" against the
+   store's "any number above 0" — and two such readers disagree over a whole
+   window of stamps while each draws a confident age from its own
+   opinion. The server resolves every age against ONE parser at the instant of
+   ONE read and sends numbers or null; these functions FORMAT and nothing
+   else. A null is the word UNKNOWN, never a number, and there is no code path
+   here that could turn it into one. The seven-day staleness line is the
+   server's `STALE_NOTE_S` for the same reason: the chip that selects stale
+   rows and the mark a row draws on itself must be one rule. */
+function tqAgeText(s) {
+  return s === null || s === undefined ? "UNKNOWN" : lrAgo(s);
+}
+function tqHeadHTML(t) {
+  /* NULL TOTALS ARE THE WORD IN EVERY FIELD. A read that failed, that this
+     server could not total, or that is past its freshness bound arrives here
+     as null — and the one thing this renderer must never do is leave the
+     numbers it drew last standing, because a stale headline is read as a
+     current one. Same shape, same fields, no numbers. */
+  const n = (label, v, cls) => '<span class="tqn' + (cls ? " " + cls : "")
+    + '"><b>' + v + "</b> " + esc(label) + "</span>";
+  if (!t) {
+    return '<span class="tqn tqunk"><b>UNKNOWN</b> backlog</span>'
+      + ["P0", "P1", "P2", "P3", "UNRANKED", "in progress"]
+        .map(k => n(k, "UNKNOWN", "tqmut tqunk")).join("");
+  }
+  /* THE OLDEST AGE IS ONLY CLAIMED WHERE IT IS KNOWN. A rank with rows but no
+     readable stamp says so; a rank with no rows says nothing, because
+     "oldest P0 unknown" over zero P0s reads as a failure rather than as an
+     empty rank. */
+  const oldest = p => !t[p] ? ""
+    : t.oldest[p] === null || t.oldest[p] === undefined
+      ? '<span class="tqn tqmut">oldest ' + p + " age UNKNOWN</span>"
+      : '<span class="tqn' + (p === "P0" ? " tqwarn" : "") + '">oldest ' + p
+        + " " + esc(lrAgo(t.oldest[p])) + "</span>";
+  return n("P0", t.P0, t.P0 ? "tqwarn" : "tqmut")
+    + n("P1", t.P1, t.P1 ? "" : "tqmut")
+    + n("P2", t.P2, "tqmut") + n("P3", t.P3, "tqmut")
+    + (t.unranked ? n("UNRANKED", t.unranked, "tqwarn") : "")
+    + n("in progress", t.in_progress, t.in_progress ? "" : "tqmut")
+    + oldest("P0") + oldest("P1");
+}
+
+/* THE FILTER CHIPS. Client side over the payload already in hand — the whole
+   backlog is one read and slicing it must not cost another. */
+const TQ_CHIPS = [
+  {key: "P0", label: "P0",
+   hint: "rank P0 only — the rows somebody judged a fleet blocker"},
+  {key: "P1", label: "P1", hint: "rank P1 only"},
+  {key: "mine", label: "★ you asked",
+   hint: "rows filed with OWNER provenance — the things you asked for. A "
+       + "legacy row whose provenance nobody witnessed is UNKNOWN and is "
+       + "never drawn as either answer, so it is not here"},
+  {key: "unowned", label: "unowned",
+   hint: "no seat holds this row — it is in the pool any idle seat may take"},
+  {key: "stale", label: "stale 7d+",
+   hint: "nobody has written a note on this row in seven days (for a row with "
+       + "no notes at all, seven days since it was filed)"}];
+function tqChipHit(r, key) {
+  if (key === "P0" || key === "P1") return r && r.priority === key;
+  /* THE OWNER'S OWN MARK, and it is the strictly-equal "owner" stamp for the
+     reason the card's ★ uses it: a legacy row with no recorded provenance is
+     UNKNOWN, not evidence that he did NOT ask. */
+  if (key === "mine") return !!r && r.origin === "owner";
+  if (key === "unowned") return !!r && !r.owner;
+  /* THE SERVER DECIDED THIS, against its own seven-day line and its own
+     clock. The chip selecting rows by one rule while the STALE mark on the
+     row drew itself by another is exactly what one field prevents. */
+  if (key === "stale") return !!r && r.stale === true;
+  return true;
+}
+function tqFilter(rows, active) {
+  /* RANKS OR EACH OTHER, EVERY OTHER CHIP ANDs. P0 and P1 are two values of
+     ONE field, so requiring both selects nothing and would read as a broken
+     filter; "unowned" and "stale" are independent questions and a reader
+     ticking both means both. One rule per axis, stated, rather than one rule
+     that is wrong on one of them. */
+  const keys = active || [];
+  const ranks = keys.filter(k => k === "P0" || k === "P1");
+  const flags = keys.filter(k => k !== "P0" && k !== "P1");
+  return (rows || []).filter(r =>
+    (!ranks.length || ranks.some(k => tqChipHit(r, k)))
+    && flags.every(k => tqChipHit(r, k)));
+}
+function tqChipsHTML(active) {
+  const on = new Set(active || []);
+  return TQ_CHIPS.map(c => '<button class="chip tqchip' + (on.has(c.key) ? " on" : "")
+    + '" data-chip="' + esc(c.key) + '" title="' + esc(c.hint) + '">'
+    + esc(c.label) + "</button>").join("");
+}
+
+function tqRender(d, ageS) {
+  const host = $("#otqlist"), meta = $("#otqmeta");
+  const saved = tqComposerState(), focus = tqFocusState();
+  /* THE HEADLINE IS DRAWN BEFORE ANY BRANCH BELOW CAN RETURN, and it is drawn
+     from the SAME `tqQueueOf` the board home's cell uses on the SAME
+     snapshot. The defect this closes: every early return here left the
+     previous totals standing in the header — a failed read cleared the meta
+     line to UNKNOWN and the five numbers above it went on reading like a
+     current backlog. There is now no path out of this function that leaves
+     a number the accepted snapshot does not carry. */
+  const head = $("#otqqueue");
+  if (head) head.innerHTML = tqHeadHTML(tqQueueOf(d, ageS))
+    + (tqUnknownWhy(d, ageS)
+       ? ' <span class="cfgmut">— ' + esc(tqUnknownWhy(d, ageS)) + "</span>"
+       : cardSource("helm task list", ageS));
+  /* THE STATE TRIAD: unavailable is NOT empty. An unreadable ledger drawn
+     as a clear backlog tells the owner the fleet is idle at the exact
+     moment it lost the ability to answer. */
+  if (!d || d.unavailable) { host.innerHTML = '<div class="empty">✗ CANNOT SEE the task backlog' + (d && d.why ? " — " + esc(d.why) : "") + "</div>"; meta.textContent = "UNKNOWN"; return; }
+  /* AND THE ROWS EXPIRE WITH THE HEADER. Rows past the freshness bound are a
+     backlog as it was, rendered as a backlog as it is; blanking the numbers
+     while leaving the list would be the same lie one line further down. */
+  if (cardStale(ageS, 45)) {
+    host.innerHTML = '<div class="empty">✗ STALE — the task read behind this '
+      + "list is " + esc(lrAgo(ageS)) + ", past this card's freshness bound. "
+      + "Nothing is rendered rather than rendering what it was; press ↻ "
+      + "reload or run <code>helm task list</code>.</div>";
+    meta.textContent = "UNKNOWN";
+    return;
+  }
+  /* THE PROJECT AXIS (task/974): the surface NAMES the project it renders —
+     two projects' consoles must be distinguishable — and what the API
+     withheld (foreign-project rows) is said as a COUNT, never silently
+     absent. The UNSCOPED legacy bucket renders SEPARATELY below the scoped
+     rows: every row filed before the axis is legacy, so hiding it would
+     blank the live board, and drawing it inside the project would claim a
+     scope nobody stamped. */
+  const rows = Array.isArray(d.entries) ? d.entries : [], c = d.counts || {};
+  const unsc = Array.isArray(d.unscoped) ? d.unscoped : [];
+  const live = rows.filter(r => r.status !== "closed");
+  const uliv = unsc.filter(r => r.status !== "closed");
+  const closed = rows.concat(unsc).filter(r => r.status === "closed");
+  /* "you asked" counts only LIVE rows, and only the strictly-equal "owner"
+     stamp: an UNKNOWN legacy row (origin null) is not evidence the owner did
+     NOT ask, so it is never drawn as either answer. Absent means absent. */
+  const asked = live.concat(uliv).filter(r => r.origin === "owner").length;
+  /* THE RANK DEBT IS A NUMBER THE OWNER ASKED FOR. "Are tasks prioritized"
+     is answered by the chips on the cards AND by how many rows carry none —
+     a board that shows four ranked rows at the top and says nothing about
+     the rest answers the question optimistically. Counted over the SAME
+     population the meta line already describes (scoped + the unscoped
+     legacy bucket), so the number and the visible rows cannot disagree. */
+  const unranked = live.concat(uliv).filter(r => !r.priority).length;
+  const chipbar = $("#otqchips");
+  if (chipbar && chipbar.dataset.wired !== "1") {
+    chipbar.dataset.wired = "1";
+    chipbar.addEventListener("click", ev => {
+      const btn = ev.target.closest && ev.target.closest("[data-chip]");
+      if (!btn) return;
+      const key = btn.dataset.chip;
+      if (TQ_ON.has(key)) TQ_ON.delete(key); else TQ_ON.add(key);
+      /* RE-PAINT THE ACCEPTED SNAPSHOT, NOT A NEW FETCH. The chips slice a
+         payload already in hand; asking the server again would make a filter
+         cost a read and would blank the card while it waited — and it would
+         put a SECOND version on the card beside a headline drawn from the
+         first. Through tqPaint so the age, the headline and the rows all
+         move together or not at all. */
+      tqPaint();
+    });
+  }
+  if (chipbar) chipbar.innerHTML = tqChipsHTML(Array.from(TQ_ON));
+  const active = Array.from(TQ_ON);
+  const shown = tqFilter(live, active);
+  const ushown = tqFilter(uliv, active);
+  const hidden = (live.length + uliv.length) - (shown.length + ushown.length);
+  meta.textContent = (d.project ? "project " + d.project + " · " : "")
+    + (c.open || 0) + " open" + (c.in_progress ? ` · ${c.in_progress} in progress` : "") + (c.closed ? ` · ${c.closed} closed` : "") + (asked ? ` · ${asked} you asked for` : "")
+    + (unranked ? ` · ${unranked} UNRANKED (helm task triage)` : "")
+    + (d.withheld_foreign ? ` · ${d.withheld_foreign} from other projects withheld` : "")
+    /* A FILTER THAT HIDES ROWS SAYS SO. A chip left on from five minutes ago
+       makes a 477-row backlog look like a 4-row one, and the difference
+       between "nothing matches" and "nothing is there" is the whole state
+       triad this card already keeps one level up. */
+    + (hidden ? ` · ${hidden} hidden by the filter` : "");
+  if (!rows.length && !unsc.length) {
+    host.innerHTML = '<div class="empty">' + (d.withheld_foreign
+      ? "no tasks in project " + esc(d.project || "?") + " — " + d.withheld_foreign + " row(s) from other projects withheld (this console renders one project)"
+      : "no tasks — the backlog is genuinely clear") + "</div>";
+    return;
+  }
+  host.innerHTML = shown.map(tqCard).join("")
+    + (!shown.length && !ushown.length && hidden
+      ? `<div class="empty">no row matches this filter — ${hidden} live row${hidden > 1 ? "s are" : " is"} hidden by it, and the backlog itself is not empty</div>`
+      : "")
+    + (ushown.length
+      ? `<div class="empty otqbucket">${ushown.length} unscoped legacy row${ushown.length > 1 ? "s" : ""} — filed before the project axis; no project claims them, nothing retro-stamps history</div>`
+        + ushown.map(tqCard).join("")
+      : "")
+    + (closed.length
+      ? `<details class="otqclosed"><summary>${closed.length} closed — cited ids resolve here</summary>`
+        + closed.map(r => `<div class="otqtomb"><span class="odqid">${esc(r.id)}</span> ${esc(r.title)}`
+          + (r.closed_reason ? ` <span class="cfgmut">— ${esc(r.closed_reason)}</span>` : "") + `</div>`).join("")
+        + `</details>`
+      : "");
+  host.querySelectorAll(".otqcard").forEach(el => {
+    const box = el.querySelector(".otqcomment");
+    if (box && saved[el.dataset.id]) box.value = saved[el.dataset.id];
+    const cbtn = el.querySelector(".otqsay");
+    if (cbtn) cbtn.onclick = () => {
+      const t = box.value.trim();
+      if (!t) { toast("type the comment first"); return; }
+      tqAct({id: el.dataset.id, text: t}, el);
+    };
+  });
+  tqRestoreFocus(focus);
+}
+function tqFocusState() {
+  /* WHERE THE READER'S CARET IS, PARKED OUTSIDE THE ROWS. This and TQ_DRAFTS
+     are what let a refresh land under a typing reader instead of being held
+     off: the draft text survives because it is stored here rather than in the
+     DOM being replaced, and the caret survives for the same reason. Without
+     the caret the text alone is not enough — a restored value with the cursor
+     thrown to position zero is a wipe as far as the person typing is
+     concerned. The decision queue beside this one has worked this way from
+     the start (odqComposerState); the backlog card held instead, and holding
+     is what let the board home and this card show two versions of one queue. */
+  const a = document.activeElement, host = $("#otqlist");
+  if (!a || !host || !host.contains(a)
+      || !(a.classList && a.classList.contains("otqcomment"))) return null;
+  const card = a.closest && a.closest(".otqcard");
+  return card ? {id: card.dataset.id, start: a.selectionStart,
+                 end: a.selectionEnd} : null;
+}
+function tqRestoreFocus(f) {
+  if (!f) return;
+  const card = $("#otqlist").querySelector('.otqcard[data-id="'
+    + (window.CSS && CSS.escape ? CSS.escape(f.id) : f.id) + '"]');
+  const box = card && card.querySelector(".otqcomment");
+  if (!box) return;
+  box.focus();
+  try { box.setSelectionRange(f.start, f.end); } catch (e) { /* not selectable */ }
+}
+function tqWhen(epoch) {
+  /* THE OWNER READS DATES; THE SERVER READ THE STAMP. This takes the epoch
+     `tasks.stamp_epoch` produced — a number or null — and formats it. Taking
+     the raw `ts` and deciding here what a date is ("any number over 1e9, else
+     the first sixteen characters of whatever this is") prints a truncated
+     slice of a malformed value as though it were a date. A stamp nobody could
+     read is the WORD, never a rendering of the garbage. */
+  return epoch === null || epoch === undefined || !Number.isFinite(Number(epoch))
+    ? "date UNKNOWN"
+    : new Date(Number(epoch) * 1000).toISOString().slice(0, 16).replace("T", " ");
+}
+function tqCard(r) {
+  /* THE FOUR THINGS THE OWNER ASKED TO SEE ON A ROW: priority, id, owner
+     (loud when nobody holds it), how long it has been waiting, how long since
+     anybody said anything, and the first line of what they said. The rank
+     chip and the ★ were already here; the ages and the note line are what
+     turn a list into something he can cross-check.
+
+     EVERY NUMBER HERE ARRIVED AS A NUMBER. The ages and the stale verdict are
+     the server's, resolved by one parser at the instant of one read; this
+     function chooses words for them and computes nothing. Null is UNKNOWN. */
+  const filedAge = r.age_s;
+  const note = r.last_note || null;
+  const notedAge = r.noted_age_s;
+  const stale = r.stale === true;
+  return `<div class="odqcard otqcard${stale ? " tqstalerow" : ""}" data-id="${esc(r.id)}">`
+    + `<div class="odqtop">`
+    + (r.origin === "owner" ? `<span class="otqasked" title="you asked for this — filed with owner provenance, not an agent's guess">★ you asked</span> ` : "")
+    /* THE RANK CHIP, AND ITS ABSENCE IS A STATE. The server normalizes
+       `priority` to one of the four ranks or null, so truthiness is safe
+       HERE in a way it is not for `origin` one line up — there the raw field
+       carries a third value and a truthy test would mark every agent row as
+       the owner's. An UNRANKED row draws NO chip rather than a "P3" or a
+       dash: nobody-has-judged-this and judged-lowest are different answers,
+       and a filler that looks like a rank is the eighth spelling the field
+       exists to refuse. The rows arrive RANK-FIRST AND OLDEST-FIRST from the
+       server, which owns the order (tasks.board_order — the SAME ordering
+       `helm task list` prints, so the board and the terminal cannot show one
+       snapshot as two lists) so this file holds no second rank table and no
+       second age comparator. */
+    + (r.priority ? `<span class="otqrank otqrank${esc(r.priority)}" title="rank ${esc(r.priority)} — the board is ordered P0 first; a row with no chip is UNRANKED, which is not the same as ranked low">${esc(r.priority)}</span> ` : "")
+    + `<span class="odqtitle">${esc(r.title)}</span><span class="odqid">${esc(r.id)}</span></div>`
+    + `<div class="odqmeta">`
+    + `<span>${esc(r.status)}</span>`
+    /* UNOWNED IS LOUD, AND IT IS NOT AN ERROR. An open row nobody holds is
+       the pool an idle seat is offered from — the ledger's own law — so the
+       word is a call to action rather than an alarm. What it may never be is
+       ABSENT: the old card printed the owner when there was one and nothing
+       when there was not, so "unowned" and "the field did not render" looked
+       identical on a 477-row board. */
+    + (r.owner ? `<span>owner: ${esc(r.owner)}</span>`
+               : `<span class="tqunowned" title="no seat holds this row — it sits in the pool any idle seat may take. It is not a fault and it is not an omission: this row genuinely has no owner">UNOWNED</span>`)
+    + `<span title="how long this row has been waiting since it was filed — the age the board orders by inside each rank, so this is the number to cross-check the ordering against">filed ${esc(tqAgeText(filedAge))}</span>`
+    /* SINCE ANYBODY SAID ANYTHING, which is the question "placed on the list
+       and ignored" actually asks. A row with no notes says so rather than
+       borrowing its filing stamp into a sentence about notes — the number
+       behind the stale mark is the same one either way (noted_age_s). */
+    + (note
+      ? `<span class="${stale ? "tqwarn" : ""}" title="when the newest note was written on this row">last note ${esc(tqAgeText(notedAge))}${note.by ? " · " + esc(note.by) : ""}</span>`
+      : `<span class="${stale ? "tqwarn" : ""}" title="nobody has written a note on this row at all; the age is since it was filed">no notes</span>`)
+    + (stale ? `<span class="tqstale" title="no note in seven days — the same rule the stale chip filters by, so the mark and the chip can never select different rows">STALE</span>` : "")
+    + `<span>${esc(tqWhen(r.ts_epoch))}</span>`
+    + (r.refs && r.refs.length ? `<span>refs: ${esc(r.refs.join(" "))}</span>` : "")
+    + `</div>`
+    /* THE ROW'S NOTE, AND WHETHER THAT IS ALL OF IT. The server sends a
+       BOUNDED opening and states the rest with `note_more` — it is the
+       heaviest field on a payload that carries every row (2.2 MB of 4.4 MB,
+       measured), and unbounded prose on a per-row list is the growth
+       `/api/task/notes` was built to refuse one field over. The whole point
+       of the flag is that a reader can never mistake an excerpt for the
+       note: `note_more === true` draws a DOOR, and the absence of that door
+       is this card saying THAT IS ALL OF IT. Strict === so a server that
+       sends no flag at all draws no door rather than a false one — it also
+       sends no excerpt, so there is nothing to mislead about. */
+    + (r.note ? `<div class="odqctx">${esc(r.note)}</div>` : "")
+    + (r.note_more === true
+      ? `<details class="otqnotes otqfull" data-kind="note" data-id="${esc(r.id)}">`
+        + `<summary title="this card shows the opening of the note only — the rest is one fetch away, never a silent cut">…read the rest of this note</summary>`
+        + `<div class="otqnotebody">…</div></details>` : "")
+    /* THE LAST NOTE'S FIRST LINE, IN THE LIST. The disclosure below holds the
+       whole conversation and costs a fetch to open; this is the one sentence
+       that tells him whether opening it is worth doing. FIRST LINE, not a
+       truncation: a cut mid-word reads as a rendering fault, a first line is
+       a thing its author wrote (the server cuts it, `_task_last_note`). */
+    + (note && note.line
+      ? `<div class="odqctx tqlastnote"><b>last note</b> ${esc(note.line)}</div>` : "")
+    /* THE COUNT USED TO BE THE WHOLE THING. `/api/tasks` sends len(comments)
+       and this rendered "3 comments" — so a ruling an agent filed onto a row,
+       which is where owner decisions are supposed to live BECAUSE chat lines
+       scroll away, reached this console as a NUMBER. Lazily fetched on open:
+       comments are unbounded prose and this list carries every row. */
+    + (r.comments ? `<details class="otqnotes" data-id="${esc(r.id)}">`
+        + `<summary>${r.comments} comment${r.comments > 1 ? "s" : ""}</summary>`
+        + `<div class="otqnotebody">…</div></details>` : "")
+    + `<div class="odqacts"><input class="otqcomment" placeholder="note for the fleet (annotates the task)…" autocomplete="off">`
+    + `<button class="chip otqsay">comment</button></div>`
+    + `</div>`;
+}
+/* capture + clear BEFORE the await; a failed send restores rather than
+   eats (the same delivered-text-never-resurrects contract as odqAct).
+   IT RIDES post(), LIKE EVERY OTHER MUTATION ON THIS PAGE (task/2621). `j` is
+   the READ helper — it takes (url, ms) — so handing it a {method, body} init
+   drops the request body and issues a GET at this POST-only route: the note
+   never leaves the page, the server answers `not found: /api/tasks/comment`,
+   and the owner reads a 404 in a toast while the ledger, the route, the
+   handler and the bearer are all healthy. `post` is the door that carries the
+   method, the body and the token. */
+async function tqAct(body, el) {
+  el.style.opacity = ".5";
+  const id = el.dataset.id, box = el.querySelector(".otqcomment"), sent = box ? box.value : "";
+  if (box) box.value = "";
+  delete TQ_DRAFTS[id];
+  try {
+    const d = await post("/api/tasks/comment", body);
+    /* A WARNING IS A PARTIAL FAILURE AND HE MUST SEE IT. tasks.comment can
+       hand back the written row AND a complaint about it; the decision queue
+       one section up surfaces its delivery_error exactly this way, and a note
+       that landed carrying a problem is not the same event as one that landed
+       clean. Drawing both as "commented on task/N" is how a half-failure
+       becomes invisible. */
+    toast(d && d.warning ? "commented on " + id + " — " + d.warning
+                         : "commented on " + id,
+          d && d.warning ? 5000 : 2600);
+    tqInit();
+  } catch (e) {
+    const live = el.isConnected && el.querySelector(".otqcomment");
+    if (live && !live.value) live.value = sent; else if (sent) TQ_DRAFTS[id] = sent;
+    toast("✗ " + e.message);
+    el.style.opacity = "";
+  }
+}
+$("#otqReload").onclick = () => tqInit();
+setInterval(tqInit, 45000);
+/* BOTH CELLS EXPIRE ON ONE TICK, FASTER THAN THE FETCH THEY RENDER: a value
+   that may only stand for four poll intervals needs a reader that runs more
+   often than the poll, or the blanking arrives a whole cycle late. One timer,
+   because the band and the card are two renderings of one snapshot and an
+   expiry that reached one of them first would be exactly the split version
+   this lane exists to close. Pure DOM, no network. */
+setInterval(tqClock, 20000);
+/* AND ONE READ AT BOOT. The 45s timer alone left the home band's queue cell
+   reading "not read yet" for three quarters of a minute after every load —
+   on the tab the owner opens FIRST, for the number he opens it to see. The
+   decision queue beside it has always booted this way (60-chat.js.part). */
+tqInit();
+
+
+/* ================= burn-down (task/955) ==========================
+   THE OWNER'S P0, in his words: "get us ABLE TO BURN DOWN ALL ROWS."
+   Until this section that answer existed only in the obligation ledger's own
+   verb, one that
+   is not even on trunk — so a GUI-first owner could neither see it nor run
+   it. Same state triad as the backlog above, for the same reason: an
+   unreadable ledger drawn as an empty list tells him the fleet owes nothing
+   at the exact moment we lost the ability to say. */
+let OBD_GEN = 0;
+/* HOW MANY TIMES A `warming` ANSWER MAY BE RE-ASKED before this card stops
+   chasing the build and simply draws whatever the server next says. Reset by
+   the first non-warming body, so a later restart gets its own three tries. */
+let OBD_WARM_TRIES = 0;
+function obdAge(since) {
+  /* AN UNDATED ROW IS NOT A FRESH ONE. Returning "new" (or a 0) for a row
+     carrying no timestamp is the defect task/872 just cured one layer down;
+     it would be a poor trade to re-introduce it in the surface that reads
+     the same data. Undated sorts as unknown and SAYS so. */
+  if (!since) return {label: "?", days: -1};
+  const t = Date.parse(since);
+  if (!Number.isFinite(t)) return {label: "?", days: -1};
+  const days = Math.floor((Date.now() - t) / 86400000);
+  if (days < 0) return {label: "?", days: -1};
+  return {label: days < 1 ? "today" : days + "d", days: days};
+}
+/* WARMING IS NOT UNREADABLE, and the burn-down learned this the expensive way.
+   The server answers {warming:true} when the burn-down has not been COMPUTED
+   yet — a fact about a CACHE. "✗ CANNOT SEE" is a claim about the RECORD, and
+   drawing one for the other told the owner the ledger had failed every time the
+   web process restarted, about a ledger that was perfectly readable and merely
+   uncold. It costs a full fold of the dispatch ledger, so this state is
+   reached on purpose rather than by accident.
+
+   ALL THREE SECTIONS, because one fetch feeds all three. Leaving the sibling
+   buckets to their own renderers would have printed "✗ CANNOT SEE the cured
+   rows" beside this, which is the same false alarm one section over. Every
+   mount is checked before it is written — obdFail's lesson: the mount this
+   function needs is itself a candidate for the missing one. */
+function obdWarming() {
+  const sections = [["obdmeta", "obdlist", "the burn-down"],
+                    ["ocbmeta", "ocblist", "the cured rows"],
+                    ["oubmeta", "oublist", "the undeclared verdicts"]];
+  for (const pair of sections) {
+    const meta = $("#" + pair[0]), list = $("#" + pair[1]);
+    if (meta) meta.textContent = "reading…";
+    if (list) {
+      list.innerHTML = '<div class="empty">⌛ ' + esc(pair[2])
+        + " is being READ now — this is the first read since the server "
+        + "started and it costs a full fold of the dispatch ledger. Nothing "
+        + "is wrong with the record; it has not been computed yet, and this "
+        + "card refreshes itself when it is.</div>";
+    }
+  }
+}
+function obdRender(d) {
+  const list = $("#obdlist"), meta = $("#obdmeta");
+  /* WARMING IS CHECKED FIRST so a warming body can never fall through into
+     the alarm branch below — the same ordering the land card states for the
+     same reason. It draws every section itself, so nothing below runs. */
+  if (d && d.warming) { obdWarming(); return; }
+  /* THE BODY'S AGE, CARRIED TO EVERY SECTION. This endpoint serves a PREVIOUS
+     body while it rebuilds, so a list on screen can be minutes old; a number
+     printed with no age passes as current, which is the one thing a
+     serve-stale surface may never do. A missing or non-numeric age is
+     "unknown" rather than a fabricated zero — lrAgo's own law. */
+  const ageS = d && typeof d.read_age_s === "number" ? d.read_age_s : null;
+  /* SECOND BUCKET FIRST, and ABOVE the early return below on purpose: the
+     cured walk is a different question over a different source, so an owed
+     half that cannot see must not blank a cured half that can. Placing this
+     after the guard would have coupled them — which is precisely what the
+     endpoint splits them to avoid. */
+  ocbRender(d && d.cured, ageS);
+  oubRender(d && d.undeclared, ageS);   // third state, also above the guard
+  /* CANNOT SEE IS NOT ZERO OWED — the whole reason this branch is separate. */
+  if (!d || d.unavailable) {
+    meta.textContent = "UNKNOWN";
+    list.innerHTML = '<div class="empty">✗ CANNOT SEE the burn-down'
+      + (d && d.why ? " — " + esc(d.why) : "") + "</div>";
+    return;
+  }
+  const rows = Array.isArray(d.rows) ? d.rows : [];
+  const bits = [d.total + " owed"];
+  if (d.forks_excluded) bits.push(d.forks_excluded + " forked chains excluded");
+  if (d.truncated) bits.push("showing " + d.shown + ", " + d.truncated + " more");
+  bits.push("read " + lrAgo(ageS));
+  meta.textContent = bits.join(" · ");
+  if (!rows.length) { list.innerHTML = '<div class="empty">nothing owed</div>'; return; }
+  /* oldest first — a burn-down is read from the rot end. Undated rows (days
+     -1) sort LAST rather than masquerading as the oldest or the newest. */
+  const sorted = rows.slice().sort((a, b) => {
+    const A = obdAge(a.since).days, B = obdAge(b.since).days;
+    if (A < 0 && B < 0) return 0;
+    if (A < 0) return 1;
+    if (B < 0) return -1;
+    return B - A;
+  });
+  list.innerHTML = sorted.map(r => {
+    const age = obdAge(r.since);
+    return '<div class="odqcard otqcard"><div class="odqtop">'
+      + '<span class="odqtitle">' + esc(r.lane || "(no lane)") + "</span>"
+      + '<span class="odqid">' + esc(r.row || "") + "</span></div>"
+      + '<div class="odqmeta"><span>' + esc(r.seat || "unassigned") + "</span>"
+      + '<span title="' + esc(r.since || "no timestamp on this row") + '">'
+      + esc(age.label) + "</span>"
+      + (r.what ? '<span>' + esc(r.what.slice(0, 120)) + "</span>" : "")
+      + "</div></div>";
+  }).join("");
+}
+/* THE FAILURE GETS THE SAME THREE-STATE HONESTY THE DATA ALREADY HAS.
+   Until this split one try/catch wrapped BOTH the fetch and the render, and
+   every path through it printed "✗ burn-down unreadable". So a RENAMED MOUNT
+   ID — $() returns null, the next textContent throws a TypeError — read on
+   the owner's console EXACTLY like a dead network. He would conclude "the
+   server could not answer; wait and reload", when the truth was that this
+   page's markup and its own code disagree and no reload will ever fix it.
+   The two send a reader to different layers, so the surface names which. */
+function obdFail(kind, e) {
+  /* THE CONSOLE FIRST AND UNCONDITIONALLY, with the Error OBJECT rather than
+     its text: a page defect's actionable part is the STACK, which a one-line
+     owner surface cannot carry — and the mounts written below may be the very
+     ones that are missing, in which case this is the only report that
+     survives. Not re-thrown: obdInit runs on a 45s interval, so throwing here
+     buys an unhandled rejection every 45s carrying what this line already
+     printed. Neither kind is swallowed; each is reported where it is
+     actionable. */
+  console.error("[burn-down] " + kind + " —", e);
+  const meta = $("#obdmeta"), list = $("#obdlist");
+  const why = esc((e && e.message) || String(e));
+  if (kind === "defect") {
+    /* NAME THE MOUNTS. "Cannot set properties of null" identifies nothing;
+       the ids this console requires and cannot find identify the edit that
+       broke it — including the case where the missing one is a SIBLING
+       section's, which throws before the burn-down half ever draws. */
+    const gone = ["obdlist", "obdmeta", "ocblist", "ocbmeta", "oublist",
+                  "oubmeta"].filter(id => !$("#" + id));
+    /* NOT "UNKNOWN": the burn-down is not unknown, it is KNOWN AND UNDRAWN.
+       Guarded because the reporter's own mount is a candidate for missing —
+       writing blind here would throw a second TypeError from inside the
+       catch and DESTROY the original cause, which is what the old code did. */
+    if (meta) meta.textContent = "BROKEN";
+    if (list) {
+      list.innerHTML = '<div class="empty">✗ burn-down BROKEN — the data '
+        + "arrived and THIS PAGE failed to draw it (a console defect, not a "
+        + "fleet or a network one): " + why
+        + (gone.length ? " — missing mount" + (gone.length > 1 ? "s" : "")
+                         + " #" + gone.map(esc).join(", #") : "")
+        + "</div>";
+    }
+    return;
+  }
+  /* TRANSPORT: no answer ever arrived, so the debt is genuinely UNKNOWN — the
+     same word the cannot-see branch uses, because it is the same state. */
+  if (meta) meta.textContent = "UNKNOWN";
+  if (list) {
+    list.innerHTML = '<div class="empty">✗ burn-down unreadable — THE FETCH '
+      + "FAILED, so the fleet's debt is unknown rather than zero: " + why
+      + "</div>";
+  }
+}
+async function obdInit() {
+  const gen = ++OBD_GEN;
+  let d;
+  /* TWO try BLOCKS, NOT ONE, and that is the whole cure: the first can only
+     catch a transport failure, the second can only catch a defect in our own
+     rendering. A single block around both cannot tell them apart AFTER THE
+     FACT — by the time the catch runs, a TypeError from a renamed mount and a
+     timeout from a dead node are both just an Error with a message. */
+  try {
+    /* THE DEADLINE MUST OUTLIVE THE COLD WAIT IT IS WAITING ON. Measured on
+       the build this actually waits for — the FIRST one in a fresh process,
+       which is the only build a cold read ever sees: 8.9-10.2s over four
+       processes. The server waits `_OWED_COLD_WAIT_S` = 14s for it, and an
+       8s deadline here aborted that wait before either the body OR the
+       warming placeholder could land — so the first view after any restart
+       printed the timeout over a build that was about to succeed. 20s clears
+       the wait with six seconds of response budget. Moving either moves
+       both, and tests/test_web_owed.py holds them together. */
+    d = await j("/api/owed", 20000);
+  } catch (e) {
+    if (gen !== OBD_GEN) return;
+    obdFail("transport", e);
+    return;
+  }
+  if (gen !== OBD_GEN) return;
+  try {
+    obdRender(d);
+  } catch (e) {
+    obdFail("defect", e);
+    return;
+  }
+  /* AND THE CARD KEEPS THE PROMISE obdWarming MAKES. That placeholder tells
+     the owner "this card refreshes itself when it is" — and until now the
+     only thing that refreshed it was the 45-SECOND timer, so a build that
+     finished at ten seconds sat unread for another thirty-five. Measured:
+     the first build in a fresh process costs 8.9-10.2s (42s once), the
+     server waits `_OWED_COLD_WAIT_S` = 14s for it, so the reads that fall
+     through to `warming` are exactly the ones that need asking again SOON.
+
+     THE RETRY IS A LONG POLL, NOT A SPIN. A re-ask lands on the SAME
+     in-flight build server-side and returns the moment it stores, so three
+     tries five seconds apart cover the slow tail rather than hammering it.
+     Bounded, because a build that never succeeds must reach the owner as a
+     failure and not as a spinner that reassures forever — the server stops
+     answering `warming` on its own bound too, and then this card draws the
+     real state. Generation-guarded like every other path here: a reload or a
+     tab switch retires the pending retry instead of racing it. */
+  if (d && d.warming && OBD_WARM_TRIES < 3) {
+    OBD_WARM_TRIES += 1;
+    setTimeout(() => { if (gen === OBD_GEN) obdInit(); }, 5000);
+    return;
+  }
+  if (!d || !d.warming) OBD_WARM_TRIES = 0;   // a real body ends the chase
+}
+$("#obdReload").onclick = () => obdInit();
+setInterval(obdInit, 45000);
+obdInit();
+
+
+/* ============ cured, awaiting re-dispatch (task/955 slice two) =========
+   THE SECOND OBLIGATION TYPE. The burn-down above answers "which chains
+   carry a FIX nobody answered"; this answers "which rows did their author
+   cure and never hand back". They are not rival answers — measured on row
+   3e4f26966ba8, the first correctly omits it and the second correctly names
+   it. Rendering only the first left nine rows invisible, and invisible is
+   where they stay: the open-row sweep excludes CURED by construction.
+   Rendered by obdRender off the SAME fetch, since one /api/owed call carries
+   both buckets and a second poll would double the git cost for no gain. */
+function ocbRender(c, ageS) {
+  const list = $("#ocblist"), meta = $("#ocbmeta");
+  /* ITS OWN CANNOT-SEE. The burn-down above may be fine while this walk is
+     broken; drawing this one empty because the other succeeded would report
+     "nothing cured" for a scan that never ran. */
+  if (!c || c.unavailable) {
+    meta.textContent = "UNKNOWN";
+    list.innerHTML = '<div class="empty">✗ CANNOT SEE the cured rows'
+      + (c && c.why ? " — " + esc(c.why) : "") + "</div>";
+    return;
+  }
+  const rows = Array.isArray(c.rows) ? c.rows : [];
+  const bits = [c.total + " cured, nobody waiting",
+    (c.measured == null ? rows.length : c.measured) + " measured"];
+  if (c.ambiguous) bits.push(c.ambiguous + " ambiguous");
+  if (c.partial) bits.push("PARTIAL — total is a floor: " + (c.why || "some cure states are unknown"));
+  /* THE UNPLACEABLE COUNT IS NOT ZERO AND MUST NOT BE SILENT. These rows name
+     a repository we could not resolve, so we cannot say whether they are
+     cured — folding them away would shrink the number the owner is asked to
+     burn down by exactly the rows nobody can act on. */
+  if (c.unplaceable) bits.push(c.unplaceable + " unplaceable — repo could not be resolved");
+  if (c.truncated) bits.push("showing " + c.shown + ", " + c.truncated + " more");
+  /* THE SAME FETCH, SO THE SAME AGE. This list is served stale while the
+     burn-down rebuilds exactly as the owed list above is. */
+  bits.push("read " + lrAgo(ageS));
+  meta.textContent = bits.join(" · ");
+  if (!rows.length) { list.innerHTML = '<div class="empty">nothing cured and unhandled</div>'; return; }
+  list.innerHTML = rows.map(r => {
+    const age = obdAge(r.since);
+    return '<div class="odqcard otqcard"><div class="odqtop">'
+      + '<span class="odqtitle">' + esc(r.lane || "(no lane)") + "</span>"
+      + '<span class="odqid">' + esc(r.row || "") + "</span></div>"
+      + '<div class="odqmeta"><span>' + esc(r.seat || "unassigned") + "</span>"
+      + '<span title="' + esc(r.since || "no timestamp on this row") + '">'
+      + esc(age.label) + "</span>"
+      + (r.branch ? '<span>cure at ' + esc(r.tip || "") + " +" + esc(String(r.ahead))
+                    + " on " + esc(r.branch) + "</span>" : "")
+      + "</div></div>";
+  }).join("");
+}
+
+
+/* ============ undeclared verdicts (the third state) ==================
+   Split out of the burn-down after a post-land review. cmd_owed
+   defines an undeclared verdict as NEITHER owed nor clear; counting them
+   inside "owed" asserted that unknowns are debts. The owner read 116 debts
+   where 91 were owed and 26 were nobody-said-yet. Rendered from the SAME
+   fetch as the other two buckets. */
+function oubRender(u, ageS) {
+  const list = $("#oublist"), meta = $("#oubmeta");
+  if (!u) {
+    meta.textContent = "UNKNOWN";
+    list.innerHTML = '<div class="empty">✗ CANNOT SEE undeclared verdicts</div>';
+    return;
+  }
+  const rows = Array.isArray(u.rows) ? u.rows : [];
+  const bits = [u.total + " undeclared — nobody has said whether a cure is owed"];
+  if (u.truncated) bits.push(u.truncated + " more");
+  bits.push("read " + lrAgo(ageS));
+  meta.textContent = bits.join(" · ");
+  if (!rows.length) { list.innerHTML = '<div class="empty">every verdict declared a polarity</div>'; return; }
+  const sorted = rows.slice().sort((a, b) => {
+    const A = obdAge(a.since).days, B = obdAge(b.since).days;
+    if (A < 0 && B < 0) return 0;
+    if (A < 0) return 1;
+    if (B < 0) return -1;
+    return B - A;
+  });
+  list.innerHTML = sorted.map(r => {
+    const age = obdAge(r.since);
+    return '<div class="odqcard otqcard"><div class="odqtop">'
+      + '<span class="odqtitle">' + esc(r.lane || "(no lane)") + "</span>"
+      + '<span class="odqid">' + esc(r.row || "") + "</span></div>"
+      + '<div class="odqmeta"><span>' + esc(r.seat || "unassigned") + "</span>"
+      + '<span title="' + esc(r.since || "no timestamp on this row") + '">'
+      + esc(age.label) + "</span>"
+      + (r.what ? '<span>' + esc(r.what.slice(0, 120)) + "</span>" : "")
+      + "</div></div>";
+  }).join("");
+}

@@ -1,0 +1,25 @@
+.remember/
+__pycache__/
+*.pyc
+.pytest_cache/
+.playwright-mcp/
+.claude/settings.json
+*.png
+.env
+.env.*
+
+# NEVER-TRACK: local-only agent skills. These stay on disk and keep working for
+# the fleet; they must not enter a commit, because a private repo is still a
+# REMOTE and this repo is meant to stay one visibility-flip away from public.
+# Pinned by tests/test_never_track.py — read its docstring before editing.
+# A path whose name is itself private goes in the machine-local list and in
+# .git/info/exclude instead, never here (helm/nevertrack.py,
+# load_local_never_track).
+agents/claudecode/skills/fleet-usage/
+evals/
+agents/claudecode/skills/vendor-as-public/
+agents/claudecode/skills/x/
+
+# Owner data: the confirmed founding ancestry lives in ~/.helm/_global/,
+# never in the repo — it maps the owner's private project graph.
+helm/lineage_seed.json

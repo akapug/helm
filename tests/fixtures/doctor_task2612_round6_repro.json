@@ -1,0 +1,166 @@
+{
+ "schema": "helm.task2612.round6-reproductions.v1",
+ "provenance": "task/2612 round six: the reviewer's twelve repro witnesses from the outsider read at b854c31b2, transferred as a fixture with the source file's sha256 recorded; machine-local paths are not carried",
+ "original_file_sha256": "aa0b78ffb8d7d8d25d7ecdd55cce8de31e4351721e2325966651e9731d5e1af9",
+ "status_rule": {
+  "open_task_ids": [
+   "2598"
+  ],
+  "all_other_task_ids": "closed",
+  "source_lambda": "lambda tid:'open' if tid=='2598' else 'closed'"
+ },
+ "roots": [
+  "docs",
+  "agents"
+ ],
+ "controls": [
+  {
+   "path": "docs/CONTROL.txt",
+   "kind": "must-hit-closed",
+   "text": "Until task/4242 lands, copy by hand.",
+   "expected_subject_ids": [
+    "4242"
+   ],
+   "expected_warning_count": 1
+  },
+  {
+   "path": "docs/OPEN.txt",
+   "kind": "must-not-open",
+   "text": "Until task/2598 lands, copy by hand.",
+   "expected_subject_ids": [],
+   "expected_warning_count": 0
+  },
+  {
+   "path": "docs/PROVENANCE.txt",
+   "kind": "must-not-provenance",
+   "text": "This was filed against task/2573. Until then, do the other thing by hand.",
+   "expected_subject_ids": [],
+   "expected_warning_count": 0
+  },
+  {
+   "path": "agents/CONTROL.txt",
+   "kind": "must-hit-closed",
+   "text": "Until task/4343 lands, copy by hand.",
+   "expected_subject_ids": [
+    "4343"
+   ],
+   "expected_warning_count": 1
+  },
+  {
+   "path": "agents/OPEN.txt",
+   "kind": "must-not-open",
+   "text": "Until task/2598 lands, copy by hand.",
+   "expected_subject_ids": [],
+   "expected_warning_count": 0
+  },
+  {
+   "path": "agents/PROVENANCE.txt",
+   "kind": "must-not-provenance",
+   "text": "This was filed against task/2573. Until then, do the other thing by hand.",
+   "expected_subject_ids": [],
+   "expected_warning_count": 0
+  }
+ ],
+ "cases": [
+  {
+   "label": "comma-no-space-provenance",
+   "family": "comma-no-space",
+   "text": "The fix was filed against task/2573,while the unrelated signer is not yet available.",
+   "text_utf8_sha256": "a4dc502b1bd525c889cf197b2a32a2d1ce460454850c21259bd421063a67ece2",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "comma-no-space-open-subject",
+   "family": "comma-no-space",
+   "text": "task/2598 is not yet available,per task/2573.",
+   "text_utf8_sha256": "e58465e74946e2f24a252e59a611aff21203e4d8d45b066add67a93a0efc021d",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "inline-comment-hidden",
+   "family": "inline-comment",
+   "text": "Before <!-- Until task/2573 lands, exit by hand. --> after.",
+   "text_utf8_sha256": "eb9a1f7ffe8efc66c2f9c3ca6d28ca3fb7b8b2ec7a7ff8a37a0c09c8e3cbbf2a",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "inline-multiline-comment",
+   "family": "inline-comment",
+   "text": "Before <!--\nUntil task/2573 lands, exit by hand.\n--> after.",
+   "text_utf8_sha256": "a215ac2027b1135a4e63860970244234dd82d1588bd1f0f607914c856dd16275",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "script-malformed-spaced-close",
+   "family": "malformed-raw-close",
+   "text": "<script>\n</script >\nUntil task/2573 lands, exit by hand.\n</script>",
+   "text_utf8_sha256": "eb7d2d1b2128a91e6058bf4411cb054c85808da3f5608208f932068dc41e8cee",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "style-malformed-spaced-close",
+   "family": "malformed-raw-close",
+   "text": "<style>\n</style >\nUntil task/2573 lands, exit by hand.\n</style>",
+   "text_utf8_sha256": "34dffd92727c1d7777076803157e97ee3e3b699dbc417f39c2f070b5ceabf88d",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "pre-malformed-spaced-close",
+   "family": "malformed-raw-close",
+   "text": "<pre>\n</pre >\nUntil task/2573 lands, exit by hand.\n</pre>",
+   "text_utf8_sha256": "79c4687fd03be7b59482daa1a83466c5c25188a688c30578df67ba0fbc2fa99a",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "textarea-malformed-spaced-close",
+   "family": "malformed-raw-close",
+   "text": "<textarea>\n</textarea >\nUntil task/2573 lands, exit by hand.\n</textarea>",
+   "text_utf8_sha256": "26a5c1c5dd1556131527fdaf0e73d644e0b07d7d8f8a90c335712c131df2c315",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "raw-same-line-malformed-close",
+   "family": "malformed-raw-close",
+   "text": "<pre>opaque</pre >\nUntil task/2573 lands, exit by hand.\n</pre>",
+   "text_utf8_sha256": "4cfd50334fc5f5b0dc32463533705322d27d2dafd57c9971d18955e2869fefec",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "duplicate-same-row-comma-and",
+   "family": "duplicate-sentence",
+   "text": "Until task/2573 lands, exit by hand, and until task/2573 lands, copy by hand.",
+   "text_utf8_sha256": "4e5c05102d9ac1e5ae0625d67c17b926b26c69e5be7f7f7ab47ee55eebf5134b",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "duplicate-state-comma-and",
+   "family": "duplicate-sentence",
+   "text": "task/2573 is not yet available, and until task/2573 lands, exit by hand.",
+   "text_utf8_sha256": "970ae5185d392f71bc7c3982c326930776ecfc9de2a85395eced7dd42fc40641",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "duplicate-semicolon-control",
+   "family": "duplicate-sentence-control",
+   "text": "Until task/2573 lands, exit by hand;until task/2573 lands, copy by hand.",
+   "text_utf8_sha256": "fafb4e2c1068ee0de7b607c3ada9ec73d969537e48d9007ab7ed5196fafb00a5",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  }
+ ],
+ "cases_joined_sha256": "5d2f3d06a36d2e3e31b7c12d02f82cf67169d35d3906529118eba5d01c6eb80d"
+}

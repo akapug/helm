@@ -1,0 +1,48 @@
+<div class="view" id="view-history">
+  <div id="ledgerstrip">connecting…</div>
+  <!-- TWO TIERS, not three peer boxes (owner 2026-07-29: "i dont really know
+       what most of these things mean and no one else will either"). Tier 1 =
+       the shared signed record, shown twice (as a feed, and grouped by
+       author). Tier 2 = this machine's fast unsigned log. Each first line
+       says what the box is in plain words; helm's internal word appears once,
+       in parentheses, as a mapping to CLI output — never as the explanation. -->
+  <div id="ledgertiers">
+    <section class="ltier" id="tiersigned">
+      <div class="ltierhead"><b>shared record · signed</b><span>chat posts and
+        captured lessons, cryptographically signed as they land — the permanent,
+        checkable copy of what the fleet said and decided. one signed entry is
+        what helm calls a “cave turn”.</span></div>
+      <div class="ltiergrid">
+        <div class="lcard" id="cavecard">
+          <h3>signed entries <span class="lsub" id="cavesub">checking whether signing is on…</span></h3>
+          <div class="llegend"><span><span class="lbadge head">chat</span> a chat message</span>
+            <span><span class="lbadge head">attest</span> a captured lesson</span>
+            <span><span class="lbadge final">final</span> confirmed permanent</span></div>
+          <div class="llegend" id="cavepulse">signing pulse: …</div>
+          <div class="lrows" id="ledgerturns"><div class="empty">loading…</div></div>
+        </div>
+        <div class="lcard" id="cellcard">
+          <h3>who signed <span class="lsub">the same entries, grouped by author</span></h3>
+          <div class="llegend"><span><span class="ldot active"></span> signed &lt;2m ago</span>
+            <span><span class="ldot quiet"></span> &lt;30m</span>
+            <span><span class="ldot stuck"></span> silent &gt;30m</span>
+            <span><span class="ldot"></span> nothing recent</span></div>
+          <div class="lrows" id="ledgercells"><div class="empty">loading…</div></div>
+        </div>
+      </div>
+    </section>
+    <section class="ltier" id="tierlocal">
+      <div class="ltierhead"><b>this machine only · not signed</b><span>helm’s
+        fast working notes on this computer — instant, but they prove nothing
+        beyond this host. the signed record is the proof copy.</span></div>
+      <div class="lcard" id="nativecard">
+        <h3>local activity <span class="lsub" id="nativesub">what helm did here, newest first</span></h3>
+        <div class="llegend"><span><span class="lbadge final">chained</span> tamper-evident local note — not a signed entry</span>
+          <span><span class="lbadge">receipt</span> plain operation log, append-only</span>
+          <span style="margin-left:auto" id="nativehead">…</span></div>
+        <div class="llegend" id="nativechat">chat pulse: …</div>
+        <div class="lrows" id="ledgernative"><div class="empty">loading…</div></div>
+      </div>
+    </section>
+  </div>
+</div>

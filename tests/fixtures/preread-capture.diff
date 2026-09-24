@@ -1,0 +1,59 @@
+diff --git a/helm/scratch.py b/helm/scratch.py
+index b396a95c9..f573d113d 100644
+--- a/helm/scratch.py
++++ b/helm/scratch.py
+@@ -1684,6 +1684,12 @@ def worktree_dirty(path, timeout):
+     A status that cannot be taken — no git, a timeout, a broken registration —
+     is UNKNOWN, and unknown keeps the tree.
+ 
++    The spawn goes through the vcs seam (helm/vcs.py, the one sanctioned git
++    spawn site; the direct-spawn audit in tests/test_vcs.py refuses a new
++    site outside it). `probe_outcome` is the op that keeps NOTHING RAN apart
++    from a non-zero exit, and both of those are the UNKNOWN this function
++    promises; only a completed status answers.
++
+     `timeout` is handed down by the pass's allowance (Reading.timeout) so that
+     the LAST spawn cannot outlive the pass's wall budget: a per-call timeout is
+     a bound on one read, never on the reading. IT IS REQUIRED. A default of
+@@ -1691,17 +1697,18 @@ def worktree_dirty(path, timeout):
+     whose own docstring promises ONE BOUNDED spawn — the forgettable-bound
+     shape this module exists to remove, and the one shape the structural
+     tripwire cannot see, because a keyword default is not a bound read."""
+-    import subprocess
++    from . import vcs
+     try:
+-        proc = subprocess.run(
+-            ["git", "-C", path, "status", "--porcelain"],
+-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+-            timeout=timeout)
++        ran, rc, out = vcs.backend(path).probe_outcome(
++            path, "status", "--porcelain", timeout=timeout)
+     except Exception as exc:              # noqa: BLE001 — unknown keeps it
+         return False, "git status unavailable (%s)" % exc.__class__.__name__
+-    if proc.returncode != 0:
+-        return False, "git status failed (exit %d)" % proc.returncode
+-    return bool(proc.stdout.strip()), None
++    if not ran:
++        return False, ("git status unavailable (nothing ran: no git, or the "
++                       "%ss bound expired)" % timeout)
++    if rc != 0:
++        return False, "git status failed (exit %d)" % rc
++    return bool((out or "").strip()), None
+ 
+ 
+ def dirty_allowance():
+diff --git a/tests/test_scratch.py b/tests/test_scratch.py
+index 418a2f8f4..920ce7026 100644
+--- a/tests/test_scratch.py
++++ b/tests/test_scratch.py
+@@ -2259,7 +2259,9 @@ class SecondTierTest(unittest.TestCase):
+         finally:
+             sp.run = real
+         self.assertFalse(dirty)
+-        self.assertIn("TimeoutExpired", trouble)
++        # the seam folds a timeout into NOTHING RAN; the reason still says the
++        # status was not taken, which is what keeps the tree
++        self.assertIn("unavailable", trouble)
+         self.assertNotIn(unit, self.paths(rep))
+         self.assertTrue(os.path.isdir(unit))
+         self.assertIn("dirtiness UNKNOWN", self.kept(rep, unit)[0])

@@ -1,0 +1,13 @@
+# FROZEN pre-cure shape of a per-file capture cap: a large source read, cut at
+# the per-file bound, and stored in a row whose consumer never learned the
+# value was short. The notice this shape printed went to a log the consumer
+# did not read, so the WRITTEN value carried no trace of the loss.
+PER_FILE_CAP = 40000
+
+
+def capture(path, rows):
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    row = {"path": path, "source": text[:PER_FILE_CAP]}
+    rows.append(row)
+    return rows

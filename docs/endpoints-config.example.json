@@ -1,0 +1,18 @@
+{
+  "_comment": [
+    "The example endpoints file. Copy to <helm home>/_global/endpoints.json and",
+    "edit: this file is documentation and is never read at runtime. A seat",
+    "family whose host is the operator's own box names a key here (its pool row",
+    "carries `base_url_from`), so the source holds no LAN host and re-pointing",
+    "the family is an edit of this file, read on every call with no restart.",
+    "",
+    "Each value is the OpenAI-compatible base URL, ending before",
+    "/chat/completions. A keyless family may use plain http only to a literal",
+    "private or loopback address; any other host must be https.",
+    "",
+    "While a family's key is missing, that family is unavailable: `helm seat",
+    "add` refuses and names this file and the key, and its route binds no",
+    "proof. Only the keys a pool row names are read, so this comment is inert."
+  ],
+  "qwen27": "http://192.0.2.10:8083/v1"
+}

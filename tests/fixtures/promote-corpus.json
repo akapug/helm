@@ -1,0 +1,217 @@
+[
+ {
+  "slug": "ticket-patch-exponentially-settings",
+  "label": "refuse",
+  "text": "Sounds right, go ahead, and make sure every worker can read the shared config through the settings service: the retry patch is already live in commit 9e1b77c0 from Tuesday. The poller now backs off exponentially, caps at five attempts, logs each failure with its request id, and clears the counter after a success. The ticket is resolved-not-closed — the patch shipped four days ago but the ticket was never moved to done. Shall I close it now? I can, since nothing else depends on it."
+ },
+ {
+  "slug": "cheaper-invoice-renewal-always",
+  "label": "refuse",
+  "text": "sure, always the cheaper plan, but each tenant does need to see its own invoice total before the renewal date. sounds fine"
+ },
+ {
+  "slug": "always-afternoon-carefully-dashboard",
+  "label": "refuse",
+  "text": "right, i'm off to the dentist for the afternoon, i will look in from the waiting room but the rollout is yours to run.\n  let's see steady progress, carefully, one region at a time, keeping status.page updated so\n  the dashboard is always clear. /focus always"
+ },
+ {
+  "slug": "finished-nightly-export-always",
+  "label": "refuse",
+  "text": "nice work!!! the nightly export finished early as always since the cache warmed haha"
+ },
+ {
+  "slug": "schema-files-paste-automatically",
+  "label": "refuse",
+  "text": "both importers are paused, restart them, and about the schema files, you tweak those schema files all the time anyway, feel free to fix the loader permanently for every service on this cluster so they all pick up the change automatically. but i doubt \"same category as the signing keys I'm not supposed to copy or paste into\n  a ticket.\" -- which policy says that? i never actually asked for that, i paste those all the time"
+ },
+ {
+  "slug": "coordinator-ready-unassigned-following",
+  "label": "refuse",
+  "text": "status check — keep moving: push the card you hold to CODE_READY; if you hold none, open docs/BACKLOG.md and take the top unassigned card (confirm it is not merged yet; compile on the shared runners, never on a laptop), then do it. Once a card reaches CODE_READY, take the following card at once — hold one card at every moment so you never wait on anyone. Route reviews to the review pool (pane:w7:pA or pane:w7:p3B), not to the coordinator. Post results for the coordinator at pane:w7:p1 in the evening thread."
+ },
+ {
+  "slug": "event-maker-notification-summary",
+  "label": "refuse",
+  "text": "<task-notification>\n<task-id>b0000aaa1</task-id>\n<summary>Monitor event: \"queue items addressed to maker-one (w7:p4) on ops-room\"</summary>\n<event>QUEUE ops-room seq 311 checker-two/PAUSE_ACK: {\"cc\": [\"maker-one\", \"maker-two\"], \"pause_ack\": \"Checker PAUSED as asked: my index rebuild is UNSAVED (never landed) \\u2014 so none of my edits are in the</event>\nIf this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.\n</task-notification>"
+ },
+ {
+  "slug": "reinstall-please-always-nobody",
+  "label": "refuse",
+  "text": "yes please do a full reinstall, we always want a known-good image so nobody debugs ghosts"
+ },
+ {
+  "slug": "afterwards-summaries-straight-handoff",
+  "label": "refuse",
+  "text": "Handoff rule for testers: always send the final results straight into this pane as well, not only into the tracker or the wiki page. I will copy the summaries and the logs over there afterwards."
+ },
+ {
+  "slug": "checklist-installer-whatever-boringly",
+  "label": "keep",
+  "text": "yes, small fixes are always welcome until the release branch is frozen, and after that there will still be new checklist items to write up from whatever the beta testers report. when the installer feels boringly reliable to you, that's the moment we pause and look at the whole product and at the corners we have been ignoring"
+ },
+ {
+  "slug": "label-specific-rendered-offline",
+  "label": "refuse",
+  "text": "fine to close this too, im still offline always with /focus \"- REQ-204 label color on the board stays grey — the style request 404s every time (label-specific; every other label\n  renders fine, REQ-230 just rendered cleanly). Logged as a small real bug to look at; the data row is\n  correct.\""
+ },
+ {
+  "slug": "clear-suggestion-dashboard-workspace",
+  "label": "refuse",
+  "text": "honestly i am a bit let down that you had a whole day on this and you haven't even finished wiring the exporters and the scheduler into the dashboard, let alone more [CORRECTION — ignore my /clear suggestion completely] I was WRONG to suggest /clear — never clear your scratch state mid-task, it throws away everything you have loaded. A large workspace is NOT a reason to do anything; a big workspace is fine. Keep all of it and carry on exactly as you are — your step 1/2/3 plan is right. Ignore that suggestion; it was my mistake, not a real directive. Keep going with the dashboard port."
+ },
+ {
+  "slug": "whenever-watcher-queued-active",
+  "label": "refuse",
+  "text": "go on, and pause the watcher whenever it suits you. which items are still open? from your queued or active list?"
+ },
+ {
+  "slug": "image-printers-powered-printer",
+  "label": "refuse",
+  "text": "\"7:42 AM]user (ops): heads up i powered down the two spare printers because they had sat unused for weeks, but there is still one printer for proofs and labels always on [7:55 AM]user (ops): Image [8:03 AM]user (ops): no idea where this came from Image\" [Image #2]"
+ },
+ {
+  "slug": "audit-migration-questions-findings",
+  "label": "refuse",
+  "text": "[audit-DONE] findings note at docs/AUDIT-cache-layer.md — the reader's token signs, the rate limit is the WHY, retry=new-request maps 1:1 onto your current queue fields (zero migration). Nice audit. Q1/Q2 answers are also in docs/OPEN_QUESTIONS.md whenever you get to them. Back to your task."
+ },
+ {
+  "slug": "differently-streaming-honestly-nervous",
+  "label": "refuse",
+  "text": "ship the lint fix, and yes, i am always nervous about hidden race bugs here. nobody has run the \"batch\" path we added yet and i honestly cannot tell what it does differently from streaming"
+ },
+ {
+  "slug": "author-appreciated-production-rebooted",
+  "label": "refuse",
+  "text": "ok rebooted the box, it should be active now, do the alerts show up for you? i'm stepping out while you work out how to get every piece that is still failing with the queue...running. bug reports and fixes to the library repo always appreciated by its author for our production cases. but you are capable and the author prefers that you fix your own issues by patching"
+ },
+ {
+  "slug": "template-written-storefront-delivered",
+  "label": "refuse",
+  "text": "hmm hold on, i want to pause and check my picture of what we actually believe we delivered so far. am i right that this shop page is a template page on the managed host? i know we only added template support in preview there, but i am a bit worried you did not notice that and then built this as a very plain hand-written page that will never have a chance of being as flexible and useful as the old storefront. did you drop the whole template plan? i keep seeing you mention the hand-written page and im not sure why that would be"
+ },
+ {
+  "slug": "event-projectx-notification-summary",
+  "label": "refuse",
+  "text": "<task-notification>\n<task-id>b0000aaa2</task-id>\n<summary>Monitor event: \"queue projectx items addressed to projectx-lead (review verdicts / owner / lead / security notes)\"</summary>\n<event>QUEUE projectx seq 87 schema-agent/HANDOFF: {\"correction\": \"My earlier 'waiting on the lead about who writes it' was a mistake \\u2014 I never actually sent the proposal. So nothing was waiting on you; I looked a</event>\nIf this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.\n</task-notification>"
+ },
+ {
+  "slug": "event-notification-priority-summary",
+  "label": "refuse",
+  "text": "<task-notification>\n<task-id>b0000aaa3</task-id>\n<summary>Monitor event: \"queue posts addressed to ops-lead/lead/broadcasts (self-echo suppressed)\"</summary>\n<event>QUEUE infra seq 904 coordinator/dispatch: {\"io_priority_durable\": \"Extend your seq880 io-priority change: agent-started COMPILES *and* test runners must never starve the interactive shell. This evening load reached 38 (</event>\nIf this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.\n</task-notification>"
+ },
+ {
+  "slug": "event-notification-summary-pushnotification",
+  "label": "refuse",
+  "text": "<task-notification>\n<task-id>b0000aaa4</task-id>\n<summary>Monitor event: \"mail beacon v3 for pane:w7:p2 (self-sent + Low items auto-acked to log, never a wake)\"</summary>\n<event>seq 412 from w9:pB [ActionRequired]: CHECK_RESULT Q8 v2 @b33c91d0 -&gt; REJECT sent to pK. Main findings: (1) the default scope ignores the seq401 decision by using a global lookup + per-hit detail --json path post-filter/id-&gt;p</event>\nIf this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.\n</task-notification>"
+ },
+ {
+  "slug": "cluster-checklist-finished-sessions",
+  "label": "refuse",
+  "text": "...with half-finished shell sessions to come back to. from now on i would like you to schedule any planned cluster restarts only after you know exactly how to bring the services back. there is detailed restart guidance and a checklist for the old cluster..."
+ },
+ {
+  "slug": "hotfix-commit-regression-scheduled",
+  "label": "refuse",
+  "text": "Scheduled fallback wake (w7:p2C test seat): confirm the --unit run for the 4ad3e9 hotfix (task output b0000ccc3 + worker log — check that a NONZERO number of tests matched the filter, never trust the exit code alone). If green: commit the hotfix in worktree ledger-sync-p2C (amend or add a commit onto 51c0aa3e's branch), notify.sh to w7:p31 action-required with the keep-the-record design and the regression proof. Then keep the inbox at zero unread, watch for the lead's merges, and re-arm the next wake before stopping. If the whole item closes, take Task #7 (Milestone B)."
+ },
+ {
+  "slug": "tracker-notification-constantly-reactions",
+  "label": "refuse",
+  "text": "guess what else we never carried over from the old tracker? reactions on comments, this should apply to the team feed too (parity with the old mobile app if possible), but also the command palette so they can be added from these text boxes, i used them CONSTANTLY in the old tracker, and reviewers like you seem to enjoy getting them. ideally every person and every bot could use them in the notification stream easily and see them. logging off for real now, see how far the team gets tonight! aim high as a group!"
+ },
+ {
+  "slug": "spotted-browser-anyway-checks",
+  "label": "refuse",
+  "text": "nice find, but you would have spotted it anyway during your usual browser and end-to-end checks at the finish, right? if you were not going to run those, you need to find out why you never picked up that habit, and pick it up!"
+ },
+ {
+  "slug": "coordinator-unassigned-backlog-confirm",
+  "label": "refuse",
+  "text": "pick up: take your next unassigned card from docs/BACKLOG.md (confirm it is not merged yet FIRST; compile on the shared runners with the single-target flag, never on a laptop), CODE_READY, post results for the coordinator at pane:w7:p1 in the evening thread."
+ },
+ {
+  "slug": "warmup",
+  "label": "refuse",
+  "text": "NEVER SKIP THE WARMUP :)"
+ },
+ {
+  "slug": "calendars-written-already-events",
+  "label": "refuse",
+  "text": "3. right, both calendars should agree, yet the rule for a clash was never written down for the case where each side already holds events. which side wins?"
+ },
+ {
+  "slug": "authoritative-comparison-uncovered-certainly",
+  "label": "refuse",
+  "text": "What you have uncovered is mostly legacy code that was never cleanly migrated. Perhaps the team got pulled onto other fires and never noticed or never came back. We certainly do not want to keep anything in a temp folder that is authoritative for anything other than a live job kept only so it stays open for comparison. But nothing in the new platform should ever depend on that and we should complete the migration. You mentioned it was about 40% done so roughly 60% remains and I do not want to skip any of it."
+ },
+ {
+  "slug": "output-notification-b0000aaa5-completed",
+  "label": "refuse",
+  "text": "<task-notification>\n<task-id>b0000aaa5</task-id>\n<tool-use-id>toolu_0000000000000000000000aa</tool-use-id>\n<output-file>/tmp/agent-1000/-home-user-dev-example/00000000-0000-4000-8000-000000000000/tasks/b0000aaa5.output</output-file>\n<status>completed</status>\n<summary>Background command \"negative case: stub disabled (always fail)\" completed (exit code 0)</summary>\n</task-notification>"
+ },
+ {
+  "slug": "quick-misleading-schema-fixes",
+  "label": "keep",
+  "text": "\"quick\" fixes are a misleading idea when the test suite is flaky. a schema change is never quick"
+ },
+ {
+  "slug": "author-sibling-release-comment",
+  "label": "refuse",
+  "text": "docs PRs to the sibling repos skip the usual \"release-ready\" review bc their author only drafts in the open /note -- always just open them so the author can comment"
+ },
+ {
+  "slug": "afterwards-improving-parallel-watchers",
+  "label": "refuse",
+  "text": "hmm that doesn't sound like the /focus answer to me? i really never want a demo-only build, but if it's a step toward the real device test, it's fine to park this run and kick off another in parallel or afterwards, either is fine by me, im just always anxious that the numbers keep improving. do your 4 watchers need some trimming and tuning? the report job has been quiet for ages too... please let's not let that happen again"
+ },
+ {
+  "slug": "projects-answers-mockups-further",
+  "label": "refuse",
+  "text": "keep at it, merge poll answers in as they arrive, i'm out today and trust you to take the mockups further. small patches to sibling projects are totally always ok!"
+ },
+ {
+  "slug": "databases-importer-remove-legacy",
+  "label": "refuse",
+  "text": "go ahead and remove the legacy importer; the test and live databases should always match"
+ },
+ {
+  "slug": "limits-window-regression-scheduler",
+  "label": "refuse",
+  "text": "worker-3 REQ-518 first slice DONE. Branch feat/req-518 commit 7c21e9fa. 3 files +214 lines: rate_limit.py (parse_limits/should_throttle/next_window seam), 14 tests. Checks: mypy clean, 190/190 unit suite passes. The design follows your two calls: (1) small INI reader kept apart from [limits], never throws, (2) next_window SEAM so a smarter scheduler can drop in later. Ready for a joint review. Diff at feat/req-518. The coverage report is attached to the ticket and the benchmark shows no regression under load."
+ },
+ {
+  "slug": "always-integrate-upstream-parser",
+  "label": "keep",
+  "text": "the parser lib has a 2.3 tag now. our app should always integrate upstream fixes as they land and we should always track the newest tag"
+ },
+ {
+  "slug": "preview-deploys-server-always",
+  "label": "refuse",
+  "text": "first, the preview server is yours and you ALWAYS own its deploys. /note that. second, the tablet shell is open now, tell me what to type"
+ },
+ {
+  "slug": "throughput-transfer-machines-included",
+  "label": "refuse",
+  "text": "Great, works for me, but I don’t only want one throughput figure, I wanted a table of the transfer rates between all of the machines so we can compare them, the old desktop included, we simply need a full baseline first, so that it’s always easy to choose where things like backups, scratch space and extra memory for tests should go."
+ },
+ {
+  "slug": "implementation-confusing-behaviour-keyboard",
+  "label": "refuse",
+  "text": "go ahead and patch the check + rerun the import, i'm looking at [Image #3] -- this is confusing to me, but if something only works because I am at the keyboard, i want the windows where that is allowed to be tiny, and my role as a hands-off owner who is no help while you're in the middle of implementation between my planning and my review of the result -- everything in between is always a black box to me, and whatever rules change your behaviour based on my \"presence\" seem tuned far too high"
+ },
+ {
+  "slug": "confirmation-confirmed-session-several",
+  "label": "refuse",
+  "text": "Nice job. I also want to double-check whether we ever confirmed that one agent session can drive several proxied models as helpers, etc. I know we were chasing that at some point but I never saw the confirmation"
+ },
+ {
+  "slug": "helper-restart-crashed-briefed",
+  "label": "refuse",
+  "text": "lol wrong target, the restart went to helper-2 when it was meant for the seat that crashed, and you then briefed helper-2 as if it were that seat, which was always the larger model [Image #12]"
+ },
+ {
+  "slug": "coordinator-deserved-smoothly-whenever",
+  "label": "refuse",
+  "text": "i wonder whether our overall rhythm would improve if leads made a status note their final step before a real, deserved pause, to the coordinator, just as a check that the coordinator sees it the same way. like a quick \"ok if i step out for a bit, boss?\" sort of human habit. just until things run smoothly, it's nice to have small checks like that, please ask the coordinator to add it to the runbook so you pick it up after the next restart or whenever possible"
+ }
+]

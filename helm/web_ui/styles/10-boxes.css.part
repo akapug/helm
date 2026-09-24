@@ -1,0 +1,41 @@
+/* ================= storage matrix =================
+   TABLE FIRST: exact values are always readable; the accent bars are one
+   redundant within-column comparison channel. Mixed units never share a scale. */
+#storagecard{margin:18px 0 40px;background:var(--card);border:1px solid var(--line);border-radius:var(--r-lg);padding:16px 18px;box-shadow:var(--shadow)}
+#storagecard .smhead{display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap}
+#storagecard .smhead h2{margin:0;font-size:var(--f5);letter-spacing:-.03em}
+#storagecard .smsub{color:var(--mut);font-size:var(--f1);margin-top:3px}
+#storagecard .smreload{margin-left:auto}
+#storagestatus{margin:14px 0 0;padding:9px 11px;border-radius:var(--r);background:color-mix(in srgb,var(--accent) 8%,transparent);color:var(--mut);font-size:var(--f1)}
+#storagestatus.stale{border-left:3px solid var(--warn);color:var(--warn)}
+#storagestatus.bad{border-left:3px solid var(--bad);color:var(--bad)}
+.smmatrix{margin-top:14px;overflow-x:auto}
+table.storage{width:100%;min-width:1040px;border-collapse:collapse;table-layout:fixed;font-size:var(--f2)}
+table.storage caption{text-align:left;color:var(--mut);font-size:var(--f1);padding:0 0 10px}
+table.storage th{padding:8px 9px;text-align:left;border-bottom:1px solid var(--line);color:var(--mut);font-size:var(--f0);letter-spacing:.02em;vertical-align:bottom}
+table.storage th small{display:block;color:var(--sub);font-weight:var(--w-reg);letter-spacing:0;margin-top:2px}
+table.storage th:first-child{width:210px}
+table.storage td{padding:9px;border-bottom:1px solid var(--line);vertical-align:middle}
+table.storage tr:last-child td,table.storage tr:last-child th{border-bottom:none}
+.smname{color:var(--fg);font-size:var(--f2)}
+.smname b{display:block}.smstate{margin-top:5px;color:var(--mut);font-size:var(--f0);font-weight:var(--w-reg);line-height:1.25}.smstate.bad{color:var(--bad)}
+.smmetric{min-width:140px}.smpair{display:grid;gap:5px}
+.smtier{position:relative;display:grid;grid-template-columns:48px minmax(40px,1fr);grid-template-areas:"label track" "label value";column-gap:6px;align-items:center;padding:2px 3px;border-radius:var(--r-sm);outline:none}
+.smlabel{grid-area:label;color:var(--mut);font-size:var(--f0);font-weight:var(--w-med);align-self:center}
+.smtrack{grid-area:track;display:block;height:8px;background:var(--accent-soft);border-radius:0 4px 4px 0}
+.smfill{display:block;height:8px;min-width:3px;background:var(--accent);border-radius:0 4px 4px 0}
+.smtier.memory .smfill{background:repeating-linear-gradient(135deg,var(--accent) 0 4px,color-mix(in srgb,var(--accent) 55%,transparent) 4px 8px)}
+.smvalue{grid-area:value;display:block;color:var(--mut);font-size:var(--f0);font-variant-numeric:tabular-nums;white-space:nowrap}
+.smtier.smnc .smtrack{background:repeating-linear-gradient(135deg,var(--accent-soft) 0 4px,transparent 4px 8px)}
+.smtier.smnc .smfill{display:none}
+.smtier.smna{grid-template-areas:"label value";grid-template-columns:48px 1fr}.smtier.smna .smvalue{align-self:center}
+.smtier:hover .smfill,.smtier:focus .smfill{filter:brightness(1.12)}
+.smtier:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
+.smtier:hover::after,.smtier:focus::after{content:attr(data-tip);position:absolute;z-index:8;left:8px;bottom:calc(100% - 2px);padding:7px 9px;border:1px solid var(--line2);border-radius:var(--r-sm);background:var(--bg);color:var(--fg);font-size:var(--f0);white-space:nowrap;box-shadow:var(--shadow)}
+.smdetail{margin-top:5px;color:var(--mut);font-size:var(--f0);font-weight:var(--w-reg)}
+.smdetail summary{cursor:pointer;color:var(--accent);list-style:none}.smdetail summary::-webkit-details-marker{display:none}
+.smdetail summary::before{content:"▸ ";color:var(--sub)}.smdetail[open] summary::before{content:"▾ "}
+.smdetail div{margin-top:4px;max-width:42ch;word-break:break-word;color:var(--mut)}
+#storagemethod{margin-top:14px;border-top:1px solid var(--line);padding-top:10px;color:var(--mut);font-size:var(--f1)}
+#storagemethod summary{cursor:pointer;color:var(--fg)}
+

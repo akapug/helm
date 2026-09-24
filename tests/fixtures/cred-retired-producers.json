@@ -1,0 +1,52 @@
+[
+  {
+    "event": "SessionStart",
+    "name": "cred-guard",
+    "command": "timeout 5 /opt/helm/bin/helm cred backup --quiet || true"
+  },
+  {
+    "event": "Stop",
+    "name": "cred-guard-turn",
+    "command": "timeout 5 /opt/helm/bin/helm cred backup --quiet || true"
+  },
+  {
+    "event": "SessionStart",
+    "name": "cred-guard",
+    "command": "timeout 5 /opt/helm/bin/helm cred backup --apply --quiet || true"
+  },
+  {
+    "event": "Stop",
+    "name": "cred-guard-turn",
+    "command": "timeout 5 /opt/helm/bin/helm cred backup --apply --quiet || true"
+  },
+  {
+    "event": "SessionStart",
+    "name": "cred-heal",
+    "command": "timeout 10 /opt/helm/bin/helm cred heal --apply --quiet || true"
+  },
+  {
+    "event": "Stop",
+    "name": "cred-heal-turn",
+    "command": "timeout 10 /opt/helm/bin/helm cred heal --apply --quiet || true"
+  },
+  {
+    "event": "SessionStart",
+    "name": "cred-guard",
+    "command": "timeout 5 /opt/helm/bin/helm cred backup --apply --quiet; rc=$?; case \"$rc\" in 0) ;; 124) printf '%s\\n' '[helm cred-guard] TIMED OUT after 5s \u2014 helm cred-guard did NOT run' >&2; printf '%s\\n' '{\"systemMessage\": \"[helm cred-guard] TIMED OUT after 5s \\u2014 helm cred-guard did NOT run\", \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": \"[helm cred-guard] TIMED OUT after 5s \\u2014 helm cred-guard did NOT run\"}}' ;; 127) printf '%s\\n' '[helm cred-guard] IS MISSING \u2014 nothing executable at /opt/helm/bin/helm \u2014 helm cred-guard did NOT run; repair with: helm hooks install' >&2; printf '%s\\n' '{\"systemMessage\": \"[helm cred-guard] IS MISSING \\u2014 nothing executable at /opt/helm/bin/helm \\u2014 helm cred-guard did NOT run; repair with: helm hooks install\", \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": \"[helm cred-guard] IS MISSING \\u2014 nothing executable at /opt/helm/bin/helm \\u2014 helm cred-guard did NOT run; repair with: helm hooks install\"}}' ;; *) printf '%s%s%s\\n' '[helm cred-guard] FAILED rc=' \"$rc\" ' \u2014 helm cred-guard did NOT run' >&2; printf '%s%s%s%s%s\\n' '{\"systemMessage\": \"[helm cred-guard] FAILED rc=' \"$rc\" ' \\u2014 helm cred-guard did NOT run\", \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": \"[helm cred-guard] FAILED rc=' \"$rc\" ' \\u2014 helm cred-guard did NOT run\"}}' ;; esac; exit 0"
+  },
+  {
+    "event": "Stop",
+    "name": "cred-guard-turn",
+    "command": "timeout 5 /opt/helm/bin/helm cred backup --apply --quiet; rc=$?; case \"$rc\" in 0) ;; 124) printf '%s\\n' '[helm cred-guard-turn] TIMED OUT after 5s \u2014 helm cred-guard-turn did NOT run' >&2; printf '%s\\n' '{\"systemMessage\": \"[helm cred-guard-turn] TIMED OUT after 5s \\u2014 helm cred-guard-turn did NOT run\", \"hookSpecificOutput\": {\"hookEventName\": \"Stop\", \"additionalContext\": \"[helm cred-guard-turn] TIMED OUT after 5s \\u2014 helm cred-guard-turn did NOT run\"}}' ;; 127) printf '%s\\n' '[helm cred-guard-turn] IS MISSING \u2014 nothing executable at /opt/helm/bin/helm \u2014 helm cred-guard-turn did NOT run; repair with: helm hooks install' >&2; printf '%s\\n' '{\"systemMessage\": \"[helm cred-guard-turn] IS MISSING \\u2014 nothing executable at /opt/helm/bin/helm \\u2014 helm cred-guard-turn did NOT run; repair with: helm hooks install\", \"hookSpecificOutput\": {\"hookEventName\": \"Stop\", \"additionalContext\": \"[helm cred-guard-turn] IS MISSING \\u2014 nothing executable at /opt/helm/bin/helm \\u2014 helm cred-guard-turn did NOT run; repair with: helm hooks install\"}}' ;; *) printf '%s%s%s\\n' '[helm cred-guard-turn] FAILED rc=' \"$rc\" ' \u2014 helm cred-guard-turn did NOT run' >&2; printf '%s%s%s%s%s\\n' '{\"systemMessage\": \"[helm cred-guard-turn] FAILED rc=' \"$rc\" ' \\u2014 helm cred-guard-turn did NOT run\", \"hookSpecificOutput\": {\"hookEventName\": \"Stop\", \"additionalContext\": \"[helm cred-guard-turn] FAILED rc=' \"$rc\" ' \\u2014 helm cred-guard-turn did NOT run\"}}' ;; esac; exit 0"
+  },
+  {
+    "event": "SessionStart",
+    "name": "cred-heal",
+    "command": "timeout 10 /opt/helm/bin/helm cred heal --apply --quiet; rc=$?; case \"$rc\" in 0) ;; 124) printf '%s\\n' '[helm cred-heal] TIMED OUT after 10s \u2014 helm cred-heal did NOT run' >&2; printf '%s\\n' '{\"systemMessage\": \"[helm cred-heal] TIMED OUT after 10s \\u2014 helm cred-heal did NOT run\", \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": \"[helm cred-heal] TIMED OUT after 10s \\u2014 helm cred-heal did NOT run\"}}' ;; 127) printf '%s\\n' '[helm cred-heal] IS MISSING \u2014 nothing executable at /opt/helm/bin/helm \u2014 helm cred-heal did NOT run; repair with: helm hooks install' >&2; printf '%s\\n' '{\"systemMessage\": \"[helm cred-heal] IS MISSING \\u2014 nothing executable at /opt/helm/bin/helm \\u2014 helm cred-heal did NOT run; repair with: helm hooks install\", \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": \"[helm cred-heal] IS MISSING \\u2014 nothing executable at /opt/helm/bin/helm \\u2014 helm cred-heal did NOT run; repair with: helm hooks install\"}}' ;; *) printf '%s%s%s\\n' '[helm cred-heal] FAILED rc=' \"$rc\" ' \u2014 helm cred-heal did NOT run' >&2; printf '%s%s%s%s%s\\n' '{\"systemMessage\": \"[helm cred-heal] FAILED rc=' \"$rc\" ' \\u2014 helm cred-heal did NOT run\", \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": \"[helm cred-heal] FAILED rc=' \"$rc\" ' \\u2014 helm cred-heal did NOT run\"}}' ;; esac; exit 0"
+  },
+  {
+    "event": "Stop",
+    "name": "cred-heal-turn",
+    "command": "timeout 10 /opt/helm/bin/helm cred heal --apply --quiet; rc=$?; case \"$rc\" in 0) ;; 124) printf '%s\\n' '[helm cred-heal-turn] TIMED OUT after 10s \u2014 helm cred-heal-turn did NOT run' >&2; printf '%s\\n' '{\"systemMessage\": \"[helm cred-heal-turn] TIMED OUT after 10s \\u2014 helm cred-heal-turn did NOT run\", \"hookSpecificOutput\": {\"hookEventName\": \"Stop\", \"additionalContext\": \"[helm cred-heal-turn] TIMED OUT after 10s \\u2014 helm cred-heal-turn did NOT run\"}}' ;; 127) printf '%s\\n' '[helm cred-heal-turn] IS MISSING \u2014 nothing executable at /opt/helm/bin/helm \u2014 helm cred-heal-turn did NOT run; repair with: helm hooks install' >&2; printf '%s\\n' '{\"systemMessage\": \"[helm cred-heal-turn] IS MISSING \\u2014 nothing executable at /opt/helm/bin/helm \\u2014 helm cred-heal-turn did NOT run; repair with: helm hooks install\", \"hookSpecificOutput\": {\"hookEventName\": \"Stop\", \"additionalContext\": \"[helm cred-heal-turn] IS MISSING \\u2014 nothing executable at /opt/helm/bin/helm \\u2014 helm cred-heal-turn did NOT run; repair with: helm hooks install\"}}' ;; *) printf '%s%s%s\\n' '[helm cred-heal-turn] FAILED rc=' \"$rc\" ' \u2014 helm cred-heal-turn did NOT run' >&2; printf '%s%s%s%s%s\\n' '{\"systemMessage\": \"[helm cred-heal-turn] FAILED rc=' \"$rc\" ' \\u2014 helm cred-heal-turn did NOT run\", \"hookSpecificOutput\": {\"hookEventName\": \"Stop\", \"additionalContext\": \"[helm cred-heal-turn] FAILED rc=' \"$rc\" ' \\u2014 helm cred-heal-turn did NOT run\"}}' ;; esac; exit 0"
+  }
+]

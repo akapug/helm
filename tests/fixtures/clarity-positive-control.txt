@@ -1,0 +1,20 @@
+land: a commit message is a body too, and there the flag-value law inverts
+
+Cross-family gate: helm-claude-2 (fable) authored, kimi (Moonshot) reviewed and
+APPROVED at exact tip 857fc4bf8330, signed, probing thirteen invocation forms
+live rather than reasoning about the grammar.
+
+The argv-guard has protected chat bodies since this morning, when ds4pro found
+the `--room=helm "body `cmd`"` bypass: a self-valued flag consumes its own
+value, so the NEXT quoted region is a body, not an argument. This extends the
+same reasoning to `git commit -m`, where it INVERTS — and the inversion is the
+whole finding, because the same shape means the opposite thing on the other
+side of the seam.
+
+Personally overdue. Every commit message I have written today, including this
+one, is `-m "$(cat <<'EOF' ... EOF)"` — a command substitution wrapping a
+multi-line body, run in a shared checkout that nine agents write to. The guard
+that has been blocking my chat posts all day had nothing to say about the far
+larger bodies I was passing to git.
+
+

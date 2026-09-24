@@ -1,0 +1,514 @@
+{
+ "schema": "helm.task2612.outsider-hostile-54-replay.v1",
+ "provenance": "task/2612: the reviewer's hostile 54-case replay from the outsider read of this lane, transferred as a fixture per the meld; the source file's sha256 is recorded so the transfer can be checked, and its machine-local paths are not carried",
+ "original_file_sha256": "2c4fc26f416dd8696876b426c3e88713cb5a5ee56e458aa3f001115e5d438727",
+ "status_rule": {
+  "open_task_ids": [
+   "2598"
+  ],
+  "all_other_task_ids": "closed",
+  "source_lambda": "lambda tid:'open' if tid=='2598' else 'closed'"
+ },
+ "roots": [
+  "docs",
+  "agents"
+ ],
+ "controls": [
+  {
+   "path": "docs/CONTROL.txt",
+   "kind": "must-hit-closed",
+   "text": "Until task/4242 lands, copy by hand.",
+   "expected_warning_count": 1
+  },
+  {
+   "path": "docs/OPEN.txt",
+   "kind": "must-not-open",
+   "text": "Until task/2598 lands, copy by hand.",
+   "expected_warning_count": 0
+  },
+  {
+   "path": "docs/PROVENANCE.txt",
+   "kind": "must-not-provenance",
+   "text": "This was filed against task/2573. Until then, do the other thing by hand.",
+   "expected_warning_count": 0
+  },
+  {
+   "path": "agents/CONTROL.txt",
+   "kind": "must-hit-closed",
+   "text": "Until task/4343 lands, copy by hand.",
+   "expected_warning_count": 1
+  },
+  {
+   "path": "agents/OPEN.txt",
+   "kind": "must-not-open",
+   "text": "Until task/2598 lands, copy by hand.",
+   "expected_warning_count": 0
+  },
+  {
+   "path": "agents/PROVENANCE.txt",
+   "kind": "must-not-provenance",
+   "text": "This was filed against task/2573. Until then, do the other thing by hand.",
+   "expected_warning_count": 0
+  }
+ ],
+ "cases": [
+  {
+   "label": "for-nowhere",
+   "text": "task/2573 fixes the old bug. We are bound for nowhere.",
+   "text_utf8_sha256": "719e5d12dc13beafbd5886dc1ae11b2a98f5ff053169c693874f001eefae355b",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "for-now-positive",
+   "text": "task/2573 will automate the exit. For now, exit by hand.",
+   "text_utf8_sha256": "aa6a660e8c25f404bc75fbce33c6af8a15b9e910878ee659b003ecc2dd4fd587",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "cf-provenance",
+   "text": "cf. task/2573. Separately the signer ships tomorrow; until then, wait.",
+   "text_utf8_sha256": "1f9e1a761c4ebf175e955ad5b25dec95d9cfa51958edf46e59e15d3b168efab8",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "cf-direct-anaphor",
+   "text": "cf. task/2573. Until then, wait for hardware.",
+   "text_utf8_sha256": "d790a3bac4a6bd30fa6521ae1881556945e3d7414dba8bb1f891f9ad7ad37bf3",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "abbreviation-eg",
+   "text": "The task/2573 shortcut, e.g. its automatic exit, is not yet available.",
+   "text_utf8_sha256": "3b9bbbfa1092993b00a0325fb6181f50ee3c39283012c0396f70b66c3426924a",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "abbreviation-ie",
+   "text": "The task/2573 shortcut, i.e. its automatic exit, is not yet available.",
+   "text_utf8_sha256": "5da17fd93131b382bf6b0d382124a0336abe132868a8b7fae847ceed68459bab",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "semicolon-provenance",
+   "text": "The fix was filed against task/2573; separately the signer is not yet available.",
+   "text_utf8_sha256": "52805e754ffe0ace4410d2657bbd23e9dee73e8679f79f5f31384052e19726dc",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "semicolon-no-space",
+   "text": "The fix was filed against task/2573;separately the signer is not yet available.",
+   "text_utf8_sha256": "4cdb78d717369487fce27149d5e88fd9126bb2e4d019b2d3074411474bb4f1c0",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "comma-provenance",
+   "text": "The fix was filed against task/2573, while the unrelated signer is not yet available.",
+   "text_utf8_sha256": "4e6dac79b46ab4bf8827a58ebacdccf42373f37bc66398b8cf001ad62a39ce09",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "provenance-explicit-open-subject",
+   "text": "task/2598 is not yet available, per task/2573.",
+   "text_utf8_sha256": "b3e2d984579b08a06549c48234af9736b42cb1df14ac63ca63d5203eb3d88476",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "explicit-plural",
+   "text": "task/2573 and task/4244 are not yet available.",
+   "text_utf8_sha256": "7eba78ca764261b9256669fd0d0ec0d4dee47ab4f5c9f97bd79c630f0e720dfa",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ],
+    [
+     1,
+     "4244"
+    ]
+   ]
+  },
+  {
+   "label": "explicit-plural-wrapped",
+   "text": "task/2573 and\ntask/4244 are not yet available.",
+   "text_utf8_sha256": "0731e684fbe28fc001f90b6eb6f4c57f56d77aa6c0ee6fa896660a25dd0d83d8",
+   "expected_line_task_pairs_per_root": [
+    [
+     2,
+     "2573"
+    ],
+    [
+     2,
+     "4244"
+    ]
+   ]
+  },
+  {
+   "label": "ambiguous-it",
+   "text": "task/2598 supersedes task/2573, and once it lands the shim goes.",
+   "text_utf8_sha256": "5bf7dc7e96bed80badaef55cbcfeb00b7aade38763746e124079063e6b174d8e",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "first-only-open-then-closed",
+   "text": "Until task/2598 lands, copy by hand, and until task/2573 lands, exit by hand.",
+   "text_utf8_sha256": "0184babebe14ca35b762350bcf7ff4324d78930666c0a8cbff986761c878be6a",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "multiple-named-promises",
+   "text": "Until task/2573 lands, exit by hand, and until task/4244 lands, copy by hand.",
+   "text_utf8_sha256": "f55a25f02cfcce5d69cbe6f12b5c238a7f4ed7ce89689c8f32db146ebce5dfbd",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ],
+    [
+     1,
+     "4244"
+    ]
+   ]
+  },
+  {
+   "label": "multiple-named-wrapped",
+   "text": "Until task/2573 lands, exit by hand,\nand until task/4244 lands, copy by hand.",
+   "text_utf8_sha256": "16d111d10c9af04097efbf7bb425bf6769c1066061813f61173f206c2d0ab3b9",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ],
+    [
+     2,
+     "4244"
+    ]
+   ]
+  },
+  {
+   "label": "multiple-semicolon-promises",
+   "text": "Until task/2573 lands, exit by hand; until task/4244 lands, copy by hand.",
+   "text_utf8_sha256": "a73dc7714bbaf80d3b386517c1d5ffec682f9af9dfc49c428a1b2bade83dbe0c",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ],
+    [
+     1,
+     "4244"
+    ]
+   ]
+  },
+  {
+   "label": "same-subject-two-sentences",
+   "text": "task/2573 is not yet available. Until then, exit by hand.",
+   "text_utf8_sha256": "2a74c1a8e035fdf8a0c6160eadc94f8747266b6b7bfd63c5826952fc6ec27bdb",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ],
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "wrapped-until",
+   "text": "Until\ntask/2573 lands, exit by hand.",
+   "text_utf8_sha256": "16a44a45ddcd96d71bdba4039b7fe6c749fa36cd83d40f26b18934b3c0fc17c5",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "wrapped-state",
+   "text": "While task/2573 is\npending, copy by hand.",
+   "text_utf8_sha256": "d070afe153b5f5ef3b2588987946b5a6e16aec05bd118666e4ff3eff4a097020",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "wrapped-tabs",
+   "text": "Once\t`task/2573`\tis\ndone, exit by hand.",
+   "text_utf8_sha256": "1fdcbefb0ee574dd76f0a89e76bb4f7cebd0627de7c90bc3960dccb9494f3589",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "wrapped-anaphor",
+   "text": "task/2573 makes the exit automatic.\nWhile\tit is\npending, exit by hand.",
+   "text_utf8_sha256": "8e7bfd75faf6f224a50d7863fac8509d630364b872d529c045e58e98eb04ae65",
+   "expected_line_task_pairs_per_root": [
+    [
+     2,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "anaphor-backward",
+   "text": "task/2573 will automate the exit. Until then, use the old script.",
+   "text_utf8_sha256": "ba4219c75aa39297e6d123ff9f4971fb63656340abe9eefc176daaf30190f9c2",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "anaphor-forward-refused",
+   "text": "Until then, wait for the signer. task/2573 records an old fix.",
+   "text_utf8_sha256": "2c82a0971adb27f6d922600ce4f19b5a6708114e5ca100533421cb3d180c9aa4",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "anaphor-provenance-citation",
+   "text": "task/2573 will automate the exit. Until then, use the script recorded under task/2598.",
+   "text_utf8_sha256": "7484855d74511bb2a2bba5e1084576effd69221daaa0a976395bd3bd1d725da3",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "anaphor-same-id-provenance-and-subject",
+   "text": "The proposal was filed against task/2573, and task/2573 will automate the exit. Until then, exit by hand.",
+   "text_utf8_sha256": "d481e9802b13d633f572d2fc54720f1e41bef60ede0134534b47566d610681d9",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "unrelated-next-anaphor",
+   "text": "task/2573 fixed the old bug. Separately the signer ships tomorrow; until then, wait.",
+   "text_utf8_sha256": "93c0cfd8e520abd012db30e5a0e95cf1848c643b1b5030a1145b0d30d192baa4",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "fence-trailing-text",
+   "text": "```text\nexample\n``` not a closer\nUntil task/2573 lands, exit by hand.\n```",
+   "text_utf8_sha256": "8b1cb3675a96f9e35c16f1470d16a7ee65ed207ab501ea536f03a73ce2e75958",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "tilde-fence-trailing-text",
+   "text": "~~~text\nexample\n~~~ not a closer\nUntil task/2573 lands, exit by hand.\n~~~",
+   "text_utf8_sha256": "7f55315264b66eebba54a522bbf9cf964d1c1ea1e7d02d785976288661b5ad54",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "fence-short-closer",
+   "text": "````text\n```\nUntil task/2573 lands, exit by hand.\n````",
+   "text_utf8_sha256": "614572b16dc834cd64db8952fdc68a181f57892ea92485f17b735d5b5485258d",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "fence-mixed-closer",
+   "text": "```text\n~~~\nUntil task/2573 lands, exit by hand.\n```",
+   "text_utf8_sha256": "1f5c41800bb0444433e9b6e3394821688cdb97492f60038a65552af9b2dd85aa",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "fence-valid-close-positive",
+   "text": "```text\nexample\n```   \nUntil task/2573 lands, exit by hand.",
+   "text_utf8_sha256": "d75ec82908d8534963a8ef8dba2fefce2421a50a895880c0ec8643176d20cde0",
+   "expected_line_task_pairs_per_root": [
+    [
+     4,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "heading-body-state-join",
+   "text": "# task/2573\nThe unrelated signer is not yet available.",
+   "text_utf8_sha256": "e3c2efc82b96027fdbfe780fb5953c163e32ac28da1b74a75f07d6f0594290f6",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "heading-body-anaphor-join",
+   "text": "# task/2573.\nUntil then, wait for unrelated hardware.",
+   "text_utf8_sha256": "8de487c2d959089c005a92b69139c511892c7fca3ddabef903d12e9da431247f",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "body-heading-boundary",
+   "text": "task/2573 fixed the old bug\n# Signer: in the meantime\nWait for hardware.",
+   "text_utf8_sha256": "66d4ff6ac6bcb85bfb5082a367e10957fe795cce1ac9e3e6e7b7f7529629af0a",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "heading-own-promise",
+   "text": "# Until task/2573 lands, exit by hand",
+   "text_utf8_sha256": "8b27def397298fe6650cc5b0ec99494c5675ace8a4bffe539d632e2a1f60a01d",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "setext-body-boundary",
+   "text": "task/2573\n=========\nThe unrelated signer is not yet available.",
+   "text_utf8_sha256": "6970bd137e17c3e7dbc97c14fbdf97048e412cf3505735a53c733c461c59abf3",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "html-comment-multiline",
+   "text": "<!--\nUntil task/2573 lands, exit by hand.\n-->",
+   "text_utf8_sha256": "8801cb4cfa97f187d8200499ae5f26afcf5972a7c1978be2113d487d7ac37423",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "html-script-multiline",
+   "text": "<script>\nconst msg = \"Until task/2573 lands, exit by hand.\";\n</script>",
+   "text_utf8_sha256": "629ea2b27dcc09242311f61b0edd79be5399fd1c7d64d253effbbe0018792510",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "html-style-multiline",
+   "text": "<style>\n/* Until task/2573 lands, exit by hand. */\n</style>",
+   "text_utf8_sha256": "e08765a691b829ea2f4115116f2985bab11b278ee63ed66d86067ef549bf8cbe",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "html-div-multiline",
+   "text": "<div>\nUntil task/2573 lands, exit by hand.\n</div>",
+   "text_utf8_sha256": "36ba158efb71eb5cb45b6299ee992cb29f34db867cb98465585205a4736d3374",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "html-comment-inline",
+   "text": "<!-- Until task/2573 lands, exit by hand. -->",
+   "text_utf8_sha256": "cd5a3cb0876dda179a1d0d593bd897261e8502fe14ad0ce34d4efb0369b7c2fb",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "html-after-comment-positive",
+   "text": "<!--\nexample\n-->\nUntil task/2573 lands, exit by hand.",
+   "text_utf8_sha256": "ec4394e208c5f268979f0c8fa7866b1dd93500adf28aee9043910eeea22fd984",
+   "expected_line_task_pairs_per_root": [
+    [
+     4,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "indented-code",
+   "text": "Example:\n\n    Until task/2573 lands, exit by hand.",
+   "text_utf8_sha256": "c9c697aa2a1c824b9c33d3ffa228820fae31f6e0f2f7ae4a7f9398b2925a4ddc",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "table-leading-pipe",
+   "text": "| task | note |\n|---|---|\n| task/2573 | Until it lands, exit by hand. |",
+   "text_utf8_sha256": "6b985fa211f6cdb941bfff2e2ea9ea318214fc232425fbbd2efd1c2e7c2da951",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "table-no-leading-pipe",
+   "text": "task | note\n---|---\ntask/2573 | Until it lands, exit by hand.",
+   "text_utf8_sha256": "dd8afd486f160c46a2dced5a88da94c09501962dd16c614a82a3a1da3e90d585",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "bullet-boundary",
+   "text": "- task/2573 fixed the old bug\n- Until then, wait for unrelated hardware.",
+   "text_utf8_sha256": "ed707a97315398eb8aed46bb7ef8e09ec796c27d7738053736f9ca3ae8557ae5",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "blank-boundary",
+   "text": "task/2573 fixed the old bug\n\nUntil then, wait for unrelated hardware.",
+   "text_utf8_sha256": "23b57fb5311485f5fcddba62c9ab2697deaa846a5c414d2054c1bc56112c7ce7",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "numbered-boundary",
+   "text": "1) task/2573 fixed the old bug\n2) Until then, wait for unrelated hardware.",
+   "text_utf8_sha256": "34f8c61c4a188d66549c8a7695221517a59cf4827579e25fd23fea70100ffba9",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "provenance-word-suffix",
+   "text": "Oversee task/2573. Until then, exit by hand.",
+   "text_utf8_sha256": "0e0922ed5d23039c5fabaa28e6209e78876fb96e18819b87b8c05908269a5c1f",
+   "expected_line_task_pairs_per_root": [
+    [
+     1,
+     "2573"
+    ]
+   ]
+  },
+  {
+   "label": "citation-word-prefix",
+   "text": "subtask/2573 is not yet available.",
+   "text_utf8_sha256": "7d9dccb04902d5e2dcd45f80cb3ab244494544caea398f92af3c30ad53f1f528",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "citation-word-suffix",
+   "text": "task/2573xyz is not yet available.",
+   "text_utf8_sha256": "091127edd6245a1c631ce4650f0adeb58de6b05ee63e37c788d435c5a714ad0e",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "phrase-word-suffix",
+   "text": "task/2573 is not yet availableish.",
+   "text_utf8_sha256": "2a0c9db349635cdd45ea30ead6607b67640e89a83376c929f4d96139661dd524",
+   "expected_line_task_pairs_per_root": []
+  },
+  {
+   "label": "phrase-word-prefix",
+   "text": "task/2573 waits for the meantime.",
+   "text_utf8_sha256": "35cec665679904ae0992cb2eb0719f9eb5fb1d8ce401d46e4b276867810c7884",
+   "expected_line_task_pairs_per_root": []
+  }
+ ],
+ "multiline_comment_witness": {
+  "text": "<!--\nUntil task/2573 lands, exit by hand.\n-->",
+  "expected_line_task_pairs_per_root": []
+ },
+ "cases_joined_sha256": "9ca7f76e31fde44efa01d263bb10b407c7f221035778041300f55fe1bcdff2fd"
+}

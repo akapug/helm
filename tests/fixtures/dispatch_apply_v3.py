@@ -1,0 +1,585 @@
+"""Frozen v3 admission body from main 5cac92c98, with LIVE helper dependencies.
+
+The regression measures the inline version gate, not an isolated old reader.
+The _apply body is unmodified baseline code, not a mirrored predicate.
+"""
+
+def _apply(state, row, current=None, verdicts=None, position=None):
+    """Apply only immutable evidence events; malformed later rows preserve the
+    preceding good obligation.
+
+    Every compatibility branch is gated to LEGACY-opened states (v1/v2): an
+    obligation opened by a v3 dispatch row accepts only strict seq-ordered
+    delivery, verdict, cancellation, structured close, and explicit correction
+    events, so a well-shaped forged snapshot, ack, or retarget row can never
+    close it or move its tip."""
+    if str(row.get("id") or "") != state["id"]:
+        return state
+    event = row.get("event")
+    # RETIREMENT IS TERMINAL IN REPLAY TOO, and this must run BEFORE every
+    # individual arm. Resolution-time guards cannot help here: a hand-appended
+    # event never passes through `_resolve_row`, so without this a forged or
+    # stale row could move a retired obligation on the next replay. The state
+    # is returned UNCHANGED — including `seq` — so a retired row's history is
+    # bit-for-bit stable no matter what is appended after it.
+    if event in _ACTIVE_ONLY_EVENTS and _retired_admin_by(state):
+        return state
+    expected = int(state.get("seq") or 0) + 1
+    strict = type(row.get("v")) is int and row.get("v") == 3 \
+        and type(row.get("seq")) is int and row.get("seq") == expected
+    # An OPEN BUILD row has no verdict of its own. Delivered reports close on
+    # their own artifact + handoff evidence; landed builds close through an
+    # accepted review descendant. Both strict variants apply before ordinary
+    # OPEN transitions; every later event then meets CLOSED_STATES.
+    if event == "close" and strict \
+            and row.get("close_reason") == "delivered-report" \
+            and _close_event_error(row, state, current=current,
+                                   verdicts=verdicts, position=position) is None:
+        out = dict(state)
+        out.update(status="closed", close_reason="delivered-report",
+                   close_ts=row.get("ts"),
+                   close_evidence=row.get("close_evidence"), seq=expected)
+        for key in _CLOSE_STATE_FIELDS["delivered-report"]:
+            out[key] = row.get(key)
+        return out
+    if event == "close" and strict and row.get("close_reason") == "landed" \
+            and row.get("close_proof_version") == 2 \
+            and _close_event_error(row, state, current=current,
+                                   verdicts=verdicts, position=position) is None:
+        out = dict(state)
+        out.update(status="closed", close_reason="landed",
+                   close_ts=row.get("ts"), close_evidence=None, seq=expected)
+        for key in _CLOSE_STATE_FIELDS["landed"]:
+            out[key] = row.get(key)
+        return out
+    # #177 — the polarity-less row's one terminal. Same early-arm shape as
+    # build-landed: an OPEN row never reaches the verdict-only close arm in
+    # the CLOSED_STATES block, and the writer's projection is this same call.
+    if event == "close" and strict \
+            and row.get("close_reason") == "discharged" \
+            and _close_event_error(row, state, current=current,
+                                   verdicts=verdicts, position=position) is None:
+        out = dict(state)
+        out.update(status="closed", close_reason="discharged",
+                   close_ts=row.get("ts"),
+                   close_evidence=row.get("close_evidence"), seq=expected)
+        for key in _CLOSE_STATE_FIELDS["discharged"]:
+            out[key] = row.get(key)
+        return out
+    # ADMINISTRATIVE RETIREMENT — the terminal that CLAIMS NOTHING ABOUT THE
+    # WORK. Every other terminal on this ledger asserts something happened
+    # (the change landed, was superseded, was withdrawn, its evidence was
+    # destroyed); this one asserts only that the row's PROOF CHAIN was
+    # measured permanently unreachable, so no reader can ever act on it and
+    # no biller should keep charging for it. It is deliberately admitted for
+    # OPEN and HELD rows as well as verdicted ones — an unreachable row bills
+    # from whatever stage it is stuck in, and a terminal that only reached
+    # verdicts would leave the OPEN half immortal, which is the very defect
+    # this event exists to end.
+    #
+    # THE REPLAY ADMITS EXACTLY WHAT THE WRITER ADMITS (the abandon lesson,
+    # one arm up): a divergence here grows events the state machine ignores
+    # while the CLI prints RETIRED over a row that stayed live.
+    if event == "retire" and strict \
+            and state.get("status") in _RETIRABLE_STATUSES \
+            and not _close_retired_by(state) and not state.get("retired_admin"):
+        reason = row.get("retire_reason")
+        measurement, m_err = _clean(
+            row.get("retire_measurement"), "retire measurement",
+            _RETIRE_MEASUREMENT_CAP)
+        seat, s_err = _clean(row.get("retire_seat"), "retire seat", 64)
+        note = row.get("retire_note")
+        note_err = None
+        if note is not None:
+            note, note_err = _clean(note, "retire note", _RETIRE_NOTE_CAP)
+        # `_TOKEN` ON THE SEAT, because the WRITER requires it and the two
+        # must admit the same shapes. This arm was the more permissive half —
+        # the harmless direction of the abandon divergence, but a divergence
+        # all the same, and the law that governs this arm is quoted three
+        # lines above it. A seat is an ADDRESS: an actor field a reader
+        # cannot resolve to a seat makes the audit trail unfollowable.
+        if reason in RETIRE_REASONS and not m_err and measurement \
+                and not s_err and seat and _TOKEN.fullmatch(seat) \
+                and not note_err \
+                and type(row.get("retire_proof_version")) is int \
+                and row.get("retire_proof_version") == _RETIRE_PROOF_V \
+                and _valid_ts(row.get("ts")):
+            out = dict(state)
+            out.update(retired_admin=True, retire_reason=reason,
+                       retire_measurement=measurement, retire_seat=seat,
+                       retire_note=note, retire_ts=row.get("ts"),
+                       retire_proof_version=_RETIRE_PROOF_V, seq=expected)
+            return out
+    # TERMINAL IS IMMUTABLE except for one NARROW reconciliation annotation:
+    # a FIX/SUPERSEDE verdict whose contrary physical land was later resolved
+    # by an approved superseding round. DISCHARGE does not rewrite the verdict,
+    # tip, or status; it retires only the operational debt while preserving the
+    # contradiction as history. Cancelled rows and every other post-terminal
+    # event remain inert.
+    if state.get("status") in CLOSED_STATES:
+        # One explicit correction may follow a historical cancellation. It does
+        # not infer from the cancel prose and does not erase it: the projected
+        # row keeps cancel_reason plus a correction marker while becoming the
+        # canonical delivered-report terminal only after exact artifact/report
+        # references are recorded.
+        if event == "close-correction" and strict \
+                and _delivered_report_event_error(row, state, correction=True) is None:
+            out = dict(state)
+            out.update(status="closed", close_reason="delivered-report",
+                       close_ts=row.get("ts"),
+                       close_evidence=row.get("close_evidence"),
+                       delivered_report_correction=True, seq=expected)
+            for key in _CLOSE_STATE_FIELDS["delivered-report"]:
+                out[key] = row.get(key)
+            return out
+        # CLOSED-BY-LANDING is a monotonic historical fact: once Git proved an
+        # UNDECLARED reviewed change on one sampled trunk, no later event or ref
+        # movement rewrites that receipt or the still-undeclared verdict.
+        if state.get("closed_by_landing") or state.get("abandoned"):
+            return state
+        if event == "abandon" and state.get("status") == "verdict" \
+                and state.get("kind") == "review" \
+                and state.get("polarity") in _WORK_POLARITIES \
+                and strict and not state.get("discharged") \
+                and not state.get("withdrawn") \
+                and not state.get("close_reason"):
+            reviewed = str(row.get("reviewed_tip") or "")
+            repo_id, repo_err = _clean(row.get("repo_id"), "abandon repo id", 4096)
+            reason, reason_err = _clean(row.get("reason"), "abandon reason", 256)
+            stamp = row.get("ts")
+            if reviewed == state.get("reviewed_tip") \
+                    and _FULL_TIP.fullmatch(reviewed) \
+                    and not repo_err and repo_id == state.get("repo_id") \
+                    and os.path.isabs(repo_id) \
+                    and os.path.realpath(repo_id) == repo_id \
+                    and not reason_err and reason \
+                    and row.get("object_state") == "missing" \
+                    and row.get("object_proof_mode") == "cat-file-batch-check" \
+                    and type(row.get("object_proof_version")) is int \
+                    and row.get("object_proof_version") == 1 \
+                    and row.get("trunk_mention_state") == "none" \
+                    and type(row.get("trunk_mention_proof_version")) is int \
+                    and (row.get("trunk_mention_proof_mode"),
+                         row.get("trunk_mention_proof_version")) in (
+                             ("structured-message-scan", 1),
+                             ("structured-message-and-tag-scan", 2)) \
+                    and row.get("branch_state") in ("none", "merged") \
+                    and row.get("branch_proof_mode") == "git-ref-and-ancestry" \
+                    and type(row.get("branch_proof_version")) is int \
+                    and row.get("branch_proof_version") == 1 \
+                    and row.get("worktree_state") in ("none", "clean") \
+                    and row.get("worktree_proof_mode") == "git-worktree-status" \
+                    and type(row.get("worktree_proof_version")) is int \
+                    and row.get("worktree_proof_version") == 1 \
+                    and row.get("land_state") == "UNKNOWN" \
+                    and _valid_ts(stamp):
+                out = dict(state)
+                out.update(abandoned=True, abandon_reason=reason,
+                           abandon_ts=stamp, abandon_repo_id=repo_id,
+                           abandon_object_state="missing",
+                           abandon_proof_mode="cat-file-batch-check",
+                           abandon_proof_version=1,
+                           abandon_trunk_mention_state="none",
+                           abandon_trunk_mention_proof_mode=
+                           row.get("trunk_mention_proof_mode"),
+                           abandon_trunk_mention_proof_version=
+                           row.get("trunk_mention_proof_version"),
+                           abandon_branch_state=row.get("branch_state"),
+                           abandon_branch_proof_mode="git-ref-and-ancestry",
+                           abandon_branch_proof_version=1,
+                           abandon_worktree_state=row.get("worktree_state"),
+                           abandon_worktree_proof_mode="git-worktree-status",
+                           abandon_worktree_proof_version=1,
+                           abandon_land_state="UNKNOWN", seq=expected)
+                return out
+        if event == "close-landed" and state.get("status") == "verdict" \
+                and state.get("polarity") is None and strict \
+                and not state.get("discharged") and not state.get("withdrawn") \
+                and not state.get("close_reason"):
+            reviewed = str(row.get("reviewed_tip") or "")
+            repo_id, repo_err = _clean(row.get("landing_repo_id"),
+                                       "landing repo id", 4096)
+            trunk_ref = _valid_trunk_ref(row.get("landing_trunk_ref"))
+            trunk_sha = str(row.get("landing_trunk_sha") or "")
+            mode = row.get("landing_proof_mode")
+            version = row.get("landing_proof_version")
+            stamp = row.get("ts")
+            if reviewed == state.get("reviewed_tip") \
+                    and not repo_err and os.path.isabs(repo_id) \
+                    and trunk_ref and _FULL_TIP.fullmatch(trunk_sha) \
+                    and mode in ("ancestor", "patch-equivalent") \
+                    and type(version) is int and version == 1 \
+                    and _valid_ts(stamp):
+                out = dict(state)
+                out.update(closed_by_landing=True,
+                           landing_repo_id=repo_id,
+                           landing_trunk_ref=trunk_ref,
+                           landing_trunk_sha=trunk_sha,
+                           landing_proof_mode=mode,
+                           landing_proof_version=version,
+                           landing_ts=stamp,
+                           seq=expected)
+                return out
+        if event == "discharge" and state.get("status") == "verdict" \
+                and state.get("polarity") in ("fix", "supersede") \
+                and strict and not state.get("discharged") \
+                and not state.get("withdrawn") \
+                and not state.get("close_reason"):
+            reviewed = str(row.get("reviewed_tip") or "")
+            superseding = str(row.get("superseding_tip") or "")
+            superseding_id = str(row.get("superseding_id") or "")
+            evidence, err = _clean(row.get("discharge_ref"),
+                                   "discharge evidence", 256)
+            contrary_state = row.get("contrary_state")
+            contrary_target = row.get("contrary_target")
+            if reviewed == state.get("reviewed_tip") \
+                    and _FULL_TIP.fullmatch(superseding) \
+                    and superseding != reviewed \
+                    and _ID.fullmatch(superseding_id) \
+                    and contrary_state in ("landed", "merged-local") \
+                    and contrary_target in ("local", "upstream") \
+                    and not err:
+                out = dict(state)
+                out.update(discharged=True,
+                           superseding_tip=superseding,
+                           superseding_id=superseding_id,
+                           discharge_ref=evidence,
+                           discharge_ts=row.get("ts"),
+                           discharge_contrary=contrary_state,
+                           discharge_target=contrary_target,
+                           seq=expected)
+                return out
+        # WITHDRAW is the mirror narrow annotation, for the row whose verdict's
+        # CORRECT resolution is "never landed" (no superseding tip will ever
+        # exist to discharge it). Same shape: no rewrite of verdict/tip/status,
+        # only the operational debt retired, history preserved. A withdrawn row
+        # accepts no discharge later (retired once); a discharged row accepts no
+        # withdraw (the discharge arm above already returned state unchanged for
+        # a discharged row, so the two can never both apply).
+        if event == "withdraw" and state.get("status") == "verdict" \
+                and state.get("polarity") in ("fix", "supersede") \
+                and strict and not state.get("withdrawn") \
+                and not state.get("discharged") \
+                and not state.get("close_reason"):
+            reviewed = str(row.get("reviewed_tip") or "")
+            evidence, werr = _clean(row.get("withdraw_ref"),
+                                    "withdraw evidence", 256)
+            if reviewed == state.get("reviewed_tip") and not werr:
+                out = dict(state)
+                out.update(withdrawn=True,
+                           withdraw_ref=evidence,
+                           withdraw_ts=row.get("ts"),
+                           seq=expected)
+                return out
+        # CLOSE — the one terminal verb's event (helm lr close). Strict-only,
+        # verdict-only, exclusivity and per-reason polarity/field validation
+        # all owned by `_close_event_error`, the SAME structural rule the writer
+        # checks before append. The writer additionally rechecks live family and
+        # tier sources under the lock; replay deliberately validates their
+        # captured, content-addressed snapshots instead, because mutable roster or
+        # policy drift must not resurrect an already-recorded terminal. As with
+        # every event in this private 0600 ledger, coherent file tampering is
+        # outside the replay model; malformed or internally inconsistent rows are
+        # inert, and a field replay would refuse never gets written.
+        # The out-of-scope reason writes a `cancel` event and never reaches
+        # this arm; discharge/withdraw/close-landed keep their arms above
+        # forever, but only new `close` events are ever emitted.
+        if event == "close" and strict \
+                and _close_event_error(row, state, current=current,
+                                       verdicts=verdicts, position=position) is None:
+            out = dict(state)
+            out.update(close_reason=row["close_reason"],
+                       close_ts=row.get("ts"),
+                       close_evidence=row.get("close_evidence"),
+                       seq=expected)
+            for key in _CLOSE_STATE_FIELDS[row["close_reason"]]:
+                out[key] = row.get(key)
+            return out
+        return state
+    legacy = state.get("v") != 3
+    # Compat replays ONLY rows stamped before the reduced core landed: an
+    # event appended today can never drive the removed machinery, however
+    # well-shaped. Missing ts is never compat (fail-closed, "~" sorts high).
+    compat = legacy and _pre_boundary(row.get("ts"))
+    # Historical full-snapshot compatibility.
+    if event is None:
+        if compat and row.get("status") == "verdict" and row.get("verdict_ref"):
+            out = dict(state)
+            out.update(status="verdict", verdict_ref=row.get("verdict_ref"),
+                       reviewed_tip=row.get("reviewed_tip") or state.get("tip"),
+                       migration=None)
+            return out
+        return state
+    if event == "retarget" and compat \
+            and _TIP.fullmatch(str(row.get("tip") or "")):
+        # Compatibility only for already-written rows; there is no shipping verb.
+        out = dict(state)
+        out.update(tip=str(row["tip"]).lower(), ref=row.get("ref"),
+                   migration=None,
+                   seq=_int_seq(row.get("seq"), state.get("seq", 0)))
+        return out
+    if event == "delivered" and state["status"] == "open" \
+            and (strict or compat):
+        ref, err = _clean(row.get("delivery_ref"), "delivery ref", 256)
+        if err:
+            return state
+        out = dict(state)
+        out.update(delivery="observed", delivery_ref=ref, seq=expected)
+        return out
+    if event == "verdict" and state["status"] == "open" \
+            and (strict or compat):
+        reviewed = str(row.get("reviewed_tip") or "").lower()
+        # THE REDUCER MUST BUDGET THE SAME STRING THE WRITER DID, and until
+        # 2026-08-03 it did not. mark_verdict strips `gate:` tokens before its
+        # 256 check (they ADDRESS a receipt, they are not prose — the
+        # 2026-08-02 drain) and stores at 4096; this arm re-checked 256 against
+        # the FULL string. The disagreement window is exactly the token: a
+        # 21-char `gate:` plus 256 chars of statement passes the WRITE and
+        # fails the REDUCE, so evidence of 257..277 chars was accepted, written,
+        # and then silently dropped here — `err` simply skips the branch below
+        # and `state` returns unchanged, leaving the row OPEN with no error
+        # raised and nothing printed. MEASURED: four rows, discarded lengths
+        # 258/260/261/275, every one inside that window (max possible 277).
+        #
+        # AND THE DROP IS NOT THE WORST OF IT. The attest fired at WRITE time
+        # over the text the writer accepted, so the signature binds evidence
+        # this reducer threw away, while the projection renders the later
+        # re-mint the signature does not cover. There is no re-sign verb (the
+        # attest path is "at most once", by design), so every such row is
+        # PERMANENTLY split. Closing the window is the only cure available.
+        raw_evidence = str(row.get("verdict_ref") or "")
+        evidence, err = _clean(raw_evidence, "verdict evidence", 4096)
+        if not err and len(_GATE_TOKEN_RE.sub("", raw_evidence)) > 256:
+            err = "verdict evidence over the 256 budget"
+        if state.get("tip") and reviewed == state["tip"] and not err:
+            out = dict(state)
+            # A pre-gate verdict carries no `gate` field, and "" is the TRUE
+            # reading of it: that verdict genuinely was not bound to a run.
+            # Replay must never invent a binding history did not have.
+            recorded = str(row.get("gate") or "")
+            out.update(status="verdict", reviewed_tip=reviewed,
+                       verdict_ref=evidence, seq=expected,
+                       gate=recorded if _GATE_ID.fullmatch(recorded) else "",
+                       polarity=_replay_polarity(row.get("polarity")))
+            # BASIS: ABSENT STAYS ABSENT, exactly like gate_caps below and for
+            # the same reason. The 221 verdicts written before this field
+            # existed were never ASKED how they knew — they are UNMARKED, not
+            # `unverified`, and collapsing those two would put a confidence
+            # claim into 221 rows nobody made one in. A row that HAS the field
+            # goes through the fail-closed backstop, so a forged or
+            # future-versioned value reads `unverified` rather than borrowing
+            # a confidence nobody recorded.
+            if "basis" in row:
+                out["basis"] = replay_basis(row["basis"])
+            # EXIT QUESTION: the same absent-stays-absent split. Historical
+            # rows were never asked whether the candidate was worse than main,
+            # so replay renders them UNMARKED instead of inventing an answer.
+            # A malformed/future answer also earns no blocking claim.
+            if verdict_exit_answer(row) != "UNMARKED":
+                out.update(exit_answer="worse-than-main",
+                           worse_than_main_paths=tuple(
+                               row["worse_than_main_paths"]))
+            # ABSENT stays ABSENT. Setting a default here would erase the
+            # difference between "written by a writer with no gate" and
+            # "written by one whose stamp we could not read".
+            if "gate_caps" in row:
+                out["gate_caps"] = clean_gate_caps(row["gate_caps"])
+            present = [key in row
+                       for key in VERDICT_AUTHOR_EVIDENCE_FIELDS]
+            if any(present):
+                if not all(present):
+                    return state
+                session = row["verdict_author_session"]
+                if not isinstance(session, str) or not session \
+                        or _verdict_author_runtime_error(
+                            row["verdict_author_runtime_evidence"],
+                            state.get("recipient"), session,
+                            row["verdict_author_runtime_anchor"]):
+                    return state
+                out.update({key: row[key]
+                            for key in VERDICT_AUTHOR_EVIDENCE_FIELDS})
+            return out
+        return state
+    # CANCEL: honest terminal abandonment of an OPEN dispatch (reviewer gone,
+    # work moot). v3-native — no compat history exists — and unlike a verdict
+    # it binds NO reviewed tip, only a reason. Terminal: a cancelled or
+    # verdict'd obligation ignores every later event.
+    if event == "cancel" and state["status"] == "open" and strict:
+        reason, err = _clean(row.get("reason"), "cancel reason",
+                             _CANCEL_REASON_CAP)
+        if err or not reason:
+            return state
+        out = dict(state)
+        out.update(status="cancelled", cancel_reason=reason, seq=expected)
+        return out
+    if event == "cancel" and state["status"] == "held" and strict:
+        reason, err = _clean(row.get("reason"), "cancel reason",
+                             _CANCEL_REASON_CAP)
+        if err or not reason:
+            return state
+        out = dict(state)
+        out.update(status="cancelled", cancel_reason=reason, seq=expected)
+        return out
+    # SUPERSEDED: an ANNOTATION, never a terminal. `--supersedes` used to mint
+    # the successor and leave the parent looking actionable, so enumeration
+    # surfaces kept offering finished work (441c4491).
+    #
+    # WHY THIS IS NOT A CANCEL, measured the expensive way: I built it as one
+    # and 18 tests across test_dispatch_chain / test_lr_close / test_web_lr went
+    # red, every one correctly. A BUILD parent is SUPPOSED to stay OPEN until
+    # its successor LANDS and then close through `landed`/`discharged` WITH
+    # PROOF — `discharging_row` walks the chain and returned (None, None) once
+    # the parent was cancelled. Closing at MINT time destroys the very door that
+    # closes it properly. The brief said "closes/ANNOTATES" and the ladders
+    # settle which: annotate.
+    #
+    # So this sets ONE field and touches neither status nor seq-terminality: the
+    # row keeps every door it had, and the enumeration surfaces read the field.
+    if event == "superseded" and strict:
+        succ = str(row.get("successor") or "").strip()
+        if not _ID.fullmatch(succ) or succ == state.get("id"):
+            return state
+        out = dict(state)
+        out.update(superseded_by=succ, seq=expected)
+        return out
+    if event == "hold" and state["status"] == "open" and strict:
+        reason, err = _clean(row.get("reason"), "hold reason", 256)
+        if err or not reason:
+            return state
+        if not _valid_ts(row.get("ts")):
+            return state
+        out = dict(state)
+        # owner_gated is a STRUCTURED claim, never a reading of the prose. The
+        # surfaces that separate "the fleet owes this" from "the OWNER owes
+        # this" read this boolean; a scanner over hold_reason would answer on
+        # wording, and the wording is whatever the holder happened to type.
+        # Absent or non-true reads False, so every historical hold — and every
+        # hold whose dependency is a build box, a credential, a vendor — stays
+        # an ordinary hold owed by the fleet.
+        out.update(status="held", hold_reason=reason, hold_ts=row["ts"],
+                   owner_gated=row.get("owner_gated") is True,
+                   seq=expected)
+        return out
+    if event == "release" and state["status"] == "held" and strict:
+        out = dict(state)
+        out.update(status="open", release_reason=row.get("reason"),
+                   release_ts=row.get("ts"), seq=expected)
+        for key in ("owner_gated", "hold_reason", "hold_ts"):
+            out.pop(key, None)
+        return out
+    # RETIP: an explicit re-point of an OPEN row's tip with an audit trail —
+    # the mirror of rebind for the case where the BASE moved rather than the
+    # reviewer (measured 2026-08-02: six hand-composed cancel-and-resends in
+    # one day, once per land that moved trunk under an already-dispatched
+    # lane). Strict v3 only, OPEN only: a verdict BINDS the tip it was written
+    # against, so a retip event appended after a verdict is inert — the status
+    # gate here IS the verdict gate, and it is stated so a later reader does
+    # not relax it as tidiness. NEVER a history rewrite: the seq-0 event keeps
+    # the old tip forever, and the projection carries every hop in `retips`
+    # (old tip, old ref, when, why, identity) so "what was the reviewer
+    # originally pointed at" stays answerable from the row itself. The event
+    # must NAME the tip it moves (`old_tip` == the projected tip): strict seq
+    # already orders events, but binding the hop to its predecessor makes a
+    # spliced or replayed-out-of-context retip inert rather than silently
+    # applied. Chain identity (id / chain_root / supersedes) is deliberately
+    # untouched: a retip is the SAME obligation at a new base, not a successor
+    # — minting a child row here is exactly what the supersedes chain law
+    # reserves for NEW rounds of work.
+    #
+    # REPLAY ENFORCES EVERY LAW THE WRITER DOES, or the writer's refusal is
+    # theater (codex FIX on this verb's first cut, both replay P1s). The SUCCESSOR
+    # FRONTIER: the writer refuses to retip a row whose OPEN successor already
+    # carries the obligation, so a hand-appended event that moves such a
+    # parent must be equally inert — replay reads the frontier off the same
+    # one coherent projection the fold is building (`current`), through the
+    # frontier's ONE owner (`_successor_frontier`), and every UNREADABLE
+    # shape refuses: no projection at all AND a not-closed row whose
+    # supersedes replays CHAIN_UNKNOWN — a frontier the check could not read
+    # never reads as clear (codex P1 round 2: per-caller `== id` equality let
+    # UNKNOWN fall through as "no open successor" here and at the writer
+    # alike). The IDENTITY STAMP: `identity` is a strict enum, never free
+    # text and never omitted — an event that cannot say whether the work
+    # identity was verified has not earned application — and it is copied
+    # INTO the hop, because an attribution that lives only in the writer's
+    # return value is transient and every fresh snapshot erases it. THE
+    # LEDGER IS THE ONLY WITNESS THE FOLD HAS (codex round 3, superseding
+    # the round-2 `proof` stamp): that stamp was an unkeyed content hash of
+    # attacker-supplied fields, and an informed forger recomputes an unkeyed
+    # recipe over their own forged event — theater, so it is DELETED from
+    # the acceptance path (pinned by test: nothing here reads `proof`, in
+    # either direction). What the fold CAN witness is its own derived state:
+    # the event must name the row's derived current tip as `old_tip`, and a
+    # row whose tip cannot be derived at all (a legacy needs-redispatch
+    # shape) anchors NOTHING — before this guard an absent old_tip
+    # string-matched an absent tip ("" == "") and a hand-appended hop moved
+    # a tip-less row. The identity stamp is the writer's recorded TESTIMONY,
+    # never re-proven at fold: work identity lives in git, the fold has no
+    # git, and a forger with append access sits outside every
+    # ledger-resident scheme — they could as easily rewrite seq-0.
+    if event == "retip" and state["status"] == "open" and strict:
+        tip = str(row.get("tip") or "").lower()
+        reason, err = _clean(row.get("reason"), "retip reason", 256)
+        if not _TIP.fullmatch(tip) or err or not reason:
+            return state
+        if not _valid_ts(row.get("ts")):
+            return state
+        derived = str(state.get("tip") or "")
+        if not _TIP.fullmatch(derived):
+            return state
+        if str(row.get("old_tip") or "").lower() != derived or tip == derived:
+            return state
+        identity = row.get("identity")
+        if identity not in ("verified", "unverified"):
+            return state
+        if current is None:
+            return state
+        successors, unknown = _successor_frontier(current, state.get("id"))
+        if successors or unknown:
+            return state
+        ref, ref_err = _clean(row.get("ref"), "ref", 256)
+        out = dict(state)
+        hops = list(state.get("retips") or ())
+        # An event written before this field, or by an older writer, replays
+        # False — never UNKNOWN and never True. The flag is the writer's
+        # testimony that the base was replaced; its ABSENCE is only the
+        # absence of that testimony, and the honest reading of that is "no
+        # replacement was recorded", which is what a fast-forward also says.
+        hops.append({"old_tip": state.get("tip"), "old_ref": state.get("ref"),
+                     "tip": tip, "ts": row["ts"], "reason": reason,
+                     "identity": identity,
+                     "base_replaced": row.get("base_replaced") is True})
+        # THE BINDING MOVES WITH THE ROW, at replay as at the writer. A row
+        # whose base stayed at the ORIGINAL dispatch would prove a second
+        # retip's direction against a base two hops stale.
+        out.update(_moving_binding(row))
+        out.update(tip=tip, ref=ref if ref and not ref_err else tip,
+                   retips=hops, seq=expected)
+        # DELIVERY STALES ON A TIP MOVE. A row reaching this arm carries a
+        # `delivery=observed` earned by a message about the OLD tip, and
+        # leaving it observed tells every delivery surface the recipient has
+        # been told — when what they were told is now a different sha. The
+        # recorded confirmation outlives the fact it confirms, and the row
+        # stops re-surfacing at exactly the moment it has something new to
+        # say. needs-confirmation puts it back in front of the recipient.
+        #
+        # `delivery_ref` is KEPT deliberately: it is the audit trail of what
+        # WAS confirmed, and the next `delivered` event overwrites it. Only
+        # the CLAIM is retracted, never the history of having made it.
+        if state.get("delivery") == "observed":
+            out["delivery"] = "needs-confirmation"
+        return out
+    # Historical snapshot verdicts/retarget-derived verdicts (compat only).
+    if compat and row.get("status") == "verdict" and row.get("verdict_ref"):
+        reviewed = str(row.get("reviewed_tip") or state.get("tip") or "").lower()
+        if not state.get("tip") or reviewed == state.get("tip"):
+            out = dict(state)
+            out.update(status="verdict", reviewed_tip=reviewed or None,
+                       verdict_ref=row.get("verdict_ref"), migration=None,
+                       seq=_int_seq(row.get("seq"), state.get("seq", 0)))
+            return out
+    if compat and row.get("delivery_ref") and state["status"] == "open":
+        out = dict(state)
+        out.update(delivery="observed", delivery_ref=row.get("delivery_ref"),
+                   seq=_int_seq(row.get("seq"), state.get("seq", 0)))
+        return out
+    return state

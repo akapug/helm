@@ -1,0 +1,24 @@
+<div class="view" id="view-roster">
+  <div class="lcard" style="margin-bottom:14px">
+    <h3>message a seat <span class="lsub" id="seatpickcount">rides the groupchat</span></h3>
+    <form id="seatform" autocomplete="off">
+      <div class="seatpick">
+        <input id="seatkey" placeholder="pick a live seat — or type @all / a name" maxlength="120" aria-label="seat name" title="live seats from the roster; free-type @all or a not-yet-joined seat" role="combobox" aria-autocomplete="list" aria-controls="seatlist" aria-expanded="false">
+        <div id="seatlist" role="listbox"></div>
+      </div>
+      <input id="seatline" placeholder="one-line message…" maxlength="400" required aria-label="message">
+      <button class="chip" id="seatsend" type="submit">send →</button>
+      <div id="seatmsg">a named seat gets a private DM (its lane only); @all posts to #main for the fleet.</div>
+    </form>
+  </div>
+  <div id="rosterbar">
+    <span class="rcount" id="rostercount">connecting…</span>
+    <input id="rosterq" placeholder="filter seat / project / doing…" autocomplete="off" aria-label="filter roster">
+    <button class="chip" id="togAbsent" title="show absent (gone) seats">absent <span id="cntAbsent">0</span></button>
+    <button class="chip" id="togSAs" title="show completed ephemeral review subagents">SAs <span id="cntSAs">0</span></button>
+  </div>
+  <div style="overflow-x:auto"><table class="roster"><thead id="rthead"></thead><tbody id="rtbody"><tr><td class="empty">connecting…</td></tr></tbody></table></div>
+  <div id="rosterclaims"></div>
+  <details id="rosterorphans" hidden></details>
+</div>
+

@@ -1,0 +1,1058 @@
+/* ================= quota view (ported from the predecessor's ui.html, behavior-preserving) =================
+   Slice B closed slice A's named seams: chart day-bars jump to the sessions view
+   filtered to that day, burn session chips open the transcript drawer, and the
+   account row-select feeds the sessions view's resume-as strip + team tray.
+   One remaining adaptation: the activity histogram joins against /api/sessions
+   (newest 200 work sessions), not the full catalog. */
+let CREDS = [], HIST = [], ALLOC = {}, SDATA = [], SEL = {anthropic: null, codex: null};
+/* WHY THE TABLE IS EMPTY, when it is empty because helm could not read.
+   An unreadable measurement and a machine with no quota provider both arrive
+   here as zero rows, and only one of them means the numbers on this tab are
+   unknown. Drawn as nothing, "could not read" reads as "nothing is wrong" on
+   a tab whose every number is unknown — the same conflation the server side
+   answers with `measured_unavailable`, one surface further out. null = read
+   (or nothing measures); a string = the class name of what stopped it. */
+let CREDS_UNREADABLE = null;
+let QWIN = "7d", AFILTER = "all", EMPH = null, QINIT = false;
+const short = (n, l = 26) => n.length > l ? n.slice(0, l - 1) + "…" : n;
+/* single-unit reset ETA (was "1h05m" compound → ragged quota cells) */
+function fmtIn(ms) {
+  const s = (ms - Date.now()) / 1e3;
+  if (s <= 0) return "now";
+  const h = s / 3600;
+  if (h > 48) return Math.round(h / 24) + "d";
+  if (h >= 1) return Math.round(h) + "h";
+  return Math.round(s / 60) + "m";
+}
+const PALETTE = ["#c9772e", "#3f7d54", "#5470c6", "#b4442e", "#8a5fc0", "#2f8f8f", "#b58a2e", "#c05f8c", "#6b8e23", "#7a5c3e"];
+const ROSTER = () => new Set(CREDS.map(c => c.name));
+const acol = a => { const i = CREDS.findIndex(c => c.name === a); return i >= 0 ? PALETTE[i % PALETTE.length] : "#999"; };
+
+function initQuota() {
+  if (QINIT) return;
+  QINIT = true;
+  loadCreds().then(() => { loadHist(); loadAlloc(); });
+  loadSData();
+  loadStatus();
+  // the declared inventory loads with the tab, not on the fold: the measured
+  // table's chips come from it, so waiting for a click would render the quota
+  // rows undescribed and then silently change them under him.
+  loadDeclared();
+  setInterval(() => { loadCreds(true).then(() => { loadHist(); loadAlloc(); }); }, 120e3);
+}
+
+/* ================= data ================= */
+async function loadCreds(refresh) {
+  let d;
+  try { d = await j("/api/creds" + (refresh ? "?refresh=1" : "")); } catch (e) { d = null; }
+  CREDS = Array.isArray(d) ? d : [];
+  /* a non-list is the server saying it could not read; a fetch that failed
+     outright is this page not being able to ask. Both are UNKNOWN, neither is
+     "you have no accounts". */
+  CREDS_UNREADABLE = Array.isArray(d) ? null
+    : (d && d.why) || "helm could not read the measured quota rows just now";
+  for (const p of ["anthropic", "codex"]) {
+    if (!SEL[p] || !CREDS.find(c => c.name === SEL[p])) {
+      const best = CREDS.filter(c => c.provider === p && c.state === "ok").sort((a, b) => (b.headroom ?? 0) - (a.headroom ?? 0))[0];
+      SEL[p] = best ? best.name : null;
+    }
+  }
+  NAV_ACC = CREDS.length ? statCell(CREDS.length, "accounts") : "";
+  renderNav();
+  renderAttn(); renderAccts(); renderResumeAs();
+}
+let NAV_ACC = "", NAV_SESS = "", NAV_CHAT = 0, NAV_CHAT_MENTION = false;
+/* one nav stat = a value over an uppercase label, right-aligned; they line up
+   as a fixed row of columns rather than a wrapping run of words. */
+function statCell(val, label, title) {
+  return `<span class="stat"${title ? ` title="${esc(title)}"` : ""}><b>${typeof val === "number" ? val.toLocaleString() : esc(val)}</b><span>${esc(label)}</span></span>`;
+}
+/* one tab's badge. `n` falsy removes it; a NON-NUMERIC n (the land pipeline's
+   "?") is rendered verbatim, because an unreadable pipeline must not be able
+   to present itself as a count of zero. */
+function navBadge(view, n, mention, title) {
+  // The value AS GIVEN, recorded before anything renders, because the area
+  // roll-up below must read the count and not the badge's text: that text is a
+  // RENDERING ("99+"), and Number("99+") is NaN, which would report a section
+  // as unreadable where it had a perfectly good count.
+  NAV_BADGE[view] = {n: n, mention: !!mention, title: title || ""};
+  // First, and on every return path: the roll-up depends only on NAV_BADGE, so
+  // a view with no tab in the markup still contributes to its area.
+  areaBadge(AREA_OF[view]);
+  const tab = $('.navtab[data-v="' + view + '"]');
+  if (!tab) return;
+  let b = tab.querySelector(".navbadge");
+  if (!n) {
+    if (b) { b.remove(); revealActiveTab(); }
+    return;
+  }
+  if (!b) { b = document.createElement("span"); b.className = "navbadge"; tab.appendChild(b); }
+  b.textContent = (typeof n === "number" && n > 99) ? "99+" : n;
+  b.classList.toggle("mention", !!mention);
+  b.title = title;
+  // A BADGE CHANGES STRIP GEOMETRY AFTER showView ALREADY SCROLLED. Measured at
+  // 390px: Ledger's late "?" badge pushed the selected Scheduler tab beyond the
+  // right edge. Any preceding tab can shift the selected tab, so re-reveal after
+  // every badge mutation; revealActiveTab is a no-op while selection stays visible.
+  revealActiveTab();
+}
+/* A SECTION IN A CLOSED AREA IS OFF SCREEN, so its badge would be invisible —
+   and the two badges that exist are chat's unread/mention and the land
+   pipeline's alarm, which are exactly the signals that must not be able to
+   hide. So every section badge ALSO rolls up onto its area button: counts add,
+   a mention paints the area, and a NON-NUMERIC value (the pipeline's "?") wins
+   over any sum, because an unreadable pipeline must not present itself as a
+   count — the same law navBadge holds one tab at a time. */
+function areaBadge(area) {
+  const btn = $('.navarea[data-a="' + area + '"]');
+  if (!btn) return;
+  let sum = 0, unknown = null, mention = false;
+  const titles = [];
+  for (const view in AREA_OF) {
+    if (AREA_OF[view] !== area) continue;
+    const b = NAV_BADGE[view];
+    if (!b || !b.n) continue;
+    if (typeof b.n === "number") sum += b.n;
+    else unknown = b.n;
+    if (b.mention) mention = true;
+    if (b.title) titles.push(b.title);
+  }
+  const val = unknown === null ? sum : unknown;
+  let el = btn.querySelector(".navbadge");
+  if (!val) {
+    if (el) el.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement("span");
+    el.className = "navbadge";
+    btn.appendChild(el);
+  }
+  el.textContent = (typeof val === "number" && val > 99) ? "99+" : val;
+  el.classList.toggle("mention", mention);
+  el.title = titles.join(" · ");
+}
+function renderNav() {
+  $("#navstats").innerHTML = NAV_ACC + NAV_SESS;
+  // THE NAV JUST CHANGED HEIGHT, SO WHATEVER STICKS UNDER IT NEEDS THE NEW
+  // NUMBER. `showView` measures once, on the way in, and the stats land LATER —
+  // the catalog answers asynchronously and fills this row — which at phone
+  // widths adds a whole row to the navigation. Without this the published
+  // `--navh` keeps describing the nav as it was BEFORE the stats arrived, and
+  // the sticky controls sit under the navigation until the next resize. The
+  // publish is idempotent and measures the real rect, so calling it on every
+  // nav render costs one layout read and cannot drift from what is on screen.
+  publishNavHeight();
+  // the chat tab's unread badge — the owner must see an @mention from ANY tab
+  navBadge("chat", NAV_CHAT, NAV_CHAT_MENTION,
+    NAV_CHAT_MENTION ? "unread @mentions for you in chat" : "unread chat messages");
+  // the land pipeline's ALARM badge — a lane contradicting its verdict, a
+  // stalled one, or a pipeline that could not be read. It badges WORK, the
+  // page that holds the pipeline's kanban, fed by the always-on pollLr so it
+  // reaches him from ANY page. Routine motion never badges: good news waits
+  // for a glance, contradictions come find him.
+  navBadge("work", NAV_LR, true, NAV_LR_TITLE);
+}
+async function loadHist() {
+  let d;
+  try { d = await j("/api/history?hours=168"); } catch (e) { d = []; }
+  HIST = Array.isArray(d) ? d : [];
+  const labels = gaugeLabels();
+  if (labels.length) {
+    if (!labels.includes(QWIN)) QWIN = labels[0];
+    $("#qtabs").innerHTML = labels.map(l => `<span class="qtab ${l === QWIN ? "on" : ""}" data-w="${esc(l)}">${esc(LBL_NICE[l] || l)}</span>`).join("");
+    $$(".qtab").forEach(tb => tb.onclick = () => { QWIN = tb.dataset.w; $$(".qtab").forEach(x => x.classList.toggle("on", x === tb)); renderChart(); });
+  }
+  let newest = 0;
+  for (const r of HIST) { const t = Date.parse(r.probed_at); if (t > newest) newest = t; }
+  if (newest) {
+    const m = Math.round((Date.now() - newest) / 60e3);
+    $("#qsub").textContent = `remaining % · history + projection to reset · server-truth ${m < 1 ? "just now" : m + "m ago"}`;
+  }
+  renderChart(); renderAccts(); renderAttn();
+}
+async function loadAlloc() {
+  try {
+    const d = await j("/api/allocate");
+    ALLOC = (d && typeof d === "object" && !d.unavailable) ? d : {};
+  } catch (e) { ALLOC = {}; }
+  renderAttn();
+}
+async function loadSData() {
+  // the activity histogram feeds the FULL catalog (parity ruling): every
+  // session's last-activity lands in the buckets, not a newest-N slice.
+  try {
+    await ensureCatalog();
+    SDATA = DATA.filter(r => !r.syn);
+  } catch (e) { SDATA = []; }
+  if (!SDATA.length) {
+    try {
+      const d = await j("/api/sessions");
+      SDATA = (d && Array.isArray(d.sessions)) ? d.sessions : [];
+    } catch (e) { SDATA = []; }
+  }
+  if (HIST.length) renderChart();
+}
+async function loadStatus() {
+  try {
+    const s = await j("/api/status");
+    if (s && s.provider && s.provider.degraded)
+      $("#qsub").textContent = "no quota provider reporting on this machine — resume still works under the default account";
+  } catch (e) {}
+}
+
+/* ================= attention ================= */
+function strandAtReset(acct) {
+  const S = seriesFor("7d")[acct];
+  if (!S || !S.reset || S.reset < Date.now()) return null;
+  const now = Date.now(), pts = S.pts, fit = pts.filter(p => p[0] > now - 6 * 3600e3);
+  if (fit.length < 3) return pts.length ? Math.round(pts[pts.length - 1][1]) : null;
+  const mx = fit.reduce((a, p) => a + p[0], 0) / fit.length, my = fit.reduce((a, p) => a + p[1], 0) / fit.length;
+  const den = fit.reduce((a, p) => a + (p[0] - mx) ** 2, 0);
+  let slope = den ? fit.reduce((a, p) => a + (p[0] - mx) * (p[1] - my), 0) / den : 0;
+  if (slope > 0) slope = 0;
+  return Math.max(0, Math.round(pts[pts.length - 1][1] + slope * (S.reset - now)));
+}
+/* One pill per signal class, uniform shape; the leading dot carries the colour.
+   Detail rides both the hover title (desktop) AND data-detail (tap-to-reveal on
+   touch — Orca mobile has no hover), surfaced in #attndetail below the row. */
+function attnPill(cls, label, title) {
+  const t = title ? ` title="${esc(title)}" data-detail="${esc(title)}"` : "";
+  return `<span class="attn ${cls}"${t}>${esc(label)}</span>`;
+}
+function renderAttn() {
+  const bits = [];
+  /* FIRST, because it is the sentence every other pill below is conditional
+     on: with the measurement unreadable there are no rows to count, and a
+     strip that counts nothing reads as "nothing is wrong". */
+  if (CREDS_UNREADABLE) bits.push(attnPill("bad", "accounts UNREADABLE",
+    CREDS_UNREADABLE + " — this is not \"no accounts\": helm could not read "
+    + "them, so every number on this tab is unknown"));
+  // REAL quota problems only: an account with auth that is exhausted or erroring.
+  const bad = CREDS.filter(c => c.state === "exhausted" || c.state === "api-error" || c.state === "approaching");
+  if (bad.length) bits.push(attnPill("bad", `${bad.length} need attention`, bad.map(c => c.name + ": " + c.state).join(" · ")));
+  // expired-token is its OWN pill (task/381): a reauth-needed account is not a
+  // broken one, and lumping an expired login into "need attention" told the owner four
+  // healthy Max 20x accounts were erroring. The word is the whole fix.
+  const stale = CREDS.filter(c => c.state === "expired-token");
+  if (stale.length) bits.push(attnPill("warn", `${stale.length} need re-login`, stale.map(c => c.name + ": " + c.status).join(" · ")));
+  // AND A DUE TOKEN IS NOT A DEAD ACCOUNT (task/2749): a home whose refresh
+  // chain helm can still grant on costs the owner nothing but a cadence, so it
+  // gets its OWN pill naming the verb that fixes it. Under the re-login pill it
+  // told him six healthy accounts needed six logins. Same shape, different
+  // sentence — the word is the whole fix, twice over now.
+  const due = CREDS.filter(c => c.state === "due-refresh");
+  if (due.length) bits.push(attnPill("warn", `${due.length} keepalive due`, due.map(c => c.name + ": " + c.status).join(" · ")));
+  const hyg = CREDS.filter(c => c.name_lies || c.duplicate_homes);
+  // A DRIFTED HOME SAYS WHAT IT HOLDS AND WHAT IT PROMISES. "dir-name-lies" is
+  // true and unactionable; the two account names plus the verb that repairs it
+  // are what the owner needs, and without them a drifted home reads as one more
+  // account wanting a login.
+  if (hyg.length) bits.push(attnPill("warn", `${hyg.length} home ${hyg.length > 1 ? "issues" : "issue"}`, hyg.map(c => c.name + (c.name_lies ? ` drifted: holds ${c.identity || "?"}, named ${c.home_name || "?"} (helm cred heal)` : "") + (c.duplicate_homes ? " " + c.duplicate_homes.length + "-homes" : "")).join(" · ")));
+  const waste = CREDS.filter(c => c.windows_verdict && c.windows_verdict !== "ok" && c.windows_verdict !== "no-weekly");
+  if (waste.length) {
+    const det = waste.map(c => { const st = HIST.length ? strandAtReset(c.name) : null; return short(c.name, 18) + (st != null ? ` strands ~${st}%` : ""); }).join(", ");
+    bits.push(attnPill("warn", `${waste.length} at waste-risk`, "capacity that expires unused at the weekly reset — " + det));
+  }
+  /* ONE WORD, TWO CAUSES (task/2981). A codex Team member whose workspace is
+     pooled while no pool file is proven to be it reads state "unknown" too,
+     and this pill told him it had no auth. It is measured, and its cure is
+     to pool that member's own credential. */
+  const unproven = CREDS.filter(c => c.member_unproven);
+  if (unproven.length) bits.push(attnPill("warn", `${unproven.length} member unproven`, unproven.map(c => c.name + ": helm codex pool " + (c.home_name || "<home>")).join(" · ") + " — no pool file matches this member, so its budget is UNKNOWN until its own credential is pooled"));
+  /* …and a row whose windows helm could not READ this minute is neither: it
+     has auth, and the "no auth" sentence below was the wrong cause for it. */
+  const unread = CREDS.filter(c => c.quota_unreadable && !c.member_unproven);
+  if (unread.length) bits.push(attnPill("", `${unread.length} unreadable`, unread.map(c => c.name).join(", ") + " — helm could not read these quota windows just now; the numbers are UNKNOWN, not zero"));
+  const nore = CREDS.filter(c => c.state === "unknown" && !c.member_unproven && !c.quota_unreadable);
+  if (nore.length) bits.push(attnPill("", `${nore.length} not reporting`, nore.map(c => c.name).join(", ") + " — no reading: no auth or usage endpoint; manage on the homes card"));
+  // steady state: say so plainly rather than an empty row
+  if (!bits.length && CREDS.length) bits.push(attnPill("ok", "all accounts healthy"));
+  const next = Object.entries(ALLOC).filter(([m, v]) => v && v.pick).map(([m, v]) => `${m} → ${short(v.pick.account, 18)} (${v.pick.headroom_pct}%)`);
+  if (next.length) bits.push(attnPill("next", "next: " + short(next[0], 26), "recommended account per model — " + next.join(" · ")));
+  $("#attn").innerHTML = bits.join("");
+  $("#attndetail").classList.remove("show");  // collapse stale detail on re-render
+}
+/* tap a pill (touch has no hover) → reveal its detail below the row; tap again
+   or tap another pill to swap. Delegated so it survives every re-render. */
+$("#attn").addEventListener("click", e => {
+  const pill = e.target.closest(".attn"); const box = $("#attndetail");
+  if (!pill || !pill.dataset.detail) { box.classList.remove("show"); return; }
+  const same = box.classList.contains("show") && box.dataset.for === pill.dataset.detail;
+  box.textContent = pill.dataset.detail; box.dataset.for = pill.dataset.detail;
+  box.classList.toggle("show", !same);
+});
+
+/* ================= chart ================= */
+const LBL_NICE = {"5h": "session", "7d": "weekly"};
+/* THE NEWEST PROBE OF EACH ACCOUNT — what the provider is reporting NOW. */
+function currentProbes() {
+  const roster = ROSTER(), latest = {};
+  for (const r of HIST) {
+    if (!roster.has(r.account)) continue;
+    const at = latest[r.account];
+    if (!at || r.probed_at > at.probed_at) latest[r.account] = r;
+  }
+  return Object.keys(latest).map(k => latest[k]);
+}
+/* WHICH WINDOWS ARE ON HIS SCREEN. Every label here becomes a column in the
+   accounts table and a tab above the chart, so this one function decides
+   whether a retired carve-out is still taking up a third of his table.
+
+   The owner: "i think openai has retired the spark 5.3 carve out, i dont see it
+   in codex backends anymore". He was right, and helm's own probe history is the
+   proof — the last sample carrying either spark gauge is from the previous
+   morning, while every account has been probed many times since. Nothing here
+   names spark, and nothing needs to.
+
+   THE BUG WAS THE WINDOW THIS READ, NOT THE RULE IT APPLIED. The rule was
+   already "draw a window the API reports"; the reading ran over all 168h of
+   loaded history, so "the API reports it" meant "the API reported it at some
+   point this week" and a retired carve-out kept its column for seven more days.
+   Reading the LATEST probe per account makes the column follow the provider:
+   the day a carve-out stops being reported it stops being drawn, and a new one
+   appears on its first probe with no edit here. The live `7d-fable` window is
+   the control — it is in every current probe and stays. */
+function gaugeLabels() {
+  const seen = new Set();
+  for (const r of currentProbes()) for (const g of r.gauges || []) if (g.utilization != null) seen.add(g.label);
+  const pref = ["5h", "7d"], rest = [...seen].filter(l => !pref.includes(l)).sort();
+  return pref.filter(l => seen.has(l)).concat(rest);
+}
+function seriesFor(win) {
+  const by = {}, roster = ROSTER();
+  for (const r of HIST) {
+    if (!roster.has(r.account)) continue;
+    const g = (r.gauges || []).find(g => g.label === win);
+    if (!g || g.utilization == null) continue;
+    const t = Date.parse(r.probed_at);
+    if (!t) continue;
+    (by[r.account] = by[r.account] || {provider: r.provider, pts: [], reset: null}).pts.push([t, (1 - Math.min(1, g.utilization)) * 100]);
+    if (g.reset) by[r.account].reset = g.reset * 1000;
+  }
+  for (const k in by) by[k].pts.sort((a, b) => a[0] - b[0]);
+  return by;
+}
+let ZOOMW = null; // {t0,t1} when the user zoomed/panned; null = auto window
+function updateZoomHint() {
+  const z = $("#zoomhint");
+  if (!z) return;
+  z.textContent = ZOOMW ? "zoomed — double-click to reset · scroll = zoom · drag = pan" : "scroll = zoom · drag = pan · double-click = reset";
+  z.style.color = ZOOMW ? "var(--accent)" : "var(--sub)";
+}
+function renderChart() {
+  const svgEl = $("#chart");
+  if (!HIST.length) { svgEl.innerHTML = ""; return; }
+  const win = QWIN, S = seriesFor(win), now = Date.now();
+  const histSpan = win === "5h" ? 24 * 3600e3 : 7 * 24 * 3600e3, projSpan = win === "5h" ? 6 * 3600e3 : 20 * 3600e3;
+  let t0 = now - histSpan, t1 = now + projSpan;
+  if (ZOOMW) { t0 = ZOOMW.t0; t1 = ZOOMW.t1; }
+  const W = 1400, H = 430, PL = 30, PR = 196, PT = 14, PB = 26, IW = W - PL - PR, IH = H - PT - PB;
+  const LEG_LH = 19; // legend line height — one row per account, no overlap
+  const x = t => PL + ((t - t0) / (t1 - t0)) * IW, y = p => PT + (1 - p / 100) * IH;
+  let s = `<line x1="${PL}" y1="${y(0)}" x2="${PL + IW}" y2="${y(0)}" stroke="var(--line)"/>`
+    + `<line x1="${PL}" y1="${y(50)}" x2="${PL + IW}" y2="${y(50)}" stroke="var(--line)" stroke-dasharray="2,5"/>`
+    + `<line x1="${PL}" y1="${y(100)}" x2="${PL + IW}" y2="${y(100)}" stroke="var(--line)"/>`
+    + `<text x="2" y="${y(100) + 4}" font-size="12" fill="var(--mut)">100%</text>`
+    + `<text x="2" y="${y(50) + 4}" font-size="12" fill="var(--mut)">50%</text>`
+    + `<text x="2" y="${y(0) + 4}" font-size="12" fill="var(--mut)">0%</text>`
+    // one mark for "now": the line + label (the shaded future-rect was a third redundant mark)
+    + (now >= t0 && now <= t1 ? `<line x1="${x(now)}" y1="${PT}" x2="${x(now)}" y2="${PT + IH}" stroke="var(--mut)" stroke-width="1"/>`
+    + `<text x="${x(now)}" y="${H - 8}" font-size="11" fill="var(--mut)" text-anchor="middle">now</text>` : "");
+  const span = t1 - t0;
+  const tickStep = span <= 10 * 3600e3 ? 3600e3 : span <= 36 * 3600e3 ? 3 * 3600e3 : span <= 5 * 24 * 3600e3 ? 12 * 3600e3 : 24 * 3600e3;
+  for (let t = Math.ceil(t0 / tickStep) * tickStep; t < Math.min(now, t1); t += tickStep) {
+    if (now >= t0 && now <= t1 && Math.abs(x(now) - x(t)) < 30) continue;
+    const d = new Date(t), lbl = tickStep < 24 * 3600e3 ? (d.getHours() === 0 ? (d.getMonth() + 1) + "/" + d.getDate() : d.getHours() + ":00") : (d.getMonth() + 1) + "/" + d.getDate();
+    // a short axis tick, not a full-height gridline — the horizontal % refs carry
+    // the lookup value; vertical rules per time-tick were chartjunk
+    s += `<line x1="${x(t)}" y1="${PT + IH}" x2="${x(t)}" y2="${PT + IH - 5}" stroke="var(--line2)"/>`
+      + `<text x="${x(t)}" y="${H - 8}" font-size="11" fill="var(--mut)" text-anchor="middle">${lbl}</text>`;
+  }
+  if (SDATA.length) {
+    const bh = 3600e3, nb = Math.ceil((now - t0) / bh), buckets = new Array(nb).fill(0);
+    for (const r of SDATA) { const mt = (r.mt || 0) * 1000; if (mt >= t0 && mt < now) buckets[Math.floor((mt - t0) / bh)]++; }
+    const bmax = Math.max(1, ...buckets);
+    for (let i = 0; i < nb; i++) {
+      if (!buckets[i]) continue;
+      const bx = x(t0 + i * bh), bw = Math.max(1, IW / nb - 0.5), h2 = 2 + (buckets[i] / bmax) * 15;
+      const dd = new Date(t0 + i * bh); // LOCAL date — must match the catalog's local "updated" day
+      const day = dd.getFullYear() + "-" + String(dd.getMonth() + 1).padStart(2, "0") + "-" + String(dd.getDate()).padStart(2, "0");
+      s += `<rect class="actb" data-day="${day}" x="${bx.toFixed(1)}" y="${(PT + IH - h2).toFixed(1)}" width="${bw.toFixed(1)}" height="${h2.toFixed(1)}" fill="var(--accent)" opacity="0.35" style="cursor:pointer"><title>${buckets[i]} session${buckets[i] > 1 ? "s" : ""} last-active here — click to list that day</title></rect>`;
+    }
+  }
+  const labels = [];
+  for (const [acct, S1] of Object.entries(S)) {
+    if (AFILTER !== "all" && S1.provider !== AFILTER) continue;
+    const col = acol(acct), pts = S1.pts.filter(p => p[0] >= t0 && p[0] <= t1);
+    if (pts.length < 2) continue;
+    const dim = EMPH && EMPH !== acct, wgt = EMPH === acct ? 3.4 : 2, op = dim ? 0.18 : 1;
+    s += `<polyline data-a="${esc(acct)}" fill="none" stroke="${col}" stroke-width="${wgt}" opacity="${op}" points="${pts.map(p => x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1)).join(" ")}"/>`;
+    const [lt, lv] = pts[pts.length - 1];
+    s += `<circle cx="${x(lt)}" cy="${y(lv)}" r="3.5" fill="${col}" opacity="${op}"/>`;
+    const fitSpan = win === "5h" ? 90 * 60e3 : 6 * 3600e3, fit = pts.filter(p => p[0] > now - fitSpan);
+    let slope = 0;
+    if (fit.length >= 3) {
+      const mx = fit.reduce((a, p) => a + p[0], 0) / fit.length, my = fit.reduce((a, p) => a + p[1], 0) / fit.length;
+      const den = fit.reduce((a, p) => a + (p[0] - mx) ** 2, 0);
+      slope = den ? fit.reduce((a, p) => a + (p[0] - mx) * (p[1] - my), 0) / den : 0;
+      if (slope > 0) slope = 0;
+    }
+    if (now >= t0 && now < t1) {
+      const rt = S1.reset && S1.reset > now && S1.reset < t1 ? S1.reset : t1;
+      const pv = Math.max(0, lv + slope * (rt - now));
+      s += `<line x1="${x(now)}" y1="${y(lv)}" x2="${x(rt)}" y2="${y(pv)}" stroke="${col}" stroke-width="1.4" stroke-dasharray="5,5" opacity="${dim ? 0.12 : 0.7}"/>`;
+      if (S1.reset && S1.reset > now && S1.reset < t1) {
+        s += `<line x1="${x(S1.reset)}" y1="${y(pv)}" x2="${x(S1.reset)}" y2="${y(100)}" stroke="${col}" stroke-width="1" stroke-dasharray="1,3" opacity="${dim ? 0.12 : 0.55}"/>`
+          + `<circle cx="${x(S1.reset)}" cy="${y(100)}" r="2.8" fill="none" stroke="${col}" opacity="${op}"/>`;
+      }
+    }
+    labels.push({acct, col, v: lv, yy: y(lv), dy: y(lv), op});
+  }
+  /* Direct labels in the right gutter, de-collided to one row each and, when
+     packed tight, spread evenly across the plot height. Name is left-aligned;
+     the % is right-aligned at a fixed x so the values form a tabular column
+     (Tufte: put the number where the eye can compare it). A short leader tie
+     joins each label to its line's endpoint. */
+  labels.sort((a, b) => a.yy - b.yy);
+  for (let i = 1; i < labels.length; i++) if (labels[i].yy - labels[i - 1].yy < LEG_LH) labels[i].yy = labels[i - 1].yy + LEG_LH;
+  const overflow = labels.length && labels[labels.length - 1].yy > PT + IH;
+  if (overflow) labels.forEach((l, i) => l.yy = PT + 6 + i * ((IH - 12) / Math.max(1, labels.length - 1)));
+  const nameX = PL + IW + 12, valX = W - 6;
+  for (const l of labels) {
+    s += `<line x1="${(PL + IW + 2).toFixed(1)}" y1="${l.dy.toFixed(1)}" x2="${(nameX - 3).toFixed(1)}" y2="${l.yy.toFixed(1)}" stroke="${l.col}" stroke-width="1" opacity="${l.op * 0.4}"/>`;
+    s += `<text data-a="${esc(l.acct)}" x="${nameX}" y="${l.yy + 4}" font-size="12" fill="${l.col}" opacity="${l.op}" style="cursor:pointer">${esc(short(l.acct, 20))}</text>`;
+    s += `<text data-a="${esc(l.acct)}" x="${valX}" y="${l.yy + 4}" font-size="12" font-weight="600" text-anchor="end" fill="${l.col}" opacity="${l.op}" style="cursor:pointer;font-variant-numeric:tabular-nums">${l.v.toFixed(0)}%</text>`;
+  }
+  svgEl.innerHTML = s;
+  svgEl._geo = {t0, t1, x, y, S, PL, IW, PT, IH, now};
+}
+$("#chart").addEventListener("mousemove", e => {
+  const svgEl = $("#chart"), g = svgEl._geo;
+  if (!g) return;
+  const r = svgEl.getBoundingClientRect();
+  const t = g.t0 + ((e.clientX - r.left) / r.width) * (g.t1 - g.t0);
+  const rows = [];
+  for (const [acct, S1] of Object.entries(g.S)) {
+    if (AFILTER !== "all" && S1.provider !== AFILTER) continue;
+    let best = null;
+    for (const p of S1.pts) if (!best || Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
+    if (best && Math.abs(best[0] - t) < 3 * 3600e3) rows.push([acct, best[1]]);
+  }
+  rows.sort((a, b) => b[1] - a[1]);
+  const tip = $("#tip");
+  if (!rows.length) { tip.style.display = "none"; return; }
+  tip.innerHTML = `<div class="tt">${new Date(t).toLocaleString([], {month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"})}</div>`
+    + rows.slice(0, 10).map(([a, v]) => `<div><span class="adot" style="background:${acol(a)}"></span>${esc(short(a, 22))} ${v.toFixed(0)}%</div>`).join("");
+  tip.style.display = "block";
+  const bx = $("#chartcard").getBoundingClientRect();
+  tip.style.left = Math.min(e.clientX - bx.left + 16, bx.width - 200) + "px";
+  tip.style.top = (e.clientY - bx.top + 10) + "px";
+});
+$("#chart").addEventListener("mouseleave", () => { $("#tip").style.display = "none"; });
+/* interactive time axis: scroll = zoom, drag = pan, double-click = reset */
+let PANST = null, PANMOVED = false;
+$("#chart").addEventListener("wheel", e => {
+  const g = $("#chart")._geo;
+  if (!g) return;
+  e.preventDefault();
+  const r = $("#chart").getBoundingClientRect();
+  const t = g.t0 + ((e.clientX - r.left) / r.width) * (g.t1 - g.t0);
+  const f = e.deltaY > 0 ? 1.2 : 1 / 1.2;
+  const nt0 = t - (t - g.t0) * f, nt1 = t + (g.t1 - t) * f, span = nt1 - nt0;
+  if (span < 20 * 60e3) return;
+  ZOOMW = span > 45 * 24 * 3600e3 ? null : {t0: nt0, t1: nt1};
+  renderChart(); updateZoomHint();
+}, {passive: false});
+$("#chart").addEventListener("pointerdown", e => { const g = $("#chart")._geo; if (!g) return; PANST = {x: e.clientX, t0: g.t0, t1: g.t1}; PANMOVED = false; });
+window.addEventListener("pointermove", e => {
+  if (!PANST) return;
+  const dx = e.clientX - PANST.x;
+  if (Math.abs(dx) > 5) PANMOVED = true;
+  if (!PANMOVED) return;
+  const r = $("#chart").getBoundingClientRect();
+  const dt = -(dx / r.width) * (PANST.t1 - PANST.t0);
+  ZOOMW = {t0: PANST.t0 + dt, t1: PANST.t1 + dt};
+  renderChart(); updateZoomHint();
+});
+window.addEventListener("pointerup", () => { PANST = null; setTimeout(() => PANMOVED = false, 60); });
+$("#chart").addEventListener("dblclick", () => { ZOOMW = null; renderChart(); updateZoomHint(); });
+$("#chart").addEventListener("click", e => {
+  if (PANMOVED) return; // a pan is not a click
+  const d = e.target.dataset || {};
+  if (d.day) { state.q = d.day; $("#sq").value = d.day; CONTENT = null; showView("sessions"); renderSessions(); toast("sessions last active " + d.day); return; }
+  if (d.a) { EMPH = EMPH === d.a ? null : d.a; renderChart(); renderAccts(); }
+});
+updateZoomHint();
+
+/* ================= burn ↔ sessions ================= */
+async function loadBurn() {
+  const host = $("#burnrows");
+  host.innerHTML = '<div class="empty">joining burn history to sessions…</div>';
+  let d;
+  try { d = await j("/api/burn?hours=48"); } catch (e) { host.innerHTML = '<div class="empty">✗ burn fetch failed</div>'; return; }
+  if (d.error || d.unavailable) { host.innerHTML = `<div class="empty">✗ ${esc(d.error || "burn unavailable on this machine")}</div>`; return; }
+  const roster = ROSTER(); // same convention as the chart: history accounts outside the roster don't render
+  const burnsOf = b => Object.entries(b.byAccount || {}).filter(([a]) => !CREDS.length || roster.has(a));
+  const rows = (d.buckets || []).filter(b => burnsOf(b).length).sort((a, b) => b.t - a.t).slice(0, 40);
+  if (!rows.length) { host.innerHTML = `<div class="empty">${esc(d.note || "no burn in the last 48h")}</div>`; return; }
+  host.innerHTML = rows.map(b => {
+    const when = new Date(b.t).toLocaleString([], {month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"});
+    const chips = burnsOf(b).sort((x, y) => y[1] - x[1]).map(([a, p]) =>
+      `<span class="burnchip" title="${esc(a)} burned ${p}% of its 5h window this hour"><span class="adot" style="background:${acol(a)}"></span>${esc(short(a, 18))} −${p}%</span>`).join("");
+    const sess = (b.sessions || []).map(s =>
+      `<span class="burnsess" data-open="${esc(s.i)}" title="${esc(s.c)} · ${s.h} — click to read the transcript">${esc(s.t || "(untitled)")}</span>`).join("");
+    return `<div class="burnrow"><span class="burnt">${when}</span><span class="burnchips">${chips}</span><span class="burnsesss">${sess || '<span class="rst">no sessions last-active this hour</span>'}</span></div>`;
+  }).join("") + (d.note ? `<div class="burnnote">${esc(d.note)}</div>` : "");
+  host.querySelectorAll(".burnsess").forEach(el => el.onclick = () => openSession(el.dataset.open));
+}
+$("#burncard").addEventListener("toggle", () => { if ($("#burncard").open) loadBurn(); });
+
+/* ================= credential homes =================
+   helm prepares/verifies/moves home DIRECTORIES; every login is human-run and
+   credentials are never read, written, copied, or moved (one home = one login). */
+let HOMES = [];
+// rides post() so home actions share the stale-bearer retry; callers keep the
+// {error: ...}-object contract they were written against (never a throw).
+const homePost = body => post("/api/homes", body).catch(e => ({error: e.message}));
+async function loadHomes() {
+  const host = $("#homerows");
+  host.innerHTML = '<div class="empty">scanning homes…</div>';
+  try { HOMES = await j("/api/homes"); } catch (e) { host.innerHTML = '<div class="empty">✗ homes fetch failed</div>'; return; }
+  if (!Array.isArray(HOMES)) { host.innerHTML = `<div class="empty">✗ ${esc(HOMES.error || "homes unavailable on this machine")}</div>`; HOMES = []; return; }
+  renderHomes();
+}
+function homeRowHTML(h) {
+  const chips = [];
+  chips.push(h.authed ? `<span class="st-ok" title="credential file present (contents never read)">authed</span>`
+    : `<span class="st-unknown" title="no credential file — this home does not appear in quota providers">no-auth</span>`);
+  chips.push(h.identity ? `<span title="identity metadata (claude: oauthAccount · codex: id_token email claim)">${esc(h.identity)}</span>`
+    : `<span class="rst">identity —</span>`);
+  if (h.canonical === false) chips.push(`<span class="flagchip" title="dir name should be the identity email folded to dashes — migrate fixes this">⚠ name-lies</span>`);
+  if (h.provider === "claude" && !h.archived) chips.push(h.projects_link_ok
+    ? `<span class="st-ok" title="projects → ~/.claude/projects (one shared session store)">link ✓</span>`
+    : `<span class="st-exhausted" title="projects must SYMLINK to ~/.claude/projects — a real dir silently strands sessions (verify shows the fix)">link ✗</span>`);
+  if (h.duplicate_identity && h.duplicate_identity.length)
+    chips.push(`<span class="flagchip" title="same identity also holds: ${esc(h.duplicate_identity.join(", "))} — one identity, one home; archive the loser (never copy creds)">⚠ dup-identity</span>`);
+  if (h.default) chips.push(`<span class="rst" title="the harness's fallback home — not archivable">default</span>`);
+  if (h.aliases && h.aliases.length) chips.push(`<span class="rst" title="alias symlinks pointing here">⤷ ${esc(h.aliases.join(", "))}</span>`);
+  const live = h.live_pids && h.live_pids.length ? ` <span title="live agent pid(s): ${h.live_pids.join(", ")}" style="color:var(--ok)">▶ ${h.live_pids.length}</span>` : "";
+  const nk = esc(h.name), pk = esc(h.provider || "?");
+  const acts = h.archived
+    ? `<button data-ha="unarchive" data-hn="${nk}">unarchive</button>`
+    : [`<button data-ha="verify" data-hn="${nk}" data-hp="${pk}" title="post-login check: identity, canonical name, projects link, duplicates">verify</button>`,
+       h.authed ? `<button data-ha="physics" data-hn="${nk}" data-hp="${pk}" title="what a seat on this home would load: MCPs, hooks, plugins, model">physics</button>` : "",
+       h.canonical === false ? `<button data-ha="migrate" data-hn="${nk}" data-hp="${pk}" title="rename to the canonical name; alias symlink left behind">migrate</button>` : "",
+       h.default ? "" : `<button data-ha="archive" data-hn="${nk}" data-hp="${pk}" title="${h.live_pids && h.live_pids.length ? "will REFUSE: live agents on this home" : "move into ~/.helm-home-archive (reversible)"}">archive</button>`
+      ].join("");
+  return `<div class="homerow"><span class="hbadge h-${pk === "claude" || pk === "codex" ? pk : "other"}">${pk.slice(0, 2)}</span>
+    <span class="hn">${nk}${live}${h.archived ? ` <span class="rst">→ ${esc(h.path)}</span>` : ""}</span>
+    <span class="hchips">${chips.join("")}</span>
+    <span class="hacts">${acts}</span><div class="homefix"></div></div>`;
+}
+function renderHomes() {
+  const active = HOMES.filter(h => !h.archived && !h.broken_alias), arch = HOMES.filter(h => h.archived), broken = HOMES.filter(h => h.broken_alias);
+  $("#homerows").innerHTML = active.map(homeRowHTML).join("")
+    + broken.map(h => `<div class="homerow"><span class="hn">${esc(h.name)}</span><span class="hchips"><span class="st-exhausted">broken alias → ${esc(h.target)}</span></span></div>`).join("")
+    + (arch.length ? `<div class="homehdr">archived (reversible — ~/.helm-home-archive)</div>` + arch.map(homeRowHTML).join("") : "")
+    || '<div class="empty">no credential homes found</div>';
+  $("#homerows").querySelectorAll("button[data-ha]").forEach(b => b.onclick = () => homeAction(b));
+}
+async function homeAction(btn) {
+  const act = btn.dataset.ha, name = btn.dataset.hn, provider = btn.dataset.hp;
+  const fixEl = btn.closest(".homerow").querySelector(".homefix");
+  if (act === "physics") {
+    if (fixEl.dataset.phys) { fixEl.innerHTML = ""; delete fixEl.dataset.phys; return; }
+    btn.disabled = true;
+    const r = await (await fetch(`/api/physics?home=${encodeURIComponent(name)}`)).json();
+    btn.disabled = false;
+    if (r.error) { fixEl.textContent = "✗ " + r.error; return; }
+    fixEl.dataset.phys = "1";
+    // shape-tolerant: mcpServers/hooks are lists; plugins may be {enabled:[...]}
+    const names = v => Array.isArray(v) ? v.map(x => (x && x.name) || x) : (v && Array.isArray(v.enabled)) ? v.enabled.map(x => String(x).split("@")[0]) : [];
+    const m = names(r.mcpServers), pl = names(r.plugins);
+    const hk = Array.isArray(r.hooks) ? r.hooks.reduce((n, h) => n + (h.count || 1), 0) : 0;
+    const hi = r.settingsHighlights || {};
+    fixEl.innerHTML = `<span class="rst">physics (home-scope): </span>`
+      + `MCPs: <b>${m.length ? esc(m.join(", ")) : "none"}</b> · hooks: <b>${hk}</b> · plugins: <b>${pl.length ? esc(pl.join(", ")) : "none"}</b>`
+      + (hi.model ? ` · model: <b>${esc(String(hi.model))}</b>` : "")
+      + (r.warnings && r.warnings.length ? `<br><span class="flagchip">⚠ ${esc(r.warnings.slice(0, 3).join(" · "))}</span>` : "");
+    return;
+  }
+  if (act === "verify") {
+    btn.disabled = true;
+    const r = await homePost({action: "verify", name, provider});
+    btn.disabled = false;
+    if (r.error) { fixEl.textContent = "✗ " + r.error; return; }
+    fixEl.innerHTML = `verdict: <b class="${r.verdict === "ok" ? "st-ok" : "st-approaching"}">${esc(r.verdict)}</b>`
+      + (r.fixes.length ? "<br>" + r.fixes.map(f => "fix: " + esc(f)).join("<br>") : " — all checks pass");
+    return;
+  }
+  if (act === "archive" && !confirm(`Archive home ${name} (${provider})?\n\nMoves the whole directory into ~/.helm-home-archive — reversible via unarchive. Refuses if a live agent is on it.`)) return;
+  if (act === "migrate" && !confirm(`Migrate home ${name} (${provider}) to its canonical name?\n\nRenames the directory and leaves an alias symlink at the old path. Refuses if a live agent is on it.`)) return;
+  btn.disabled = true;
+  const r = await homePost(act === "unarchive" ? {action: act, name} : {action: act, name, provider});
+  btn.disabled = false;
+  if (r.error) { fixEl ? fixEl.textContent = "✗ " + r.error : 0; toast("✗ " + r.error, 6000); return; }
+  toast("✓ " + (r.archived_to ? ("archived → " + r.archived_to) : r.restored_to ? ("restored → " + r.restored_to) : r.note || "done"), 6000);
+  loadHomes(); loadCreds(true);
+}
+$("#hCreate").onclick = async () => {
+  const email = $("#hEmail").value.trim(), provider = $("#hProv").value;
+  if (!email) { toast("enter the account email — the home name derives from it"); return; }
+  const r = await homePost({action: "create", provider, email});
+  const slot = $("#hCmd");
+  if (r.error) { slot.innerHTML = `<div class="dupwarn">✗ ${esc(r.error)}</div>`; return; }
+  slot.innerHTML = `<div class="cmdbox">${esc(r.login_cmd)}<div class="hintline">click to copy — run it in YOUR terminal, approve in the browser, then hit verify on the new row (logins are human-only)</div></div>`;
+  slot.querySelector(".cmdbox").onclick = async () => {
+    await navigator.clipboard.writeText(r.login_cmd);
+    toast("login command copied ✓ — run it yourself, then verify");
+  };
+  toast(`home ${r.existing ? "already prepared" : "created"}: ${r.home}`, 5000);
+  loadHomes();
+};
+$("#homescard").addEventListener("toggle", () => { if ($("#homescard").open) loadHomes(); });
+
+
+/* ================= accounts we pay for (declared, not measured) =================
+   The OWNER's own inventory: vendor, plan, count, price, what each account is
+   FOR and what it must NOT be used for. helm/accounts.py owns every rule; this
+   card only draws them and posts his edits back.
+
+   IT DECORATES THE MEASURED TABLE, IT NEVER REPLACES IT. Three states stay
+   three: a declared row whose `measured_as` matches a quota row adds chips to
+   THAT row (no measured cell is removed, reordered or overwritten), a declared
+   row with no measurement lives here and says "declared, not measured" instead
+   of a fake quota cell, and a measured row nobody has described gets one quiet
+   "describe" affordance. Inventing a "—" in a quota column would make an
+   unmeasured account look like a broken measured one.
+
+   AND THE FOURTH STATE IS SAID OUT LOUD: an unreadable inventory draws the
+   UNKNOWN strip with its reason, never an empty card. Absence is unknown, never
+   empty — an empty card would answer "we have no accounts", which is the one
+   sentence this whole surface exists to stop anybody saying. */
+let DECL = {accounts: [], bad: [], unreadable: null, revision: "", totals: null,
+            join: {matched: {}, declared_only: [], measured_only: []}, cap: 64};
+let DECL_EDIT = null;   // the id being edited, or null when adding
+/* the OPAQUE HANDLE of the measured account the form is describing, or null on
+   every other flow. The card is never given the provider's own spelling for an
+   undescribed account — it is usually an address — so this is the only thing
+   it can post back to say WHICH account it means. */
+let DECL_MKEY = null;
+/* THE CARD'S TRANSPORT, and it is a declared function rather than a const
+   arrow on purpose: the client suite lifts functions by name, and the arrow it
+   could not lift was the one line of this card nothing executed — the line
+   that dropped the server's `code` and made the conflict branch below dead.
+
+   post() THROWS on any non-2xx and carries the parsed body on the error, so a
+   refusal comes back as the server's own object: the sentence VERBATIM (no
+   path, no status in front of it — the owner is being told what he typed
+   wrong, not what HTTP did) and the `code` the caller branches on. A failure
+   with no body at all — the network, a non-JSON answer — still resolves with
+   an {error} object, because every caller here renders r.error and none of
+   them catch. */
+async function declPost(body) {
+  try {
+    return await post("/api/accounts", body);
+  } catch (e) {
+    const b = e && e.body;
+    if (b && typeof b === "object" && (b.error || b.code)) return b;
+    /* NO BODY AT ALL — the network, a proxy, a non-JSON answer. e.message is
+       post()'s RENDERING ("/api/accounts -> 500"), which is the route and the
+       number and nothing he can act on; it was the last developer-shaped
+       string on this card. The status is a fact worth keeping, said in a
+       sentence, and "nothing was changed" is the part he needs. */
+    const st = e && e.status;
+    return {error: "helm could not reach the accounts store"
+      + (st ? " — it answered " + st + " and said nothing more" : " at all")
+      + ". Nothing was changed; try again."};
+  }
+}
+
+async function loadDeclared() {
+  let d;
+  try { d = await j("/api/accounts"); } catch (e) {
+    d = {accounts: [], bad: [], unreadable: "the declared inventory could not be fetched"};
+  }
+  DECL = Object.assign({accounts: [], bad: [], unreadable: null, revision: "",
+                        totals: null, join: {matched: {}, declared_only: [], measured_only: []},
+                        cap: 64}, d || {});
+  renderDeclared();
+  renderDeclFill();       // …and the fill table, when he is in fill mode
+  renderAccts();          // the measured table's chips come from this data
+}
+
+/* the chips a DECLARED row lends a MEASURED one. Additive by construction:
+   the caller concatenates these onto the meta line and the quota cells are
+   never touched. */
+function declChips(name) {
+  const a = (DECL.join && DECL.join.matched) ? DECL.join.matched[name] : null;
+  if (!a) return [];
+  // the tooltip quotes what the owner SAID; on a row nobody has described it
+  // would quote the prompt back at him, which is the same mistake as the chip
+  const why = a.needs_describe ? "declared — nobody has said what this one is for"
+                               : "declared: " + (a.good_for || "");
+  const bits = [`<span class="flagchip" title="${esc(why)}">${esc(a.plan || "declared")}</span>`];
+  if (a.price_month) bits.push(`<span class="rst">${esc(a.price_month)}/mo</span>`);
+  // A SEEDED ROW NOBODY HAS DESCRIBED IS NOT A DESCRIPTION. The seeder had to
+  // fill a required field to write the row at all, and quoting that prompt
+  // back as "for: not described yet…" both wastes the line and hides the one
+  // affordance that fixes it — measured on the owner's real board, where the
+  // seed pre-declared every measured account and made "+ describe" unreachable
+  // on all fourteen of them.
+  if (a.needs_describe) bits.push(declareChip(name));
+  else if (a.good_for) bits.push(`<span class="rst" title="${esc(a.good_for)}">for: ${esc(short(a.good_for, 40))}</span>`);
+  return bits;
+}
+
+/* the one-click "say what this is for" affordance, in the one spelling both
+   its callers use: an undeclared measured row and a declared-but-undescribed
+   one ask the owner the same question and must not ask it two ways. */
+function declareChip(name) {
+  return `<span class="rst declare" data-declare="${esc(name)}" title="say what this account is for, so agents stop asking">+ describe</span>`;
+}
+
+/* one plain line, detail behind a native <details> — the owner-surface law. The
+   HEADLINE COMES FROM THE SERVER (accounts.project), so this card and
+   `helm accounts` cannot render different sentences about the same account. */
+function declRowHTML(a, matched) {
+  // THE MASKED SPELLING IS WHAT RENDERS. `measured_as` holds the provider's
+  // own account name so the join can find it, and on this host most of those
+  // names are addresses — a new card that printed them whole would publish
+  // something no existing verb publishes.
+  const mname = esc(a.measured_as_masked || a.measured_as);
+  // A PROVIDER THAT FAILED IS NOT A PROVIDER THAT SAW NOTHING. With the
+  // measured side unreadable every row would otherwise read "no quota row
+  // called that right now" — a confident sentence about a question nobody
+  // could answer.
+  /* …and it says so only about a row that HAS a measurement to be unknown
+     about. A row naming no `measured_as` is one nothing ever measures, so
+     "its measurement is UNKNOWN" is the same confident-wrong sentence this
+     branch was written to remove, pointed the other way. */
+  const quota = DECL.measured_unavailable && a.measured_as
+    ? esc(DECL.measured_unavailable) + " — this row's measurement is UNKNOWN, not absent"
+    : a.measured_as
+    ? (matched ? "measured as " + mname
+               : "declared, not measured — no quota row called " + mname + " right now")
+    : "declared, not measured — no quota provider watches this one";
+  const field = (label, value) => value
+    ? `<div class="dfield"><span class="dlabel">${esc(label)}</span>${esc(value)}</div>` : "";
+  // THE CONFIRM IS ITS OWN BUTTON. Every seeded row asks to be confirmed, and
+  // without a control that answers exactly that, the only answer is `edit` —
+  // a whole-row form opened to change one flag. One button, one merged field.
+  const seeded = a.needs_confirm
+    ? `<span class="dseeded">${esc(a.seeded_from || "seeded")} — please confirm</span>`
+      + `<button data-dact="confirm" data-did="${esc(a.id)}" title="mark this row confirmed; nothing else about it changes">confirm</button>` : "";
+  return `<div class="declrow" data-did="${esc(a.id)}">
+    <div class="declhead"><span class="dname">${esc(a.id)}</span>
+      <span class="declline">${esc(a.headline || "")}</span>${seeded}${declDupHTML(a)}
+      <span class="dacts"><button data-dact="edit" data-did="${esc(a.id)}">edit</button>
+      <button data-dact="rm" data-did="${esc(a.id)}">remove</button></span></div>
+    <details><summary>details</summary>
+      ${field("for", a.good_for)}${field("not for", a.not_for)}
+      ${field("reach", a.reach)}
+      <div class="dfield"><span class="dlabel">quota</span>${quota}</div>
+      ${field("billing", a.billing_word)}${field("allowance", a.allowance)}
+      ${field("key kept where", a.key_where)}
+      ${field("renews", a.renews_on)}${field("notes", a.notes)}
+      ${field("updated", a.updated_at)}</details></div>`;
+}
+
+/* ── WHICH ROWS ARE THE SAME BILL ─────────────────────────────────────────
+   The owner, having filled this card by hand: "some of them were dupes or
+   unknown to me (the ones i didnt edit)". He was right about every one of them,
+   and the card said nothing — so the only way to act on it was to know, from
+   memory, which credential home belonged to which account.
+
+   THREE STRENGTHS, KEPT APART, because he acts on these. `duplicate_of` is
+   PROVEN: both rows name the same login and one of them should go. A pointer
+   row is proven too — a default home is whichever account is currently
+   selected, never a subscription of its own. `vendor_siblings` is a QUESTION
+   and is phrased as one: helm cannot prove from here whether an unbound row is
+   a real account nobody has linked or a second name for one that is linked, so
+   it asks rather than accusing. A verdict he cannot check would be worse than
+   the silence it replaced.
+
+   REMOVING IS NOW SAFE TO SUGGEST, and that is why these say anything at all:
+   until this pass a deleted row came back on the next seed, so pointing at a
+   duplicate was pointing at a chore that would undo itself. */
+function declDupHTML(a) {
+  const bits = [];
+  if (a.duplicate_of && a.duplicate_of.length)
+    bits.push(`<span class="ddup" title="these rows name the same login, so they are one subscription written down twice — remove one and it stays removed">same subscription as ${esc(a.duplicate_of.join(", "))}</span>`);
+  if (a.points_at_default)
+    bits.push(`<span class="ddup" title="a default home is whichever account is selected at the time — it is a pointer at a subscription, never one of its own">points at a default, not a subscription</span>`);
+  if (a.vendor_siblings && a.vendor_siblings.length)
+    bits.push(`<span class="dask" title="this row names no login, so helm cannot tell whether it is its own account or another name for ${esc(a.vendor_siblings.join(", "))} — you can">names no login · ${a.vendor_siblings.length} other ${esc(a.vendor || "")} row${a.vendor_siblings.length === 1 ? "" : "s"}</span>`);
+  return bits.join("");
+}
+
+/* accounts N · monthly spend $X — so he never has to recount. UNPRICED ROWS ARE
+   NAMED, never assumed free: a total that silently treats "unknown" as zero
+   understates the bill and reads authoritative doing it. */
+function declTotalsHTML(t, cap) {
+  if (!t) return "";
+  return `<div class="decltotals"><b>${t.accounts}</b> account${t.accounts === 1 ? "" : "s"} declared`
+    + ` · <b>${t.units}</b> subscription${t.units === 1 ? "" : "s"} in total`
+    + ` · <b>$${t.monthly_spend}</b>/month`
+    + (t.unpriced ? ` <span class="rst">(${t.unpriced} with no price recorded — the total is a floor)</span>` : "")
+    + (cap ? ` <span class="rst">· ${t.accounts}/${cap}</span>` : "") + `</div>`;
+}
+
+/* a MEASURED account nobody has described: one click, prefilled from what is
+   measured. Never a hidden row and never a dimmed one.
+
+   AND IT NAMES THE ACCOUNT THE WAY EVERY OTHER HUMAN RENDERING DOES — MASKED.
+   The server sends {name_masked, key, suggest_id} and no longer sends the
+   provider's own spelling at all, because that spelling is usually an address
+   and this button printed it whole on a card whose own module docstring
+   promises it masks. The mask is what the owner READS; the opaque `key` is
+   what the button POSTS, because a masked string cannot be a join key. */
+function declUndescribedHTML(rows) {
+  if (!rows || !rows.length) return "";
+  return `<div class="dundesc"><span>${rows.length} account${rows.length === 1 ? " helm measures is" : "s helm measures are"} not described yet:</span>`
+    + rows.map(m => `<button data-dact="describe" data-dkey="${esc(m.key)}" data-dsuggest="${esc(m.suggest_id || "")}" data-dname="${esc(m.name_masked)}" title="say what this account is for">describe ${esc(short(m.name_masked, 22))}</button>`).join("")
+    + `</div>`;
+}
+
+function renderDeclared() {
+  const host = $("#declrows");
+  if (!host) return;
+  if (DECL.unreadable) {
+    // THE UNKNOWN STRIP. Not an empty card, not a zero: the file exists and
+    // could not be read, and saying "no accounts" here would be a lie with the
+    // same shape as the truth.
+    host.innerHTML = `<div class="dunknown">✗ ${esc(DECL.unreadable)}<br>`
+      + `<span class="rst">helm does NOT know how many accounts you have right now — this is not "none". `
+      + `Fix or move that file, then reload.</span></div>`;
+    return;
+  }
+  const matched = (DECL.join && DECL.join.matched) || {};
+  const rows = (DECL.accounts || []).map(a => declRowHTML(a, !!(a.measured_as && matched[a.measured_as])));
+  /* THE NAME IS THE ESCAPED RENDERING, THE BUTTON CARRIES THE HANDLE. A row is
+     bad because its key is not an id, and the escaped spelling that makes it
+     safe to print is exactly what `remove` refuses — a button carrying the
+     name it prints is a button that cannot remove anything. */
+  const bad = (DECL.bad || []).map(b =>
+    `<div class="declrow"><div class="declhead"><span class="dname">${esc(b.id)}</span>`
+    + `<span class="declline">✗ skipped: ${esc(b.why)} — it is still on the file, nothing was dropped</span>`
+    + `<span class="dacts"><button data-dact="rm" data-did="${esc(b.handle)}">remove</button></span></div></div>`).join("");
+  host.innerHTML = declTotalsHTML(DECL.totals, DECL.cap)
+    + declUndescribedHTML((DECL.join || {}).measured_only)
+    + (rows.length ? rows.join("") : `<div class="dundesc">nothing declared yet — hit “add an account” and say what you pay for.</div>`)
+    + bad;
+  host.querySelectorAll("button[data-dact]").forEach(b => b.onclick = () => declAct(b));
+}
+
+function declAct(btn) {
+  const act = btn.dataset.dact;
+  if (act === "edit") return declFormOpen((DECL.accounts || []).find(a => a.id === btn.dataset.did) || null);
+  // the card's own undescribed list names an account by HANDLE (it is never
+  // given the provider's spelling); the chip on the measured quota table names
+  // it by the name that table already renders.
+  if (act === "describe") return btn.dataset.dkey
+    ? declOpenForKey(btn.dataset.dkey, btn.dataset.dname, btn.dataset.dsuggest)
+    : declOpenFor(btn.dataset.dname);
+  if (act === "confirm") return declConfirm(btn.dataset.did);
+  if (act === "rm") return declRemove(btn.dataset.did);
+}
+
+/* THE EDITOR FOR ONE MEASURED ACCOUNT NAME, in one place because it has two
+   callers: the describe chip on an undeclared quota row and the same chip on a
+   declared row nobody has described yet. An already-declared row is EDITED;
+   prefilling a fresh slug for it would mint a second row for one account and
+   leave the first still asking to be described. */
+function declOpenFor(name) {
+  const have = (DECL.join && DECL.join.matched) ? DECL.join.matched[name] : null;
+  declFormOpen(have || {measured_as: name, id: declSlug(name)});
+}
+
+/* THE SAME EDITOR FOR AN ACCOUNT THIS CARD ONLY KNOWS MASKED. An undescribed
+   measured account arrives as {name_masked, key, suggest_id} and never as a
+   name, so the form shows the mask, carries the handle, and lets the SERVER
+   turn the handle back into the join key. `suggest_id` is `declSlug`'s own
+   rule applied one side of the wire over: the slug comes from the whole name,
+   which only the server has. */
+function declOpenForKey(key, masked, suggest) {
+  declFormOpen({measured_key: key, measured_masked: masked,
+                id: declFreeId(suggest || declSlug(masked))});
+}
+
+/* TWO ACCOUNTS CAN SLUG TO ONE ID. The prefill must not land on an id that
+   already describes another account, because the save would merge over that
+   row; the server refuses that anyway, and this makes the prefill land on a
+   free id rather than a refusal he must edit. */
+function declFreeId(base) {
+  const taken = new Set((DECL.accounts || []).map(a => a.id));
+  if (!taken.has(base)) return base;
+  for (let n = 2; n < 100; n++) {
+    const cand = (base.slice(0, 60) + "-" + n);
+    if (!taken.has(cand)) return cand;
+  }
+  return base;
+}
+
+/* a measured account name is frequently an email, and nothing email-shaped may
+   become a key on this surface — so the prefill slugs the local part and drops
+   everything else. The writer refuses an email id anyway; this makes the
+   prefill land on something he can accept rather than a refusal he must edit. */
+function declSlug(name) {
+  return String(name || "").split("@")[0].replace(/[^A-Za-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "").toLowerCase().slice(0, 64);
+}
+
+/* EVERY EDITABLE FIELD OF THE SCHEMA IS ON THE FORM. A field missing from it
+   is a field the owner can READ in the details fold — the renewal date is
+   rendered one function up — and has no way to change; the door preserves
+   what the form omits, which stops an edit destroying it but hands him no
+   editor either. The three that stay off are writer-owned or provenance:
+   `updated_at` is the writer's, `seeded_from` records where a row came from,
+   and `confirmed` is the checkbox below rather than a text box. */
+const DECL_FIELDS = [["#dId", "id"], ["#dVendor", "vendor"], ["#dPlan", "plan"],
+                     ["#dCount", "count"], ["#dPrice", "price_month"],
+                     ["#dGood", "good_for"], ["#dNot", "not_for"],
+                     ["#dReach", "reach"], ["#dMeasured", "measured_as"],
+                     ["#dRenews", "renews_on"], ["#dNotes", "notes"],
+                     ["#dBilling", "billing"], ["#dAllowance", "allowance"],
+                     ["#dKeyWhere", "key_where"]];
+
+function declFormOpen(a) {
+  DECL_EDIT = a && a.id && (DECL.accounts || []).some(x => x.id === a.id) ? a.id : null;
+  DECL_MKEY = (a && a.measured_key) || null;
+  for (const [sel, key] of DECL_FIELDS) {
+    const el = $(sel);
+    if (el) el.value = a && a[key] != null ? String(a[key]) : (key === "count" ? "1" : "");
+  }
+  // THE ID IS THE ROW'S KEY AND AN EDIT MAY NOT RETYPE IT. The box was plain
+  // and editable on an edit, so changing it posted a save under a key nothing
+  // was stored under: helm wrote a SECOND row and left the first one there,
+  // under a form whose own line says the id stays the same. Read-only here,
+  // the original id on the payload, and the door refuses the mismatch.
+  const idbox = $("#dId");
+  if (idbox) idbox.readOnly = !!DECL_EDIT;
+  // THE BOX SHOWS THE MASK AND CANNOT BE TYPED OVER. On a describe the card
+  // holds a handle rather than a name, so an editable box here would let him
+  // change a join key he cannot see — and what he typed would be saved as the
+  // provider's spelling. Every other flow leaves the box as it was.
+  const meas = $("#dMeasured");
+  if (meas) {
+    if (DECL_MKEY) meas.value = (a && a.measured_masked) || "";
+    meas.readOnly = !!DECL_MKEY;
+  }
+  const conf = $("#dConfirm");
+  if (conf) conf.checked = !!(a && a.confirmed);
+  const msg = $("#dMsg");
+  if (msg) msg.innerHTML = DECL_EDIT
+    ? `editing <b>${esc(DECL_EDIT)}</b> — the id stays the same`
+    : "a new account. Never a password, key, token or email: helm refuses them.";
+  const form = $("#declform");
+  if (form) form.hidden = false;
+}
+
+function declFormClose() {
+  DECL_EDIT = null;
+  DECL_MKEY = null;
+  const form = $("#declform");
+  if (form) form.hidden = true;
+}
+
+/* EVERY FIELD THE FORM CARRIES, EMPTY ONES INCLUDED. The door merges what a
+   payload omits, so omitting the empties would make a cleared box a no-op and
+   the owner could never take a price or a note back off a row. Absence
+   preserves, an explicit empty clears — the form is the writer that means
+   "clear it", and `seeded_from` survives because the form never carries it. */
+function declPayload() {
+  const out = {};
+  for (const [sel, key] of DECL_FIELDS) {
+    // THE MASK IS NOT THE NAME. On a describe the measured box holds the
+    // masked spelling, and posting that as `measured_as` would write a join
+    // key that joins nothing — so the handle goes instead and the server
+    // resolves it back to the name the provider minted.
+    if (key === "measured_as" && DECL_MKEY) continue;
+    const el = $(sel);
+    out[key] = el && typeof el.value === "string" ? el.value.trim() : "";
+  }
+  if (DECL_MKEY) out.measured_key = DECL_MKEY;
+  // the id of the row this form OPENED, whatever the box now holds: the box is
+  // read-only on an edit, and this is the half of that rule the server can see
+  if (DECL_EDIT) out.id = DECL_EDIT;
+  const conf = $("#dConfirm");
+  out.confirmed = !!(conf && conf.checked);
+  return out;
+}
+
+async function declSave() {
+  const msg = $("#dMsg");
+  // THE REVISION THE FORM WAS OPENED AGAINST. Two tabs cannot clobber each
+  // other: the second save is refused with a plain sentence and writes nothing.
+  const r = await declPost({action: "save", account: declPayload(),
+                            revision: DECL.revision, original_id: DECL_EDIT});
+  if (r && r.error) {
+    // `stale` is the one error that means the write LANDED — the list moved
+    // between the write and the read that should have confirmed it — so it
+    // closes the form like a success and never wears a ✗.
+    const landed = r.code === "stale";
+    if (msg) msg.innerHTML = landed
+      ? `<span class="dseeded">✓ saved — ${esc(r.error)}</span>`
+      : `<span class="dupwarn">✗ ${esc(r.error)}</span>`;
+    // "gone" is the row he was editing having been removed under him: the same
+    // lost-update answer as a conflict, and the same cure — redraw the card.
+    if (r.code === "conflict" || r.code === "gone" || landed) {
+      if (landed) declFormClose();
+      await loadDeclared();
+    }
+    return r;
+  }
+  if (msg) msg.textContent = "";
+  declFormClose();
+  await loadDeclared();
+  toast("✓ saved — agents read this now, so nobody has to ask you again", 5000);
+  return r;
+}
+
+/* "yes, that row is right" — and NOTHING else about the row changes. The
+   payload carries the id and the flag only; the door keeps every other stored
+   field, which is the whole point of merging there instead of in the form. */
+async function declConfirm(id) {
+  const r = await declPost({action: "save", account: {id, confirmed: true},
+                            revision: DECL.revision});
+  if (r && r.error) {
+    // `stale` IS THE WRITE HAVING LANDED — the list moved between the write and
+    // the read that should have confirmed it — and declSave and the fill path
+    // both already read it that way. This branch alone painted it as a
+    // failure: he ticked the box, helm told him it had not taken, and the card
+    // was never re-read, so the row he was looking at still showed unticked
+    // and his next move was to tick it again.
+    const landed = r.code === "stale";
+    if (landed || r.code === "conflict" || r.code === "gone") await loadDeclared();
+    toast((landed ? "✓ confirmed — " : "✗ ") + r.error, 6000);
+    return r;
+  }
+  await loadDeclared();
+  toast("✓ confirmed — agents can stop treating that row as a guess", 4000);
+  return r;
+}
+
+async function declRemove(id) {
+  if (!confirm(`Remove ${id} from the accounts you declared?\n\nThis deletes the description only — the account itself, its login and its quota are untouched.`)) return null;
+  const r = await declPost({action: "remove", id, revision: DECL.revision});
+  if (r && r.error) {
+    // `stale` IS THE REMOVE HAVING LANDED, exactly as it is for a save and a
+    // confirm: the row is gone from disk and only the read-back failed.
+    // Painted as a failure it sends him to remove a row that is not there.
+    const landed = r.code === "stale";
+    if (landed || r.code === "conflict" || r.code === "gone") await loadDeclared();
+    toast((landed ? "✓ removed — " : "✗ ") + r.error, 6000);
+    return r;
+  }
+  await loadDeclared();
+  toast("✓ removed from the declared inventory", 4000);
+  return r;
+}
+
+if ($("#dAdd")) $("#dAdd").onclick = () => declFormOpen(null);
+if ($("#dCancel")) $("#dCancel").onclick = () => declFormClose();
+if ($("#dSave")) $("#dSave").onclick = () => declSave();
+if ($("#acctdeclared")) $("#acctdeclared").addEventListener("toggle", () => {
+  if ($("#acctdeclared").open) loadDeclared();
+});

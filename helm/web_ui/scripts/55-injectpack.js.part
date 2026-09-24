@@ -1,0 +1,246 @@
+/* THE INJECTION PACK — what helm put in this seat's context, and the doors to
+   change it. Rendered into the Config detail pane underneath the identity the
+   pane already resolved, so there is ONE place that answers "which seat am I
+   looking at" and this section never re-derives it.
+
+   IT LEADS WITH FOUR NUMBERS BECAUSE THAT IS WHAT GETS READ. Bytes per turn,
+   bytes this context window, turns since the last compaction, and how many
+   distinct entries were delivered — four figures that can be compared to each
+   other and to yesterday. Everything below them is evidence for them, and the
+   per-turn breakdown is behind a disclosure because a page that opens with
+   sixty rows of premise text is a page nobody finishes.
+
+   NO COST OR CREDENTIAL FIGURE APPEARS HERE, DELIBERATELY. Nobody has measured
+   whether these bytes explain any credential burn — injections are cache-read
+   on most turns — so a cost column would launder an unmeasured claim into a
+   dashboard. Bytes and repeat counts only. */
+
+function ipkB(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
+
+/* THE PENDING FORM IS KEYED BY ENTRY ID, NOT HELD ON THE ELEMENT. A refresh
+   replaces the table, and a half-typed reason parked on a dead node is a
+   silent loss of the owner's own words — the same failure the composer drafts
+   ledger exists to prevent. */
+const IPK_OPEN = {};
+
+/* The last model this pane rendered, and the seat it belongs to. A redraw
+   after an edit re-renders from the SAME model until the reload lands, so a
+   click never blanks the numbers the owner was reading. */
+let IPK_MODEL = {state: "unknown", why: ""};
+let IPK_PACK = null;
+
+/* How many entry rows the table shows before the tail goes behind a click. */
+const IPK_ROWS = 20;
+let IPK_ALL = false;
+
+function ipkCell(row) {
+  /* "fleet" is the store's word and "everywhere" is the owner's. The
+     derivation ("statement", "root", "recorded" — HOW the scope was decided)
+     rides the tooltip rather than the cell, because inline it reads as a
+     second value for the same column. */
+  const scope = row.project
+    ? '<span title="scope decided by: ' + esc(row.scope_how || "unknown") + '">'
+      + esc(row.project === "fleet" ? "everywhere" : row.project) + '</span>'
+    : '<span class="cfgro">gone from the store</span>';
+  return '<td class="n">' + ipkB(row.bytes) + '</td>'
+    + '<td class="n">' + row.fires + '&times;</td>'
+    + '<td>' + esc(row.lane) + '</td>'
+    + '<td>' + scope + '</td>'
+    + '<td class="ipkid">' + esc(row.id)
+    + (row.text ? '<span class="ipktext">' + esc(row.text.slice(0, 160)) + (row.text.length > 160 ? '…' : '') + '</span>' : '')
+    + ipkActs(row) + '</td>';
+}
+
+/* Only the verbs the BACKEND said this entry can take are drawn. The model
+   derives them from the store writers' own admission rules, so a button that
+   appears is a button that will work — the page never offers a door and then
+   explains a refusal. */
+function ipkActs(row) {
+  if (!row.actions || !row.actions.length) return "";
+  const open = IPK_OPEN[row.id];
+  let h = '<div class="ipkform">' + row.actions.map(a =>
+    '<button type="button" class="ipkact" data-act="' + esc(a) + '" data-id="'
+    + esc(row.id) + '">' + esc(ipkVerb(a)) + '</button>').join("");
+  if (open) {
+    const rescope = open.action === "rescope";
+    h += '<input class="ipkin" data-id="' + esc(row.id) + '" placeholder="'
+      + esc(rescope ? "project name, fleet for everywhere, - to clear"
+                    : "why, in one line")
+      + '" value="' + esc(open.value || "") + '">'
+      + '<button type="button" class="ipkact" data-go="' + esc(row.id) + '">'
+      + esc(open.action === "retire" ? "confirm retire" : "confirm") + '</button>'
+      + '<button type="button" class="ipkact" data-cancel="' + esc(row.id) + '">cancel</button>';
+  }
+  return h + '</div>';
+}
+
+function ipkVerb(a) {
+  return a === "rescope" ? "which project is this about?"
+    : a === "demote" ? "stop pinning it every turn"
+    : a === "undemote" ? "pin it every turn again"
+    : "stop it firing";
+}
+
+async function ipkLoad(seat, session, gen) {
+  const host = $("#ipkhost");
+  if (!host) return;
+  host.innerHTML = '<div class="empty">reading what this seat injects…</div>';
+  let d;
+  try {
+    d = await j('/api/inject/pack?seat=' + encodeURIComponent(seat || "")
+                + '&session=' + encodeURIComponent(session || ""), 20000);
+  } catch (e) {
+    if (gen !== CFG_DETAIL_GEN) return;
+    host.innerHTML = '<div class="cfgwarn">the injection pack could not be read: '
+      + esc(e.message) + '</div>';
+    return;
+  }
+  if (gen !== CFG_DETAIL_GEN) return;
+  if (!IPK_PACK || IPK_PACK.session !== session) IPK_ALL = false;
+  IPK_PACK = {seat, session, project: d.project || ""};
+  IPK_MODEL = d;
+  ipkRedraw();
+}
+
+function ipkHtml(d) {
+  if (d.state !== "observed") {
+    return '<div class="cfgsec"><h4>what this seat injects</h4>'
+      + '<div class="empty">' + esc(d.why || "nothing recorded yet") + '</div></div>';
+  }
+  const w = d.window, s = d.scope || {}, t = d.session_total || {};
+  const big = (v, label) => '<div class="ipkbig"><b>' + v + '</b><span>'
+    + esc(label) + '</span></div>';
+  /* "since the last compaction" is the honest label for a window and it is
+     also the answer to the question that brought him here: everything counted
+     in it is still sitting in the context the next compaction will cut. */
+  const totals = '<div class="ipktot">'
+    + big(ipkB(w.per_turn || 0), "helm adds this to every turn")
+    + big(ipkB(w.bytes), "in this context window so far")
+    + big(w.turns, "turns since the last compaction")
+    + big(w.distinct, "different entries delivered")
+    + '</div>';
+  /* THE CANDIDATE COUNT IS A PER-TURN FIGURE AND EVERYTHING BESIDE IT IS A
+     WINDOW TOTAL, so they may not share a sentence. "helm looked at 99
+     entries and delivered 267 of them" is two true numbers bound to a claim
+     neither supports: the 267 deliveries happened across sixty turns and the
+     99 is what the most recent turn alone weighed. One sentence per span. */
+  const held = '<div class="ipkline">'
+    + (w.candidates == null ? ""
+       : 'On its most recent turn helm weighed ' + w.candidates
+         + ' entries against what you typed. ')
+    + 'Across this whole window it sent ' + w.fires + ' lines'
+    + (w.repeat == null ? "" : ', ' + Math.round(w.repeat * 100)
+       + '% of them an entry this window had already received')
+    + ', and held back ' + w.suppressed_fires + ' more worth '
+    + ipkB(w.suppressed_bytes) + ' that this seat already had.'
+    + (d.windows > 1 ? ' This session has been compacted ' + (d.windows - 1)
+       + ' time' + (d.windows === 2 ? '' : 's') + '; across all of them helm has sent '
+       + ipkB(t.bytes) + '.' : '')
+    + '</div>';
+  const lanes = '<div>' + ["jit", "pinned", "reflex", "whisper"].map(l =>
+    '<span class="ipklane"><i>' + esc(l) + '</i>' + ipkB((w.lanes || {})[l] || 0)
+    + '</span>').join("") + '</div>';
+  /* The scope line is the one lever the measurement actually points at: the
+     recurring per-turn cost is the JIT lane, and an entry that records no
+     project reaches this seat whatever it is working on. The page states the
+     split and refuses to call it waste — some of it is owner policy that
+     rightly travels everywhere, and only the owner can tell which. */
+  const scope = '<div class="ipkline">' + s.fleet + ' of these entries record no project, so they fire on every project you work in ('
+    + ipkB(s.fleet_bytes) + ' here)'
+    + (s.project ? '; ' + s.owned + ' are recorded as being about '
+       + esc(s.project) + ' (' + ipkB(s.owned_bytes) + ')' : '')
+    + (s.off_project ? '. <b>' + s.off_project + '</b> are recorded as being about a DIFFERENT project and should not have reached this seat at all: '
+       + esc((s.off_project_ids || []).join(", ")) : '')
+    + '.</div>';
+  /* THE TABLE IS CAPPED AND THE TAIL IS ONE CLICK AWAY. A live seat delivers
+     a couple of hundred distinct entries in a window, and the costliest
+     twenty carry the decision — the other two hundred are a scrollbar that
+     makes the four numbers above scroll off the screen. The rows are already
+     costliest-first, so the cap keeps exactly the rows worth acting on. */
+  const shown = IPK_ALL ? d.entries : d.entries.slice(0, IPK_ROWS);
+  const rows = shown.map(r => '<tr>' + ipkCell(r) + '</tr>').join("");
+  const table = '<table class="ipktab"><thead><tr><th>bytes</th><th>sent</th>'
+    + '<th>lane</th><th>about</th><th>entry</th></tr></thead><tbody>'
+    + (rows || '<tr><td colspan="5" class="empty">nothing delivered in this window</td></tr>')
+    + '</tbody></table>'
+    + (d.entries.length > shown.length
+       ? '<button type="button" class="ipkact" id="ipkmore">show the other '
+         + (d.entries.length - shown.length) + ' entries ('
+         + ipkB(d.entries.slice(IPK_ROWS).reduce((n, r) => n + r.bytes, 0))
+         + ' between them)</button>' : '');
+  const turns = '<details><summary>the last ' + d.turns.length
+    + ' turns, one row each</summary>' + d.turns.map(x =>
+      '<div class="ipkwhy">turn ' + esc(x.turn) + ' &middot; ' + ipkB(x.bytes)
+      + (x.silent ? ' &middot; silent' : '')
+      + ' &middot; held back ' + x.suppressed
+      + (x.fired.jit.length ? ' &middot; ' + esc(x.fired.jit.join(", ")) : '')
+      + '</div>').join("") + '</details>';
+  return '<div class="cfgsec"><h4>what this seat injects</h4>'
+    + totals + held + lanes + scope
+    + (d.derived_note ? '<div class="cfgwarn">' + esc(d.derived_note) + '</div>' : '')
+    + ((d.unavailable || []).length ? '<div class="cfgwarn">unavailable: '
+       + esc(d.unavailable.join(", ")) + '</div>' : '')
+    + table + turns + '</div>';
+}
+
+function ipkBind(host) {
+  host.querySelectorAll(".ipkact[data-act]").forEach(el => el.onclick = () => {
+    const id = el.dataset.id;
+    IPK_OPEN[id] = {action: el.dataset.act, value: ipkSeed(el.dataset.act)};
+    ipkRedraw();
+  });
+  host.querySelectorAll(".ipkact[data-cancel]").forEach(el => el.onclick = () => {
+    delete IPK_OPEN[el.dataset.cancel];
+    ipkRedraw();
+  });
+  host.querySelectorAll(".ipkin").forEach(el => el.oninput = () => {
+    if (IPK_OPEN[el.dataset.id]) IPK_OPEN[el.dataset.id].value = el.value;
+  });
+  host.querySelectorAll(".ipkact[data-go]").forEach(el => el.onclick = () =>
+    ipkAct(el.dataset.go));
+  const more = host.querySelector("#ipkmore");
+  if (more) more.onclick = () => { IPK_ALL = true; ipkRedraw(); };
+}
+
+function ipkSeed(action) {
+  return action === "rescope" && IPK_PACK && IPK_PACK.project
+    ? IPK_PACK.project : "";
+}
+
+function ipkRedraw() {
+  const host = $("#ipkhost");
+  if (host) { host.innerHTML = ipkHtml(IPK_MODEL); ipkBind(host); }
+}
+
+async function ipkAct(id) {
+  const open = IPK_OPEN[id];
+  if (!open) return;
+  /* THE SCOPE TRAVELS WITH THE CLICK, because the store resolves an id
+     against a ROOT SET and `project` is what puts the project roots in it.
+     The read that drew this row passed the seat's project into
+     `load_entries`, so a row here can be resident in a project root — and a
+     write that omits the project resolves against the global roots alone and
+     answers "not found" for exactly those rows. That is a button that appears
+     and cannot work, which is the one thing this page promises not to do.
+     tests/test_injectpack.py drives both poles against a project-resident
+     entry. */
+  const body = {action: open.action, id,
+                project: (IPK_PACK && IPK_PACK.project) || ""};
+  if (open.action === "rescope") body.owner = (open.value || "").trim() || "-";
+  else body.reason = (open.value || "").trim();
+  try {
+    await post("/api/inject/act", body);
+    delete IPK_OPEN[id];
+    toast(open.action + " " + id, 2600);
+    if (IPK_PACK) ipkLoad(IPK_PACK.seat, IPK_PACK.session, CFG_DETAIL_GEN);
+  } catch (e) {
+    /* THE WRITER'S OWN WORDS, NOT THE PAGE'S. A refusal rephrased here would
+       teach a vocabulary `helm store` does not share. */
+    toast("✗ " + e.message, 6000);
+  }
+}

@@ -1,0 +1,216 @@
+{
+ "schema": "helm.task2612.original-hostile-corpus.v1",
+ "provenance": "task/2612: the reviewer's original 30-case corpus, transferred as a fixture per meld clause 5; the source file's sha256 is recorded so the transfer can be checked, and its machine-local paths are not carried",
+ "original_file_sha256": "b830945049ab7601abbd9e21eb94d1fdbd4101e4b6644f35bcd9693c23732c3f",
+ "original_command_sha256": "d27f2a3ff08cfa5453ef9a58ea4dec68d05f25b3cf2ad9aa5baa0505664d796e",
+ "original_cases_assignment_sha256": "60284e2160ff9099a1472341dd6159006453a0a0cac437812a64fe712eea0689",
+ "status_rule": "status_of answers 'open' for 2598 and 'closed' for every other id, exactly as the original command did",
+ "roots": [
+  [
+   "docs",
+   "4242"
+  ],
+  [
+   "agents",
+   "4343"
+  ]
+ ],
+ "control_text": "Until task/{id} lands, copy by hand.",
+ "original_case_columns": [
+  "label",
+  "text",
+  "expected_subject_ids_per_root"
+ ],
+ "original_cases": [
+  [
+   "canonical-deadline",
+   "the door is task/2573 and until task/2573 lands, exit by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "canonical-state",
+   "while task/2573 is pending, copy by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "canonical-absence",
+   "task/2573 is not yet available, so exit by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "when-deadline",
+   "When task/2573 lands, stop exiting by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "once-done",
+   "Once task/2573 is done, stop exiting by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "wrapped-deadline",
+   "Until\ntask/2573 lands, exit by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "wrapped-state",
+   "While task/2573 is\npending, copy by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "markdown-deadline",
+   "Until `task/2573` lands, exit by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "true-next-anaphor",
+   "task/2573 makes the exit automatic. Until then, exit by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "next-state-anaphor",
+   "task/2573 makes the exit automatic. While it is pending, exit by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "next-nonanaphoric",
+   "task/2573 fixed the old bug. The unrelated signer is not yet available.",
+   []
+  ],
+  [
+   "reverse-direction",
+   "The signer will arrive tomorrow; until then, wait. task/2573 records an old fix.",
+   []
+  ],
+  [
+   "plain-provenance",
+   "The old fix was filed against task/2573. Separately the signer ships tomorrow; until then, wait.",
+   []
+  ],
+  [
+   "markdown-provenance",
+   "The old fix was filed against `task/2573`. Separately the signer ships tomorrow; until then, wait.",
+   []
+  ],
+  [
+   "abbrev-provenance",
+   "cf. task/2573. Separately the signer ships tomorrow; until then, wait.",
+   []
+  ],
+  [
+   "same-sentence-provenance",
+   "The old fix was filed against task/2573; separately, the signer is not yet available.",
+   []
+  ],
+  [
+   "same-sentence-true-promise",
+   "See task/2573 once it lands; until then exit by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "multiple-task-binding",
+   "The old fix was filed against task/2573; until task/2598 lands, stage by hand.",
+   []
+  ],
+  [
+   "next-anaphor-with-citation",
+   "task/2573 will automate the exit. Until then, use the script recorded under task/2598.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "provenance-and-promise-same-id",
+   "The proposal was filed against task/2573, and task/2573 will automate the exit. Until then, exit by hand.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "unrelated-next-anaphor",
+   "task/2573 fixed the old bug. Separately the signer ships tomorrow; until then, wait.",
+   []
+  ],
+  [
+   "bullet-boundary",
+   "- task/2573 fixed the old bug\n- Separately the signer ships tomorrow; until then, wait.",
+   []
+  ],
+  [
+   "heading-boundary",
+   "task/2573 fixed the old bug\n# Signer: in the meantime\nWait for hardware.",
+   []
+  ],
+  [
+   "blank-boundary",
+   "task/2573 fixed the old bug\n\nThe signer ships tomorrow; until then, wait.",
+   []
+  ],
+  [
+   "numbered-boundary",
+   "1) Historical fix: task/2573\n2) The unrelated signer is not yet available.",
+   []
+  ],
+  [
+   "abbreviation-in-promise",
+   "The task/2573 shortcut, e.g. its automatic exit, is not yet available.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "duplicate-sentences",
+   "task/2573 is not yet available.\ntask/2573 is not yet available.",
+   [
+    "2573",
+    "2573"
+   ]
+  ],
+  [
+   "citation-on-second-line",
+   "The exit shortcut introduced by\ntask/2573 is not yet available.",
+   [
+    "2573"
+   ]
+  ],
+  [
+   "both-tasks-closed",
+   "task/2573 and task/4244 are not yet available.",
+   [
+    "2573",
+    "4244"
+   ]
+  ],
+  [
+   "both-sentences-promises",
+   "task/2573 is not yet available. Until then, exit by hand.",
+   [
+    "2573",
+    "2573"
+   ]
+  ]
+ ],
+ "cases_joined_sha256": "e9e60ac5a43d093f17b9629ea37eca83fde1c8cd32fb24621af9cfe28f2fde65"
+}

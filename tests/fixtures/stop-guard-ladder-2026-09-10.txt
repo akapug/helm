@@ -1,0 +1,80 @@
+STOP-GUARD LADDER TIMING EVIDENCE — task/2069, build 0925904b53363a5d35c967ad3ee8b9c4
+
+Provisional fleet distribution
+  provenance: transcript-derived Stop delivery records, pinned 2026-09-10
+  pinned raw artifact: /tmp/claude-1000/-home-user-dev-akapug-helm/650e328b-54cc-4925-8772-307cfbc1afed/scratchpad/ladder-production.txt
+  pinned SHA-256: a3a276907ff5ede569592ba016bfb464866519157264396223225a5a236fffd7
+  pinned shape: 5,855 TSV rows: transcript, record index, carrier, timing line
+  vendored replay: stop-guard-ladder-replay-2026-09-10.tsv; all 339 runs
+  carriers: 328 Stop hook-success attachment.stderr blocks plus 11 system
+    hookErrors blocks. For the latter shape, the adjacent user Stop-feedback
+    mirror is excluded, so each live event contributes once. Tool results,
+    toolUseResult mirrors, rendered/file/snippet fields, assistant strings, and
+    command inputs are excluded as observations rather than Stop deliveries.
+
+  family: all three measured seats are Claude Code. Time-local SessionStart
+    identity, not author or display name, binds each timing record to its seat:
+    opus-integrator 297 runs, helm-claude-2 38, helm-claude-4 4.
+  seat totals (runs / p50 / p90 / p95 / max seconds):
+    opus-integrator  297 / 2.964 / 4.408 / 5.102 /  7.968
+    helm-claude-2     38 / 4.547 / 6.462 / 8.008 / 10.319
+    helm-claude-4      4 / 7.662 / 7.780 / 7.780 /  7.780
+  limitation: this is a provisional transcript-retention sample, not a native
+    timing ledger. The only 2026-08-28 native hook instrument is hookprobe.log;
+    its 359 BLOW records measure UserPromptSubmit `helm inject`, and it contains
+    zero Stop timings. Non-Claude seat-family timing is unavailable/UNKNOWN.
+    Task/1811 builds the native Stop ledger and must re-derive these bounds.
+
+  fleet total seconds: p50 3.151; p75 4.004; p90 5.102; p95 5.906;
+    p99 7.968; max 10.319
+  exceeding 10s: 1/339; exceeding 12s: 0/339
+  rung seconds (n / p50 / p90 / max):
+    seam             329 / 1.731 / 3.564 / 6.500
+    claims           329 / measured maximum 5.250
+    dispatch-ledger  329 / measured maximum 5.139
+    spiral           329 / measured maximum 1.684
+    all later cheap rungs combined: approximately 1.4 seconds
+
+Production regression specimen
+  provenance: helm room row 1719, codex-4, shared runtime c0f3e81a3e33
+  dispatch-ledger 1.324s; seam 4.924s; cumulative 6.395s before whisper
+  result under old 10s ambient budget: REFUSED / COVERAGE UNKNOWN, whisper
+    unfinished; claim-evidence, mechanical, and response unreached. Installed
+    outer wrapper `timeout 20` did not fire.
+
+Ordinary positive controls
+  provenance: fresh installed-main Stop feedback on 2026-09-10
+  total 2.294s; claims 1.300s including dispatch-ledger 1.211s; seam 0.868s;
+    every later rung through response completed; `timeout 20` untouched.
+  total 6.875s; dispatch-ledger 1.196s; seam 5.412s; response completed and
+    `timeout 20` remained untouched.
+  total 8.799s; dispatch-ledger 1.671s; claims 1.724s; seam began at 1.821s and
+    ran 6.942s, exceeding the pinned 6.500s seam maximum; full response
+    completed and `timeout 20` remained untouched. This falsifies exact-max
+    admission and supplies the current seam observation.
+
+Historical controls preserved in hooks.py history
+  ThinkPad, four worktree leases, 3,186 dispatch rows, approximately 120 binding
+  rows: full profile 7.70s before binding memo, 6.27s after; exact hook rc2 samples
+  8.7s / 8.1s / 5.9s; seam 4.36s before memo, 2.14s after. The recorded policy
+  treats 8.7s as an observed sample maximum, not a runtime bound, and requires at
+  least 2x that sample under the 20s wrapper.
+
+Derived ambient and rung admission
+  ambient 17.5s = round_up(2 * 8.7s); external reserve 2.5s beneath immutable
+  `timeout 20`. Successor reserves remain dispatch-ledger 10.0s, claims 8.0s,
+  seam 2.0s.
+  INFERRED engineering margin: the seam drifted 6.8% from the pinned 6.500s
+  maximum to 6.942s. Select 1.25x the current observation, rounded upward to
+  0.1s, leaving further headroom rather than treating either maximum as a bound:
+    dispatch-ledger: observed 5.139s -> cost 6.5s -> latest start 1.000s
+    claims:          observed 5.250s -> cost 6.6s -> latest start 2.900s
+    seam:            observed 6.942s -> cost 8.7s -> latest start 6.800s
+  The pinned replay reconstructs starts as DONE total minus elapsed. Its latest
+  starts are 0.482s / 0.404s / 5.508s respectively: all 987 heavy-rung
+  instances start, zero yield. The fresh 6.942s seam started at 1.821s and also
+  fits. Admission requires current time + fitted cost + successor reserve <=
+  ambient deadline. A miss is COVERAGE UNKNOWN and fail-closed, while later
+  rungs continue. Falsifiers are any observed heavy rung above its fitted cost,
+  or the immutable outer `timeout 20` firing before fallback publication; either
+  requires the native-ledger successor to remeasure and refit.

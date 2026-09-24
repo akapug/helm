@@ -1,0 +1,15 @@
+
+</div>
+
+<div id="tray"><h3>team tray — one seat per terminal<button id="trayClose" title="close">✕</button></h3>
+<div id="presets" style="margin-bottom:6px"></div><div id="dup"></div><div id="seats"></div>
+<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+<input id="presetName" placeholder="team name…" style="flex:1;min-width:100px">
+<button class="chip" id="savePreset">save team</button></div></div>
+
+<div id="drawer"><div id="dhead"></div><div id="dbody"></div></div>
+<div id="cmdpop"></div>
+
+<div class="hint" id="hint"></div>
+
+<script>

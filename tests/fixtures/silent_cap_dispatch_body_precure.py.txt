@@ -1,0 +1,11 @@
+# FROZEN pre-cure shape of the dispatch-brief store, kept as data so the rung
+# has a real instance of the class to judge. The live module now wraps the cut
+# in a notice that names both sizes; this is what it looked like when the cut
+# copy was stored and every reader presented it as the brief.
+MESSAGE_BODY_CAP = 4000
+
+
+def store_brief(row, message, ledger):
+    row["message_body"] = message[:MESSAGE_BODY_CAP]
+    ledger.append(row)
+    return row

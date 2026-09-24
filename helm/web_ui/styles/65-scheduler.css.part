@@ -1,0 +1,58 @@
+/* ================= scheduler graph =================
+   Geometry only. helm.scheduler owns grouping, order, ages, SUC and edges;
+   this sheet merely makes that shared model readable on desktop and phone. */
+#schedfold{margin:14px 0 0;min-width:0}
+#schedulersec{min-width:0;margin:10px 14px 14px;overflow-x:auto}
+.schunknown,.schwarming{padding:16px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--card)}
+.schunknown{border-color:color-mix(in srgb,var(--bad) 55%,var(--line));color:var(--bad)}
+.schwarming{color:var(--mut)}
+.schhead{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.schhero{min-width:150px;padding:10px 14px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--card)}
+.schhero strong{display:block;font-size:var(--f4);line-height:1.15}
+.schhero.zero strong{color:var(--ok)}
+.schhero.debt strong{color:var(--warn)}
+.schhero span{display:block;color:var(--mut);font-size:var(--f1);margin-top:3px}
+.schfresh{flex:1 1 300px;display:flex;align-items:center;padding:10px 14px;border:1px solid var(--line);border-radius:var(--r-lg);color:var(--mut);background:var(--card);font-size:var(--f1)}
+.schasks{margin-bottom:14px;border:1px solid color-mix(in srgb,var(--accent) 55%,var(--line));border-radius:var(--r-lg);background:var(--card);overflow:hidden}
+.schaskshead{display:flex;gap:9px;align-items:baseline;padding:9px 12px;border-bottom:1px solid var(--line)}
+.schaskshead b{font-size:var(--f0);letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
+.schaskshead span{color:var(--mut);font-size:var(--f1)}
+.schask{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:8px;align-items:baseline;padding:8px 12px;border-bottom:1px solid var(--line);font-size:var(--f2)}
+.schask:last-child{border-bottom:none}
+.schask .edge{color:var(--accent);font-family:var(--mono);font-size:var(--f1)}
+.schask .asktext{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.schask .asktext b{font-weight:var(--w-med)}
+.schask .askdetail{color:var(--mut)}
+.schage{color:var(--sub);white-space:nowrap;font-size:var(--f1);font-variant-numeric:tabular-nums}
+.schaskunknown{padding:9px 12px;color:var(--bad);font-size:var(--f2)}
+.schgraph{display:flex;gap:12px;align-items:flex-start;min-width:0;overflow-x:auto;padding:2px 2px 12px;scrollbar-width:thin;scroll-snap-type:x proximity}
+.schgroup{flex:0 0 min(330px,86vw);min-width:250px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--card);overflow:hidden;scroll-snap-align:start}
+.schgroup.alarm{border-color:color-mix(in srgb,var(--warn) 58%,var(--line))}
+.schgrouphead{position:sticky;top:0;z-index:1;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--elev)}
+.schwho{display:flex;gap:8px;align-items:center;min-width:0}
+.schwho b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--f3)}
+.schwho .schn{margin-left:auto;color:var(--mut);font-size:var(--f1);white-space:nowrap}
+.schgroupsuc{margin-top:3px;color:var(--mut);font-size:var(--f0);text-transform:uppercase;letter-spacing:.04em}
+.schgroupsuc.alarm{color:var(--warn);font-weight:var(--w-bold)}
+.schrows{max-height:68vh;overflow-y:auto}
+.schrow{position:relative;margin:9px 10px 9px 22px;padding:9px 10px;border:1px solid var(--line);border-radius:var(--r);background:var(--bg);font-size:var(--f1)}
+.schrow:before{content:"";position:absolute;left:-13px;top:17px;width:11px;border-top:1px solid var(--accent)}
+.schrow:after{content:"›";position:absolute;left:-20px;top:7px;color:var(--accent);font:var(--f4) var(--mono)}
+.schrow.alarm{border-color:color-mix(in srgb,var(--warn) 55%,var(--line))}
+.schrow.unknown{border-style:dashed}
+.schrow.honored{opacity:.72}
+.schtitle{font-weight:var(--w-med);line-height:1.3;overflow-wrap:anywhere}
+.schmeta{display:flex;gap:7px;align-items:baseline;flex-wrap:wrap;margin-top:4px;color:var(--mut)}
+.schstate{font-family:var(--mono);font-size:var(--f0);color:var(--fg)}
+.schwait{color:var(--accent)}
+.schsup{margin-top:5px;padding-top:5px;border-top:1px dashed var(--line);font-family:var(--mono);font-size:var(--f0);color:var(--sub);overflow-wrap:anywhere}
+.schsup.dangling{color:var(--warn)}
+.schdrop{padding:8px 12px;color:var(--mut);font-size:var(--f1);border-top:1px solid var(--line)}
+.schempty{padding:22px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--card);color:var(--mut)}
+@media(max-width:680px){
+  .schhead{display:grid;grid-template-columns:1fr 1fr}
+  .schfresh{grid-column:1/-1}
+  .schask{grid-template-columns:auto minmax(0,1fr)}
+  .schask .schage{grid-column:2}
+  .schgroup{flex-basis:86vw}
+}
